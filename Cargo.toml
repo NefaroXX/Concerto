@@ -94,7 +94,7 @@ camino = { version = "1", features = ["serde1"] }
 fastrand = "2"
 
 # ---- Diff computation (Phase 2) ----
-imara-diff = "0.1"
+imara-diff = "0.2"
 
 # ---- Pure-Rust Git operations (Phase 2+, ADR-01) ----
 gix = "0.85"
