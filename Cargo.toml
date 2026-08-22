@@ -122,7 +122,7 @@ iced = { version = "0.14", features = ["tokio", "canvas"] }
 
 # ---- Terminal UI (Phase 3, ADR-07) ----
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # ---- Syntax highlighting for diff viewer (Phase 3) ----
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "default-fancy"] }
