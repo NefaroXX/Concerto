@@ -64,7 +64,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 async-stream = "0.3"
 
-ulid = { version = "1", features = ["serde"] }
+ulid = { version = "3", features = ["serde"] }
 time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
 
 serde = { version = "1", features = ["derive"] }
