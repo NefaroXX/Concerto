@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.96.0)
         uses: dtolnay/rust-toolchain@1.96.0
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.96.0)
         uses: dtolnay/rust-toolchain@1.96.0
@@ -81,7 +81,7 @@ jobs:
       CONCERTO_TEST_MODE: "1"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.96.0)
         uses: dtolnay/rust-toolchain@1.96.0
@@ -102,7 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.96.0)
         uses: dtolnay/rust-toolchain@1.96.0
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.96.0)
         uses: dtolnay/rust-toolchain@1.96.0
@@ -148,7 +148,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Official action from the cargo-deny maintainers; handles install.
       # Policy lives in deny.toml (licenses, bans, advisories, sources).
@@ -163,7 +163,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # views/ and ui/ must use theme palette colors, never Color::from_rgb,
       # Color::{BLACK,WHITE,TRANSPARENT}, or hex literals. widgets/ and
