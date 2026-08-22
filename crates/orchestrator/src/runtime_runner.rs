@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_runner::AgentRunner;
-use crate::coordinator::{CoordinatorAgent, OrchestrationDepth};
+use crate::coordinator::{ApprovedPlanSeed, CoordinatorAgent, OrchestrationDepth};
 use crate::intent_grants::{
     apply_intent_gate, outcome_name, router_route_name, IntentGrantStore, SessionIntentAuth,
 };
 use crate::plan_approval::{
-    apply_plan_decision, plan_registry, rehydrate_durable_binding, verified_binding, PlanBinding,
+    append_plan_approved_event, apply_plan_decision, load_approved_plan, plan_registry,
+    rehydrate_durable_binding, verified_binding, ApprovedPlanContext, PlanBinding,
 };
 use crate::registry::AgentRegistry;
 use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
@@ -38,7 +39,8 @@ use concerto_core::transcript::{
 use concerto_core::types::ToolRegistry;
 use concerto_core::types::{
     AgentCompletionStatus, AgentContext, AgentId, AgentOutput, AgentStage, AgentTask,
-    CompletionRequest, Message, ProjectId, ProviderMetrics, Role, SessionContext, TaskId,
+    CompletionRequest, DesignDoc, Message, ProjectId, ProviderMetrics, Role, SessionContext,
+    TaskId,
 };
 use concerto_core::types::{Condition, PolicyRule};
 use concerto_core::{
@@ -2156,23 +2158,108 @@ fn approved_plan_task_description(binding: &PlanBinding) -> String {
     )
 }
 
+/// ADR-60 D7 (#152): the task description for an Execute run governed by a
+/// whiteboard-verified approved plan. The structured artifact — DesignDoc
+/// when the planning run produced one, otherwise the hash-verified plan text
+/// read back from the log — replaces the rendered-plan prose, and the
+/// carry-forward ledger states what already happened under the plan so
+/// completed subtasks are not redone and failed commands are not re-run
+/// unchanged (#152 acceptance).
+fn approved_plan_structured_description(context: &ApprovedPlanContext) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Execute the approved plan {} (objective {}). The approved structured artifact below \
+         governs this run — do not re-derive or re-plan it.\n",
+        context.binding.plan_id(),
+        context.binding.objective_hash(),
+    ));
+    match &context.design_doc {
+        Some(doc) => {
+            out.push_str("\n<approved-design-doc>\n");
+            for goal in &doc.goals {
+                out.push_str(&format!("Goal: {goal}\n"));
+            }
+            for constraint in &doc.constraints {
+                out.push_str(&format!("Constraint: {constraint}\n"));
+            }
+            for file in &doc.proposed_files {
+                out.push_str(&format!("Proposed file: {file}\n"));
+            }
+            if !doc.interface_sketch.trim().is_empty() {
+                out.push_str(&format!("Interface: {}\n", doc.interface_sketch.trim()));
+            }
+            for risk in &doc.risks {
+                out.push_str(&format!("Risk: {risk}\n"));
+            }
+            out.push_str("</approved-design-doc>\n");
+        }
+        // No structured doc exists (single-agent plans): the verified plan
+        // text IS the persisted artifact — loaded from the log and checked
+        // against its creation-time hash, never replayed from the transcript.
+        None => {
+            out.push_str("\n<approved-plan-artifact>\n");
+            out.push_str(context.binding.plan_text());
+            out.push_str("\n</approved-plan-artifact>\n");
+        }
+    }
+    out.push_str("\n<approved-plan-ledger>\n");
+    if context.ledger.completed_subtasks.is_empty()
+        && context.ledger.files_touched.is_empty()
+        && context.ledger.failed_commands.is_empty()
+    {
+        out.push_str("No prior execution under this plan.\n");
+    } else {
+        if !context.ledger.completed_subtasks.is_empty() {
+            out.push_str("Completed subtasks (do not redo):\n");
+            for entry in &context.ledger.completed_subtasks {
+                out.push_str(&format!("- {entry}\n"));
+            }
+        }
+        if !context.ledger.files_touched.is_empty() {
+            out.push_str("Files already touched under this plan:\n");
+            for entry in &context.ledger.files_touched {
+                out.push_str(&format!("- {entry}\n"));
+            }
+        }
+        if !context.ledger.failed_commands.is_empty() {
+            out.push_str(
+                "Failed commands (address the recorded failure reason; never re-run unchanged):\n",
+            );
+            for entry in &context.ledger.failed_commands {
+                out.push_str(&format!("- {entry}\n"));
+            }
+        }
+    }
+    out.push_str("</approved-plan-ledger>");
+    out
+}
+
 /// Build the run's task from the gate and plan-binding state (ADR-55 Phase
 /// 2b, M3 live-fix).
 ///
 /// An Apply run must describe the APPROVED plan rather than the approval
 /// phrase that armed the dialog ("i approve"); without this the coordinator's
 /// subtasks were literally built from the approval phrase and the Coder
-/// produced nothing. The action-required/answer-only routing from B-2 is
-/// otherwise untouched.
+/// produced nothing. ADR-60 D7: when the whiteboard state was verified
+/// (`approved`), the structured artifact + ledger description replaces the
+/// legacy rendered-prose description entirely. The action-required/
+/// answer-only routing from B-2 is otherwise untouched.
+#[allow(clippy::too_many_arguments)]
 fn build_run_task(
     session_id: Ulid,
     action_required: bool,
     apply_plan: bool,
     applied_plan: Option<&PlanBinding>,
+    approved: Option<&ApprovedPlanContext>,
     input: &str,
 ) -> AgentTask {
     if apply_plan {
-        if let Some(binding) = applied_plan {
+        if let Some(context) = approved {
+            AgentTask::new_action_required(
+                session_id,
+                approved_plan_structured_description(context),
+            )
+        } else if let Some(binding) = applied_plan {
             AgentTask::new_action_required(session_id, approved_plan_task_description(binding))
         } else {
             // Defensive: apply without a captured binding (should be
@@ -2183,6 +2270,66 @@ fn build_run_task(
         AgentTask::new_action_required(session_id, input.to_owned())
     } else {
         AgentTask::new(session_id, input.to_owned())
+    }
+}
+
+/// ADR-60 D7 gating (oracle comment 5): the whiteboard plan-binding path
+/// rides the same opt-in as Phase 1 — `[orchestration] supervisor_enabled` —
+/// narrowed by the `plan_binding_source` rollout switch (default
+/// `whiteboard`). With a default config everything here stays off, so every
+/// path is byte-identical to pre-D7; `legacy` keeps the exact prose behavior
+/// even when supervision itself is on.
+fn d7_whiteboard_enabled(multi_agent: Option<&concerto_config::MultiAgentConfig>) -> bool {
+    matches!(
+        multi_agent,
+        Some(config)
+            if config.supervisor_enabled
+                && config.plan_binding_source == concerto_config::PlanBindingSource::Whiteboard
+    )
+}
+
+/// ADR-60 D7 (#152): append the content-addressed `plan-approved` whiteboard
+/// event for a freshly bound plan. Ordering is deliberate: the LOG commits
+/// first (source of truth) and the `plan_bindings` durable mirror follows —
+/// a crash in between leaves the log ahead of the projection, which an
+/// Execute read resolves by degrading to the legacy prose path with a warn,
+/// never by reading an unattested artifact.
+///
+/// Fail-soft like every persistence step on this path: a missing pool or an
+/// append error warns and returns; the just-completed Plan run is never
+/// failed by continuity bookkeeping.
+async fn append_plan_binding_event(
+    pool: Option<&sqlx::SqlitePool>,
+    session_id: Ulid,
+    binding: &PlanBinding,
+    design_doc: Option<&DesignDoc>,
+    multi_agent: Option<&concerto_config::MultiAgentConfig>,
+) {
+    if !d7_whiteboard_enabled(multi_agent) {
+        return;
+    }
+    let Some(pool) = pool else {
+        // Same documented degradation as the write gate without a session DB:
+        // observable, never silent.
+        tracing::warn!(
+            plan_id = %binding.plan_id(),
+            "no session DB pool — plan-approved whiteboard event not recorded; \
+             Execute will use the legacy prose path"
+        );
+        return;
+    };
+    match append_plan_approved_event(pool, session_id, binding, design_doc).await {
+        Ok(stored) => tracing::info!(
+            plan_id = %binding.plan_id(),
+            gate_seq = stored.gate_seq,
+            "recorded plan-approved whiteboard event (ADR-60 D7)"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            plan_id = %binding.plan_id(),
+            "failed to append the plan-approved whiteboard event; Execute falls \
+             back to the legacy prose path"
+        ),
     }
 }
 
@@ -2467,10 +2614,17 @@ pub async fn run_shared_agent(
     // task must be built from the approved plan text, which is only available
     // while the binding still exists.
     let mut applied_plan: Option<PlanBinding> = None;
+    // ADR-60 D7: the source revision snapshot the user's Apply answer was
+    // made at (the Apply/Replan dialog names both revisions). The divergence
+    // guard below fails loudly when the tree moves AFTER this snapshot — a
+    // change between approval and dispatch is silent divergence, never
+    // something the user saw.
+    let mut approval_time_revision: Option<String> = None;
     let (effective, confirmation) = match bound {
         Some(binding) => {
             let objective_hash = binding.objective_hash();
             let current_revision = current_source_revision(&req.project_dir).await;
+            approval_time_revision = current_revision.clone();
             let binding_revision = binding.source_revision().unwrap_or("unknown");
             // The wording names the plan id and avoids claiming the plan was
             // made "for this objective": phrase/hash arming loads the plan
@@ -2557,6 +2711,73 @@ pub async fn run_shared_agent(
     // objective (its input hash would otherwise match the implicit-resume
     // check below).
     let apply_plan = matches!(plan_decision, Some(PlanDecision::Apply));
+
+    // ─── ADR-60 D7 (#152): whiteboard rehydration for the approved-plan
+    // Execute. Rides the same opt-in as Phase 1 (`supervisor_enabled`) plus
+    // the `plan_binding_source` rollout switch. The verified structured
+    // artifact + carry-forward ledger replace the rendered-plan prose; any
+    // divergence from what the user approved is a LOUD failure — silent
+    // re-decompose is forbidden.
+    let mut approved_context: Option<ApprovedPlanContext> = None;
+    if apply_plan && d7_whiteboard_enabled(services.config.multi_agent.as_ref()) {
+        match (applied_plan.as_ref(), gate_log_pool.as_ref()) {
+            (Some(binding), Some(pool)) => match load_approved_plan(pool, binding).await {
+                Ok(Some(context)) => {
+                    // Divergence guard, revision axis: the tree may not move
+                    // between the user's Apply answer and dispatch. A
+                    // divergence the dialog itself surfaced was explicitly
+                    // approved (it named both revisions); anything after that
+                    // snapshot is silent and fails the run. Unverifiable
+                    // revisions (git absent) degrade with a warn — the
+                    // artifact hash above still guards content integrity.
+                    let now_revision = current_source_revision(&req.project_dir).await;
+                    match (&now_revision, &approval_time_revision) {
+                        (Some(now), Some(approved_at)) if now != approved_at => {
+                            return Err(OrchestratorError::Unrecoverable {
+                                message: format!(
+                                    "approved plan {} diverged from its approval: source \
+                                     revision moved from {approved_at} to {now} after the \
+                                     Apply decision — explicit re-approval is required \
+                                     (ADR-60 D7 forbids silent divergence)",
+                                    binding.plan_id(),
+                                ),
+                            });
+                        }
+                        (None, _) | (_, None) => tracing::warn!(
+                            plan_id = %binding.plan_id(),
+                            "source revision could not be resolved on both sides of the \
+                             approval; proceeding with artifact-hash verification only"
+                        ),
+                        _ => {}
+                    }
+                    tracing::info!(
+                        plan_id = %binding.plan_id(),
+                        design_doc = context.design_doc.is_some(),
+                        completed_subtasks = context.ledger.completed_subtasks.len(),
+                        files_touched = context.ledger.files_touched.len(),
+                        failed_commands = context.ledger.failed_commands.len(),
+                        "rehydrated approved plan from the whiteboard (ADR-60 D7)"
+                    );
+                    approved_context = Some(context);
+                }
+                Ok(None) => tracing::warn!(
+                    plan_id = %binding.plan_id(),
+                    "no plan-approved whiteboard events for this binding (pre-D7 plan?) — \
+                     Execute falls back to the legacy prose path"
+                ),
+                Err(divergence) => {
+                    return Err(OrchestratorError::Unrecoverable { message: divergence });
+                }
+            },
+            (Some(_), None) => tracing::warn!(
+                "no session DB pool for the approved-plan lookup — Execute falls back to the \
+                 legacy prose path"
+            ),
+            // Defensive: an Apply without a captured binding is handled by
+            // `build_run_task`'s fallback below.
+            (None, _) => {}
+        }
+    }
 
     // The plan-decision helper grants but never mutates the read-only flag
     // (it owns only the store), so normalize it here from the confirmation.
@@ -2697,9 +2918,17 @@ pub async fn run_shared_agent(
     let action_required = task_action_required(effective_outcome, gate_read_only);
     // ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
     // not the approval phrase. `req.input` is still recorded in the transcript
-    // and audit; only the task the agents execute is replaced.
-    let task =
-        build_run_task(session_id, action_required, apply_plan, applied_plan.as_ref(), &req.input);
+    // and audit; only the task the agents execute is replaced. ADR-60 D7: a
+    // whiteboard-verified approved plan swaps in the structured artifact +
+    // ledger description instead of the rendered prose.
+    let task = build_run_task(
+        session_id,
+        action_required,
+        apply_plan,
+        applied_plan.as_ref(),
+        approved_context.as_ref(),
+        &req.input,
+    );
 
     // Run-stage tracking (ADR-55 Phase 2a). Created here, after routing, so
     // the stage chip always starts from Understand; threaded down into the
@@ -2727,6 +2956,7 @@ pub async fn run_shared_agent(
             action_required,
             effective_outcome,
             plan_objective_hash,
+            approved_context.as_ref(),
             &stage_tracker,
             intent_policy.clone(),
             gate_log_pool.clone(),
@@ -2739,6 +2969,9 @@ pub async fn run_shared_agent(
     // current source revision and persist the durable binding.
     let plan_project_dir = req.project_dir.clone();
     let plan_cancel_token = req.cancel_token.clone();
+    // ADR-60 D7: the post-Plan binding insert below appends its whiteboard
+    // event through this pool clone (the match consumes `gate_log_pool`).
+    let d7_event_pool = gate_log_pool.clone();
     // ADR-60 D5: give the in-process single-agent loop the same always-on
     // write-gate protection the supervised agent-process path enforces. The
     // gate reuses the run's own policy/executor pair and the session-DB pool
@@ -2806,6 +3039,20 @@ pub async fn run_shared_agent(
             output.final_message.clone(),
         );
         plan_registry().insert(session_id, binding.clone());
+        // ADR-60 D7 (#152): the whiteboard event commits FIRST (the log is
+        // the source of truth), then the durable `plan_bindings` mirror — a
+        // crash in between leaves the log ahead of the projection, which
+        // degrades to the legacy prose path with a warn, never to an
+        // unattested read. Single-agent plans carry no DesignDoc; the capped
+        // text is the artifact.
+        append_plan_binding_event(
+            d7_event_pool.as_ref(),
+            session_id,
+            &binding,
+            None,
+            services.config.multi_agent.as_ref(),
+        )
+        .await;
         // Live-fix: mirror the binding to durable storage so "i approve the
         // plan" offered after an app restart still arms the dialog.
         // Fail-soft: a persistence failure never fails the run — the
@@ -2843,6 +3090,12 @@ pub async fn run_shared_agent(
 /// the always-on intent gate (ADR-55 Phase 1e): they shape the topology, the
 /// text-only system prompt, and the post-run plan-binding insert.
 ///
+/// ADR-60 D7 (#152): `approved_plan` carries the whiteboard-verified state of
+/// an approved-plan Execute — it suppresses the conversation-history prose
+/// injection (the transcript contains the rendered plan markdown; the
+/// verified artifact governs instead) and seeds the coordinator so decompose
+/// skips the architect rather than re-deriving an approved plan.
+///
 /// `intent_policy` + `gate_log_pool` are the run's own policy engine and
 /// session-DB pool; they back the ADR-60 Phase 1 supervised path's write gate
 /// when `[orchestration] supervisor_enabled` opts in. They mirror exactly what
@@ -2863,6 +3116,7 @@ async fn run_multi_agent(
     action_required: bool,
     effective_outcome: RequestedOutcome,
     plan_objective_hash: String,
+    approved_plan: Option<&ApprovedPlanContext>,
     stage_tracker: &Arc<Mutex<StageTracker>>,
     intent_policy: Arc<dyn PolicyEngine>,
     gate_log_pool: Option<sqlx::SqlitePool>,
@@ -3449,7 +3703,26 @@ async fn run_multi_agent(
     if planning_only {
         coordinator = coordinator.with_orchestration_depth(OrchestrationDepth::PlanningOnly);
     }
-    let multi_task = multi_agent_task_with_history(task.clone(), &req.conversation_history);
+    // ADR-60 D7 (#152): an approved-plan run seeds the whiteboard-verified
+    // structured state so decompose skips the architect — re-deriving an
+    // approved plan (silent re-decompose) is forbidden. The supervised path
+    // above needs no seeding: children receive the structured task
+    // description directly.
+    if let Some(context) = approved_plan {
+        coordinator = coordinator.with_approved_plan_seed(ApprovedPlanSeed {
+            plan_id: context.binding.plan_id().to_owned(),
+            design_doc: context.design_doc.clone(),
+        });
+    }
+    // ADR-60 D7: an approved-plan run does NOT inject the conversation
+    // history as prose — that transcript carries the rendered plan markdown,
+    // and the whiteboard-verified structured artifact governs instead.
+    // Prior decisions that matter ride the ledger in the task description;
+    // non-approved runs keep the exact pre-D7 history injection.
+    let multi_task = match approved_plan {
+        Some(_) => task.clone(),
+        None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
+    };
     let context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
     // Run-stage tracking (ADR-55 Phase 2a): the coordinator publishes
     // `SubTaskCreated` and gate-cycle (`ReviewCycleStarted` /
@@ -3590,6 +3863,19 @@ async fn run_multi_agent(
             output.final_message.clone(),
         );
         plan_registry().insert(session_id, binding.clone());
+        // ADR-60 D7 (#152): the whiteboard event commits FIRST (the log is
+        // the source of truth), then the durable `plan_bindings` mirror — a
+        // crash in between leaves the log ahead of the projection. A
+        // planning-only run carries the structured DesignDoc the architect
+        // produced; Execute rehydrates it instead of re-deriving the plan.
+        append_plan_binding_event(
+            gate_log_pool.as_ref(),
+            session_id,
+            &binding,
+            coordinator.design_doc_snapshot().as_ref(),
+            services.config.multi_agent.as_ref(),
+        )
+        .await;
         // Live-fix: mirror the binding to durable storage so "i approve the
         // plan" offered after an app restart still arms the dialog.
         // Fail-soft: a persistence failure never fails the run — the
@@ -5444,7 +5730,7 @@ mod runtime_runner_tests {
         let input = "i approve";
 
         // An Apply run with a captured binding executes the approved plan.
-        let task = build_run_task(session_id, false, true, Some(&binding), input);
+        let task = build_run_task(session_id, false, true, Some(&binding), None, input);
         assert!(
             task.description.contains(plan_text),
             "Apply task describes the approved plan, got: {}",
@@ -5465,12 +5751,12 @@ mod runtime_runner_tests {
 
         // Defensive fallback: apply without a captured binding (should be
         // impossible) reuses the input rather than panicking.
-        let fallback = build_run_task(session_id, true, true, None, input);
+        let fallback = build_run_task(session_id, true, true, None, None, input);
         assert_eq!(fallback.description, input);
 
         // Non-apply routing is unchanged: action-required and answer-only
         // tasks both carry the user's input verbatim.
-        let action = build_run_task(session_id, true, false, None, input);
+        let action = build_run_task(session_id, true, false, None, None, input);
         assert_eq!(action.description, input);
         assert!(
             matches!(
@@ -5479,9 +5765,261 @@ mod runtime_runner_tests {
             ),
             "a confirmed Execute must stay action-required"
         );
-        let answer = build_run_task(session_id, false, false, None, "explain X");
+        let answer = build_run_task(session_id, false, false, None, None, "explain X");
         assert_eq!(answer.description, "explain X");
         assert_eq!(answer.execution_mode, concerto_core::types::TaskExecutionMode::AnswerOnly);
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D7 (#152): Plan → Execute two-turn continuity over the
+    // whiteboard (oracle review 2026-08-22, comments 1–5).
+    // ------------------------------------------------------------------
+
+    /// File-backed pool with production PRAGMAs and every session migration
+    /// applied — the same substrate `create_audit_pool` gives production runs.
+    async fn d7_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        use sqlx::pool::PoolOptions;
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let path = dir.path().join("d7_runtime_test.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(SqliteSynchronous::Normal);
+        let pool = PoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("test pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+        (dir, pool)
+    }
+
+    fn supervised_config() -> concerto_config::MultiAgentConfig {
+        concerto_config::MultiAgentConfig { supervisor_enabled: true, ..Default::default() }
+    }
+
+    fn d7_design_doc() -> DesignDoc {
+        DesignDoc {
+            goals: vec!["add plan continuity".to_owned()],
+            constraints: vec!["no new dependencies".to_owned()],
+            proposed_files: vec![camino::Utf8PathBuf::from("src/continuity.rs")],
+            interface_sketch: "load_approved_plan(pool, binding)".to_owned(),
+            risks: vec![],
+        }
+    }
+
+    fn d7_binding() -> PlanBinding {
+        PlanBinding::new(
+            "plan-d7".into(),
+            "0123456789abcdef0123456789abcdef".into(),
+            Some("abc1234".into()),
+            "# Plan\nstep 1: build continuity\nstep 2: verify it".to_owned(),
+        )
+    }
+
+    /// Two-turn simulation, happy path:
+    /// (a) a completed Plan run approves and its structured artifact lands in
+    ///     the whiteboard keyed by `plan_id` (the sole source of truth);
+    /// (b) the Execute turn rehydrates the STRUCTURED doc + ledger from the
+    ///     log — the task description carries the design doc and carry-forward
+    ///     facts, NOT the rendered plan markdown.
+    #[tokio::test]
+    async fn approved_plan_execute_rehydrates_structured_state_not_prose() {
+        let (_dir, pool) = d7_pool().await;
+        let multi_agent = supervised_config();
+        let binding = d7_binding();
+        let doc = d7_design_doc();
+
+        // Turn 1 (Plan): approval persists the content-addressed event BEFORE
+        // any Execute dispatch exists.
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &binding,
+            Some(&doc),
+            Some(&multi_agent),
+        )
+        .await;
+
+        // Turn 2 (Execute): the verified rehydration replaces prose.
+        let ctx =
+            load_approved_plan(&pool, &binding).await.expect("verified load").expect("approval");
+        assert!(
+            ctx.design_doc.is_some() && ctx.ledger == crate::plan_approval::PlanLedger::default(),
+            "a first Execute carries the structured doc and a truthful empty ledger"
+        );
+
+        let task = build_run_task(
+            Ulid::new(),
+            true,
+            true,
+            Some(&binding),
+            Some(&ctx),
+            "i approve the plan",
+        );
+        assert!(
+            task.description.contains("<approved-design-doc>"),
+            "the structured artifact governs the task: {}",
+            task.description
+        );
+        assert!(
+            task.description.contains("Goal: add plan continuity"),
+            "design doc goals ride the structured block: {}",
+            task.description
+        );
+        assert!(
+            !task.description.contains("step 1: build continuity"),
+            "the rendered plan markdown must NOT be injected as prose: {}",
+            task.description
+        );
+    }
+
+    /// Carry-forward completeness (oracle comment 4): an Execute AFTER prior
+    /// work under the same plan knows the completed subtask, the files
+    /// touched, and the failed command — from the whiteboard ledger.
+    #[tokio::test]
+    async fn approved_plan_execute_knows_prior_ledger() {
+        use concerto_sessions::whiteboard::{append_whiteboard_event, NewWhiteboardEvent};
+        let (_dir, pool) = d7_pool().await;
+        let multi_agent = supervised_config();
+        let binding = d7_binding();
+
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &binding,
+            Some(&d7_design_doc()),
+            Some(&multi_agent),
+        )
+        .await;
+        // Prior partial execution under this plan id.
+        for (event_id, kind, payload) in [
+            (
+                "done-1",
+                concerto_sessions::whiteboard::WhiteboardKind::SubtaskCompleted,
+                serde_json::json!({ "task_id": "01HQ", "status": "completed" }),
+            ),
+            (
+                "write-1",
+                concerto_sessions::whiteboard::WhiteboardKind::WriteApplied,
+                serde_json::json!({ "pre_images": { "src/lib.rs": "h" } }),
+            ),
+            (
+                "fail-1",
+                concerto_sessions::whiteboard::WhiteboardKind::Failure,
+                serde_json::json!({ "tool": "shell", "error": "cargo test exited 101" }),
+            ),
+        ] {
+            append_whiteboard_event(
+                &pool,
+                &NewWhiteboardEvent {
+                    event_id: event_id.to_owned(),
+                    agent_id: "agent-a".into(),
+                    kind,
+                    scope: String::new(),
+                    session_id: None,
+                    plan_id: Some(binding.plan_id().to_owned()),
+                    causation: None,
+                    payload,
+                    pre_image_hash: None,
+                    created_at: 2,
+                },
+            )
+            .await
+            .expect("ledger event");
+        }
+
+        let ctx =
+            load_approved_plan(&pool, &binding).await.expect("verified load").expect("approval");
+        let task = build_run_task(Ulid::new(), true, true, Some(&binding), Some(&ctx), "continue");
+        assert!(
+            task.description.contains("- 01HQ"),
+            "completed subtasks are carried forward: {}",
+            task.description
+        );
+        assert!(
+            task.description.contains("src/lib.rs"),
+            "files touched are carried forward: {}",
+            task.description
+        );
+        assert!(
+            task.description.contains("cargo test exited 101"),
+            "failed commands carry their failure reasons: {}",
+            task.description
+        );
+    }
+
+    /// Oracle comment 3: a plan change injected into the whiteboard AFTER
+    /// `plan-approved` but BEFORE Execute loud-fails — it never silently
+    /// re-decomposes.
+    #[tokio::test]
+    async fn injected_plan_change_loud_fails_without_reapproval() {
+        let (_dir, pool) = d7_pool().await;
+        let multi_agent = supervised_config();
+        let binding = d7_binding();
+
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &binding,
+            Some(&d7_design_doc()),
+            Some(&multi_agent),
+        )
+        .await;
+        // The injected change: a second approval of DIFFERENT content under
+        // the same plan id.
+        let injected = PlanBinding::new(
+            binding.plan_id().to_owned(),
+            binding.objective_hash().to_owned(),
+            None,
+            "# Plan\nstep 1: DELETE EVERYTHING".to_owned(),
+        );
+        append_plan_binding_event(Some(&pool), Ulid::new(), &injected, None, Some(&multi_agent))
+            .await;
+
+        // The run maps a divergence to a loud, unrecoverable failure.
+        match load_approved_plan(&pool, &binding).await {
+            Ok(_) => panic!("an injected plan change must never rehydrate cleanly"),
+            Err(divergence) => {
+                let error = OrchestratorError::Unrecoverable { message: divergence };
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains("re-approval"),
+                    "the loud failure names the required re-approval: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// Rollout (oracle comment 5): with the supervisor opt-in OFF — or with
+    /// `plan_binding_source = legacy` — nothing is written and the pre-D7
+    /// prose path stays byte-identical.
+    #[tokio::test]
+    async fn d7_write_is_gated_behind_the_opt_in_flags() {
+        let (_dir, pool) = d7_pool().await;
+        let binding = d7_binding();
+
+        // supervisor_enabled = false: no whiteboard rows at all.
+        let off = concerto_config::MultiAgentConfig::default();
+        assert!(!off.supervisor_enabled);
+        append_plan_binding_event(Some(&pool), Ulid::new(), &binding, None, Some(&off)).await;
+        assert!(
+            load_approved_plan(&pool, &binding).await.expect("load").is_none(),
+            "with the opt-in off, no events are recorded and reads see nothing"
+        );
+
+        // supervisor_enabled = true but source = legacy: still nothing.
+        let mut legacy = supervised_config();
+        legacy.plan_binding_source = concerto_config::PlanBindingSource::Legacy;
+        append_plan_binding_event(Some(&pool), Ulid::new(), &binding, None, Some(&legacy)).await;
+        assert!(
+            load_approved_plan(&pool, &binding).await.expect("load").is_none(),
+            "legacy keeps the exact pre-D7 behavior"
+        );
     }
 
     // ------------------------------------------------------------------

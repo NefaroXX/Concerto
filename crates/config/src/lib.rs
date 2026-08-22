@@ -45,9 +45,9 @@ pub use schema::{
     builtin_agent_seeds, AgentCapabilities, AgentModelAssignment, AgentRelationshipConfig,
     AppConfig, ConditionDef, ContextConfig, CustomAgentConfig, FewShotExample, IntentConfig,
     McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings,
-    MultiAgentConfig, ObservabilityConfig, PipelinePreset, PolicyConfig, PolicyRuleDef,
-    PromptSections, ProviderConfig, RetryConfig, SkillsConfig, ToolSettings, UpdatesConfig,
-    SCHEMA_VERSION,
+    MultiAgentConfig, ObservabilityConfig, PipelinePreset, PlanBindingSource, PolicyConfig,
+    PolicyRuleDef, PromptSections, ProviderConfig, RetryConfig, SkillsConfig, ToolSettings,
+    UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};
 pub use shell::{

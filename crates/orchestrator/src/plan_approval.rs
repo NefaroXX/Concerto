@@ -29,16 +29,34 @@
 //! rehydrated with [`PlanBinding::restored`] so "i approve the plan" after
 //! an app restart still arms the real Apply/Replan dialog. A registry miss
 //! falls through to the unchanged generic gate path.
+//!
+//! ADR-60 D7 (issue #152): an approved plan is ALSO persisted as a
+//! content-addressed whiteboard event ([`WhiteboardKind::PlanApproved`])
+//! keyed by `plan_id` — the whiteboard log is the sole source of truth for
+//! Plan→Execute continuity; no projected table exists (oracle review
+//! 2026-08-22, comment 1). The payload carries the structured DesignDoc when
+//! one was produced, the capped plan text it hashes, and the artifact/source
+//! identity needed to verify integrity before rehydration
+//! ([`load_approved_plan`]). An Execute run of an approved plan rehydrates
+//! that verified state instead of re-deriving the plan from rendered prose,
+//! and any divergence from what the user approved is a loud failure — silent
+//! re-decompose is forbidden.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{PlanDecision, RequestedOutcome, RouterOutput};
+use concerto_core::types::DesignDoc;
 use concerto_core::CancellationToken;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::intent_grants::{grant_execute, IntentGrantStore};
+use concerto_sessions::whiteboard::{
+    append_whiteboard_event, load_whiteboard_events_by_plan, NewWhiteboardEvent, WhiteboardEvent,
+    WhiteboardKind,
+};
 
 /// Upper bound for stored plan text (16 KiB), enforced by [`plan_text_cap`].
 pub const MAX_PLAN_TEXT_BYTES: usize = 16 * 1024;
@@ -329,6 +347,278 @@ pub fn plan_text_cap(text: &str) -> String {
     text[..end].to_owned()
 }
 
+// ===========================================================================
+// ADR-60 D7 (issue #152): whiteboard plan binding — write + rehydrate.
+//
+// The whiteboard `plan_id`-keyed event is the SOLE source of truth for
+// Plan→Execute continuity (oracle comment 1): no projected table, no parallel
+// store. Write ordering at approval time is (1) whiteboard event commits
+// (BEGIN IMMEDIATE, WAL-durable on return), then (2) the in-memory registry
+// insert, then (3) the `plan_bindings` durable mirror — a crash between the
+// steps leaves the LOG ahead of the projections, never behind, so an Execute
+// read either sees a fully verified artifact or degrades to the legacy prose
+// path with a warn. Every Execute-phase tool application is ordered after the
+// plan event by construction: the event lands during the Plan turn, strictly
+// before any Execute dispatch, and Execute-phase tool writes keep their own
+// gate WAL-before-execute invariant unchanged.
+// ===========================================================================
+
+/// Content-addressed payload of a [`WhiteboardKind::PlanApproved`] whiteboard
+/// event (ADR-60 D7). The row's own `content_hash` fingerprints this payload;
+/// `artifact_hash` additionally fingerprints `plan_text` via
+/// [`plan_artifact_hash`], so tampering with either layer is detectable at
+/// rehydration time ([`load_approved_plan`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanApprovedPayload {
+    /// The plan this approval binds (mirrored into the row's `plan_id`
+    /// column; duplicated in-payload so the payload alone is self-describing).
+    pub plan_id: String,
+    /// The objective the approved plan implements.
+    pub objective_hash: String,
+    /// blake3 of the capped plan text at creation (`plan_artifact_hash`).
+    pub artifact_hash: String,
+    /// Git revision the plan was created at, when known.
+    pub source_revision: Option<String>,
+    /// Structured DesignDoc when the planning run produced one (multi-agent
+    /// planning-only depth). `None` for single-agent plans whose capped text
+    /// IS the artifact.
+    #[serde(default)]
+    pub design_doc: Option<DesignDoc>,
+    /// The capped plan text the hash covers.
+    pub plan_text: String,
+    /// Approval instant, unix epoch milliseconds UTC.
+    pub created_at_ms: i64,
+}
+
+/// Carry-forward state an approved-plan Execute seeds from the whiteboard
+/// ledger (ADR-60 D7 fix #3: completed subtask results, files touched, failed
+/// commands with their failure reasons). Extracted defensively from whatever
+/// ledger events exist for the plan — a first Execute simply carries empty
+/// lists, which is the truthful state.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanLedger {
+    /// Descriptions of subtasks already completed under this plan.
+    pub completed_subtasks: Vec<String>,
+    /// File paths mutated by gated writes under this plan.
+    pub files_touched: Vec<String>,
+    /// Recorded failure reasons (failed commands/tools) that must not be
+    /// re-run unchanged.
+    pub failed_commands: Vec<String>,
+}
+
+/// Everything an approved-plan Execute run rehydrates from the whiteboard:
+/// the verified binding plus the structured doc and carry-forward ledger.
+/// (`DesignDoc` carries no `PartialEq`, so equality is compared through its
+/// canonical JSON where tests need it.)
+#[derive(Debug, Clone)]
+pub struct ApprovedPlanContext {
+    /// The binding the user approved (hash-verified against the log).
+    pub binding: PlanBinding,
+    /// Structured DesignDoc when the planning run produced one; `None` means
+    /// the verified plan text is the artifact.
+    pub design_doc: Option<DesignDoc>,
+    /// Carry-forward state folded from the plan's ledger events.
+    pub ledger: PlanLedger,
+}
+
+/// Unix epoch milliseconds for an approval timestamp.
+fn offset_ms(at: OffsetDateTime) -> i64 {
+    at.unix_timestamp() * 1000 + i64::from(at.millisecond())
+}
+
+/// Append the content-addressed `plan-approved` whiteboard event for
+/// `binding` (ADR-60 D7 write side). Fail-soft by contract: the caller logs
+/// a returned error and the run proceeds — Execute then falls back to the
+/// legacy prose path rather than reading an artifact that was never durably
+/// attested.
+pub async fn append_plan_approved_event(
+    pool: &sqlx::SqlitePool,
+    session_id: Ulid,
+    binding: &PlanBinding,
+    design_doc: Option<&DesignDoc>,
+) -> Result<WhiteboardEvent, concerto_sessions::SessionError> {
+    let payload = PlanApprovedPayload {
+        plan_id: binding.plan_id().to_owned(),
+        objective_hash: binding.objective_hash().to_owned(),
+        artifact_hash: binding.artifact_hash().unwrap_or_default().to_owned(),
+        source_revision: binding.source_revision().map(ToOwned::to_owned),
+        design_doc: design_doc.cloned(),
+        plan_text: binding.plan_text().to_owned(),
+        created_at_ms: offset_ms(binding.created_at()),
+    };
+    let payload = serde_json::to_value(&payload).map_err(|error| {
+        concerto_sessions::SessionError::Serialization(format!(
+            "plan-approved payload serialization: {error}"
+        ))
+    })?;
+    append_whiteboard_event(
+        pool,
+        &NewWhiteboardEvent {
+            // Idempotency key (ULID, same convention as the supervisor's
+            // publish path); a retry mints a fresh key because a re-approval
+            // is a new fact, not a replay.
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::PlanApproved,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: Some(binding.plan_id().to_owned()),
+            causation: None,
+            payload,
+            // Not a write: no pre-image (the gate fills this column for
+            // write events only).
+            pre_image_hash: None,
+            created_at: offset_ms(OffsetDateTime::now_utc()),
+        },
+    )
+    .await
+}
+
+/// Load and VERIFY the approved plan's whiteboard state for an Execute run
+/// (ADR-60 D7 read side + divergence guard).
+///
+/// Return contract:
+/// - `Ok(Some(ctx))` — the newest approval matches `binding`, its payload is
+///   internally content-addressed, and the ledger has been folded.
+/// - `Ok(None)` — no `plan-approved` events exist for the binding's plan id
+///   (a pre-D7 binding): the caller degrades to the legacy prose path with a
+///   warn. Missing state is never invented.
+/// - `Err(reason)` — DIVERGENCE between the log and what the user approved:
+///   a second approval of the same plan id with different content (an
+///   injected change after approval), a payload that fails its own artifact
+///   hash, or a payload/binding mismatch. The caller must fail the run
+///   loudly — silent re-decompose is forbidden (oracle comment 3).
+pub async fn load_approved_plan(
+    pool: &sqlx::SqlitePool,
+    binding: &PlanBinding,
+) -> Result<Option<ApprovedPlanContext>, String> {
+    let plan_id = binding.plan_id();
+    let events = load_whiteboard_events_by_plan(pool, plan_id)
+        .await
+        .map_err(|error| format!("approved plan lookup failed for {plan_id}: {error}"))?;
+    let approvals: Vec<&WhiteboardEvent> =
+        events.iter().filter(|event| event.kind == WhiteboardKind::PlanApproved).collect();
+    if approvals.is_empty() {
+        return Ok(None);
+    }
+
+    // The load is gate_seq-ordered, so `approvals` is oldest→newest. Every
+    // approval under one plan id must carry IDENTICAL content: a second
+    // approval with a different hash means the artifact changed under this
+    // plan id after the user approved it (identical replays are fine).
+    let mut reference_payload: Option<PlanApprovedPayload> = None;
+    for approval in &approvals {
+        let payload: PlanApprovedPayload = serde_json::from_value(approval.payload.clone())
+            .map_err(|error| {
+                format!(
+                    "approved plan {plan_id} carries an unreadable plan-approved payload \
+                     (event {}): {error}",
+                    approval.event_id
+                )
+            })?;
+        match &reference_payload {
+            None => reference_payload = Some(payload),
+            Some(first) if first.artifact_hash == payload.artifact_hash => {}
+            Some(first) => {
+                return Err(format!(
+                    "divergence detected for approved plan {plan_id}: whiteboard holds two \
+                     plan-approved artifacts with different content hashes ({}/{}); explicit \
+                     user re-approval is required before execution",
+                    first.artifact_hash, payload.artifact_hash,
+                ));
+            }
+        }
+    }
+    let payload = match reference_payload {
+        Some(payload) => payload,
+        // Unreachable in practice (the empty-list check above returned), but
+        // a missing payload degrades instead of panicking.
+        None => return Ok(None),
+    };
+
+    // Content addressing: the payload's text must hash to the hash it
+    // declares, and both must match the binding the user actually approved.
+    if plan_artifact_hash(&payload.plan_text) != payload.artifact_hash {
+        return Err(format!(
+            "divergence detected for approved plan {plan_id}: payload text does not match its \
+             declared artifact_hash; explicit user re-approval is required before execution"
+        ));
+    }
+    if binding.artifact_hash() != Some(payload.artifact_hash.as_str()) {
+        return Err(format!(
+            "divergence detected for approved plan {plan_id}: whiteboard artifact hash {} does \
+             not match the approved binding hash {}; explicit user re-approval is required \
+             before execution",
+            payload.artifact_hash,
+            binding.artifact_hash().unwrap_or("<none>"),
+        ));
+    }
+    if payload.objective_hash != binding.objective_hash() {
+        return Err(format!(
+            "divergence detected for approved plan {plan_id}: whiteboard objective hash {} does \
+             not match the approved binding objective {}; explicit user re-approval is required \
+             before execution",
+            payload.objective_hash,
+            binding.objective_hash(),
+        ));
+    }
+
+    Ok(Some(ApprovedPlanContext {
+        binding: binding.clone(),
+        design_doc: payload.design_doc,
+        ledger: fold_ledger(&events),
+    }))
+}
+
+/// Fold a plan's non-approval events into the carry-forward ledger.
+/// Extraction is defensive: every writer (gate, agent-process children) uses
+/// its own payload shape, so fields are probed and absent ones skipped — a
+/// malformed sibling event never blocks continuity.
+fn fold_ledger(events: &[WhiteboardEvent]) -> PlanLedger {
+    let mut ledger = PlanLedger::default();
+    for event in events {
+        match event.kind {
+            WhiteboardKind::SubtaskCompleted => {
+                if let Some(description) =
+                    string_field(&event.payload, &["description", "summary", "task_id"])
+                {
+                    ledger.completed_subtasks.push(description);
+                }
+            }
+            WhiteboardKind::Failure => {
+                if let Some(failure) = string_field(&event.payload, &["error", "reason"]) {
+                    let tool =
+                        string_field(&event.payload, &["tool"]).unwrap_or_else(|| "tool".into());
+                    ledger.failed_commands.push(format!("{tool}: {failure}"));
+                }
+            }
+            WhiteboardKind::WriteApplied => {
+                // Gated writes carry per-target pre-images keyed by relative
+                // path — exactly the "files touched" record (D5 attribution).
+                if let Some(pre_images) =
+                    event.payload.get("pre_images").and_then(|v| v.as_object())
+                {
+                    for path in pre_images.keys() {
+                        ledger.files_touched.push(path.clone());
+                    }
+                } else if let Some(path) = string_field(&event.payload, &["path", "target"]) {
+                    ledger.files_touched.push(path);
+                }
+            }
+            // Findings/decisions/task-graph rows inform agents via their own
+            // surfaces; they are not carry-forward facts.
+            _ => {}
+        }
+    }
+    ledger
+}
+
+/// Probe `payload` for the first present string field among `keys`.
+fn string_field(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(|value| value.as_str()).map(ToOwned::to_owned))
+}
+
 /// Translate the user's plan-binding decision into the run's effective outcome
 /// and audit confirmation (ADR-55 Phase 1d).
 ///
@@ -598,5 +888,264 @@ mod tests {
         assert_eq!(effective, RequestedOutcome::Execute, "dismissed keeps the routed intent");
         assert_eq!(confirmation, "dismissed");
         assert!(store.is_empty(), "a missing response never grants");
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D7 (#152): whiteboard plan binding — write + verified read.
+    // ------------------------------------------------------------------
+
+    /// File-backed pool with production PRAGMAs and every session migration
+    /// applied (file-backed so the append path's BEGIN IMMEDIATE locking is
+    /// exercised for real, mirroring whiteboard.rs's own test helper).
+    async fn d7_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        use sqlx::pool::PoolOptions;
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let path = dir.path().join("plan_approval_test.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(SqliteSynchronous::Normal);
+        let pool = PoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("test pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+        (dir, pool)
+    }
+
+    fn design_doc() -> DesignDoc {
+        DesignDoc {
+            goals: vec!["add plan continuity".to_owned()],
+            constraints: vec!["no new dependencies".to_owned()],
+            proposed_files: vec![camino::Utf8PathBuf::from("src/continuity.rs")],
+            interface_sketch: "load_approved_plan(pool, binding)".to_owned(),
+            risks: vec!["payload tampering".to_owned()],
+        }
+    }
+
+    fn approved_binding() -> PlanBinding {
+        PlanBinding::new(
+            "plan-d7".into(),
+            objective_hash(),
+            Some("abc1234".into()),
+            "step 1: build continuity\nstep 2: verify it".to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn plan_approved_event_round_trips_with_design_doc() {
+        let (_dir, pool) = d7_pool().await;
+        let binding = approved_binding();
+        let doc = design_doc();
+
+        let stored = append_plan_approved_event(&pool, Ulid::new(), &binding, Some(&doc))
+            .await
+            .expect("append approval");
+        assert_eq!(stored.kind, WhiteboardKind::PlanApproved);
+        assert_eq!(stored.plan_id.as_deref(), Some(binding.plan_id()));
+
+        // The verified read returns the structured doc and an empty ledger
+        // (nothing executed under this plan yet — truthful carry-forward).
+        let ctx = load_approved_plan(&pool, &binding).await.expect("verified load");
+        let ctx = ctx.expect("approval exists");
+        assert_eq!(ctx.binding, binding);
+        assert_eq!(
+            serde_json::to_value(&ctx.design_doc).expect("doc serializes"),
+            serde_json::to_value(Some(&doc)).expect("expected doc serializes"),
+            "the structured DesignDoc survives the whiteboard round trip"
+        );
+        assert_eq!(ctx.ledger, PlanLedger::default());
+    }
+
+    #[tokio::test]
+    async fn plan_without_whiteboard_events_degrades_to_none() {
+        let (_dir, pool) = d7_pool().await;
+        // A pre-D7 binding (approved before this slice) has no events.
+        let loaded = load_approved_plan(&pool, &approved_binding()).await.expect("load");
+        assert!(loaded.is_none(), "missing state is reported as None, never invented");
+    }
+
+    #[tokio::test]
+    async fn injected_second_approval_loud_fails() {
+        // Oracle comment 3: a plan change injected AFTER `plan-approved` but
+        // BEFORE Execute must loud-fail without re-approval. Simulate it by
+        // appending a second approval with different content under the SAME
+        // plan id.
+        let (_dir, pool) = d7_pool().await;
+        let binding = approved_binding();
+
+        // First (legitimate) approval carries the structured doc...
+        let doc = design_doc();
+        append_plan_approved_event(&pool, Ulid::new(), &binding, Some(&doc))
+            .await
+            .expect("first approval");
+
+        // ...then a second approval of DIFFERENT content under the same id.
+        let injected = PlanBinding::new(
+            binding.plan_id().to_owned(),
+            binding.objective_hash().to_owned(),
+            None,
+            "step 1: build continuity\nstep 2: DELETE EVERYTHING".to_owned(),
+        );
+        append_plan_approved_event(&pool, Ulid::new(), &injected, None)
+            .await
+            .expect("injected approval");
+
+        let error = load_approved_plan(&pool, &binding).await.expect_err("must loud-fail");
+        assert!(
+            error.contains("re-approval"),
+            "divergence names the required re-approval: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_hash_mismatch_loud_fails() {
+        // The whiteboard artifact and the durable binding disagree — e.g. the
+        // binding row was rewritten after approval. Never re-decompose.
+        let (_dir, pool) = d7_pool().await;
+        let binding = approved_binding();
+        append_plan_approved_event(&pool, Ulid::new(), &binding, None).await.expect("approval");
+
+        let other = PlanBinding::new(
+            "plan-d7".into(),
+            objective_hash(),
+            None,
+            "an entirely different plan".to_owned(),
+        );
+        let error = load_approved_plan(&pool, &other).await.expect_err("must loud-fail");
+        assert!(error.contains("artifact hash"), "names the hash mismatch: {error}");
+    }
+
+    #[tokio::test]
+    async fn tampered_payload_text_loud_fails() {
+        // Content addressing: payload text must hash to its declared
+        // artifact_hash. Forged through a raw event with inconsistent fields.
+        let (_dir, pool) = d7_pool().await;
+        let binding = approved_binding();
+        let forged_payload = serde_json::json!({
+            "plan_id": binding.plan_id(),
+            "objective_hash": binding.objective_hash(),
+            "artifact_hash": plan_artifact_hash(binding.plan_text()),
+            "source_revision": null,
+            "design_doc": null,
+            "plan_text": "totally different text than what was hashed",
+            "created_at_ms": 1,
+        });
+        concerto_sessions::whiteboard::append_whiteboard_event(
+            &pool,
+            &concerto_sessions::whiteboard::NewWhiteboardEvent {
+                event_id: "forged-1".into(),
+                agent_id: "attacker".into(),
+                kind: WhiteboardKind::PlanApproved,
+                scope: String::new(),
+                session_id: None,
+                plan_id: Some(binding.plan_id().to_owned()),
+                causation: None,
+                payload: forged_payload,
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("forged row stored");
+
+        let error = load_approved_plan(&pool, &binding).await.expect_err("must loud-fail");
+        assert!(error.contains("artifact_hash"), "content-addressing failure is named: {error}");
+    }
+
+    #[tokio::test]
+    async fn ledger_folds_completed_files_and_failures() {
+        use concerto_sessions::whiteboard::WhiteboardKind as Kind;
+        let (_dir, pool) = d7_pool().await;
+        let binding = approved_binding();
+        append_plan_approved_event(&pool, Ulid::new(), &binding, None).await.expect("approval");
+
+        // Ledger events from earlier supervised work under the SAME plan id:
+        // one completed subtask, two gated file writes, one failed tool.
+        async fn ledger_event(
+            pool: &sqlx::SqlitePool,
+            event_id: &str,
+            kind: Kind,
+            payload: serde_json::Value,
+        ) {
+            concerto_sessions::whiteboard::append_whiteboard_event(
+                pool,
+                &concerto_sessions::whiteboard::NewWhiteboardEvent {
+                    event_id: event_id.to_owned(),
+                    agent_id: "agent-a".into(),
+                    kind,
+                    scope: String::new(),
+                    session_id: None,
+                    plan_id: Some("plan-d7".to_owned()),
+                    causation: None,
+                    payload,
+                    pre_image_hash: None,
+                    created_at: 2,
+                },
+            )
+            .await
+            .expect("ledger event stored");
+        }
+        ledger_event(
+            &pool,
+            "done-1",
+            Kind::SubtaskCompleted,
+            serde_json::json!({ "task_id": "01HQ", "status": "completed" }),
+        )
+        .await;
+        ledger_event(
+            &pool,
+            "write-1",
+            Kind::WriteApplied,
+            serde_json::json!({
+                "tool": "filesystem.write",
+                "input": { "path": "src/lib.rs" },
+                "pre_images": { "src/lib.rs": "hash-a", "src/main.rs": "hash-b" },
+            }),
+        )
+        .await;
+        ledger_event(
+            &pool,
+            "fail-1",
+            Kind::Failure,
+            serde_json::json!({ "tool": "shell", "error": "cargo build exited 101" }),
+        )
+        .await;
+
+        // A stranger binding under the same objective hash must NOT verify
+        // against plan-d7's artifact (different text → different hash).
+        let ctx = load_approved_plan(&pool, &binding).await.expect("load").expect("approval");
+        assert_eq!(
+            ctx.ledger.completed_subtasks,
+            vec!["01HQ".to_owned()],
+            "completed subtask ids fold into the ledger"
+        );
+        assert_eq!(
+            ctx.ledger.files_touched.len(),
+            2,
+            "both gated write targets are recorded: {:?}",
+            ctx.ledger.files_touched
+        );
+        assert!(
+            ctx.ledger.files_touched.contains(&"src/lib.rs".to_owned())
+                && ctx.ledger.files_touched.contains(&"src/main.rs".to_owned()),
+            "files touched come from the write attribution record"
+        );
+        assert_eq!(
+            ctx.ledger.failed_commands,
+            vec!["shell: cargo build exited 101".to_owned()],
+            "failed commands carry their failure reasons"
+        );
+
+        // Unrelated plans never leak into this ledger.
+        let stranger =
+            PlanBinding::new("plan-other".into(), objective_hash(), None, "x".to_owned());
+        let other = load_approved_plan(&pool, &stranger).await.expect("load");
+        assert!(other.is_none(), "a different plan id sees nothing");
     }
 }

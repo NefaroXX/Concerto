@@ -587,6 +587,25 @@ pub struct CoordinatorAgent {
     /// registry answer against blueprint staffing). `None` for coordinators
     /// built without a resolved blueprint (tests) — the guards stay silent.
     blueprint_facade: Option<BlueprintFacade>,
+    /// ADR-60 D7 (#152): structured plan state rehydrated from the whiteboard
+    /// for an approved-plan Execute run. Consumed once by the first
+    /// `decompose_task`: a seeded DesignDoc drives the planner directly and
+    /// the architect is NOT re-invoked on the same objective — re-deriving an
+    /// already-approved plan (silent re-decompose) is forbidden.
+    approved_plan_seed: Option<ApprovedPlanSeed>,
+}
+
+/// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
+/// executing an approved plan. Produced by `plan_approval::load_approved_plan`
+/// and attached via [`CoordinatorAgent::with_approved_plan_seed`].
+#[derive(Debug, Clone, Default)]
+pub struct ApprovedPlanSeed {
+    /// The approved plan id (for logging/attribution).
+    pub plan_id: String,
+    /// Structured DesignDoc rehydrated from the `plan-approved` event.
+    /// `None` when the planning run produced only text — decompose then keeps
+    /// its normal design stage rather than inventing a doc.
+    pub design_doc: Option<DesignDoc>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -716,6 +735,7 @@ impl CoordinatorAgent {
             supplemental_prompt: String::new(),
             eval_engine: None,
             blueprint_facade: None,
+            approved_plan_seed: None,
         }
     }
 
@@ -1144,6 +1164,16 @@ impl CoordinatorAgent {
         self.last_plan_id.as_deref()
     }
 
+    /// ADR-60 D7 (#152): seed an approved-plan Execute with the structured
+    /// state rehydrated from the whiteboard. When the seed carries a
+    /// DesignDoc, `decompose_task` skips the architect entirely — the
+    /// approved plan governs and is never re-derived (silent re-decompose is
+    /// forbidden). Unseeded runs (the default) are byte-identical to pre-D7.
+    pub fn with_approved_plan_seed(mut self, seed: ApprovedPlanSeed) -> Self {
+        self.approved_plan_seed = Some(seed);
+        self
+    }
+
     /// Attach the session's skills instructions (ADR-43, Task 4), injected
     /// into every planner prompt. Pass an empty string to omit them.
     pub fn with_skills_section(mut self, skills_section: String) -> Self {
@@ -1198,7 +1228,11 @@ impl CoordinatorAgent {
         self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
-    fn design_doc_snapshot(&self) -> Option<DesignDoc> {
+    /// ADR-60 D7 (#152): snapshot of the most recent DesignDoc — the
+    /// runtime_runner binds it into the planning-only run's `plan-approved`
+    /// whiteboard event so Execute can rehydrate the structured object
+    /// instead of re-deriving it from rendered prose.
+    pub fn design_doc_snapshot(&self) -> Option<DesignDoc> {
         self.design_doc.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
@@ -4826,27 +4860,57 @@ impl CoordinatorAgent {
             .unwrap_or_default();
 
         // ── Design stage (optional) ──────────────────────────────────────
-        let mut design_doc: Option<DesignDoc> = None;
-        let design_id: Option<TaskId> = match &design_role {
-            Some(role) => {
-                // The architect run is dispatched through the SAME
-                // classify → retry → escalate → fallback-ladder recovery the
-                // execution-phase dispatch loop uses (ADR-42/45). A provider
-                // failure during planning (e.g. a non-retryable stream-idle
-                // timeout) therefore walks the ladder instead of abandoning
-                // the run with a bare `?`. Only an exhausted ladder surfaces
-                // as a graceful Partial plan via the caller.
-                let (completed_arch, doc) = self
-                    .run_design_stage_with_recovery(role, task, context, cancel, &planning_repair)
-                    .await?;
-                design_doc = Some(doc);
-                let arch_id = completed_arch.id;
-                graph.add_root(completed_arch);
-                Some(arch_id)
+        // ADR-60 D7 (#152): an approved-plan Execute seeds its structured
+        // DesignDoc from the whiteboard and skips the architect — re-invoking
+        // the architect with the same objective is exactly the silent
+        // re-decompose D7 forbids. The seeded doc lands in `self.design_doc`
+        // below, so checkpoints and expected-artifact derivation keep
+        // working unchanged. A seed without a stored doc (text-only plans)
+        // falls back to the normal stage rather than inventing a document.
+        let mut design_doc: Option<DesignDoc> = self
+            .approved_plan_seed
+            .take()
+            .map(|seed| {
+                tracing::info!(
+                    plan_id = %seed.plan_id,
+                    "executing an approved plan: seeding the whiteboard DesignDoc \
+                     and skipping the architect (ADR-60 D7)"
+                );
+                seed.design_doc
+            })
+            .unwrap_or(None);
+        let design_id: Option<TaskId> = if design_doc.is_some() {
+            // Seeded doc: subtasks become graph roots (the same shape a
+            // pipeline without any design-stage agent produces).
+            None
+        } else {
+            match &design_role {
+                Some(role) => {
+                    // The architect run is dispatched through the SAME
+                    // classify → retry → escalate → fallback-ladder recovery the
+                    // execution-phase dispatch loop uses (ADR-42/45). A provider
+                    // failure during planning (e.g. a non-retryable stream-idle
+                    // timeout) therefore walks the ladder instead of abandoning
+                    // the run with a bare `?`. Only an exhausted ladder surfaces
+                    // as a graceful Partial plan via the caller.
+                    let (completed_arch, doc) = self
+                        .run_design_stage_with_recovery(
+                            role,
+                            task,
+                            context,
+                            cancel,
+                            &planning_repair,
+                        )
+                        .await?;
+                    design_doc = Some(doc);
+                    let arch_id = completed_arch.id;
+                    graph.add_root(completed_arch);
+                    Some(arch_id)
+                }
+                // No design-stage agent: the graph starts directly at the
+                // planned subtasks.
+                None => None,
             }
-            // No design-stage agent: the graph starts directly at the
-            // planned subtasks.
-            None => None,
         };
         // Keep the plan (or lack of one) so checkpoints capture the DesignDoc
         // without re-running the Architect on resume (C-05).
@@ -9358,6 +9422,65 @@ mod tests {
         assert!(
             events.iter().any(|kind| matches!(kind, EventKind::MultiAgentModeCompleted { .. })),
             "planning-only still publishes the completion event (S3)"
+        );
+    }
+
+    /// ADR-60 D7 (#152): a seeded approved-plan DesignDoc drives decompose
+    /// directly — the architect is NOT re-invoked on the same objective
+    /// (silent re-decompose is forbidden), and the planned work still
+    /// executes to completion off the structured doc.
+    #[tokio::test]
+    async fn approved_plan_seed_skips_the_architect() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            // A poisoned architect: if the design stage ran anyway, its
+            // failure would surface in the run output and the assertion
+            // below would catch the dispatch itself.
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let seed = ApprovedPlanSeed {
+            plan_id: "plan-d7".to_owned(),
+            design_doc: Some(DesignDoc {
+                goals: vec!["approved goal".to_owned()],
+                constraints: vec![],
+                proposed_files: vec![camino::Utf8PathBuf::from("src/approved.rs")],
+                interface_sketch: "approved interface".to_owned(),
+                risks: vec![],
+            }),
+        };
+        let plan_json = r#"[{"role":"Coder","description":"implement","depends_on":[]}]"#;
+        let (output, events) = run_for_test(
+            coordinator_with(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                plan_json.into(),
+            )
+            .with_approved_plan_seed(seed),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            }),
+            "the architect must never be re-invoked for an approved plan"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the seeded plan still executes to completion: {}",
+            output.final_message
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the implement subtask still dispatches off the seeded doc"
         );
     }
 
