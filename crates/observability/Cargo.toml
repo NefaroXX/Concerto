@@ -9,7 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-client"] }
