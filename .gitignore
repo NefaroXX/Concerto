@@ -46,3 +46,6 @@ build/
 hello.py
 random_message.py
 concerto-sessions-2026-07-13.csv
+
+# deepwork session state (local only, not versioned)
+.slim/deepwork/

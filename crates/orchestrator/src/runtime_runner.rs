@@ -67,6 +67,8 @@ use crate::exec_backend::SharedExecutionBackend;
 use crate::gate::{FilePreImageReader, WriteGate};
 use crate::in_process_gate::InProcessGateBackend;
 use crate::prompts::PromptBuilder;
+use crate::subscriptions::SubscriptionManager;
+use crate::supervisor::{AgentState, Supervisor, SupervisorConfig, SupervisorServices};
 
 /// Shared memory-enabled decision for both frontends.
 ///
@@ -2726,6 +2728,8 @@ pub async fn run_shared_agent(
             effective_outcome,
             plan_objective_hash,
             &stage_tracker,
+            intent_policy.clone(),
+            gate_log_pool.clone(),
         )
         .await;
     }
@@ -2838,6 +2842,12 @@ pub async fn run_shared_agent(
 /// `action_required` / `effective_outcome` / `plan_objective_hash` come from
 /// the always-on intent gate (ADR-55 Phase 1e): they shape the topology, the
 /// text-only system prompt, and the post-run plan-binding insert.
+///
+/// `intent_policy` + `gate_log_pool` are the run's own policy engine and
+/// session-DB pool; they back the ADR-60 Phase 1 supervised path's write gate
+/// when `[orchestration] supervisor_enabled` opts in. They mirror exactly what
+/// the single-agent in-process gate is built from, so both gated paths enforce
+/// the same policy over the same durable log.
 #[allow(clippy::too_many_arguments)]
 async fn run_multi_agent(
     req: &AgentRunRequest,
@@ -2854,6 +2864,8 @@ async fn run_multi_agent(
     effective_outcome: RequestedOutcome,
     plan_objective_hash: String,
     stage_tracker: &Arc<Mutex<StageTracker>>,
+    intent_policy: Arc<dyn PolicyEngine>,
+    gate_log_pool: Option<sqlx::SqlitePool>,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -3220,6 +3232,48 @@ async fn run_multi_agent(
         // only runs here are Chat/Verify/Review/Diagnose/Answer and store no
         // binding.
         return Ok(output);
+    }
+    // ADR-60 Phase 1 thin slice: an opt-in supervised run dispatches through
+    // the process supervisor (real `orchestrator-agent-process` children under
+    // one write gate) instead of the in-process coordinator waves. Only
+    // Execute-classified runs take this path — text-only outcomes returned
+    // above and Plan still runs on the coordinator at planning-only depth, so
+    // both branches keep their exact pre-slice behavior. Any preparation gap
+    // (no session-DB pool, missing child binary, empty roster) degrades loudly
+    // to the coordinator below rather than failing the run.
+    if action_required
+        && services.config.multi_agent.as_ref().is_some_and(|multi| multi.supervisor_enabled)
+    {
+        match prepare_supervised_run(
+            services.config.multi_agent.as_ref(),
+            &req.project_dir,
+            session_id,
+            &task.description,
+            intent_policy.clone(),
+            executor.clone(),
+            gate_log_pool.clone(),
+            memory.clone(),
+        ) {
+            Some(supervised) => {
+                return drive_supervised_run(
+                    supervised,
+                    services,
+                    stage_tracker,
+                    session_store.as_ref(),
+                    task.id,
+                    transcript_recorder,
+                    event_recorder,
+                    req.cancel_token.clone(),
+                )
+                .await;
+            }
+            None => {
+                tracing::warn!(
+                    "supervised multi-agent run could not start — falling back to the \
+                     in-process coordinator"
+                );
+            }
+        }
     }
     // Share one RetryPolicy across the registry for per-agent
     // with_provider_retry (used inside each specialist agent).
@@ -3625,6 +3679,343 @@ async fn run_multi_agent(
     transcript_recorder.stop().await;
     event_recorder.stop().await;
     Ok(output)
+}
+
+// ===========================================================================
+// ADR-60 Phase 1 thin slice: the supervised multi-agent path.
+//
+// Opt-in via `[orchestration] supervisor_enabled` (default off — the
+// in-process coordinator below remains the production path). The supervised
+// run shares ONE write gate over the run's own policy/executor pair and
+// session-DB pool (mirroring the single-agent `InProcessGateBackend`
+// construction), and every child reaches tools exclusively through the
+// supervisor's `execute-tool` dispatch, which is `WriteGate::submit`: the
+// WAL append commits before any VirtualFs apply, and a base_version collision
+// surfaces as `GateError::Conflict` → IPC `-32005` — a retriable tool error
+// for the child, never process termination. There is no direct executor write
+// anywhere on this path.
+//
+// TODO(ADR-60 Deferred 3, Phase 3): early resumability stub — persist at
+// least `plan_id` + `review_target` when a review cycle enters so a restart
+// cannot run a duplicate second review for the same plan. Not done here:
+// it needs both a durable stash reachable from the coordinator/child loop
+// AND rehydration-on-restart to actually prevent duplicates; half of it
+// would only fake safety. Tracked for Phase 3 (oracle review 2026-08-22,
+// comment 4).
+// ===========================================================================
+
+/// Wall-clock budget for one supervised multi-agent run before it is torn
+/// down and reported partial. Generous on purpose: children are full agent
+/// loops; this guards only against a wedged child or a lost completion.
+const SUPERVISED_RUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Everything a prepared supervised multi-agent run needs.
+struct SupervisedRun {
+    /// Write-path services shared by every child (ADR-60 D3/D4): one write
+    /// gate over the run's policy/executor pair + session DB pool, the
+    /// whiteboard log pool, the memory spine, and the subscription registry.
+    services: SupervisorServices,
+    /// Supervisor tunables, including each agent's whiteboard subscription
+    /// (`Decision` topics), registered by the loop on first sight of the
+    /// child generation.
+    config: SupervisorConfig,
+    /// Resolved path of the `orchestrator-agent-process` child binary.
+    binary: PathBuf,
+    /// Project root handed to each child (its tool scope).
+    project_root: PathBuf,
+    /// Owning session id, stamped on appended messages for this run.
+    session_id: Ulid,
+    /// `(agent id, task description)` pairs to spawn, in topology order.
+    tasks: Vec<(String, String)>,
+}
+
+/// Prepare everything a supervised multi-agent run needs, or `None` (with a
+/// logged reason) when the supervised path cannot start and the caller must
+/// fall back to the in-process coordinator — degradation, never silent.
+///
+/// The gate mirrors the single-agent construction exactly: same policy/
+/// executor pair, same pool, max-in-flight 1 per agent.
+#[allow(clippy::too_many_arguments)]
+fn prepare_supervised_run(
+    multi_agent: Option<&concerto_config::MultiAgentConfig>,
+    project_dir: &Path,
+    session_id: Ulid,
+    objective: &str,
+    policy: Arc<dyn PolicyEngine>,
+    executor: Arc<ToolExecutor>,
+    gate_log_pool: Option<sqlx::SqlitePool>,
+    memory: Arc<dyn MemoryStore>,
+) -> Option<SupervisedRun> {
+    let tasks = supervised_agent_tasks(multi_agent, objective);
+    if tasks.is_empty() {
+        tracing::warn!(
+            "no enabled specialist agents in the configured topology — supervised path unavailable"
+        );
+        return None;
+    }
+    let Some(log_pool) = gate_log_pool else {
+        // Same documented degradation as the single-agent gate: without the
+        // session DB the write gate cannot append its WAL rows, so the
+        // supervised invariant (WAL-before-execute) could not hold.
+        tracing::warn!(
+            "no session DB pool for the supervised write gate — falling back to the coordinator"
+        );
+        return None;
+    };
+    let Some(binary) = agent_process_binary() else {
+        tracing::warn!(
+            "orchestrator-agent-process binary not found (set CONCERTO_AGENT_PROCESS_BIN or \
+             place it next to the running executable) — falling back to the coordinator"
+        );
+        return None;
+    };
+
+    let gate = Arc::new(WriteGate::new(
+        policy,
+        executor,
+        log_pool.clone(),
+        Arc::new(FilePreImageReader::new(project_dir)),
+        project_dir.to_path_buf(),
+        1,
+    ));
+    let services = SupervisorServices {
+        gate,
+        whiteboard_pool: log_pool.clone(),
+        memory,
+        project_id: ProjectId(concerto_core::helpers::project_id_hash(project_dir)),
+        subscriptions: SubscriptionManager::new(log_pool),
+    };
+    // ADR-60 D3: every supervised worker subscribes to `Decision` topics so
+    // sibling decisions stream to it as `whiteboard-slice` pushes (protocol
+    // 0.2.0); the supervisor loop registers these on first sight of the child.
+    let mut config = SupervisorConfig::default();
+    for (agent_id, _) in &tasks {
+        config = config.with_whiteboard_subscription(
+            agent_id.clone(),
+            vec![concerto_sessions::whiteboard::WhiteboardKind::Decision],
+        );
+    }
+    Some(SupervisedRun {
+        services,
+        config,
+        binary,
+        project_root: project_dir.to_path_buf(),
+        session_id,
+        tasks,
+    })
+}
+
+/// Locate the ADR-60 agent-process child binary: an explicit
+/// `CONCERTO_AGENT_PROCESS_BIN` wins; otherwise the sibling of the running
+/// executable (`orchestrator-agent-process[.exe]`). `None` when neither names
+/// a file — the caller degrades loudly to the coordinator.
+fn agent_process_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CONCERTO_AGENT_PROCESS_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "CONCERTO_AGENT_PROCESS_BIN does not name a file; probing the executable directory"
+        );
+    }
+    let exe = std::env::current_exe().ok()?;
+    let sibling =
+        exe.with_file_name(format!("orchestrator-agent-process{}", std::env::consts::EXE_SUFFIX));
+    sibling.is_file().then_some(sibling)
+}
+
+/// The supervised roster: every enabled specialist role in the configured
+/// topology (built-ins not disabled by config, then custom agents), excluding
+/// the coordinator — the coordinator role stays an in-process planning concern
+/// (ADR-35 §5) with no agent-process form.
+///
+/// Phase 1 thin slice: each worker receives the whole objective — there is no
+/// graph decomposition yet (that remains the coordinator fallback's job until
+/// the supervised planner lands), which is exactly what makes the shared
+/// write gate's conflict surface the coordination mechanism.
+fn supervised_agent_tasks(
+    multi_agent: Option<&concerto_config::MultiAgentConfig>,
+    objective: &str,
+) -> Vec<(String, String)> {
+    // Reuse the canonical topology ordering (ADR-35 phase 4); the
+    // once-per-run config clone keeps `topology_roles`' signature untouched.
+    let owned = multi_agent.cloned();
+    topology_roles(&owned)
+        .into_iter()
+        .filter(|role| role.as_str() != "coordinator")
+        .map(|role| (role.as_str().to_owned(), objective.to_owned()))
+        .collect()
+}
+
+/// Drive one prepared supervised multi-agent run to completion and synthesize
+/// the run output from the supervisor's summary.
+///
+/// Cancellation propagates as [`OrchestratorError::Cancelled`] (matching the
+/// coordinator path); a budget overrun tears the children down gracefully and
+/// reports [`AgentCompletionStatus::Partial`].
+#[allow(clippy::too_many_arguments)]
+async fn drive_supervised_run(
+    run: SupervisedRun,
+    services: &SharedServices,
+    stage_tracker: &Arc<Mutex<StageTracker>>,
+    session_store: Option<&Arc<dyn SessionStore>>,
+    task_id: TaskId,
+    transcript_recorder: TranscriptRecorderGuard,
+    event_recorder: EventRecorderGuard,
+    cancel: CancellationToken,
+) -> Result<AgentOutput, OrchestratorError> {
+    // Oracle comment 4 (ADR-60 Phase 1 review): in-flight review state is not
+    // persisted yet (Deferred 3). A supervised run that dies mid-review loses
+    // the cycle; a restart re-enters it from scratch. Loud until Phase 3
+    // lands the plan_id/review_target stash.
+    tracing::warn!(
+        "supervised multi-agent run starting without review-cycle resumability \
+         (ADR-60 Deferred 3): in-flight review state is lost on restart"
+    );
+    let mut supervisor = Supervisor::new(run.config);
+    for (agent_id, description) in &run.tasks {
+        let mut command = std::process::Command::new(&run.binary);
+        command
+            .env("CONCERTO_AGENT_ID", agent_id)
+            .env("CONCERTO_PROJECT_ROOT", &run.project_root)
+            .env("CONCERTO_TASK_DESCRIPTION", description)
+            // Slice limitation (documented on the child entry): the
+            // agent-process binary wires the mock provider only today; real
+            // provider plumbing is a later ADR-60 chunk.
+            .env("CONCERTO_PROVIDER", "mock");
+        if let Err(error) = supervisor.spawn_agent(&mut command, agent_id) {
+            event_recorder.stop().await;
+            transcript_recorder.stop().await;
+            return Err(OrchestratorError::AgentLoopError(format!(
+                "supervised agent {agent_id} failed to start: {error}"
+            )));
+        }
+    }
+
+    let expected: std::collections::HashSet<String> =
+        run.tasks.iter().map(|(id, _)| id.clone()).collect();
+    let mut supervisor = supervisor.with_services(run.services);
+    // Budget guard: a separate token so an overrun teardown can never be
+    // misreported as user cancellation.
+    let budget_cancel = CancellationToken::new();
+    let driven = tokio::time::timeout(
+        SUPERVISED_RUN_BUDGET,
+        supervisor.run_until(budget_cancel.clone(), |supervisor| {
+            supervisor.agents().iter().all(|meta| {
+                expected.contains(&meta.agent_id)
+                    && matches!(meta.state, AgentState::Completed | AgentState::Failed)
+            })
+        }),
+    )
+    .await;
+    let summary = match driven {
+        Ok(summary) => summary,
+        Err(_elapsed) => {
+            tracing::warn!("supervised multi-agent run exceeded its time budget; tearing down");
+            budget_cancel.cancel();
+            supervisor.run_until(CancellationToken::new(), |_| false).await
+        }
+    };
+
+    if cancel.is_cancelled() {
+        event_recorder.stop().await;
+        transcript_recorder.stop().await;
+        return Err(OrchestratorError::Cancelled);
+    }
+
+    let total = expected.len();
+    let completed = summary
+        .agents
+        .iter()
+        .filter(|meta| meta.state == AgentState::Completed && expected.contains(&meta.agent_id))
+        .count();
+    let all_completed = total > 0 && completed == total;
+    for agent_id in &summary.failed {
+        tracing::warn!(%agent_id, "supervised multi-agent run finished with a failed agent");
+    }
+    let final_message = if all_completed {
+        format!(
+            "Supervised run completed: {total} agent process(es) finished under the shared \
+             write gate."
+        )
+    } else {
+        let failed_list =
+            if summary.failed.is_empty() { "none".to_owned() } else { summary.failed.join(", ") };
+        format!(
+            "Supervised run partially completed: {completed}/{total} agent process(es) finished; \
+             failed agents: {failed_list}."
+        )
+    };
+    let project_root =
+        camino::Utf8PathBuf::from_path_buf(run.project_root.clone()).unwrap_or_default();
+
+    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+    // Per-child provider metrics/spend are not surfaced through the parent in
+    // this slice (the mock-provider children consume none), so there is
+    // nothing to persist here yet — the coordinator tail's metric writes are
+    // deliberately omitted rather than called with empty data.
+    if let Some(store) = session_store {
+        let assistant_message = Message {
+            role: Role::Assistant,
+            content: final_message.clone(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        };
+        if let Err(error) =
+            store.append_messages(run.session_id, &[assistant_message], cancel.clone()).await
+        {
+            if is_expected_cancellation(&error, &cancel) {
+                tracing::debug!(%error, "run cancelled; supervised assistant message not persisted");
+            } else {
+                tracing::warn!(%error, "failed to persist supervised assistant message");
+            }
+        }
+    }
+    transcript_recorder
+        .append_entries(&[
+            TranscriptEntry::Assistant { content: final_message.clone() },
+            TranscriptEntry::Completion {
+                multi_agent: true,
+                completed: all_completed,
+                files: Vec::new(),
+                project_root: Some(project_root.to_string()),
+            },
+        ])
+        .await;
+    maintain_context_after_run(
+        session_store,
+        run.session_id,
+        services.config.context.as_ref(),
+        cancel.clone(),
+        Some(&services.bus),
+    )
+    .await;
+    transcript_recorder.stop().await;
+    event_recorder.stop().await;
+
+    Ok(AgentOutput {
+        task_id,
+        session_id: run.session_id,
+        final_message,
+        files_modified: Vec::new(),
+        tool_call_count: 0,
+        eval_result: None,
+        tool_events: Vec::new(),
+        verification: Vec::new(),
+        project_root: Some(project_root),
+        completion_status: if all_completed {
+            AgentCompletionStatus::Completed
+        } else {
+            AgentCompletionStatus::Partial
+        },
+        provider_metrics: Vec::new(),
+        checkpoint_json: None,
+    })
 }
 
 /// Carry persisted conversational decisions into the multi-agent path.

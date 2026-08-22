@@ -1405,6 +1405,18 @@ pub struct MultiAgentConfig {
     /// config-file knob.
     #[serde(default)]
     pub coordinator_prompt: Option<String>,
+    /// ADR-60 Phase 1 (thin slice): when `true`, an Execute-classified
+    /// multi-agent run dispatches through the process supervisor
+    /// ([`Supervisor`] + real `orchestrator-agent-process` children) instead
+    /// of the in-process `CoordinatorAgent` waves. Defaults to `false` — the
+    /// coordinator remains the production path until supervised parity lands.
+    /// When enabled but the supervisor cannot start (no session-DB pool,
+    /// missing child binary, empty roster), the run degrades loudly (a warn)
+    /// back to the coordinator.
+    ///
+    /// [`Supervisor`]: concerto_orchestrator::supervisor::Supervisor
+    #[serde(default)]
+    pub supervisor_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -1436,6 +1448,7 @@ impl Default for MultiAgentConfig {
             max_subtask_attempts: None,
             max_total_iterations: None,
             coordinator_prompt: None,
+            supervisor_enabled: false,
         }
     }
 }
@@ -2095,6 +2108,30 @@ mod tests {
         let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
         let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(parsed.coordinator_prompt, None);
+    }
+
+    #[test]
+    fn multi_agent_supervisor_enabled_defaults_off_and_round_trips() {
+        // ADR-60 Phase 1: the supervised multi-agent path is opt-in. The flag
+        // defaults to false (the coordinator stays the production path), and
+        // configs that never carried the key keep loading as coordinator runs.
+        let cfg = MultiAgentConfig::default();
+        assert!(!cfg.supervisor_enabled, "the supervisor path must default to off");
+
+        let json = serde_json::to_string(&MultiAgentConfig {
+            supervisor_enabled: true,
+            ..Default::default()
+        })
+        .expect("serialize");
+        let restored: MultiAgentConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.supervisor_enabled, "an explicit opt-in must survive the round trip");
+
+        let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
+        let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
+        assert!(
+            !parsed.supervisor_enabled,
+            "legacy config without the key stays on the coordinator"
+        );
     }
 
     #[test]
