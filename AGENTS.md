@@ -68,9 +68,10 @@ cargo audit
   asserts constructor semantics without touching the backend, so no special
   environment is required; `CONCERTO_TEST_MODE=1` is documented for parity with
   CI but is not read by any code.
-- **No repo-local opencode config**: there is no `opencode.json` / `.opencode`
-  here. This file plus `CONTRIBUTING.md` / `SECURITY_BOUNDARIES.md` are the only
-  instruction files.
+- **Repo-local opencode config**: `opencode.json` exists (schema-only, no
+  overrides) and `.opencode/skills/concerto-maintainer/SKILL.md` carries the
+  repo-maintenance instruction pack. Instruction sources: this file,
+  `CONTRIBUTING.md`, `SECURITY_BOUNDARIES.md`, and that skill.
 
 ## Conventions that differ from defaults
 - **Branching**: feature/fix branches must be merged to `dev` via PR. `main`
