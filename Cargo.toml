@@ -177,7 +177,7 @@ once_cell = "1"
 # ---- WASM Plugin Runtime (Phase 7, ADR-14, ADR-21) ----
 # PINNED to v28 — upgrading to v43+ requires significant API migration (func_wrap signature changes).
 # Security exceptions tracked in deny.toml with justification, scope, and review date.
-wasmtime = { version = "28", default-features = false, features = ["cranelift", "async"] }
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "async"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
