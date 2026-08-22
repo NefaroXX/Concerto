@@ -30,7 +30,7 @@ async-trait = { workspace = true }
 # crate's watcher stack: notify for the native backend, notify-debouncer-mini
 # to collapse bursty edits into a 1s window.
 notify = { workspace = true }
-notify-debouncer-mini = "0.5"
+notify-debouncer-mini = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
