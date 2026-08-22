@@ -1,0 +1,17 @@
+[package]
+name = "concerto-plugin-sdk"
+description = "Guest-side SDK for WASM plugins in Concerto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "concerto_plugin_sdk"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

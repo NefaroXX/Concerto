@@ -1,0 +1,27 @@
+[package]
+name = "concerto-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-client"] }
+opentelemetry-langfuse = "0.6.1"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18.3"
+tokio = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+concerto-core = { path = "../core" }
+concerto-config = { path = "../config" }
+
+[dev-dependencies]
+opentelemetry-stdout = "0.31"

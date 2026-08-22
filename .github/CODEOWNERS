@@ -1,0 +1,6 @@
+# Default owner for everything in the repository.
+# Solo-maintainer project: NefaroXX reviews all changes unless a path below
+# says otherwise. Add per-crate owners as `crates/<name>/ @handle` lines when
+# that changes.
+
+* @NefaroXX

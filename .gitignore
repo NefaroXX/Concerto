@@ -1,0 +1,48 @@
+/target
+/crates/*/target
+**/*.rs.bk
+.DS_Store
+
+# Local dev config that may contain machine-specific paths (never secrets —
+# secrets live in the OS keychain per ADR-04, never in this file or any
+# config.toml).
+/.concerto-rs-local.toml
+
+# Planning artifacts from Phase 0 scaffold kickoff:
+/concerto-rs-phase0-kickoff.md
+/concerto-rs-phase0-scaffold.tar.gz
+
+# OpenCode/Concerto session context directory:
+/concerto/
+
+# Runtime agent session continuation metadata:
+/.omo/run-continuation/
+
+# cargo-mutants output directory (including backup/old copies):
+/mutants.out/
+/mutants.out.old/
+
+# OpenCode plans/instructions (local only — not project source, never version-controlled):
+/.sisyphus/
+
+# SQLite in-memory test artifacts (created by tests with ?cache=shared)
+crates/sessions/sqlite::memory*
+
+# Generated, not source of truth (regenerate with `cargo tree`):
+# docs/crate-graph.md is hand-maintained alongside the generated tree output,
+# so it is intentionally NOT ignored.
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+# Codebase-memory MCP knowledge-graph artifacts (machine-local index; regenerated
+# by the MCP server, churns on every session and is not meaningful in git):
+/.codebase-memory/
+
+# Local-only artifacts, not to be published:
+OpenCode-rs.zip
+.fastembed_cache/
+__pycache__/
+build/
+hello.py
+random_message.py
+concerto-sessions-2026-07-13.csv

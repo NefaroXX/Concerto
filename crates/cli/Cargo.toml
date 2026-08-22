@@ -1,0 +1,47 @@
+[package]
+name = "concerto-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+concerto-core = { path = "../core", version = "0.1.0" }
+
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+time = { workspace = true }
+ulid = { workspace = true }
+camino = { workspace = true }
+semver = { workspace = true }
+reqwest = { workspace = true }
+
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+concerto-orchestrator = { path = "../orchestrator", version = "0.1.0" }
+concerto-providers = { path = "../providers", version = "0.1.0" }
+concerto-sessions = { path = "../sessions", version = "0.1.0" }
+concerto-tools = { path = "../tools", version = "0.1.0" }
+concerto-memory = { path = "../memory", version = "0.1.0" }
+concerto-eval = { path = "../eval", version = "0.1.0" }
+concerto-config = { path = "../config", version = "0.1.0" }
+dirs = { workspace = true }
+concerto-plugins = { path = "../plugins", version = "0.1.0" }
+concerto-api-types = { path = "../api-types", version = "0.1.0" }
+concerto-skills = { path = "../skills", version = "0.1.0" }
+concerto-lsp = { path = "../lsp", version = "0.1.0" }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

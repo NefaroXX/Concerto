@@ -1,0 +1,172 @@
+# Continuous integration for Concerto.
+#
+# fmt, clippy, test, and cargo-deny run as separate, independent jobs (no
+# needs:) so a failure in one never masks another; on GitHub's hosted
+# runners they also execute in parallel.
+#
+# Toolchain note: rust-toolchain.toml at the repo root pins channel 1.96.0,
+# so every cargo invocation inside this workspace resolves through rustup to
+# exactly that version regardless of the runner default. The workflow
+# installs 1.96.0 explicitly (dtolnay/rust-toolchain takes its selector from
+# the @ref) instead of relying on implicit auto-install.
+#
+# WASM note: the test-*-plugin-wasm crates require the wasm32-wasip2 target;
+# it is added to every job that compiles workspace crates.
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation artifacts are machine-local and must not poison
+  # shared caches; disabling keeps builds reproducible across runners.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # --------------------------------------------------------------- formatting
+  fmt:
+    name: Formatting (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # -------------------------------------------------------------------- lints
+  clippy:
+    name: Lints (clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+          targets: wasm32-wasip2
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Lint workspace (all targets, warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # -------------------------------------------------------------------- tests
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    env:
+      # Selects the environment-backed credential store inside tests so they
+      # never touch the real OS keychain.
+      CONCERTO_TEST_MODE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-wasip2
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # Plain `cargo test` also runs doc tests, which nextest skips; this one
+      # command therefore covers unit, integration, and doc tests together.
+      - name: Run workspace tests (unit, integration, doc)
+        run: cargo test --workspace
+
+  # -------------------------------------------------------------------- build
+  build:
+    name: Build (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-wasip2
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build entire workspace
+        run: cargo build --workspace
+
+  # ------------------------------------------------------------ wasm plugins
+  wasm-plugins:
+    name: WASM plugins (wasm32-wasip2)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-wasip2
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # Guest plugin crates must compile to wasm32-wasip2 artifacts; host
+      # builds elsewhere in CI do not prove the deployable .wasm is valid.
+      - name: Build guest plugin crates for wasm32-wasip2
+        run: >-
+          cargo build
+          -p test-plugin-wasm
+          -p test-provider-plugin-wasm
+          -p test-adapter-plugin-wasm
+          -p test-dialect-plugin-wasm
+          --target wasm32-wasip2
+
+  # -------------------------------------------------------------- supply chain
+  deny:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Official action from the cargo-deny maintainers; handles install.
+      # Policy lives in deny.toml (licenses, bans, advisories, sources).
+      - name: Run cargo-deny checks
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # ------------------------------------------------------- desktop UI palette
+  ui-colors:
+    name: Desktop UI palette check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # views/ and ui/ must use theme palette colors, never Color::from_rgb,
+      # Color::{BLACK,WHITE,TRANSPARENT}, or hex literals. widgets/ and
+      # theme/ are exempt by design.
+      - name: Check for hard-coded colors in desktop UI
+        run: bash scripts/check-hardcoded-colors.sh

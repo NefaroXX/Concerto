@@ -1,0 +1,57 @@
+[package]
+name = "concerto-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+concerto-core = { path = "../core", version = "0.1.0" }
+concerto-tools = { path = "../tools", version = "0.1.0" }
+concerto-providers = { path = "../providers", version = "0.1.0" }
+concerto-sessions = { path = "../sessions", version = "0.1.0" }
+concerto-memory = { path = "../memory", version = "0.1.0" }
+concerto-eval = { path = "../eval", version = "0.1.0" }
+concerto-lsp = { path = "../lsp", version = "0.1.0" }
+
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = "1"
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+time = { workspace = true }
+camino = { workspace = true }
+blake3 = { workspace = true }
+petgraph = { workspace = true }
+
+dirs = "5"
+sqlx = { workspace = true }
+concerto-config = { path = "../config", version = "0.1.0" }
+concerto-plugins = { path = "../plugins", version = "0.1.0" }
+concerto-skills = { path = "../skills", version = "0.1.0" }
+concerto-mcp = { path = "../mcp", version = "0.1.0" }
+concerto-api-types = { path = "../api-types", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "task_graph"
+harness = false
+
+[[bin]]
+name = "orchestrator-mock-agent"
+path = "src/bin/mock_agent.rs"
+
+[[bin]]
+name = "orchestrator-agent-process"
+path = "src/bin/agent_process.rs"

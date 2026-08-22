@@ -1,0 +1,14 @@
+-- ADR-55 §1 (pending): artifact hash for durable plan bindings.
+--
+-- `artifact_hash` is the blake3 fingerprint of the binding's `plan_text`,
+-- captured when the plan was created (the plan text shown in the
+-- Apply/Replan dialog is the artifact of record for single-agent runs; the
+-- multi-agent ADR-52 `plan-<id>.json` is written by the coordinator in the
+-- same run). At dialog arming the stored plan text is re-hashed and compared
+-- against this value, so a binding whose text was altered since creation
+-- never arms the dialog — the run falls through to the generic intent gate.
+--
+-- NULL for rows written before this migration: those are unverifiable and,
+-- because the ADR-55 §1 verification is load-bearing, are treated as no
+-- binding (fail-soft to the generic gate) rather than silently shown.
+ALTER TABLE plan_bindings ADD COLUMN artifact_hash TEXT;

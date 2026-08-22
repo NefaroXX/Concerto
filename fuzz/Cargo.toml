@@ -1,0 +1,26 @@
+[package]
+name = "concerto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+concerto-shell = { path = "../crates/shell" }
+concerto-plugins = { path = "../crates/plugins" }
+concerto-core = { path = "../crates/core" }
+
+[[bin]]
+name = "shell_parser"
+path = "fuzz_targets/shell_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "guest_abi"
+path = "fuzz_targets/guest_abi.rs"
+test = false
+doc = false

@@ -1,0 +1,224 @@
+# Concerto configuration example (schema v5)
+#
+# Preferred setup: use the desktop setup wizard and Settings page. This file
+# documents the serialized values for advanced/manual configuration.
+#
+# Global location: platform config directory, normally
+#   ~/.config/concerto/config.toml        (Linux)
+# Project override:
+#   <project>/.concerto.toml
+#
+# API keys are not stored here. `keyring_key` names an entry in the operating-
+# system credential store. Set credentials through Concerto Settings.
+
+schema_version = 5
+mode = "Build" # Build, Chat, or Plan (serde variant spelling)
+session_spend_cap_usd = 5.0
+
+# Optional project-root allowlist (ADR-44). Empty (the default) is permissive.
+# A non-empty list restricts which project directories Concerto opens; on the
+# api-server, out-of-root session roots are refused with HTTP 403. The
+# CONCERTO_PROJECT_ROOTS environment variable (platform-separated paths)
+# overrides this value.
+# project_roots = ["/home/user/projects"]
+
+# Central retry policy for transient provider errors such as 429/5xx,
+# disconnects, and timeouts. It does not retry invalid configuration forever.
+[retry]
+enabled = true
+initial_delay_ms = 2000
+max_delay_ms = 30000
+multiplier = 2.0
+jitter = true
+respect_retry_after = true
+# fixed_delay_ms = 5000
+max_attempts = 8
+max_elapsed_seconds = 900
+time_to_first_byte_seconds = 60
+stream_idle_timeout_seconds = 120
+
+# Multiple providers. Valid provider IDs: openai, anthropic, google,
+# openrouter, nim, ollama, opencode.
+[model_settings]
+global_default_id = "main-provider"
+
+[[model_settings.providers]]
+id = "main-provider"
+name = "Main provider"
+provider = "anthropic"
+model = "your-model-id"
+timeout_seconds = 60
+keyring_key = "anthropic/api_key"
+
+[[model_settings.providers]]
+id = "local-provider"
+name = "Local Ollama"
+provider = "ollama"
+model = "your-local-model-id"
+api_base = "http://localhost:11434"
+timeout_seconds = 120
+keyring_key = "ollama/api_key"
+
+# Optional, OpenAI-compatible providers:
+#   extra_models = ["alias-model-a"]   # additional offered models (resolution only)
+#   reasoning_echo = "always"          # "always" | "if-present" (ADR-46)
+# See docs/models.md for details.
+
+[[model_settings.agent_assignments]]
+agent_role = "coordinator"
+provider_config_id = "main-provider"
+
+[[model_settings.agent_assignments]]
+agent_role = "coder"
+provider_config_id = "local-provider"
+# model_override = "another-tool-capable-model"
+
+# Objective metadata overrides. These are routing hints and do not grant a
+# model capabilities it does not actually have.
+[model_settings.model_profile_overrides]
+"local-provider" = { context_window = 32768, supports_tool_calling = true }
+
+# Multi-agent mode is explicit. An empty relationships list uses the validated
+# default topology described in docs/agent-collaboration.md.
+[multi_agent]
+default_enabled = false
+spend_cap_multiplier = 3.0
+max_concurrent_agents = 3
+max_concurrent_per_provider = 2
+# ADR-42 fallback ladder tier 1: retry a hard-failed subtask with the SAME
+# agent on a global default model. The agent's provider is bound at startup,
+# so default_model must be a model offered by that role's own provider; the
+# request is NOT re-routed to another provider. default_provider_config_id
+# only disambiguates which routing profile matches when the model name is
+# shared across providers (it does not switch the serving provider).
+# Unset/omitted keys skip this tier.
+# default_model = "another-tool-capable-model"
+# default_provider_config_id = "local-provider"
+# ADR-45 fallback ladder tier 1b: when the role's own provider is the failure
+# (latency, quota, outage), rebuild the failed role on the run's default
+# provider serving the global default model. This knob gates the
+# default-model fallback tier of the ladder; disable it to skip that tier.
+default_model_fallback = true
+# ADR-45: dispatch-attempt ceiling per subtask before the fallback ladder
+# walks in. Defaults to 3 when omitted. Raise it for flaky providers.
+# max_subtask_attempts = 5
+
+[[multi_agent.relationships]]
+from = "reviewer"
+to = "coder"
+relationship = "supervises"
+max_cycles = 3
+
+[[multi_agent.relationships]]
+from = "validator"
+to = "coder"
+relationship = "supervises"
+max_cycles = 2
+
+[[multi_agent.relationships]]
+from = "researcher"
+to = "coder"
+relationship = "provides_context_to"
+
+# Policy rules are first-match-wins. This example allows reads, asks before
+# writes/deletes, allows common Cargo verification, then asks for everything
+# else. See docs/policy-rules.md before changing these values.
+[policy]
+
+[[policy.rules]]
+action = "auto_approve"
+[policy.rules.condition]
+tool_name = "filesystem"
+operation = "read"
+
+[[policy.rules]]
+action = "require_approval"
+[policy.rules.condition]
+tool_name = "filesystem"
+operation = "write"
+
+[[policy.rules]]
+action = "require_approval"
+[policy.rules.condition]
+tool_name = "filesystem"
+operation = "delete"
+
+[[policy.rules]]
+action = "auto_approve"
+[policy.rules.condition]
+command_pattern = "^cargo (check|test|fmt|clippy)( |$)"
+
+[[policy.rules]]
+action = "require_approval"
+[policy.rules.condition]
+always = true
+
+# Optional time window. Hours are 0-23 in the named IANA timezone. Wrapping
+# windows such as 22 -> 6 are supported.
+# [policy.time_window]
+# start_hour = 9
+# end_hour = 17
+# timezone = "Africa/Johannesburg"
+# auto_approve_below_usd = 0.10
+
+# Shell profiles are normally detected and saved by Settings. The single
+# selected profile is used by agents, validation, and the integrated terminal.
+# A custom profile example:
+# [shell_settings]
+# selected_profile = "my-bash"
+#
+# [[shell_settings.profiles]]
+# id = "my-bash"
+# name = "Project Bash"
+# backend = "custom"
+# executable = "/opt/bin/bash"
+# args = []
+# login = false
+# interactive = true
+# encoding = "utf-8"
+# default_working_dir = "project_root"
+
+# Exporters are disabled by omitting fields/the entire section.
+# [observability]
+# prometheus_port = 9091
+# service_name = "concerto"
+# otlp_endpoint = "http://localhost:4318"
+# langfuse_host = "https://cloud.langfuse.com"
+# langfuse_public_key = "keyring:langfuse/public_key"
+# langfuse_secret_key = "keyring:langfuse/secret_key"
+
+# Tool plugins only are currently executable through the plugin bridge.
+# [plugins]
+# enabled = false
+# search_paths = ["~/.local/share/concerto/plugins"]
+# bundled_plugins_enabled = true
+# auto_load = true
+
+# Skills are local instruction packs injected into prompts (ADR-43). They
+# never execute code. Defaults shown here apply when the section is omitted.
+# NOTE: enabled defaults to false (ADR-43 decision 5 — explicit opt-in).
+# [skills]
+# enabled = true
+# search_paths = ["~/.local/share/concerto/skills", "./.concerto/skills"]
+# auto_load = true
+# enabled_ids = ["rust-testing", "commit-style"]  # empty/unset = all discovered
+# max_chars = 4000  # cap on the injected skills section
+
+# MCP client (ADR-43). Default off until you opt in. Servers run as child
+# processes; every mcp:* tool is policy-gated (RequireApproval by default).
+# [mcp]
+# enabled = false
+#
+# [[mcp.servers]]
+# id = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/safe/path"]
+# env = {}
+# enabled = true
+# timeout_secs = 60  # per-call default, hard cap enforced in the bridge
+
+# The default crates.io update endpoint is not useful for an unpublished
+# source build. Disable it unless you provide an endpoint for your deployment.
+[updates]
+check_on_startup = false
+# update_endpoint = "https://example.invalid/concerto/version"
