@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt
 
@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
           targets: wasm32-wasip2
@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-wasip2
 
@@ -105,7 +105,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-wasip2
 
@@ -124,7 +124,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-wasip2
 
