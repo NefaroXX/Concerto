@@ -1,0 +1,29 @@
+name: Question
+description: Ask a question about Concerto
+title: "[Question] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For general help and open-ended discussion, consider starting a
+        thread in [Discussions](../../discussions) instead — questions there
+        are searchable and don't sit in the triage queue. Use this template
+        when you want a maintainer's answer tracked as an issue.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What would you like to know?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: |
+        Anything that helps us answer — what you already tried, the relevant
+        documentation you consulted (README, docs/architecture.md,
+        SECURITY_BOUNDARIES.md, TESTING.md), and your setup if it matters.
+    validations:
+      required: false

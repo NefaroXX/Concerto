@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Workspace crates (24 members, single root manifest). Weekly cadence keeps
+  # dependency drift small; the 5-PR cap prevents a flood after quiet periods.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    labels:
+      - "dependencies"
+
+  # CI/release actions (checkout, rust-toolchain, rust-cache, ...). Grouped
+  # so minor/patch bumps arrive as one reviewable PR.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    labels:
+      - "dependencies"

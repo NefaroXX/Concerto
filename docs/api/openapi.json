@@ -1,0 +1,340 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "concerto-api-server",
+    "description": "",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "tags": [],
+        "summary": "GET /v1/health",
+        "operationId": "health_check",
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "tags": [],
+        "summary": "GET /v1/sessions",
+        "operationId": "list_sessions",
+        "responses": {
+          "200": {
+            "description": "List of recent sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SessionResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "summary": "POST /v1/sessions",
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}": {
+      "get": {
+        "tags": [],
+        "summary": "GET /v1/sessions/{id}",
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ULID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found"
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/spend": {
+      "get": {
+        "tags": [],
+        "summary": "GET /v1/sessions/{id}/spend",
+        "operationId": "get_spend_summary",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ULID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Spend summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpendSummaryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/tasks": {
+      "post": {
+        "tags": [],
+        "summary": "POST /v1/sessions/{id}/tasks",
+        "operationId": "create_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ULID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Task created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/tasks/{tid}/stream": {
+      "get": {
+        "tags": [],
+        "summary": "GET /v1/sessions/{id}/tasks/{tid}/stream",
+        "operationId": "stream_task_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ULID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tid",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE event stream",
+            "content": {
+              "text/event-stream": {}
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateSessionRequest": {
+        "type": "object",
+        "description": "Request to create a new session.",
+        "required": [
+          "provider",
+          "model",
+          "project_dir"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "project_dir": {
+            "type": "string",
+            "description": "The project directory for the session. Must be a valid, existing directory.\nCannot be empty. Must be valid UTF-8."
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateTaskRequest": {
+        "type": "object",
+        "description": "Request to create a new task for an agent session.",
+        "required": [
+          "description"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionResponse": {
+        "type": "object",
+        "description": "Summary of a session.",
+        "required": [
+          "id",
+          "created_at",
+          "last_activity",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_activity": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
+      "SpendSummaryResponse": {
+        "type": "object",
+        "description": "Spend summary for a session.",
+        "required": [
+          "session_id",
+          "total_usd",
+          "total_tokens_in",
+          "total_tokens_out"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "total_tokens_in": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_tokens_out": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_usd": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "TaskResponse": {
+        "type": "object",
+        "description": "Response to a task creation request.",
+        "required": [
+          "task_id",
+          "session_id",
+          "status"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "sessions",
+      "description": "Session management"
+    },
+    {
+      "name": "system",
+      "description": "System health and metadata"
+    }
+  ]
+}

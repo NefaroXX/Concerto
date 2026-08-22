@@ -1,0 +1,18 @@
+[package]
+name = "concerto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["desktop"]
+desktop = ["dep:concerto-desktop"]
+cli = ["dep:concerto-cli"]
+
+[dependencies]
+concerto-cli = { path = "../cli", optional = true }
+concerto-desktop = { path = "../desktop", optional = true }

@@ -1,0 +1,39 @@
+[package]
+name = "concerto-api-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+concerto-core = { path = "../core", version = "0.1.0" }
+concerto-api-types = { path = "../api-types", version = "0.1.0" }
+concerto-orchestrator = { path = "../orchestrator", version = "0.1.0" }
+concerto-sessions = { path = "../sessions", version = "0.1.0" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+ulid = { workspace = true }
+time = { workspace = true }
+camino = { workspace = true }
+
+axum = { workspace = true }
+tower-http = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = "0.5"

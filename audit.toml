@@ -1,0 +1,45 @@
+# cargo-audit configuration. Run with: cargo audit
+# Mirrors deny.toml advisory exceptions.
+
+[advisories]
+# Ignore advisories that are already tracked in deny.toml.
+# See deny.toml for full justification, scope, and review dates.
+ignore = [
+    # rsa — no fix, dead dep from sqlx-mysql (excluded by default-features=false)
+    "RUSTSEC-2023-0071",
+    # yaml-rust — unmaintained, used by syntect for syntax highlighting
+    "RUSTSEC-2024-0320",
+    # bincode — unmaintained, transitive dep
+    "RUSTSEC-2024-0384",
+    # instant — unmaintained, transitive dep via iced
+    "RUSTSEC-2024-0436",
+    # number_prefix — unmaintained, transitive dep
+    "RUSTSEC-2025-0119",
+    # paste — unmaintained, transitive dep
+    "RUSTSEC-2025-0141",
+    # wasmtime v28.0.1 — pinned for plugin sandbox, see deny.toml
+    "RUSTSEC-2025-0046",
+    "RUSTSEC-2025-0118",
+    "RUSTSEC-2026-0020",
+    "RUSTSEC-2026-0021",
+    "RUSTSEC-2026-0085",
+    "RUSTSEC-2026-0086",
+    "RUSTSEC-2026-0087",
+    "RUSTSEC-2026-0088",
+    "RUSTSEC-2026-0089",
+    "RUSTSEC-2026-0091",
+    "RUSTSEC-2026-0092",
+    "RUSTSEC-2026-0093",
+    "RUSTSEC-2026-0094",
+    "RUSTSEC-2026-0095",
+    "RUSTSEC-2026-0096",
+    # quick-xml — constrained by upstream, DoS requires crafted XML
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # ttf-parser — unmaintained, no security issue
+    "RUSTSEC-2026-0192",
+    # proc-macro-error2 — unmaintained, transitive dep
+    "RUSTSEC-2026-0173",
+    # lru — unsound, iterator invalidation, low risk in our usage
+    "RUSTSEC-2026-0002",
+]

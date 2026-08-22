@@ -1,0 +1,1 @@
+{"id": "01J1ABCDEFGHIJKLMNOPQRSTUV1", "description": "Echo CLI tool that accepts --text and --uppercase flag", "project_snapshot_path": "./", "expected_outcomes": [{"files_changed": ["src/main.rs"], "tests_pass": true, "min_patterns": ["test"], "max_patterns": []}]}

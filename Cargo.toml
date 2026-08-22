@@ -1,0 +1,194 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/config",
+    "crates/providers",
+    "crates/tools",
+    "crates/shell",
+    "crates/memory",
+    "crates/orchestrator",
+    "crates/sessions",
+    "crates/lsp",
+    "crates/plugins",
+    "crates/skills",
+    "crates/mcp",
+    "crates/plugin-sdk",
+    "crates/api-types",
+    "crates/api-server",
+    "crates/eval",
+    "crates/observability",
+    "crates/cli",
+    "crates/desktop",
+    "crates/concerto",
+    "crates/test-plugin-wasm",
+    "crates/test-provider-plugin-wasm",
+    "crates/test-adapter-plugin-wasm",
+    "crates/test-dialect-plugin-wasm",
+    "crates/eval-runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/NefaroXX/Concerto"
+publish = false
+
+# Optimize for debug iteration speed (Guiding Principle: incremental value delivery).
+# Tune opt-level up only if debug builds become a measured bottleneck.
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+# ---------------------------------------------------------------------------
+# Shared dependency versions for the current 20-crate workspace. Historical
+# section labels record when a dependency was introduced; they are not active
+# phase gates. Add or retain a dependency only for a current, tested need.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util", "test-util"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-stream = "0.3"
+
+ulid = { version = "1", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- HTTP / streaming (Phase 1, providers) ----
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# ---- Token counting (Phase 1, context budget) ----
+tiktoken-rs = "0.6"
+
+# ---- Database (Phase 1, sessions) ----
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "time", "uuid"] }
+
+# ---- Filesystem & paths (Phase 1, sessions) ----
+dirs = "6"
+fd-lock = "4"
+camino = { version = "1", features = ["serde1"] }
+fastrand = "2"
+
+# ---- Diff computation (Phase 2) ----
+imara-diff = "0.1"
+
+# ---- Pure-Rust Git operations (Phase 2+, ADR-01) ----
+gix = "0.85"
+
+# ---- Shell allowlist / pattern matching (Phase 2) ----
+regex = "1"
+
+# ---- Timezone support (Phase 8, policy engine) ----
+chrono = "0.4"
+chrono-tz = "0.10"
+
+# ---- Input hashing for audit log (Phase 2) ----
+blake3 = "1"
+
+# ---- LSP client (Phase 2) ----
+tower-lsp = "0.20"
+lsp-types = "0.97"
+
+figment = { version = "0.10", features = ["toml", "env"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+semver = "1"
+
+# ---- Native desktop UI (Phase 3, ADR-08) ----
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+
+# ---- Terminal UI (Phase 3, ADR-07) ----
+ratatui = "0.29"
+crossterm = "0.28"
+
+# ---- Syntax highlighting for diff viewer (Phase 3) ----
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "default-fancy"] }
+
+# ---- Markdown rendering (Phase 3) ----
+pulldown-cmark = "0.12"
+
+# ---- Clipboard (Phase 3) ----
+arboard = "3"
+
+# ---- Image loading (Phase 3) ----
+image = "0.25"
+
+# ---- HTTP server (Phase 3) ----
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# ---- OpenAPI (Phase 3) ----
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.1"
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+
+# ---- Indexing / RAG pipeline (Phase 4) ----
+# swiftide = { version = "0.1", features = ["tree-sitter", "fastembed"] }  # Decision (2026-07-07): Ship Feature 4 v1 on entities.rs only. Revisit swiftide or hand-rolled tree-sitter only if entities.rs proves insufficient. See roadmap §3.3 option (c).
+
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-typescript = "0.23"
+
+fastembed = "4"
+
+# ---- Recursive directory walking (Phase 4) ----
+walkdir = "2"
+glob = "0.3"
+
+# ---- Filesystem watch (Phase 4, ADR-06) ----
+notify = "7"
+
+# ---- BM25 full-text search (Phase 4, optional FTS5 alternative) ----
+# tantivy = "0.22"   # deferred — start with SQLite FTS5
+
+# ---- Vector store (Phase 4, ADR-10) ----
+
+# ---- Task graph / DAG (Phase 5, ADR-19) ----
+petgraph = "0.6"
+
+# ---- Lazy initialization (Phase 6, ADR-20) ----
+once_cell = "1"
+
+# ---- WASM Plugin Runtime (Phase 7, ADR-14, ADR-21) ----
+# PINNED to v28 — upgrading to v43+ requires significant API migration (func_wrap signature changes).
+# Security exceptions tracked in deny.toml with justification, scope, and review date.
+wasmtime = { version = "28", default-features = false, features = ["cranelift", "async"] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# NOTE: no [workspace.lints.rustdoc] table here. On toolchains >= ~1.80 the
+# legacy `rustdoc::missing_docs` lint path is gone (renamed to the top-level
+# `missing_docs`), so a table entry would make Cargo pass `-W
+# rustdoc::missing_docs` on the command line, which rustc rejects with an
+# E0602 "unknown lint" warning on EVERY crate's doc build. Doc coverage is
+# opted into per-crate instead: `#![allow(missing_docs)]` on the 16 crate
+# roots, and a dedicated doc crate can flip to `#![warn(missing_docs)]`.

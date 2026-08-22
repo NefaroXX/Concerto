@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a problem with Concerto
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report!
+
+        Please never include API keys, private project content, or unredacted
+        prompts/logs — see [SECURITY_BOUNDARIES.md](../blob/main/SECURITY_BOUNDARIES.md)
+        and [TESTING.md](../blob/main/TESTING.md) for what a complete report
+        contains.
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        How can we reproduce the problem? Include the commit you were on,
+        the interaction mode, and whether a fresh run reproduced it without
+        restarting Concerto.
+      placeholder: |
+        1. Start `concerto` with ...
+        2. Ask the agent to ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: |
+        What actually happened? If the failure was partial, state which
+        files or state were preserved.
+    validations:
+      required: true
+  - type: dropdown
+    id: frontend
+    attributes:
+      label: Frontend
+      description: Which interface were you using?
+      options:
+        - Desktop GUI (Iced)
+        - CLI (TUI)
+        - Both
+        - Not applicable
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: "`concerto --version`, or the commit hash if built from source"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: e.g. Ubuntu 24.04, macOS 14, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: provider-model
+    attributes:
+      label: Provider / model (if relevant)
+      description: e.g. Anthropic / claude-sonnet-4-5, Ollama / qwen3, plugin-backed provider
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output / logs
+      description: Paste sanitized terminal output or log excerpts. Redact anything private.
+      render: shell
+    validations:
+      required: false

@@ -1,0 +1,65 @@
+[package]
+name = "concerto-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+concerto-core = { path = "../core", version = "0.1.0" }
+concerto-memory = { path = "../memory", version = "0.1.0" }
+concerto-orchestrator = { path = "../orchestrator", version = "0.1.0" }
+concerto-tools = { path = "../tools", version = "0.1.0" }
+concerto-sessions = { path = "../sessions", version = "0.1.0" }
+concerto-config = { path = "../config", version = "0.1.0" }
+concerto-providers = { path = "../providers", version = "0.1.0" }
+concerto-eval = { path = "../eval", version = "0.1.0" }
+concerto-plugins = { path = "../plugins", version = "0.1.0" }
+concerto-api-types = { path = "../api-types", version = "0.1.0" }
+concerto-lsp = { path = "../lsp", version = "0.1.0" }
+concerto-mcp = { path = "../mcp", version = "0.1.0" }
+concerto-skills = { path = "../skills", version = "0.1.0" }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+# Config change propagation without restart (ADR-57) — mirrors the memory
+# crate's watcher stack: notify for the native backend, notify-debouncer-mini
+# to collapse bursty edits into a 1s window.
+notify = { workspace = true }
+notify-debouncer-mini = "0.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+time = { workspace = true }
+ulid = { workspace = true }
+camino = { workspace = true }
+once_cell = { workspace = true }
+petgraph = { workspace = true }
+walkdir = { workspace = true }
+
+iced = { workspace = true, features = ["highlighter"] }
+iced_core = "0.14.0"
+iced_futures = "0.14.0"
+iced_term = "0.8.0"
+rfd = "0.17.2"
+
+dirs = "5.0"
+
+# Syntax highlighting for code blocks and diff viewer
+syntect = { workspace = true }
+
+# Markdown rendering for chat pane
+pulldown-cmark = { workspace = true }
+
+# Screenshot support
+image = { workspace = true }
+arboard = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

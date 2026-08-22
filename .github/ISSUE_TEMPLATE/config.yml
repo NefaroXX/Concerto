@@ -1,0 +1,20 @@
+# Issue template routing for Concerto.
+#
+# Blank issues are disabled: the templates collect the report fields
+# CONTRIBUTING.md and TESTING.md require (commit, frontend, provider/model,
+# sanitized errors), which makes reports reproducible on the first try.
+# Anything that fits no template belongs in Discussions.
+
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security vulnerability
+    url: https://mit-s.co.za/contact
+    about: >-
+      Report vulnerabilities privately per SECURITY.md — include
+      "Concerto security report" in the subject. Never open a public issue.
+  - name: 💬 Questions & help
+    url: https://github.com/NefaroXX/Concerto/discussions
+    about: Ask questions and discuss ideas without filing a tracked issue.
+  - name: 📖 Architecture & boundaries
+    url: https://github.com/NefaroXX/Concerto/blob/main/docs/architecture.md
+    about: How the crates fit together, plus SECURITY_BOUNDARIES.md for the threat model.

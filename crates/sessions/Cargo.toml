@@ -1,0 +1,35 @@
+[package]
+name = "concerto-sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fastrand = { workspace = true }
+concerto-core = { path = "../core", version = "0.1.0" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+time = { workspace = true }
+
+sqlx = { workspace = true }
+dirs = { workspace = true }
+camino = { workspace = true }
+
+# Deterministic content_hash for whiteboard events (ADR-60 D3); same workspace
+# dep used by core/config/memory/orchestrator/tools.
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
