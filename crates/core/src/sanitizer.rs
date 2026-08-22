@@ -416,7 +416,7 @@ mod tests {
             "{}{}{}{}{}",
             "Slack token: ", "xoxb-", "1234567890-", "1234567890123-", "ABCDEFghijklmnop"
         );
-        let result = sanitizer.sanitize(input);
+        let result = sanitizer.sanitize(&input);
         assert_eq!(result, "Slack token: [REDACTED]");
     }
 
@@ -424,7 +424,7 @@ mod tests {
     fn test_stripe_key() {
         let sanitizer = SecretSanitizer::default();
         let input = format!("{}{}{}", "Stripe key: ", "sk_live_", "1234567890abcdefghijklmnopqrst");
-        let result = sanitizer.sanitize(input);
+        let result = sanitizer.sanitize(&input);
         assert_eq!(result, "Stripe key: [REDACTED]");
     }
 
