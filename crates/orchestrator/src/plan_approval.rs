@@ -54,8 +54,8 @@ use time::OffsetDateTime;
 
 use crate::intent_grants::{grant_execute, IntentGrantStore};
 use concerto_sessions::whiteboard::{
-    append_whiteboard_event, load_whiteboard_events_by_plan, NewWhiteboardEvent, WhiteboardEvent,
-    WhiteboardKind,
+    append_whiteboard_event, compute_content_hash, load_whiteboard_events_by_plan,
+    NewWhiteboardEvent, WhiteboardEvent, WhiteboardKind,
 };
 
 /// Upper bound for stored plan text (16 KiB), enforced by [`plan_text_cap`].
@@ -619,6 +619,348 @@ fn string_field(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
         .find_map(|key| payload.get(*key).and_then(|value| value.as_str()).map(ToOwned::to_owned))
 }
 
+// ===========================================================================
+// ADR-60 Deferred 3: `run_review_cycle` resumability — write + rehydrate.
+//
+// An in-flight review cycle used to die with the process (coordinator.rs
+// historically noted "there is no call to save"): a restart either lost the
+// review or ran a duplicate second review of the same deliverable. The
+// whiteboard is the durable fix, exactly as for D7 above: one shared event
+// kind ([`WhiteboardKind::ReviewState`]) with ONE payload serialization,
+// defined here so every future consumer (the coordinator today; any
+// supervisor-side review participant later) reads and writes the same shape.
+//
+// Write ordering is WAL-before-invoke (oracle 2026-08-23 comment 2): the
+// caller awaits [`append_review_state_event`] and only then spawns the
+// reviewer or continues the loop — the snapshot commits (BEGIN IMMEDIATE,
+// WAL-durable on return) before any model call that could be lost.
+//
+// Each event is a FULL self-contained snapshot: plan id, review target,
+// complete feedback ledger, retry counter, and the `gate_seq` cursor of the
+// previous snapshot in the cycle group (oracle answer: minimal
+// plan_id+target stashes were rejected — resuming from scratch would repeat
+// paid-for reviewer work). Rehydration validates before trusting
+// (oracle comment 1): each row's canonical content hash is recomputed and a
+// structurally inconsistent ledger (counters that disagree with the entries,
+// cycles out of range, a cursor pointing past the row itself) is rejected —
+// a corrupt state degrades to a fresh cycle with a warn, never to silently
+// trusting injected data. Idempotency (oracle comment 3): the newest valid
+// snapshot decides — an already-terminal cycle is reported as resolved
+// instead of resumed, and a same-process terminal never suppresses a sibling
+// subtask's own fresh review.
+// ===========================================================================
+
+/// One recorded reviewer verdict inside a review cycle's feedback ledger.
+///
+/// Only non-terminal verdicts are recorded: a pass or an escalation is the
+/// terminal event's `status`, while every needs-revision verdict consumes one
+/// cycle slot and queues one implement revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFeedbackEntry {
+    /// The review cycle (1-based) whose reviewer returned this verdict.
+    pub cycle_num: u32,
+    /// Verdict string; `"needs-revision"` today.
+    pub verdict: String,
+    /// The revision reason, when the reviewer gave one.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Terminal / progress status carried by a [`WhiteboardKind::ReviewState`]
+/// snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewCycleStatus {
+    /// The reviewer invocation for cycle `ledger.len() + 1` is about to start
+    /// (or was in flight when the process died — its result is unknown).
+    Started,
+    /// Cycle `ledger.len()` returned needs-revision and the implement
+    /// revision was queued; the next reviewer invocation is one revision
+    /// later.
+    RevisionQueued,
+    /// The reviewer passed — the cycle group is settled.
+    Completed,
+    /// `max_cycles` was reached unresolved — the cycle group is settled.
+    Escalated,
+}
+
+impl ReviewCycleStatus {
+    /// Whether this status settles the cycle group (no further reviewer work).
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Escalated)
+    }
+}
+
+/// Content payload of a [`WhiteboardKind::ReviewState`] whiteboard event
+/// (ADR-60 Deferred 3). The row's own `content_hash` fingerprints this
+/// payload via the log's canonical hashing, which [`load_review_resume`]
+/// recomputes on read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewStatePayload {
+    /// The approved plan this review runs under (mirrored into the row's
+    /// `plan_id` column; duplicated in-payload so the payload alone is
+    /// self-describing).
+    pub plan_id: String,
+    /// Session that wrote the snapshot — distinguishes a previous process
+    /// attempt's settled review from a sibling subtask of the live run.
+    pub session_id: String,
+    /// The implement-stage role whose output is under review.
+    pub implement_role: String,
+    /// Human-readable review target (the implement subtask description).
+    pub review_target: String,
+    /// Stable identity of the target within the plan:
+    /// [`review_target_identity`] of `(implement_role, review_target)`.
+    /// For approved-plan runs the decomposition comes from the seeded
+    /// DesignDoc, so this survives a restart byte-identically.
+    pub review_target_hash: String,
+    /// Snapshot status.
+    pub status: ReviewCycleStatus,
+    /// Cycle cap recorded when the snapshot was written.
+    pub max_cycles: u32,
+    /// Needs-revision verdicts issued so far (`== feedback_ledger.len()`).
+    pub retry_count: u32,
+    /// FULL feedback ledger snapshot — every needs-revision verdict so far,
+    /// oldest first.
+    pub feedback_ledger: Vec<ReviewFeedbackEntry>,
+    /// `gate_seq` of the previous snapshot in this cycle group (`0` = none);
+    /// the consistent-cut coordinate linking the snapshots in order. Must
+    /// never exceed the storing row's own `gate_seq` (the future cannot be
+    /// cited).
+    pub gate_seq_cursor: u64,
+    /// Snapshot instant, unix epoch milliseconds UTC.
+    pub created_at_ms: i64,
+}
+
+impl ReviewStatePayload {
+    /// Structural validation applied before a loaded snapshot is trusted.
+    ///
+    /// Checks the invariants every writer in this module upholds:
+    /// - the target hash matches what the caller is resuming;
+    /// - ledger cycles are strictly ascending from 1 and within the recorded
+    ///   cap, and every entry is a needs-revision verdict;
+    /// - `retry_count == feedback_ledger.len()`;
+    /// - open statuses leave at least one cycle unspent, `Escalated` spends
+    ///   them all, and `Completed` is reachable from any count;
+    /// - the cursor does not cite a log position after the row itself.
+    fn is_internally_consistent(
+        &self,
+        target_hash: &str,
+        row_gate_seq: u64,
+        spent_cycles: u32,
+    ) -> bool {
+        if self.review_target_hash != target_hash || self.gate_seq_cursor > row_gate_seq {
+            return false;
+        }
+        if self.retry_count as usize != self.feedback_ledger.len() {
+            return false;
+        }
+        for (index, entry) in self.feedback_ledger.iter().enumerate() {
+            // `u32::try_from` cannot fail for a realistic ledger length, but
+            // a cast would silently wrap — compare without casting.
+            let expected = match u32::try_from(index + 1) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            if entry.cycle_num != expected
+                || entry.cycle_num > self.max_cycles
+                || entry.verdict != "needs-revision"
+            {
+                return false;
+            }
+        }
+        match self.status {
+            ReviewCycleStatus::Started | ReviewCycleStatus::RevisionQueued => {
+                spent_cycles < self.max_cycles
+            }
+            ReviewCycleStatus::Completed => true,
+            ReviewCycleStatus::Escalated => spent_cycles == self.max_cycles,
+        }
+    }
+}
+
+/// Stable identity of a review target within a plan: blake3 over
+/// `implement_role \0 description`. Deterministic across restarts so the
+/// rehydrated lookup finds exactly the crashed cycle group.
+pub fn review_target_identity(implement_role: &str, review_target: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(implement_role.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(review_target.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Append one [`WhiteboardKind::ReviewState`] snapshot and return the stored
+/// row (its log-assigned `gate_seq` becomes the caller's next cursor).
+///
+/// WAL-before-invoke contract: the caller must await this BEFORE spawning the
+/// reviewer or continuing cycle logic, so a crash can only ever land between
+/// durable snapshots. Idempotency note: each transition mints a fresh
+/// `event_id` because it is a NEW fact (a distinct checkpoint), not a replay
+/// of an earlier one.
+pub async fn append_review_state_event(
+    pool: &sqlx::SqlitePool,
+    payload: &ReviewStatePayload,
+) -> Result<WhiteboardEvent, concerto_sessions::SessionError> {
+    let payload_json = serde_json::to_value(payload).map_err(|error| {
+        concerto_sessions::SessionError::Serialization(format!(
+            "review-state payload serialization: {error}"
+        ))
+    })?;
+    append_whiteboard_event(
+        pool,
+        &NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::ReviewState,
+            scope: String::new(),
+            session_id: Some(payload.session_id.clone()),
+            plan_id: Some(payload.plan_id.clone()),
+            causation: None,
+            payload: payload_json,
+            // Not a write: no pre-image (the gate fills this column for
+            // write events only).
+            pre_image_hash: None,
+            created_at: offset_ms(OffsetDateTime::now_utc()),
+        },
+    )
+    .await
+}
+
+/// What an entering review cycle should do, decided from the durable
+/// whiteboard state for `(plan_id, review_target_hash)`.
+#[derive(Debug, Clone)]
+pub enum ReviewResume {
+    /// No trustworthy prior state — start at cycle 1 (pre-Phase 3 behavior).
+    Fresh,
+    /// An open cycle group exists: continue at `resume_cycle`
+    /// (`feedback_ledger.len() + 1`) with the persisted counters, injecting
+    /// the full ledger into the reviewer context. `from_gate_seq` chains the
+    /// cursor for the next snapshot.
+    Resume {
+        resume_cycle: u32,
+        retry_count: u32,
+        feedback_ledger: Vec<ReviewFeedbackEntry>,
+        from_gate_seq: u64,
+    },
+    /// The cycle group already settled in a previous process attempt — the
+    /// recorded outcome stands and NO second review may run (oracle
+    /// comment 3). A terminal snapshot written by the CURRENT session is
+    /// deliberately NOT honored here: within one live run it belongs to a
+    /// sibling subtask with an identical target description, which deserves
+    /// its own fresh review.
+    Resolved { status: ReviewCycleStatus, feedback_ledger: Vec<ReviewFeedbackEntry> },
+}
+
+/// Load and VALIDATE the durable review-cycle state for a target (ADR-60
+/// Deferred 3 read side).
+///
+/// Every [`WhiteboardKind::ReviewState`] row under `plan_id` is verified
+/// against its own canonical content hash (rejecting stale/corrupt injection,
+/// oracle comment 1) and structurally validated; rejected rows are skipped
+/// with a warn, and if none survive the answer is [`ReviewResume::Fresh`] —
+/// degraded-but-safe, never silently trusting bad data. Among surviving rows
+/// the newest `gate_seq` decides between resume and resolved.
+///
+/// `Err` means the LOOKUP itself failed (storage error); the caller degrades
+/// to a fresh cycle with a warn rather than failing the run — continuity
+/// bookkeeping never blocks a review the way divergence-guarded plan
+/// artifacts legitimately do.
+pub async fn load_review_resume(
+    pool: &sqlx::SqlitePool,
+    plan_id: &str,
+    target_hash: &str,
+    current_session_id: &str,
+) -> Result<ReviewResume, String> {
+    let events = load_whiteboard_events_by_plan(pool, plan_id)
+        .await
+        .map_err(|error| format!("review-state lookup failed for {plan_id}: {error}"))?;
+
+    let mut valid: Vec<(u64, Option<String>, ReviewStatePayload)> = Vec::new();
+    for event in events.iter().filter(|event| {
+        event.kind == WhiteboardKind::ReviewState && event.plan_id.as_deref() == Some(plan_id)
+    }) {
+        // Layer 1 — content addressing: rebuild the canonical fields from the
+        // stored row and recompute the hash. A mutated payload (stale copy,
+        // manual edit, partial write surfaced by another bug) fails here and
+        // is dropped instead of driving a wrong resume.
+        let rebuilt = NewWhiteboardEvent {
+            event_id: event.event_id.clone(),
+            agent_id: event.agent_id.clone(),
+            kind: event.kind,
+            scope: event.scope.clone(),
+            session_id: event.session_id.clone(),
+            plan_id: event.plan_id.clone(),
+            causation: event.causation.clone(),
+            payload: event.payload.clone(),
+            pre_image_hash: event.pre_image_hash.clone(),
+            created_at: event.created_at,
+        };
+        let hash_verified =
+            matches!(compute_content_hash(&rebuilt), Ok(hash) if hash == event.content_hash);
+        if !hash_verified {
+            tracing::warn!(
+                event_id = %event.event_id,
+                "review-state row failed its content-hash verification; ignoring it \
+                 (ADR-60 Deferred 3)"
+            );
+            continue;
+        }
+        // Layer 2 — structure: deserialize and check writer invariants.
+        let payload: ReviewStatePayload = match serde_json::from_value(event.payload.clone()) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    %error,
+                    "review-state row carries an unreadable payload; ignoring it"
+                );
+                continue;
+            }
+        };
+        let spent_cycles = u32::try_from(payload.feedback_ledger.len()).unwrap_or(u32::MAX);
+        if !payload.is_internally_consistent(target_hash, event.gate_seq, spent_cycles) {
+            tracing::warn!(
+                event_id = %event.event_id,
+                "review-state row is structurally inconsistent with its cycle history; \
+                 ignoring it (ADR-60 Deferred 3)"
+            );
+            continue;
+        }
+        valid.push((event.gate_seq, event.session_id.clone(), payload));
+    }
+
+    // Newest surviving snapshot wins (gate_seq order from the loader).
+    let Some((row_gate_seq, row_session, latest)) = valid.last() else {
+        return Ok(ReviewResume::Fresh);
+    };
+
+    if latest.status.is_terminal() {
+        if row_session.as_deref() == Some(current_session_id) {
+            tracing::debug!(
+                plan_id = %plan_id,
+                "terminal review-state snapshot belongs to this session (sibling subtask \
+                 with an identical target); starting a fresh review"
+            );
+            return Ok(ReviewResume::Fresh);
+        }
+        return Ok(ReviewResume::Resolved {
+            status: latest.status,
+            feedback_ledger: latest.feedback_ledger.clone(),
+        });
+    }
+
+    let resume_cycle = match u32::try_from(latest.feedback_ledger.len() + 1) {
+        Ok(cycle) => cycle,
+        Err(_) => return Ok(ReviewResume::Fresh),
+    };
+    Ok(ReviewResume::Resume {
+        resume_cycle,
+        retry_count: latest.retry_count,
+        feedback_ledger: latest.feedback_ledger.clone(),
+        from_gate_seq: *row_gate_seq,
+    })
+}
+
 /// Translate the user's plan-binding decision into the run's effective outcome
 /// and audit confirmation (ADR-55 Phase 1d).
 ///
@@ -1147,5 +1489,313 @@ mod tests {
             PlanBinding::new("plan-other".into(), objective_hash(), None, "x".to_owned());
         let other = load_approved_plan(&pool, &stranger).await.expect("load");
         assert!(other.is_none(), "a different plan id sees nothing");
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 Deferred 3: run_review_cycle resumability.
+    // ------------------------------------------------------------------
+
+    const REVIEW_TARGET: &str = "implement the login feature";
+
+    fn review_payload(
+        status: ReviewCycleStatus,
+        session: &str,
+        ledger: Vec<ReviewFeedbackEntry>,
+    ) -> ReviewStatePayload {
+        ReviewStatePayload {
+            plan_id: "plan-d7".into(),
+            session_id: session.into(),
+            implement_role: "coder".into(),
+            review_target: REVIEW_TARGET.into(),
+            review_target_hash: review_target_identity("coder", REVIEW_TARGET),
+            status,
+            max_cycles: 3,
+            retry_count: u32::try_from(ledger.len()).unwrap_or(u32::MAX),
+            feedback_ledger: ledger,
+            gate_seq_cursor: 0,
+            created_at_ms: 1,
+        }
+    }
+
+    fn revision_entry(cycle: u32, reason: &str) -> ReviewFeedbackEntry {
+        ReviewFeedbackEntry {
+            cycle_num: cycle,
+            verdict: "needs-revision".to_owned(),
+            reason: Some(reason.to_owned()),
+        }
+    }
+
+    async fn append_review_snapshot(pool: &sqlx::SqlitePool, payload: &ReviewStatePayload) {
+        append_review_state_event(pool, payload).await.expect("review snapshot stored");
+    }
+
+    #[tokio::test]
+    async fn crash_between_start_and_verdict_resumes_not_duplicates() {
+        // The Phase 3 acceptance shape: a snapshot commits (WAL-before-
+        // invoke), the reviewer's verdict is lost to a crash, and a restart
+        // must continue from the durable position instead of re-running the
+        // settled cycles.
+        let (_dir, pool) = d7_pool().await;
+        let crashed_session = Ulid::new().to_string();
+
+        // Attempt 1: cycle 1 STARTED, then the process died before any
+        // verdict landed — exactly one open snapshot exists.
+        append_review_snapshot(
+            &pool,
+            &review_payload(ReviewCycleStatus::Started, &crashed_session, Vec::new()),
+        )
+        .await;
+        let resumed = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            "fresh-session",
+        )
+        .await
+        .expect("load");
+        match resumed {
+            ReviewResume::Resume { resume_cycle, retry_count, feedback_ledger, .. } => {
+                assert_eq!(resume_cycle, 1, "no verdicts were recorded");
+                assert_eq!(retry_count, 0);
+                assert!(feedback_ledger.is_empty());
+            }
+            other => panic!("expected Resume, got {other:?}"),
+        }
+
+        // Attempt 1 (earlier cycles): revision verdict + queued revision +
+        // cycle-2 start all committed before the second crash. The restart
+        // continues at cycle 2 with the FULL ledger — it does not restart at
+        // cycle 1 and re-ask an already-answered reviewer question.
+        append_review_snapshot(
+            &pool,
+            &review_payload(
+                ReviewCycleStatus::RevisionQueued,
+                &crashed_session,
+                vec![revision_entry(1, "missing error path")],
+            ),
+        )
+        .await;
+        append_review_snapshot(
+            &pool,
+            &review_payload(
+                ReviewCycleStatus::Started,
+                &crashed_session,
+                vec![revision_entry(1, "missing error path")],
+            ),
+        )
+        .await;
+        let resumed = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            "fresh-session",
+        )
+        .await
+        .expect("load");
+        match resumed {
+            ReviewResume::Resume { resume_cycle, retry_count, feedback_ledger, .. } => {
+                assert_eq!(resume_cycle, 2, "cycle 1 was fully settled pre-crash");
+                assert_eq!(retry_count, 1);
+                assert_eq!(
+                    feedback_ledger,
+                    vec![revision_entry(1, "missing error path")],
+                    "the full feedback ledger survives the crash"
+                );
+            }
+            other => panic!("expected Resume, got {other:?}"),
+        }
+
+        // A DIFFERENT target under the same plan never inherits this state.
+        let other = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", "implement the logout feature"),
+            "fresh-session",
+        )
+        .await
+        .expect("load");
+        assert!(matches!(other, ReviewResume::Fresh), "targets are isolated: {other:?}");
+    }
+
+    #[tokio::test]
+    async fn completed_review_suppresses_duplicate_cross_session_only() {
+        let (_dir, pool) = d7_pool().await;
+        let previous_session = Ulid::new().to_string();
+
+        // A previous attempt passed the review; the completion event is
+        // durable even though the process died right after (oracle comment
+        // 3: check for completion BEFORE resuming).
+        append_review_snapshot(
+            &pool,
+            &review_payload(
+                ReviewCycleStatus::RevisionQueued,
+                &previous_session,
+                vec![revision_entry(1, "off-by-one")],
+            ),
+        )
+        .await;
+        append_review_snapshot(
+            &pool,
+            &review_payload(ReviewCycleStatus::Completed, &previous_session, Vec::new()),
+        )
+        .await;
+
+        // The RESTARTED attempt (different session) must NOT run a second
+        // review for the same target — the recorded pass stands.
+        let resolved = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            "restarted-session",
+        )
+        .await
+        .expect("load");
+        assert!(
+            matches!(resolved, ReviewResume::Resolved { .. }),
+            "a settled review suppresses the duplicate: {resolved:?}"
+        );
+
+        // Within the SAME live session a terminal snapshot belongs to a
+        // sibling subtask with an identical description, which still gets
+        // its own fresh review.
+        let sibling = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            &previous_session,
+        )
+        .await
+        .expect("load");
+        assert!(
+            matches!(sibling, ReviewResume::Fresh),
+            "same-session terminals never suppress a live sibling: {sibling:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalated_round_trips_as_resolved() {
+        let (_dir, pool) = d7_pool().await;
+        let session = Ulid::new().to_string();
+        append_review_snapshot(
+            &pool,
+            &review_payload(
+                ReviewCycleStatus::Escalated,
+                &session,
+                vec![
+                    revision_entry(1, "still wrong"),
+                    revision_entry(2, "worse"),
+                    revision_entry(3, "hopeless"),
+                ],
+            ),
+        )
+        .await;
+        let resolved = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            "next-session",
+        )
+        .await
+        .expect("load");
+        match resolved {
+            ReviewResume::Resolved { status, feedback_ledger } => {
+                assert_eq!(status, ReviewCycleStatus::Escalated);
+                assert_eq!(feedback_ledger.len(), 3, "every spent cycle is in the ledger");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_and_inconsistent_rows_are_rejected_not_trusted() {
+        // Oracle comment 1: stale/corrupt injection must not drive a resume.
+        let (_dir, pool) = d7_pool().await;
+
+        // Layer 1 — a row whose payload is mutated AFTER commit no longer
+        // hashes to its stored content_hash and is ignored.
+        append_review_snapshot(
+            &pool,
+            &review_payload(ReviewCycleStatus::Completed, "crashed-session", Vec::new()),
+        )
+        .await;
+        let mut tampered = serde_json::to_value(review_payload(
+            ReviewCycleStatus::Completed,
+            "crashed-session",
+            Vec::new(),
+        ))
+        .expect("payload serializes");
+        tampered["status"] = serde_json::json!("completed-forged");
+        sqlx::query("UPDATE whiteboard_events SET payload = ? WHERE kind = 'review-state'")
+            .bind(tampered.to_string())
+            .execute(&pool)
+            .await
+            .expect("tamper applied");
+
+        // Layer 2 — a well-hashed row whose counters contradict its ledger
+        // (a buggy writer) is rejected by structural validation.
+        let mut inconsistent = review_payload(
+            ReviewCycleStatus::Started,
+            "crashed-session",
+            vec![revision_entry(1, "reason")],
+        );
+        inconsistent.retry_count = 5; // ledger.len() == 1
+        append_review_snapshot(&pool, &inconsistent).await;
+
+        let resumed = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            "restarted-session",
+        )
+        .await
+        .expect("load");
+        assert!(
+            matches!(resumed, ReviewResume::Fresh),
+            "corrupt rows are rejected wholesale, never trusted for a resume: {resumed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalated_with_unspent_cycles_is_rejected() {
+        // An Escalated claim that did not spend its cap contradicts every
+        // writer here — reject rather than settle on it.
+        let (_dir, pool) = d7_pool().await;
+        append_review_snapshot(
+            &pool,
+            &review_payload(
+                ReviewCycleStatus::Escalated,
+                "crashed-session",
+                vec![revision_entry(1, "only one of three cycles spent")],
+            ),
+        )
+        .await;
+        let resumed = load_review_resume(
+            &pool,
+            "plan-d7",
+            &review_target_identity("coder", REVIEW_TARGET),
+            "restarted-session",
+        )
+        .await
+        .expect("load");
+        assert!(matches!(resumed, ReviewResume::Fresh), "{resumed:?}");
+    }
+
+    #[tokio::test]
+    async fn review_target_identity_is_deterministic_and_discriminating() {
+        assert_eq!(
+            review_target_identity("coder", REVIEW_TARGET),
+            review_target_identity("coder", REVIEW_TARGET),
+            "identity is stable across restarts"
+        );
+        assert_ne!(
+            review_target_identity("coder", REVIEW_TARGET),
+            review_target_identity("reviewer", REVIEW_TARGET),
+            "role participates in the identity"
+        );
+        assert_ne!(
+            review_target_identity("coder", REVIEW_TARGET),
+            review_target_identity("coder", "another target"),
+            "description participates in the identity"
+        );
     }
 }

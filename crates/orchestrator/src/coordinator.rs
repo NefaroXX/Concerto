@@ -41,6 +41,10 @@ use crate::checkpoint;
 use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
 use crate::delta::FileDeltaTracker;
 use crate::graph::{Dependency, TaskGraph, TaskGraphValidator};
+use crate::plan_approval::{
+    append_review_state_event, load_review_resume, review_target_identity, ReviewCycleStatus,
+    ReviewFeedbackEntry, ReviewResume, ReviewStatePayload,
+};
 use crate::planner::{PlanArtifact, PlannerAgentInfo, TaskPlanner};
 use crate::registry::AgentRegistry;
 use crate::relationship::{
@@ -593,6 +597,12 @@ pub struct CoordinatorAgent {
     /// the architect is NOT re-invoked on the same objective — re-deriving an
     /// already-approved plan (silent re-decompose) is forbidden.
     approved_plan_seed: Option<ApprovedPlanSeed>,
+    /// ADR-60 Deferred 3: session-DB pool backing review-cycle resumability
+    /// (`ReviewState` whiteboard snapshots written before every reviewer
+    /// invocation and read back on restart). `None` (the default) degrades
+    /// review cycles to pre-Phase 3 behavior — observable via a debug log at
+    /// cycle entry, never a run failure.
+    review_store: Option<sqlx::SqlitePool>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -682,6 +692,39 @@ fn sentinel_capabilities(persona: &FallbackPersonaDef, kind: StageKind) -> Agent
     }
 }
 
+/// ADR-60 Deferred 3: build one full-state [`ReviewStatePayload`] snapshot
+/// for the review cycle identified by `(plan_id, target_hash)`. Every
+/// snapshot carries the complete feedback ledger and counters so a resumed
+/// run needs exactly the newest row (oracle: full state, not minimal).
+#[allow(clippy::too_many_arguments)]
+fn review_snapshot(
+    plan_id: &str,
+    session_id: Ulid,
+    implement_role: &str,
+    review_target: &str,
+    target_hash: &str,
+    status: ReviewCycleStatus,
+    max_cycles: u32,
+    retry_count: u32,
+    ledger: &[ReviewFeedbackEntry],
+    gate_seq_cursor: u64,
+) -> ReviewStatePayload {
+    let now = time::OffsetDateTime::now_utc();
+    ReviewStatePayload {
+        plan_id: plan_id.to_owned(),
+        session_id: session_id.to_string(),
+        implement_role: implement_role.to_owned(),
+        review_target: review_target.to_owned(),
+        review_target_hash: target_hash.to_owned(),
+        status,
+        max_cycles,
+        retry_count,
+        feedback_ledger: ledger.to_vec(),
+        gate_seq_cursor,
+        created_at_ms: now.unix_timestamp() * 1000 + i64::from(now.millisecond()),
+    }
+}
+
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -736,6 +779,7 @@ impl CoordinatorAgent {
             eval_engine: None,
             blueprint_facade: None,
             approved_plan_seed: None,
+            review_store: None,
         }
     }
 
@@ -1171,6 +1215,17 @@ impl CoordinatorAgent {
     /// forbidden). Unseeded runs (the default) are byte-identical to pre-D7.
     pub fn with_approved_plan_seed(mut self, seed: ApprovedPlanSeed) -> Self {
         self.approved_plan_seed = Some(seed);
+        self
+    }
+
+    /// ADR-60 Deferred 3: attach the whiteboard pool that makes review cycles
+    /// resumable. With a store AND an approved-plan seed attached, every
+    /// review cycle persists full-state snapshots (feedback ledger + retry
+    /// counters + gate-seq cursor) BEFORE invoking the reviewer, and an entry
+    /// after a restart resumes the crashed cycle instead of duplicating it.
+    /// `None` (the default) keeps pre-Phase 3 behavior with a degradation log.
+    pub fn with_review_store(mut self, pool: Option<sqlx::SqlitePool>) -> Self {
+        self.review_store = pool;
         self
     }
 
@@ -3804,6 +3859,28 @@ impl CoordinatorAgent {
         &self.settled_metrics
     }
 
+    /// ADR-60 Deferred 3: persist one review-cycle snapshot (fail-soft).
+    ///
+    /// Returns the stored row's `gate_seq` for cursor chaining, or `None`
+    /// when persistence degraded (no pool attached / append error). The
+    /// review continues either way — continuity bookkeeping must never fail
+    /// a run — and every degradation is logged, never silent.
+    async fn persist_review_state(&self, payload: &ReviewStatePayload) -> Option<u64> {
+        let pool = self.review_store.as_ref()?;
+        match append_review_state_event(pool, payload).await {
+            Ok(stored) => Some(stored.gate_seq),
+            Err(error) => {
+                warn!(
+                    %error,
+                    plan_id = %payload.plan_id,
+                    "failed to persist review state; the review continues without \
+                     resumability (ADR-60 Deferred 3 degradation)"
+                );
+                None
+            }
+        }
+    }
+
     /// Run the review loop: a review-stage agent checks implement output,
     /// re-runs the implement-stage agent if revision is needed, up to
     /// `max_cycles`. The cycle limit is governed by the `CollaborationRule`
@@ -3811,6 +3888,15 @@ impl CoordinatorAgent {
     ///
     /// ADR-35 §5: review participants are resolved by stage tag from the
     /// registry. Pipelines without a review-stage agent skip review.
+    ///
+    /// ADR-60 Deferred 3: with a review store AND an approved-plan binding
+    /// attached, every cycle transition is a full-state whiteboard snapshot
+    /// committed BEFORE the work it describes (WAL-before-invoke), and an
+    /// entry after a restart resumes the interrupted cycle group — ledger,
+    /// retry counters, and cursor rehydrated and validated — instead of
+    /// running a duplicate second review. Costs spent by the crashed attempt
+    /// are gone with it (only verdicts are durable) and are honestly absent
+    /// from the resumed run's totals.
     #[allow(clippy::too_many_arguments)]
     async fn run_review_cycle(
         &mut self,
@@ -3875,6 +3961,158 @@ impl CoordinatorAgent {
         let max_cycles =
             self.relationships.max_cycles(&reviewer_role, &implement_role, kind_default);
         self.review_cycles.set_max_cycles(max_cycles);
+        // ── ADR-60 Deferred 3: durable review-cycle state ───────────────────
+        // Identity of THIS cycle group: the approved plan id (the only
+        // identity that survives a process restart) plus a restart-stable
+        // hash of `(implement role, target description)` — approved-plan runs
+        // decompose from the seeded DesignDoc, so the description repeats
+        // byte-identically after a restart. Everything here is fail-soft:
+        // any rehydration or persistence problem degrades to pre-Phase 3
+        // behavior with an observable log, never a run failure.
+        let review_key = match (&self.review_store, self.approved_plan_seed.as_ref()) {
+            (Some(pool), Some(seed)) => Some((
+                pool.clone(),
+                seed.plan_id.clone(),
+                review_target_identity(implement_role.as_str(), &description),
+            )),
+            _ => None,
+        };
+        if review_key.is_none() {
+            tracing::debug!(
+                task_id = %task_id.0,
+                "review cycle not resumable (ADR-60 Deferred 3): no whiteboard store \
+                 attached or no approved-plan binding for this run"
+            );
+        }
+        let mut ledger: Vec<ReviewFeedbackEntry> = Vec::new();
+        let mut retry_count = 0_u32;
+        let mut last_review_event_seq = 0_u64;
+        let mut start_cycle = 1_u32;
+        if let Some((pool, plan_id, target_hash)) = &review_key {
+            match load_review_resume(pool, plan_id, target_hash, &session_id.to_string()).await {
+                Ok(ReviewResume::Resolved { status, feedback_ledger }) => {
+                    // Oracle comment 3 (idempotency): a previous attempt
+                    // already settled this cycle group — its recorded outcome
+                    // stands and NO second reviewer call may run for the same
+                    // target, even though this attempt's implement subtask
+                    // re-entered the review gate.
+                    tracing::info!(
+                        %plan_id,
+                        cycles = feedback_ledger.len(),
+                        ?status,
+                        "review cycle already settled per the whiteboard; suppressing \
+                         duplicate review (ADR-60 Deferred 3)"
+                    );
+                    if status == ReviewCycleStatus::Escalated {
+                        let _ = self.bus.publish_for_session(
+                            session_id,
+                            task_id.0,
+                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                        );
+                    } else {
+                        let _ = self.bus.publish_for_session(
+                            session_id,
+                            task_id.0,
+                            EventKind::ReviewCycleCompleted {
+                                task_id,
+                                cycle_num: u32::try_from(feedback_ledger.len() + 1).unwrap_or(1),
+                                verdict: "pass".into(),
+                            },
+                        );
+                    }
+                    let last_reason = feedback_ledger.last().and_then(|entry| entry.reason.clone());
+                    let summary = match status {
+                        ReviewCycleStatus::Escalated => format!(
+                            "Review remains unresolved: {} (settled before the restart; \
+                             resumed from whiteboard)",
+                            last_reason.unwrap_or_else(|| "max cycles reached".to_owned())
+                        ),
+                        _ => "Review previously completed for this deliverable \
+                              (resumed from whiteboard); no new review run"
+                            .to_owned(),
+                    };
+                    return Ok(AgentRunResult {
+                        task_id: TaskId::new(),
+                        role: source_result.role.clone(),
+                        outcome: AgentOutcome::Success,
+                        summary,
+                        files_modified: Vec::new(),
+                        tool_call_count: 0,
+                        cost_usd: 0.0,
+                        latency_ms: 0,
+                        provider: String::new(),
+                        model: String::new(),
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    });
+                }
+                Ok(ReviewResume::Resume {
+                    resume_cycle,
+                    retry_count: persisted_retries,
+                    feedback_ledger: persisted_ledger,
+                    from_gate_seq,
+                }) => {
+                    if resume_cycle > max_cycles {
+                        // The cap shrank between attempts (config change):
+                        // every slot is spent; settle unresolved without
+                        // another reviewer call rather than exceeding the cap.
+                        warn!(
+                            %plan_id,
+                            %resume_cycle,
+                            %max_cycles,
+                            "persisted review cycle is beyond the current cycle cap; \
+                             settling unresolved without another reviewer call"
+                        );
+                        let _ = self.bus.publish_for_session(
+                            session_id,
+                            task_id.0,
+                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                        );
+                        return Ok(AgentRunResult {
+                            task_id: TaskId::new(),
+                            role: source_result.role.clone(),
+                            outcome: AgentOutcome::Success,
+                            summary: format!(
+                                "Review remains unresolved after {max_cycles} cycles \
+                                 (resumed beyond the configured cap from whiteboard)"
+                            ),
+                            files_modified: Vec::new(),
+                            tool_call_count: 0,
+                            cost_usd: 0.0,
+                            latency_ms: 0,
+                            provider: String::new(),
+                            model: String::new(),
+                            tokens_in: 0,
+                            tokens_out: 0,
+                        });
+                    }
+                    // Fast-forward the in-memory gate counter so `next_cycle`
+                    // inside the loop stays consistent with the persisted
+                    // position (a restart rebuilt this manager empty).
+                    for _ in 1..resume_cycle {
+                        let _ = self.review_cycles.next_cycle(task_id);
+                    }
+                    start_cycle = resume_cycle;
+                    retry_count = persisted_retries;
+                    ledger = persisted_ledger;
+                    last_review_event_seq = from_gate_seq;
+                    tracing::info!(
+                        %plan_id,
+                        %resume_cycle,
+                        retries = retry_count,
+                        "resuming interrupted review cycle from whiteboard state \
+                         (ADR-60 Deferred 3)"
+                    );
+                }
+                // Nothing trustworthy persisted — start fresh (pre-Phase 3).
+                Ok(ReviewResume::Fresh) => {}
+                Err(error) => warn!(
+                    %error,
+                    "review-state lookup failed; proceeding without resumability \
+                     (ADR-60 Deferred 3 degradation)"
+                ),
+            }
+        }
         let mut review_input = source_result.clone();
         let mut revision_cost = 0.0;
         let mut revision_tool_calls = 0_u32;
@@ -3882,7 +4120,7 @@ impl CoordinatorAgent {
         let mut revision_tokens_in = 0_u64;
         let mut revision_tokens_out = 0_u64;
 
-        for cycle in 1..=max_cycles {
+        for cycle in start_cycle..=max_cycles {
             if cancel.is_cancelled() {
                 return Err(OrchestratorError::Cancelled);
             }
@@ -3893,12 +4131,53 @@ impl CoordinatorAgent {
                 EventKind::ReviewCycleStarted { task_id, cycle_num: cycle },
             );
 
+            // ADR-60 Deferred 3 (WAL-before-invoke): commit the FULL snapshot
+            // — ledger, counters, cursor — BEFORE spawning the reviewer, so a
+            // crash can only ever land between durable snapshots. A verdict
+            // lost in that gap leaves the snapshot open and the resumed run
+            // replays exactly one reviewer call with the ledger carried over.
+            if let Some((_pool, plan_id, target_hash)) = &review_key {
+                let snapshot = review_snapshot(
+                    plan_id,
+                    session_id,
+                    implement_role.as_str(),
+                    &description,
+                    target_hash,
+                    ReviewCycleStatus::Started,
+                    max_cycles,
+                    retry_count,
+                    &ledger,
+                    last_review_event_seq,
+                );
+                if let Some(stored_seq) = self.persist_review_state(&snapshot).await {
+                    last_review_event_seq = stored_seq;
+                }
+            }
+
+            // On a resumed cycle the reviewer must see the feedback the
+            // previous attempt already collected — otherwise it would redo
+            // settled work (the redundant cost Phase 3 exists to avoid).
+            let mut review_description = format!("Review cycle {cycle} for: {description}");
+            if !ledger.is_empty() {
+                review_description.push_str(
+                    "\n\nPrior review feedback carried over from before the restart \
+                     (ADR-60 Deferred 3); verify these were addressed instead of \
+                     redoing settled work:",
+                );
+                for entry in &ledger {
+                    let reason = entry.reason.as_deref().unwrap_or("unspecified");
+                    review_description.push_str(&format!(
+                        "\n- cycle {}: needs revision: {reason}",
+                        entry.cycle_num
+                    ));
+                }
+            }
             let review_task = SubTask {
                 id: TaskId::new(),
                 parent_id: Some(task_id),
                 session_id,
                 role: reviewer_role.clone(),
-                description: format!("Review cycle {cycle} for: {description}"),
+                description: review_description,
                 status: concerto_core::types::SubTaskStatus::Pending,
                 dependencies: vec![task_id],
                 deliverable: None,
@@ -3950,6 +4229,25 @@ impl CoordinatorAgent {
                             verdict: "pass".into(),
                         },
                     );
+                    // ADR-60 Deferred 3: settle the cycle group durably so a
+                    // restart reports it resolved instead of re-reviewing
+                    // (oracle comment 3). No cursor update needed — this arm
+                    // returns immediately.
+                    if let Some((_pool, plan_id, target_hash)) = &review_key {
+                        let snapshot = review_snapshot(
+                            plan_id,
+                            session_id,
+                            implement_role.as_str(),
+                            &description,
+                            target_hash,
+                            ReviewCycleStatus::Completed,
+                            max_cycles,
+                            retry_count,
+                            &ledger,
+                            last_review_event_seq,
+                        );
+                        let _ = self.persist_review_state(&snapshot).await;
+                    }
                     let mut completed = result.clone();
                     completed.cost_usd += revision_cost;
                     completed.tool_call_count =
@@ -3960,12 +4258,37 @@ impl CoordinatorAgent {
                     return Ok(completed);
                 }
                 AgentOutcome::NeedsRevision { reason } => {
+                    // ADR-60 Deferred 3: the verdict is durable BEFORE any
+                    // follow-up work, so a resumed run never replays a cycle
+                    // that already produced one.
+                    ledger.push(ReviewFeedbackEntry {
+                        cycle_num: cycle,
+                        verdict: "needs-revision".to_owned(),
+                        reason: Some(reason.clone()),
+                    });
+                    retry_count = retry_count.saturating_add(1);
                     if cycle >= max_cycles {
                         let _ = self.bus.publish_for_session(
                             session_id,
                             task_id.0,
                             EventKind::ReviewCycleEscalated { task_id, max_cycles },
                         );
+                        if let Some((_pool, plan_id, target_hash)) = &review_key {
+                            let snapshot = review_snapshot(
+                                plan_id,
+                                session_id,
+                                implement_role.as_str(),
+                                &description,
+                                target_hash,
+                                ReviewCycleStatus::Escalated,
+                                max_cycles,
+                                retry_count,
+                                &ledger,
+                                last_review_event_seq,
+                            );
+                            // Terminal arm — returns below, no cursor update.
+                            let _ = self.persist_review_state(&snapshot).await;
+                        }
                         let mut unresolved = result.clone();
                         unresolved.cost_usd += revision_cost;
                         unresolved.tool_call_count =
@@ -3995,6 +4318,27 @@ impl CoordinatorAgent {
                             rationale: handoff.rationale.clone(),
                         },
                     );
+                    // ADR-60 Deferred 3: durably record the queued revision
+                    // before dispatching it — a crash here resumes AFTER this
+                    // verdict (one fresh implement pass + next review), never
+                    // re-asking the same reviewer question.
+                    if let Some((_pool, plan_id, target_hash)) = &review_key {
+                        let snapshot = review_snapshot(
+                            plan_id,
+                            session_id,
+                            implement_role.as_str(),
+                            &description,
+                            target_hash,
+                            ReviewCycleStatus::RevisionQueued,
+                            max_cycles,
+                            retry_count,
+                            &ledger,
+                            last_review_event_seq,
+                        );
+                        if let Some(stored_seq) = self.persist_review_state(&snapshot).await {
+                            last_review_event_seq = stored_seq;
+                        }
+                    }
                     let coder_task = SubTask {
                         id: TaskId::new(),
                         parent_id: Some(task_id),

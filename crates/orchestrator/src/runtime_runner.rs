@@ -3714,6 +3714,22 @@ async fn run_multi_agent(
             design_doc: context.design_doc.clone(),
         });
     }
+    // ADR-60 Deferred 3: review-cycle resumability rides the same opt-in as
+    // D7 (`supervisor_enabled` + `plan_binding_source: whiteboard`) — with a
+    // default config nothing changes. The pool is the run's own session DB,
+    // the same durable log the write gate and the plan events use. Without a
+    // pool (or without the flag) review cycles degrade to pre-Phase 3
+    // behavior; the missing-pool case is warned here because only this site
+    // knows both facts.
+    if d7_whiteboard_enabled(services.config.multi_agent.as_ref()) {
+        if gate_log_pool.is_none() {
+            tracing::warn!(
+                "no session DB pool — review cycles run non-resumable \
+                 (ADR-60 Deferred 3 degradation)"
+            );
+        }
+        coordinator = coordinator.with_review_store(gate_log_pool.clone());
+    }
     // ADR-60 D7: an approved-plan run does NOT inject the conversation
     // history as prose — that transcript carries the rendered plan markdown,
     // and the whiteboard-verified structured artifact governs instead.
@@ -3981,13 +3997,15 @@ async fn run_multi_agent(
 // for the child, never process termination. There is no direct executor write
 // anywhere on this path.
 //
-// TODO(ADR-60 Deferred 3, Phase 3): early resumability stub — persist at
-// least `plan_id` + `review_target` when a review cycle enters so a restart
-// cannot run a duplicate second review for the same plan. Not done here:
-// it needs both a durable stash reachable from the coordinator/child loop
-// AND rehydration-on-restart to actually prevent duplicates; half of it
-// would only fake safety. Tracked for Phase 3 (oracle review 2026-08-22,
-// comment 4).
+// ADR-60 Deferred 3 (implemented): review-cycle resumability lives in
+// `plan_approval.rs` (shared `ReviewState` whiteboard kind + payload, one
+// serialization for every path) and `coordinator.rs::run_review_cycle`
+// (WAL-before-invoke snapshots at every cycle transition + validated
+// rehydration on entry). The coordinator path attaches the store in this
+// file behind the D7 opt-in. Supervised CHILDREN are single-agent loops and
+// run no multi-agent review cycles today; when they gain review
+// participation (Phase 4), they must reuse the same plan_approval helpers —
+// not a second serialization.
 // ===========================================================================
 
 /// Wall-clock budget for one supervised multi-agent run before it is torn
