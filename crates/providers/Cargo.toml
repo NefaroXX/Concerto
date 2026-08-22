@@ -29,7 +29,7 @@ fastrand = { workspace = true }
 httpdate = "1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 # Used by provider-compat tests (audit H-01) to build the real
 # submit_design_doc schema instead of a hand-maintained duplicate.
 schemars = "1"
