@@ -121,7 +121,7 @@ semver = "1"
 iced = { version = "0.14", features = ["tokio", "canvas"] }
 
 # ---- Terminal UI (Phase 3, ADR-07) ----
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 
 # ---- Syntax highlighting for diff viewer (Phase 3) ----
