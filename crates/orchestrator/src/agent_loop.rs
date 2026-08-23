@@ -2914,10 +2914,26 @@ mod tests {
         assert!(content.contains("hello from disk"), "written file content mismatch: {content}");
 
         // And it must be runnable: executing it produces the expected output.
-        let ran = std::process::Command::new("python3")
+        // Interpreter probe: prefer `python3`, fall back to `python` (stock
+        // Windows exposes only `python` on PATH). A candidate counts only if
+        // it spawns and exits successfully — Windows' Store alias stub for
+        // `python3` resolves on PATH yet always exits non-zero, so exit status
+        // is part of the probe. With no interpreter at all, degrade to a
+        // logged skip rather than failing the disk-write behavior under test.
+        let interpreter = ["python3", "python"].into_iter().find(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .output()
+                .is_ok_and(|probe| probe.status.success())
+        });
+        let Some(interpreter) = interpreter else {
+            eprintln!("skipping runnability assertion: neither python3 nor python is on PATH");
+            return;
+        };
+        let ran = std::process::Command::new(interpreter)
             .arg(&written)
             .output()
-            .expect("python3 should be available");
+            .expect("interpreter probed above should stay available");
         let stdout = String::from_utf8_lossy(&ran.stdout);
         assert!(
             stdout.contains("hello from disk"),
