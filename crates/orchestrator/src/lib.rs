@@ -16,6 +16,7 @@ pub mod agent_runner;
 pub mod agents;
 pub mod checkpoint;
 pub mod conflict;
+pub mod consolidation;
 mod context_compaction;
 pub mod context_engine;
 pub mod coordinator;

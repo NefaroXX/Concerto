@@ -282,6 +282,7 @@ async fn real_agent_process_gated_write_completes_end_to_end() {
         ),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: memory.clone(),
         project_id: ProjectId("proj-s5".to_owned()),
     };
@@ -363,6 +364,7 @@ async fn denied_write_fails_the_tool_call_but_the_agent_completes() {
         ),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-s5".to_owned()),
     };

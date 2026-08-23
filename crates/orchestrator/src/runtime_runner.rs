@@ -3498,6 +3498,13 @@ async fn run_multi_agent(
     if action_required
         && services.config.multi_agent.as_ref().is_some_and(|multi| multi.supervisor_enabled)
     {
+        // ADR-60 D7 ledger enrichment (Phase 4): a plan-driven run (its
+        // whiteboard-verified context rehydrated by the caller) hands its
+        // approved plan id to the children so their gated writes and terminal
+        // events key into the plan's ledger.
+        let supervised_plan_id = approved_plan.map(|context| context.binding.plan_id().to_owned());
+        let consolidation =
+            build_supervised_consolidation(&req.project_dir, req.memory_enabled).await;
         match prepare_supervised_run(
             services.config.multi_agent.as_ref(),
             &req.project_dir,
@@ -3507,6 +3514,8 @@ async fn run_multi_agent(
             executor.clone(),
             gate_log_pool.clone(),
             memory.clone(),
+            consolidation,
+            supervised_plan_id,
         ) {
             Some(supervised) => {
                 return drive_supervised_run(
@@ -4031,6 +4040,12 @@ struct SupervisedRun {
     session_id: Ulid,
     /// `(agent id, task description)` pairs to spawn, in topology order.
     tasks: Vec<(String, String)>,
+    /// ADR-60 D7 ledger enrichment (Phase 4): the approved plan this run
+    /// executes, when the run is plan-driven under the whiteboard binding.
+    /// Handed to each child via `CONCERTO_PLAN_ID` so the child stamps
+    /// `GateRequest.plan_id` and its terminal events — write-applied rows and
+    /// subtask completions then key into the plan's ledger (`fold_ledger`).
+    plan_id: Option<String>,
 }
 
 /// Prepare everything a supervised multi-agent run needs, or `None` (with a
@@ -4049,6 +4064,8 @@ fn prepare_supervised_run(
     executor: Arc<ToolExecutor>,
     gate_log_pool: Option<sqlx::SqlitePool>,
     memory: Arc<dyn MemoryStore>,
+    consolidation: Option<Arc<crate::consolidation::Consolidator>>,
+    plan_id: Option<String>,
 ) -> Option<SupervisedRun> {
     let tasks = supervised_agent_tasks(multi_agent, objective);
     if tasks.is_empty() {
@@ -4088,6 +4105,7 @@ fn prepare_supervised_run(
         memory,
         project_id: ProjectId(concerto_core::helpers::project_id_hash(project_dir)),
         subscriptions: SubscriptionManager::new(log_pool),
+        consolidation,
     };
     // ADR-60 D3: every supervised worker subscribes to `Decision` topics so
     // sibling decisions stream to it as `whiteboard-slice` pushes (protocol
@@ -4106,7 +4124,61 @@ fn prepare_supervised_run(
         project_root: project_dir.to_path_buf(),
         session_id,
         tasks,
+        plan_id,
     })
+}
+
+/// ADR-60 D6 (Phase 4): construct the supervised consolidation projection
+/// task over the project's memory DB (`<app data>/memory/memory.db`), the
+/// same store the memory subsystem indexes into.
+///
+/// Fail-soft like every optional spine on this path: memory disabled, an
+/// unopenable DB, or a failed store migration yields `None` with a warn — the
+/// supervised run proceeds without consolidation, and the whiteboard log (the
+/// source of truth) is unaffected. Gated behind `memory_enabled` so a user
+/// who disabled the memory subsystem never gets a hidden projection writer.
+async fn build_supervised_consolidation(
+    project_dir: &Path,
+    memory_enabled: bool,
+) -> Option<Arc<crate::consolidation::Consolidator>> {
+    if !memory_enabled {
+        tracing::debug!("memory disabled — supervised D6 consolidation not constructed");
+        return None;
+    }
+    let project_id = ProjectId(concerto_core::helpers::project_id_hash(project_dir));
+    let db_path = match concerto_sessions::app_data_dir() {
+        Ok(dir) => dir.join("memory").join("memory.db"),
+        Err(error) => {
+            tracing::warn!(%error, "data directory unavailable — no D6 consolidation projection");
+            return None;
+        }
+    };
+    let db_utf8 = match camino::Utf8PathBuf::from_path_buf(db_path) {
+        Ok(path) => path,
+        Err(path) => {
+            tracing::warn!(
+                path = %path.display(),
+                "memory DB path is not valid UTF-8 — no D6 consolidation projection"
+            );
+            return None;
+        }
+    };
+    let db = match concerto_memory::storage::MemoryDb::connect(&db_utf8).await {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(%error, "memory DB unavailable — no D6 consolidation projection");
+            return None;
+        }
+    };
+    let pool = db.pool().clone();
+    let store = match concerto_memory::vector_store::SqliteVectorStore::new(pool.clone()).await {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::warn!(%error, "vector store unavailable — no D6 consolidation projection");
+            return None;
+        }
+    };
+    Some(Arc::new(crate::consolidation::Consolidator::new(pool, store, project_id)))
 }
 
 /// Locate the ADR-60 agent-process child binary: an explicit
@@ -4189,6 +4261,12 @@ async fn drive_supervised_run(
             // agent-process binary wires the mock provider only today; real
             // provider plumbing is a later ADR-60 chunk.
             .env("CONCERTO_PROVIDER", "mock");
+        // ADR-60 D7 ledger enrichment: a plan-driven run stamps every child
+        // write with the approved plan id (the child mirrors it onto
+        // `GateRequest.plan_id` and its terminal whiteboard events).
+        if let Some(plan_id) = &run.plan_id {
+            command.env("CONCERTO_PLAN_ID", plan_id);
+        }
         if let Err(error) = supervisor.spawn_agent(&mut command, agent_id) {
             event_recorder.stop().await;
             transcript_recorder.stop().await;

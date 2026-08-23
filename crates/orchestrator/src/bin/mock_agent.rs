@@ -56,6 +56,21 @@
 //!   `retrieve-memory` requests (wire ids `300..`, query
 //!   `supervisor memory query`, limit 3). Default: none.
 //!
+//! ### Whiteboard-slice consumption (ADR-60 D3 crash-window tests)
+//!
+//! The stock fixture ignores `whiteboard-slice` notifications. Two optional
+//! knobs turn it into a consuming subscriber for the Ack→cursor window:
+//!
+//! - `MOCK_AGENT_ACK_SLICES=1` — on every received slice, emit an
+//!   `ack-whiteboard` request for its `end_gate_seq` (wire ids `400..`,
+//!   fire-and-forget).
+//! - `MOCK_AGENT_CRASH_ONCE_FILE=<path>` — on the FIRST received slice of
+//!   this fixture lineage: create `<path>` and exit 1 BEFORE acking,
+//!   simulating a subscriber dying between slice delivery and cursor update.
+//!   The file is cross-incarnation memory: the supervisor's restarted child
+//!   sees the marker exists and proceeds to consume + ack instead of
+//!   crashing again.
+//!
 //! Outbound emission order is deterministic: heartbeats, then tool requests,
 //! then publishes, then retrieves — all in one burst after the handshake.
 
@@ -109,6 +124,10 @@ async fn run() -> i32 {
     // exactly what the supervisor wrote on the wire (e.g. `whiteboard-slice`
     // notifications).
     let log_path = std::env::var("MOCK_AGENT_LOG_FILE").ok();
+    // Whiteboard-slice consumption knobs (module docs: crash-window tests).
+    let ack_slices = std::env::var("MOCK_AGENT_ACK_SLICES").is_ok();
+    let crash_once_file = std::env::var("MOCK_AGENT_CRASH_ONCE_FILE").ok();
+    let mut next_ack_id = 400u64;
 
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -165,6 +184,55 @@ async fn run() -> i32 {
                             let _ = std::io::Write::write_all(&mut file, b"\n");
                         }
                     }
+                }
+                // ADR-60 D3 crash-window consumption: a `whiteboard-slice`
+                // notification is either the deterministic crash (first slice
+                // of the lineage: die before acking — the supervisor's cursor
+                // has not advanced, so redelivery is guaranteed) or, on the
+                // restarted incarnation, consumed + acked via a
+                // fire-and-forget `ack-whiteboard` request.
+                if let Some(end_gate_seq) = whiteboard_slice_end(&value) {
+                    if let Some(marker) = &crash_once_file {
+                        if !std::path::Path::new(marker).exists() {
+                            if let Err(error) = std::fs::write(marker, b"slice-before-ack") {
+                                eprintln!(
+                                    "orchestrator-mock-agent: crash marker write failed: {error}"
+                                );
+                                return 1;
+                            }
+                            exit_before_dropping().await;
+                            return 1;
+                        }
+                    }
+                    if ack_slices {
+                        let ack = IpcRequest {
+                            jsonrpc: "2.0".to_owned(),
+                            id: next_ack_id,
+                            method: IpcMethod::AckWhiteboard,
+                            params: IpcParams::AckWhiteboard { end_gate_seq },
+                        };
+                        next_ack_id += 1;
+                        match serde_json::to_value(&ack) {
+                            Ok(ack_value) => {
+                                if let Some(code) = write_json(&mut stdout, &ack_value).await {
+                                    return code;
+                                }
+                                if let Err(error) = stdout.flush().await {
+                                    eprintln!(
+                                        "orchestrator-mock-agent: stdout flush failed: {error}"
+                                    );
+                                    return 1;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "orchestrator-mock-agent: failed to serialize ack: {error}"
+                                );
+                                return 1;
+                            }
+                        }
+                    }
+                    continue;
                 }
                 match handle_message_typed(value) {
                     MaybeReply::Write(response, agent_id) => {
@@ -402,6 +470,24 @@ where
         return Some(0);
     }
     None
+}
+
+/// The `end_gate_seq` of a `whiteboard-slice` NOTIFICATION line, or `None`.
+/// Shape-probed (not fully deserialized) on purpose: the fixture only needs
+/// the ack coordinate, and a malformed slice must not crash the fixture
+/// outside the deterministic crash window.
+fn whiteboard_slice_end(value: &Value) -> Option<u64> {
+    let method = value.get("method").and_then(|m| m.as_str())?;
+    if method != "whiteboard-slice" {
+        return None;
+    }
+    // Wire shape: params are internally tagged (`type`) with the payload
+    // under `value`, so the ack coordinate lives at params.value.end_gate_seq.
+    value
+        .get("params")
+        .and_then(|params| params.get("value"))
+        .and_then(|payload| payload.get("end_gate_seq"))
+        .and_then(|seq| seq.as_u64())
 }
 
 /// Dispatch one decoded message: requests first (a request also decodes as a

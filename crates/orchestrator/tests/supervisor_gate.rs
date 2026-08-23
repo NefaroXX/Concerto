@@ -233,6 +233,7 @@ async fn execute_tool_flows_through_gate_to_whiteboard_with_bound_attribution() 
         gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-1".to_owned()),
     };
@@ -267,6 +268,7 @@ async fn denied_execute_tool_persists_nothing_and_agent_stays_healthy() {
         gate: gate(engine(vec![PolicyRule::AutoDeny(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-1".to_owned()),
     };
@@ -310,6 +312,7 @@ async fn publish_event_assigns_sequencing_and_binds_agent() {
         gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-1".to_owned()),
     };
@@ -343,6 +346,7 @@ async fn tool_and_publish_share_one_global_gate_seq_order() {
         gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-1".to_owned()),
     };
@@ -378,6 +382,7 @@ async fn retrieve_memory_queries_the_spine_once_per_request() {
         gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: memory.clone(),
         project_id: ProjectId("proj-1".to_owned()),
     };
@@ -399,6 +404,7 @@ async fn clean_exit_marks_agent_completed_and_is_never_restarted() {
         gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-1".to_owned()),
     };
@@ -427,6 +433,7 @@ async fn nonzero_exit_is_a_crash_and_consumes_the_restart_budget() {
         gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-1".to_owned()),
     };
