@@ -728,6 +728,11 @@ pub struct SupervisorServices {
     /// ADR-60 D3 subscription manager: per-agent cursors and bounded slices
     /// for the `whiteboard-slice` / `ack-whiteboard` push surface.
     pub subscriptions: SubscriptionManager,
+    /// ADR-60 D6 consolidation projection task; `None` when no projection
+    /// store is available (fail-soft degradation, mirroring the gate without
+    /// a session DB). When attached, write-path handlers feed it append
+    /// counts so it can detach an out-of-band fold pass onto the runtime.
+    pub consolidation: Option<std::sync::Arc<crate::consolidation::Consolidator>>,
 }
 
 /// One supervisor instance: owns all agent children, their pipes, and their
@@ -1166,7 +1171,7 @@ impl Supervisor {
                                             }
                                             IpcParams::PublishEvent { event } => {
                                                 handle_publish_event(
-                                                    &services, &agent_id, event, id,
+                                                    &services, &agent_id, event, id, &cancel,
                                                 )
                                                 .await
                                             }
@@ -1514,8 +1519,15 @@ fn dispatch_agent_line(
         return match request.method {
             IpcMethod::Handshake => Dispatch::None,
             IpcMethod::Heartbeat => match &request.params {
-                IpcParams::Heartbeat { seq, timestamp_ms, .. } => {
-                    let accepted = meta.record_heartbeat(*seq, *timestamp_ms, now_ms).is_ok();
+                IpcParams::Heartbeat { seq, .. } => {
+                    // Liveness anchors on THIS process's clock (`now_ms`),
+                    // matching the handshake's `last_seen_ms` stamp — never
+                    // on the agent's self-reported wire `timestamp_ms`,
+                    // which comes from another process's clock and can sit
+                    // milliseconds behind the supervisor's sample of its
+                    // own, spuriously tripping ClockWentBackwards and
+                    // silently dropping healthy heartbeats.
+                    let accepted = meta.record_heartbeat(*seq, now_ms, 0).is_ok();
                     Dispatch::Reply(reply_ok(request.id, IpcResult::Heartbeat { accepted }))
                 }
                 _ => Dispatch::Reply(reply_error(
@@ -1547,8 +1559,11 @@ fn dispatch_agent_line(
     }
     if let Ok(notification) = serde_json::from_str::<IpcNotification>(text) {
         if notification.method == IpcMethod::Heartbeat {
-            if let IpcParams::Heartbeat { seq, timestamp_ms, .. } = notification.params {
-                let _ = meta.record_heartbeat(seq, timestamp_ms, now_ms);
+            if let IpcParams::Heartbeat { seq, .. } = notification.params {
+                // Same clock rule as the request path: record against this
+                // process's `now_ms`, not the agent's wire timestamp (see
+                // the comment there).
+                let _ = meta.record_heartbeat(seq, now_ms, 0);
             }
         }
         return Dispatch::None;
@@ -1603,6 +1618,11 @@ async fn handle_execute_tool(
             // itself); the publisher needs no re-read — `gate_seq` is the
             // wake coordinate.
             services.subscriptions.mark_append(outcome.gate_seq).await;
+            // ADR-60 D6: feed the consolidation trigger. The pass detaches
+            // onto the runtime — this reply path never awaits indexing.
+            if let Some(consolidator) = &services.consolidation {
+                consolidator.note_append(cancel.clone());
+            }
             reply_ok(id, IpcResult::ExecuteTool { outcome })
         }
         Err(error) => {
@@ -1622,17 +1642,22 @@ async fn handle_execute_tool(
 /// log assigns `gate_seq` (global) and `agent_seq` (per agent). The agent id
 /// is bound to the registered process, never trusted from the wire. A
 /// committed append wakes subscribed peers so their slices flow on a later
-/// tick.
+/// tick, and counts toward the D6 consolidation trigger.
 async fn handle_publish_event(
     services: &SupervisorServices,
     agent_id: &str,
     mut event: NewWhiteboardEvent,
     id: u64,
+    cancel: &CancellationToken,
 ) -> Box<IpcResponse> {
     event.agent_id = agent_id.to_owned();
     match append_whiteboard_event(&services.whiteboard_pool, &event).await {
         Ok(stored) => {
             services.subscriptions.mark_append(stored.gate_seq).await;
+            // ADR-60 D6: same out-of-band trigger as the gated-write path.
+            if let Some(consolidator) = &services.consolidation {
+                consolidator.note_append(cancel.clone());
+            }
             reply_ok(id, IpcResult::PublishEvent { stored })
         }
         Err(error) => reply_error_full(
@@ -1670,7 +1695,10 @@ async fn handle_list_tools(
 }
 
 /// Query the memory spine off the loop (ADR-60 D6). The query is scoped to
-/// the supervisor's project namespace; the wire agent id is ignored.
+/// the supervisor's project namespace; the wire agent id is ignored. The
+/// shortlist is clamped to [`crate::consolidation::DISCLOSURE_MAX_CHUNKS`] —
+/// one disclosure level with a bounded 5–10-chunk window, never unbounded
+/// retrieval.
 async fn handle_retrieve_memory(
     services: &SupervisorServices,
     _agent_id: &str,
@@ -1679,11 +1707,12 @@ async fn handle_retrieve_memory(
     id: u64,
     cancel: &CancellationToken,
 ) -> Box<IpcResponse> {
+    let top_k = (limit.max(1) as usize).min(crate::consolidation::DISCLOSURE_MAX_CHUNKS);
     let query = MemoryQuery {
         text: query_text,
         project_id: services.project_id.clone(),
         namespace: MemoryNamespace::Project(services.project_id.clone()),
-        top_k: limit.max(1) as usize,
+        top_k,
         filters: Vec::new(),
     };
     match services.memory.retrieve(&query, cancel.clone()).await {
@@ -2121,6 +2150,7 @@ mod write_path_tests {
             memory: Arc::new(CountingMemoryStore),
             project_id: ProjectId("proj-d5-inject".to_owned()),
             subscriptions: SubscriptionManager::new(pool),
+            consolidation: None,
         }
     }
 
@@ -2402,9 +2432,79 @@ mod write_path_tests {
         // `handle_publish_event` appends and wakes subscribers; `peer` and
         // `other` are at cursor 0 so both become flush candidates.
         let event = new_event("agent-a", WhiteboardKind::Decision, "peer-visible");
-        handle_publish_event(&services, "agent-a", event, 2).await;
+        handle_publish_event(&services, "agent-a", event, 2, &CancellationToken::new()).await;
         let candidates = services.subscriptions.flush_candidates().await;
         assert!(candidates.contains(&"peer".to_owned()));
         assert!(candidates.contains(&"other".to_owned()));
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-60 D6 minimal consolidation (Phase 4): the write path feeds the
+    // trigger; the pass runs OUT-OF-BAND (the reply returns first) and lands
+    // a `Consolidation` bookmark once the append threshold is crossed.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_events_trigger_an_out_of_band_consolidation_pass() {
+        use crate::consolidation::{Consolidator, CONSOLIDATION_TRIGGER_APPENDS};
+        use concerto_memory::vector_store::SqliteVectorStore;
+
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let (_pool_dir, pool) = test_pool().await;
+        let store = std::sync::Arc::new(
+            SqliteVectorStore::new(pool.clone()).await.expect("projection store opens"),
+        );
+        let mut services = services(pool.clone(), dir.path().to_path_buf());
+        services.consolidation = Some(std::sync::Arc::new(Consolidator::new(
+            pool.clone(),
+            store,
+            ProjectId("proj-d6-supervisor".to_owned()),
+        )));
+
+        // Fewer than the threshold: no pass may run.
+        for n in 0..(CONSOLIDATION_TRIGGER_APPENDS - 1) {
+            let event = new_event("agent-a", WhiteboardKind::Decision, &format!("note-{n}"));
+            let response =
+                handle_publish_event(&services, "agent-a", event, n, &CancellationToken::new())
+                    .await;
+            assert!(response.error.is_none());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !all_events(&pool)
+                .await
+                .iter()
+                .any(|event| event.kind == WhiteboardKind::Consolidation),
+            "no bookmark before the append threshold"
+        );
+
+        // The threshold append detaches the pass; the reply itself must not
+        // wait for it (out-of-band), so we only poll for the eventual result.
+        let event = new_event("agent-a", WhiteboardKind::Decision, "threshold-crosser");
+        let response = handle_publish_event(
+            &services,
+            "agent-a",
+            event,
+            CONSOLIDATION_TRIGGER_APPENDS,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(response.error.is_none(), "the reply is immediate");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if all_events(&pool)
+                .await
+                .iter()
+                .any(|event| event.kind == WhiteboardKind::Consolidation)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached consolidation pass never recorded its bookmark"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

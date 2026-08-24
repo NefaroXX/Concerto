@@ -244,6 +244,10 @@ impl GateProxyClient {
 pub struct GateProxyBackend {
     client: Arc<tokio::sync::Mutex<GateProxyClient>>,
     agent_id: String,
+    /// ADR-60 D7 ledger enrichment (Phase 4): the approved plan this child
+    /// executes (from `CONCERTO_PLAN_ID`), stamped onto every gated request
+    /// so write-applied rows key into the plan's ledger.
+    plan_id: Option<String>,
     definitions: std::sync::OnceLock<Vec<ToolDefinition>>,
 }
 
@@ -255,11 +259,12 @@ impl GateProxyBackend {
     pub async fn new(
         client: Arc<tokio::sync::Mutex<GateProxyClient>>,
         agent_id: String,
+        plan_id: Option<String>,
     ) -> Result<Self, GateProxyError> {
         let mut guard = client.lock().await;
         let tools = guard.list_tools().await?;
         drop(guard);
-        let backend = Self { client, agent_id, definitions: std::sync::OnceLock::new() };
+        let backend = Self { client, agent_id, plan_id, definitions: std::sync::OnceLock::new() };
         let _ = backend.definitions.set(tools);
         Ok(backend)
     }
@@ -329,7 +334,9 @@ impl ToolExecutionBackend for GateProxyBackend {
             input,
             session_id: Some(session.session_id.to_string()),
             scope: Self::SCOPE.to_owned(),
-            plan_id: None,
+            // Ledger enrichment (ADR-60 D7): the run's approved plan, when
+            // the process was spawned for a plan-driven task.
+            plan_id: self.plan_id.clone(),
             causation: None,
             base_versions,
         };

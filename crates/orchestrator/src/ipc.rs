@@ -8,7 +8,8 @@
 //! ## Framing
 //!
 //! [`write_message`] emits one compact-JSON message per line (terminated by
-//! `\n`); [`read_message`] reads exactly one line back, bounded by `max_len`
+//! `\n`) and flushes the writer before returning; [`read_message`] reads
+//! exactly one line back, bounded by `max_len`
 //! (default [`MAX_MESSAGE_BYTES`]). Clean EOF between lines yields
 //! `Ok(None)`; EOF mid-message is [`IpcTransportError::Closed`]; a line over
 //! the cap is [`IpcTransportError::Oversized`]; malformed frame bytes (empty
@@ -449,6 +450,12 @@ pub fn serialize_frame(message: &serde_json::Value) -> Result<Vec<u8>, IpcTransp
 /// Serialize `message` and write it as one newline-delimited line (message +
 /// `\n`), mirroring the MCP stdio framing. Rejects messages over
 /// [`MAX_MESSAGE_BYTES`].
+///
+/// The writer is flushed before returning, so one awaited call delivers one
+/// frame to the OS. This matters for `tokio::io::Stdout`, whose unflushed
+/// writes sit in a shared buffer drained by a background flusher thread:
+/// relying on that timing made supervised-child output nondeterministic
+/// under load (whole bursts could stay unobserved for a child's lifetime).
 pub async fn write_message<W>(
     writer: &mut W,
     message: &serde_json::Value,
@@ -460,6 +467,7 @@ where
 
     let line = serialize_frame(message)?;
     writer.write_all(&line).await?;
+    writer.flush().await?;
     Ok(())
 }
 

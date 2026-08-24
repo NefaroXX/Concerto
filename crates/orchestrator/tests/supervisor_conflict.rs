@@ -447,6 +447,7 @@ async fn concurrent_same_file_writes_surface_durably_and_never_corrupt() {
         gate: fs_gate(pool.clone(), gate_root.path().to_path_buf(), vec![]),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -514,6 +515,7 @@ async fn sequential_same_file_writes_by_two_agents_both_apply() {
             gate: fs_gate(pool.clone(), root.to_path_buf(), vec![]),
             whiteboard_pool: pool.clone(),
             subscriptions: SubscriptionManager::new(pool.clone().clone()),
+            consolidation: None,
             memory: Arc::new(CountingMemoryStore::new()),
             project_id: ProjectId("proj-d5".to_owned()),
         };
@@ -574,6 +576,7 @@ async fn matching_base_version_applies_and_records_the_claimed_hash() {
         gate: fs_gate(pool.clone(), root.path().to_path_buf(), vec![]),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -623,6 +626,7 @@ async fn stale_base_version_is_surfaced_and_the_agent_continues_with_a_fresh_wri
         gate: fs_gate(pool.clone(), root.path().to_path_buf(), vec![]),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -698,6 +702,7 @@ async fn kill_mid_gated_write_restarts_and_replays_without_reexecuting() {
         gate: fs_gate(pool.clone(), root.path().to_path_buf(), vec![Box::new(BlockingTool)]),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -775,6 +780,7 @@ async fn identical_runs_replay_identical_logs_and_different_scripts_differ() {
             gate: fs_gate(pool.clone(), root.path().to_path_buf(), vec![]),
             whiteboard_pool: pool.clone(),
             subscriptions: SubscriptionManager::new(pool.clone().clone()),
+            consolidation: None,
             memory: Arc::new(CountingMemoryStore::new()),
             project_id: ProjectId("proj-d5".to_owned()),
         };
@@ -847,6 +853,7 @@ async fn concurrent_moves_of_same_source_apply_exactly_once_and_never_corrupt() 
         gate: fs_gate(pool.clone(), gate_root.path().to_path_buf(), vec![]),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -922,6 +929,7 @@ async fn stale_claimed_move_source_is_refused_and_a_fresh_move_recovers() {
         gate: fs_gate(pool.clone(), root.path().to_path_buf(), vec![]),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };

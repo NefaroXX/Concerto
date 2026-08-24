@@ -41,8 +41,8 @@ fn snapshot<'a>(summary: &'a RunSummary, agent_id: &str) -> &'a AgentMeta {
 #[tokio::test(flavor = "multi_thread")]
 async fn run_loop_records_heartbeats_and_stops_cleanly() {
     // Staleness must not interfere with this test: the wait is
-    // condition-based (bounded by the 15s guard below), so set the
-    // heartbeat timeout far above it — a healthy-but-slow child must be
+    // condition-based (bounded by the 30s guard below), so the heartbeat
+    // timeout is set just as generously — a healthy-but-slow child must be
     // recorded, not restarted.
     let mut supervisor = Supervisor::new(SupervisorConfig {
         heartbeat_timeout: Duration::from_secs(30),
@@ -61,8 +61,10 @@ async fn run_loop_records_heartbeats_and_stops_cleanly() {
     });
     // Condition-wait, not wall-clock: the loop exits on the tick that
     // records the second heartbeat, however long a contended machine takes
-    // to deliver it. The timeout only guards against a wedge.
-    let result = tokio::time::timeout(Duration::from_secs(15), task).await;
+    // to deliver it. The timeout only guards against a wedge; 30s (not the
+    // siblings' 15s) because loaded GitHub CI runners have been observed to
+    // exceed 15s between spawn and second heartbeat.
+    let result = tokio::time::timeout(Duration::from_secs(30), task).await;
     if result.is_err() {
         shutdown.cancel(); // unblock the loop before unwinding
     }

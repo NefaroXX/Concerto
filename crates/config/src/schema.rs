@@ -1318,6 +1318,24 @@ pub struct AgentModelAssignment {
 
 // ---- Phase 5: multi-agent configuration ------------------------------------
 
+/// Source of truth for an approved plan's Execute state (ADR-60 D7, issue
+/// #152). Kebab-case on the wire (`whiteboard` / `legacy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanBindingSource {
+    /// Whiteboard events keyed by `plan_id` are the source of truth: an
+    /// approved-plan Execute rehydrates the content-addressed structured
+    /// artifact + carry-forward ledger from the log and forbids silent
+    /// re-decompose (loud failure on divergence without re-approval).
+    #[default]
+    Whiteboard,
+    /// Pre-D7 behavior kept byte-identical as the migration escape hatch:
+    /// the rendered plan text rides as prose and conversation history is
+    /// injected as before. Plans without whiteboard rows degrade here too
+    /// (with a warn), so bindings created before the D7 slice keep working.
+    Legacy,
+}
+
 /// Multi-agent orchestration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MultiAgentConfig {
@@ -1405,6 +1423,25 @@ pub struct MultiAgentConfig {
     /// config-file knob.
     #[serde(default)]
     pub coordinator_prompt: Option<String>,
+    /// ADR-60 Phase 1 (thin slice): when `true`, an Execute-classified
+    /// multi-agent run dispatches through the process supervisor
+    /// ([`Supervisor`] + real `orchestrator-agent-process` children) instead
+    /// of the in-process `CoordinatorAgent` waves. Defaults to `false` — the
+    /// coordinator remains the production path until supervised parity lands.
+    /// When enabled but the supervisor cannot start (no session-DB pool,
+    /// missing child binary, empty roster), the run degrades loudly (a warn)
+    /// back to the coordinator.
+    ///
+    /// [`Supervisor`]: concerto_orchestrator::supervisor::Supervisor
+    #[serde(default)]
+    pub supervisor_enabled: bool,
+    /// ADR-60 D7 (#152): how an approved plan's Execute run sources its
+    /// state. Defaults to [`PlanBindingSource::Whiteboard`]; the whole D7
+    /// path additionally rides the `supervisor_enabled` opt-in, so production
+    /// behavior is unchanged until that flag is set. `legacy` keeps the exact
+    /// pre-D7 prose path for operators who need it during migration.
+    #[serde(default)]
+    pub plan_binding_source: PlanBindingSource,
 }
 
 fn default_true() -> bool {
@@ -1436,6 +1473,8 @@ impl Default for MultiAgentConfig {
             max_subtask_attempts: None,
             max_total_iterations: None,
             coordinator_prompt: None,
+            supervisor_enabled: false,
+            plan_binding_source: PlanBindingSource::default(),
         }
     }
 }
@@ -2095,6 +2134,67 @@ mod tests {
         let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
         let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(parsed.coordinator_prompt, None);
+    }
+
+    #[test]
+    fn multi_agent_supervisor_enabled_defaults_off_and_round_trips() {
+        // ADR-60 Phase 1: the supervised multi-agent path is opt-in. The flag
+        // defaults to false (the coordinator stays the production path), and
+        // configs that never carried the key keep loading as coordinator runs.
+        let cfg = MultiAgentConfig::default();
+        assert!(!cfg.supervisor_enabled, "the supervisor path must default to off");
+
+        let json = serde_json::to_string(&MultiAgentConfig {
+            supervisor_enabled: true,
+            ..Default::default()
+        })
+        .expect("serialize");
+        let restored: MultiAgentConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.supervisor_enabled, "an explicit opt-in must survive the round trip");
+
+        let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
+        let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
+        assert!(
+            !parsed.supervisor_enabled,
+            "legacy config without the key stays on the coordinator"
+        );
+    }
+
+    #[test]
+    fn plan_binding_source_defaults_to_whiteboard_and_round_trips_legacy() {
+        // ADR-60 D7: the whiteboard is the default source of truth for an
+        // approved plan's Execute state; `legacy` is the explicit migration
+        // escape hatch and must survive a round trip byte-for-byte.
+        let cfg = MultiAgentConfig::default();
+        assert_eq!(
+            cfg.plan_binding_source,
+            PlanBindingSource::Whiteboard,
+            "D7 rides the supervisor_enabled opt-in, so whiteboard can be the safe default"
+        );
+
+        let json = serde_json::to_string(&MultiAgentConfig {
+            plan_binding_source: PlanBindingSource::Legacy,
+            ..Default::default()
+        })
+        .expect("serialize");
+        let restored: MultiAgentConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.plan_binding_source,
+            PlanBindingSource::Legacy,
+            "an explicit legacy opt-out must survive the round trip"
+        );
+
+        // Kebab-case on the wire.
+        let wire = serde_json::to_value(PlanBindingSource::Legacy).expect("kind serializes");
+        assert_eq!(wire, serde_json::json!("legacy"));
+
+        let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
+        let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(
+            parsed.plan_binding_source,
+            PlanBindingSource::Whiteboard,
+            "a config that never carried the key defaults to the D7 source of truth"
+        );
     }
 
     #[test]

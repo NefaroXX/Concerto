@@ -24,6 +24,7 @@
 //! | `CONCERTO_MAX_ITERATIONS` | Loop iteration cap (default 25). |
 //! | `CONCERTO_PROVIDER` | `mock` (the only wiring in the slice; default). |
 //! | `CONCERTO_MOCK_SCRIPT_JSON` | Optional per-turn [`CompletionChunk`] script for the mock provider. |
+//! | `CONCERTO_PLAN_ID` | Optional approved plan id (ADR-60 D7 ledger enrichment); stamps every gated write and the terminal event. |
 //!
 //! ## Stdout discipline
 //!
@@ -101,6 +102,10 @@ async fn run() -> i32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(25);
+    // ADR-60 D7 ledger enrichment: a plan-driven run hands its approved plan
+    // id to every child; the child mirrors it onto each gated write and its
+    // terminal whiteboard events so `fold_ledger` can attribute them.
+    let plan_id = std::env::var("CONCERTO_PLAN_ID").ok().filter(|plan_id| !plan_id.is_empty());
 
     // Bind to the supervisor: handshake (D2) then the tool registry (the
     // gate owns what the loop may present to the model).
@@ -112,13 +117,14 @@ async fn run() -> i32 {
         }
     };
     let client = Arc::new(tokio::sync::Mutex::new(client));
-    let backend = match GateProxyBackend::new(client.clone(), agent_id.clone()).await {
-        Ok(backend) => Arc::new(backend),
-        Err(error) => {
-            eprintln!("agent-process: tool registry fetch failed: {error}");
-            return 1;
-        }
-    };
+    let backend =
+        match GateProxyBackend::new(client.clone(), agent_id.clone(), plan_id.clone()).await {
+            Ok(backend) => Arc::new(backend),
+            Err(error) => {
+                eprintln!("agent-process: tool registry fetch failed: {error}");
+                return 1;
+            }
+        };
 
     let provider: Arc<dyn LlmProvider> = match std::env::var("CONCERTO_PROVIDER").as_deref() {
         Ok("mock") | Err(_) => match mock_provider() {
@@ -170,24 +176,26 @@ async fn run() -> i32 {
     let cancel = CancellationToken::new();
     match agent.run(task.clone(), cancel).await {
         Ok(_output) => {
-            let event = terminal_event(
+            let mut event = terminal_event(
                 &agent_id,
                 &task,
                 WhiteboardKind::SubtaskCompleted,
                 json!({ "task_id": task.id.to_string(), "status": "completed" }),
             );
+            event.plan_id = plan_id;
             publish_best_effort(&backend, event).await;
             eprintln!("agent-process: task completed");
             0
         }
         Err(error) => {
             eprintln!("agent-process: task failed: {error}");
-            let event = terminal_event(
+            let mut event = terminal_event(
                 &agent_id,
                 &task,
                 WhiteboardKind::Failure,
                 json!({ "task_id": task.id.to_string(), "error": error.to_string() }),
             );
+            event.plan_id = plan_id;
             publish_best_effort(&backend, event).await;
             1
         }
