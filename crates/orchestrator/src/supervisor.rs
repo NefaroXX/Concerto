@@ -1519,8 +1519,15 @@ fn dispatch_agent_line(
         return match request.method {
             IpcMethod::Handshake => Dispatch::None,
             IpcMethod::Heartbeat => match &request.params {
-                IpcParams::Heartbeat { seq, timestamp_ms, .. } => {
-                    let accepted = meta.record_heartbeat(*seq, *timestamp_ms, now_ms).is_ok();
+                IpcParams::Heartbeat { seq, .. } => {
+                    // Liveness anchors on THIS process's clock (`now_ms`),
+                    // matching the handshake's `last_seen_ms` stamp — never
+                    // on the agent's self-reported wire `timestamp_ms`,
+                    // which comes from another process's clock and can sit
+                    // milliseconds behind the supervisor's sample of its
+                    // own, spuriously tripping ClockWentBackwards and
+                    // silently dropping healthy heartbeats.
+                    let accepted = meta.record_heartbeat(*seq, now_ms, 0).is_ok();
                     Dispatch::Reply(reply_ok(request.id, IpcResult::Heartbeat { accepted }))
                 }
                 _ => Dispatch::Reply(reply_error(
@@ -1552,8 +1559,11 @@ fn dispatch_agent_line(
     }
     if let Ok(notification) = serde_json::from_str::<IpcNotification>(text) {
         if notification.method == IpcMethod::Heartbeat {
-            if let IpcParams::Heartbeat { seq, timestamp_ms, .. } = notification.params {
-                let _ = meta.record_heartbeat(seq, timestamp_ms, now_ms);
+            if let IpcParams::Heartbeat { seq, .. } = notification.params {
+                // Same clock rule as the request path: record against this
+                // process's `now_ms`, not the agent's wire timestamp (see
+                // the comment there).
+                let _ = meta.record_heartbeat(seq, now_ms, 0);
             }
         }
         return Dispatch::None;

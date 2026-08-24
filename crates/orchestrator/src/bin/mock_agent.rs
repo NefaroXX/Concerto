@@ -73,7 +73,15 @@
 //!
 //! Outbound emission order is deterministic: heartbeats, then tool requests,
 //! then publishes, then retrieves — all in one burst after the handshake.
+//!
+//! Every outbound frame is written synchronously and flushed before the
+//! helper returns (blocking stdio, mirroring the supervisor's parent-side
+//! writes through [`ipc::serialize_frame`]). Delivery must not depend on
+//! `tokio::io::Stdout`'s background flusher: its scheduling delays were
+//! observed to leave the whole post-handshake burst undelivered for a child's
+//! lifetime under load, wedging supervisor-loop tests.
 
+use std::io::Write as IoWrite;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use concerto_orchestrator::gate::GateRequest;
@@ -84,7 +92,6 @@ use concerto_orchestrator::ipc::{
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use tokio::io::AsyncWriteExt;
 
 /// Wire `agent_id` this fixture sends on all write-path requests — never the
 /// registered id. Tests assert the supervisor binds attribution to the
@@ -130,7 +137,9 @@ async fn run() -> i32 {
     let mut next_ack_id = 400u64;
 
     let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    // Synchronous frame sink (see module docs): every write is flushed
+    // before returning, so delivery never depends on a background flusher.
+    let mut stdout = std::io::stdout();
     // Caller-owned carry buffer reused across `read_message` calls (see the
     // framing contract in `ipc.rs`).
     let mut buf = Vec::new();
@@ -153,7 +162,7 @@ async fn run() -> i32 {
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::InvalidData =>
             {
-                if let Some(code) = write_reply(&mut stdout, &parse_error_response()).await {
+                if let Some(code) = write_reply(&mut stdout, &parse_error_response()) {
                     return code;
                 }
                 replies += 1;
@@ -214,14 +223,8 @@ async fn run() -> i32 {
                         next_ack_id += 1;
                         match serde_json::to_value(&ack) {
                             Ok(ack_value) => {
-                                if let Some(code) = write_json(&mut stdout, &ack_value).await {
+                                if let Some(code) = write_json(&mut stdout, &ack_value) {
                                     return code;
-                                }
-                                if let Err(error) = stdout.flush().await {
-                                    eprintln!(
-                                        "orchestrator-mock-agent: stdout flush failed: {error}"
-                                    );
-                                    return 1;
                                 }
                             }
                             Err(error) => {
@@ -236,7 +239,7 @@ async fn run() -> i32 {
                 }
                 match handle_message_typed(value) {
                     MaybeReply::Write(response, agent_id) => {
-                        if let Some(code) = write_reply(&mut stdout, &response).await {
+                        if let Some(code) = write_reply(&mut stdout, &response) {
                             return code;
                         }
                         replies += 1;
@@ -257,18 +260,8 @@ async fn run() -> i32 {
                                     tool_requests,
                                     publishes,
                                     retrieves,
-                                )
-                                .await
-                                {
+                                ) {
                                     return code;
-                                }
-                                // Flush to ensure the outbound messages are sent immediately
-                                if let Err(e) = stdout.flush().await {
-                                    eprintln!(
-                                        "orchestrator-mock-agent: stdout flush failed: {}",
-                                        e
-                                    );
-                                    return 1;
                                 }
                             }
                         }
@@ -304,20 +297,20 @@ fn handle_message(value: Value) -> Option<IpcResponse> {
 
 /// Read one integer test knob from the environment (absent or unparseable →
 /// `0`).
-/// Wait out tokio's background stdout flusher before exiting.
-///
-/// Replies are written through `tokio::io::stdout()`, whose flusher thread
-/// owns the real write to fd 1 — `write_all` completing does not mean the
-/// bytes are on the wire. If the fixture exits immediately after the reply
-/// (e.g. `MOCK_AGENT_EXIT_AFTER=1`), `std::process::exit` can drop the
-/// un-flushed handshake reply and flake the supervisor's spawn. A short
-/// sleep lets the flusher catch up before the process dies.
-async fn exit_before_dropping() {
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-}
-
 fn knob(name: &str) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Defensive pause before exiting right after a reply.
+///
+/// Replies and bursts are written synchronously and flushed before the
+/// writing helper returns, so normally nothing is left in flight. The short
+/// sleep is pure defense-in-depth for fast-exit paths
+/// (`MOCK_AGENT_EXIT_AFTER`, crash-window knob): an exotic stdout
+/// redirection that buffers again must never lose the fixture's final bytes
+/// to [`std::process::exit`].
+async fn exit_before_dropping() {
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 /// Emit the configured outbound traffic after the handshake reply, in
@@ -326,7 +319,7 @@ fn knob(name: &str) -> u64 {
 /// `retrieve-memory` requests (`300..`).
 ///
 /// Mirrors `write_reply`'s error contract: `Some(exit_code)` on failure.
-async fn write_outbound<W>(
+fn write_outbound<W>(
     writer: &mut W,
     agent_id: &str,
     heartbeats: u64,
@@ -335,7 +328,7 @@ async fn write_outbound<W>(
     retrieves: u64,
 ) -> Option<i32>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: IoWrite,
 {
     for seq in 1..=heartbeats {
         let notification = IpcNotification {
@@ -351,7 +344,7 @@ where
         let Some(value) = to_value(&notification) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -382,7 +375,7 @@ where
         let Some(value) = to_value(&request) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -410,7 +403,7 @@ where
         let Some(value) = to_value(&request) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -428,7 +421,7 @@ where
         let Some(value) = to_value(&request) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -455,21 +448,49 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Serialize and write one JSON message line.
+/// Serialize and write one JSON message line, flushed before returning.
 ///
 /// Same error contract as `write_reply`: `Some(exit_code)` when the write
 /// failed and the loop must stop — `0` when the supervisor's read end closed
-/// (broken stdout pipe — graceful teardown), `1` on an internal
-/// serialization failure. `None` means the message was written.
-async fn write_json<W>(writer: &mut W, value: &Value) -> Option<i32>
+/// (broken stdout pipe — graceful teardown), `1` on an internal failure.
+/// `None` means the message is on the wire.
+fn write_json<W>(writer: &mut W, value: &Value) -> Option<i32>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: IoWrite,
 {
-    if let Err(error) = ipc::write_message(writer, value).await {
-        eprintln!("orchestrator-mock-agent: write failed, supervisor gone: {error}");
-        return Some(0);
+    sync_write_frame(writer, value)
+}
+
+/// Blocking-write one serialized frame and flush it before returning — the
+/// fixture's single outbound funnel (the supervisor's parent-side writes use
+/// the same `serialize_frame` + `write_all` + `flush` pattern).
+///
+/// Error contract shared by every writing helper: `Some(exit_code)` when the
+/// loop must stop — `0` when the supervisor's read end closed (broken stdout
+/// pipe — graceful teardown), `1` on any other internal failure. `None`
+/// means the frame was delivered to the OS.
+fn sync_write_frame<W>(writer: &mut W, value: &Value) -> Option<i32>
+where
+    W: IoWrite,
+{
+    let frame = match ipc::serialize_frame(value) {
+        Ok(frame) => frame,
+        Err(error) => {
+            eprintln!("orchestrator-mock-agent: failed to frame message: {error}");
+            return Some(1);
+        }
+    };
+    match IoWrite::write_all(writer, &frame).and_then(|()| IoWrite::flush(writer)) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            eprintln!("orchestrator-mock-agent: write failed, supervisor gone: {error}");
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("orchestrator-mock-agent: stdout write failed: {error}");
+            Some(1)
+        }
     }
-    None
 }
 
 /// The `end_gate_seq` of a `whiteboard-slice` NOTIFICATION line, or `None`.
@@ -563,15 +584,15 @@ fn parse_error_response() -> IpcResponse {
     }
 }
 
-/// Serialize and write one response line.
+/// Serialize and write one response line, flushed before returning.
 ///
 /// Returns `Some(exit_code)` when the write failed and the loop must stop:
 /// `0` when the supervisor's read end closed (broken stdout pipe — graceful
 /// teardown), `1` on an internal serialization failure. `None` means the
-/// response was written and the loop continues.
-async fn write_reply<W>(writer: &mut W, response: &IpcResponse) -> Option<i32>
+/// response is on the wire and the loop continues.
+fn write_reply<W>(writer: &mut W, response: &IpcResponse) -> Option<i32>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: IoWrite,
 {
     let value = match serde_json::to_value(response) {
         Ok(value) => value,
@@ -580,11 +601,7 @@ where
             return Some(1);
         }
     };
-    if let Err(error) = ipc::write_message(writer, &value).await {
-        eprintln!("orchestrator-mock-agent: write failed, supervisor gone: {error}");
-        return Some(0);
-    }
-    None
+    sync_write_frame(writer, &value)
 }
 
 #[cfg(test)]
