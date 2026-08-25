@@ -1470,6 +1470,8 @@ dependencies = [
  "criterion",
  "dirs 5.0.1",
  "futures",
+ "imara-diff",
+ "libc",
  "petgraph",
  "schemars",
  "serde",

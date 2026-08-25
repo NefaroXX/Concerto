@@ -31,6 +31,10 @@ time = { workspace = true }
 camino = { workspace = true }
 blake3 = { workspace = true }
 petgraph = { workspace = true }
+imara-diff = { workspace = true }
+
+# ---- Parent-death signal for the supervised child (ADR-60 D1, Linux-only) ----
+libc = "0.2"
 
 dirs = "5"
 sqlx = { workspace = true }

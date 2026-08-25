@@ -51,6 +51,24 @@
 //!   policy evaluation), surfacing as [`GateError::Cancelled`] without
 //!   appending a `failure` row.
 //!
+//! ## Shared-file conflicts (ADR-60 D5)
+//!
+//! - **Optimistic `base_version` checks**: a request declaring the hash of a
+//!   versioned target's state is refused with [`GateError::Conflict`] — no
+//!   whiteboard row — when the target's current pre-image hash differs.
+//! - **Hunk-aware staging**: when the declared base diverged but this write
+//!   touches *different lines* than the sibling's intervening change, the
+//!   write's hunks are spliced onto the current content
+//!   ([`crate::hunk::stage_three_way`]) instead of refusing, so disjoint
+//!   concurrent edits both survive. Same-hunk collisions surface loudly for
+//!   manual resolution; anything undiffable (CRLF/binary/unobserved base)
+//!   falls back to the file-level check — never to silent loss.
+//! - **Explicit lock tokens** reserve hot shared files for exclusive write:
+//!   [`WriteGate::acquire_lock`] / [`WriteGate::release_lock`] manage an
+//!   in-memory TTL table, checked inside [`WriteGate::submit`] before the
+//!   conflict logic — a foreign-held lock is a loud [`GateError::Conflict`]
+//!   carrying holder info, never a silent race or drop.
+//!
 //! ## Deferred to S4 (ADR-60)
 //!
 //! - Weighted round-robin fairness across agents (D4).
@@ -59,6 +77,7 @@
 //! - Supervisor wiring — the runtime does not yet call [`WriteGate::submit`]
 //!   for every agent write; the gate is exercised by its unit tests.
 
+use crate::hunk::{stage_three_way, HunkStaging};
 use concerto_core::error::{PolicyError, ToolError};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::{new_id, Ulid};
@@ -67,12 +86,16 @@ use concerto_core::types::{
     CapabilitySet, PolicyAction, PolicyVerdict, SessionContext, ToolDefinition,
 };
 use concerto_core::CancellationToken;
-use concerto_sessions::whiteboard::{append_whiteboard_event, NewWhiteboardEvent, WhiteboardKind};
+use concerto_sessions::whiteboard::{
+    append_whiteboard_event, latest_gate_seq, load_whiteboard_events_up_to, NewWhiteboardEvent,
+    WhiteboardKind,
+};
 use concerto_sessions::SessionError;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
@@ -191,6 +214,18 @@ pub enum GateError {
         /// Human-readable mismatch detail.
         reason: String,
     },
+    /// ADR-60 D5 explicit lock tokens: an acquire/release attempt on a path
+    /// whose exclusive-write reservation belongs to a different agent or
+    /// token. Only the lock-management API returns this; a *write* submitted
+    /// against a foreign-held lock surfaces as [`GateError::Conflict`] with
+    /// holder info instead.
+    #[error("path {path} is locked for exclusive write by agent '{holder}'")]
+    Locked {
+        /// The contended relative target path.
+        path: String,
+        /// The agent currently holding (or owning) the reservation.
+        holder: String,
+    },
     /// Policy evaluation itself failed.
     #[error("policy evaluation failed: {0}")]
     Policy(String),
@@ -273,6 +308,87 @@ enum StoredDecision {
     Rejected,
 }
 
+/// Handle for an exclusive-write reservation on one path (ADR-60 D5 explicit
+/// lock tokens, v1: hot shared files). Returned by
+/// [`WriteGate::acquire_lock`]; pass it to [`WriteGate::release_lock`] to
+/// free the path early. Reservations lapse lazily at `expires_at_ms`
+/// (purged on the next acquire/submit/release touching the table) — there is
+/// no background sweeper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockToken {
+    /// Unguessable id proving ownership; a release with a stale or forged id
+    /// is refused.
+    pub token_id: String,
+    /// The reserved relative target path (the [`versioned_targets`] form).
+    pub path: String,
+    /// The reserving agent; re-acquisition by the same agent refreshes.
+    pub agent_id: String,
+    /// Unix epoch millis after which the reservation lapses.
+    pub expires_at_ms: i64,
+}
+
+/// The live reservation behind a [`LockToken`] (private mirror).
+struct ActiveLock {
+    token_id: String,
+    agent_id: String,
+    expires_at_ms: i64,
+}
+
+/// Exclusive-write reservations keyed by relative target path (ADR-60 D5).
+/// In-memory by design for v1 — locks are advisory coordination between the
+/// 3–6 agents of one supervised run sharing this gate process, not crash
+/// state; the whiteboard remains the durable authority.
+type LockTable = HashMap<String, ActiveLock>;
+
+/// Upper bounds of the pre-image text cache (see [`PreImageTextCache`]).
+const PRE_IMAGE_CACHE_MAX_FILES: usize = 64;
+const PRE_IMAGE_CACHE_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const PRE_IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounded in-memory store of observed pre-image bytes, keyed by their blake3
+/// hex — the recovery mechanism hunk-aware staging needs.
+///
+/// Every gated submit already reads each attributed path's bytes for the
+/// pre-image hash (ADR-60 D5 attribution); caching them here lets the gate
+/// later reconstruct "the base text an agent declared" from its hash alone,
+/// without widening the wire format (`base_versions` carries hashes only).
+/// A claimed base the gate never observed (e.g. a file that predates this
+/// gate process and was never written through it) is simply absent, and
+/// staging falls back to the file-level conflict check.
+///
+/// Content-addressed and FIFO-evicted under three caps (file count, total
+/// bytes, single-entry bytes); oversized files are never cached, so writes to
+/// them degrade gracefully to file-level checks.
+#[derive(Default)]
+struct PreImageTextCache {
+    entries: HashMap<String, Arc<Vec<u8>>>,
+    order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+impl PreImageTextCache {
+    fn insert(&mut self, hash: String, bytes: Arc<Vec<u8>>) {
+        if bytes.len() > PRE_IMAGE_CACHE_MAX_ENTRY_BYTES || self.entries.contains_key(&hash) {
+            return;
+        }
+        self.total_bytes += bytes.len();
+        self.order.push_back(hash.clone());
+        self.entries.insert(hash, bytes);
+        while self.total_bytes > PRE_IMAGE_CACHE_MAX_TOTAL_BYTES
+            || self.entries.len() > PRE_IMAGE_CACHE_MAX_FILES
+        {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.len());
+            }
+        }
+    }
+
+    fn get(&self, hash: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries.get(hash).cloned()
+    }
+}
+
 /// Policy-gated, whiteboard-logged tool execution (ADR-60 D4).
 pub struct WriteGate {
     policy: Arc<dyn PolicyEngine>,
@@ -288,6 +404,12 @@ pub struct WriteGate {
     limits: Mutex<HashMap<String, Arc<Semaphore>>>,
     /// In-process replay-race claim set: `call_id` → claim lock.
     in_flight: Arc<Mutex<ClaimSet>>,
+    /// Exclusive-write reservations for hot shared files (ADR-60 D5 lock
+    /// tokens); lazily purged of expired entries.
+    locks: Arc<Mutex<LockTable>>,
+    /// Observed pre-image bytes keyed by blake3 hex — lets hunk staging
+    /// recover a claimed base text without a wire format change.
+    text_cache: Mutex<PreImageTextCache>,
 }
 
 /// ADR-60 D5: the relative paths a request mutates, in a canonical order, or
@@ -373,6 +495,29 @@ fn attributed_paths(req: &GateRequest) -> Vec<&str> {
     paths
 }
 
+/// Result of one hunk-staging attempt inside [`WriteGate::run_gated`].
+enum HunkAttempt {
+    /// The write's hunks did not overlap the sibling's: execute this merged
+    /// content (the sibling's state plus this write's hunks) instead of the
+    /// request's original, claiming `onto_hash` as the truthful base.
+    Staged(StagedWrite),
+    /// Same-hunk collision — a loud conflict with resolution detail.
+    Collision(String),
+    /// Staging was impossible or unsafe — fall back to the file-level
+    /// `base_version` check. Carries the reason (debug-logged).
+    NotAttempted(String),
+}
+
+/// A successfully staged write: what to execute and how to attribute it.
+struct StagedWrite {
+    /// The sibling's current content with this write's hunks spliced in.
+    merged: String,
+    /// The hash of the state this write is now built on (the pre-image).
+    onto_hash: String,
+    /// Observability note riding the WAL payload (`hunk_staging`).
+    note: serde_json::Value,
+}
+
 impl WriteGate {
     /// Create a gate over the *shared* policy/executor pair, the whiteboard
     /// log, a pre-image reader rooted at the project, and a per-agent
@@ -394,6 +539,8 @@ impl WriteGate {
             max_in_flight_per_agent: max_in_flight_per_agent.max(1),
             limits: Mutex::new(HashMap::new()),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            text_cache: Mutex::new(PreImageTextCache::default()),
         }
     }
 
@@ -401,6 +548,138 @@ impl WriteGate {
     /// truth the supervisor publishes to agents via `list-tools` (ADR-60 S5).
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.executor.tool_definitions()
+    }
+
+    /// Reserve `path` for exclusive write by `agent_id` for `ttl` (ADR-60 D5
+    /// explicit lock tokens — v1 coordination for hot shared files).
+    ///
+    /// Server-side by design for v1: the table lives on this gate process,
+    /// and every supervised/in-process write funnels through
+    /// [`WriteGate::submit`], which enforces reservations ahead of its
+    /// conflict logic — no IPC surface needed yet. Re-acquiring a path this
+    /// agent already holds refreshes the reservation (latest token wins);
+    /// acquiring a path another agent holds fails loudly with holder info
+    /// ([`GateError::Locked`]). Expired reservations lapse lazily.
+    pub fn acquire_lock(
+        &self,
+        path: impl Into<String>,
+        agent_id: &str,
+        ttl: Duration,
+    ) -> Result<LockToken, GateError> {
+        let path = path.into();
+        let mut locks = self.locks.lock().map_err(|error| {
+            GateError::Policy(format!("write-gate lock table poisoned: {error}"))
+        })?;
+        purge_expired_locks(&mut locks, now_millis());
+        if let Some(active) = locks.get(path.as_str()) {
+            if active.agent_id != agent_id {
+                return Err(GateError::Locked {
+                    path: path.clone(),
+                    holder: active.agent_id.clone(),
+                });
+            }
+        }
+        let expires_at_ms =
+            now_millis().saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX));
+        let token = LockToken {
+            token_id: new_id().to_string(),
+            path: path.clone(),
+            agent_id: agent_id.to_owned(),
+            expires_at_ms,
+        };
+        locks.insert(
+            path,
+            ActiveLock {
+                token_id: token.token_id.clone(),
+                agent_id: token.agent_id.clone(),
+                expires_at_ms,
+            },
+        );
+        Ok(token)
+    }
+
+    /// Release a reservation granted by [`WriteGate::acquire_lock`].
+    ///
+    /// The genuine token always succeeds; an expired reservation has already
+    /// lapsed (also success — the desired state is reached); a stale or
+    /// forged token on a live reservation held by someone else is refused
+    /// loudly with holder info.
+    pub fn release_lock(&self, token: &LockToken) -> Result<(), GateError> {
+        let mut locks = self.locks.lock().map_err(|error| {
+            GateError::Policy(format!("write-gate lock table poisoned: {error}"))
+        })?;
+        purge_expired_locks(&mut locks, now_millis());
+        match locks.get(token.path.as_str()) {
+            Some(active) if active.token_id == token.token_id => {
+                locks.remove(token.path.as_str());
+                Ok(())
+            }
+            Some(active) => {
+                Err(GateError::Locked { path: token.path.clone(), holder: active.agent_id.clone() })
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Attempt hunk-aware staging for one mismatched versioned target (see
+    /// [`crate::hunk`] and the module docs).
+    ///
+    /// Only whole-content `filesystem` `write` operations are stageable —
+    /// delete/move/copy mutate the file as a unit, so they always take the
+    /// file-level check. Staging further requires the claimed base text AND
+    /// the current text to be recoverable from the observed-pre-image cache
+    /// and decodable as UTF-8 without carriage returns; anything else degrades
+    /// to [`HunkAttempt::NotAttempted`] and the caller falls back to the
+    /// file-level conflict — never to silent last-writer-wins.
+    fn try_stage_hunks(
+        &self,
+        req: &GateRequest,
+        target: &str,
+        expected: &str,
+        actual: Option<String>,
+    ) -> HunkAttempt {
+        if req.tool != "filesystem"
+            || req.input.get("operation").and_then(serde_json::Value::as_str) != Some("write")
+            || req.input.get("path").and_then(serde_json::Value::as_str) != Some(target)
+        {
+            return HunkAttempt::NotAttempted("not a whole-content filesystem write".to_owned());
+        }
+        let Some(proposed) = req.input.get("content").and_then(serde_json::Value::as_str) else {
+            return HunkAttempt::NotAttempted("no string `content` field".to_owned());
+        };
+        let Some(actual_hash) = actual else {
+            return HunkAttempt::NotAttempted("target no longer exists".to_owned());
+        };
+        let (base_bytes, current_bytes) = match self.text_cache.lock() {
+            Ok(cache) => (cache.get(expected), cache.get(actual_hash.as_str())),
+            Err(error) => {
+                return HunkAttempt::NotAttempted(format!("pre-image text cache poisoned: {error}"))
+            }
+        };
+        let (Some(base_bytes), Some(current_bytes)) = (base_bytes, current_bytes) else {
+            return HunkAttempt::NotAttempted(
+                "claimed base or current text not observed by this gate".to_owned(),
+            );
+        };
+        let (Some(base), Some(current)) =
+            (std::str::from_utf8(&base_bytes).ok(), std::str::from_utf8(&current_bytes).ok())
+        else {
+            return HunkAttempt::NotAttempted(
+                "binary (non-UTF-8) content cannot be hunk-diffed".to_owned(),
+            );
+        };
+        match stage_three_way(base, current, proposed) {
+            HunkStaging::Merged(merged) => {
+                let note = serde_json::json!({
+                    "target": target,
+                    "declared_base_hash": expected,
+                    "staged_onto_hash": actual_hash,
+                });
+                HunkAttempt::Staged(StagedWrite { merged, onto_hash: actual_hash, note })
+            }
+            HunkStaging::Collision(detail) => HunkAttempt::Collision(detail),
+            HunkStaging::NotApplicable(reason) => HunkAttempt::NotAttempted(reason),
+        }
     }
 
     /// Submit a write request for policy evaluation and gated execution.
@@ -527,7 +806,7 @@ impl WriteGate {
     /// The gated write itself: policy → pre-image → WAL append → execute.
     async fn run_gated(
         &self,
-        req: GateRequest,
+        mut req: GateRequest,
         cancel: CancellationToken,
     ) -> Result<GateOutcome, GateError> {
         if cancel.is_cancelled() {
@@ -576,25 +855,87 @@ impl WriteGate {
             });
         }
 
+        // ADR-60 D5 explicit lock tokens: a versioned target reserved for
+        // exclusive write by ANOTHER agent refuses loudly here — before any
+        // WAL append — with holder info in the reason. The reserving owner
+        // proceeds through its own lock, and an expired reservation has
+        // already lapsed (lazy purge).
+        let versioned =
+            versioned_targets(&req).into_iter().map(str::to_owned).collect::<Vec<String>>();
+        {
+            let mut locks = self.locks.lock().map_err(|error| {
+                GateError::Policy(format!("write-gate lock table poisoned: {error}"))
+            })?;
+            purge_expired_locks(&mut locks, now_millis());
+            for target in &versioned {
+                if let Some(active) = locks.get(target.as_str()) {
+                    if active.agent_id != req.agent_id {
+                        return Err(GateError::Conflict {
+                            event_id: req.call_id.clone(),
+                            reason: format!(
+                                "target {target} is locked for exclusive write by agent '{}' \
+                                 (explicit lock token, ADR-60 D5)",
+                                active.agent_id,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         // ADR-60 D5: optimistic base_version conflict detection over every
-        // mutated (versioned) target. When the caller declared the hash of a
-        // target's state it believes it is editing, that target's pre-image
-        // must match right now. A mismatch — including a target that does not
-        // exist — means a sibling agent already changed the file: refuse with
-        // NO whiteboard row (nothing was applied, so nothing is logged) and
-        // surface the collision loudly to the supervisor for the
-        // manual-resolution path. Targets without a declared claim are not
-        // checked (fresh creates carry no claim → documented
-        // last-writer-wins), and declared claims on read-only targets (the
-        // `copy` source, absent from [`versioned_targets`]) are ignored.
-        for target in versioned_targets(&req) {
-            let Some(expected) = req.base_versions.get(target) else {
+        // mutated (versioned) target, refined by hunk-aware staging. When the
+        // caller declared the hash of a target's state it believes it is
+        // editing, that target's pre-image must match right now. A mismatch —
+        // including a target that does not exist — means a sibling agent
+        // already changed the file. If both edits touch different lines of
+        // the shared base, the write's hunks are STAGED onto the current
+        // content (disjoint concurrent edits both survive); otherwise the
+        // collision surfaces loudly with NO whiteboard row (nothing was
+        // applied, so nothing is logged) for the manual-resolution path.
+        // Targets without a declared claim are not checked (fresh creates
+        // carry no claim → documented last-writer-wins), and declared claims
+        // on read-only targets (the `copy` source, absent from
+        // [`versioned_targets`]) are ignored.
+        let mut staging_notes = Vec::new();
+        for target in &versioned {
+            let Some(expected) = req.base_versions.get(target).cloned() else {
                 continue;
             };
             let actual = pre_images.get(target);
             if actual.map(String::as_str) == Some(expected.as_str()) {
                 continue;
             }
+            match self.try_stage_hunks(&req, target, &expected, actual.cloned()) {
+                HunkAttempt::Staged(staged) => {
+                    tracing::info!(
+                        target_path = %target,
+                        call_id = %req.call_id,
+                        "hunk-aware staging merged disjoint sibling edits"
+                    );
+                    staging_notes.push(staged.note);
+                    // The truthful claim going forward is the state this
+                    // write is now built on (the sibling's current bytes).
+                    req.base_versions.insert(target.clone(), staged.onto_hash);
+                    req.input["content"] = serde_json::Value::String(staged.merged);
+                    continue;
+                }
+                HunkAttempt::Collision(reason) => {
+                    return Err(GateError::Conflict {
+                        event_id: req.call_id.clone(),
+                        reason: format!("hunk-aware staging refused on {target}: {reason}"),
+                    });
+                }
+                HunkAttempt::NotAttempted(reason) => {
+                    tracing::debug!(
+                        target_path = %target,
+                        %reason,
+                        "hunk staging unavailable; falling back to the file-level base_version check"
+                    );
+                }
+            }
+            // File-level fallback (the pre-staging contract, unchanged):
+            // undiffable or unstageable mismatches refuse wholesale.
             let current = actual.map(String::as_str).unwrap_or("<absent>");
             let absent = if actual.is_none() { " (target does not exist)" } else { "" };
             return Err(GateError::Conflict {
@@ -607,6 +948,17 @@ impl WriteGate {
 
         // WAL-before-execute: the applied event is durable before the tool
         // runs; a crash after this point replays as `replayed: true`.
+        let mut payload = serde_json::json!({
+            "tool": &req.tool,
+            "input": &req.input,
+            "policy_verdict": "allow",
+            "pre_images": &pre_images,
+        });
+        if !staging_notes.is_empty() {
+            // Observability for the manual-resolution trail: records exactly
+            // what was staged onto whose state (ADR-60 D5 attribution).
+            payload["hunk_staging"] = serde_json::Value::Array(staging_notes);
+        }
         let stored = append_whiteboard_event(
             &self.log_pool,
             &NewWhiteboardEvent {
@@ -617,12 +969,7 @@ impl WriteGate {
                 session_id: req.session_id.clone(),
                 plan_id: req.plan_id.clone(),
                 causation: req.causation.clone(),
-                payload: serde_json::json!({
-                    "tool": &req.tool,
-                    "input": &req.input,
-                    "policy_verdict": "allow",
-                    "pre_images": &pre_images,
-                }),
+                payload,
                 pre_image_hash: primary_pre_image,
                 created_at: now_millis(),
             },
@@ -732,7 +1079,20 @@ impl WriteGate {
                 GateError::PreImage(format!("read pre-image for {relative_path:?}: {error}"))
             })?;
             if let Some(bytes) = bytes {
-                hashes.insert(relative_path.to_owned(), blake3::hash(&bytes).to_hex().to_string());
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                // Cache the observed bytes (content-addressed by hash) so
+                // hunk-aware staging can later reconstruct this exact content
+                // from its hash alone. A poisoned cache only degrades staging
+                // to file-level checks, never correctness.
+                match self.text_cache.lock() {
+                    Ok(mut cache) => cache.insert(hash.clone(), Arc::new(bytes)),
+                    Err(error) => tracing::debug!(
+                        target_path = %relative_path,
+                        %error,
+                        "pre-image text cache poisoned; hunk staging may fall back to file-level checks"
+                    ),
+                }
+                hashes.insert(relative_path.to_owned(), hash);
             }
         }
         Ok(hashes)
@@ -775,6 +1135,46 @@ impl WriteGate {
             }
             None => Ok(None),
         }
+    }
+
+    /// ADR-60 D5 (i): materialize the gate-boundary checkpoint at
+    /// `gate_seq` — the projected file state of every applied filesystem
+    /// write with `gate_seq <= gate_seq` (the consistent cut "everything ≤
+    /// seq S"), restricted to `session_id` when given.
+    ///
+    /// Durability rides the log, not a second store: every folded event was
+    /// committed WAL-first by this gate before its tool executed (the module's
+    /// ordering invariant), so the cut is reconstructible after any crash. The
+    /// checkpoint is a projection — the raw log is never truncated or
+    /// rewritten. Restoring forward (and per-agent revert, D5 (ii)) replays
+    /// the tail over the snapshot via
+    /// [`crate::checkpoint::GateBoundaryCheckpoint::replay_tail_excluding`].
+    ///
+    /// Reachable wherever the gate is attached —
+    /// [`crate::supervisor::SupervisorServices::gate`] on the supervised path
+    /// (opt-in `[orchestration] supervisor_enabled`) and the in-process loop's
+    /// gate alike — for revert/restore flows built on top.
+    pub async fn create_checkpoint_at(
+        &self,
+        gate_seq: u64,
+        session_id: Option<&str>,
+    ) -> Result<crate::checkpoint::GateBoundaryCheckpoint, GateError> {
+        let events = load_whiteboard_events_up_to(&self.log_pool, gate_seq, session_id).await?;
+        Ok(crate::checkpoint::GateBoundaryCheckpoint::at_cut(
+            &events,
+            gate_seq,
+            session_id.map(str::to_owned),
+        ))
+    }
+
+    /// Convenience form of [`WriteGate::create_checkpoint_at`] pinned to the
+    /// current head of the log: "checkpoint now".
+    pub async fn create_checkpoint(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<crate::checkpoint::GateBoundaryCheckpoint, GateError> {
+        let head = latest_gate_seq(&self.log_pool).await.map_err(GateError::from)?;
+        self.create_checkpoint_at(head, session_id).await
     }
 }
 
@@ -831,6 +1231,13 @@ pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequ
         };
         request.base_versions.insert(target, blake3::hash(&bytes).to_hex().to_string());
     }
+}
+
+/// Drop lock reservations past their TTL (ADR-60 D5 lazy expiry: no
+/// background sweeper — the next acquire/release/submit touching the table
+/// observes the lapses).
+fn purge_expired_locks(locks: &mut LockTable, now_ms: i64) {
+    locks.retain(|_, active| active.expires_at_ms > now_ms);
 }
 
 /// Unix epoch milliseconds (UTC) — the whiteboard `created_at` contract
@@ -2181,5 +2588,257 @@ mod tests {
             json!(blake3::hash(b"old out").to_hex().to_string()),
             "the destination pre-image is attributed too"
         );
+    }
+
+    #[tokio::test]
+    async fn create_checkpoint_materializes_consistent_cut_for_per_agent_revert() {
+        let (_dir, pool) = test_pool(1).await;
+        let gate = gate(
+            allow_engine(),
+            Arc::new(AtomicUsize::new(0)),
+            pool.clone(),
+            PathBuf::from("/tmp"),
+        );
+
+        // Two agents write the same path through the gate (stub executor; the
+        // contract under test is the WAL projection, not disk semantics).
+        let mut req_a = filesystem_request("cp-a", "write", "shared.txt");
+        req_a.input["content"] = json!("from-a");
+        gate.submit(req_a, CancellationToken::new()).await.expect("agent-a applies");
+
+        let mut req_b = filesystem_request("cp-b", "write", "shared.txt");
+        req_b.agent_id = "agent-b".to_owned();
+        req_b.input["content"] = json!("from-b");
+        gate.submit(req_b, CancellationToken::new()).await.expect("agent-b applies");
+
+        // Cut at seq 1: only agent-a's write is inside the consistent cut.
+        let cut = gate.create_checkpoint_at(1, None).await.expect("checkpoint at 1");
+        assert_eq!(cut.gate_seq, 1);
+        assert_eq!(cut.files.get("shared.txt").map(String::as_str), Some("from-a"));
+
+        // Head checkpoint ("checkpoint now"): both writes folded, and the
+        // log's total order decides the surviving content.
+        let head = gate.create_checkpoint(None).await.expect("checkpoint at head");
+        assert_eq!(head.gate_seq, 2, "the head is the latest assigned gate_seq");
+        assert_eq!(head.files.get("shared.txt").map(String::as_str), Some("from-b"));
+
+        // Per-agent revert (D5 ii): restore to the cut, replay the tail
+        // without agent-b — shared.txt stays exactly where the cut left it.
+        let events =
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default()).await.expect("load");
+        let reverted = cut.replay_tail_excluding(&events, Some("agent-b"));
+        assert_eq!(reverted.get("shared.txt").map(String::as_str), Some("from-a"));
+    }
+
+    // ---- ADR-60 D5 second half: hunk-aware staging + explicit lock tokens ----
+
+    /// Fifteen distinct lines — neighbors never repeat, so the histogram diff
+    /// of a single-line edit is exactly one clean hunk.
+    fn numbered_file() -> String {
+        let joined = (1..=15).map(|n| format!("line-{n:02}")).collect::<Vec<_>>().join("\n");
+        joined + "\n"
+    }
+
+    fn replace_line(content: &str, index: usize, with: &str) -> String {
+        let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+        lines[index] = with.to_owned();
+        lines.join("\n") + "\n"
+    }
+
+    #[tokio::test]
+    async fn hunk_aware_staging_applies_disjoint_sibling_edits_without_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let seed = numbered_file();
+        std::fs::write(root.join("shared.txt"), &seed).expect("seed file");
+        let base_hash = blake3::hash(seed.as_bytes()).to_hex().to_string();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // Agent-a rewrites line 2 off the shared base and lands first.
+        let a_content = replace_line(&seed, 1, "A-edit");
+        let mut req_a = real_fs_write("stage-a", "shared.txt", &a_content);
+        req_a.base_versions.insert("shared.txt".to_owned(), base_hash.clone());
+        gate.submit(req_a, CancellationToken::new()).await.expect("agent-a applies");
+
+        // Agent-b still holds the ORIGINAL base view (its claim predates a's
+        // landing) and rewrites line 14 — a disjoint hunk. Instead of the
+        // old wholesale refusal, the write stages onto a's state.
+        let b_content = replace_line(&seed, 13, "B-edit");
+        let mut req_b = real_fs_write("stage-b", "shared.txt", &b_content);
+        req_b.agent_id = "agent-b".to_owned();
+        req_b.base_versions.insert("shared.txt".to_owned(), base_hash); // stale on purpose
+
+        let outcome =
+            gate.submit(req_b, CancellationToken::new()).await.expect("disjoint hunks stage");
+        assert!(!outcome.replayed, "a staged write is a fresh execution");
+
+        // The executed content keeps BOTH edits — not b's verbatim text,
+        // which would have silently reverted a's line.
+        let expected_merged = replace_line(&a_content, 13, "B-edit");
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared.txt")).expect("read"),
+            expected_merged,
+            "sibling's line-2 edit AND late writer's line-14 edit both survive"
+        );
+
+        // Attribution stays honest: the pre-image is what was actually on
+        // disk (a's state), and the WAL row records the merged input plus a
+        // staging note for the manual-resolution trail.
+        let row = applied_row(&pool, "stage-b").await;
+        assert_eq!(
+            row.pre_image_hash.as_deref(),
+            Some(blake3::hash(a_content.as_bytes()).to_hex().to_string().as_str()),
+            "the applied row attributes the true pre-write state"
+        );
+        assert_eq!(row.payload["input"]["content"], json!(expected_merged));
+        assert_eq!(row.payload["hunk_staging"][0]["target"], json!("shared.txt"));
+        assert_eq!(
+            row.payload["hunk_staging"][0]["staged_onto_hash"],
+            json!(blake3::hash(a_content.as_bytes()).to_hex().to_string()),
+            "the staging note names the exact state the write was built on"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_hunk_collision_conflicts_loudly_for_manual_resolution() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let seed = numbered_file();
+        std::fs::write(root.join("shared.txt"), &seed).expect("seed file");
+        let base_hash = blake3::hash(seed.as_bytes()).to_hex().to_string();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // Agent-a rewrites line 2 off the shared base and lands first.
+        let a_content = replace_line(&seed, 1, "A-edit");
+        let mut req_a = real_fs_write("collide-a", "shared.txt", &a_content);
+        req_a.base_versions.insert("shared.txt".to_owned(), base_hash.clone());
+        gate.submit(req_a, CancellationToken::new()).await.expect("agent-a applies");
+
+        // Agent-b rewrites THE SAME LINE off the same stale base: the hunks
+        // overlap, so the write refuses loudly instead of picking a winner.
+        let b_content = replace_line(&seed, 1, "B-edit");
+        let mut req_b = real_fs_write("collide-b", "shared.txt", &b_content);
+        req_b.agent_id = "agent-b".to_owned();
+        req_b.base_versions.insert("shared.txt".to_owned(), base_hash);
+
+        let error = gate
+            .submit(req_b, CancellationToken::new())
+            .await
+            .expect_err("same-hunk collision must refuse loudly");
+        match error {
+            GateError::Conflict { event_id, reason } => {
+                assert_eq!(event_id, "collide-b");
+                assert!(
+                    reason.contains("same-hunk collision"),
+                    "the reason names the collision class: {reason}"
+                );
+                assert!(
+                    reason.contains("manual resolution"),
+                    "the reason points at the manual-resolution path: {reason}"
+                );
+                assert!(reason.contains("shared.txt"), "the reason names the target: {reason}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        assert_eq!(
+            whiteboard_row_count(&pool).await,
+            1,
+            "only agent-a's applied row — the collision appends nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared.txt")).expect("read"),
+            a_content,
+            "the colliding write never reached disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_lock_blocks_foreign_writes_with_holder_info_until_release() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("hot.txt"), "hot-v1").expect("seed file");
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // Agent-a reserves the hot shared file for exclusive write.
+        let token =
+            gate.acquire_lock("hot.txt", "agent-a", Duration::from_secs(60)).expect("lock granted");
+        assert_eq!(token.path, "hot.txt");
+        assert_eq!(token.agent_id, "agent-a");
+
+        // A foreign write against the locked file is refused LOUDLY with
+        // holder info — before any WAL append, before touching disk.
+        let mut foreign = real_fs_write("lock-1", "hot.txt", "sneaky-bypass");
+        foreign.agent_id = "agent-b".to_owned();
+        let error = gate.submit(foreign, CancellationToken::new()).await.expect_err("locked");
+        match error {
+            GateError::Conflict { event_id, reason } => {
+                assert_eq!(event_id, "lock-1");
+                assert!(
+                    reason.contains("agent-a") && reason.contains("locked for exclusive write"),
+                    "the conflict names the lock holder: {reason}"
+                );
+            }
+            other => panic!("expected Conflict with lock info, got {other:?}"),
+        }
+        assert_eq!(whiteboard_row_count(&pool).await, 0, "the refused write appends nothing");
+        assert_eq!(
+            std::fs::read_to_string(root.join("hot.txt")).expect("read"),
+            "hot-v1",
+            "the locked file is untouched"
+        );
+
+        // The reserving owner writes through its own lock.
+        let mut owned = real_fs_write("lock-2", "hot.txt", "owner-write");
+        owned.agent_id = "agent-a".to_owned();
+        gate.submit(owned, CancellationToken::new()).await.expect("holder writes through own lock");
+
+        // A stale/forged token cannot release someone's reservation...
+        let mut forged = token.clone();
+        forged.token_id = "forged-id".to_owned();
+        assert!(
+            matches!(gate.release_lock(&forged), Err(GateError::Locked { ref holder, .. }) if holder == "agent-a"),
+            "release with a wrong token id is refused with holder info"
+        );
+        // ...and the genuine token frees the path.
+        gate.release_lock(&token).expect("genuine release succeeds");
+
+        let mut after = real_fs_write("lock-3", "hot.txt", "free-now");
+        after.agent_id = "agent-b".to_owned();
+        let outcome = gate.submit(after, CancellationToken::new()).await;
+        assert!(outcome.is_ok(), "the write flows once the reservation is released: {outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("hot.txt")).expect("read"),
+            "free-now",
+            "the released write materializes"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_lock_lapses_and_stops_blocking_writes() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("hot.txt"), "hot-v1").expect("seed file");
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // A very short TTL: after it lapses (purged lazily on the next
+        // table touch), a foreign agent may write again — no sweeper needed.
+        let token =
+            gate.acquire_lock("hot.txt", "agent-a", Duration::from_millis(50)).expect("granted");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let mut foreign = real_fs_write("expiry-1", "hot.txt", "post-lapse");
+        foreign.agent_id = "agent-b".to_owned();
+        let outcome = gate.submit(foreign, CancellationToken::new()).await;
+        assert!(outcome.is_ok(), "an expired reservation no longer blocks writes: {outcome:?}");
+
+        // Releasing an already-lapsed reservation is idempotent success: the
+        // desired state is already reached.
+        gate.release_lock(&token).expect("release after lapse still succeeds");
+        assert_eq!(whiteboard_row_count(&pool).await, 1, "only the post-lapse write applied");
     }
 }

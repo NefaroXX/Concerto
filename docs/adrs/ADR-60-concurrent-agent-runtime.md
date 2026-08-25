@@ -1,6 +1,6 @@
 # ADR-60: Concurrent Agent Runtime — Process-per-Agent Supervisor, Event-Sourced Whiteboard, Memory Spine
 
-**Status:** Active (approved — see Revision)
+**Status:** Accepted (see Revision)
 **Date:** 2026-08-18
 **Deciders:** sol (product owner); architecture review pending per process
 **Supersedes:** none (new decision; ADR-35 §4/§5 coordinator contract is redefined below, not silently contradicted)
@@ -140,6 +140,16 @@ Negative / costs:
   - D1/D2 claim verification completed: `agent_loop.rs` struct (:35–80) owns every dependency for a run, all injected at construction (`new` :180, `with_project_root` :215, `with_session_store` :292); `run` (:303) → `run_once` (:442) → provider → `execute_single_tool_call` (:1286) → single tool-executor call site (:1365) → `store_task_summary` (:1102) → persistence (:1185/:1232). AgentLoop is the agent-process entry; the slice swaps the executor call site for a gate-proxy client. `mcp/client.rs` confirms the transport precedent: `spawn` (:194, piped stdio, `kill_on_drop`, double-spawn guard :200), `initialize` (:266), JSON-RPC 2.0 newline-delimited framing (:495–511), `stop` (:439, cancel → stdin EOF → GRACE_PERIOD → kill escalation), `Drop` reap (:580); `GRACE_PERIOD = 2s` (:45).
   - `run_review_cycle` resumability promoted from a consequence footnote to an explicit Deferred/Sequencing item (item 3 above).
   - Approved to proceed to the vertical slice (Deferred item 1).
+- 2026-08-24 — v1.2, Status Active → Accepted. Implementation complete across
+  Phases 1–4 plus follow-up fixes: decisions D1–D8 are implemented and Deferred
+  items 1–3 are delivered (thin vertical slice, #152 plan binding, review-cycle
+  resumability); Deferred item 4 (scheduler/subscription generalization beyond
+  6 agents, real-embedder swap, multi-level disclosure) remains deferred per
+  ADR. Implementation commits: `5c9b269` (Phase 1 supervisor wiring),
+  `4dc2c67` (Phase 2 whiteboard-verified plan binding), `8e065d8` (Phase 3
+  review-cycle resumability), `787df6e` (Phase 4 consolidation and replay
+  harness), `b6ce712` (heartbeat liveness anchored on the supervisor clock),
+  `f75b4b7` (`PR_SET_PDEATHSIG` orphan cleanup); merged via PR #11 (`83d20cc`).
 
 ### D5 implementation notes — always-on injection & per-target claims (2026-08)
 
@@ -285,3 +295,37 @@ unchanged.
   backpressure signalling, and schedule-driven pushes all remain behind
   Deferred item 4. The raw log remains append-only and untouched; slices are
   projections.
+
+### D6 implementation notes — consolidation (2026-08)
+
+Minimal thin-slice consolidator as landed in Phase 4 (`787df6e`). These notes
+extend D6; the decision text above is unchanged.
+
+- **Out-of-band trigger, never blocking the gate.** The supervisor's write-path
+  handlers count appends; every `CONSOLIDATION_TRIGGER_APPENDS` (= 16) appends
+  detach ONE consolidation pass onto the tokio runtime, fire-and-forget. The
+  gated-write / publish reply path never awaits indexing work; triggers are
+  coalesced while a pass is in flight (at most one pass runs at a time).
+- **Fold into the hybrid store, bi-temporal.** Each pass folds foldable events
+  (`Decision`, `PlanApproved`, `ReviewState`) into `SqliteVectorStore` with
+  bi-temporal metadata (world-time from the folded events vs ingestion-time of
+  the projection). The raw log is never summarized away.
+- **Content-derived ids + bookmark watermark → idempotent.** Chunk ids derive
+  deterministically from project + group + watermark `gate_seq`, so a crash
+  between storing a chunk and recording its `Consolidation` bookmark converges
+  on re-run instead of duplicating; each pass records ONE bookmark event whose
+  watermark is where the next pass resumes.
+- **Invalidate-not-delete with provenance.** A newer projection tombstones the
+  previous chunk (rows retained) and cites `superseded_event_ids` /
+  `superseded_chunk_ids` in its own provenance, keeping the audit trail
+  unbroken.
+- **Deterministic feature-hash placeholder embedder.** Projections are
+  retrievable without a downloaded model via bag-of-tokens feature-hash vectors
+  (`model_id: "feature-hash"`); swapping in real embeddings later changes no
+  contract and stays behind Deferred item 4.
+- **Disclosure clamp.** The supervisor's `retrieve-memory` shortlist clamps to
+  `DISCLOSURE_MAX_CHUNKS` (= 10) chunks — one disclosure level, per D6.
+- **Files:** `crates/orchestrator/src/consolidation.rs` (`Consolidator`,
+  constants above), `crates/orchestrator/src/supervisor.rs` (write-path trigger,
+  retrieval clamp), `crates/memory/src/vector_store.rs` (`SqliteVectorStore`
+  projection target).
