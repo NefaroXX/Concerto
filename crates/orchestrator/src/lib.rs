@@ -29,6 +29,7 @@ pub mod gate;
 pub mod gate_proxy;
 pub mod graph;
 pub mod hash;
+pub mod hunk;
 pub mod in_process_gate;
 pub mod intent_classifier;
 pub mod intent_grants;
