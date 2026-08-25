@@ -207,28 +207,16 @@ async fn all_events(pool: &sqlx::SqlitePool) -> Vec<WhiteboardEvent> {
 }
 
 /// Per-agent revert (ADR-60 D5): restore-to-base + replay excluding one
-/// agent's event ids. Slice scope: `write` operations only (the only ops this
-/// fixture performs); move/copy/delete revert remains future work.
+/// agent's event ids — delegated to the library implementation
+/// (`checkpoint::revert_excluding_agent`) promoted from this very fixture, so
+/// the e2e assertions exercise the production API. Cut `0` makes the empty
+/// state the restore point, so the exclusion spans the whole log — exactly
+/// this fixture's original replay-everything-minus-one-agent semantics.
 fn revert_agent(
     events: &[WhiteboardEvent],
     exclude_agent: Option<&str>,
 ) -> BTreeMap<String, String> {
-    let mut state = BTreeMap::new();
-    for event in events {
-        if event.kind != WhiteboardKind::WriteApplied {
-            continue;
-        }
-        if exclude_agent.is_some_and(|agent| event.agent_id == agent) {
-            continue;
-        }
-        if event.payload["input"]["operation"] != json!("write") {
-            continue;
-        }
-        let path = event.payload["input"]["path"].as_str().expect("path");
-        let content = event.payload["input"]["content"].as_str().expect("content");
-        state.insert(path.to_owned(), content.to_owned());
-    }
-    state
+    concerto_orchestrator::checkpoint::revert_excluding_agent(events, exclude_agent, 0)
 }
 
 #[tokio::test(flavor = "multi_thread")]

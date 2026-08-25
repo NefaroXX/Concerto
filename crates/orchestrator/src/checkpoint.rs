@@ -6,12 +6,13 @@
 //! skips the expensive `decompose_task` (Architect) phase and resumes the
 //! execution loop with the remaining subtasks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use concerto_core::types::{
     AgentId, AgentRunResult, DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskId,
 };
 use concerto_core::OrchestratorError;
+use concerto_sessions::whiteboard::{WhiteboardEvent, WhiteboardKind};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -466,6 +467,144 @@ fn restore_edge(
             "checkpoint restore: failed to add dependency {from} -> {to}: {error}"
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// ADR-60 D5: gate-boundary checkpoints & per-agent revert
+// ---------------------------------------------------------------------------
+
+/// A gate-boundary checkpoint (ADR-60 D5 (i)): the projected file state of a
+/// run pinned to a consistent cut of the whiteboard log.
+///
+/// `gate_seq` is the consistent-cut coordinate — "everything ≤ seq S" — and
+/// `files` is that cut replayed through the log's total order: for every
+/// path, the content of the last applied write at or before S. Restoring a
+/// later state means *restore = snapshot + replay tail*
+/// ([`GateBoundaryCheckpoint::replay_tail_excluding`]); per-agent revert is
+/// restore + tail replay skipping one agent's `event_id`s (D5 (ii)) — never a
+/// last-action undo, always an attribution-aware log replay.
+///
+/// The checkpoint is a **projection, not a second store**: every folded event
+/// was committed WAL-first by the write gate before its tool executed (the D4
+/// ordering invariant), so the cut survives any crash without separate
+/// storage and the raw log is never truncated or rewritten. Materialize one
+/// from the durable log via [`crate::gate::WriteGate::create_checkpoint_at`],
+/// or from an in-memory event slice via [`GateBoundaryCheckpoint::at_cut`].
+///
+/// Replay scope: applied filesystem **write** operations only — the op set
+/// the per-agent-revert e2e fixture (`supervisor_parallel_e2e.rs`) exercises,
+/// from which this API was promoted. Move/copy/delete revert remains future
+/// work; non-write rows are skipped, not misapplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateBoundaryCheckpoint {
+    /// The inclusive consistent-cut coordinate: every folded event has
+    /// `gate_seq <= gate_seq`; every event after it belongs to the replay
+    /// tail.
+    pub gate_seq: u64,
+    /// Session filter the cut was taken under (`None` = whole log). Purely
+    /// informational here — filtering happens where events are loaded.
+    pub session_id: Option<String>,
+    /// Projected file state at the cut: relative path → content.
+    pub files: BTreeMap<String, String>,
+}
+
+impl GateBoundaryCheckpoint {
+    /// Fold an ordered event slice into the snapshot at cut `gate_seq`.
+    ///
+    /// `events` must be ordered ascending by `gate_seq` — the order every
+    /// whiteboard reader returns, and the total order the replay semantics
+    /// depend on. Events with `gate_seq > gate_seq` are ignored (they are the
+    /// tail, not part of this cut).
+    pub fn at_cut(events: &[WhiteboardEvent], gate_seq: u64, session_id: Option<String>) -> Self {
+        let mut files = BTreeMap::new();
+        for event in events.iter().filter(|event| event.gate_seq <= gate_seq) {
+            apply_write_event(&mut files, event);
+        }
+        Self { gate_seq, session_id, files }
+    }
+
+    /// D5 (ii): restore to this snapshot, then replay the log tail — every
+    /// event with `gate_seq > self.gate_seq` **excluding** `exclude_agent`'s
+    /// rows — over it, returning the resulting file state.
+    ///
+    /// `exclude_agent = None` replays the whole tail (plain restore-forward).
+    /// The result is the same map shape as [`Self::files`] so callers can
+    /// diff, verify, or materialize it.
+    pub fn replay_tail_excluding(
+        &self,
+        events: &[WhiteboardEvent],
+        exclude_agent: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut files = self.files.clone();
+        for event in events.iter().filter(|event| event.gate_seq > self.gate_seq) {
+            if exclude_agent.is_some_and(|agent| event.agent_id == agent) {
+                continue;
+            }
+            apply_write_event(&mut files, event);
+        }
+        files
+    }
+}
+
+/// Per-agent revert (ADR-60 D5 (ii)) in one call over a log slice: restore to
+/// the consistent cut at `checkpoint_seq`, then replay the tail excluding
+/// `exclude_agent`'s `event_ids`, returning the final file state.
+///
+/// The exclusion filters **the tail only** — a checkpoint is, by definition,
+/// state that predates what is being reverted, so to exclude an agent across
+/// the whole log pass `checkpoint_seq = 0` (empty restore point; this is what
+/// the promoted `supervisor_parallel_e2e` fixture uses). The degenerate
+/// `checkpoint_seq = u64::MAX` with `exclude_agent = None` is the full-log
+/// replay whose last writer per path is the log's verdict. For a stored
+/// snapshot object use [`GateBoundaryCheckpoint::replay_tail_excluding`]
+/// instead of re-folding the prefix.
+pub fn revert_excluding_agent(
+    events: &[WhiteboardEvent],
+    exclude_agent: Option<&str>,
+    checkpoint_seq: u64,
+) -> BTreeMap<String, String> {
+    GateBoundaryCheckpoint::at_cut(events, checkpoint_seq, None)
+        .replay_tail_excluding(events, exclude_agent)
+}
+
+/// Fold one whiteboard row into the projected file state if it is an applied
+/// filesystem write carrying a usable path/content pair; anything else is
+/// skipped. A malformed payload on an applied-write row degrades to a
+/// `debug!`-logged skip (observable), never a hard failure — the projection
+/// must stay reconstructible from any historical log.
+fn apply_write_event(files: &mut BTreeMap<String, String>, event: &WhiteboardEvent) {
+    if event.kind != WhiteboardKind::WriteApplied {
+        return;
+    }
+    let Some(input) = event.payload.get("input") else {
+        tracing::debug!(
+            target: "concerto_orchestrator::checkpoint",
+            event_id = %event.event_id,
+            "checkpoint replay: applied write without input payload; row skipped"
+        );
+        return;
+    };
+    // Slice scope (see [`GateBoundaryCheckpoint`]): writes only, so
+    // move/copy/delete rows are left for their dedicated revert support.
+    if input.get("operation").and_then(serde_json::Value::as_str) != Some("write") {
+        return;
+    }
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let content = input.get("content").and_then(serde_json::Value::as_str);
+    match (path, content) {
+        (Some(path), Some(content)) => {
+            files.insert(path.to_owned(), content.to_owned());
+        }
+        (path, content) => {
+            tracing::debug!(
+                target: "concerto_orchestrator::checkpoint",
+                event_id = %event.event_id,
+                ?path,
+                ?content,
+                "checkpoint replay: applied write missing path or string content; row skipped"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1215,6 +1354,101 @@ mod tests {
             serde_json::to_value(&completed_results).unwrap(),
             "completed results preserved"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D5: gate-boundary checkpoint + per-agent revert
+    // ------------------------------------------------------------------
+
+    /// A stored `WriteApplied` filesystem-write row shaped exactly like the
+    /// write gate produces (payload `{ tool, input: { operation, path,
+    /// content } }`).
+    fn applied_write(
+        gate_seq: u64,
+        event_id: &str,
+        agent_id: &str,
+        path: &str,
+        content: &str,
+    ) -> WhiteboardEvent {
+        WhiteboardEvent {
+            event_id: event_id.to_owned(),
+            gate_seq,
+            agent_id: agent_id.to_owned(),
+            agent_seq: 1,
+            kind: WhiteboardKind::WriteApplied,
+            scope: String::new(),
+            session_id: None,
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "tool": "filesystem",
+                "input": { "operation": "write", "path": path, "content": content }
+            }),
+            content_hash: String::new(),
+            pre_image_hash: None,
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn d5_checkpoint_at_cut_then_revert_excluding_agent_replays_the_log() {
+        let events = vec![
+            applied_write(1, "e1", "agent-a", "shared.txt", "base"),
+            applied_write(2, "e2", "agent-b", "notes.md", "b1"),
+            // Non-write rows must never be folded into the projection.
+            WhiteboardEvent {
+                kind: WhiteboardKind::Decision,
+                payload: serde_json::json!({ "note": "not a write" }),
+                ..applied_write(3, "e3", "agent-a", "poison.txt", "never")
+            },
+            applied_write(4, "e4", "agent-a", "shared.txt", "cut-value"),
+            // A rejected write carries no file effect even for a kept agent.
+            WhiteboardEvent {
+                kind: WhiteboardKind::WriteRejected,
+                ..applied_write(5, "e5", "agent-b", "rejected.txt", "nope")
+            },
+            applied_write(6, "e6", "agent-b", "shared.txt", "tail-b"),
+            applied_write(7, "e7", "agent-a", "notes.md", "a2"),
+        ];
+
+        // Checkpoint at S = 4 ("everything ≤ seq S"): the cut holds each
+        // path's last applied write at or before the boundary.
+        let cut = GateBoundaryCheckpoint::at_cut(&events, 4, None);
+        assert_eq!(cut.gate_seq, 4);
+        assert_eq!(cut.files.get("shared.txt").map(String::as_str), Some("cut-value"));
+        assert_eq!(cut.files.get("notes.md").map(String::as_str), Some("b1"));
+        assert!(!cut.files.contains_key("poison.txt"), "non-write rows are not applied");
+        assert!(!cut.files.contains_key("rejected.txt"), "rejected writes are not applied");
+        assert!(!cut.files.contains_key("extra.txt"));
+
+        // Per-agent revert (D5 ii): restore the cut, replay the tail minus
+        // agent-b's rows. shared.txt stays at its cut value (b's tail write
+        // is skipped); notes.md advances via agent-a's tail write.
+        let reverted = revert_excluding_agent(&events, Some("agent-b"), 4);
+        assert_eq!(reverted.get("shared.txt").map(String::as_str), Some("cut-value"));
+        assert_eq!(reverted.get("notes.md").map(String::as_str), Some("a2"));
+        assert!(!reverted.contains_key("extra.txt"), "excluded agent's creates are gone");
+
+        // Whole-log exclusion (cut 0 — the promoted fixture's semantics):
+        // agent-b's rows are skipped everywhere, so shared.txt keeps only
+        // agent-a's writes and notes.md advances straight to a2.
+        let no_b = revert_excluding_agent(&events, Some("agent-b"), 0);
+        assert_eq!(no_b.get("shared.txt").map(String::as_str), Some("cut-value"));
+        assert_eq!(no_b.get("notes.md").map(String::as_str), Some("a2"));
+
+        // Full-log replay (empty restore point, no exclusion): the log's last
+        // writer per path wins. Only the two genuinely applied write paths
+        // appear; poison/rejected rows contribute nothing.
+        let full = revert_excluding_agent(&events, None, u64::MAX);
+        assert_eq!(full.len(), 2);
+        assert_eq!(full.get("shared.txt").map(String::as_str), Some("tail-b"));
+        assert_eq!(full.get("notes.md").map(String::as_str), Some("a2"));
+        assert!(!full.contains_key("poison.txt") && !full.contains_key("rejected.txt"));
+
+        // Restore-forward through the same snapshot object agrees with the
+        // one-shot helper.
+        let forward = cut.replay_tail_excluding(&events, Some("agent-b"));
+        assert_eq!(forward, reverted);
     }
 
     // ------------------------------------------------------------------

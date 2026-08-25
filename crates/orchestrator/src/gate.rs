@@ -67,7 +67,10 @@ use concerto_core::types::{
     CapabilitySet, PolicyAction, PolicyVerdict, SessionContext, ToolDefinition,
 };
 use concerto_core::CancellationToken;
-use concerto_sessions::whiteboard::{append_whiteboard_event, NewWhiteboardEvent, WhiteboardKind};
+use concerto_sessions::whiteboard::{
+    append_whiteboard_event, latest_gate_seq, load_whiteboard_events_up_to, NewWhiteboardEvent,
+    WhiteboardKind,
+};
 use concerto_sessions::SessionError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -775,6 +778,46 @@ impl WriteGate {
             }
             None => Ok(None),
         }
+    }
+
+    /// ADR-60 D5 (i): materialize the gate-boundary checkpoint at
+    /// `gate_seq` — the projected file state of every applied filesystem
+    /// write with `gate_seq <= gate_seq` (the consistent cut "everything ≤
+    /// seq S"), restricted to `session_id` when given.
+    ///
+    /// Durability rides the log, not a second store: every folded event was
+    /// committed WAL-first by this gate before its tool executed (the module's
+    /// ordering invariant), so the cut is reconstructible after any crash. The
+    /// checkpoint is a projection — the raw log is never truncated or
+    /// rewritten. Restoring forward (and per-agent revert, D5 (ii)) replays
+    /// the tail over the snapshot via
+    /// [`crate::checkpoint::GateBoundaryCheckpoint::replay_tail_excluding`].
+    ///
+    /// Reachable wherever the gate is attached —
+    /// [`crate::supervisor::SupervisorServices::gate`] on the supervised path
+    /// (opt-in `[orchestration] supervisor_enabled`) and the in-process loop's
+    /// gate alike — for revert/restore flows built on top.
+    pub async fn create_checkpoint_at(
+        &self,
+        gate_seq: u64,
+        session_id: Option<&str>,
+    ) -> Result<crate::checkpoint::GateBoundaryCheckpoint, GateError> {
+        let events = load_whiteboard_events_up_to(&self.log_pool, gate_seq, session_id).await?;
+        Ok(crate::checkpoint::GateBoundaryCheckpoint::at_cut(
+            &events,
+            gate_seq,
+            session_id.map(str::to_owned),
+        ))
+    }
+
+    /// Convenience form of [`WriteGate::create_checkpoint_at`] pinned to the
+    /// current head of the log: "checkpoint now".
+    pub async fn create_checkpoint(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<crate::checkpoint::GateBoundaryCheckpoint, GateError> {
+        let head = latest_gate_seq(&self.log_pool).await.map_err(GateError::from)?;
+        self.create_checkpoint_at(head, session_id).await
     }
 }
 
@@ -2181,5 +2224,45 @@ mod tests {
             json!(blake3::hash(b"old out").to_hex().to_string()),
             "the destination pre-image is attributed too"
         );
+    }
+
+    #[tokio::test]
+    async fn create_checkpoint_materializes_consistent_cut_for_per_agent_revert() {
+        let (_dir, pool) = test_pool(1).await;
+        let gate = gate(
+            allow_engine(),
+            Arc::new(AtomicUsize::new(0)),
+            pool.clone(),
+            PathBuf::from("/tmp"),
+        );
+
+        // Two agents write the same path through the gate (stub executor; the
+        // contract under test is the WAL projection, not disk semantics).
+        let mut req_a = filesystem_request("cp-a", "write", "shared.txt");
+        req_a.input["content"] = json!("from-a");
+        gate.submit(req_a, CancellationToken::new()).await.expect("agent-a applies");
+
+        let mut req_b = filesystem_request("cp-b", "write", "shared.txt");
+        req_b.agent_id = "agent-b".to_owned();
+        req_b.input["content"] = json!("from-b");
+        gate.submit(req_b, CancellationToken::new()).await.expect("agent-b applies");
+
+        // Cut at seq 1: only agent-a's write is inside the consistent cut.
+        let cut = gate.create_checkpoint_at(1, None).await.expect("checkpoint at 1");
+        assert_eq!(cut.gate_seq, 1);
+        assert_eq!(cut.files.get("shared.txt").map(String::as_str), Some("from-a"));
+
+        // Head checkpoint ("checkpoint now"): both writes folded, and the
+        // log's total order decides the surviving content.
+        let head = gate.create_checkpoint(None).await.expect("checkpoint at head");
+        assert_eq!(head.gate_seq, 2, "the head is the latest assigned gate_seq");
+        assert_eq!(head.files.get("shared.txt").map(String::as_str), Some("from-b"));
+
+        // Per-agent revert (D5 ii): restore to the cut, replay the tail
+        // without agent-b — shared.txt stays exactly where the cut left it.
+        let events =
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default()).await.expect("load");
+        let reverted = cut.replay_tail_excluding(&events, Some("agent-b"));
+        assert_eq!(reverted.get("shared.txt").map(String::as_str), Some("from-a"));
     }
 }

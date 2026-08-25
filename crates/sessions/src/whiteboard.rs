@@ -347,6 +347,50 @@ pub async fn load_whiteboard_events_by_plan(
     rows.into_iter().map(WhiteboardEvent::try_from).collect()
 }
 
+/// ADR-60 D5 consistent-cut read: every event with `gate_seq <= max_gate_seq`
+/// ("everything ≤ seq S"), optionally restricted to one session, ordered by
+/// `gate_seq` ascending.
+///
+/// Unlike [`load_whiteboard_events`] there is no exclusive cursor and no
+/// limit: a gate-boundary checkpoint materializes the whole prefix of the cut,
+/// which is exactly the replay input for restore. The raw log is only read —
+/// never truncated or rewritten (the checkpoint is a projection).
+pub async fn load_whiteboard_events_up_to(
+    pool: &sqlx::SqlitePool,
+    max_gate_seq: u64,
+    session_id: Option<&str>,
+) -> Result<Vec<WhiteboardEvent>, SessionError> {
+    let mut sql = format!("SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE gate_seq <= ?");
+    if session_id.is_some() {
+        sql.push_str(" AND session_id = ?");
+    }
+    sql.push_str(" ORDER BY gate_seq ASC");
+
+    // Log-assigned seqs always fit i64; saturate absurd bounds (`u64::MAX`
+    // meaning "through end of log") instead of wrapping negative on cast.
+    let bound = i64::try_from(max_gate_seq).unwrap_or(i64::MAX);
+    let mut query = query_as::<_, WhiteboardEventRow>(&sql).bind(bound);
+    if let Some(session_id) = session_id {
+        query = query.bind(session_id);
+    }
+    let rows = query.fetch_all(pool).await?;
+    rows.into_iter().map(WhiteboardEvent::try_from).collect()
+}
+
+/// Current head of the log: the largest assigned `gate_seq`, or `0` when the
+/// log is empty. This is the natural boundary for "checkpoint at the current
+/// gate" ([`load_whiteboard_events_up_to`] takes it as its inclusive bound).
+pub async fn latest_gate_seq(pool: &sqlx::SqlitePool) -> Result<u64, SessionError> {
+    let head: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(gate_seq) FROM whiteboard_events").fetch_one(pool).await?;
+    match head {
+        Some(seq) => {
+            u64::try_from(seq).map_err(|_| SessionError::Storage("negative gate_seq".to_string()))
+        }
+        None => Ok(0),
+    }
+}
+
 const EVENT_COLUMNS: &str =
     "event_id, gate_seq, agent_id, agent_seq, kind, scope, session_id, plan_id, \
      causation, payload, content_hash, pre_image_hash, created_at";
@@ -676,6 +720,35 @@ mod tests {
             .await
             .expect("row count");
         assert_eq!(count, N as i64);
+    }
+
+    #[tokio::test]
+    async fn consistent_cut_reader_returns_inclusive_prefix_and_head() {
+        let (_dir, pool) = test_pool(1).await;
+        assert_eq!(latest_gate_seq(&pool).await.expect("empty head"), 0, "empty log head is 0");
+
+        for (i, (agent, session)) in
+            [("agent-a", Some("sess-1")), ("agent-b", None), ("agent-a", None)].iter().enumerate()
+        {
+            let mut event = new_event(&format!("cut-{i}"), agent, WhiteboardKind::WriteApplied);
+            event.session_id = session.map(str::to_owned);
+            append_whiteboard_event(&pool, &event).await.expect("append");
+        }
+
+        assert_eq!(latest_gate_seq(&pool).await.expect("head"), 3);
+
+        // Inclusive upper bound: seq 2 folds rows 1 and 2, never 3.
+        let cut = load_whiteboard_events_up_to(&pool, 2, None).await.expect("cut at 2");
+        assert_eq!(cut.iter().map(|ev| ev.gate_seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        let full = load_whiteboard_events_up_to(&pool, u64::MAX, None).await.expect("full cut");
+        assert_eq!(full.len(), 3);
+
+        // Session filter composes with the cut.
+        let sess1 = load_whiteboard_events_up_to(&pool, u64::MAX, Some("sess-1"))
+            .await
+            .expect("session cut");
+        assert_eq!(sess1.iter().map(|ev| ev.event_id.as_str()).collect::<Vec<_>>(), vec!["cut-0"]);
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ stubs in place — nothing is ever deleted.
 | **Accepted — amended/extended by ADR-NN** | In force as modified by the named ADR(s); read both. |
 | **Accepted (revised in place)** | Corrected by maintainer direction; no superseding ADR exists. |
 | **Deferred** | Design is recorded for future work; not implemented. |
-| **Active** | Approved and in force; may carry in-document revisions (ADR-60). |
+| **Active** | Approved and in force; may carry in-document revisions. |
 | **Superseded** | Replaced by a later ADR; archived copy kept for history. |
 | **Archived** | Historical record only; not current guidance. |
 
@@ -87,7 +87,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [57](./ADR-57-config-change-propagation.md) | Config change propagation without restart | 2026-08-13 | Accepted | Desktop watcher + reconcile helper; per-run reload in the CLI. |
 | [58](./ADR-58-configurable-orchestration.md) | Configurable orchestration — config owns the pipeline | 2026-08-13 (rev. 2026-08-15) | Accepted (revised in place) | Table-driven stage topology from config; only the coordinator is hardcoded. |
 | [59](./ADR-59-studio-blueprint-editor.md) | Studio orchestration editor — one surface, config-owned, full CRUD | 2026-08-14 (rev. 2026-08-15) | Accepted (revised in place) | Single-surface roster editor with locked coordinator and atomic saves. |
-| [60](./ADR-60-concurrent-agent-runtime.md) | Concurrent Agent Runtime — Process-per-Agent Supervisor | 2026-08-18 | Active (approved) | Process-per-agent supervision, event-sourced whiteboard, and a durable memory spine. |
+| [60](./ADR-60-concurrent-agent-runtime.md) | Concurrent Agent Runtime — Process-per-Agent Supervisor | 2026-08-18 (rev. 2026-08-24) | Accepted | Process-per-agent supervision, event-sourced whiteboard, and a durable memory spine; amends the [ADR-35](./ADR-35.md) coordinator contract, [ADR-36](./ADR-36.md) transcripts become log projections. Supersedes none. |
 | [61](./ADR-61-provider-layer-and-factory.md) | Provider Layer — `LlmProvider` Trait, Factory, Transport Hardening | 2026-08-18 | Accepted | One provider execution contract, one construction path, uniform transport behavior. |
 | [62](./ADR-62-tool-executor-and-virtual-fs.md) | Tool Execution Pipeline — `ToolExecutor`, Policy Gates, `VirtualFs` | 2026-08-19 | Accepted | Single auditable, policy-gated mutation boundary with staged, reversible writes. |
 | [63](./ADR-63-memory-subsystem.md) | Memory Subsystem — SQLite Hybrid Vector/FTS Retrieval | 2026-08-19 | Accepted — supersedes [ADR-10](archive/ADR-10.md) | Offline hybrid semantic + lexical retrieval over SQLite with local embeddings. |
