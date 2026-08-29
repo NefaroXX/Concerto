@@ -97,7 +97,7 @@ fastrand = "2"
 imara-diff = "0.1"
 
 # ---- Pure-Rust Git operations (Phase 2+, ADR-01) ----
-gix = "0.85"
+gix = "0.87"
 
 # ---- Shell allowlist / pattern matching (Phase 2) ----
 regex = "1"
