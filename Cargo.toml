@@ -169,7 +169,7 @@ notify = "7"
 # ---- Vector store (Phase 4, ADR-10) ----
 
 # ---- Task graph / DAG (Phase 5, ADR-19) ----
-petgraph = "0.6"
+petgraph = "0.8"
 
 # ---- Lazy initialization (Phase 6, ADR-20) ----
 once_cell = "1"
