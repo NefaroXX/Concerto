@@ -85,7 +85,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 tiktoken-rs = "0.6"
 
 # ---- Database (Phase 1, sessions) ----
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "time", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "time", "uuid"] }
 
 # ---- Filesystem & paths (Phase 1, sessions) ----
 dirs = "6"
