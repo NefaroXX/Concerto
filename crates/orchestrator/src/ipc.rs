@@ -68,6 +68,8 @@ pub enum IpcMethod {
     /// Agent acknowledgement of a pushed slice (ADR-60 D3; advances the
     /// supervisor's persisted cursor).
     AckWhiteboard,
+    /// Graceful shutdown (supervisor → agent notification, ADR-60 D1).
+    Shutdown,
 }
 
 impl IpcMethod {
@@ -82,6 +84,7 @@ impl IpcMethod {
             IpcMethod::Handshake => "handshake",
             IpcMethod::WhiteboardSlice => "whiteboard-slice",
             IpcMethod::AckWhiteboard => "ack-whiteboard",
+            IpcMethod::Shutdown => "shutdown",
         }
     }
 }
@@ -206,6 +209,12 @@ pub enum IpcParams {
     AckWhiteboard {
         /// The highest `gate_seq` the agent applied contiguously.
         end_gate_seq: u64,
+    },
+    /// Graceful shutdown (supervisor → agent notification).
+    Shutdown {
+        /// Optional reason for shutdown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 

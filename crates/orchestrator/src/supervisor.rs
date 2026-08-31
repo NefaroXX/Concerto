@@ -32,6 +32,8 @@
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write as IoWrite};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
@@ -795,6 +797,7 @@ impl Supervisor {
     /// path. On success the agent is [`AgentState::Running`]. On any failure
     /// the child is killed (if still alive) and reaped before returning, and
     /// no agent is left registered.
+    #[allow(unsafe_code)]
     fn spawn_inner(
         &mut self,
         spec: &RespawnSpec,
@@ -802,6 +805,28 @@ impl Supervisor {
         restart_count: u32,
     ) -> Result<(), SupervisorError> {
         let mut command = spec.to_command();
+        // ADR-60 D3: propagate the agent's whiteboard subscription scopes via
+        // env so the child can declare them / filter locally. The supervisor
+        // also declares them in the handshake request; env is the spawn-time
+        // config-owned source (ADR-58/59).
+        if let Some(scopes) = self.config.whiteboard_subscriptions.get(agent_id) {
+            if let Ok(json) = serde_json::to_string(scopes) {
+                command.env("CONCERTO_WHITEBOARD_SCOPES", json);
+            }
+        }
+        // ADR-60 D1: orphan cleanup — child dies with supervisor, own process group.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         // Child stderr is normally discarded; `CONCERTO_SUPERVISOR_DEBUG_STDERR`
         // redirects it to a file for diagnosing agent-process failures (used
@@ -937,6 +962,8 @@ impl Supervisor {
             return Err(SupervisorError::UnknownAgent(agent_id.to_owned()));
         };
         process.meta.state = AgentState::Stopping;
+        // ADR-60 D1/D2: try graceful shutdown notification before stdin-close.
+        send_shutdown_notification(&mut process.stdin);
         // Dropping the write end signals EOF to the child (ADR-60 D1 cleanup
         // path: stdin-close → child exits → reap).
         drop(process.stdin);
@@ -959,8 +986,8 @@ impl Supervisor {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        // Grace period exhausted: escalate.
-        let _ = process.child.kill();
+        // Grace period exhausted: escalate to SIGKILL on the process group.
+        kill_group_kill(&mut process.child);
         match process.child.wait() {
             Ok(_status) => {
                 process.meta.state = AgentState::Stopped;
@@ -1000,7 +1027,7 @@ impl Supervisor {
             // running). The registration is left in place, its child reaped,
             // for the caller to mark failed.
             if let Some(process) = self.agents.get_mut(agent_id) {
-                let _ = process.child.kill();
+                kill_group_kill(&mut process.child);
                 let _ = process.child.wait();
             }
             return Err(SupervisorError::RestartsExhausted {
@@ -1014,9 +1041,11 @@ impl Supervisor {
             .remove(agent_id)
             .ok_or_else(|| SupervisorError::UnknownAgent(agent_id.to_owned()))?;
 
-        // Old child teardown: close stdin (clean-shutdown signal), give it
-        // the grace window to exit on its own, then escalate to SIGKILL. The
-        // old child is always reaped before respawning.
+        // Old child teardown: shutdown notification + close stdin (clean-shutdown
+        // signal), give it the grace window to exit on its own, then escalate
+        // to SIGKILL on the process group. The old child is always reaped
+        // before respawning.
+        send_shutdown_notification(&mut process.stdin);
         drop(process.stdin);
         let deadline = Instant::now() + self.config.kill_grace;
         loop {
@@ -1026,7 +1055,7 @@ impl Supervisor {
                 Err(error) => return Err(SupervisorError::Io(error)),
             }
             if Instant::now() >= deadline {
-                let _ = process.child.kill();
+                kill_group_kill(&mut process.child);
                 let _ = process.child.wait();
                 break;
             }
@@ -1548,12 +1577,13 @@ fn dispatch_agent_line(
                     "supervisor write services are not configured".to_owned(),
                 )),
             },
-            // `whiteboard-slice` is a supervisor→agent notification only; a
-            // request-shaped line with that method is protocol noise.
-            IpcMethod::WhiteboardSlice => Dispatch::Reply(reply_error(
+            // `whiteboard-slice` and `shutdown` are supervisor→agent
+            // notifications only; a request-shaped line with either method is
+            // protocol noise.
+            IpcMethod::WhiteboardSlice | IpcMethod::Shutdown => Dispatch::Reply(reply_error(
                 request.id,
                 IpcErrorCode::InvalidRequest,
-                "whiteboard-slice is a supervisor-to-agent notification".to_owned(),
+                "notification-only method received as request".to_owned(),
             )),
         };
     }
@@ -1814,6 +1844,49 @@ async fn supervisor_flush(
         );
         services.subscriptions.mark_flushed(agent_id, batch.end_gate_seq, batch.more).await;
     }
+}
+
+/// Send a graceful shutdown notification (ADR-60 D2) before closing stdin.
+fn send_shutdown_notification(stdin: &mut std::process::ChildStdin) {
+    let notification = crate::ipc::IpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: crate::ipc::IpcMethod::Shutdown,
+        params: crate::ipc::IpcParams::Shutdown { reason: Some("supervisor shutdown".to_owned()) },
+    };
+    write_notification(stdin, &notification);
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_group(child: &mut std::process::Child, sig: i32) {
+    let pid = child.id() as i32;
+    // Child is its own process group (setpgid(0,0) in pre_exec), so killpg targets the group.
+    unsafe {
+        if libc::killpg(pid, sig) != 0 {
+            // Fallback to single-process kill if group kill fails (already reaped, etc.)
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(child: &mut std::process::Child, _sig: i32) {
+    let _ = child.kill();
+}
+
+#[allow(dead_code)]
+fn kill_group_term(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_group(child, libc::SIGTERM);
+    #[cfg(not(unix))]
+    kill_group(child, 0);
+}
+
+fn kill_group_kill(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_group(child, libc::SIGKILL);
+    #[cfg(not(unix))]
+    kill_group(child, 0);
 }
 
 #[cfg(test)]
