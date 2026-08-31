@@ -25,6 +25,7 @@
 use concerto_core::types::{CompletionRequest, Role, ToolChoice, ToolDefinition};
 use serde_json::json;
 
+use super::schema_sanitize::sanitize_tool_schema;
 use super::{Dialect, ReasoningEcho};
 
 /// The Anthropic Messages API chat dialect.
@@ -175,14 +176,19 @@ impl Dialect for AnthropicChatDialect {
 
 /// Convert `ToolDefinition`s into Anthropic's native tools JSON array
 /// (`name`, `description`, `input_schema`).
+///
+/// Each tool's `input_schema` is sanitized via [`sanitize_tool_schema`]
+/// to strip draft-2020-12 constructs that some Anthropic models reject.
 fn build_anthropic_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .map(|t| {
+            let mut params = t.parameters.clone();
+            sanitize_tool_schema(&mut params);
             json!({
                 "name": t.name,
                 "description": t.description,
-                "input_schema": t.parameters,
+                "input_schema": params,
             })
         })
         .collect()

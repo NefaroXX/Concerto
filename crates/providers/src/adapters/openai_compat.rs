@@ -21,6 +21,7 @@
 
 use concerto_core::types::{CompletionRequest, Message, Role, ToolChoice, ToolDefinition};
 
+use super::schema_sanitize::sanitize_tool_schema;
 use super::{Dialect, ReasoningEcho};
 
 /// The OpenAI-compatible chat dialect (`/chat/completions`).
@@ -186,16 +187,23 @@ fn build_tool_messages(m: &Message) -> Vec<serde_json::Value> {
 }
 
 /// Convert a list of `ToolDefinition` into the OpenAI tools JSON array.
+///
+/// Each tool's `parameters` schema is sanitized via
+/// [`sanitize_tool_schema`] to strip draft-2020-12 constructs that
+/// forwarder-gateways and free-tier pilots reject on the wire (`$defs`,
+/// `$ref`, `$schema`, `prefixItems`).
 fn build_openai_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .map(|tool| {
+            let mut params = tool.parameters.clone();
+            sanitize_tool_schema(&mut params);
             serde_json::json!({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.parameters,
+                    "parameters": params,
                 }
             })
         })

@@ -1268,6 +1268,13 @@ pub struct ResearchReport {
 pub struct CodeSnippet {
     #[schemars(with = "String")]
     pub file: Utf8PathBuf,
+    /// Declared as `[u32; 2]` for schema purposes: schemars renders the Rust
+    /// tuple `(u32, u32)` as a draft-2020-12 `prefixItems` tuple, which Google
+    /// Gemini rejects (`INVALID_ARGUMENT` on unknown name), while a sized
+    /// array emits `items` + `minItems`/`maxItems` — accepted by every
+    /// provider. Serde serializes tuples and sized arrays identically, so the
+    /// wire contract (`[start, end]`) is unchanged.
+    #[schemars(with = "[u32; 2]")]
     pub lines: (u32, u32),
     pub content: String,
 }

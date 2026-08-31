@@ -28,6 +28,7 @@
 
 use concerto_core::types::{CompletionRequest, Role, ToolChoice, ToolDefinition};
 
+use super::schema_sanitize::sanitize_tool_schema;
 use super::{Dialect, ReasoningEcho};
 
 /// The Ollama chat dialect (`/api/chat`).
@@ -171,16 +172,22 @@ impl Dialect for OllamaChatDialect {
 // ---------------------------------------------------------------------------
 
 /// Convert `ToolDefinition`s into Ollama's OpenAI-style tools JSON array.
+///
+/// Each tool's `parameters` schema is sanitized via
+/// [`sanitize_tool_schema`] to strip draft-2020-12 constructs that
+/// forwarder-gateways and free-tier pilots reject on the wire.
 fn build_ollama_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .map(|t| {
+            let mut params = t.parameters.clone();
+            sanitize_tool_schema(&mut params);
             serde_json::json!({
                 "type": "function",
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
+                    "parameters": params,
                 }
             })
         })

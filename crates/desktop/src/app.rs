@@ -1361,6 +1361,7 @@ impl App {
                     // Drop results for a provider that was deleted meanwhile.
                     if !self.runtime_providers().iter().any(|p| p.id == *provider_id) {
                         self.pending_refresh.remove(provider_id);
+                        self.settings.end_provider_refresh(provider_id);
                         return iced::Task::none();
                     }
                     self.pending_refresh.remove(provider_id);
@@ -1386,6 +1387,25 @@ impl App {
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
                     task
+                }
+                views::settings::Message::ProviderModelsRefreshRequested(provider_id) => {
+                    // Manual per-provider model refresh. Only live rows whose
+                    // provider type actually supports discovery get a tracked
+                    // request; anything else (stale id, deleted mid-flight) is
+                    // a silent no-op.
+                    let supported = self.runtime_providers().iter().any(|p| {
+                        p.id == *provider_id
+                            && provider_definition(&p.provider).supports_discovery()
+                    });
+                    if !supported {
+                        return iced::Task::none();
+                    }
+                    self.settings.begin_provider_refresh(provider_id);
+                    let provider_id = provider_id.clone();
+                    self.refresh_seq = self.refresh_seq.wrapping_add(1);
+                    let req_id = self.refresh_seq;
+                    self.pending_refresh.insert(provider_id.clone(), req_id);
+                    self.fetch_models_for_provider(provider_id, req_id)
                 }
                 _ => self.settings.update(msg).map(Message::Settings),
             },
@@ -2351,10 +2371,20 @@ impl App {
                 .await
             },
             move |models| {
+                // The providers crate collapses every discovery failure
+                // (network, auth, …) into an empty list. Surfacing that as
+                // `Err` keeps BOTH cache writers (config + settings state)
+                // preserving the previous model list during an outage instead
+                // of silently wiping it.
+                let result = if models.is_empty() {
+                    Err("Discovery returned no models — check credentials/network.".to_string())
+                } else {
+                    Ok(models)
+                };
                 Message::Settings(views::settings::Message::ProviderModelsRefreshed {
                     provider_id: provider_id.clone(),
                     request_id,
-                    result: Ok(models),
+                    result,
                 })
             },
         )
@@ -5116,6 +5146,21 @@ description = "keep me"
         });
     }
 
+    /// Mirror the Settings rows into `config.model_settings.providers` so
+    /// `runtime_providers` resolves them. Tests push rows into
+    /// `settings.providers`, but on a host with a real user config
+    /// `App::new()` loads it and `runtime_providers` prefers the config list —
+    /// without this mirror the refresh handlers treat every pushed row as
+    /// deleted and silently drop its results.
+    fn sync_config_providers(app: &mut App) {
+        let ms = app
+            .config
+            .get_or_insert_with(AppConfig::default)
+            .model_settings
+            .get_or_insert_with(concerto_config::ModelSettings::default);
+        ms.providers = app.settings.providers.clone();
+    }
+
     #[test]
     fn dispatch_blocked_when_active_provider_missing_credential() {
         let (mut app, _) = App::new();
@@ -5239,6 +5284,7 @@ description = "keep me"
         let (mut app, _) = App::new();
         app.settings.providers.clear();
         push_provider(&mut app, "prov1", "openai", "gpt-4");
+        sync_config_providers(&mut app);
         app.settings.providers[0].cached_models = vec!["gpt-4".into()];
         app.settings.providers[0].cached_models_fetched_at = 1;
 
@@ -5277,11 +5323,14 @@ description = "keep me"
         app.settings.providers.clear();
         push_provider(&mut app, "provA", "openai", "gpt-4");
         push_provider(&mut app, "provB", "openai", "gpt-4");
-        app.refresh_seq = 1;
-        app.pending_refresh.insert("provA".into(), 1);
 
         // Delete provA while the refresh is "in flight".
         app.settings.providers.retain(|p| p.id != "provA");
+        // Mirror AFTER the deletion so runtime_providers agrees provA is gone
+        // (a host's real user config would otherwise keep it resolvable).
+        sync_config_providers(&mut app);
+        app.refresh_seq = 1;
+        app.pending_refresh.insert("provA".into(), 1);
 
         // The result for the deleted provider must be ignored, and provB must
         // be untouched.
@@ -5307,6 +5356,7 @@ description = "keep me"
         let (mut app, _) = App::new();
         app.settings.providers.clear();
         push_provider(&mut app, "prov1", "ollama", "llama3");
+        sync_config_providers(&mut app);
         app.active_provider_id = "prov1".into();
         app.refresh_seq = 1;
         app.pending_refresh.insert("prov1".into(), 1);
@@ -5324,6 +5374,135 @@ description = "keep me"
                 .map(|models| models.iter().any(|m| m == "discovered-model"))
                 .unwrap_or(false),
             "discovered model must appear in the per-provider model cache"
+        );
+    }
+
+    #[test]
+    fn manual_refresh_request_registers_tracked_in_flight_fetch() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+
+        // Startup auto-discovery may already have consumed request ids.
+        let seq_before = app.refresh_seq;
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshRequested(
+            "prov1".into(),
+        )));
+
+        assert_eq!(
+            app.pending_refresh.get("prov1"),
+            Some(&seq_before.wrapping_add(1)),
+            "manual refresh must register a tracked request id"
+        );
+        assert!(
+            app.settings.refreshing_providers.contains("prov1"),
+            "the provider row must report its refresh as in flight"
+        );
+    }
+
+    #[test]
+    fn manual_refresh_request_for_unknown_or_nondiscovering_provider_is_ignored() {
+        let (mut app, _) = App::new();
+        // Startup auto-discovery may legitimately hold tracked requests; only
+        // the unknown id must stay untouched.
+        let pending_before = app.pending_refresh.len();
+
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshRequested(
+            "ghost".into(),
+        )));
+
+        assert_eq!(
+            app.pending_refresh.len(),
+            pending_before,
+            "unknown providers must not spawn fetches"
+        );
+        assert!(!app.pending_refresh.contains_key("ghost"));
+        assert!(app.settings.refreshing_providers.is_empty());
+    }
+
+    #[test]
+    fn completed_manual_refresh_updates_cache_and_clears_in_flight_state() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshRequested(
+            "prov1".into(),
+        )));
+        let request_id = *app.pending_refresh.get("prov1").expect("tracked request");
+
+        // The spawned task is dropped in tests; simulate its completion with
+        // the request id the handler assigned.
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id,
+            result: Ok(vec!["ox-alpha".into(), "gpt-4o".into()]),
+        }));
+
+        assert!(
+            !app.settings.refreshing_providers.contains("prov1"),
+            "the in-flight marker must clear when the result arrives"
+        );
+        assert!(!app.pending_refresh.contains_key("prov1"));
+        assert!(!app.settings.provider_refresh_errors.contains_key("prov1"));
+        let cache = app.settings.cached_models_by_provider();
+        assert!(
+            cache.get("prov1").map(|m| m.iter().any(|n| n == "ox-alpha")).unwrap_or(false),
+            "newly released models must appear in the picker cache immediately"
+        );
+    }
+
+    #[test]
+    fn failed_manual_refresh_preserves_cache_and_reports_inline_error() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+        app.settings.providers[0].cached_models = vec!["gpt-4".into()];
+        app.settings.providers[0].cached_models_fetched_at = 1;
+
+        // An explicit Err (network outage) must preserve the cache, clear the
+        // in-flight marker, and surface the error inline.
+        app.refresh_seq = 1;
+        app.pending_refresh.insert("prov1".into(), 1);
+        app.settings.begin_provider_refresh("prov1");
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id: 1,
+            result: Err("connection refused".into()),
+        }));
+        let p = app.settings.providers.iter().find(|p| p.id == "prov1").unwrap();
+        assert!(
+            p.cached_models.contains(&"gpt-4".to_string()),
+            "failed refresh must preserve the previous cache"
+        );
+        assert!(!app.settings.refreshing_providers.contains("prov1"));
+        assert_eq!(
+            app.settings.provider_refresh_errors.get("prov1").map(String::as_str),
+            Some("connection refused")
+        );
+
+        // A later empty discovery result — the shape every providers-crate
+        // failure collapses to before this handler — must likewise never wipe
+        // the cached list.
+        app.refresh_seq = 2;
+        app.pending_refresh.insert("prov1".into(), 2);
+        app.settings.begin_provider_refresh("prov1");
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id: 2,
+            result: Ok(Vec::new()),
+        }));
+        let p = app.settings.providers.iter().find(|p| p.id == "prov1").unwrap();
+        assert!(
+            p.cached_models.contains(&"gpt-4".to_string()),
+            "an empty discovery result must not wipe the cached model list"
+        );
+        assert!(
+            app.settings.provider_refresh_errors.contains_key("prov1"),
+            "an empty discovery result must be surfaced as a failure"
         );
     }
 

@@ -37,6 +37,10 @@ pub enum Message {
     FormCancel,
 
     // Phase 3 — model discovery
+    /// User pressed a provider row's "Refresh" model-list control. The App
+    /// layer intercepts this: it owns the request bookkeeping
+    /// (`pending_refresh`) and spawns the async discovery fetch.
+    ProviderModelsRefreshRequested(String),
     /// Discovery result for a saved provider, produced by the app's async task.
     ProviderModelsRefreshed {
         provider_id: String,

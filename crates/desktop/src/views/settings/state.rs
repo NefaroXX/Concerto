@@ -57,6 +57,13 @@ pub struct State {
     pub cached_provider_model_options: Vec<Vec<String>>,
     pub cached_model_names: Vec<String>,
     pub cached_models_by_provider: HashMap<String, Vec<String>>,
+    /// Providers with a model-list refresh currently in flight; their Refresh
+    /// control renders inert ("Refreshing…") until the result arrives. View
+    /// mirror of the App's `pending_refresh` request bookkeeping.
+    pub refreshing_providers: HashSet<String>,
+    /// Last model-discovery failure per provider id, shown inline next to the
+    /// Refresh control until a later successful refresh clears it.
+    pub provider_refresh_errors: HashMap<String, String>,
 
     // Add-provider form state
     pub show_form: bool,
@@ -239,6 +246,8 @@ impl State {
             cached_provider_model_options: Vec::new(),
             cached_model_names: Vec::new(),
             cached_models_by_provider: HashMap::new(),
+            refreshing_providers: HashSet::new(),
+            provider_refresh_errors: HashMap::new(),
             show_form: false,
             form_provider_type: State::load_form_provider_type_def().to_string(),
             form_name: String::new(),
@@ -390,6 +399,10 @@ impl State {
         self.confirm_clear_for = None;
         self.editing_key_for = None;
         self.key_edit_text.clear();
+        // Drop refresh markers/errors whose provider row no longer exists so
+        // they can neither leak nor resurface on a recycled id.
+        self.refreshing_providers.retain(|id| self.providers.iter().any(|p| &p.id == id));
+        self.provider_refresh_errors.retain(|id, _| self.providers.iter().any(|p| p.id == *id));
     }
 
     /// Build the `AppConfig` fragments this page owns, merging onto `base`.
@@ -718,6 +731,17 @@ impl State {
         !self.skills_loaded && !self.skills_loading
     }
 
+    /// Mark a provider's model-list refresh as in flight. The row's Refresh
+    /// control renders inert until the matching result message arrives.
+    pub fn begin_provider_refresh(&mut self, provider_id: &str) {
+        self.refreshing_providers.insert(provider_id.to_string());
+    }
+
+    /// Clear a provider's in-flight refresh marker. Idempotent.
+    pub fn end_provider_refresh(&mut self, provider_id: &str) {
+        self.refreshing_providers.remove(provider_id);
+    }
+
     /// Start a skill discovery pass. Sets the loading flag and returns the
     /// task whose completion is routed back as `SkillsDiscoveryResult`.
     /// Idempotent: a second call while a run is in flight is a no-op.
@@ -909,11 +933,40 @@ impl State {
                 self.show_form = false;
             }
 
-            // Phase 3 — model discovery (auto-triggered at startup; no manual button)
+            // Phase 3 — model discovery (startup auto-fetch + per-provider
+            // Refresh button; the App layer spawns the fetch and forwards
+            // the result here).
+            Message::ProviderModelsRefreshRequested(provider_id) => {
+                // Normally intercepted by the App layer before reaching this
+                // update. Handled anyway so a misrouted message still flips
+                // the row into its in-flight state instead of leaving a dead
+                // button.
+                self.begin_provider_refresh(&provider_id);
+            }
             Message::ProviderModelsRefreshed { provider_id, request_id: _, result } => {
-                if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
-                    if let Ok(models) = result {
-                        p.record_discovered_models(models);
+                self.end_provider_refresh(&provider_id);
+                match result {
+                    Ok(models) => {
+                        if models.is_empty() {
+                            // The providers crate collapses every discovery
+                            // failure (network, auth, …) into an empty list.
+                            // Keep the previous cache so one offline refresh
+                            // cannot wipe the user's usable model list.
+                            self.provider_refresh_errors.insert(
+                                provider_id.clone(),
+                                "Discovery returned no models — check credentials/network."
+                                    .to_string(),
+                            );
+                        } else {
+                            self.provider_refresh_errors.remove(&provider_id);
+                            if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id)
+                            {
+                                p.record_discovered_models(models);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.provider_refresh_errors.insert(provider_id.clone(), error);
                     }
                 }
                 self.rebuild_cache();

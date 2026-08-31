@@ -195,7 +195,14 @@ impl LlmProvider for GoogleProvider {
                                 if let Some(candidates) = parsed["candidates"].as_array() {
                                     if let Some(candidate) = candidates.first() {
                                         if let Some(content) = candidate["content"].as_object() {
-                                            if let Some(parts) = content["parts"].as_array() {
+                                            // `content` is a `serde_json::Map`, whose
+                                            // `Index` impl panics on a missing key
+                                            // (unlike `Value` indexing, which yields
+                                            // Null). Gemini may omit "parts" (e.g.
+                                            // finishReason-only candidates).
+                                            if let Some(parts) =
+                                                content.get("parts").and_then(serde_json::Value::as_array)
+                                            {
                                                 for part in parts {
                                                     if let Some(text) = part["text"].as_str() {
                                                         items.push(Ok(CompletionChunk {
