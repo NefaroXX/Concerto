@@ -549,6 +549,139 @@ struct WhiteboardSubscriptionRow {
     cursor_gate_seq: i64,
 }
 
+/// A whiteboard checkpoint: gate-boundary snapshot for D5 reversibility and
+/// deterministic replay (ADR-60 D5). The snapshot is an opaque JSON blob
+/// (file-system or whiteboard projection) taken at `gate_seq`; restore is
+/// snapshot + replay of tail events with `gate_seq > gate_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhiteboardCheckpoint {
+    /// Checkpoint id (ULID string).
+    pub id: String,
+    /// Gate sequence the snapshot is taken at (consistent cut).
+    pub gate_seq: u64,
+    /// Opaque snapshot payload (JSON).
+    pub snapshot: String,
+    /// Creation time (unix epoch ms, UTC).
+    pub created_at: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct WhiteboardCheckpointRow {
+    id: String,
+    gate_seq: i64,
+    snapshot: String,
+    created_at: i64,
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Create a whiteboard checkpoint at `gate_seq` with `snapshot` payload.
+pub async fn create_whiteboard_checkpoint(
+    pool: &sqlx::SqlitePool,
+    gate_seq: u64,
+    snapshot: &str,
+) -> Result<WhiteboardCheckpoint, SessionError> {
+    let id = ulid::Ulid::new().to_string();
+    let created_at = now_millis();
+    sqlx::query(
+        "INSERT INTO whiteboard_checkpoints (id, gate_seq, snapshot, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(gate_seq as i64)
+    .bind(snapshot)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(WhiteboardCheckpoint { id, gate_seq, snapshot: snapshot.to_owned(), created_at })
+}
+
+/// Load a checkpoint by id.
+pub async fn load_whiteboard_checkpoint(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<Option<WhiteboardCheckpoint>, SessionError> {
+    let row = sqlx::query_as::<_, WhiteboardCheckpointRow>(
+        "SELECT id, gate_seq, snapshot, created_at FROM whiteboard_checkpoints WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| WhiteboardCheckpoint {
+        id: r.id,
+        gate_seq: r.gate_seq as u64,
+        snapshot: r.snapshot,
+        created_at: r.created_at,
+    }))
+}
+
+/// Load the latest checkpoint at or before `gate_seq`.
+pub async fn load_whiteboard_checkpoint_by_gate_seq(
+    pool: &sqlx::SqlitePool,
+    gate_seq: u64,
+) -> Result<Option<WhiteboardCheckpoint>, SessionError> {
+    let row = sqlx::query_as::<_, WhiteboardCheckpointRow>(
+        "SELECT id, gate_seq, snapshot, created_at FROM whiteboard_checkpoints WHERE gate_seq <= ? ORDER BY gate_seq DESC LIMIT 1",
+    )
+    .bind(gate_seq as i64)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| WhiteboardCheckpoint {
+        id: r.id,
+        gate_seq: r.gate_seq as u64,
+        snapshot: r.snapshot,
+        created_at: r.created_at,
+    }))
+}
+
+/// List all checkpoints ordered by gate_seq ascending.
+pub async fn list_whiteboard_checkpoints(
+    pool: &sqlx::SqlitePool,
+) -> Result<Vec<WhiteboardCheckpoint>, SessionError> {
+    let rows = sqlx::query_as::<_, WhiteboardCheckpointRow>(
+        "SELECT id, gate_seq, snapshot, created_at FROM whiteboard_checkpoints ORDER BY gate_seq ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| WhiteboardCheckpoint {
+            id: r.id,
+            gate_seq: r.gate_seq as u64,
+            snapshot: r.snapshot,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Replay tail events after `checkpoint_gate_seq`, excluding `exclude_event_ids`.
+/// Used for per-agent revert: restore snapshot at checkpoint, then replay
+/// excluding the reverted agent's event_ids. Returns events in gate_seq order.
+pub async fn replay_whiteboard_tail_excluding(
+    pool: &sqlx::SqlitePool,
+    checkpoint_gate_seq: u64,
+    exclude_event_ids: &[String],
+) -> Result<Vec<WhiteboardEvent>, SessionError> {
+    let mut events = load_whiteboard_events(
+        pool,
+        &WhiteboardLoadOpts {
+            after_gate_seq: checkpoint_gate_seq,
+            session_id: None,
+            scope: None,
+            limit: 10000,
+        },
+    )
+    .await?;
+    if !exclude_event_ids.is_empty() {
+        events.retain(|e| !exclude_event_ids.contains(&e.event_id));
+    }
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,5 +1229,58 @@ mod tests {
         let loaded =
             load_whiteboard_subscription(&pool, "agent-b").await.expect("load").expect("row");
         assert_eq!(loaded, re_registered, "re-registration replaces scopes and cursor");
+    }
+
+    // --- ADR-60 D5: checkpoint durability (migration 028) ---
+
+    #[tokio::test]
+    async fn whiteboard_checkpoint_round_trips() {
+        let (_dir, pool) = test_pool(1).await;
+        let cp1 = create_whiteboard_checkpoint(&pool, 5, r#"{"files":{"a.txt":"hello"}}"#)
+            .await
+            .expect("create cp1");
+        assert_eq!(cp1.gate_seq, 5);
+        let loaded = load_whiteboard_checkpoint(&pool, &cp1.id).await.expect("load").expect("row");
+        assert_eq!(loaded, cp1);
+        let cp2 = create_whiteboard_checkpoint(&pool, 10, r#"{"files":{"a.txt":"hello world"}}"#)
+            .await
+            .expect("create cp2");
+        let by_gate = load_whiteboard_checkpoint_by_gate_seq(&pool, 7)
+            .await
+            .expect("load by gate")
+            .expect("row");
+        assert_eq!(by_gate.id, cp1.id, "latest checkpoint <= gate_seq");
+        let all = list_whiteboard_checkpoints(&pool).await.expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].gate_seq, 5);
+        assert_eq!(all[1].gate_seq, 10);
+        let _ = cp2;
+    }
+
+    #[tokio::test]
+    async fn replay_excluding_filters_per_agent_events() {
+        let (_dir, pool) = test_pool(1).await;
+        let e1 = append_whiteboard_event(&pool, &new_event("e1", "agent-a", WhiteboardKind::WriteApplied))
+            .await
+            .expect("append e1");
+        let e2 = append_whiteboard_event(&pool, &new_event("e2", "agent-a", WhiteboardKind::WriteApplied))
+            .await
+            .expect("append e2");
+        let e3 = append_whiteboard_event(&pool, &new_event("e3", "agent-a", WhiteboardKind::WriteApplied))
+            .await
+            .expect("append e3");
+        create_whiteboard_checkpoint(&pool, e1.gate_seq, r#"{"snap":1}"#)
+            .await
+            .expect("checkpoint");
+        // Replay after e1, excluding e2 (per-agent revert)
+        let replay = replay_whiteboard_tail_excluding(&pool, e1.gate_seq, &[e2.event_id.clone()])
+            .await
+            .expect("replay");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, e3.event_id);
+        // Full replay without exclusion
+        let full = replay_whiteboard_tail_excluding(&pool, e1.gate_seq, &[]).await.expect("full");
+        assert_eq!(full.len(), 2);
+        let _ = e1;
     }
 }
