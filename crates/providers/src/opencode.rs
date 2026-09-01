@@ -538,11 +538,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn muse_models_need_anthropic_dialect() {
-        assert!(needs_anthropic_dialect("muse-spark-1.2-contributor-free"));
-        assert!(needs_anthropic_dialect("Muse-Spark-1.2"));
-        assert!(needs_anthropic_dialect("some-muse-model"));
-        assert!(needs_anthropic_dialect("MUSE-v2"));
+    fn muse_models_use_the_responses_dialect() {
+        assert!(!needs_anthropic_dialect("muse-spark-1.2-contributor-free"));
+        assert!(!needs_anthropic_dialect("Muse-Spark-1.2"));
+        assert!(!needs_anthropic_dialect("some-muse-model"));
+        assert!(needs_responses_api("MUSE-v2"));
     }
 
     #[test]
