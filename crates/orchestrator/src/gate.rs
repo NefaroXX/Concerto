@@ -69,13 +69,50 @@
 //!   conflict logic — a foreign-held lock is a loud [`GateError::Conflict`]
 //!   carrying holder info, never a silent race or drop.
 //!
-//! ## Deferred to S4 (ADR-60)
+//! ## Fairness across agents (ADR-60 D4 — resolved)
 //!
-//! - Weighted round-robin fairness across agents (D4).
+//! D4's fairness requirement is "no chatty-agent starvation"; the gate
+//! satisfies it *structurally*, not with a cross-agent scheduler:
+//!
+//! - **Scheduling model.** Every agent owns a private FIFO in-flight limiter
+//!   ([`Semaphore`], cap = [`WriteGate::new`]'s `max_in_flight_per_agent`,
+//!   default 1). Demand beyond the cap parks on the agent's *own* semaphore
+//!   in arrival order; agents never contend for one another's permits, and
+//!   tool execution runs concurrently across agents. There is no cross-agent
+//!   queue inside the gate, so one agent's backlog can neither delay nor
+//!   reorder a sibling's write: the sibling proceeds as soon as its own
+//!   permit is free, and its WAL append is sequenced ahead of the parked
+//!   backlog (pinned by
+//!   `per_agent_limiter_bounds_concurrency_but_agents_are_independent`).
+//! - **Backpressure.** In-flight gated ops are bounded per agent (total
+//!   bound: roster size × cap), and no other queue exists to grow. The wired
+//!   callers add no buffering: the supervised child is a strictly sequential
+//!   one-request-at-a-time client (`gate_proxy.rs`) and the in-process loop
+//!   awaits each tool call, so each agent holds at most one write in flight
+//!   in practice and backpressure propagates to the agent loop instead of
+//!   accumulating at the gate.
+//! - **The one cross-agent serialization point** is the whiteboard WAL
+//!   append (`gate_seq` assignment under SQLite's write lock). Appends are
+//!   single short transactions; contention is bounded by the pool's
+//!   `busy_timeout` and surfaces as [`GateError::Whiteboard`] — never as
+//!   silent deferral or reordering.
+//! - **Why not weighted round-robin.** WRR presupposes a serialized gate
+//!   queue it can fairly interleave. This gate is deliberately
+//!   non-serialized (per-agent isolation + concurrent cross-agent
+//!   execution), so there is no queue to schedule: adding one (a global
+//!   execution cap) would slow every agent down to ration a resource nobody
+//!   contends for. The WRR mechanism is superseded by per-agent isolation;
+//!   the requirement it served holds (see ADR-60 D4 implementation notes).
+//!
+//! ## Remaining deferred (ADR-60)
+//!
 //! - Interactive approval surfacing — the gate returns [`GateError::Denied`]
 //!   for approval-required verdicts today.
-//! - Supervisor wiring — the runtime does not yet call [`WriteGate::submit`]
-//!   for every agent write; the gate is exercised by its unit tests.
+//!
+//! (The other two former "S4" entries are closed: supervisor wiring exists —
+//! `supervisor.rs::handle_execute_tool` and `in_process_gate.rs` both route
+//! every agent write through [`WriteGate::submit`] — and fairness is
+//! resolved above.)
 
 use crate::hunk::{stage_three_way, HunkStaging};
 use concerto_core::error::{PolicyError, ToolError};
@@ -2101,13 +2138,20 @@ mod tests {
         assert_eq!(probe.active.load(Ordering::SeqCst), 1, "one agent-a write in flight");
 
         // Agent B completes independently while agent-a still holds its single
-        // permit — agents do not block one another.
+        // permit AND two of its writes are parked behind it — agents do not
+        // block one another. This is the ADR-60 D4 fairness contract ("no
+        // chatty-agent starvation"): agent-a's backlog lives on agent-a's own
+        // semaphore and is invisible to agent-b.
         let mut b_req = request("limiter-b-1");
         b_req.agent_id = "agent-b".to_owned();
-        tokio::time::timeout(Duration::from_secs(10), gate.submit(b_req, CancellationToken::new()))
-            .await
-            .expect("agent-b write finishes within timeout")
-            .expect("agent-b write allowed");
+        let b_outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            gate.submit(b_req, CancellationToken::new()),
+        )
+        .await
+        .expect("agent-b write finishes within timeout")
+        .expect("agent-b write allowed");
+        assert!(!b_outcome.replayed, "agent-b write is a fresh execution");
         assert_eq!(probe.active.load(Ordering::SeqCst), 1, "agent-a queue unaffected by agent-b");
 
         // Drain agent-a: releasing one permit lets the next queued write in;
@@ -2133,6 +2177,15 @@ mod tests {
         a_outcomes.sort_unstable();
         a_outcomes.dedup();
         assert_eq!(a_outcomes.len(), 3, "agent-a writes get distinct gate_seqs");
+        // Fairness ordering pin: exactly the write already in flight when
+        // agent-b arrived precedes b in the total order; both PARKED backlog
+        // writes are sequenced strictly after it. The backlog never displaced
+        // the sibling — with a shared gate queue it could have.
+        let ahead = a_outcomes.iter().filter(|seq| **seq < b_outcome.gate_seq).count();
+        assert_eq!(
+            ahead, 1,
+            "only the in-flight write precedes agent-b; the parked backlog must not"
+        );
         assert_eq!(probe.max_active.load(Ordering::SeqCst), 1, "per-agent cap held throughout");
         assert_eq!(whiteboard_row_count(&pool).await, 4, "three agent-a + one agent-b writes");
     }

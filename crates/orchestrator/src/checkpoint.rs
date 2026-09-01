@@ -12,7 +12,8 @@ use concerto_core::types::{
     AgentId, AgentRunResult, DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskId,
 };
 use concerto_core::OrchestratorError;
-use concerto_sessions::whiteboard::{WhiteboardEvent, WhiteboardKind};
+use concerto_sessions::whiteboard::{WhiteboardCheckpoint, WhiteboardEvent, WhiteboardKind};
+use concerto_sessions::SessionError;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -565,6 +566,104 @@ pub fn revert_excluding_agent(
 ) -> BTreeMap<String, String> {
     GateBoundaryCheckpoint::at_cut(events, checkpoint_seq, None)
         .replay_tail_excluding(events, exclude_agent)
+}
+
+// ---------------------------------------------------------------------------
+// Durable store round-trip (ADR-60 D5 (i)): persist / load
+// ---------------------------------------------------------------------------
+
+/// Why a gate-boundary checkpoint could not be persisted or reloaded.
+#[derive(Debug)]
+pub enum CheckpointStoreError {
+    /// SQLite persistence failure surfaced by the sessions crate.
+    Storage(SessionError),
+    /// The snapshot could not be serialized to its stored JSON form.
+    Serialize(serde_json::Error),
+    /// A stored snapshot row exists but its payload no longer deserializes
+    /// into a [`GateBoundaryCheckpoint`] (schema drift or corruption).
+    Deserialize { gate_seq: u64, reason: String },
+    /// The write gate refused to materialize the cut.
+    Gate(String),
+}
+
+impl std::fmt::Display for CheckpointStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => write!(f, "checkpoint store error: {error}"),
+            Self::Serialize(error) => {
+                write!(f, "failed to serialize checkpoint snapshot: {error}")
+            }
+            Self::Deserialize { gate_seq, reason } => {
+                write!(f, "stored checkpoint at gate_seq {gate_seq} is unreadable: {reason}")
+            }
+            Self::Gate(reason) => write!(f, "gate refused to materialize the checkpoint: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::Serialize(error) => Some(error),
+            Self::Deserialize { .. } | Self::Gate(_) => None,
+        }
+    }
+}
+
+impl From<SessionError> for CheckpointStoreError {
+    fn from(error: SessionError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<serde_json::Error> for CheckpointStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialize(error)
+    }
+}
+
+/// Persist a [`GateBoundaryCheckpoint`] into the sessions whiteboard
+/// checkpoint store (`whiteboard_checkpoints`, migration 028), pinned to the
+/// checkpoint's own `gate_seq` (the consistent-cut coordinate).
+///
+/// The store is a projection, never a second source of truth: every folded
+/// event already lives WAL-first in the log, so a failed persist loses
+/// nothing — restore can always be rebuilt from the raw log.
+pub async fn persist_gate_boundary_checkpoint(
+    pool: &sqlx::SqlitePool,
+    checkpoint: &GateBoundaryCheckpoint,
+) -> Result<WhiteboardCheckpoint, CheckpointStoreError> {
+    let snapshot = serde_json::to_string(checkpoint)?;
+    Ok(concerto_sessions::whiteboard::create_whiteboard_checkpoint(
+        pool,
+        checkpoint.gate_seq,
+        &snapshot,
+    )
+    .await?)
+}
+
+/// Load the latest persisted checkpoint at or before `gate_seq`, deserialized
+/// back into a typed [`GateBoundaryCheckpoint`]. The read-side of restart
+/// restore: **read-only** — this returns the projected file state, it never
+/// materializes anything to disk (see `Supervisor::checkpoint_at_shutdown`
+/// for the write side and the documented restore gap).
+///
+/// `None` means no stored checkpoint exists at or before `gate_seq`.
+pub async fn load_gate_boundary_checkpoint(
+    pool: &sqlx::SqlitePool,
+    gate_seq: u64,
+) -> Result<Option<(WhiteboardCheckpoint, GateBoundaryCheckpoint)>, CheckpointStoreError> {
+    let Some(record) =
+        concerto_sessions::whiteboard::load_whiteboard_checkpoint_by_gate_seq(pool, gate_seq)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let checkpoint = serde_json::from_str(&record.snapshot).map_err(|reason| {
+        CheckpointStoreError::Deserialize { gate_seq: record.gate_seq, reason: reason.to_string() }
+    })?;
+    Ok(Some((record, checkpoint)))
 }
 
 /// Fold one whiteboard row into the projected file state if it is an applied

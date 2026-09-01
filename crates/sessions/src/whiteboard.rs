@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::query_as;
+use sqlx::AssertSqlSafe;
 
 use crate::SessionError;
 
@@ -319,7 +320,10 @@ pub async fn load_whiteboard_events(
     }
     sql.push_str(" ORDER BY gate_seq ASC LIMIT ?");
 
-    let mut query = query_as::<_, WhiteboardEventRow>(&sql).bind(opts.after_gate_seq as i64);
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let mut query =
+        query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql)).bind(opts.after_gate_seq as i64);
     if let Some(session_id) = &opts.session_id {
         query = query.bind(session_id);
     }
@@ -343,7 +347,10 @@ pub async fn load_whiteboard_events_by_plan(
     let sql = format!(
         "SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE plan_id = ? ORDER BY gate_seq ASC"
     );
-    let rows = query_as::<_, WhiteboardEventRow>(&sql).bind(plan_id).fetch_all(pool).await?;
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let rows =
+        query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql)).bind(plan_id).fetch_all(pool).await?;
     rows.into_iter().map(WhiteboardEvent::try_from).collect()
 }
 
@@ -369,7 +376,9 @@ pub async fn load_whiteboard_events_up_to(
     // Log-assigned seqs always fit i64; saturate absurd bounds (`u64::MAX`
     // meaning "through end of log") instead of wrapping negative on cast.
     let bound = i64::try_from(max_gate_seq).unwrap_or(i64::MAX);
-    let mut query = query_as::<_, WhiteboardEventRow>(&sql).bind(bound);
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let mut query = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql)).bind(bound);
     if let Some(session_id) = session_id {
         query = query.bind(session_id);
     }
@@ -402,7 +411,9 @@ async fn load_whiteboard_event(
     event_id: &str,
 ) -> Result<WhiteboardEvent, SessionError> {
     let sql = format!("SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE event_id = ?");
-    let row = query_as::<_, WhiteboardEventRow>(&sql)
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let row = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql))
         .bind(event_id)
         .fetch_optional(conn)
         .await?
@@ -1260,22 +1271,35 @@ mod tests {
     #[tokio::test]
     async fn replay_excluding_filters_per_agent_events() {
         let (_dir, pool) = test_pool(1).await;
-        let e1 = append_whiteboard_event(&pool, &new_event("e1", "agent-a", WhiteboardKind::WriteApplied))
-            .await
-            .expect("append e1");
-        let e2 = append_whiteboard_event(&pool, &new_event("e2", "agent-a", WhiteboardKind::WriteApplied))
-            .await
-            .expect("append e2");
-        let e3 = append_whiteboard_event(&pool, &new_event("e3", "agent-a", WhiteboardKind::WriteApplied))
-            .await
-            .expect("append e3");
+        let e1 = append_whiteboard_event(
+            &pool,
+            &new_event("e1", "agent-a", WhiteboardKind::WriteApplied),
+        )
+        .await
+        .expect("append e1");
+        let e2 = append_whiteboard_event(
+            &pool,
+            &new_event("e2", "agent-a", WhiteboardKind::WriteApplied),
+        )
+        .await
+        .expect("append e2");
+        let e3 = append_whiteboard_event(
+            &pool,
+            &new_event("e3", "agent-a", WhiteboardKind::WriteApplied),
+        )
+        .await
+        .expect("append e3");
         create_whiteboard_checkpoint(&pool, e1.gate_seq, r#"{"snap":1}"#)
             .await
             .expect("checkpoint");
         // Replay after e1, excluding e2 (per-agent revert)
-        let replay = replay_whiteboard_tail_excluding(&pool, e1.gate_seq, &[e2.event_id.clone()])
-            .await
-            .expect("replay");
+        let replay = replay_whiteboard_tail_excluding(
+            &pool,
+            e1.gate_seq,
+            std::slice::from_ref(&e2.event_id),
+        )
+        .await
+        .expect("replay");
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].event_id, e3.event_id);
         // Full replay without exclusion

@@ -42,6 +42,10 @@ cargo nextest run -p concerto-<crate> <testname>   # one focused test
 cargo deny check                        # licenses / duplicates / advisories (deny.toml)
 cargo audit
 ```
+- **Build location:** never clone, build, test, or set `CARGO_TARGET_DIR` to a
+  path under `/tmp`. This environment mounts `/tmp` as a RAM-backed filesystem;
+  keep Cargo artifacts in the repository's `target/` directory and use
+  disk-backed repository worktrees for isolation.
 - GitHub Actions at `.github/workflows/ci.yml` runs fmt, clippy, test, and
   deny as separate jobs without `needs:`, so they run in parallel (alongside
   build/wasm/ui-color jobs). Match `.github/workflows/ci.yml` locally before

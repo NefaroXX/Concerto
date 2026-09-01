@@ -33,9 +33,12 @@
 //! `GateError::*` shapes directly.
 
 use crate::gate::{GateError, GateOutcome, GateRequest};
+use concerto_core::ids::Ulid;
+use concerto_core::memory::{ChunkType, MemoryEntry, MemoryId, MemoryNamespace, ProjectId};
 use concerto_core::types::ToolDefinition;
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardEvent, WhiteboardScope};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Semver of the supervisor/agent IPC protocol (ADR-60 D2). Negotiated during
 /// handshake; both sides reject the peer on mismatch. `0.2.0` adds the ADR-60
@@ -55,6 +58,11 @@ pub enum IpcMethod {
     PublishEvent,
     /// Retrieve memory chunks for an agent (ADR-60 D6).
     RetrieveMemory,
+    /// Persist a memory entry at the supervisor's memory spine (ADR-60 D6).
+    StoreMemory,
+    /// Invalidate one memory entry at the supervisor's memory spine
+    /// (ADR-60 D6).
+    InvalidateMemory,
     /// Fetch the supervisor's tool registry — the single source of truth for
     /// the tools an agent may call (ADR-60 S5 agent-process entry).
     ListTools,
@@ -79,6 +87,8 @@ impl IpcMethod {
             IpcMethod::ExecuteTool => "execute-tool",
             IpcMethod::PublishEvent => "publish-event",
             IpcMethod::RetrieveMemory => "retrieve-memory",
+            IpcMethod::StoreMemory => "store-memory",
+            IpcMethod::InvalidateMemory => "invalidate-memory",
             IpcMethod::ListTools => "list-tools",
             IpcMethod::Heartbeat => "heartbeat",
             IpcMethod::Handshake => "handshake",
@@ -155,6 +165,20 @@ pub enum IpcParams {
         agent_id: String,
         /// Maximum chunks to return.
         limit: u32,
+    },
+    /// Persist a memory entry at the supervisor's spine (ADR-60 D6). The
+    /// wire entry carries content/metadata/lifetime only — the supervisor
+    /// assigns the persisted id and binds project scoping, never trusting
+    /// the wire (see [`MemoryEntryWire`]).
+    StoreMemory {
+        /// The entry to persist (projection; see [`MemoryEntryWire`]).
+        entry: MemoryEntryWire,
+    },
+    /// Invalidate one memory entry at the supervisor's spine (ADR-60 D6).
+    /// The id is a ULID string; a malformed id is answered `InvalidParams`.
+    InvalidateMemory {
+        /// The ULID of the memory entry to invalidate.
+        memory_id: String,
     },
     /// Fetch the supervisor's tool registry (ADR-60 S5).
     ListTools {
@@ -237,6 +261,17 @@ pub enum IpcResult {
         /// Query results; empty when nothing matched.
         chunks: Vec<MemoryChunk>,
     },
+    /// The memory entry persisted by `store-memory`; carries the spine-assigned
+    /// id the agent uses for later invalidation.
+    StoreMemory {
+        /// The persisted entry's ULID (spine-assigned).
+        memory_id: String,
+    },
+    /// Echo of a completed invalidation: the ULID that was invalidated.
+    InvalidateMemory {
+        /// The invalidated entry's ULID.
+        memory_id: String,
+    },
     /// The supervisor's tool registry (ADR-60 S5).
     ListTools {
         /// Tool definitions the agent may present to the model.
@@ -276,6 +311,99 @@ pub struct MemoryChunk {
     pub score: f64,
     /// Whiteboard `event_id` this chunk originated from, when known.
     pub source_event_id: Option<String>,
+}
+
+/// Wire projection of a memory write crossing `store-memory` (ADR-60 D6).
+///
+/// The domain [`MemoryEntry`] cannot ride the request envelope (it does not
+/// implement `PartialEq`, and its ULID/timestamp types have never been part
+/// of this wire), so the protocol carries this lossless projection instead:
+/// identifiers stay supervisor-owned and timestamps travel as unix epoch
+/// milliseconds. The supervisor assigns the persisted id and binds
+/// `project_id`/`MemoryNamespace` at the spine (mirroring how
+/// `retrieve-memory` scopes its query to the supervisor's project), so the
+/// wire never carries a trusted identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryEntryWire {
+    /// The entry's text content.
+    pub content: String,
+    /// Memory kind label (serde-derives, so it rides the wire directly).
+    pub chunk_type: ChunkType,
+    /// Embedding model that produced the entry, when known.
+    pub model_id: Option<String>,
+    /// Embedding model version, when known.
+    pub model_version: Option<String>,
+    /// Free-form metadata payload.
+    pub metadata: serde_json::Value,
+    /// Unix epoch milliseconds (UTC); `None` means the entry never expires.
+    pub expires_at_ms: Option<i64>,
+    /// Unix epoch milliseconds (UTC).
+    pub created_at_ms: i64,
+}
+
+impl MemoryEntryWire {
+    /// Unix-epoch milliseconds for a timestamp, saturating at the `i64`
+    /// range (real memory timestamps are far inside it; the saturation keeps
+    /// the projection total without inventing an error path).
+    pub(crate) fn unix_ms(datetime: OffsetDateTime) -> i64 {
+        let millis = datetime.unix_timestamp_nanos().div_euclid(1_000_000);
+        if millis > i128::from(i64::MAX) {
+            i64::MAX
+        } else if millis < i128::from(i64::MIN) {
+            i64::MIN
+        } else {
+            millis as i64
+        }
+    }
+
+    /// Rebuild a timestamp from unix-epoch milliseconds; out-of-range values
+    /// are a malformed request (the caller answers `InvalidParams`).
+    pub(crate) fn from_unix_ms(ms: i64) -> Result<OffsetDateTime, String> {
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+            .map_err(|error| format!("timestamp {ms} ms out of range: {error}"))
+    }
+
+    /// Project a domain entry onto the wire. Infallible: identifiers are
+    /// dropped (the spine assigns its own) and timestamps convert to millis.
+    pub fn from_entry(entry: &MemoryEntry) -> Self {
+        Self {
+            content: entry.content.clone(),
+            chunk_type: entry.chunk_type,
+            model_id: entry.model_id.clone(),
+            model_version: entry.model_version.clone(),
+            metadata: entry.metadata.clone(),
+            expires_at_ms: entry.expires_at.map(Self::unix_ms),
+            created_at_ms: Self::unix_ms(entry.created_at),
+        }
+    }
+
+    /// Rebuild a domain entry the supervisor's spine can store, bound to
+    /// `project_id` (both `project_id` and the `Project` namespace) with a
+    /// freshly assigned id. Millis outside the representable range are a
+    /// malformed request; the message names the offending field.
+    pub fn into_entry(self, project_id: ProjectId) -> Result<MemoryEntry, String> {
+        let created_at = Self::from_unix_ms(self.created_at_ms)
+            .map_err(|error| format!("invalid created_at_ms: {error}"))?;
+        let expires_at = match self.expires_at_ms {
+            Some(ms) => Some(
+                Self::from_unix_ms(ms)
+                    .map_err(|error| format!("invalid expires_at_ms: {error}"))?,
+            ),
+            None => None,
+        };
+        Ok(MemoryEntry {
+            id: MemoryId(Ulid::new()),
+            project_id: project_id.clone(),
+            namespace: MemoryNamespace::Project(project_id),
+            content: self.content,
+            chunk_type: self.chunk_type,
+            model_id: self.model_id,
+            model_version: self.model_version,
+            metadata: self.metadata,
+            expires_at,
+            created_at,
+        })
+    }
 }
 
 /// JSON-RPC 2.0 error object with the supervisor-domain closed code set.
@@ -725,6 +853,31 @@ mod tests {
         });
     }
 
+    /// A memory-entry wire projection for round-trip and conversion tests.
+    fn memory_entry_wire() -> MemoryEntryWire {
+        MemoryEntryWire {
+            content: "agents own their writes".to_owned(),
+            chunk_type: ChunkType::Fact,
+            model_id: Some("mock-model".to_owned()),
+            model_version: Some("2".to_owned()),
+            metadata: json!({ "origin": "agent-a" }),
+            expires_at_ms: Some(1_800_000_000_000),
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn params_round_trip_store_memory() {
+        round_trip(&IpcParams::StoreMemory { entry: memory_entry_wire() });
+    }
+
+    #[test]
+    fn params_round_trip_invalidate_memory() {
+        round_trip(&IpcParams::InvalidateMemory {
+            memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        });
+    }
+
     #[test]
     fn params_round_trip_heartbeat() {
         round_trip(&IpcParams::Heartbeat {
@@ -816,6 +969,106 @@ mod tests {
                 source_event_id: Some("evt-1".to_owned()),
             }],
         });
+    }
+
+    #[test]
+    fn result_round_trip_store_memory() {
+        round_trip(&IpcResult::StoreMemory { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned() });
+    }
+
+    #[test]
+    fn result_round_trip_invalidate_memory() {
+        round_trip(&IpcResult::InvalidateMemory {
+            memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        });
+    }
+
+    /// The wire method names are part of the contract (kebab-case, like every
+    /// other supervisor method).
+    #[test]
+    fn memory_methods_have_kebab_case_wire_names() {
+        assert_eq!(IpcMethod::StoreMemory.as_str(), "store-memory");
+        assert_eq!(IpcMethod::InvalidateMemory.as_str(), "invalidate-memory");
+        assert_eq!(
+            serde_json::to_string(&IpcMethod::StoreMemory).expect("serialize method"),
+            "\"store-memory\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcMethod::InvalidateMemory).expect("serialize method"),
+            "\"invalidate-memory\""
+        );
+    }
+
+    /// The wire projection must be lossless: a domain entry crosses to the
+    /// wire and back with content, metadata, kind, model info and lifetime
+    /// preserved (identity/project/namespace are spine-assigned by design).
+    #[test]
+    fn memory_entry_wire_projection_is_lossless() {
+        let entry = MemoryEntry {
+            id: MemoryId(Ulid::new()),
+            project_id: ProjectId("proj-1".to_owned()),
+            namespace: MemoryNamespace::Project(ProjectId("proj-1".to_owned())),
+            content: "remembered".to_owned(),
+            chunk_type: ChunkType::SlidingWindow,
+            model_id: Some("mock-model".to_owned()),
+            model_version: Some("7".to_owned()),
+            metadata: json!({ "k": "v" }),
+            expires_at: Some(MemoryEntryWire::from_unix_ms(1_800_000_000_000).expect("valid ms")),
+            created_at: MemoryEntryWire::from_unix_ms(1_700_000_000_000).expect("valid ms"),
+        };
+        let wire = MemoryEntryWire::from_entry(&entry);
+        assert_eq!(wire.created_at_ms, 1_700_000_000_000);
+        assert_eq!(wire.expires_at_ms, Some(1_800_000_000_000));
+        let rebuilt = wire.into_entry(ProjectId("proj-supervisor".to_owned())).expect("rebuild");
+        assert_eq!(rebuilt.content, entry.content);
+        assert_eq!(rebuilt.chunk_type, entry.chunk_type);
+        assert_eq!(rebuilt.model_id, entry.model_id);
+        assert_eq!(rebuilt.model_version, entry.model_version);
+        assert_eq!(rebuilt.metadata, entry.metadata);
+        assert_eq!(MemoryEntryWire::unix_ms(rebuilt.created_at), 1_700_000_000_000);
+        assert_eq!(rebuilt.expires_at.map(MemoryEntryWire::unix_ms), Some(1_800_000_000_000));
+        // Identity and scoping are assigned at the spine, never trusted from
+        // the wire.
+        assert_ne!(rebuilt.id, entry.id, "the spine assigns a fresh id");
+        assert_eq!(rebuilt.project_id.0, "proj-supervisor");
+        assert!(matches!(
+            rebuilt.namespace,
+            MemoryNamespace::Project(ref project) if project.0 == "proj-supervisor"
+        ));
+    }
+
+    /// `None` expiry stays `None` through the projection (never-expiring
+    /// entries must not materialize a bogus timestamp).
+    #[test]
+    fn memory_entry_wire_preserves_missing_expiry() {
+        let entry = MemoryEntry {
+            id: MemoryId(Ulid::new()),
+            project_id: ProjectId("proj-1".to_owned()),
+            namespace: MemoryNamespace::Project(ProjectId("proj-1".to_owned())),
+            content: "forever".to_owned(),
+            chunk_type: ChunkType::Fact,
+            model_id: None,
+            model_version: None,
+            metadata: json!({}),
+            expires_at: None,
+            created_at: MemoryEntryWire::from_unix_ms(1_700_000_000_000).expect("valid ms"),
+        };
+        let wire = MemoryEntryWire::from_entry(&entry);
+        assert_eq!(wire.expires_at_ms, None);
+        let rebuilt = wire.into_entry(ProjectId("proj-1".to_owned())).expect("rebuild");
+        assert!(rebuilt.expires_at.is_none());
+    }
+
+    /// Out-of-range millis are a malformed request, reported against the
+    /// offending field (the supervisor answers `InvalidParams`).
+    #[test]
+    fn memory_entry_wire_rejects_out_of_range_timestamps() {
+        let mut wire = memory_entry_wire();
+        wire.created_at_ms = i64::MAX;
+        let error = wire
+            .into_entry(ProjectId("proj-1".to_owned()))
+            .expect_err("out-of-range created_at must fail");
+        assert!(error.contains("created_at_ms"), "names the field: {error}");
     }
 
     #[test]

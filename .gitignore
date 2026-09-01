@@ -1,5 +1,7 @@
 /target
 /crates/*/target
+/.tmp/*
+!/.tmp/.gitkeep
 **/*.rs.bk
 .DS_Store
 
