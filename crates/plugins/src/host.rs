@@ -48,8 +48,8 @@ impl PluginHost {
         // must go through the wasmtime async API (func_wrap_async /
         // call_async / instantiate_async).
         config.async_support(true);
-        // Limit linear memory growth per-instance via memory reservation.
-        config.memory_reservation(Self::DEFAULT_MAX_MEMORY as u64);
+        // Limit the static linear-memory reservation per instance.
+        config.static_memory_maximum_size(Self::DEFAULT_MAX_MEMORY as u64);
 
         let engine = Engine::new(&config)?;
         Ok(Self { engine })
