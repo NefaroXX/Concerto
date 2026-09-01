@@ -24,4 +24,4 @@ concerto-core = { path = "../core" }
 concerto-config = { path = "../config" }
 
 [dev-dependencies]
-opentelemetry-stdout = "0.31"
+opentelemetry-stdout = "0.32"
