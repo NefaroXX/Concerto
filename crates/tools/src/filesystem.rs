@@ -100,6 +100,110 @@ fn coerce_scalar_to_string(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Guard heuristic inference (adaptive tool-guard Solution 3)
+// ---------------------------------------------------------------------------
+
+/// Alias keys weak models emit for the canonical `path` field.
+const PATH_ALIASES: [&str; 4] = ["file", "filepath", "file_path", "filename"];
+
+/// Alias keys weak models emit for the canonical `operation` field.
+const OPERATION_ALIASES: [&str; 2] = ["op", "action"];
+
+/// Conservative heuristic inference for missing required filesystem arguments
+/// (adaptive tool-guard Solution 3: last-mile adaptability for weak
+/// tool-calling models).
+///
+/// Called by the orchestrator's tool-call guard only when a required field is
+/// absent or `null` after parse+coerce. `raw` is the model's ORIGINAL argument
+/// object (pre-coercion, so hallucinated alias keys are still present) and
+/// `missing` lists the unresolved required field names. Returns `(field,
+/// value)` insertions for the guard to apply; the guard re-coerces and
+/// re-validates the completed arguments, so a wrong guess can never reach the
+/// executor — it degrades to the usual corrective reject.
+///
+/// Rules, most-specific first (direct evidence beats inference, and `path` is
+/// never invented from nothing):
+///
+/// 1. `operation` ← `op`/`action` alias (non-empty string values only).
+/// 2. `operation` ← `write` when a non-null string `content` is present
+///    (content is only meaningful for the write operation).
+/// 3. `operation` ← `list` when the path is directory-like (`.` or a trailing
+///    separator), else `read` — the least destructive default, whose failure
+///    mode is the tool's own corrective "use list for directories" error.
+/// 4. `path` ← `file`/`filepath`/`file_path`/`filename` alias (non-empty
+///    string values only).
+pub fn infer_missing_arguments(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    missing: &[String],
+) -> Vec<(String, serde_json::Value)> {
+    let mut inferred = Vec::new();
+
+    if missing.iter().any(|field| field == "operation") {
+        if let Some(operation) = infer_operation(raw) {
+            inferred.push(("operation".to_string(), serde_json::Value::String(operation)));
+        }
+    }
+
+    if missing.iter().any(|field| field == "path") {
+        if let Some(path) = non_empty_string_alias(raw, &PATH_ALIASES) {
+            inferred.push(("path".to_string(), serde_json::Value::String(path)));
+        }
+    }
+
+    inferred
+}
+
+/// Operation inference for one raw argument object, per the documented rules.
+fn infer_operation(raw: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if let Some(alias) = non_empty_string_alias(raw, &OPERATION_ALIASES) {
+        return Some(alias);
+    }
+    if raw.get("content").is_some_and(serde_json::Value::is_string) {
+        return Some("write".to_string());
+    }
+    match raw.get("path").and_then(serde_json::Value::as_str) {
+        Some(path) => Some(operation_for_path(path).to_string()),
+        None => {
+            non_empty_string_alias(raw, &PATH_ALIASES).map(|path| operation_for_path(&path).into())
+        }
+    }
+}
+
+/// Path-shape operation: directories list, everything else reads.
+fn operation_for_path(path: &str) -> &'static str {
+    if is_directory_like(path) {
+        "list"
+    } else {
+        "read"
+    }
+}
+
+/// Directory-shape test for `list` inference: the workspace root or a path
+/// explicitly terminated as a directory. Both separators are accepted because
+/// models on Windows-style paths still mean a directory.
+fn is_directory_like(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed == "." || trimmed.ends_with('/') || trimmed.ends_with('\\')
+}
+
+/// First non-empty (after trimming) string value among `keys`.
+///
+/// Whitespace-only values carry no signal and are skipped; non-string values
+/// are never guessed at by this layer.
+fn non_empty_string_alias(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        raw.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Filesystem tool wrapping a `VirtualFs` instance.
 ///
 /// Uses `Arc<Mutex<VirtualFs>>` internally so the same underlying VFS can
@@ -1068,5 +1172,106 @@ mod tests {
         assert_eq!(parsed.path, "Cargo.toml");
         assert_eq!(parsed.content, None);
         assert_eq!(parsed.destination, None);
+    }
+
+    // -- guard heuristic inference (Solution 3) --------------------------------
+
+    /// Builds the `missing` argument for [`infer_missing_arguments`].
+    fn missing(fields: &[&str]) -> Vec<String> {
+        fields.iter().map(|field| (*field).to_string()).collect()
+    }
+
+    #[test]
+    fn infer_read_when_only_path_is_present() {
+        let raw = serde_json::json!({ "path": "src/main.rs" }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["operation"]));
+        assert_eq!(inferred, vec![("operation".to_string(), serde_json::json!("read"))]);
+    }
+
+    #[test]
+    fn infer_list_for_directory_like_paths() {
+        for path in [".", "src/", "src\\"] {
+            let raw = serde_json::json!({ "path": path }).as_object().unwrap().clone();
+            let inferred = infer_missing_arguments(&raw, &missing(&["operation"]));
+            assert_eq!(inferred[0].1, serde_json::json!("list"), "path {path:?}");
+        }
+    }
+
+    #[test]
+    fn infer_write_when_content_is_present() {
+        let raw =
+            serde_json::json!({ "path": "a.rs", "content": "hi" }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["operation"]));
+        assert_eq!(inferred[0].1, serde_json::json!("write"));
+    }
+
+    #[test]
+    fn operation_alias_wins_over_shape_inference() {
+        let raw =
+            serde_json::json!({ "op": " list ", "path": "a.rs" }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["operation"]));
+        assert_eq!(inferred[0].1, serde_json::json!("list"), "trimmed alias value wins");
+    }
+
+    #[test]
+    fn path_alias_is_recovered() {
+        for alias in PATH_ALIASES {
+            let mut raw = serde_json::Map::new();
+            raw.insert(alias.to_string(), serde_json::json!("src/main.rs"));
+            let inferred = infer_missing_arguments(&raw, &missing(&["path"]));
+            assert_eq!(
+                inferred,
+                vec![("path".to_string(), serde_json::json!("src/main.rs"))],
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_alias_is_recovered() {
+        for alias in OPERATION_ALIASES {
+            let mut raw = serde_json::Map::new();
+            raw.insert(alias.to_string(), serde_json::json!("read"));
+            let inferred = infer_missing_arguments(&raw, &missing(&["operation"]));
+            assert_eq!(inferred[0].1, serde_json::json!("read"), "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn empty_or_non_string_alias_values_are_ignored() {
+        // Whitespace-only and non-string alias values carry no signal: fall
+        // through to shape inference for `operation`, nothing for `path`.
+        let raw = serde_json::json!({ "op": "   ", "file": 42, "path": "a.rs" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["operation"]));
+        assert_eq!(inferred[0].1, serde_json::json!("read"));
+
+        let raw = serde_json::json!({ "file": 42 }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["path"])).is_empty());
+    }
+
+    #[test]
+    fn no_path_signal_yields_no_inference() {
+        // No path/content/alias: nothing grounds `operation`, and a `path` is
+        // never invented — the guard must reject instead of guessing.
+        let raw = serde_json::Map::new();
+        assert!(infer_missing_arguments(&raw, &missing(&["operation", "path"])).is_empty());
+    }
+
+    #[test]
+    fn resolved_fields_are_not_reinferred() {
+        let raw = serde_json::json!({ "op": "write" }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["path"])).is_empty());
+    }
+
+    #[test]
+    fn directory_like_shape_test() {
+        assert!(is_directory_like("."));
+        assert!(is_directory_like("src/"));
+        assert!(is_directory_like(" src/ "));
+        assert!(!is_directory_like("src/main.rs"));
+        assert!(!is_directory_like("src"));
     }
 }

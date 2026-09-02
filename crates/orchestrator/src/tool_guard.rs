@@ -11,11 +11,20 @@
 //! builds a structured corrective `ToolResult` so the model retries with
 //! corrected arguments inside the same conversation.
 //!
-//! The guard is generic over every tool: it only reads standard JSON Schema
-//! keywords (`properties`, `required`, `type`, `enum`,
-//! `additionalProperties`) and never special-cases tool names. Provider-side
-//! coercion (`concerto_providers::protocol::ensure_arguments_object`) is left
-//! untouched — this is the orchestrator-side second line of defense.
+//! The parse, coerce, validate, and repair layers are generic over every
+//! tool: they only read standard JSON Schema keywords (`properties`,
+//! `required`, `type`, `enum`, `additionalProperties`) and never special-case
+//! tool names. The one deliberate exception is the heuristic-inference layer
+//! (Phase 2.5, adaptive tool-guard Solution 3): a bounded, name-keyed
+//! dispatch to per-tool heuristics owned by `concerto-tools` — next to each
+//! tool's schema — that recover missing required fields (e.g. filesystem
+//! `operation` from path shape, shell `command` from a `cmd` alias).
+//! Heuristic fills are logged, only applied to absent/`null` slots, and
+//! accepted only after the completed arguments re-validate; otherwise the
+//! corrective reject below proceeds unchanged.
+//!
+//! Provider-side coercion (`concerto_providers::protocol::ensure_arguments_object`)
+//! is left untouched — this is the orchestrator-side second line of defense.
 
 use serde_json::{Map, Value};
 
@@ -217,6 +226,84 @@ fn parse_bool(text: &str) -> Option<bool> {
         "true" | "yes" | "on" | "1" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.5 — heuristic inference: per-tool last-mile recovery
+// ---------------------------------------------------------------------------
+
+/// The required fields of `schema` that carry no usable value in `args`:
+/// either absent or explicitly `null`. Validation reports those as missing
+/// fields or type errors; this is the trigger set for heuristic inference.
+fn unresolved_required_fields(args: &Value, schema: &Value) -> Vec<String> {
+    let Some(object) = args.as_object() else {
+        return Vec::new();
+    };
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|field| object.get(*field).is_none_or(Value::is_null))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Attempt conservative, per-tool heuristic inference for unresolved required
+/// fields (adaptive tool-guard Solution 3).
+///
+/// Dispatches by tool name to heuristics exported by `concerto-tools`
+/// ([`concerto_tools::filesystem::infer_missing_arguments`],
+/// [`concerto_tools::shell::infer_missing_arguments`]). Tools without a
+/// registered heuristic — including every external MCP tool — get none:
+/// generic inference would be guessing, which this layer must not do.
+///
+/// `raw` is the model's ORIGINAL parsed argument object (pre-coercion, so
+/// hallucinated alias keys such as `cmd` are still present for alias
+/// recovery); `arguments` is the post-coercion object, mutated in place.
+///
+/// Returns human-readable notes for `tracing` when at least one field was
+/// filled in, `None` otherwise. Fills only touch absent/`null` slots — a real
+/// value is never overwritten — and the caller MUST re-run
+/// [`coerce_arguments`] and [`validate_arguments`]: inference is accepted
+/// only when the completed arguments validate cleanly, otherwise the usual
+/// corrective reject applies.
+pub(crate) fn heuristic_infer(
+    tool: &str,
+    raw: &Value,
+    arguments: &mut Value,
+    schema: &Value,
+) -> Option<Vec<String>> {
+    let raw_map = raw.as_object()?;
+    let missing = unresolved_required_fields(arguments, schema);
+    if missing.is_empty() {
+        return None;
+    }
+    let insertions = match tool {
+        "filesystem" => concerto_tools::filesystem::infer_missing_arguments(raw_map, &missing),
+        "shell" => concerto_tools::shell::infer_missing_arguments(raw_map, &missing),
+        _ => Vec::new(),
+    };
+    if insertions.is_empty() {
+        return None;
+    }
+    let target = arguments.as_object_mut()?;
+    let mut notes = Vec::new();
+    for (field, value) in insertions {
+        match target.get(&field) {
+            None | Some(Value::Null) => {
+                notes.push(format!("filled missing '{field}' with {value}"));
+                target.insert(field, value);
+            }
+            Some(_) => {}
+        }
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes)
     }
 }
 
@@ -729,5 +816,179 @@ mod tests {
             errors.iter().any(|error| error.contains("one of")),
             "missing-operation error must carry the enum hint: {errors:?}"
         );
+    }
+
+    // -- heuristic inference (Solution 3) --------------------------------------
+
+    #[test]
+    fn heuristic_infers_read_for_file_like_path() {
+        // Canonical Solution-3 example: filesystem with only `path` infers
+        // `read`.
+        let mut args = serde_json::json!({});
+        let notes = heuristic_infer(
+            "filesystem",
+            &serde_json::json!({ "path": "src/main.rs" }),
+            &mut args,
+            &filesystem_schema(),
+        );
+        assert!(notes.is_some(), "notes: {notes:?}");
+        assert_eq!(args["operation"], "read");
+        assert!(notes.unwrap().iter().any(|note| note.contains("'operation'")));
+    }
+
+    #[test]
+    fn heuristic_infers_list_for_directory_like_paths() {
+        for path in [".", "src/", "src\\"] {
+            let mut args = serde_json::json!({});
+            let notes = heuristic_infer(
+                "filesystem",
+                &serde_json::json!({ "path": path }),
+                &mut args,
+                &filesystem_schema(),
+            );
+            assert!(notes.is_some(), "path {path:?}: {notes:?}");
+            assert_eq!(args["operation"], "list", "path {path:?} must infer list");
+        }
+    }
+
+    #[test]
+    fn heuristic_infers_write_when_content_is_present() {
+        let mut args = serde_json::json!({});
+        let notes = heuristic_infer(
+            "filesystem",
+            &serde_json::json!({ "path": "a.rs", "content": "hi" }),
+            &mut args,
+            &filesystem_schema(),
+        );
+        assert!(notes.is_some(), "notes: {notes:?}");
+        assert_eq!(args["operation"], "write");
+    }
+
+    #[test]
+    fn heuristic_alias_beats_shape_inference() {
+        // Direct evidence (an alias carrying an operation value) wins over
+        // path-shape guessing; case normalization happens in the re-coerce.
+        let mut args = serde_json::json!({});
+        heuristic_infer(
+            "filesystem",
+            &serde_json::json!({ "op": "LIST", "path": "src/main.rs" }),
+            &mut args,
+            &filesystem_schema(),
+        );
+        assert_eq!(args["operation"], "LIST");
+    }
+
+    #[test]
+    fn heuristic_recovers_path_from_file_alias() {
+        let mut args = serde_json::json!({});
+        let notes = heuristic_infer(
+            "filesystem",
+            &serde_json::json!({ "file": "src/main.rs" }),
+            &mut args,
+            &filesystem_schema(),
+        );
+        assert!(notes.is_some(), "notes: {notes:?}");
+        assert_eq!(args["operation"], "read", "path alias feeds shape inference too");
+        assert_eq!(args["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn heuristic_shell_recovers_command_from_cmd_alias() {
+        // Canonical Solution-3 example: shell with `cmd` infers `command`.
+        let mut args = serde_json::json!({});
+        let notes = heuristic_infer(
+            "shell",
+            &serde_json::json!({ "cmd": "cargo test" }),
+            &mut args,
+            &shell_schema(),
+        );
+        assert!(notes.is_some(), "notes: {notes:?}");
+        assert_eq!(args["command"], "cargo test");
+    }
+
+    #[test]
+    fn heuristic_never_overwrites_present_values() {
+        // `operation` is present → only `path` is unresolved; the present
+        // value must survive while the alias fills the gap.
+        let mut args = serde_json::json!({ "operation": "write" });
+        let notes = heuristic_infer(
+            "filesystem",
+            &serde_json::json!({ "file": "a.rs" }),
+            &mut args,
+            &filesystem_schema(),
+        );
+        assert!(notes.is_some(), "path alias should fill the missing path");
+        assert_eq!(args["operation"], "write");
+        assert_eq!(args["path"], "a.rs");
+    }
+
+    #[test]
+    fn heuristic_treats_null_required_fields_as_unresolved() {
+        // Realistic pipeline state: the model sent a null `operation` beside a
+        // valid `path`; parse/coerce leave both, and the null is unresolved.
+        let raw = serde_json::json!({ "operation": null, "path": "a.rs" });
+        let (coerced, _) = coerce_arguments(raw.clone(), &filesystem_schema());
+        let mut repaired = coerced;
+        let notes = heuristic_infer("filesystem", &raw, &mut repaired, &filesystem_schema());
+        assert!(notes.is_some(), "null operation is unresolved: {notes:?}");
+        assert_eq!(repaired["operation"], "read");
+        assert_eq!(repaired["path"], "a.rs");
+    }
+
+    #[test]
+    fn heuristic_fully_resolved_arguments_yield_none() {
+        let mut args = serde_json::json!({ "operation": "read", "path": "a.rs" });
+        let notes = heuristic_infer(
+            "filesystem",
+            &serde_json::json!({ "op": "write", "file": "b.rs" }),
+            &mut args,
+            &filesystem_schema(),
+        );
+        assert!(notes.is_none());
+        assert_eq!(args, serde_json::json!({ "operation": "read", "path": "a.rs" }));
+    }
+
+    #[test]
+    fn heuristic_unknown_tool_yields_none() {
+        // Tools without a registered heuristic (MCP, git, ...) get none:
+        // generic inference would be guessing.
+        let mut args = serde_json::json!({});
+        let notes = heuristic_infer(
+            "mcp:srv:tool",
+            &serde_json::json!({ "cmd": "ls" }),
+            &mut args,
+            &shell_schema(),
+        );
+        assert!(notes.is_none());
+    }
+
+    #[test]
+    fn heuristic_without_grounding_signal_yields_none() {
+        // No path, no content, no alias: nothing to ground `operation` on,
+        // and a `path` is never invented — the guard must reject instead.
+        let mut args = serde_json::json!({});
+        let notes =
+            heuristic_infer("filesystem", &serde_json::json!({}), &mut args, &filesystem_schema());
+        assert!(notes.is_none());
+    }
+
+    #[test]
+    fn heuristic_pipeline_completes_path_only_filesystem_call() {
+        // Full pipeline against the REAL filesystem schema: parse → coerce →
+        // infer → re-coerce → re-validate.
+        let schema = FilesystemTool::new(camino::Utf8PathBuf::from(".")).input_schema();
+        let parsed = parse_tool_arguments(&serde_json::json!({ "path": "src/main.rs" }));
+        let (coerced, _) = coerce_arguments(parsed.clone(), &schema);
+        assert!(!validate_arguments(&coerced, &schema).is_empty());
+
+        let mut repaired = coerced;
+        let notes = heuristic_infer("filesystem", &parsed, &mut repaired, &schema)
+            .expect("path-only call must be inferable");
+        let (repaired, _) = coerce_arguments(repaired, &schema);
+        assert!(
+            validate_arguments(&repaired, &schema).is_empty(),
+            "inferred arguments must validate: {notes:?}"
+        );
+        assert_eq!(repaired["operation"], "read");
     }
 }

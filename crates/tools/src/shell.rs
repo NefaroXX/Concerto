@@ -85,6 +85,51 @@ pub struct ShellInput {
     pub timeout_secs: Option<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// Guard heuristic inference (adaptive tool-guard Solution 3)
+// ---------------------------------------------------------------------------
+
+/// Alias keys weak models emit for the canonical `command` field.
+const COMMAND_ALIASES: [&str; 2] = ["cmd", "action"];
+
+/// Conservative heuristic inference for a missing required `command` argument
+/// (adaptive tool-guard Solution 3: last-mile adaptability for weak
+/// tool-calling models).
+///
+/// Called by the orchestrator's tool-call guard only when `command` is absent
+/// or `null` after parse+coerce. `raw` is the model's ORIGINAL argument object
+/// (pre-coercion, so hallucinated alias keys are still present) and `missing`
+/// lists the unresolved required field names. Returns `(field, value)`
+/// insertions for the guard to apply; the guard re-coerces and re-validates
+/// the completed arguments, so a wrong guess can never reach the executor.
+///
+/// Alias recovery only: `cmd`/`action` → `command` (non-empty string values).
+/// No command is ever synthesized from prose, the tool name, or `args` — a
+/// guessed command would be executed, so any ambiguity must fall through to
+/// the guard's corrective reject instead. Policy (allowlist/denylist) still
+/// gates whatever command ends up running.
+pub fn infer_missing_arguments(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    missing: &[String],
+) -> Vec<(String, serde_json::Value)> {
+    if !missing.iter().any(|field| field == "command") {
+        return Vec::new();
+    }
+    COMMAND_ALIASES
+        .iter()
+        .find_map(|alias| {
+            raw.get(*alias)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|command| {
+                    ("command".to_string(), serde_json::Value::String(command.to_string()))
+                })
+        })
+        .into_iter()
+        .collect()
+}
+
 /// Configuration for allowlist/denylist filtering of shell commands.
 ///
 /// # Deny-by-default
@@ -1450,5 +1495,51 @@ mod tests {
             Err(other) => panic!("expected Timeout error, got: {other:?}"),
             Ok(_) => panic!("expected timeout, got Ok"),
         }
+    }
+
+    // -- guard heuristic inference (Solution 3) --------------------------------
+
+    /// Builds the `missing` argument for [`infer_missing_arguments`].
+    fn missing(fields: &[&str]) -> Vec<String> {
+        fields.iter().map(|field| (*field).to_string()).collect()
+    }
+
+    #[test]
+    fn infer_command_from_cmd_alias() {
+        // Canonical Solution-3 example: shell with `cmd` infers `command`.
+        let raw = json!({ "cmd": "cargo test" }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["command"]));
+        assert_eq!(inferred, vec![("command".to_string(), json!("cargo test"))]);
+    }
+
+    #[test]
+    fn infer_command_from_action_alias() {
+        let raw = json!({ "action": " pwd " }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["command"]));
+        assert_eq!(inferred[0].1, json!("pwd"), "alias value is trimmed");
+    }
+
+    #[test]
+    fn no_command_invention_from_args_or_empty_values() {
+        // `args` alone never becomes a command; empty, whitespace-only, and
+        // non-string aliases are ignored; with nothing to recover, the guard
+        // must reject instead of guessing.
+        let raw = json!({ "args": ["ls", "-la"] }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+
+        let raw = json!({ "cmd": "" }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+
+        let raw = json!({ "cmd": "  ", "action": 7 }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+
+        let raw = serde_json::Map::new();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+    }
+
+    #[test]
+    fn no_inference_when_command_is_not_missing() {
+        let raw = json!({ "cmd": "ls" }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["args"])).is_empty());
     }
 }
