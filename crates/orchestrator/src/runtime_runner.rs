@@ -10,8 +10,9 @@ use crate::intent_grants::{
     apply_intent_gate, outcome_name, router_route_name, IntentGrantStore, SessionIntentAuth,
 };
 use crate::plan_approval::{
-    append_plan_approved_event, apply_plan_decision, load_approved_plan, plan_registry,
-    rehydrate_durable_binding, verified_binding, ApprovedPlanContext, PlanBinding,
+    append_plan_approved_event, apply_plan_decision, fold_ledger, load_approved_plan,
+    plan_artifact_hash, plan_registry, rehydrate_durable_binding, verified_binding,
+    ApprovedPlanContext, PlanApprovedPayload, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
 use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
@@ -48,6 +49,9 @@ use concerto_core::{
     PolicyPresets, RpmLimiter, SimplePolicyEngine, SpendTracker, LOW_CONFIDENCE_THRESHOLD,
 };
 use concerto_sessions::audit::SqliteAuditLog;
+use concerto_sessions::whiteboard::{
+    latest_gate_seq, load_whiteboard_events, WhiteboardKind, WhiteboardLoadOpts,
+};
 use concerto_sessions::PlanBindingRecord;
 use concerto_sessions::SessionStore;
 use concerto_tools::git::GitTool;
@@ -2202,36 +2206,208 @@ fn approved_plan_structured_description(context: &ApprovedPlanContext) -> String
             out.push_str("\n</approved-plan-artifact>\n");
         }
     }
+    out.push_str(&render_plan_ledger_section(&context.ledger));
+    out
+}
+
+/// The carry-forward ledger block shared by the approved-plan Execute
+/// description and the run-continuity section below: completed subtasks are
+/// not redone, files touched are known, and failed commands carry their
+/// failure reasons so they are never re-run unchanged (#152 acceptance).
+fn render_plan_ledger_section(ledger: &PlanLedger) -> String {
+    let mut out = String::new();
     out.push_str("\n<approved-plan-ledger>\n");
-    if context.ledger.completed_subtasks.is_empty()
-        && context.ledger.files_touched.is_empty()
-        && context.ledger.failed_commands.is_empty()
+    if ledger.completed_subtasks.is_empty()
+        && ledger.files_touched.is_empty()
+        && ledger.failed_commands.is_empty()
     {
         out.push_str("No prior execution under this plan.\n");
     } else {
-        if !context.ledger.completed_subtasks.is_empty() {
+        if !ledger.completed_subtasks.is_empty() {
             out.push_str("Completed subtasks (do not redo):\n");
-            for entry in &context.ledger.completed_subtasks {
+            for entry in &ledger.completed_subtasks {
                 out.push_str(&format!("- {entry}\n"));
             }
         }
-        if !context.ledger.files_touched.is_empty() {
+        if !ledger.files_touched.is_empty() {
             out.push_str("Files already touched under this plan:\n");
-            for entry in &context.ledger.files_touched {
+            for entry in &ledger.files_touched {
                 out.push_str(&format!("- {entry}\n"));
             }
         }
-        if !context.ledger.failed_commands.is_empty() {
+        if !ledger.failed_commands.is_empty() {
             out.push_str(
                 "Failed commands (address the recorded failure reason; never re-run unchanged):\n",
             );
-            for entry in &context.ledger.failed_commands {
+            for entry in &ledger.failed_commands {
                 out.push_str(&format!("- {entry}\n"));
             }
         }
     }
     out.push_str("</approved-plan-ledger>");
     out
+}
+
+// ===========================================================================
+// ADR-60 D7 run-continuity: `continue` without an approved-plan binding.
+//
+// The approved-plan rehydration above only fires when a Plan was approved and
+// applied. A `continue` after a failed Execute — or in a reopened project,
+// where the active session already carries earlier runs — used to start
+// blank, wastefully re-deriving what the ledger already knows. The fix is
+// read-side only: the gate already persists the durable substrate (keyed by
+// the run's session id — `write-applied` rows carry the files touched,
+// `failure` rows carry failed commands, and any `plan-approved` row carries
+// the session's last approved artifact), so continuity rehydrates from the
+// log instead of duplicating it into a new summary event. No new write path,
+// no new whiteboard kind, no double bookkeeping to drift.
+//
+// Fail-soft by the same contract as every D7 step: no pool, an empty log, or
+// a read error leaves the task untouched (with an observable warn), and a
+// plan payload that fails its own artifact hash is skipped, never trusted.
+// ===========================================================================
+
+/// How many of a session's most recent whiteboard events the run-continuity
+/// read folds. Bounds the query; the gate's write/failure rows and the last
+/// plan approval sit at the tail of the session's log, so the newest window
+/// is the relevant one.
+const RUN_CONTINUITY_WINDOW: usize = 200;
+
+/// One session's run-continuity snapshot: the newest hash-verified
+/// `plan-approved` payload (when the session ever approved a plan) plus the
+/// carry-forward ledger folded from the gate's write/failure events.
+#[derive(Debug, Default)]
+struct RunContinuity {
+    /// The session's last approved plan, artifact-hash verified at read.
+    plan: Option<PlanApprovedPayload>,
+    /// Carry-forward state from the session's gate-written ledger events.
+    ledger: PlanLedger,
+}
+
+impl RunContinuity {
+    /// An empty snapshot seeds nothing — the truthful state for a fresh
+    /// session or a pre-whiteboard log.
+    fn is_empty(&self) -> bool {
+        self.plan.is_none() && self.ledger == PlanLedger::default()
+    }
+}
+
+/// Whether a run seeds run-continuity into its task: a `continue`/resume
+/// request that is NOT governed by an approved-plan binding (that path has
+/// its own verified rehydration), gated by the same `plan_binding_source`
+/// switch as every D7 whiteboard read.
+fn run_continuity_applies(
+    apply_plan: bool,
+    input: &str,
+    multi_agent: Option<&concerto_config::MultiAgentConfig>,
+) -> bool {
+    !apply_plan && is_resume_request(input) && d7_whiteboard_enabled(multi_agent)
+}
+
+/// Load a session's run-continuity snapshot from the whiteboard: the newest
+/// `plan-approved` payload (verified against its own artifact hash — an
+/// unattested artifact is skipped with a warn, never trusted) plus the ledger
+/// folded from the session's gate-written events.
+async fn load_run_continuity(
+    pool: &sqlx::SqlitePool,
+    session_id: Ulid,
+) -> Result<RunContinuity, concerto_sessions::SessionError> {
+    // Read the newest tail of the session's log. `gate_seq` is global, so
+    // anchor the cursor `RUN_CONTINUITY_WINDOW` events back from the head and
+    // rely on the session filter to keep only this session's rows.
+    let head = latest_gate_seq(pool).await?;
+    let after = head.saturating_sub(RUN_CONTINUITY_WINDOW as u64);
+    let events = load_whiteboard_events(
+        pool,
+        &WhiteboardLoadOpts {
+            after_gate_seq: after,
+            session_id: Some(session_id.to_string()),
+            scope: None,
+            limit: RUN_CONTINUITY_WINDOW,
+        },
+    )
+    .await?;
+
+    // The newest approval only: an older plan could be stale, and digging
+    // backwards past an unverifiable one would trust a log the caller cannot
+    // attest to.
+    let plan =
+        events.iter().rev().find(|event| event.kind == WhiteboardKind::PlanApproved).and_then(
+            |event| match serde_json::from_value::<PlanApprovedPayload>(event.payload.clone()) {
+                Ok(payload) if plan_artifact_hash(&payload.plan_text) == payload.artifact_hash => {
+                    Some(payload)
+                }
+                Ok(payload) => {
+                    tracing::warn!(
+                        event_id = %event.event_id,
+                        plan_id = %payload.plan_id,
+                        "session's last plan-approved payload fails its artifact hash — \
+                         run continuity skips it"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        event_id = %event.event_id,
+                        "session's last plan-approved payload is unreadable — run continuity \
+                         skips it"
+                    );
+                    None
+                }
+            },
+        );
+    let ledger = fold_ledger(&events);
+    Ok(RunContinuity { plan, ledger })
+}
+
+/// Render the run-continuity section appended to a `continue` run's task
+/// description: the re-anchor context (last approved artifact) plus the same
+/// carry-forward ledger grammar the approved-plan Execute uses.
+fn run_continuity_description(continuity: &RunContinuity) -> String {
+    let mut out = String::new();
+    out.push_str("<run-continuity>\n");
+    out.push_str(
+        "This run resumes prior work in this session. The state below is rehydrated from the \
+         session's whiteboard ledger — do not re-plan from scratch and do not redo completed \
+         work.\n",
+    );
+    if let Some(plan) = &continuity.plan {
+        out.push_str(&format!(
+            "\n<last-approved-plan id=\"{}\">\n{}\n</last-approved-plan>\n",
+            plan.plan_id, plan.plan_text
+        ));
+    }
+    out.push_str(&render_plan_ledger_section(&continuity.ledger));
+    out
+}
+
+/// Load the session's run-continuity snapshot and append it to the task
+/// description when the log carries anything. Fail-soft: an empty log seeds
+/// nothing; a read error warns and leaves the task untouched — continuity
+/// bookkeeping never fails the run.
+async fn seed_run_continuity(task: &mut AgentTask, pool: &sqlx::SqlitePool, session_id: Ulid) {
+    match load_run_continuity(pool, session_id).await {
+        Ok(continuity) if !continuity.is_empty() => {
+            tracing::info!(
+                session_id = %task.session_id,
+                last_plan = continuity.plan.as_ref().map(|plan| plan.plan_id.as_str()),
+                files_touched = continuity.ledger.files_touched.len(),
+                failed_commands = continuity.ledger.failed_commands.len(),
+                "rehydrated run continuity from the whiteboard for a resume request \
+                 (ADR-60 D7)"
+            );
+            task.description.push_str("\n\n");
+            task.description.push_str(&run_continuity_description(&continuity));
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            session_id = %task.session_id,
+            "failed to load the session's run-continuity ledger; the resume run \
+             proceeds without it"
+        ),
+    }
 }
 
 /// Build the run's task from the gate and plan-binding state (ADR-55 Phase
@@ -2928,7 +3104,7 @@ pub async fn run_shared_agent(
     // and audit; only the task the agents execute is replaced. ADR-60 D7: a
     // whiteboard-verified approved plan swaps in the structured artifact +
     // ledger description instead of the rendered prose.
-    let task = build_run_task(
+    let mut task = build_run_task(
         session_id,
         action_required,
         apply_plan,
@@ -2936,6 +3112,21 @@ pub async fn run_shared_agent(
         approved_context.as_ref(),
         &req.input,
     );
+
+    // ─── ADR-60 D7 run-continuity: a `continue`/resume run with no approved
+    // plan binding still rehydrates the session's whiteboard ledger — files
+    // touched, failed commands, and the session's last approved artifact —
+    // so resuming after a failed Execute (or in a reopened project) starts
+    // from what the ledger already knows instead of restarting blank and
+    // wastefully re-deriving it. The approved-plan path above keeps its own
+    // verified rehydration; this seeds only when that path did not fire.
+    // Fail-soft: no pool, an empty log, or a read error leaves the task
+    // untouched — continuity bookkeeping never fails the run.
+    if run_continuity_applies(apply_plan, &req.input, services.config.multi_agent.as_ref()) {
+        if let Some(pool) = gate_log_pool.as_ref() {
+            seed_run_continuity(&mut task, pool, session_id).await;
+        }
+    }
 
     // Run-stage tracking (ADR-55 Phase 2a). Created here, after routing, so
     // the stage chip always starts from Understand; threaded down into the
@@ -6206,6 +6397,213 @@ mod runtime_runner_tests {
         assert!(
             orphan_rehydrated.expect("rehydrated").design_doc.is_some(),
             "the structured DesignDoc persists even without a config section"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D7 run-continuity: `continue` without an approved-plan
+    // binding rehydrates the session's ledger (files touched, failed
+    // commands) and the session's last approved artifact from the
+    // whiteboard, so a resume after a failed Execute — or in a reopened
+    // project — never starts blank.
+    // ------------------------------------------------------------------
+
+    /// Helper: append one gate-shaped whiteboard event keyed to `session_id`
+    /// (mirroring `in_process_gate`: session-keyed, plan-less).
+    async fn append_session_event(
+        pool: &sqlx::SqlitePool,
+        session_id: Ulid,
+        event_id: &str,
+        kind: concerto_sessions::whiteboard::WhiteboardKind,
+        payload: serde_json::Value,
+    ) {
+        use concerto_sessions::whiteboard::{append_whiteboard_event, NewWhiteboardEvent};
+        append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: event_id.to_owned(),
+                agent_id: "single-agent".into(),
+                kind,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload,
+                pre_image_hash: None,
+                created_at: 2,
+            },
+        )
+        .await
+        .expect("session-keyed whiteboard event");
+    }
+
+    /// The trigger follows the resume request and the D7 gate alone: a
+    /// `continue` on the whiteboard source seeds (including fresh installs
+    /// with no multi-agent section); an Apply run keeps its own verified
+    /// rehydration; a non-resume input and the `legacy` source seed nothing.
+    #[test]
+    fn run_continuity_applies_follows_resume_request_and_whiteboard_gate() {
+        let default = concerto_config::MultiAgentConfig::default();
+        assert!(run_continuity_applies(false, "continue", Some(&default)));
+        assert!(run_continuity_applies(false, "continue", None));
+        assert!(run_continuity_applies(false, "resume the task", Some(&default)));
+        // The approved-plan path governs its own rehydration.
+        assert!(!run_continuity_applies(true, "continue", Some(&default)));
+        // Only resume-shaped inputs seed.
+        assert!(!run_continuity_applies(false, "fix the login bug", Some(&default)));
+        // `legacy` keeps the exact pre-D7 behavior.
+        let legacy = concerto_config::MultiAgentConfig {
+            plan_binding_source: concerto_config::PlanBindingSource::Legacy,
+            ..Default::default()
+        };
+        assert!(!run_continuity_applies(false, "continue", Some(&legacy)));
+    }
+
+    /// The live scenario: a `continue` after a failed Execute (session-keyed
+    /// gate rows from the prior run, no binding in play) seeds the files
+    /// touched, the failed command with its reason, and the session's last
+    /// approved artifact into the task description.
+    #[tokio::test]
+    async fn continue_rehydrates_session_ledger_and_last_plan_from_whiteboard() {
+        let (_dir, pool) = d7_pool().await;
+        let session_id = Ulid::new();
+        let multi_agent = concerto_config::MultiAgentConfig::default();
+
+        // The session's last approved plan (single-agent shape: no DesignDoc,
+        // the capped text is the artifact), written session-keyed like the
+        // post-Plan binding insert does.
+        let binding = d7_binding();
+        append_plan_binding_event(Some(&pool), session_id, &binding, None, Some(&multi_agent))
+            .await;
+        // Gate-shaped ledger rows from the failed prior run.
+        append_session_event(
+            &pool,
+            session_id,
+            "write-1",
+            concerto_sessions::whiteboard::WhiteboardKind::WriteApplied,
+            serde_json::json!({ "pre_images": { "src/lib.rs": "h" } }),
+        )
+        .await;
+        append_session_event(
+            &pool,
+            session_id,
+            "fail-1",
+            concerto_sessions::whiteboard::WhiteboardKind::Failure,
+            serde_json::json!({ "tool": "shell", "error": "cargo test exited 101" }),
+        )
+        .await;
+
+        let continuity = load_run_continuity(&pool, session_id).await.expect("load");
+        assert!(
+            continuity
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.plan_text.contains("build continuity")),
+            "the session's last approved artifact rehydrates: {:?}",
+            continuity.plan
+        );
+        assert!(
+            continuity.ledger.files_touched.contains(&"src/lib.rs".to_owned()),
+            "files touched fold from the gate rows: {:?}",
+            continuity.ledger
+        );
+        assert!(
+            continuity
+                .ledger
+                .failed_commands
+                .iter()
+                .any(|entry| entry.contains("cargo test exited 101")),
+            "failed commands carry their failure reasons: {:?}",
+            continuity.ledger
+        );
+
+        // The seed mirrors the hook: a resume-shaped task grows the section.
+        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        assert_eq!(task.description, "continue");
+        seed_run_continuity(&mut task, &pool, session_id).await;
+        assert!(
+            task.description.contains("<run-continuity>"),
+            "the continuity section is appended: {}",
+            task.description
+        );
+        assert!(
+            task.description.contains("<last-approved-plan"),
+            "the last approved artifact re-anchors the run: {}",
+            task.description
+        );
+        assert!(
+            task.description.contains("src/lib.rs")
+                && task.description.contains("cargo test exited 101"),
+            "the ledger rides the section: {}",
+            task.description
+        );
+    }
+
+    /// A session's last plan-approved payload that fails its own artifact
+    /// hash is never trusted: the plan section is skipped (with a warn), but
+    /// the ledger still folds — continuity degrades, it does not break.
+    #[tokio::test]
+    async fn run_continuity_skips_a_plan_payload_that_fails_its_artifact_hash() {
+        use concerto_sessions::whiteboard::{append_whiteboard_event, NewWhiteboardEvent};
+        let (_dir, pool) = d7_pool().await;
+        let session_id = Ulid::new();
+
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "tampered-plan".into(),
+                agent_id: "coordinator".into(),
+                kind: concerto_sessions::whiteboard::WhiteboardKind::PlanApproved,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: Some("plan-tampered".into()),
+                causation: None,
+                payload: serde_json::json!({
+                    "plan_id": "plan-tampered",
+                    "objective_hash": "0123456789abcdef0123456789abcdef",
+                    "artifact_hash": "deadbeef",
+                    "design_doc": null,
+                    "plan_text": "# Plan\nstep 1: build continuity",
+                    "created_at_ms": 2,
+                }),
+                pre_image_hash: None,
+                created_at: 2,
+            },
+        )
+        .await
+        .expect("tampered plan-approved event");
+        append_session_event(
+            &pool,
+            session_id,
+            "write-1",
+            concerto_sessions::whiteboard::WhiteboardKind::WriteApplied,
+            serde_json::json!({ "path": "src/main.rs" }),
+        )
+        .await;
+
+        let continuity = load_run_continuity(&pool, session_id).await.expect("load");
+        assert!(continuity.plan.is_none(), "an unattested artifact is skipped, never trusted");
+        assert!(
+            continuity.ledger.files_touched.contains(&"src/main.rs".to_owned()),
+            "the ledger still folds past the skipped plan: {:?}",
+            continuity.ledger
+        );
+    }
+
+    /// A fresh session (or a pre-whiteboard log) carries nothing: the
+    /// snapshot is truthfully empty and the task is untouched.
+    #[tokio::test]
+    async fn run_continuity_empty_log_is_a_noop() {
+        let (_dir, pool) = d7_pool().await;
+        let session_id = Ulid::new();
+        let continuity = load_run_continuity(&pool, session_id).await.expect("load");
+        assert!(continuity.is_empty(), "an empty log is the truthful empty state");
+
+        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        seed_run_continuity(&mut task, &pool, session_id).await;
+        assert_eq!(
+            task.description, "continue",
+            "an empty ledger seeds nothing — the resume text is untouched"
         );
     }
 
