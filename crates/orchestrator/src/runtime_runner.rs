@@ -2273,19 +2273,26 @@ fn build_run_task(
     }
 }
 
-/// ADR-60 D7 gating (oracle comment 5): the whiteboard plan-binding path
-/// rides the same opt-in as Phase 1 — `[orchestration] supervisor_enabled` —
-/// narrowed by the `plan_binding_source` rollout switch (default
-/// `whiteboard`). With a default config everything here stays off, so every
-/// path is byte-identical to pre-D7; `legacy` keeps the exact prose behavior
-/// even when supervision itself is on.
+/// ADR-60 D7 gating (issue #19 decoupling): the whiteboard plan-binding path
+/// is gated solely by the `plan_binding_source` rollout switch (default
+/// `whiteboard`) — it no longer rides `[orchestration] supervisor_enabled`,
+/// which now governs only the supervised concurrency runtime. `legacy` keeps
+/// the exact pre-D7 prose behavior. A config without any multi-agent section
+/// (`None`) stays off: continuity is not auto-enabled when the config is
+/// missing entirely.
 fn d7_whiteboard_enabled(multi_agent: Option<&concerto_config::MultiAgentConfig>) -> bool {
     matches!(
         multi_agent,
-        Some(config)
-            if config.supervisor_enabled
-                && config.plan_binding_source == concerto_config::PlanBindingSource::Whiteboard
+        Some(config) if config.plan_binding_source == concerto_config::PlanBindingSource::Whiteboard
     )
+}
+
+/// ADR-60 Deferred 3 (issue #19 decoupling): review-cycle resumability stays a
+/// supervised-runtime feature — gated by `[orchestration] supervisor_enabled`
+/// alone and deliberately independent of the D7 `plan_binding_source` switch,
+/// which now governs only Plan→Execute state sourcing.
+fn supervisor_review_enabled(multi_agent: Option<&concerto_config::MultiAgentConfig>) -> bool {
+    multi_agent.is_some_and(|config| config.supervisor_enabled)
 }
 
 /// ADR-60 D7 (#152): append the content-addressed `plan-approved` whiteboard
@@ -2713,8 +2720,9 @@ pub async fn run_shared_agent(
     let apply_plan = matches!(plan_decision, Some(PlanDecision::Apply));
 
     // ─── ADR-60 D7 (#152): whiteboard rehydration for the approved-plan
-    // Execute. Rides the same opt-in as Phase 1 (`supervisor_enabled`) plus
-    // the `plan_binding_source` rollout switch. The verified structured
+    // Execute. Gated solely by the `plan_binding_source` rollout switch
+    // (default `whiteboard`); it no longer rides the supervisor opt-in
+    // (issue #19 decoupling). The verified structured
     // artifact + carry-forward ledger replace the rendered-plan prose; any
     // divergence from what the user approved is a LOUD failure — silent
     // re-decompose is forbidden.
@@ -3098,7 +3106,8 @@ pub async fn run_shared_agent(
 ///
 /// `intent_policy` + `gate_log_pool` are the run's own policy engine and
 /// session-DB pool; they back the ADR-60 Phase 1 supervised path's write gate
-/// when `[orchestration] supervisor_enabled` opts in. They mirror exactly what
+/// when `[orchestration] supervisor_enabled` opts in, and (under the same
+/// opt-in only) the review-cycle resumability store. They mirror exactly what
 /// the single-agent in-process gate is built from, so both gated paths enforce
 /// the same policy over the same durable log.
 #[allow(clippy::too_many_arguments)]
@@ -3723,14 +3732,16 @@ async fn run_multi_agent(
             design_doc: context.design_doc.clone(),
         });
     }
-    // ADR-60 Deferred 3: review-cycle resumability rides the same opt-in as
-    // D7 (`supervisor_enabled` + `plan_binding_source: whiteboard`) — with a
-    // default config nothing changes. The pool is the run's own session DB,
+    // ADR-60 Deferred 3 (issue #19 decoupling): review-cycle resumability
+    // stays gated behind `[orchestration] supervisor_enabled` — the supervised
+    // runtime's opt-in — and is deliberately independent of the D7
+    // `plan_binding_source` switch, which now governs only Plan→Execute state
+    // sourcing. The pool is the run's own session DB,
     // the same durable log the write gate and the plan events use. Without a
     // pool (or without the flag) review cycles degrade to pre-Phase 3
     // behavior; the missing-pool case is warned here because only this site
     // knows both facts.
-    if d7_whiteboard_enabled(services.config.multi_agent.as_ref()) {
+    if supervisor_review_enabled(services.config.multi_agent.as_ref()) {
         if gate_log_pool.is_none() {
             tracing::warn!(
                 "no session DB pool — review cycles run non-resumable \
@@ -5919,8 +5930,12 @@ mod runtime_runner_tests {
     }
 
     fn d7_binding() -> PlanBinding {
+        d7_binding_named("plan-d7")
+    }
+
+    fn d7_binding_named(plan_id: &str) -> PlanBinding {
         PlanBinding::new(
-            "plan-d7".into(),
+            plan_id.into(),
             "0123456789abcdef0123456789abcdef".into(),
             Some("abc1234".into()),
             "# Plan\nstep 1: build continuity\nstep 2: verify it".to_owned(),
@@ -6101,30 +6116,85 @@ mod runtime_runner_tests {
         }
     }
 
-    /// Rollout (oracle comment 5): with the supervisor opt-in OFF — or with
-    /// `plan_binding_source = legacy` — nothing is written and the pre-D7
-    /// prose path stays byte-identical.
+    /// Issue #19 decoupling: the whiteboard write gate follows
+    /// `plan_binding_source` alone, not the supervisor opt-in. A default
+    /// multi-agent config (supervisor off, `whiteboard` default) writes the
+    /// structured artifact; `legacy` keeps the pre-D7 prose path regardless of
+    /// the supervisor flag; a missing multi-agent config (`None`) stays off —
+    /// continuity is never auto-enabled when the config is absent. Each
+    /// negative case uses its own plan id so the positive case's committed
+    /// rows cannot mask a regression.
     #[tokio::test]
-    async fn d7_write_is_gated_behind_the_opt_in_flags() {
+    async fn d7_write_gated_by_plan_binding_source_not_supervisor() {
         let (_dir, pool) = d7_pool().await;
-        let binding = d7_binding();
 
-        // supervisor_enabled = false: no whiteboard rows at all.
+        // supervisor_enabled = false + default source = whiteboard: rows ARE
+        // written — Plan→Execute continuity is on by default.
         let off = concerto_config::MultiAgentConfig::default();
         assert!(!off.supervisor_enabled);
-        append_plan_binding_event(Some(&pool), Ulid::new(), &binding, None, Some(&off)).await;
+        assert_eq!(off.plan_binding_source, concerto_config::PlanBindingSource::Whiteboard);
+        let default_binding = d7_binding();
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &default_binding,
+            Some(&d7_design_doc()),
+            Some(&off),
+        )
+        .await;
+        let rehydrated = load_approved_plan(&pool, &default_binding).await.expect("load");
         assert!(
-            load_approved_plan(&pool, &binding).await.expect("load").is_none(),
-            "with the opt-in off, no events are recorded and reads see nothing"
+            rehydrated.is_some(),
+            "whiteboard continuity is active without the supervisor opt-in"
+        );
+        assert!(
+            rehydrated.expect("rehydrated").design_doc.is_some(),
+            "the structured DesignDoc persists alongside the binding"
         );
 
         // supervisor_enabled = true but source = legacy: still nothing.
-        let mut legacy = supervised_config();
-        legacy.plan_binding_source = concerto_config::PlanBindingSource::Legacy;
-        append_plan_binding_event(Some(&pool), Ulid::new(), &binding, None, Some(&legacy)).await;
+        let mut legacy_supervised = supervised_config();
+        legacy_supervised.plan_binding_source = concerto_config::PlanBindingSource::Legacy;
+        let legacy_binding = d7_binding_named("plan-d7-legacy-supervised");
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &legacy_binding,
+            None,
+            Some(&legacy_supervised),
+        )
+        .await;
         assert!(
-            load_approved_plan(&pool, &binding).await.expect("load").is_none(),
-            "legacy keeps the exact pre-D7 behavior"
+            load_approved_plan(&pool, &legacy_binding).await.expect("load").is_none(),
+            "legacy keeps the exact pre-D7 behavior even with supervision on"
+        );
+
+        // supervisor_enabled = false + legacy: still nothing.
+        let legacy_unsupervised = concerto_config::MultiAgentConfig {
+            plan_binding_source: concerto_config::PlanBindingSource::Legacy,
+            ..Default::default()
+        };
+        let legacy_off_binding = d7_binding_named("plan-d7-legacy-unsupervised");
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &legacy_off_binding,
+            None,
+            Some(&legacy_unsupervised),
+        )
+        .await;
+        assert!(
+            load_approved_plan(&pool, &legacy_off_binding).await.expect("load").is_none(),
+            "legacy keeps the exact pre-D7 behavior with supervision off"
+        );
+
+        // No multi-agent config at all: stays off — continuity is not
+        // auto-enabled when the config section is missing.
+        let orphan_binding = d7_binding_named("plan-d7-no-config");
+        append_plan_binding_event(Some(&pool), Ulid::new(), &orphan_binding, None, None).await;
+        assert!(
+            load_approved_plan(&pool, &orphan_binding).await.expect("load").is_none(),
+            "a missing multi-agent config does not auto-enable continuity"
         );
     }
 

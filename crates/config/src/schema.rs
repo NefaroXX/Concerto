@@ -1436,10 +1436,11 @@ pub struct MultiAgentConfig {
     #[serde(default)]
     pub supervisor_enabled: bool,
     /// ADR-60 D7 (#152): how an approved plan's Execute run sources its
-    /// state. Defaults to [`PlanBindingSource::Whiteboard`]; the whole D7
-    /// path additionally rides the `supervisor_enabled` opt-in, so production
-    /// behavior is unchanged until that flag is set. `legacy` keeps the exact
-    /// pre-D7 prose path for operators who need it during migration.
+    /// state. Defaults to [`PlanBindingSource::Whiteboard`]; D7 whiteboard
+    /// persistence is gated solely by this switch — `supervisor_enabled` only
+    /// controls the supervised concurrency runtime (issue #19 decoupling).
+    /// `legacy` keeps the exact pre-D7 prose path for operators who need it
+    /// during migration.
     #[serde(default)]
     pub plan_binding_source: PlanBindingSource,
 }
@@ -2169,7 +2170,8 @@ mod tests {
         assert_eq!(
             cfg.plan_binding_source,
             PlanBindingSource::Whiteboard,
-            "D7 rides the supervisor_enabled opt-in, so whiteboard can be the safe default"
+            "D7 is gated by plan_binding_source alone; whiteboard is a safe default \
+             independent of supervisor_enabled",
         );
 
         let json = serde_json::to_string(&MultiAgentConfig {
