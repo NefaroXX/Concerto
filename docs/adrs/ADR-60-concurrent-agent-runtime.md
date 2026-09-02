@@ -150,6 +150,14 @@ Negative / costs:
   review-cycle resumability), `787df6e` (Phase 4 consolidation and replay
   harness), `b6ce712` (heartbeat liveness anchored on the supervisor clock),
   `f75b4b7` (`PR_SET_PDEATHSIG` orphan cleanup); merged via PR #11 (`83d20cc`).
+- 2026-09-01 — v1.3, D4 fairness resolved (implementation notes below). The
+  delivered gate satisfies D4's "no chatty-agent starvation" requirement
+  structurally — per-agent in-flight isolation over a deliberately
+  non-serialized gate — so the weighted-round-robin *mechanism* named in D4
+  is superseded, not deferred: there is no cross-agent queue for it to
+  schedule, and inventing one (a global execution cap) would be a throughput
+  regression rationing a resource nobody contends for. Decision text above is
+  unchanged; the notes extend D4 the way the D3/D5/D6 notes do.
 
 ### D5 implementation notes — always-on injection & per-target claims (2026-08)
 
@@ -329,3 +337,47 @@ extend D6; the decision text above is unchanged.
   constants above), `crates/orchestrator/src/supervisor.rs` (write-path trigger,
   retrieval clamp), `crates/memory/src/vector_store.rs` (`SqliteVectorStore`
   projection target).
+
+### D4 implementation notes — gate fairness (2026-09)
+
+Closing the "weighted round-robin fairness across agents (D4)" deferral that
+the write-gate module docs carried since the vertical slice. These notes
+extend D4; the decision text above is unchanged.
+
+- **The requirement, verified against the delivered gate.** D4's fairness
+  requirement is "no chatty-agent starvation". The delivered `WriteGate`
+  satisfies it structurally: every agent owns a private FIFO in-flight
+  limiter (cap = `max_in_flight_per_agent`, 1 in production), demand beyond
+  the cap parks on the agent's *own* semaphore, agents never contend for one
+  another's permits, and tool execution runs concurrently across agents.
+  There is no cross-agent queue inside the gate, so one agent's backlog can
+  neither delay nor reorder a sibling's write. Pinned by
+  `per_agent_limiter_bounds_concurrency_but_agents_are_independent`
+  (`crates/orchestrator/src/gate.rs`): while a chatty agent holds its permit
+  with two writes parked behind it, a sibling's write completes within a
+  bounded wait and is sequenced (`gate_seq`) ahead of the parked backlog.
+- **Backpressure and caller shape.** In-flight gated ops are bounded per
+  agent (total bound: roster size × cap) and no other queue exists. The
+  wired callers add no buffering: the supervised child is a strictly
+  sequential one-request-at-a-time client (`gate_proxy.rs`), and the
+  in-process loop awaits each tool call, so each agent holds at most one
+  write in flight in practice; backpressure propagates to the agent loop
+  instead of accumulating at the gate. The supervisor's steady-state loop
+  additionally drains each agent at `MAX_EVENTS_PER_TICK` per tick —
+  per-agent fair by construction.
+- **The one cross-agent serialization point** is the whiteboard WAL append
+  (`gate_seq` assignment under SQLite's `BEGIN IMMEDIATE` write lock).
+  Appends are single short transactions; contention is bounded by the pool's
+  `busy_timeout` and surfaces as a `GateError::Whiteboard` error — never as
+  silent deferral or reordering.
+- **Why weighted round-robin is superseded, not shipped.** WRR presupposes a
+  serialized gate queue it can fairly interleave (the research brief's
+  "single-writer thread" gate). The implemented gate is deliberately
+  non-serialized: per-agent isolation plus concurrent cross-agent execution
+  was the chosen concurrency model (the module docs' "agents do not block
+  one another" contract). Scheduling WRR there would first require
+  inventing contention — a global execution cap serializing what today runs
+  concurrently — a throughput regression that rations a resource nobody
+  contends for, to fix a failure mode (cross-agent starvation) that
+  structurally cannot occur. The mechanism is therefore rejected; the
+  requirement it served is met and pinned by test.

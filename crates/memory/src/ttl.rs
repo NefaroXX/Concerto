@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::ProjectId;
-use sqlx::Row;
 use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, Row};
 
 use crate::fts::FullTextStore;
 use crate::vector_store::VectorStore;
@@ -91,7 +91,10 @@ impl TtlManager {
                AND datetime(created_at, '+' || {ttl_case} || ' days') < datetime('now')"
         );
 
-        let rows = sqlx::query(&query)
+        // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is built from static fragments
+        // and the locally computed `{ttl_case}` CASE expression; no user input is
+        // interpolated — every filter value is bound via `?`.
+        let rows = sqlx::query(AssertSqlSafe(query))
             .bind(&project_id.0)
             .fetch_all(&self.pool)
             .await

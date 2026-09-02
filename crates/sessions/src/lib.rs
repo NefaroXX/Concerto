@@ -27,7 +27,7 @@ use concerto_core::CancellationToken;
 use concerto_core::TaskId;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -1064,7 +1064,10 @@ impl SessionStore for SqliteSessionStore {
             "transcript_entries",
             "plan_bindings",
         ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE session_id = ?"))
+            // AUDITED (sqlx 0.9 `AssertSqlSafe`): `{table}` iterates the hard-coded
+            // literal allow-list above — no user input is interpolated; the session id
+            // is bound.
+            sqlx::query(AssertSqlSafe(format!("DELETE FROM {table} WHERE session_id = ?")))
                 .bind(&id_str)
                 .execute(&mut *tx)
                 .await?;

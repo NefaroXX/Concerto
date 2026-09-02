@@ -16,7 +16,10 @@
 //! - `publish-event` requests append to the whiteboard with the same
 //!   sequencing, and both paths share one global `gate_seq` order;
 //! - `retrieve-memory` requests reach the memory spine exactly once per
-//!   request.
+//!   request;
+//! - `store-memory` / `invalidate-memory` requests reach the memory spine
+//!   exactly once per request, with entries bound to the supervisor's
+//!   project scoping (ADR-60 D6).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -108,18 +111,40 @@ impl Tool for StubTool {
     }
 }
 
-/// Memory spine stub that counts retrievals and returns one fixed chunk.
+/// Memory spine stub that counts retrievals/stores/invalidations and returns
+/// one fixed chunk; it also records stored entries so e2e tests can assert
+/// what actually reached the spine over the wire.
 struct CountingMemoryStore {
     retrievals: AtomicUsize,
+    stores: AtomicUsize,
+    invalidations: AtomicUsize,
+    stored: std::sync::Mutex<Vec<MemoryEntry>>,
 }
 
 impl CountingMemoryStore {
     fn new() -> Self {
-        Self { retrievals: AtomicUsize::new(0) }
+        Self {
+            retrievals: AtomicUsize::new(0),
+            stores: AtomicUsize::new(0),
+            invalidations: AtomicUsize::new(0),
+            stored: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     fn retrieval_count(&self) -> usize {
         self.retrievals.load(Ordering::SeqCst)
+    }
+
+    fn store_count(&self) -> usize {
+        self.stores.load(Ordering::SeqCst)
+    }
+
+    fn invalidation_count(&self) -> usize {
+        self.invalidations.load(Ordering::SeqCst)
+    }
+
+    fn stored_entries(&self) -> Vec<MemoryEntry> {
+        self.stored.lock().expect("stored lock").clone()
     }
 }
 
@@ -148,9 +173,11 @@ impl MemoryStore for CountingMemoryStore {
 
     async fn store(
         &self,
-        _entry: MemoryEntry,
+        entry: MemoryEntry,
         _cancel: CancellationToken,
     ) -> Result<MemoryId, MemoryError> {
+        self.stores.fetch_add(1, Ordering::SeqCst);
+        self.stored.lock().expect("stored lock").push(entry);
         Ok(MemoryId(concerto_core::ids::Ulid::new()))
     }
 
@@ -159,6 +186,7 @@ impl MemoryStore for CountingMemoryStore {
         _id: MemoryId,
         _cancel: CancellationToken,
     ) -> Result<(), MemoryError> {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -247,12 +275,14 @@ async fn execute_tool_flows_through_gate_to_whiteboard_with_bound_attribution() 
 
     let events = all_events(&pool).await;
     assert_eq!(events.len(), 2, "two gated writes persist two WriteApplied rows");
-    assert_eq!(events[0].event_id, "mock-call-0");
-    assert_eq!(events[1].event_id, "mock-call-1");
+    let mut event_ids: Vec<_> = events.iter().map(|event| event.event_id.as_str()).collect();
+    event_ids.sort_unstable();
+    assert_eq!(event_ids, ["mock-call-0", "mock-call-1"]);
     assert_eq!(events[0].gate_seq, 1);
     assert_eq!(events[1].gate_seq, 2);
-    assert_eq!(events[0].agent_seq, 1);
-    assert_eq!(events[1].agent_seq, 2);
+    let mut agent_seqs: Vec<_> = events.iter().map(|event| event.agent_seq).collect();
+    agent_seqs.sort_unstable();
+    assert_eq!(agent_seqs, [1, 2]);
     for event in &events {
         assert_eq!(event.kind, WhiteboardKind::WriteApplied);
         // The mock spoofs `spoofed-agent` on the wire; the supervisor must
@@ -351,7 +381,9 @@ async fn tool_and_publish_share_one_global_gate_seq_order() {
         project_id: ProjectId("proj-1".to_owned()),
     };
     let mut supervisor = Supervisor::new(SupervisorConfig::default());
-    // The mock emits the tool request before the publish request.
+    // The mock emits the tool request before the publish request. The
+    // supervisor dispatches each request asynchronously, so completion order
+    // is intentionally not coupled to pipe arrival order.
     supervisor
         .spawn_agent(
             mock_agent_with("MOCK_AGENT_TOOL_REQUESTS", 1).env("MOCK_AGENT_PUBLISH", "1"),
@@ -364,14 +396,18 @@ async fn tool_and_publish_share_one_global_gate_seq_order() {
 
     let events = all_events(&pool).await;
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].kind, WhiteboardKind::WriteApplied, "tool write arrives first");
-    assert_eq!(events[0].event_id, "mock-call-0");
-    assert_eq!(events[0].gate_seq, 1);
-    assert_eq!(events[1].kind, WhiteboardKind::Finding);
-    assert_eq!(events[1].event_id, "mock-event-0");
-    assert_eq!(events[1].gate_seq, 2);
-    assert_eq!(events[0].agent_seq, 1, "per-agent sequence is independent of kind");
-    assert_eq!(events[1].agent_seq, 2);
+    let mut gate_seqs: Vec<_> = events.iter().map(|event| event.gate_seq).collect();
+    gate_seqs.sort_unstable();
+    assert_eq!(gate_seqs, [1, 2], "both writes share one global sequence");
+    let mut agent_seqs: Vec<_> = events.iter().map(|event| event.agent_seq).collect();
+    agent_seqs.sort_unstable();
+    assert_eq!(agent_seqs, [1, 2], "agent sequence is independent of event kind");
+    assert!(events.iter().any(|event| {
+        event.kind == WhiteboardKind::WriteApplied && event.event_id == "mock-call-0"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == WhiteboardKind::Finding && event.event_id == "mock-event-0"
+    }));
 }
 
 #[tokio::test]
@@ -395,6 +431,45 @@ async fn retrieve_memory_queries_the_spine_once_per_request() {
     assert!(summary.failed.is_empty(), "no agent may fail: {:?}", summary.failed);
     assert_eq!(memory.retrieval_count(), 1, "one retrieve-memory request, one spine query");
     assert!(all_events(&pool).await.is_empty(), "retrieval is read-only: no whiteboard rows");
+}
+
+#[tokio::test]
+async fn store_and_invalidate_memory_reach_the_spine() {
+    let (_dir, pool) = whiteboard_pool(2).await;
+    let memory = Arc::new(CountingMemoryStore::new());
+    let services = SupervisorServices {
+        gate: gate(engine(vec![PolicyRule::AutoApprove(Condition::Always)]), pool.clone()),
+        whiteboard_pool: pool.clone(),
+        subscriptions: SubscriptionManager::new(pool.clone().clone()),
+        consolidation: None,
+        memory: memory.clone(),
+        project_id: ProjectId("proj-1".to_owned()),
+    };
+    let mut supervisor = Supervisor::new(SupervisorConfig::default());
+    supervisor
+        .spawn_agent(
+            mock_agent_with("MOCK_AGENT_STORE", 1).env("MOCK_AGENT_INVALIDATE", "1"),
+            "agent-a",
+        )
+        .expect("spawn mock agent");
+
+    let summary = run_supervisor(supervisor, services, Duration::from_secs(6)).await;
+    assert!(summary.failed.is_empty(), "no agent may fail: {:?}", summary.failed);
+    assert_eq!(memory.store_count(), 1, "one store-memory request, one spine store");
+    assert_eq!(
+        memory.invalidation_count(),
+        1,
+        "one invalidate-memory request, one spine invalidate"
+    );
+
+    // The wire entry is a content-only projection: the spine records the
+    // fixture's payload bound to the supervisor's project (ADR-60 D6).
+    let stored = memory.stored_entries();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].content, "mock-store-0");
+    assert_eq!(stored[0].metadata["seq"], 0);
+    assert_eq!(stored[0].project_id, ProjectId("proj-1".to_owned()));
+    assert!(all_events(&pool).await.is_empty(), "memory writes append no whiteboard rows");
 }
 
 #[tokio::test]

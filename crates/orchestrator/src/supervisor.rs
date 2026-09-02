@@ -39,16 +39,22 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::{persist_gate_boundary_checkpoint, CheckpointStoreError};
 use crate::gate::{stamp_base_versions, GateError, GateRequest, WriteGate};
 use crate::ipc::{
     self, IpcError, IpcErrorCode, IpcMethod, IpcNotification, IpcParams, IpcRequest, IpcResponse,
     IpcResult, IpcTransportError, MAX_MESSAGE_BYTES,
 };
 use crate::subscriptions::SubscriptionManager;
-use concerto_core::memory::{MemoryNamespace, MemoryQuery, ProjectId};
+use concerto_core::error::MemoryError;
+use concerto_core::ids::Ulid;
+use concerto_core::memory::{MemoryId, MemoryNamespace, MemoryQuery, ProjectId};
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::CancellationToken;
-use concerto_sessions::whiteboard::{append_whiteboard_event, NewWhiteboardEvent, WhiteboardScope};
+use concerto_sessions::whiteboard::{
+    append_whiteboard_event, latest_gate_seq, NewWhiteboardEvent, WhiteboardCheckpoint,
+    WhiteboardScope,
+};
 
 /// Cap for the exponential restart backoff ([`restart_backoff`] clip).
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(60);
@@ -710,6 +716,11 @@ pub struct RunSummary {
     pub failed: Vec<String>,
     /// Metadata snapshot of every registration at shutdown time.
     pub agents: Vec<AgentMeta>,
+    /// Set when the ADR-60 D5 shutdown checkpoint could not be persisted:
+    /// the run ended without a durable resume point, and restart restore
+    /// must fall back to a full log replay. `None` on success or when no
+    /// checkpoint was due (no write-path services / empty log).
+    pub checkpoint_error: Option<String>,
 }
 
 /// Shared write-path services the steady-state loop dispatches into
@@ -755,7 +766,8 @@ impl Supervisor {
 
     /// Attach the write-path services (gate, whiteboard pool, memory spine).
     /// Until this is called, `execute-tool` / `publish-event` /
-    /// `retrieve-memory` requests are answered `Internal` "not configured".
+    /// `retrieve-memory` / `store-memory` / `invalidate-memory` requests are
+    /// answered `Internal` "not configured".
     pub fn with_services(mut self, services: SupervisorServices) -> Self {
         self.services = Some(services);
         self
@@ -1087,7 +1099,8 @@ impl Supervisor {
     ///   acknowledged; heartbeat **notifications** are recorded silently;
     /// - with write-path services attached
     ///   ([`Supervisor::with_services`]), `execute-tool` /
-    ///   `publish-event` / `retrieve-memory` **requests** are dispatched to
+    ///   `publish-event` / `retrieve-memory` / `store-memory` /
+    ///   `invalidate-memory` **requests** are dispatched to
     ///   the tokio task pool; the handler's reply is routed back through the
     ///   agent's reply channel and written on a later tick. Without
     ///   services they are answered `Internal` "not configured";
@@ -1106,7 +1119,11 @@ impl Supervisor {
     /// moment the loop stops driving), then every healthy agent is stopped
     /// gracefully ([`Supervisor::stop_agent`], which removes the
     /// registration); agents that failed during the run are left registered
-    /// in their [`AgentState::Failed`] state for inspection.
+    /// in their [`AgentState::Failed`] state for inspection. Finally the
+    /// ADR-60 D5 shutdown checkpoint is persisted at the log head
+    /// ([`Supervisor::checkpoint_at_shutdown`]); a failure is logged at
+    /// `error!` and surfaced as [`RunSummary::checkpoint_error`] without
+    /// blocking teardown.
     ///
     /// `summary.failed` lists the agents that gave up during the run (restart
     /// budget [`SupervisorConfig::max_restarts`] exhausted, or an
@@ -1207,6 +1224,18 @@ impl Supervisor {
                                             IpcParams::RetrieveMemory { query, limit, .. } => {
                                                 handle_retrieve_memory(
                                                     &services, &agent_id, query, limit, id, &cancel,
+                                                )
+                                                .await
+                                            }
+                                            IpcParams::StoreMemory { entry } => {
+                                                handle_store_memory(
+                                                    &services, &agent_id, entry, id, &cancel,
+                                                )
+                                                .await
+                                            }
+                                            IpcParams::InvalidateMemory { memory_id } => {
+                                                handle_invalidate_memory(
+                                                    &services, &agent_id, memory_id, id, &cancel,
                                                 )
                                                 .await
                                             }
@@ -1391,7 +1420,8 @@ impl Supervisor {
             }
         }
         failed.extend(shutdown_failed);
-        let summary = RunSummary { failed: failed.clone(), agents: self.agents() };
+        let mut summary =
+            RunSummary { failed: failed.clone(), agents: self.agents(), checkpoint_error: None };
         for agent_id in self.agents.keys().map(Clone::clone).collect::<Vec<_>>() {
             if failed.contains(&agent_id) {
                 continue;
@@ -1402,6 +1432,29 @@ impl Supervisor {
                 continue;
             }
             let _ = self.stop_agent(&agent_id);
+        }
+        // ADR-60 D5 (i): after every agent has been stopped (so the cut is the
+        // final write state, modulo harmless stragglers — see
+        // `checkpoint_at_shutdown`), persist the resume point. Failure is
+        // loud but never blocks teardown: the run still ends, and the reason
+        // is surfaced in the summary for the caller to escalate.
+        match checkpoint_services(self.services.clone()).await {
+            Ok(Some(record)) => {
+                tracing::info!(
+                    gate_seq = record.gate_seq,
+                    checkpoint_id = %record.id,
+                    "supervisor: shutdown checkpoint persisted (ADR-60 D5)"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "supervisor: shutdown checkpoint NOT persisted (ADR-60 D5); \
+                     restart restore must fall back to a full log replay"
+                );
+                summary.checkpoint_error = Some(error.to_string());
+            }
         }
         summary
     }
@@ -1414,6 +1467,64 @@ impl Supervisor {
             process.meta.failed_at_ms = Some(unix_ms());
         }
     }
+
+    /// ADR-60 D5 (i): persist the gate-boundary checkpoint at the current log
+    /// head — the graceful-shutdown resume point.
+    ///
+    /// Materializes the projected file state of every applied write up to the
+    /// log head ([`WriteGate::create_checkpoint`], the consistent cut
+    /// "everything ≤ head") and stores it in the sessions
+    /// `whiteboard_checkpoints` table, pinned to the cut's `gate_seq`. After a
+    /// restart, restore is snapshot + tail replay
+    /// ([`GateBoundaryCheckpoint::replay_tail_excluding`]).
+    ///
+    /// Semantics:
+    /// - no write-path services attached → `Ok(None)` (the gate is the only
+    ///   thing worth checkpointing; nothing is due);
+    /// - an empty log (head 0) → `Ok(None)` — nothing has ever been written,
+    ///   so no resume point exists to store;
+    /// - a write that lands *after* the cut is safe by construction: any cut
+    ///   is a valid checkpoint under snapshot + tail-replay semantics, so a
+    ///   straggling in-flight handler cannot corrupt the restore model;
+    /// - no `CancellationToken` is threaded: this runs once from the teardown
+    ///   path, after the shutdown token has already fired, and is a single
+    ///   bounded SQLite write (same posture as the sync teardown helpers). It
+    ///   never gates teardown — callers must treat failure as report-and-
+    ///   continue, not as a teardown blocker.
+    ///
+    /// Restart restore (D5) is deliberately **not** auto-performed on
+    /// `Supervisor::new`: materializing the projected file state to disk is a
+    /// gated write and needs a project-root + policy decision the supervisor's
+    /// construction path does not carry. The read side is exposed as
+    /// [`crate::checkpoint::load_gate_boundary_checkpoint`]; see the module
+    /// documentation for the remaining gap.
+    pub async fn checkpoint_at_shutdown(
+        &self,
+    ) -> Result<Option<WhiteboardCheckpoint>, CheckpointStoreError> {
+        checkpoint_services(self.services.clone()).await
+    }
+}
+
+/// The ADR-60 D5 shutdown-checkpoint body, over `SupervisorServices` **by
+/// value**: no `&Supervisor` borrow ever crosses an await point, so the
+/// `run_until` future stays `Send` (`Supervisor` is `Send` but deliberately
+/// not `Sync` — its per-agent std::mpsc receivers are not). Callers that
+/// [`tokio::spawn`] the supervisor's own loop must keep using this path.
+async fn checkpoint_services(
+    services: Option<SupervisorServices>,
+) -> Result<Option<WhiteboardCheckpoint>, CheckpointStoreError> {
+    let Some(services) = services else {
+        return Ok(None);
+    };
+    if latest_gate_seq(&services.whiteboard_pool).await? == 0 {
+        return Ok(None);
+    }
+    let cut = services
+        .gate
+        .create_checkpoint(None)
+        .await
+        .map_err(|error| CheckpointStoreError::Gate(error.to_string()))?;
+    persist_gate_boundary_checkpoint(&services.whiteboard_pool, &cut).await.map(Some)
 }
 
 impl Drop for Supervisor {
@@ -1532,7 +1643,8 @@ enum Dispatch {
 /// Heartbeat requests are recorded and acknowledged (`accepted` reflects
 /// [`AgentMeta::record_heartbeat`]); a heartbeat with malformed params is
 /// answered `InvalidParams`. The write-path methods (`ExecuteTool` /
-/// `PublishEvent` / `RetrieveMemory`) are dispatched to the async task pool
+/// `PublishEvent` / `RetrieveMemory` / `StoreMemory` / `InvalidateMemory`)
+/// are dispatched to the async task pool
 /// when `services` are attached and answered `Internal` "not configured"
 /// otherwise — the fail-closed posture until the supervisor is wired. A
 /// second handshake is ignored. Heartbeat notifications are recorded
@@ -1568,6 +1680,8 @@ fn dispatch_agent_line(
             IpcMethod::ExecuteTool
             | IpcMethod::PublishEvent
             | IpcMethod::RetrieveMemory
+            | IpcMethod::StoreMemory
+            | IpcMethod::InvalidateMemory
             | IpcMethod::ListTools
             | IpcMethod::AckWhiteboard => match services {
                 Some(_) => Dispatch::Async { id: request.id, params: Box::new(request.params) },
@@ -1766,6 +1880,68 @@ async fn handle_retrieve_memory(
             IpcError::new(IpcErrorCode::Internal, format!("memory retrieval failed: {error}")),
         ),
     }
+}
+
+/// Persist a memory write at the spine (ADR-60 D6). The wire entry carries
+/// content/metadata/lifetime only: the spine-assigned id is echoed in the
+/// reply and project scoping is bound to the supervisor's project exactly
+/// like `retrieve-memory` — the wire agent id and any agent-side identity are
+/// never trusted.
+async fn handle_store_memory(
+    services: &SupervisorServices,
+    _agent_id: &str,
+    entry: ipc::MemoryEntryWire,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Box<IpcResponse> {
+    match entry.into_entry(services.project_id.clone()) {
+        Ok(entry) => match services.memory.store(entry, cancel.clone()).await {
+            Ok(memory_id) => {
+                reply_ok(id, IpcResult::StoreMemory { memory_id: memory_id.to_string() })
+            }
+            Err(error) => reply_error_full(id, memory_spine_error("memory store failed", error)),
+        },
+        Err(message) => reply_error(id, IpcErrorCode::InvalidParams, message),
+    }
+}
+
+/// Invalidate one memory entry at the spine (ADR-60 D6). The wire id is
+/// parsed supervisor-side (a malformed ULID is `InvalidParams`); a
+/// well-formed id unknown to the spine surfaces the store's own error, so a
+/// retried invalidation stays loud instead of pretending success.
+async fn handle_invalidate_memory(
+    services: &SupervisorServices,
+    _agent_id: &str,
+    memory_id: String,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Box<IpcResponse> {
+    let ulid = match Ulid::from_string(&memory_id) {
+        Ok(ulid) => ulid,
+        Err(_) => {
+            return reply_error(
+                id,
+                IpcErrorCode::InvalidParams,
+                format!("invalid memory id: {memory_id}"),
+            )
+        }
+    };
+    match services.memory.invalidate(MemoryId(ulid), cancel.clone()).await {
+        Ok(()) => reply_ok(id, IpcResult::InvalidateMemory { memory_id }),
+        Err(error) => reply_error_full(id, memory_spine_error("memory invalidation failed", error)),
+    }
+}
+
+/// Map a memory-spine failure onto the wire. Cancellation keeps its own code
+/// so an agent can distinguish "shutdown raced the write" from a spine fault;
+/// every other failure is `Internal` carrying the store's message.
+fn memory_spine_error(context: &str, error: MemoryError) -> IpcError {
+    let code = if matches!(error, MemoryError::Cancelled) {
+        IpcErrorCode::Cancelled
+    } else {
+        IpcErrorCode::Internal
+    };
+    IpcError::new(code, format!("{context}: {error}"))
 }
 
 /// Write one reply line to an agent's stdin; failures are logged — the
@@ -2099,6 +2275,7 @@ mod run_loop_tests {
 #[cfg(test)]
 mod write_path_tests {
     use super::*;
+    use crate::checkpoint::load_gate_boundary_checkpoint;
     use crate::gate::{stamp_base_versions, FilePreImageReader};
     use async_trait::async_trait;
     use concerto_core::error::{MemoryError, PolicyError};
@@ -2109,8 +2286,8 @@ mod write_path_tests {
     use concerto_core::traits::policy::AuditLog;
     use concerto_core::types::{Condition, PolicyRule, ToolRegistry};
     use concerto_sessions::whiteboard::{
-        load_whiteboard_events, load_whiteboard_subscription, WhiteboardEvent, WhiteboardKind,
-        WhiteboardLoadOpts, WhiteboardScope,
+        list_whiteboard_checkpoints, load_whiteboard_events, load_whiteboard_subscription,
+        WhiteboardEvent, WhiteboardKind, WhiteboardLoadOpts, WhiteboardScope,
     };
     use concerto_tools::filesystem::FilesystemTool;
     use serde_json::json;
@@ -2579,5 +2756,402 @@ mod write_path_tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-60 D6 memory write path: `store-memory` / `invalidate-memory`
+    // handlers bound to the configured MemoryStore.
+    // ---------------------------------------------------------------------
+
+    use crate::ipc::MemoryEntryWire;
+    use concerto_core::memory::{ChunkType, MemoryNamespace};
+
+    /// Unwrap a sync reply; panics if the dispatch was async or silent.
+    fn reply_of(dispatch: Dispatch) -> IpcResponse {
+        match dispatch {
+            Dispatch::Reply(reply) => *reply,
+            other => panic!("expected a sync reply, got {other:?}"),
+        }
+    }
+
+    /// The fixed spine-assigned id `RecordingMemoryStore` returns, so the
+    /// echoed reply can be asserted byte-for-byte.
+    const SPINE_ASSIGNED_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    /// Memory spine stub recording every `store`/`invalidate` the handlers
+    /// forward, so tests can assert the exact entry (scoping included) and
+    /// id that reached the store.
+    struct RecordingMemoryStore {
+        stored: std::sync::Mutex<Vec<MemoryEntry>>,
+        invalidated: std::sync::Mutex<Vec<MemoryId>>,
+    }
+
+    impl RecordingMemoryStore {
+        fn new() -> Self {
+            Self {
+                stored: std::sync::Mutex::new(Vec::new()),
+                invalidated: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn stored(&self) -> Vec<MemoryEntry> {
+            self.stored.lock().expect("stored lock").clone()
+        }
+
+        fn invalidated(&self) -> Vec<MemoryId> {
+            self.invalidated.lock().expect("invalidated lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl MemoryStore for RecordingMemoryStore {
+        async fn retrieve(
+            &self,
+            _query: &MemoryQuery,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<MemoryChunk>, MemoryError> {
+            Ok(Vec::new())
+        }
+        async fn store(
+            &self,
+            entry: MemoryEntry,
+            _cancel: CancellationToken,
+        ) -> Result<MemoryId, MemoryError> {
+            self.stored.lock().expect("stored lock").push(entry);
+            Ok(MemoryId(Ulid::from_string(SPINE_ASSIGNED_ID).expect("fixed test ulid parses")))
+        }
+        async fn invalidate(
+            &self,
+            id: MemoryId,
+            _cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            self.invalidated.lock().expect("invalidated lock").push(id);
+            Ok(())
+        }
+    }
+
+    /// Memory spine stub that honors cancellation: a cancelled token makes
+    /// `store` fail with `MemoryError::Cancelled` the way real stores do.
+    struct CancelAwareStore;
+
+    #[async_trait]
+    impl MemoryStore for CancelAwareStore {
+        async fn retrieve(
+            &self,
+            _query: &MemoryQuery,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<MemoryChunk>, MemoryError> {
+            Ok(Vec::new())
+        }
+        async fn store(
+            &self,
+            _entry: MemoryEntry,
+            cancel: CancellationToken,
+        ) -> Result<MemoryId, MemoryError> {
+            if cancel.is_cancelled() {
+                return Err(MemoryError::Cancelled);
+            }
+            Ok(MemoryId(ulid::Ulid::new()))
+        }
+        async fn invalidate(
+            &self,
+            _id: MemoryId,
+            _cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+
+    fn wire_entry() -> MemoryEntryWire {
+        MemoryEntryWire {
+            content: "agents own their writes".to_owned(),
+            chunk_type: ChunkType::Fact,
+            model_id: Some("mock-model".to_owned()),
+            model_version: Some("2".to_owned()),
+            metadata: serde_json::json!({ "origin": "agent-a" }),
+            expires_at_ms: Some(1_800_000_000_000),
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn recording_services(
+        pool: sqlx::SqlitePool,
+        root: PathBuf,
+    ) -> (SupervisorServices, Arc<RecordingMemoryStore>) {
+        let memory = Arc::new(RecordingMemoryStore::new());
+        let services = SupervisorServices {
+            gate: fs_gate(pool.clone(), root),
+            whiteboard_pool: pool.clone(),
+            memory: memory.clone(),
+            project_id: ProjectId("proj-store-test".to_owned()),
+            subscriptions: SubscriptionManager::new(pool),
+            consolidation: None,
+        };
+        (services, memory)
+    }
+
+    #[tokio::test]
+    async fn handle_store_memory_binds_scoping_and_echoes_the_spine_id() {
+        let (_pool_dir, pool) = test_pool().await;
+        let (services, memory) = recording_services(pool, std::env::temp_dir());
+        let response =
+            handle_store_memory(&services, "agent-a", wire_entry(), 1, &CancellationToken::new())
+                .await;
+        assert!(response.error.is_none(), "store-memory succeeds: {:?}", response.error);
+        assert_eq!(
+            response.result,
+            Some(IpcResult::StoreMemory { memory_id: SPINE_ASSIGNED_ID.to_owned() }),
+            "the reply carries the spine-assigned id"
+        );
+
+        let stored = memory.stored();
+        assert_eq!(stored.len(), 1, "exactly one entry reached the spine");
+        let entry = &stored[0];
+        assert_eq!(entry.content, "agents own their writes");
+        assert_eq!(entry.chunk_type, ChunkType::Fact);
+        assert_eq!(entry.model_id.as_deref(), Some("mock-model"));
+        assert_eq!(entry.metadata["origin"], "agent-a");
+        assert_eq!(crate::ipc::MemoryEntryWire::unix_ms(entry.created_at), 1_700_000_000_000);
+        assert_eq!(
+            entry.expires_at.map(crate::ipc::MemoryEntryWire::unix_ms),
+            Some(1_800_000_000_000)
+        );
+        // Scoping is bound supervisor-side; the wire never carries identity.
+        assert_eq!(entry.project_id, ProjectId("proj-store-test".to_owned()));
+        assert_eq!(
+            entry.namespace,
+            MemoryNamespace::Project(ProjectId("proj-store-test".to_owned()))
+        );
+        assert!(memory.invalidated().is_empty(), "a store request must not invalidate anything");
+    }
+
+    #[tokio::test]
+    async fn handle_invalidate_memory_forwards_the_parsed_id() {
+        let (_pool_dir, pool) = test_pool().await;
+        let (services, memory) = recording_services(pool, std::env::temp_dir());
+        let response = handle_invalidate_memory(
+            &services,
+            "agent-a",
+            SPINE_ASSIGNED_ID.to_owned(),
+            2,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(response.error.is_none(), "invalidate succeeds: {:?}", response.error);
+        assert_eq!(
+            response.result,
+            Some(IpcResult::InvalidateMemory { memory_id: SPINE_ASSIGNED_ID.to_owned() }),
+            "the reply echoes the invalidated id"
+        );
+        assert_eq!(
+            memory.invalidated(),
+            vec![MemoryId(Ulid::from_string(SPINE_ASSIGNED_ID).expect("fixed test ulid parses"))],
+            "the parsed ULID reached the spine"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_invalidate_memory_rejects_malformed_ids() {
+        let (_pool_dir, pool) = test_pool().await;
+        let (services, memory) = recording_services(pool, std::env::temp_dir());
+        let response = handle_invalidate_memory(
+            &services,
+            "agent-a",
+            "not-a-ulid".to_owned(),
+            3,
+            &CancellationToken::new(),
+        )
+        .await;
+        let error = response.error.as_ref().expect("malformed id refused");
+        assert_eq!(error.code, IpcErrorCode::InvalidParams);
+        assert!(memory.invalidated().is_empty(), "nothing reached the spine");
+    }
+
+    #[tokio::test]
+    async fn handle_store_memory_rejects_malformed_timestamps() {
+        let (_pool_dir, pool) = test_pool().await;
+        let (services, memory) = recording_services(pool, std::env::temp_dir());
+        let mut entry = wire_entry();
+        entry.created_at_ms = i64::MAX;
+        let response =
+            handle_store_memory(&services, "agent-a", entry, 4, &CancellationToken::new()).await;
+        let error = response.error.as_ref().expect("malformed timestamp refused");
+        assert_eq!(error.code, IpcErrorCode::InvalidParams);
+        assert!(memory.stored().is_empty(), "nothing reached the spine");
+    }
+
+    #[tokio::test]
+    async fn cancelled_store_surfaces_the_cancelled_wire_code() {
+        let (_pool_dir, pool) = test_pool().await;
+        let services = SupervisorServices {
+            gate: fs_gate(pool.clone(), std::env::temp_dir()),
+            whiteboard_pool: pool.clone(),
+            memory: Arc::new(CancelAwareStore),
+            project_id: ProjectId("proj-store-test".to_owned()),
+            subscriptions: SubscriptionManager::new(pool),
+            consolidation: None,
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let response = handle_store_memory(&services, "agent-a", wire_entry(), 5, &cancel).await;
+        let error = response.error.as_ref().expect("cancelled store fails");
+        assert_eq!(
+            error.code,
+            IpcErrorCode::Cancelled,
+            "an agent can distinguish shutdown-raced writes from spine faults"
+        );
+    }
+
+    #[test]
+    fn memory_spine_error_maps_cancelled_and_internal() {
+        let cancelled = memory_spine_error("ctx", MemoryError::Cancelled);
+        assert_eq!(cancelled.code, IpcErrorCode::Cancelled);
+        let missing = memory_spine_error("ctx", MemoryError::NotFound("gone".to_owned()));
+        assert_eq!(missing.code, IpcErrorCode::Internal);
+        assert!(missing.message.contains("gone"));
+    }
+
+    #[tokio::test]
+    async fn memory_write_requests_dispatch_to_the_async_pool() {
+        let (_pool_dir, pool) = test_pool().await;
+        let (services, _memory) = recording_services(pool, std::env::temp_dir());
+        let mut meta = AgentMeta::new("agent-a");
+        for method in [IpcMethod::StoreMemory, IpcMethod::InvalidateMemory] {
+            let text = serde_json::to_string(&IpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: 11,
+                method,
+                params: match method {
+                    IpcMethod::StoreMemory => IpcParams::StoreMemory { entry: wire_entry() },
+                    _ => IpcParams::InvalidateMemory { memory_id: SPINE_ASSIGNED_ID.to_owned() },
+                },
+            })
+            .expect("serialize request");
+            let dispatch = dispatch_agent_line(&mut meta, &text, 1_000, Some(&services));
+            assert!(
+                matches!(dispatch, Dispatch::Async { id: 11, .. }),
+                "{method:?} must ride the async pool when services are attached"
+            );
+            // Without services the fail-closed posture holds.
+            let dispatch = dispatch_agent_line(&mut meta, &text, 1_000, None);
+            let reply = reply_of(dispatch);
+            assert_eq!(reply.id, 11);
+            assert_eq!(
+                reply.error.map(|error| error.code),
+                Some(IpcErrorCode::Internal),
+                "{method:?} is answered Internal without services"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-60 D5: shutdown checkpoint wiring.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn checkpoint_at_shutdown_without_services_is_a_no_op() {
+        let supervisor = Supervisor::new(SupervisorConfig::default());
+        let result = supervisor.checkpoint_at_shutdown().await;
+        assert!(matches!(result, Ok(None)), "no services: nothing to checkpoint, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_at_shutdown_persists_the_head_cut_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool().await;
+        let services = services(pool.clone(), root.clone());
+        let cancel = CancellationToken::new();
+
+        // Deterministic log content: one applied write through the gate.
+        let response =
+            handle_execute_tool(&services, "agent-a", fs_write("cp-1", "f.txt", "new"), 1, &cancel)
+                .await;
+        assert!(response.error.is_none(), "seed write applies: {:?}", response.error);
+
+        let supervisor =
+            Supervisor::new(SupervisorConfig::default()).with_services(services.clone());
+        let record = supervisor
+            .checkpoint_at_shutdown()
+            .await
+            .expect("checkpoint persists")
+            .expect("a non-empty log produces a checkpoint");
+        let head = latest_gate_seq(&pool).await.expect("head");
+        assert!(record.gate_seq <= head, "the cut is never ahead of the log");
+
+        // Read side round-trips to the same projected file state the gate
+        // materializes at the same cut.
+        let (_, loaded) = load_gate_boundary_checkpoint(&pool, i64::MAX as u64)
+            .await
+            .expect("load")
+            .expect("latest checkpoint is found");
+        let fresh = services.gate.create_checkpoint(None).await.expect("fresh cut");
+        assert_eq!(loaded, fresh, "persisted snapshot == gate cut at the head");
+        assert_eq!(loaded.files.get("f.txt").map(String::as_str), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_at_shutdown_skips_an_empty_log() {
+        let (_pool_dir, pool) = test_pool().await;
+        let supervisor = Supervisor::new(SupervisorConfig::default())
+            .with_services(services(pool.clone(), std::env::temp_dir()));
+        assert!(
+            supervisor.checkpoint_at_shutdown().await.expect("succeeds").is_none(),
+            "nothing has ever been written: no resume point to store"
+        );
+        assert!(
+            list_whiteboard_checkpoints(&pool).await.expect("list").is_empty(),
+            "an empty log persists no checkpoint row"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_persists_the_shutdown_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool().await;
+        let services = services(pool.clone(), root.clone());
+        let cancel = CancellationToken::new();
+        // Make the log non-empty so a checkpoint is due.
+        let response =
+            handle_execute_tool(&services, "agent-a", fs_write("cp-2", "g.txt", "v"), 1, &cancel)
+                .await;
+        assert!(response.error.is_none(), "seed write applies: {:?}", response.error);
+
+        // Zero-agent run: the completion predicate exits on the first tick and
+        // exercises exactly the shutdown wiring (drain → stop pass → checkpoint).
+        let mut supervisor = Supervisor::new(SupervisorConfig::default()).with_services(services);
+        let summary = supervisor.run_until(CancellationToken::new(), |_| true).await;
+        assert!(summary.checkpoint_error.is_none(), "no checkpoint failure: {:?}", summary);
+        let checkpoints = list_whiteboard_checkpoints(&pool).await.expect("list");
+        assert_eq!(checkpoints.len(), 1, "exactly one shutdown checkpoint row");
+        let (_, loaded) = load_gate_boundary_checkpoint(&pool, i64::MAX as u64)
+            .await
+            .expect("load")
+            .expect("row round-trips");
+        assert_eq!(loaded.files.get("g.txt").map(String::as_str), Some("v"));
+    }
+
+    #[tokio::test]
+    async fn run_until_surfaces_a_loud_checkpoint_failure_without_blocking_teardown() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool().await;
+        let services = services(pool.clone(), root.clone());
+        let cancel = CancellationToken::new();
+        let response =
+            handle_execute_tool(&services, "agent-a", fs_write("cp-3", "h.txt", "v"), 1, &cancel)
+                .await;
+        assert!(response.error.is_none(), "seed write applies: {:?}", response.error);
+        // Deterministic failure injection: the store is gone, so the
+        // checkpoint cannot persist. Teardown must still complete and the
+        // failure must be surfaced in the summary (fail loudly, not fatally).
+        pool.close().await;
+        let mut supervisor = Supervisor::new(SupervisorConfig::default()).with_services(services);
+        let summary = supervisor.run_until(CancellationToken::new(), |_| true).await;
+        assert!(
+            summary.checkpoint_error.is_some(),
+            "a failed shutdown checkpoint is surfaced loudly"
+        );
     }
 }

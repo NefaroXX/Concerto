@@ -55,6 +55,12 @@
 //! - `MOCK_AGENT_RETRIEVE=N` — after the handshake reply, emit N
 //!   `retrieve-memory` requests (wire ids `300..`, query
 //!   `supervisor memory query`, limit 3). Default: none.
+//! - `MOCK_AGENT_STORE=N` — after the handshake reply, emit N `store-memory`
+//!   requests (wire ids `500..`, content `mock-store-N`, kind `fact`,
+//!   no expiry). Default: none.
+//! - `MOCK_AGENT_INVALIDATE=N` — after the handshake reply, emit N
+//!   `invalidate-memory` requests (wire ids `600..`, a freshly generated
+//!   ULID each). Default: none.
 //!
 //! ### Whiteboard-slice consumption (ADR-60 D3 crash-window tests)
 //!
@@ -72,7 +78,8 @@
 //!   crashing again.
 //!
 //! Outbound emission order is deterministic: heartbeats, then tool requests,
-//! then publishes, then retrieves — all in one burst after the handshake.
+//! then publishes, then retrieves, then stores, then invalidates — all in one
+//! burst after the handshake.
 //!
 //! Every outbound frame is written synchronously and flushed before the
 //! helper returns (blocking stdio, mirroring the supervisor's parent-side
@@ -84,10 +91,12 @@
 use std::io::Write as IoWrite;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use concerto_core::ids::Ulid;
+use concerto_core::memory::ChunkType;
 use concerto_orchestrator::gate::GateRequest;
 use concerto_orchestrator::ipc::{
     self, IpcError, IpcErrorCode, IpcMethod, IpcNotification, IpcParams, IpcRequest, IpcResponse,
-    IpcResult, IpcTransportError, MAX_MESSAGE_BYTES,
+    IpcResult, IpcTransportError, MemoryEntryWire, MAX_MESSAGE_BYTES,
 };
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use serde_json::{json, Value};
@@ -126,6 +135,8 @@ async fn run() -> i32 {
     let tool_requests = knob("MOCK_AGENT_TOOL_REQUESTS");
     let publishes = knob("MOCK_AGENT_PUBLISH");
     let retrieves = knob("MOCK_AGENT_RETRIEVE");
+    let stores = knob("MOCK_AGENT_STORE");
+    let invalidates = knob("MOCK_AGENT_INVALIDATE");
     // When set, every JSON line received on stdin is appended (re-serialized)
     // to this file. Test observability only: lets a supervisor e2e assert
     // exactly what the supervisor wrote on the wire (e.g. `whiteboard-slice`
@@ -260,6 +271,8 @@ async fn run() -> i32 {
                                     tool_requests,
                                     publishes,
                                     retrieves,
+                                    stores,
+                                    invalidates,
                                 ) {
                                     return code;
                                 }
@@ -315,10 +328,12 @@ async fn exit_before_dropping() {
 
 /// Emit the configured outbound traffic after the handshake reply, in
 /// deterministic order: heartbeat notifications, then `execute-tool`
-/// requests (ids `100..`), `publish-event` requests (`200..`), and
-/// `retrieve-memory` requests (`300..`).
+/// requests (ids `100..`), `publish-event` requests (`200..`),
+/// `retrieve-memory` requests (`300..`), `store-memory` requests (`500..`),
+/// and `invalidate-memory` requests (`600..`).
 ///
 /// Mirrors `write_reply`'s error contract: `Some(exit_code)` on failure.
+#[allow(clippy::too_many_arguments)]
 fn write_outbound<W>(
     writer: &mut W,
     agent_id: &str,
@@ -326,6 +341,8 @@ fn write_outbound<W>(
     tools: u64,
     publishes: u64,
     retrieves: u64,
+    stores: u64,
+    invalidates: u64,
 ) -> Option<i32>
 where
     W: IoWrite,
@@ -417,6 +434,46 @@ where
                 agent_id: SPOOFED_AGENT_ID.to_owned(),
                 limit: 3,
             },
+        };
+        let Some(value) = to_value(&request) else {
+            return Some(1);
+        };
+        if let Some(code) = write_json(writer, &value) {
+            return Some(code);
+        }
+    }
+    for index in 0..stores {
+        let request = IpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: 500 + index,
+            method: IpcMethod::StoreMemory,
+            params: IpcParams::StoreMemory {
+                // Content-only projection: the supervisor assigns the entry
+                // id and binds project scoping at the spine (ADR-60 D6).
+                entry: MemoryEntryWire {
+                    content: format!("mock-store-{index}"),
+                    chunk_type: ChunkType::Fact,
+                    model_id: None,
+                    model_version: None,
+                    metadata: json!({ "seq": index }),
+                    expires_at_ms: None,
+                    created_at_ms: now_millis(),
+                },
+            },
+        };
+        let Some(value) = to_value(&request) else {
+            return Some(1);
+        };
+        if let Some(code) = write_json(writer, &value) {
+            return Some(code);
+        }
+    }
+    for index in 0..invalidates {
+        let request = IpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: 600 + index,
+            method: IpcMethod::InvalidateMemory,
+            params: IpcParams::InvalidateMemory { memory_id: Ulid::new().to_string() },
         };
         let Some(value) = to_value(&request) else {
             return Some(1);
@@ -668,6 +725,78 @@ mod tests {
         let error = response.error.expect("unsupported method errors");
         assert_eq!(error.code, IpcErrorCode::MethodNotFound);
         assert_eq!(error.message, "mock agent: unsupported method");
+    }
+
+    #[test]
+    fn memory_write_requests_get_method_not_found() {
+        // `store-memory` / `invalidate-memory` are supervisor-side methods;
+        // this agent-side fixture rejects both loudly (same contract as the
+        // other unsupported supervisor methods).
+        let store = request_value(
+            9,
+            IpcMethod::StoreMemory,
+            IpcParams::StoreMemory {
+                entry: MemoryEntryWire {
+                    content: "mock".to_owned(),
+                    chunk_type: ChunkType::Fact,
+                    model_id: None,
+                    model_version: None,
+                    metadata: json!({}),
+                    expires_at_ms: None,
+                    created_at_ms: 1_700_000_000_000,
+                },
+            },
+        );
+        let response = handle_message(store).expect("store-memory must get a reply");
+        assert_eq!(response.id, 9);
+        assert_eq!(
+            response.error.expect("store-memory rejected").code,
+            IpcErrorCode::MethodNotFound
+        );
+
+        let invalidate = request_value(
+            10,
+            IpcMethod::InvalidateMemory,
+            IpcParams::InvalidateMemory { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned() },
+        );
+        let response = handle_message(invalidate).expect("invalidate-memory must get a reply");
+        assert_eq!(response.id, 10);
+        assert_eq!(
+            response.error.expect("invalidate-memory rejected").code,
+            IpcErrorCode::MethodNotFound
+        );
+    }
+
+    /// The `MOCK_AGENT_STORE` / `MOCK_AGENT_INVALIDATE` knobs emit the memory
+    /// write-path requests in the documented id bands (`500..` / `600..`)
+    /// with the correct wire shapes.
+    #[test]
+    fn outbound_emits_store_and_invalidate_requests() {
+        let mut wire: Vec<u8> = Vec::new();
+        let result = write_outbound(&mut wire, "agent-a", 0, 0, 0, 0, 2, 1);
+        assert!(result.is_none(), "emission must succeed");
+        let lines: Vec<Value> = String::from_utf8(wire)
+            .expect("frames are utf-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each frame parses"))
+            .collect();
+        assert_eq!(lines.len(), 3, "two stores then one invalidate");
+
+        for (index, value) in lines[..2].iter().enumerate() {
+            assert_eq!(value["id"], json!(500 + index as u64));
+            assert_eq!(value["method"], json!("store-memory"));
+            let entry = &value["params"]["value"]["entry"];
+            assert_eq!(entry["content"], json!(format!("mock-store-{index}")));
+            assert_eq!(entry["chunk_type"], json!("Fact"));
+            assert_eq!(entry["expires_at_ms"], json!(null), "no expiry by default");
+            assert!(entry["created_at_ms"].as_i64().is_some(), "creation time is millis");
+        }
+        assert_eq!(lines[2]["id"], json!(600));
+        assert_eq!(lines[2]["method"], json!("invalidate-memory"));
+        assert!(
+            lines[2]["params"]["value"]["memory_id"].is_string(),
+            "invalidate carries a ULID string"
+        );
     }
 
     #[test]

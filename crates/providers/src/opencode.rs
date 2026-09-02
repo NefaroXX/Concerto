@@ -375,6 +375,56 @@ struct AnthropicStreamState {
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
 }
 
+struct ResponsesStreamState {
+    parser: BufferedSseParser,
+    pending: VecDeque<Result<CompletionChunk, ProviderError>>,
+}
+
+impl ResponsesStreamState {
+    fn new() -> Self {
+        Self { parser: BufferedSseParser::new(), pending: VecDeque::new() }
+    }
+
+    fn handle_event(&mut self, event: crate::sse::SseEvent) {
+        if event.keepalive {
+            self.pending.push_back(Ok(CompletionChunk {
+                reasoning: None,
+                delta: String::new(),
+                tool_call: None,
+                is_final: false,
+                usage: None,
+            }));
+            return;
+        }
+
+        let Some(data) = event.data else { return };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&data) else { return };
+        match event.event.as_deref().unwrap_or("") {
+            "response.output_text.delta" => {
+                if let Some(delta) = data.get("delta").and_then(serde_json::Value::as_str) {
+                    self.pending.push_back(Ok(CompletionChunk {
+                        reasoning: None,
+                        delta: delta.to_owned(),
+                        tool_call: None,
+                        is_final: false,
+                        usage: None,
+                    }));
+                }
+            }
+            "response.completed" | "response.done" => {
+                self.pending.push_back(Ok(CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: None,
+                    is_final: true,
+                    usage: None,
+                }));
+            }
+            _ => {}
+        }
+    }
+}
+
 impl AnthropicStreamState {
     fn new() -> Self {
         Self {
@@ -488,11 +538,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn muse_models_need_anthropic_dialect() {
-        assert!(needs_anthropic_dialect("muse-spark-1.2-contributor-free"));
-        assert!(needs_anthropic_dialect("Muse-Spark-1.2"));
-        assert!(needs_anthropic_dialect("some-muse-model"));
-        assert!(needs_anthropic_dialect("MUSE-v2"));
+    fn muse_models_use_the_responses_dialect() {
+        assert!(!needs_anthropic_dialect("muse-spark-1.2-contributor-free"));
+        assert!(!needs_anthropic_dialect("Muse-Spark-1.2"));
+        assert!(!needs_anthropic_dialect("some-muse-model"));
+        assert!(needs_responses_api("MUSE-v2"));
     }
 
     #[test]

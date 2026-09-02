@@ -42,6 +42,10 @@ cargo nextest run -p concerto-<crate> <testname>   # one focused test
 cargo deny check                        # licenses / duplicates / advisories (deny.toml)
 cargo audit
 ```
+- **Build location:** never clone, build, test, or set `CARGO_TARGET_DIR` to a
+  path under `/tmp`. This environment mounts `/tmp` as a RAM-backed filesystem;
+  keep Cargo artifacts in the repository's `target/` directory and use
+  disk-backed repository worktrees for isolation.
 - GitHub Actions at `.github/workflows/ci.yml` runs fmt, clippy, test, and
   deny as separate jobs without `needs:`, so they run in parallel (alongside
   build/wasm/ui-color jobs). Match `.github/workflows/ci.yml` locally before
@@ -99,7 +103,9 @@ cargo audit
   **v28** (v43+ needs a `func_wrap` API migration). Read `deny.toml`
   justification/scope before changing anything.
 - **Dependencies**: historical phase comments are not authorization to retain
-  unused crates. Add a dependency only for a current, tested need.
+  unused crates. Add a dependency only for a current, tested need. Wasmtime is
+  pinned to the patched 24.0.x line for the current RustSec advisory; do not
+  move it to an unpatched release without checking the advisory and API.
 - **Policy gates**: every file write / shell / git op is policy-gated and
   reversible via git stash/branch rollback. Don't bypass `SimplePolicyEngine` or
   `VirtualFs`.

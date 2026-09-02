@@ -4307,6 +4307,16 @@ async fn drive_supervised_run(
         return Err(OrchestratorError::Cancelled);
     }
 
+    // ADR-60 D5: a supervised run that ended without a durable shutdown
+    // checkpoint loses its cheap resume point (restart restore must fall
+    // back to a full log replay). Loud until restore is wired end-to-end.
+    if let Some(error) = &summary.checkpoint_error {
+        tracing::warn!(
+            %error,
+            "supervised multi-agent run ended without a persisted shutdown checkpoint (ADR-60 D5)"
+        );
+    }
+
     let total = expected.len();
     let completed = summary
         .agents

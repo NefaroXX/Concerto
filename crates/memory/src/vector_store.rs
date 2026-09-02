@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use concerto_core::CancellationToken;
 use serde_json;
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::{
@@ -221,7 +221,10 @@ async fn ensure_column(
         return Ok(());
     }
     let statement = format!("ALTER TABLE vector_store ADD COLUMN {column_name} {column_type}");
-    sqlx::query(&statement)
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): `{column_name}` and `{column_type}` are
+    // caller-controlled migration constants (internal, not user input); there are no
+    // runtime values to bind.
+    sqlx::query(AssertSqlSafe(statement))
         .execute(pool)
         .await
         .map_err(|error| MemoryError::Persistence(error.to_string()))?;

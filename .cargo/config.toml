@@ -1,0 +1,4 @@
+[env]
+# Keep tempfile-based tests and build-script scratch files off /tmp. Cargo's
+# compilation artifacts still belong in the normal repository target/.
+TMPDIR = { value = "/var/tmp" }
