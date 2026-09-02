@@ -58,6 +58,11 @@ pub struct OpenCodeZenProvider {
     model: String,
     timeout_secs: u64,
     api_base: String,
+    /// Tool-schema presentation tier (adaptive tool schemas) for the
+    /// provider's own Anthropic-dialect path. The OpenAI-compatible path
+    /// delegates to `openai_inner`, which carries its own copy. `Auto`
+    /// (default) keeps every non-weak model on the verbatim strict schema.
+    tool_schema_mode: concerto_config::ToolSchemaMode,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
     openai_inner: OpenAiProvider,
 }
@@ -80,7 +85,32 @@ impl OpenCodeZenProvider {
         let openai_inner = OpenAiProvider::new(api_key.clone(), model.clone(), timeout_secs)
             .with_api_base(api_base.clone())
             .with_reasoning_echo(ReasoningEcho::Always);
-        Self { api_key, model, timeout_secs, api_base, openai_inner }
+        Self {
+            api_key,
+            model,
+            timeout_secs,
+            api_base,
+            tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            openai_inner,
+        }
+    }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas).
+    ///
+    /// Applies to both wire paths: the Anthropic Messages path handled here
+    /// and the OpenAI-compatible path delegated to the inner provider. The
+    /// Responses API path (Muse models) carries no tool declarations at all,
+    /// so there is nothing to adapt there.
+    ///
+    /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
+    /// tool-calling models (name heuristic) get loose schemas and the
+    /// connector re-nests dot-notation arguments on the way back; every
+    /// other model keeps the verbatim strict schema and byte-identical wire
+    /// output. See `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.tool_schema_mode = mode;
+        self.openai_inner = self.openai_inner.with_tool_schema_mode(mode);
+        self
     }
 
     /// Resolve the effective model name for a request.
@@ -248,6 +278,21 @@ impl OpenCodeZenProvider {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/messages", self.api_base);
 
+        // Adaptive tool schemas (weak-model tier): when the resolved model
+        // matches the loose tier, rewrite the request's tool definitions in
+        // place before the dialect renders the body. Strict models are
+        // untouched — their wire output stays byte-identical.
+        let mut request = request;
+        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+            self.tool_schema_mode,
+            &model,
+        );
+        if tool_adapted {
+            if let Some(tools) = request.tools.as_mut() {
+                crate::adapters::schema_loose::adapt_tool_definitions(tools);
+            }
+        }
+
         let body = self.build_anthropic_body(&request, &model);
 
         let response = tokio::select! {
@@ -273,7 +318,10 @@ impl OpenCodeZenProvider {
             } => result,
         }?;
 
-        let state = AnthropicStreamState::new();
+        let mut state = AnthropicStreamState::new();
+        if tool_adapted {
+            state.tool_adapted = true;
+        }
         let cancel = cancel.clone();
 
         let s = stream! {
@@ -373,6 +421,11 @@ struct AnthropicStreamState {
     parser: BufferedSseParser,
     parse: AnthropicParseState,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
+    /// Whether the request that produced this stream was rendered with
+    /// loose (weak-model) tool schemas. When set, emitted tool-call
+    /// arguments are re-nested from dot-notation back into the tools'
+    /// original nested shape (see `crate::adapters::schema_loose`).
+    tool_adapted: bool,
 }
 
 struct ResponsesStreamState {
@@ -431,6 +484,7 @@ impl AnthropicStreamState {
             parser: BufferedSseParser::new(),
             parse: AnthropicParseState::default(),
             pending: VecDeque::new(),
+            tool_adapted: false,
         }
     }
 
@@ -499,7 +553,13 @@ impl AnthropicStreamState {
                     } else {
                         serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
                     };
-                    let args = crate::protocol::ensure_arguments_object(args_json);
+                    let mut args = crate::protocol::ensure_arguments_object(args_json);
+                    // Adaptive tool schemas: re-nest dot-notation arguments
+                    // from loose-schema streams before the executor or the
+                    // tool-call guard validates against the nested schema.
+                    if self.tool_adapted {
+                        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+                    }
                     self.pending.push_back(Ok(CompletionChunk {
                         reasoning: None,
                         delta: String::new(),

@@ -42,12 +42,12 @@ pub use saving::{
     seed_agent_roster_only, seed_orchestration_roster,
 };
 pub use schema::{
-    builtin_agent_seeds, AgentCapabilities, AgentModelAssignment, AgentRelationshipConfig,
-    AppConfig, ConditionDef, ContextConfig, CustomAgentConfig, FewShotExample, IntentConfig,
-    McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings,
-    MultiAgentConfig, ObservabilityConfig, PipelinePreset, PlanBindingSource, PolicyConfig,
-    PolicyRuleDef, PromptSections, ProviderConfig, RetryConfig, SkillsConfig, ToolSettings,
-    UpdatesConfig, SCHEMA_VERSION,
+    builtin_agent_seeds, parse_tool_schema_mode, AgentCapabilities, AgentModelAssignment,
+    AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig, CustomAgentConfig,
+    FewShotExample, IntentConfig, McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig,
+    ModelProfileOverride, ModelSettings, MultiAgentConfig, ObservabilityConfig, PipelinePreset,
+    PlanBindingSource, PolicyConfig, PolicyRuleDef, PromptSections, ProviderConfig, RetryConfig,
+    SkillsConfig, ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};
 pub use shell::{

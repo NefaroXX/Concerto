@@ -969,6 +969,51 @@ impl ConditionDef {
     }
 }
 
+// ---- Tool-schema presentation tier (adaptive tool schemas) -------------------
+
+/// How tool parameter schemas are presented to a model on the wire.
+///
+/// Weak tool-calling models (audit: `mimo-v2.5-free`) stall on nested
+/// JSON-Schema tool parameters: they emit `null` arguments, hallucinate keys,
+/// and miss required nested fields. "Loose" presentation flattens nested
+/// object properties to dot-notation leaves, appends argument examples to
+/// tool descriptions, and spells out enum members in property descriptions;
+/// the provider connector re-nests dot-notation arguments on the way back so
+/// the executor and the tool-call guard still see the original nested shape
+/// (see `concerto_providers::adapters::schema_loose`).
+///
+/// The user-facing dial lives on each `[providers.*]` entry as the
+/// `tool_schema_mode` string (`"auto"` | `"strict"` | `"loose"`); this enum is
+/// the parsed, provider-side value. Default is [`ToolSchemaMode::Auto`]:
+/// unknown model names keep today's verbatim ("strict") schema — only names
+/// matching the weak-tier heuristic are adapted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolSchemaMode {
+    /// Decide per resolved model name: weak tool-callers (heuristic, see
+    /// `concerto_providers::adapters::schema_loose`) get loose schemas,
+    /// every other model keeps the verbatim strict schema.
+    #[default]
+    Auto,
+    /// Always send the tool schema verbatim (strong tool-calling models).
+    Strict,
+    /// Always send the adapted loose schema, regardless of model name.
+    Loose,
+}
+
+/// Parse the `[providers.*] tool_schema_mode` dial into a [`ToolSchemaMode`].
+///
+/// Lenient like the `reasoning_echo` dial: `None`, empty, and unrecognized
+/// values resolve to [`ToolSchemaMode::Auto`] so configs stay
+/// forward-compatible. Unknown-but-present values are logged by the factory,
+/// which is the only caller that has logging context.
+pub fn parse_tool_schema_mode(raw: Option<&str>) -> ToolSchemaMode {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("strict") => ToolSchemaMode::Strict,
+        Some(value) if value.eq_ignore_ascii_case("loose") => ToolSchemaMode::Loose,
+        _ => ToolSchemaMode::Auto,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     /// Unique identifier for referencing in agent assignments.
@@ -1027,6 +1072,14 @@ pub struct ProviderConfig {
     /// no-op. Off preserves the current wire output exactly.
     #[serde(default)]
     pub cache_breakpoints: bool,
+    /// Tool-schema presentation tier for this provider's models.
+    ///
+    /// One of `"auto"` (default — adapt schemas only for weak tool-calling
+    /// model names such as `mimo-v2.5-free`), `"strict"` (never adapt), or
+    /// `"loose"` (always adapt). `None`/unrecognized resolves to `"auto"`.
+    /// See [`ToolSchemaMode`] for what adaptation changes on the wire.
+    #[serde(default)]
+    pub tool_schema_mode: Option<String>,
 }
 
 impl ProviderConfig {
@@ -1154,6 +1207,7 @@ impl Default for ProviderConfig {
             extra_models: Vec::new(),
             reasoning_echo: None,
             cache_breakpoints: false,
+            tool_schema_mode: None,
         }
     }
 }
@@ -2382,6 +2436,60 @@ mod tests {
         let lenient: ProviderConfig =
             toml::from_str(&encoded.replace("\"always\"", "\"sometimes\"")).unwrap();
         assert_eq!(lenient.reasoning_echo.as_deref(), Some("sometimes"));
+    }
+
+    #[test]
+    fn provider_config_tool_schema_mode_round_trip() {
+        // Legacy provider block without the field must load with the dial
+        // unset (additive `serde(default)`, backward compatible).
+        let legacy = toml::from_str::<ProviderConfig>(
+            "id = \"outdated\"\nprovider = \"openrouter\"\nmodel = \"mimo-v2.5-free\"\n\
+             timeout_seconds = 30\nkeyring_key = \"openrouter/api_key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.tool_schema_mode, None,
+            "legacy provider must default to unset tool_schema_mode"
+        );
+
+        // Explicit values survive a round trip unchanged. Like
+        // `reasoning_echo`, the dial is stored as a raw string and leniently
+        // parsed at provider-build time.
+        let pc = ProviderConfig {
+            id: "gateway".into(),
+            provider: "openrouter".into(),
+            model: "mimo-v2.5-free".into(),
+            tool_schema_mode: Some("loose".into()),
+            ..ProviderConfig::default()
+        };
+        let encoded = toml::to_string(&pc).unwrap();
+        assert!(encoded.contains("tool_schema_mode"), "unexpected encoding: {encoded}");
+        let decoded: ProviderConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.tool_schema_mode.as_deref(), Some("loose"));
+
+        // An unknown value is preserved as raw config data so the factory can
+        // warn and fall back — never a hard parse failure.
+        let lenient: ProviderConfig =
+            toml::from_str(&encoded.replace("\"loose\"", "\"sometimes\"")).unwrap();
+        assert_eq!(lenient.tool_schema_mode.as_deref(), Some("sometimes"));
+    }
+
+    #[test]
+    fn parse_tool_schema_mode_dial() {
+        // Unset, empty, and unknown values all resolve to Auto (lenient,
+        // forward-compatible parsing).
+        assert_eq!(parse_tool_schema_mode(None), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("   ")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("sometimes")), ToolSchemaMode::Auto);
+
+        // Known values parse case-insensitively and tolerate whitespace.
+        assert_eq!(parse_tool_schema_mode(Some("auto")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("AUTO")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("strict")), ToolSchemaMode::Strict);
+        assert_eq!(parse_tool_schema_mode(Some("Strict")), ToolSchemaMode::Strict);
+        assert_eq!(parse_tool_schema_mode(Some("loose")), ToolSchemaMode::Loose);
+        assert_eq!(parse_tool_schema_mode(Some(" loose ")), ToolSchemaMode::Loose);
     }
 
     #[test]
