@@ -2278,13 +2278,12 @@ fn build_run_task(
 /// `whiteboard`) — it no longer rides `[orchestration] supervisor_enabled`,
 /// which now governs only the supervised concurrency runtime. `legacy` keeps
 /// the exact pre-D7 prose behavior. A config without any multi-agent section
-/// (`None`) stays off: continuity is not auto-enabled when the config is
-/// missing entirely.
+/// (`None`) defaults to `Whiteboard` (continuity on) — fresh installs get the
+/// fix, `legacy` must be opted into explicitly.
 fn d7_whiteboard_enabled(multi_agent: Option<&concerto_config::MultiAgentConfig>) -> bool {
-    matches!(
-        multi_agent,
-        Some(config) if config.plan_binding_source == concerto_config::PlanBindingSource::Whiteboard
-    )
+    multi_agent
+        .map(|config| config.plan_binding_source == concerto_config::PlanBindingSource::Whiteboard)
+        .unwrap_or(true)
 }
 
 /// ADR-60 Deferred 3 (issue #19 decoupling): review-cycle resumability stays a
@@ -6188,13 +6187,25 @@ mod runtime_runner_tests {
             "legacy keeps the exact pre-D7 behavior with supervision off"
         );
 
-        // No multi-agent config at all: stays off — continuity is not
-        // auto-enabled when the config section is missing.
+        // No multi-agent config at all: defaults to Whiteboard — fresh installs
+        // get continuity (DesignDoc persists), legacy must be opted into.
         let orphan_binding = d7_binding_named("plan-d7-no-config");
-        append_plan_binding_event(Some(&pool), Ulid::new(), &orphan_binding, None, None).await;
+        append_plan_binding_event(
+            Some(&pool),
+            Ulid::new(),
+            &orphan_binding,
+            Some(&d7_design_doc()),
+            None,
+        )
+        .await;
+        let orphan_rehydrated = load_approved_plan(&pool, &orphan_binding).await.expect("load");
         assert!(
-            load_approved_plan(&pool, &orphan_binding).await.expect("load").is_none(),
-            "a missing multi-agent config does not auto-enable continuity"
+            orphan_rehydrated.is_some(),
+            "fresh installs (no multi_agent section) default to whiteboard continuity"
+        );
+        assert!(
+            orphan_rehydrated.expect("rehydrated").design_doc.is_some(),
+            "the structured DesignDoc persists even without a config section"
         );
     }
 
