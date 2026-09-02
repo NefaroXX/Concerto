@@ -53,6 +53,7 @@ pub mod state;
 pub mod subscriptions;
 pub mod supervisor;
 pub mod timeline;
+mod tool_guard;
 mod working_memory;
 
 #[path = "runtime_runner_persistent.rs"]

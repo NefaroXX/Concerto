@@ -21,6 +21,12 @@ use tracing;
 pub struct FilesystemInput {
     /// The filesystem operation to perform: "read", "write", "delete",
     /// "exists", "list", "move", or "copy".
+    ///
+    /// The advertised enum lets the orchestrator's tool-call guard emit a
+    /// `one of [...]` hint in corrective results when a weak model omits the
+    /// field. Keep the list in sync with the operation match arms in
+    /// [`FilesystemTool::execute`].
+    #[schemars(extend("enum" = ["read", "write", "delete", "exists", "list", "move", "copy"]))]
     pub operation: String,
     /// Path relative to project root. Use "." to list the workspace root.
     pub path: String,
@@ -155,7 +161,7 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "operation": { "type": "string", "enum": ["read", "write", "delete", "exists", "list"] },
+                    "operation": { "type": "string", "enum": ["read", "write", "delete", "exists", "list", "move", "copy"] },
                     "path": { "type": "string", "description": "Path relative to project root." },
                     "content": { "type": ["string", "null"], "description": "Content to write (required for write operation)." }
                 },
