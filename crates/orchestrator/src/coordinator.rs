@@ -50,6 +50,7 @@ use crate::registry::AgentRegistry;
 use crate::relationship::{
     AgentHandoff, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
+use crate::resolver_integration::{self, ResolverOutcome};
 use crate::state::OrchestratorState;
 use tracing::warn;
 
@@ -2345,6 +2346,143 @@ impl CoordinatorAgent {
             let ready_ids: Vec<(TaskId, AgentId)> =
                 graph.ready_tasks().iter().map(|st| (st.id, st.role.clone())).collect();
 
+            // ADR-64 Phase 5: capsule projection — clone the timeline
+            // projection out of the resolver block so it is available
+            // for capsule building in the dispatch futures below.
+            let mut projection_for_capsule: Option<crate::timeline::TimelineProjection> = None;
+
+            // ── ADR-64 Phase 6: resolver short-circuit ──────────────
+            // Before dispatching any ready tasks, check whether the
+            // resolver can prove a task is *reusable* from the timeline.
+            // Reuse = zero model dispatch: the cached result is injected
+            // directly.  All other verdicts flow through normal dispatch.
+            let ready_ids = if !ready_ids.is_empty() {
+                if let Some(pool) = self.review_store.as_ref() {
+                    // Build the timeline projection from durable sources.
+                    let projection_opt = match crate::timeline::build_timeline(
+                        pool,
+                        Some(&task.session_id.to_string()),
+                        self.last_plan_id.as_deref(),
+                        u64::MAX,
+                    )
+                    .await
+                    {
+                        Ok(proj) => Some(proj),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "orchestrator::coordinator",
+                                error = %e,
+                                "resolver: failed to build timeline projection, skipping reuse short-circuit"
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(projection) = projection_opt {
+                        // ADR-64 Phase 5: keep a clone for capsule building.
+                        projection_for_capsule = Some(projection.clone());
+                        // Derive plan_version: design_doc content hash → objective_hash.
+                        let plan_version = {
+                            let design_doc =
+                                self.design_doc.lock().unwrap_or_else(|error| error.into_inner());
+                            if let Some(ref doc) = *design_doc {
+                                // Hash the serialized design doc to get a stable
+                                // content hash, matching plan_approval.rs:173.
+                                serde_json::to_string(doc)
+                                    .ok()
+                                    .map(|s| blake3::hash(s.as_bytes()).to_hex().to_string())
+                                    .unwrap_or_else(|| checkpoint_scope.objective_hash.clone())
+                            } else {
+                                checkpoint_scope.objective_hash.clone()
+                            }
+                        };
+
+                        let expected_map = self.expected_artifacts_snapshot();
+
+                        let pass = resolver_integration::resolve_batch(
+                            &ready_ids,
+                            &graph,
+                            &completed_results,
+                            &projection,
+                            &checkpoint_scope.objective_hash,
+                            &plan_version,
+                            &expected_map,
+                        );
+
+                        // Inject cached results for reused tasks.
+                        for (tid, outcome) in &pass.reused {
+                            if let ResolverOutcome::Reused { result, audit } = outcome {
+                                // 1. Inject cached result.
+                                completed_results.insert(*tid, *result.clone());
+                                // 1b. Accumulate files_modified so the final
+                                //     AgentOutput is complete.
+                                all_files.extend(result.files_modified.clone());
+                                // 2. Mark graph node done.
+                                graph.mark_done(tid);
+                                // 3. Set deliverable on the SubTask.
+                                if let Some(subtask) = graph.get_mut(tid) {
+                                    subtask.deliverable = Some(result.summary.clone());
+                                }
+                                // 4. Clear retry feedback.
+                                retry_feedback.remove(tid);
+                                // 5. Record in the checkpoint action ledger.
+                                action_ledger.push(checkpoint::CheckpointAction {
+                                    kind: "resolver-reuse".into(),
+                                    task_id: Some(*tid),
+                                    timestamp: time::OffsetDateTime::now_utc(),
+                                    evidence: None,
+                                });
+                                // 6. Publish audit via event bus for real-time
+                                //    visibility.  The checkpoint action ledger
+                                //    provides durability across resume.
+                                let _ = self.bus.publish_for_session(
+                                    task.session_id,
+                                    tid.0,
+                                    EventKind::AgentThought {
+                                        agent_id: "coordinator".into(),
+                                        content: format!(
+                                            "ADR-64 resolver: Reuse short-circuit for task {tid} \
+                                             (semantic_key={}, reason: {})",
+                                            audit.semantic_key_hex, audit.reason,
+                                        ),
+                                    },
+                                );
+                                // 7. Add a working-memory decision so the
+                                //    timeline enrichment sees the audit.
+                                context.working_memory.decisions.push(
+                                    concerto_core::memory::Decision {
+                                        id: concerto_core::memory::DecisionId(
+                                            concerto_core::ids::Ulid::new(),
+                                        ),
+                                        session_id: task.session_id,
+                                        task_id: Some(*tid),
+                                        what: "ADR-64 resolver: Reuse".into(),
+                                        why: audit.reason.clone(),
+                                        outcome: Some(result.summary.chars().take(500).collect()),
+                                        category:
+                                            concerto_core::memory::DecisionCategory::Implementation,
+                                        confidence: 1.0,
+                                        superseded_by: None,
+                                        created_at: time::OffsetDateTime::now_utc(),
+                                    },
+                                );
+                            }
+                        }
+
+                        // Return only the non-reused task IDs for normal dispatch.
+                        pass.dispatch_ids
+                    } else {
+                        // Projection build failed — dispatch all.
+                        ready_ids
+                    }
+                } else {
+                    // No pool available — skip resolver, dispatch all.
+                    ready_ids
+                }
+            } else {
+                ready_ids
+            };
+
             if ready_ids.is_empty() {
                 if graph.all_completed() {
                     break;
@@ -2554,6 +2692,22 @@ impl CoordinatorAgent {
                     })
                     .collect()
             };
+            // ADR-64 Phase 5: pre-compute workspace capsules for each task
+            // in the batch. The projection was cloned out of the resolver
+            // block; build_capsule is pure (no I/O, no LLM calls).
+            let capsules_for_batch: Vec<(TaskId, Option<concerto_core::types::WorkspaceCapsule>)> =
+                if let Some(ref projection) = projection_for_capsule {
+                    expected_for_batch
+                        .iter()
+                        .map(|(tid, artifacts)| {
+                            let capsule =
+                                crate::capsule::build_capsule(projection, tid, &graph, artifacts);
+                            (*tid, Some(capsule))
+                        })
+                        .collect()
+                } else {
+                    batch.iter().map(|ready| (ready.id, None)).collect()
+                };
             let futures = batch.iter().map(|ready| {
                 let tid = ready.id;
                 let rl = ready.role.clone();
@@ -2570,6 +2724,10 @@ impl CoordinatorAgent {
                     .find(|(id, _)| *id == tid)
                     .map(|(_, a)| a.clone())
                     .unwrap_or_default();
+                let task_capsule = capsules_for_batch
+                    .iter()
+                    .find(|(id, _)| *id == tid)
+                    .and_then(|(_, c)| c.clone());
                 async move {
                     let profile = match this.model_selector.select_for_session(
                         &rl,
@@ -2600,6 +2758,7 @@ impl CoordinatorAgent {
                         previous_results,
                         budget_remaining_usd: None,
                         expected_artifacts: task_artifacts,
+                        workspace_capsule: task_capsule,
                     };
                     // ADR-35 §8 trigger 1 (stage absence): implement subtasks
                     // planned for the reserved `coordinator` role are executed
@@ -2775,6 +2934,7 @@ impl CoordinatorAgent {
                                     previous_results: ladder_entry.previous_results.clone(),
                                     budget_remaining_usd: None,
                                     expected_artifacts: ladder_artifacts,
+                                    workspace_capsule: None,
                                 };
                                 match self
                                     .attempt_fallback_ladder(
@@ -3389,6 +3549,7 @@ impl CoordinatorAgent {
                             previous_results: ladder_entry.previous_results.clone(),
                             budget_remaining_usd: None,
                             expected_artifacts: ladder_artifacts,
+                            workspace_capsule: None,
                         };
                         let classify_err = OrchestratorError::AgentLoopError(error.clone());
                         match self
@@ -4205,6 +4366,7 @@ impl CoordinatorAgent {
                 previous_results: vec![review_input.clone()],
                 budget_remaining_usd: None,
                 expected_artifacts: Vec::new(),
+                workspace_capsule: None,
             };
 
             let result = self
@@ -4365,6 +4527,7 @@ impl CoordinatorAgent {
                             .get(&task_id)
                             .cloned()
                             .unwrap_or_default(),
+                        workspace_capsule: None,
                     };
                     // Select routing profile for coder revision
                     let coder_profile = self.model_selector.select_for_session(
@@ -4877,6 +5040,7 @@ impl CoordinatorAgent {
             previous_results: retry_feedback.to_vec(),
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
+            workspace_capsule: None,
         };
         let profile = self.model_selector.select_for_session(
             role,
@@ -5066,6 +5230,7 @@ impl CoordinatorAgent {
                                 previous_results: retry_feedback.clone(),
                                 budget_remaining_usd: None,
                                 expected_artifacts: Vec::new(),
+                                workspace_capsule: None,
                             };
                             match self
                                 .attempt_fallback_ladder(

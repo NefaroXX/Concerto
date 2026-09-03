@@ -194,6 +194,18 @@ impl GenericSpecialistAgent {
         prompt.push_str("\n\n");
         prompt.push_str(&crate::memory_prompt::format_run_memory(&context.working_memory));
 
+        // ADR-64 Phase 5: inject workspace capsule after working memory
+        // and before previous results. The capsule provides task-specific
+        // file metadata from the timeline so agents never re-read files
+        // merely to confirm existence.
+        if let Some(capsule) = &context.workspace_capsule {
+            let formatted = crate::capsule::format_capsule(capsule);
+            if !formatted.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&formatted);
+            }
+        }
+
         if !context.previous_results.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&crate::memory_prompt::format_previous_results(
@@ -1670,6 +1682,7 @@ mod tests {
             previous_results: Vec::new(),
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
+            workspace_capsule: None,
         }
     }
 
