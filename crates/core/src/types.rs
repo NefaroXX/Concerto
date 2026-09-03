@@ -1445,6 +1445,11 @@ pub struct AgentContext {
     /// The agent runner checks these after execution and rejects premature
     /// completion if required artifacts are missing.
     pub expected_artifacts: Vec<Utf8PathBuf>,
+    /// ADR-64 §6: task-specific workspace capsule preloaded into agent
+    /// prompts so agents never re-read files merely to confirm existence.
+    /// `None` when the timeline projection is unavailable or the feature is
+    /// disabled; `Some` at dispatch time when the coordinator builds it.
+    pub workspace_capsule: Option<WorkspaceCapsule>,
 }
 
 impl AgentContext {
@@ -1464,7 +1469,62 @@ impl AgentContext {
             previous_results: Vec::new(),
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
+            workspace_capsule: None,
         }
+    }
+}
+
+// ---- Phase 5: WorkspaceCapsule (ADR-64 §6) ----------------------------------
+
+/// A file known to the workspace — either written via the write gate (timeline
+/// `WroteFile` / `WroteFilesFromPath`) or modified by a completed dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleFileEntry {
+    /// Absolute or workspace-relative path.
+    pub path: String,
+    /// blake3 content hex from the timeline or pre-image cache.
+    pub content_hash: String,
+    /// Whiteboard gate sequence at which this file was last observed.
+    pub last_modified_gate_seq: u64,
+}
+
+/// A pending (not-yet-completed) task in the execution graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsulePendingTask {
+    /// The task's stable identifier.
+    pub task_id: String,
+    /// Human-readable description of the work.
+    pub description: String,
+    /// Task IDs this task depends on.
+    pub dependencies: Vec<String>,
+}
+
+/// A task-specific workspace capsule: the bounded, typed context packet that
+/// preloads file metadata from the timeline so agents never re-read files
+/// merely to confirm existence.
+///
+/// Built by the orchestrator's [`capsule::build_capsule`] and serialized
+/// into agent prompts by [`capsule::format_capsule`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceCapsule {
+    /// Files known to exist (from timeline `WroteFile` + `WroteFilesFromPath`
+    /// events).
+    pub known_files: Vec<CapsuleFileEntry>,
+    /// Files modified earlier in this run by completed dependency tasks.
+    pub modified_files: Vec<CapsuleFileEntry>,
+    /// Pending work not yet done (from the task graph).
+    pub pending_work: Vec<CapsulePendingTask>,
+    /// Expected outputs for this specific task.
+    pub expected_outputs: Vec<String>,
+}
+
+impl WorkspaceCapsule {
+    /// True when the capsule carries no information beyond the expected outputs.
+    pub fn is_empty(&self) -> bool {
+        self.known_files.is_empty()
+            && self.modified_files.is_empty()
+            && self.pending_work.is_empty()
+            && self.expected_outputs.is_empty()
     }
 }
 

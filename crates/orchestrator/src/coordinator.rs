@@ -2346,6 +2346,11 @@ impl CoordinatorAgent {
             let ready_ids: Vec<(TaskId, AgentId)> =
                 graph.ready_tasks().iter().map(|st| (st.id, st.role.clone())).collect();
 
+            // ADR-64 Phase 5: capsule projection — clone the timeline
+            // projection out of the resolver block so it is available
+            // for capsule building in the dispatch futures below.
+            let mut projection_for_capsule: Option<crate::timeline::TimelineProjection> = None;
+
             // ── ADR-64 Phase 6: resolver short-circuit ──────────────
             // Before dispatching any ready tasks, check whether the
             // resolver can prove a task is *reusable* from the timeline.
@@ -2374,6 +2379,8 @@ impl CoordinatorAgent {
                     };
 
                     if let Some(projection) = projection_opt {
+                        // ADR-64 Phase 5: keep a clone for capsule building.
+                        projection_for_capsule = Some(projection.clone());
                         // Derive plan_version: design_doc content hash → objective_hash.
                         let plan_version = {
                             let design_doc =
@@ -2685,6 +2692,22 @@ impl CoordinatorAgent {
                     })
                     .collect()
             };
+            // ADR-64 Phase 5: pre-compute workspace capsules for each task
+            // in the batch. The projection was cloned out of the resolver
+            // block; build_capsule is pure (no I/O, no LLM calls).
+            let capsules_for_batch: Vec<(TaskId, Option<concerto_core::types::WorkspaceCapsule>)> =
+                if let Some(ref projection) = projection_for_capsule {
+                    expected_for_batch
+                        .iter()
+                        .map(|(tid, artifacts)| {
+                            let capsule =
+                                crate::capsule::build_capsule(projection, tid, &graph, artifacts);
+                            (*tid, Some(capsule))
+                        })
+                        .collect()
+                } else {
+                    batch.iter().map(|ready| (ready.id, None)).collect()
+                };
             let futures = batch.iter().map(|ready| {
                 let tid = ready.id;
                 let rl = ready.role.clone();
@@ -2701,6 +2724,10 @@ impl CoordinatorAgent {
                     .find(|(id, _)| *id == tid)
                     .map(|(_, a)| a.clone())
                     .unwrap_or_default();
+                let task_capsule = capsules_for_batch
+                    .iter()
+                    .find(|(id, _)| *id == tid)
+                    .and_then(|(_, c)| c.clone());
                 async move {
                     let profile = match this.model_selector.select_for_session(
                         &rl,
@@ -2731,6 +2758,7 @@ impl CoordinatorAgent {
                         previous_results,
                         budget_remaining_usd: None,
                         expected_artifacts: task_artifacts,
+                        workspace_capsule: task_capsule,
                     };
                     // ADR-35 §8 trigger 1 (stage absence): implement subtasks
                     // planned for the reserved `coordinator` role are executed
@@ -2906,6 +2934,7 @@ impl CoordinatorAgent {
                                     previous_results: ladder_entry.previous_results.clone(),
                                     budget_remaining_usd: None,
                                     expected_artifacts: ladder_artifacts,
+                                    workspace_capsule: None,
                                 };
                                 match self
                                     .attempt_fallback_ladder(
@@ -3520,6 +3549,7 @@ impl CoordinatorAgent {
                             previous_results: ladder_entry.previous_results.clone(),
                             budget_remaining_usd: None,
                             expected_artifacts: ladder_artifacts,
+                            workspace_capsule: None,
                         };
                         let classify_err = OrchestratorError::AgentLoopError(error.clone());
                         match self
@@ -4336,6 +4366,7 @@ impl CoordinatorAgent {
                 previous_results: vec![review_input.clone()],
                 budget_remaining_usd: None,
                 expected_artifacts: Vec::new(),
+                workspace_capsule: None,
             };
 
             let result = self
@@ -4496,6 +4527,7 @@ impl CoordinatorAgent {
                             .get(&task_id)
                             .cloned()
                             .unwrap_or_default(),
+                        workspace_capsule: None,
                     };
                     // Select routing profile for coder revision
                     let coder_profile = self.model_selector.select_for_session(
@@ -5008,6 +5040,7 @@ impl CoordinatorAgent {
             previous_results: retry_feedback.to_vec(),
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
+            workspace_capsule: None,
         };
         let profile = self.model_selector.select_for_session(
             role,
@@ -5197,6 +5230,7 @@ impl CoordinatorAgent {
                                 previous_results: retry_feedback.clone(),
                                 budget_remaining_usd: None,
                                 expected_artifacts: Vec::new(),
+                                workspace_capsule: None,
                             };
                             match self
                                 .attempt_fallback_ladder(
