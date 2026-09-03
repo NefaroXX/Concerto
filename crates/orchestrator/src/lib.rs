@@ -46,6 +46,7 @@ pub mod planner;
 pub mod prompts;
 pub mod registry;
 pub mod resolver;
+pub mod resolver_integration;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;

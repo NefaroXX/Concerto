@@ -135,10 +135,7 @@ pub fn should_dispatch(
     // gate_seq. `build_timeline` guarantees this; defend against any caller
     // that constructs a projection by hand without sorting.
     debug_assert!(
-        projection
-            .events
-            .windows(2)
-            .all(|w| w[0].gate_seq() <= w[1].gate_seq()),
+        projection.events.windows(2).all(|w| w[0].gate_seq() <= w[1].gate_seq()),
         "TimelineProjection events must be ordered by gate_seq"
     );
 
