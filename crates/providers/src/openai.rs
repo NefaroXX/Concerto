@@ -26,6 +26,10 @@ pub struct OpenAiProvider {
     model: String,
     timeout_secs: u64,
     reasoning_echo: ReasoningEcho,
+    /// Tool-schema presentation tier (adaptive tool schemas). Resolved per
+    /// request against the actual model name; `Auto` (default) keeps every
+    /// non-weak model on the verbatim strict schema.
+    tool_schema_mode: concerto_config::ToolSchemaMode,
     dialect: OpenAiChatDialect,
 }
 
@@ -37,6 +41,7 @@ impl OpenAiProvider {
             model,
             timeout_secs,
             reasoning_echo: ReasoningEcho::IfPresent,
+            tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             dialect: OpenAiChatDialect,
         }
     }
@@ -54,6 +59,19 @@ impl OpenAiProvider {
     /// rejects.
     pub fn with_reasoning_echo(mut self, echo: ReasoningEcho) -> Self {
         self.reasoning_echo = echo;
+        self
+    }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas).
+    ///
+    /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
+    /// tool-calling models (name heuristic) get loose schemas (flattened
+    /// nested objects, enum descriptions, argument examples) and the
+    /// connector re-nests dot-notation arguments on the way back; every
+    /// other model keeps the verbatim strict schema and byte-identical wire
+    /// output. See `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.tool_schema_mode = mode;
         self
     }
 }
@@ -74,6 +92,12 @@ struct OpenAiStreamState {
     parser: BufferedSseParser,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
     partial_tools: HashMap<usize, PartialToolCall>,
+    /// Whether the request that produced this stream was rendered with
+    /// loose (weak-model) tool schemas. When set, emitted tool-call
+    /// arguments are re-nested from dot-notation back into the tools'
+    /// original nested shape before the executor or the tool-call guard
+    /// sees them (see `crate::adapters::schema_loose`).
+    tool_adapted: bool,
     /// Accumulated `reasoning_content` deltas for the current turn (ADR-46).
     ///
     /// DeepSeek-style endpoints stream reasoning incrementally across many
@@ -95,6 +119,7 @@ impl OpenAiStreamState {
             parser: BufferedSseParser::new(),
             pending: VecDeque::new(),
             partial_tools: HashMap::new(),
+            tool_adapted: false,
             reasoning_buffer: String::new(),
             usage: None,
         }
@@ -139,9 +164,16 @@ impl OpenAiStreamState {
             // Empty or garbage accumulated arguments must not serialize to
             // `"null"` / `"\"ls\""` on the wire (`HTTP 400: function.arguments
             // must be a JSON object`) — coerce to `{}` first.
-            let args = crate::protocol::ensure_arguments_object(
+            let mut args = crate::protocol::ensure_arguments_object(
                 serde_json::from_str(&ptc.arguments).unwrap_or(serde_json::Value::Null),
             );
+            // Adaptive tool schemas: when the request was rendered with loose
+            // (weak-model) schemas, the model answers in the flattened
+            // dot-notation shape — re-nest before the executor or the
+            // tool-call guard validates against the original nested schema.
+            if self.tool_adapted {
+                crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+            }
             self.pending.push_back(Ok(CompletionChunk {
                 delta: String::new(),
                 reasoning: None,
@@ -336,6 +368,21 @@ impl LlmProvider for OpenAiProvider {
         let model =
             if request.model.is_empty() { self.model.clone() } else { request.model.clone() };
 
+        // Adaptive tool schemas (weak-model tier): when the resolved model
+        // matches the loose tier, rewrite the request's tool definitions in
+        // place before the dialect renders the body. Strict models are
+        // untouched — their wire output stays byte-identical.
+        let mut request = request;
+        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+            self.tool_schema_mode,
+            &model,
+        );
+        if tool_adapted {
+            if let Some(tools) = request.tools.as_mut() {
+                crate::adapters::schema_loose::adapt_tool_definitions(tools);
+            }
+        }
+
         let body = self.dialect.render_chat_body(&request, &model, self.reasoning_echo);
 
         let response = tokio::select! {
@@ -359,7 +406,10 @@ impl LlmProvider for OpenAiProvider {
             return Err(crate::retry::map_http_error(status, &text, retry_after));
         }
 
-        let state = OpenAiStreamState::new();
+        let mut state = OpenAiStreamState::new();
+        if tool_adapted {
+            state.tool_adapted = true;
+        }
 
         let s = stream! {
             let mut state = state;
@@ -590,6 +640,72 @@ mod tests {
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
         assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
         assert!(tool.arguments.is_object(), "arguments must be a JSON object");
+    }
+
+    /// Adaptive tool schemas: when the request was rendered with loose
+    /// (weak-model) schemas, dot-notation arguments emitted by the model are
+    /// re-nested into the tool's original nested shape before leaving the
+    /// connector. Without the flag the arguments pass through untouched, so
+    /// strict models keep byte-identical behavior.
+    #[test]
+    fn stream_tool_adaptation_unflattens_dotted_arguments() {
+        // Serialize through `json!` so argument strings are correctly escaped
+        // inside the SSE data payload.
+        let event = |data: String| crate::sse::SseEvent {
+            event: None,
+            data: Some(data),
+            id: None,
+            keepalive: false,
+        };
+        let start_event = || {
+            event(
+                serde_json::json!({
+                    "choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "id": "call_1", "type": "function",
+                         "function": {"name": "runner", "arguments": ""}}]}}]
+                })
+                .to_string(),
+            )
+        };
+        let args_event = |arguments: &str| {
+            event(
+                serde_json::json!({
+                    "choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "function": {"arguments": arguments}}]}}]
+                })
+                .to_string(),
+            )
+        };
+        let dotted_args = r#"{"config.mode":"fast","config.retries":2}"#;
+
+        // Adapted stream: dotted keys are re-nested.
+        let mut adapted = OpenAiStreamState::new();
+        adapted.tool_adapted = true;
+        adapted.handle_event(start_event());
+        adapted.handle_event(args_event(dotted_args));
+        adapted.handle_event(event("[DONE]".to_string()));
+        let chunks: Vec<CompletionChunk> =
+            adapted.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(
+            tool.arguments,
+            serde_json::json!({"config": {"mode": "fast", "retries": 2}}),
+            "dotted arguments must be re-nested on adapted streams"
+        );
+
+        // Non-adapted stream: identical wire input passes through unchanged.
+        let mut strict = OpenAiStreamState::new();
+        strict.handle_event(start_event());
+        strict.handle_event(args_event(dotted_args));
+        strict.handle_event(event("[DONE]".to_string()));
+        let chunks: Vec<CompletionChunk> =
+            strict.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(
+            tool.arguments,
+            serde_json::json!({"config.mode": "fast", "config.retries": 2}),
+            "strict streams must pass arguments through untouched"
+        );
     }
 
     /// ADR-48 §4: a trailing `usage` object (OpenAI `stream_options.include_usage`

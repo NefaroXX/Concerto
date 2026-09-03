@@ -26,6 +26,15 @@ impl NimProvider {
         self.inner = self.inner.with_reasoning_echo(echo);
         self
     }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas),
+    /// forwarded to the inner OpenAI-compatible connector. Defaults to
+    /// [`concerto_config::ToolSchemaMode::Auto`]. See
+    /// `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.inner = self.inner.with_tool_schema_mode(mode);
+        self
+    }
 }
 
 #[async_trait]

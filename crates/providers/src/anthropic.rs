@@ -19,6 +19,10 @@ pub struct AnthropicProvider {
     /// Opt-in Anthropic prompt-cache breakpoints (ADR-48 decision 3). Off by
     /// default; toggled via [`Self::with_cache_breakpoints`].
     cache_breakpoints: bool,
+    /// Tool-schema presentation tier (adaptive tool schemas). Resolved per
+    /// request against the actual model name; `Auto` (default) keeps every
+    /// non-weak model on the verbatim strict schema.
+    tool_schema_mode: concerto_config::ToolSchemaMode,
 }
 
 impl AnthropicProvider {
@@ -29,6 +33,7 @@ impl AnthropicProvider {
             timeout_secs,
             dialect: AnthropicChatDialect,
             cache_breakpoints: false,
+            tool_schema_mode: concerto_config::ToolSchemaMode::default(),
         }
     }
 
@@ -48,6 +53,19 @@ impl AnthropicProvider {
     /// Whether this provider emits Anthropic prompt-cache breakpoints.
     pub fn cache_breakpoints(&self) -> bool {
         self.cache_breakpoints
+    }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas).
+    ///
+    /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
+    /// tool-calling models (name heuristic) get loose schemas (flattened
+    /// nested objects, enum descriptions, argument examples) and the
+    /// connector re-nests dot-notation arguments on the way back; every
+    /// other model keeps the verbatim strict schema and byte-identical wire
+    /// output. See `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.tool_schema_mode = mode;
+        self
     }
 
     /// Build the wire request body for a completion: render the canonical
@@ -72,6 +90,11 @@ struct AnthropicStreamState {
     parser: BufferedSseParser,
     parse: AnthropicParseState,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
+    /// Whether the request that produced this stream was rendered with
+    /// loose (weak-model) tool schemas. When set, emitted tool-call
+    /// arguments are re-nested from dot-notation back into the tools'
+    /// original nested shape (see `crate::adapters::schema_loose`).
+    tool_adapted: bool,
 }
 
 impl AnthropicStreamState {
@@ -80,6 +103,7 @@ impl AnthropicStreamState {
             parser: BufferedSseParser::new(),
             parse: AnthropicParseState::default(),
             pending: VecDeque::new(),
+            tool_adapted: false,
         }
     }
 
@@ -146,11 +170,17 @@ impl AnthropicStreamState {
                         usage: None,
                     }));
                 } else if let Some((id, name, args_str)) = self.parse.tool_acc.remove(&index) {
-                    let args_json = if args_str.trim().is_empty() {
+                    let mut args_json = if args_str.trim().is_empty() {
                         serde_json::Value::Null
                     } else {
                         serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
                     };
+                    // Adaptive tool schemas: re-nest dot-notation arguments
+                    // from loose-schema streams before the executor or the
+                    // tool-call guard validates against the nested schema.
+                    if self.tool_adapted {
+                        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args_json);
+                    }
                     self.pending.push_back(Ok(CompletionChunk {
                         reasoning: None,
                         delta: String::new(),
@@ -267,6 +297,21 @@ impl LlmProvider for AnthropicProvider {
         let model =
             if request.model.is_empty() { self.model.clone() } else { request.model.clone() };
 
+        // Adaptive tool schemas (weak-model tier): when the resolved model
+        // matches the loose tier, rewrite the request's tool definitions in
+        // place before the dialect renders the body. Strict models are
+        // untouched — their wire output stays byte-identical.
+        let mut request = request;
+        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+            self.tool_schema_mode,
+            &model,
+        );
+        if tool_adapted {
+            if let Some(tools) = request.tools.as_mut() {
+                crate::adapters::schema_loose::adapt_tool_definitions(tools);
+            }
+        }
+
         // Request-body rendering now lives in
         // `crate::adapters::anthropic` (`AnthropicChatDialect`); stream
         // parsing remains here in the connector. `build_body` additionally
@@ -296,7 +341,10 @@ impl LlmProvider for AnthropicProvider {
             } => result,
         }?;
 
-        let state = AnthropicStreamState::new();
+        let mut state = AnthropicStreamState::new();
+        if tool_adapted {
+            state.tool_adapted = true;
+        }
         let cancel = cancel.clone();
 
         let s = stream! {

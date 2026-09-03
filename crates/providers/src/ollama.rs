@@ -13,6 +13,10 @@ pub struct OllamaProvider {
     model: String,
     timeout_secs: u64,
     dialect: OllamaChatDialect,
+    /// Tool-schema presentation tier (adaptive tool schemas). Resolved per
+    /// request against the actual model name; `Auto` (default) keeps every
+    /// non-weak model on the verbatim strict schema.
+    tool_schema_mode: concerto_config::ToolSchemaMode,
 }
 
 impl OllamaProvider {
@@ -22,11 +26,25 @@ impl OllamaProvider {
             model,
             timeout_secs,
             dialect: OllamaChatDialect,
+            tool_schema_mode: concerto_config::ToolSchemaMode::default(),
         }
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
+        self
+    }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas).
+    ///
+    /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
+    /// tool-calling models (name heuristic) get loose schemas (flattened
+    /// nested objects, enum descriptions, argument examples) and the
+    /// connector re-nests dot-notation arguments on the way back; every
+    /// other model keeps the verbatim strict schema and byte-identical wire
+    /// output. See `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.tool_schema_mode = mode;
         self
     }
 }
@@ -105,6 +123,21 @@ impl LlmProvider for OllamaProvider {
         let url = format!("{}/api/chat", self.base_url);
         let model =
             if request.model.is_empty() { self.model.clone() } else { request.model.clone() };
+
+        // Adaptive tool schemas (weak-model tier): when the resolved model
+        // matches the loose tier, rewrite the request's tool definitions in
+        // place before the dialect renders the body. Strict models are
+        // untouched — their wire output stays byte-identical.
+        let mut request = request;
+        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+            self.tool_schema_mode,
+            &model,
+        );
+        if tool_adapted {
+            if let Some(tools) = request.tools.as_mut() {
+                crate::adapters::schema_loose::adapt_tool_definitions(tools);
+            }
+        }
 
         // Request-body rendering now lives in `crate::adapters::ollama`
         // (`OllamaChatDialect`); stream parsing remains here in the connector.
@@ -191,10 +224,18 @@ impl LlmProvider for OllamaProvider {
                                                     .get("name")
                                                     .and_then(|v| v.as_str())
                                                     .unwrap_or("unknown");
-                                                let args = func
+                                                let mut args = func
                                                     .get("arguments")
                                                     .cloned()
                                                     .unwrap_or(serde_json::Value::Null);
+                                                // Adaptive tool schemas: re-nest
+                                                // dot-notation arguments from
+                                                // loose-schema streams before the
+                                                // executor or tool-call guard sees
+                                                // them.
+                                                if tool_adapted {
+                                                    crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+                                                }
                                                 // Generate a stable call ID for the tool
                                                 // result round-trip.
                                                 let id = format!("oc_{}", name);

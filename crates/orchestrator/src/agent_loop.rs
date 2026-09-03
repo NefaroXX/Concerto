@@ -3,6 +3,7 @@
 //! Phase 3: basic sequential loop with memory, undo, and eval hooks.
 //! Multi-agent coordination is Phase 5.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -30,6 +31,7 @@ use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
 use crate::state::AgentState;
+use crate::tool_guard;
 
 /// The single-agent loop driving plan → act → observe → plan cycles.
 pub struct AgentLoop {
@@ -47,6 +49,11 @@ pub struct AgentLoop {
     eval: EvalEngine,
     prompt_builder: PromptBuilder,
     cycle_budget: CycleBudgetTracker,
+    /// Consecutive tool-guard rejections per tool name within the current
+    /// run (cleared on a valid guarded call and at run start). Bounds the
+    /// corrective-retry coaching for weak models at
+    /// [`tool_guard::MAX_TOOL_GUARD_REJECTS`] injections per tool.
+    tool_guard_rejects: HashMap<String, u32>,
     max_iterations: u32,
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
@@ -169,6 +176,16 @@ enum ProviderResponseAction {
     Proceed,
 }
 
+/// Outcome of the tool-call guard (VALIDATE → COERCE → REPAIR) for one
+/// incoming tool call.
+enum GuardOutcome {
+    /// Arguments are usable (possibly after coercion); execute with these.
+    Pass(serde_json::Value),
+    /// Arguments are invalid after coercion; inject the corrective tool
+    /// result so the model retries and skip execution entirely.
+    Reject { summary: String, content: String, payload: serde_json::Value },
+}
+
 /// Normalize a collected reasoning string into an `Option`, so an empty
 /// reasoning buffer maps to `None` (ADR-46).
 fn non_empty_reasoning(reasoning: Option<String>) -> Option<String> {
@@ -241,6 +258,7 @@ impl AgentLoop {
             eval,
             prompt_builder,
             cycle_budget: CycleBudgetTracker::default(),
+            tool_guard_rejects: HashMap::new(),
             max_iterations,
             fast,
             state: AgentState::Idle,
@@ -310,6 +328,9 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<AgentOutput, OrchestratorError> {
         let session_id = task.session_id;
+        // Fresh run: clear any corrective-retry streaks carried over from a
+        // previous run on this loop instance.
+        self.tool_guard_rejects.clear();
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -1284,8 +1305,96 @@ impl AgentLoop {
         self.state
     }
 
-    /// Execute a single tool call: cycle-budget check, approval, execution, and
-    /// structured result persistence.
+    /// Tool-call guard (VALIDATE → COERCE → INFER → REPAIR): normalize
+    /// weak-model arguments against the tool's advertised JSON Schema before
+    /// the cycle budget or the executor sees the call.
+    ///
+    /// * parses `null`/empty/stringified arguments (including fenced JSON
+    ///   blocks) into an object;
+    /// * applies schema-guided safe coercions (string → number/boolean, enum
+    ///   case normalization, unknown-key stripping), logging every fix;
+    /// * validates required fields, types, and enum membership; on failure
+    ///   attempts per-tool heuristic inference (adaptive tool-guard Solution
+    ///   3) for required fields that are absent or `null` — e.g. filesystem
+    ///   `operation` from path shape, shell `command` recovered from a `cmd`
+    ///   alias — accepting the result only when the completed arguments
+    ///   re-validate cleanly;
+    /// * otherwise injects a structured corrective `ToolResult` (bounded by
+    ///   [`tool_guard::MAX_TOOL_GUARD_REJECTS`] per tool name per run) so the
+    ///   model retries with corrected arguments.
+    ///
+    /// Tools without a schema in the registry pass through untouched — the
+    /// executor and policy engine own unknown-tool errors. The guard adds no
+    /// `await` points, so the caller's `CancellationToken` is unaffected.
+    fn guard_tool_call(&mut self, tc: &ToolCall) -> GuardOutcome {
+        let parsed = tool_guard::parse_tool_arguments(&tc.arguments);
+        let definitions = self.tool_executor.tool_definitions();
+        let Some(schema) =
+            definitions.iter().find(|definition| definition.name == tc.name).map(|d| &d.parameters)
+        else {
+            return GuardOutcome::Pass(parsed);
+        };
+
+        // The original parse result is kept for heuristic alias recovery:
+        // coercion strips hallucinated alias keys (`cmd`, `file`, ...), which
+        // are exactly the alternative field names the heuristics recover.
+        let (coerced, coercions) = tool_guard::coerce_arguments(parsed.clone(), schema);
+        if !coercions.is_empty() {
+            tracing::warn!(
+                tool = %tc.name,
+                coercions = ?coercions,
+                "tool-call guard coerced tool arguments"
+            );
+        }
+
+        let errors = tool_guard::validate_arguments(&coerced, schema);
+        if errors.is_empty() {
+            self.tool_guard_rejects.remove(&tc.name);
+            return GuardOutcome::Pass(coerced);
+        }
+
+        // Heuristic inference (Solution 3): last-mile recovery for unresolved
+        // required fields before coaching the model. Conservative by
+        // construction — fills only absent/`null` slots, logged, and accepted
+        // only when the completed arguments validate cleanly; anything else
+        // falls through to the corrective reject below with the original
+        // errors (no silent guesses).
+        let mut repaired = coerced;
+        if let Some(notes) = tool_guard::heuristic_infer(&tc.name, &parsed, &mut repaired, schema) {
+            let (repaired, repair_coercions) = tool_guard::coerce_arguments(repaired, schema);
+            if tool_guard::validate_arguments(&repaired, schema).is_empty() {
+                tracing::warn!(
+                    tool = %tc.name,
+                    heuristic_inferred = ?notes,
+                    coercions = ?repair_coercions,
+                    "tool-call guard heuristically inferred missing tool arguments"
+                );
+                self.tool_guard_rejects.remove(&tc.name);
+                return GuardOutcome::Pass(repaired);
+            }
+        }
+
+        let reject_count = self.tool_guard_rejects.entry(tc.name.clone()).or_insert(0);
+        *reject_count += 1;
+        let exhausted = *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+        let content = tool_guard::corrective_message_text(&tc.name, &errors, schema, exhausted);
+        let payload = tool_guard::corrective_tool_result(&tc.name, &errors, schema, exhausted);
+        tracing::warn!(
+            tool = %tc.name,
+            reject_count,
+            exhausted,
+            errors = ?errors,
+            "tool-call guard rejected tool arguments; injecting corrective tool result"
+        );
+        GuardOutcome::Reject {
+            summary: format!("invalid arguments: {}", errors.first().cloned().unwrap_or_default()),
+            content,
+            payload,
+        }
+    }
+
+    /// Execute a single tool call: tool-guard validation, cycle-budget check,
+    /// approval, execution, and structured result persistence.
     #[allow(clippy::too_many_arguments)]
     async fn execute_single_tool_call(
         &mut self,
@@ -1300,7 +1409,58 @@ impl AgentLoop {
         tool_events: &mut Vec<ToolExecutionSummary>,
         messages: &mut Vec<Message>,
     ) -> Result<(), OrchestratorError> {
-        let input_hash = blake3::hash(tc.arguments.to_string().as_bytes());
+        // Tool-call guard (VALIDATE → COERCE → REPAIR): normalize the
+        // provider-accumulated arguments against the tool's schema before
+        // anything else sees them. Rejected calls never execute and never
+        // touch the cycle budget; the model receives a corrective tool
+        // result instead and retries on the next iteration.
+        let arguments = match self.guard_tool_call(tc) {
+            GuardOutcome::Pass(arguments) => arguments,
+            GuardOutcome::Reject { summary, content, payload } => {
+                *tool_call_count += 1;
+                tool_events.push(ToolExecutionSummary {
+                    tool_name: tc.name.clone(),
+                    operation: None,
+                    path: None,
+                    success: false,
+                    summary: summary.clone(),
+                });
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    correlation_id,
+                    EventKind::ToolExecutionFinished {
+                        tool_name: tc.name.clone(),
+                        duration_ms: 0,
+                        success: false,
+                        detail: Some(summary),
+                    },
+                );
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    correlation_id,
+                    EventKind::AgentThought {
+                        agent_id: "single-agent".to_string(),
+                        content: content.clone(),
+                    },
+                );
+                messages.push(Message {
+                    role: Role::Tool,
+                    content,
+                    tool_calls: None,
+                    tool_results: Some(vec![concerto_core::types::ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        content: payload,
+                    }]),
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                });
+                return Ok(());
+            }
+        };
+
+        let input_hash = blake3::hash(arguments.to_string().as_bytes());
 
         // Check cycle budget — on repeat, pause and ask the user
         // rather than hard-failing (roadmap requirement 3.2).
@@ -1319,7 +1479,7 @@ impl AgentLoop {
 
             let action = PolicyAction {
                 tool_name: &tc.name,
-                input: &tc.arguments,
+                input: &arguments,
                 session_id: task.session_id,
                 correlation_id: Ulid::new(),
                 capability_requirements: CapabilitySet::default(),
@@ -1348,8 +1508,8 @@ impl AgentLoop {
         }
 
         // Execute via tool executor
-        let filesystem_operation = tc.arguments.get("operation").and_then(|v| v.as_str());
-        let detail_path = tc.arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let filesystem_operation = arguments.get("operation").and_then(|v| v.as_str());
+        let detail_path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
         let start_detail = match (tc.name.as_str(), filesystem_operation, &detail_path) {
             (_, Some(op), Some(p)) => Some(format!("{} {}", op, p)),
             (_, Some(op), None) => Some(op.to_string()),
@@ -1366,10 +1526,7 @@ impl AgentLoop {
             },
         );
 
-        match self
-            .tool_executor
-            .execute(&tc.name, tc.arguments.clone(), &tc.id, session, cancel)
-            .await
+        match self.tool_executor.execute(&tc.name, arguments.clone(), &tc.id, session, cancel).await
         {
             Ok(output) => {
                 *tool_call_count += 1;
@@ -1384,7 +1541,7 @@ impl AgentLoop {
                 if is_file_changing {
                     *file_changing_tool_count += 1;
 
-                    if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                    if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
                         let path = camino::Utf8PathBuf::from(path);
                         if !files_modified.contains(&path) {
                             files_modified.push(path);
@@ -3695,6 +3852,339 @@ mod tests {
         let fp1 = ProgressFingerprint::from_output(&o);
         let fp2 = ProgressFingerprint::from_output(&o);
         assert_eq!(fp1, fp2, "same output must have identical fingerprint");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool-call guard (VALIDATE → COERCE → REPAIR) — integration-level tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: a loop wired with the real `FilesystemTool` plus the default
+    /// request state for one direct `execute_single_tool_call` invocation.
+    fn guard_test_harness(dir: &std::path::Path) -> (AgentLoop, AgentTask, SessionContext) {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop_with_fs_tool(dir, provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "guard harness task");
+        let session = SessionContext::new(task.session_id, dir.to_path_buf());
+        (loop_, task, session)
+    }
+
+    #[tokio::test]
+    async fn tool_guard_rejects_null_arguments_with_corrective_result() {
+        // Audit stall shape: mimo-v2.5-free emits `arguments: null`. The guard
+        // must normalize to `{}`, find the required fields missing, and inject
+        // a corrective tool result instead of executing (or erroring) inside
+        // the filesystem tool.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_null".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1, "exactly one corrective tool message");
+        assert!(
+            messages[0].content.contains("Tool call invalid for 'filesystem'"),
+            "content: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("missing required field 'operation'"),
+            "content: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("one of [\"read\""),
+            "enum hint from the advertised schema: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("Please retry with corrected arguments"),
+            "content: {}",
+            messages[0].content
+        );
+        let results = messages[0].tool_results.as_ref().unwrap();
+        assert_eq!(results[0].id, "call_null");
+        assert_eq!(results[0].content["error"], "invalid_tool_arguments");
+        assert!(tool_events[0].summary.contains("invalid arguments"), "events: {tool_events:?}");
+        assert!(files_modified.is_empty(), "rejected calls must not execute");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_coerces_stringified_uppercase_arguments_and_executes() {
+        // Weak-model shape that IS repairable: stringified JSON, capitalized
+        // enum value, hallucinated extra key. After coercion the call must
+        // reach the filesystem tool and really write the file.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (mut loop_, calls) =
+            make_loop_with_counting_fs_tool(dir.path(), provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "write a file");
+        let session = SessionContext::new(task.session_id, dir.path().to_path_buf());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_coerce".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::String(
+                r#"{"operation": "WRITE", "path": "guarded.txt", "content": "hi", "rationale": "because"}"#
+                    .into(),
+            ),
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "filesystem tool executed exactly once");
+        assert!(
+            messages[0].content.contains("status: success"),
+            "content: {}",
+            messages[0].content
+        );
+        let written = dir.path().join("guarded.txt");
+        assert!(written.exists(), "coerced call must materialize the file");
+        assert!(files_modified.iter().any(|p| p.as_str().ends_with("guarded.txt")));
+        assert_eq!(file_changing_tool_count, 1, "coerced write counts as file-changing");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_bounds_corrective_retries_then_exhausts() {
+        // Two corrective retries per tool per run; the third consecutive
+        // rejection flips the message to the exhausted form so the model
+        // stops ping-ponging malformed calls.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_bad".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+        };
+        for _ in 0..3 {
+            loop_
+                .execute_single_tool_call(
+                    &tc,
+                    &task,
+                    Ulid::new(),
+                    &session,
+                    CancellationToken::new(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].content.contains("Please retry with corrected arguments"));
+        assert!(messages[1].content.contains("Please retry with corrected arguments"));
+        assert!(
+            messages[2].content.contains("Stop calling 'filesystem'"),
+            "third rejection must stop coaching: {}",
+            messages[2].content
+        );
+        let exhausted_payload = messages[2].tool_results.as_ref().unwrap()[0].content.clone();
+        assert_eq!(exhausted_payload["error"], "tool_guard_exhausted");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristically_infers_read_from_path_only_call() {
+        // Audit stall shape: the model emits `{"path": "..."}` with no
+        // `operation`. Heuristic inference fills `read` (file-like path) and
+        // the call executes instead of bouncing a corrective result.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_infer_read".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "path": "existing.txt" }),
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            messages[0].content.contains("status: success"),
+            "inferred call must execute: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("Read "),
+            "file-like path must infer read: {}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("Tool call invalid"),
+            "no corrective result expected: {}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristically_infers_write_from_content() {
+        // `content` present without `operation` infers `write`; the call
+        // executes for real and counts as file-changing.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_infer_write".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "path": "inferred.txt", "content": "hi" }),
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            messages[0].content.contains("status: success"),
+            "inferred write must execute: {}",
+            messages[0].content
+        );
+        assert!(
+            dir.path().join("inferred.txt").exists(),
+            "inferred write must materialize the file"
+        );
+        assert_eq!(file_changing_tool_count, 1, "inferred write counts as file-changing");
+        assert!(files_modified.iter().any(|p| p.as_str().ends_with("inferred.txt")));
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristically_infers_shell_command_from_cmd_alias() {
+        // Some models send `cmd` instead of `command`; the alias recovers the
+        // command and the call executes through the default shell-wrapped
+        // backend (policy/allowlist still gate it).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_extra_tools(
+            provider,
+            approval,
+            10,
+            vec![Box::new(concerto_tools::shell::ShellTool::allow_all())],
+        );
+        let task = AgentTask::new_action_required(Ulid::new(), "run a command");
+        let session = SessionContext::new(task.session_id, dir.path().to_path_buf());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_infer_cmd".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "cmd": "echo guard-heuristic-ok" }),
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            messages[0].content.contains("status: success"),
+            "alias-recovered call must execute: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("guard-heuristic-ok"),
+            "command output must be present: {}",
+            messages[0].content
+        );
     }
 
     // -----------------------------------------------------------------------

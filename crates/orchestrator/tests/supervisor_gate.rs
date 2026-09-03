@@ -356,12 +356,17 @@ async fn publish_event_assigns_sequencing_and_binds_agent() {
 
     let events = all_events(&pool).await;
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_id, "mock-event-0");
-    assert_eq!(events[1].event_id, "mock-event-1");
+    // The supervisor dispatches publish requests asynchronously, so gate_seq
+    // assignment follows completion order, not mock-event index order — assert
+    // set membership like the execute_tool sibling test, not index pairing.
+    let mut event_ids: Vec<_> = events.iter().map(|event| event.event_id.as_str()).collect();
+    event_ids.sort_unstable();
+    assert_eq!(event_ids, ["mock-event-0", "mock-event-1"]);
     assert_eq!(events[0].gate_seq, 1);
     assert_eq!(events[1].gate_seq, 2);
-    assert_eq!(events[0].agent_seq, 1);
-    assert_eq!(events[1].agent_seq, 2);
+    let mut agent_seqs: Vec<_> = events.iter().map(|event| event.agent_seq).collect();
+    agent_seqs.sort_unstable();
+    assert_eq!(agent_seqs, [1, 2]);
     for event in &events {
         assert_eq!(event.kind, WhiteboardKind::Finding);
         assert_eq!(event.agent_id, "agent-a", "wire agent_id must never be trusted");

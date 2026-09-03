@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use concerto_config::{CredentialStore, ModelSettings, ProviderConfig};
+use concerto_config::{
+    parse_tool_schema_mode, CredentialStore, ModelSettings, ProviderConfig, ToolSchemaMode,
+};
 use concerto_core::error::ProviderError;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::RoutingProfile;
@@ -14,6 +16,28 @@ use crate::ollama::OllamaProvider;
 use crate::openai::{OpenAiProvider, ReasoningEcho};
 use crate::opencode::OpenCodeZenProvider;
 use crate::openrouter::OpenRouterProvider;
+
+/// Resolve the `[providers.*] tool_schema_mode` dial for provider construction.
+///
+/// Lenient like the `reasoning_echo` dial: unset/empty/`"auto"` resolve to
+/// [`ToolSchemaMode::Auto`] silently; any other unrecognized value warns and
+/// falls back to `Auto` instead of failing the build, keeping configs
+/// forward-compatible.
+fn resolve_tool_schema_mode(config: &ProviderConfig) -> ToolSchemaMode {
+    let raw = config.tool_schema_mode.as_deref();
+    let mode = parse_tool_schema_mode(raw);
+    if let Some(raw) = raw {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if mode == ToolSchemaMode::Auto && !matches!(normalized.as_str(), "" | "auto") {
+            tracing::warn!(
+                provider = %config.provider,
+                value = %raw,
+                "unknown tool_schema_mode; falling back to \"auto\""
+            );
+        }
+    }
+    mode
+}
 
 /// Builds `Arc<dyn LlmProvider>` instances from config definitions.
 pub struct ProviderFactory;
@@ -74,7 +98,8 @@ impl ProviderFactory {
 
         // Ollama doesn't use API keys.
         if config.provider == "ollama" {
-            let mut provider = OllamaProvider::new(config.model.clone(), config.timeout_seconds);
+            let mut provider = OllamaProvider::new(config.model.clone(), config.timeout_seconds)
+                .with_tool_schema_mode(resolve_tool_schema_mode(config));
             if let Some(base) = &config.api_base {
                 provider = provider.with_base_url(base.clone());
             }
@@ -106,7 +131,8 @@ impl ProviderFactory {
         let provider: Arc<dyn LlmProvider> = match config.provider.as_str() {
             "anthropic" => {
                 let mut provider =
-                    AnthropicProvider::new(key, config.model.clone(), config.timeout_seconds);
+                    AnthropicProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 if config.cache_breakpoints {
                     provider = provider.with_cache_breakpoints(true);
                 }
@@ -114,7 +140,8 @@ impl ProviderFactory {
             }
             "openai" => {
                 let mut provider =
-                    OpenAiProvider::new(key, config.model.clone(), config.timeout_seconds);
+                    OpenAiProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -137,15 +164,19 @@ impl ProviderFactory {
                     )
                 } else {
                     OpenCodeZenProvider::new(key, config.model.clone(), config.timeout_seconds)
-                };
+                }
+                .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 Arc::new(provider)
             }
             "google" => {
+                // Google/Gemini has no loose-schema path yet; the
+                // `tool_schema_mode` dial is tolerated but inert for it.
                 Arc::new(GoogleProvider::new(key, config.model.clone(), config.timeout_seconds))
             }
             "openrouter" => {
                 let mut provider =
-                    OpenRouterProvider::new(key, config.model.clone(), config.timeout_seconds);
+                    OpenRouterProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 if let Some(echo) = reasoning_echo {
                     provider = provider.with_reasoning_echo(echo);
                 }
@@ -153,7 +184,8 @@ impl ProviderFactory {
             }
             "nim" => {
                 let mut provider =
-                    NimProvider::new(key, config.model.clone(), config.timeout_seconds);
+                    NimProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 if let Some(echo) = reasoning_echo {
                     provider = provider.with_reasoning_echo(echo);
                 }
