@@ -574,7 +574,11 @@ pub async fn load_approved_plan(
 /// Extraction is defensive: every writer (gate, agent-process children) uses
 /// its own payload shape, so fields are probed and absent ones skipped — a
 /// malformed sibling event never blocks continuity.
-fn fold_ledger(events: &[WhiteboardEvent]) -> PlanLedger {
+///
+/// `pub(crate)` so the run-continuity reader (`runtime_runner`) folds the
+/// session's gate-written events with the exact same extraction rules as the
+/// approved-plan read — one ledger grammar, two read paths.
+pub(crate) fn fold_ledger(events: &[WhiteboardEvent]) -> PlanLedger {
     let mut ledger = PlanLedger::default();
     for event in events {
         match event.kind {
