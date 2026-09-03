@@ -91,6 +91,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [61](./ADR-61-provider-layer-and-factory.md) | Provider Layer — `LlmProvider` Trait, Factory, Transport Hardening | 2026-08-18 | Accepted | One provider execution contract, one construction path, uniform transport behavior. |
 | [62](./ADR-62-tool-executor-and-virtual-fs.md) | Tool Execution Pipeline — `ToolExecutor`, Policy Gates, `VirtualFs` | 2026-08-19 | Accepted | Single auditable, policy-gated mutation boundary with staged, reversible writes. |
 | [63](./ADR-63-memory-subsystem.md) | Memory Subsystem — SQLite Hybrid Vector/FTS Retrieval | 2026-08-19 | Accepted — supersedes [ADR-10](archive/ADR-10.md) | Offline hybrid semantic + lexical retrieval over SQLite with local embeddings. |
+| [64](./ADR-64-timeline-zero-waste-orchestration.md) | Timeline-driven zero-waste orchestration | 2026-09-02 | Proposed | Durable timeline + role-agnostic semantic keys + pre-dispatch resolver; plan reuse, gap-driven research, file capsules, agent-removability. |
 
 ## Archived ADRs ([`archive/`](./archive/))
 

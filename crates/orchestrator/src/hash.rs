@@ -1,9 +1,35 @@
-//! `SubTaskHasher` — produces stable task hashes for cycle detection.
+//! Content-addressed hashing for cycle detection and semantic identity.
 //!
-//! Uses blake3 of a normalised description + sorted dependency IDs so that
-//! equivalent subtasks produce the same hash.
+//! [`SubTaskHasher`] produces stable task hashes for cycle detection using
+//! blake3 of a normalised description + sorted dependency IDs.
+//!
+//! [`normalize_description`] is the shared canonicalization used by both
+//! `SubTaskHasher` and `crate::fingerprint` (semantic keys / work-intent
+//! hashing).  Its contract is fixed: lowercase, strip non-alphanumeric
+//! characters, collapse whitespace to single spaces, trim.
 
 use concerto_core::types::TaskId;
+
+/// Canonicalize a text description for hashing.
+///
+/// **Contract** (stable — `crate::fingerprint` depends on this):
+/// 1. Lowercase the entire string.
+/// 2. Strip every character that is not alphanumeric and not whitespace.
+/// 3. Collapse runs of whitespace into a single ASCII space.
+/// 4. Trim leading/trailing whitespace.
+///
+/// Two descriptions that differ only in capitalization, punctuation, or
+/// extraneous whitespace produce the same normalised form.
+pub fn normalize_description(description: &str) -> String {
+    description
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Produces the `task_hash` consumed by `OrchestratorState` cycle detection.
 pub struct SubTaskHasher;
@@ -11,16 +37,9 @@ pub struct SubTaskHasher;
 impl SubTaskHasher {
     /// Compute a stable hash for a subtask description and its dependencies.
     ///
-    /// Normalisation: lowercase, collapse whitespace, strip punctuation.
+    /// Uses [`normalize_description`] then blake3 of `"normalised|deps"`.
     pub fn compute(description: &str, dependencies: &[TaskId]) -> String {
-        let normalised: String = description
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let normalised = normalize_description(description);
 
         let mut dep_ids: Vec<String> = dependencies.iter().map(|d| d.to_string()).collect();
         dep_ids.sort();

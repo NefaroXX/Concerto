@@ -25,6 +25,7 @@ pub mod cycle;
 pub mod cycle_manager;
 pub mod delta;
 pub mod exec_backend;
+pub mod fingerprint;
 pub mod gate;
 pub mod gate_proxy;
 pub mod graph;
@@ -44,10 +45,12 @@ pub use relationship::{
 pub mod planner;
 pub mod prompts;
 pub mod registry;
+pub mod resolver;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;
 pub mod supervisor;
+pub mod timeline;
 mod working_memory;
 
 #[path = "runtime_runner_persistent.rs"]
