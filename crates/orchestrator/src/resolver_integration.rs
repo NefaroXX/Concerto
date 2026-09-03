@@ -723,4 +723,339 @@ mod tests {
         assert_eq!(deserialized.semantic_key_hex, audit.semantic_key_hex);
         assert_eq!(deserialized.reason, audit.reason);
     }
+
+    // ==================================================================
+    // Phase 7a: Zero-waste e2e proof tests (ADR-64)
+    // ==================================================================
+
+    /// E2E zero-waste proof 1: re-running an unchanged completed graph
+    /// yields ZERO dispatches - every task short-circuits as Reuse.
+    #[test]
+    fn zero_waste_e2e_rerun_unchanged_graph_all_reused() {
+        let objective_hash = "obj-e2e";
+        let plan_version = "plan-e2e";
+
+        let dep_a = make_task("research topic A", vec![]);
+        let dep_a_id = dep_a.id;
+        let mut dep_a_result = make_result(dep_a_id, "researcher", "research A done");
+        let dep_a_output = "src/research_a.md";
+        dep_a_result.files_modified = vec![camino::Utf8PathBuf::from(dep_a_output)];
+
+        let task_a = make_task("implement feature A", vec![dep_a_id]);
+        let task_a_id = task_a.id;
+
+        let dep_b = make_task("research topic B", vec![]);
+        let dep_b_id = dep_b.id;
+        let mut dep_b_result = make_result(dep_b_id, "researcher", "research B done");
+        let dep_b_output = "src/research_b.md";
+        dep_b_result.files_modified = vec![camino::Utf8PathBuf::from(dep_b_output)];
+
+        let task_b = make_task("implement feature B", vec![dep_b_id]);
+        let task_b_id = task_b.id;
+
+        let mut graph = TaskGraph::new();
+        graph.add_root(dep_a.clone());
+        graph.add_child(task_a.clone(), dep_a_id, Dependency::MustFinishBefore);
+        graph.add_root(dep_b.clone());
+        graph.add_child(task_b.clone(), dep_b_id, Dependency::MustFinishBefore);
+
+        let mut completed_results = HashMap::new();
+        completed_results.insert(dep_a_id, dep_a_result);
+        completed_results.insert(dep_b_id, dep_b_result);
+
+        let dep_a_key =
+            SemanticKey::compute(objective_hash, plan_version, &dep_a.description, "", &[]);
+        let dep_b_key =
+            SemanticKey::compute(objective_hash, plan_version, &dep_b.description, "", &[]);
+        let key_a = SemanticKey::compute(
+            objective_hash,
+            plan_version,
+            &task_a.description,
+            "",
+            &[dep_a_key.hex().to_string()],
+        );
+        let key_b = SemanticKey::compute(
+            objective_hash,
+            plan_version,
+            &task_b.description,
+            "",
+            &[dep_b_key.hex().to_string()],
+        );
+
+        let recorded_a = vec![ArtifactFingerprint::Output {
+            path: dep_a_output.to_owned(),
+            content_hash: blake3::hash(dep_a_output.as_bytes()).to_hex().to_string(),
+        }];
+        let recorded_b = vec![ArtifactFingerprint::Output {
+            path: dep_b_output.to_owned(),
+            content_hash: blake3::hash(dep_b_output.as_bytes()).to_hex().to_string(),
+        }];
+
+        let result_a = make_result(task_a_id, "coder", "implemented feature A");
+        let result_b = make_result(task_b_id, "coder", "implemented feature B");
+        let mut projection = TimelineProjection {
+            events: Vec::new(),
+            checkpoints: Vec::new(),
+            plan_artifacts: Vec::new(),
+            completed_results: HashMap::new(),
+        };
+        projection.events.push(completed_event(
+            key_a.hex(),
+            "implemented feature A",
+            recorded_a,
+            1,
+            task_a_id,
+        ));
+        projection.events.push(completed_event(
+            key_b.hex(),
+            "implemented feature B",
+            recorded_b,
+            2,
+            task_b_id,
+        ));
+        projection.completed_results.insert(task_a_id, result_a);
+        projection.completed_results.insert(task_b_id, result_b);
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        let ready_ids =
+            vec![(task_a_id, AgentId::new("coder")), (task_b_id, AgentId::new("coder"))];
+        let expected_map = HashMap::new();
+
+        let pass = resolve_batch(
+            &ready_ids,
+            &graph,
+            &completed_results,
+            &projection,
+            objective_hash,
+            plan_version,
+            &expected_map,
+        );
+
+        assert!(
+            pass.dispatch_ids.is_empty(),
+            "zero-waste proof failed: {} task(s) dispatched instead of zero",
+            pass.dispatch_ids.len(),
+        );
+        assert_eq!(pass.reused.len(), 2, "both tasks must be short-circuited as Reuse");
+        assert!(pass.reused.contains_key(&task_a_id), "task_a reused");
+        assert!(pass.reused.contains_key(&task_b_id), "task_b reused");
+
+        for outcome in pass.reused.values() {
+            match outcome {
+                ResolverOutcome::Reused { result, audit } => {
+                    assert_eq!(audit.decision, DispatchDecision::Reuse, "verdict must be Reuse");
+                    assert!(
+                        !result.summary.is_empty(),
+                        "injected result must carry a non-empty summary"
+                    );
+                }
+                other => panic!("expected Reused, got {:?}", other),
+            }
+        }
+    }
+
+    /// E2E zero-waste proof 2 (negative): changed inputs for one task
+    /// breaks reuse for THAT task only.
+    #[test]
+    fn zero_waste_e2e_changed_input_breaks_only_that_task() {
+        let objective_hash = "obj-e2e";
+        let plan_version = "plan-e2e";
+
+        let dep_a = make_task("research topic A", vec![]);
+        let dep_a_id = dep_a.id;
+        let mut dep_a_result = make_result(dep_a_id, "researcher", "research A done");
+        let dep_a_output = "src/research_a.md";
+        dep_a_result.files_modified = vec![camino::Utf8PathBuf::from(dep_a_output)];
+
+        let task_a = make_task("implement feature A", vec![dep_a_id]);
+        let task_a_id = task_a.id;
+
+        let dep_b = make_task("research topic B", vec![]);
+        let dep_b_id = dep_b.id;
+        let mut dep_b_result = make_result(dep_b_id, "researcher", "research B done");
+        let dep_b_output = "src/research_b.md";
+        dep_b_result.files_modified = vec![camino::Utf8PathBuf::from(dep_b_output)];
+
+        let task_b = make_task("implement feature B", vec![dep_b_id]);
+        let task_b_id = task_b.id;
+
+        let mut graph = TaskGraph::new();
+        graph.add_root(dep_a.clone());
+        graph.add_child(task_a.clone(), dep_a_id, Dependency::MustFinishBefore);
+        graph.add_root(dep_b.clone());
+        graph.add_child(task_b.clone(), dep_b_id, Dependency::MustFinishBefore);
+
+        let mut completed_results = HashMap::new();
+        completed_results.insert(dep_a_id, dep_a_result);
+        completed_results.insert(dep_b_id, dep_b_result);
+
+        let dep_a_key =
+            SemanticKey::compute(objective_hash, plan_version, &dep_a.description, "", &[]);
+        let dep_b_key =
+            SemanticKey::compute(objective_hash, plan_version, &dep_b.description, "", &[]);
+        let key_a = SemanticKey::compute(
+            objective_hash,
+            plan_version,
+            &task_a.description,
+            "",
+            &[dep_a_key.hex().to_string()],
+        );
+        let key_b = SemanticKey::compute(
+            objective_hash,
+            plan_version,
+            &task_b.description,
+            "",
+            &[dep_b_key.hex().to_string()],
+        );
+
+        let recorded_a = vec![ArtifactFingerprint::Output {
+            path: dep_a_output.to_owned(),
+            content_hash: blake3::hash(dep_a_output.as_bytes()).to_hex().to_string(),
+        }];
+        let stale_hash = blake3::hash("old-research-b-content".as_bytes()).to_hex().to_string();
+        let recorded_b = vec![ArtifactFingerprint::Output {
+            path: dep_b_output.to_owned(),
+            content_hash: stale_hash,
+        }];
+
+        let result_a = make_result(task_a_id, "coder", "implemented feature A");
+        let result_b = make_result(task_b_id, "coder", "implemented feature B");
+        let mut projection = TimelineProjection {
+            events: Vec::new(),
+            checkpoints: Vec::new(),
+            plan_artifacts: Vec::new(),
+            completed_results: HashMap::new(),
+        };
+        projection.events.push(completed_event(
+            key_a.hex(),
+            "implemented feature A",
+            recorded_a,
+            1,
+            task_a_id,
+        ));
+        projection.events.push(completed_event(
+            key_b.hex(),
+            "implemented feature B",
+            recorded_b,
+            2,
+            task_b_id,
+        ));
+        projection.completed_results.insert(task_a_id, result_a);
+        projection.completed_results.insert(task_b_id, result_b);
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        let ready_ids =
+            vec![(task_a_id, AgentId::new("coder")), (task_b_id, AgentId::new("coder"))];
+        let expected_map = HashMap::new();
+
+        let pass = resolve_batch(
+            &ready_ids,
+            &graph,
+            &completed_results,
+            &projection,
+            objective_hash,
+            plan_version,
+            &expected_map,
+        );
+
+        assert!(pass.reused.contains_key(&task_a_id), "task_a must be reused (inputs unchanged)");
+        assert_eq!(pass.dispatch_ids.len(), 1, "one task dispatched (task_b with stale inputs)");
+        assert_eq!(pass.dispatch_ids[0].0, task_b_id, "task_b dispatched due to changed inputs");
+    }
+
+    /// E2E zero-waste proof 3 (partial reuse): one task reused, two
+    /// dispatched in a single batch.
+    #[test]
+    fn zero_waste_e2e_partial_reuse_mixed_outcomes() {
+        let objective_hash = "obj-e2e";
+        let plan_version = "plan-e2e";
+
+        let dep_a = make_task("research for A", vec![]);
+        let dep_a_id = dep_a.id;
+        let mut dep_a_result = make_result(dep_a_id, "researcher", "research done");
+        let dep_a_output = "src/research_a.md";
+        dep_a_result.files_modified = vec![camino::Utf8PathBuf::from(dep_a_output)];
+
+        let task_a = make_task("implement feature A", vec![dep_a_id]);
+        let task_a_id = task_a.id;
+
+        let task_b = make_task("implement feature B", vec![]);
+        let task_b_id = task_b.id;
+
+        let task_c = make_task("implement feature C", vec![]);
+        let task_c_id = task_c.id;
+
+        let mut graph = TaskGraph::new();
+        graph.add_root(dep_a.clone());
+        graph.add_child(task_a.clone(), dep_a_id, Dependency::MustFinishBefore);
+        graph.add_root(task_b.clone());
+        graph.add_root(task_c.clone());
+
+        let mut completed_results = HashMap::new();
+        completed_results.insert(dep_a_id, dep_a_result);
+
+        let dep_a_key =
+            SemanticKey::compute(objective_hash, plan_version, &dep_a.description, "", &[]);
+        let key_a = SemanticKey::compute(
+            objective_hash,
+            plan_version,
+            &task_a.description,
+            "",
+            &[dep_a_key.hex().to_string()],
+        );
+        let key_b =
+            SemanticKey::compute(objective_hash, plan_version, &task_b.description, "", &[]);
+
+        let result_a = make_result(task_a_id, "coder", "implemented feature A");
+        let mut projection = TimelineProjection {
+            events: Vec::new(),
+            checkpoints: Vec::new(),
+            plan_artifacts: Vec::new(),
+            completed_results: HashMap::new(),
+        };
+
+        let recorded_a = vec![ArtifactFingerprint::Output {
+            path: dep_a_output.to_owned(),
+            content_hash: blake3::hash(dep_a_output.as_bytes()).to_hex().to_string(),
+        }];
+        projection.events.push(completed_event(
+            key_a.hex(),
+            "implemented feature A",
+            recorded_a,
+            1,
+            task_a_id,
+        ));
+        projection.events.push(completed_event(
+            key_b.hex(),
+            "implemented feature B",
+            vec![],
+            2,
+            task_b_id,
+        ));
+        projection.completed_results.insert(task_a_id, result_a);
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        let ready_ids = vec![
+            (task_a_id, AgentId::new("coder")),
+            (task_b_id, AgentId::new("coder")),
+            (task_c_id, AgentId::new("coder")),
+        ];
+        let expected_map = HashMap::new();
+
+        let pass = resolve_batch(
+            &ready_ids,
+            &graph,
+            &completed_results,
+            &projection,
+            objective_hash,
+            plan_version,
+            &expected_map,
+        );
+
+        assert!(pass.reused.contains_key(&task_a_id), "task_a must be reused");
+        let dispatched_ids: Vec<TaskId> = pass.dispatch_ids.iter().map(|(id, _)| *id).collect();
+        assert_eq!(dispatched_ids.len(), 2, "two tasks dispatched");
+        assert!(dispatched_ids.contains(&task_b_id), "task_b dispatched");
+        assert!(dispatched_ids.contains(&task_c_id), "task_c dispatched");
+    }
 }

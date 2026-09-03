@@ -300,10 +300,7 @@ mod tests {
         let mut projection = empty_projection();
 
         let dep_id = task_id("01HXYZ00000000000000000010");
-        let result_files = vec![
-            Utf8PathBuf::from("src/a.rs"),
-            Utf8PathBuf::from("src/b.rs"),
-        ];
+        let result_files = vec![Utf8PathBuf::from("src/a.rs"), Utf8PathBuf::from("src/b.rs")];
         projection.completed_results.insert(
             dep_id,
             AgentRunResult {
