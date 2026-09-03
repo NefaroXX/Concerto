@@ -192,6 +192,47 @@ impl OpenAiStreamState {
         }
     }
 
+    /// Feed a non-streamed completion body through the stream reducer.
+    ///
+    /// A `stream: false` response carries the full assistant turn in
+    /// `choices[].message` (complete `tool_calls` entries, no `index`)
+    /// instead of the streamed `choices[].delta` fragments. Rewriting the
+    /// body into the delta shape lets the existing reducer handle both
+    /// transports: reasoning capture (ADR-46), argument-string coercion to
+    /// objects, loose-schema un-flattening, and `usage` attached to the
+    /// terminal chunk all apply unchanged.
+    fn handle_non_stream_body(&mut self, mut parsed: serde_json::Value) {
+        if let Some(choices) = parsed.get_mut("choices").and_then(serde_json::Value::as_array_mut) {
+            for choice in choices.iter_mut() {
+                let Some(choice_object) = choice.as_object_mut() else { continue };
+                let Some(message) = choice_object.remove("message") else { continue };
+                let mut delta = message;
+                if let Some(tool_calls) =
+                    delta.get_mut("tool_calls").and_then(serde_json::Value::as_array_mut)
+                {
+                    for (index, call) in tool_calls.iter_mut().enumerate() {
+                        if let Some(call_object) = call.as_object_mut() {
+                            call_object.insert("index".to_owned(), serde_json::Value::from(index));
+                        }
+                    }
+                }
+                choice_object.insert("delta".to_owned(), delta);
+            }
+        }
+        self.handle_event(crate::sse::SseEvent {
+            event: None,
+            data: Some(parsed.to_string()),
+            id: None,
+            keepalive: false,
+        });
+        self.handle_event(crate::sse::SseEvent {
+            event: None,
+            data: Some("[DONE]".to_string()),
+            id: None,
+            keepalive: false,
+        });
+    }
+
     fn handle_event(&mut self, event: crate::sse::SseEvent) {
         if event.keepalive {
             // Liveness signal (SSE comment line): emit an empty chunk so the
@@ -368,20 +409,33 @@ impl LlmProvider for OpenAiProvider {
         let model =
             if request.model.is_empty() { self.model.clone() } else { request.model.clone() };
 
-        // Adaptive tool schemas (weak-model tier): when the resolved model
-        // matches the loose tier, rewrite the request's tool definitions in
-        // place before the dialect renders the body. Strict models are
-        // untouched — their wire output stays byte-identical.
+        // Adaptive tool schemas + non-streamed transport (weak-model tier):
+        // when the resolved model matches the loose tier, rewrite the
+        // request's tool definitions in place before the dialect renders the
+        // body AND request the completion non-streamed so tool-call
+        // arguments arrive whole. Strict models are untouched — their wire
+        // output stays byte-identical (streamed).
         let mut request = request;
-        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+        let tool_adapted = crate::adapters::schema_loose::non_streaming_transport_active(
             self.tool_schema_mode,
             &model,
         );
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);
+                tracing::debug!(
+                    model = %model,
+                    tools = tools.len(),
+                    "weak-model loose tool schemas applied (flattened + examples)"
+                );
             }
+            request.stream = false;
+            tracing::info!(
+                model = %model,
+                "weak tool-calling model: requesting non-streamed completion (stream=false)"
+            );
         }
+        let non_streamed = !request.stream;
 
         let body = self.dialect.render_chat_body(&request, &model, self.reasoning_echo);
 
@@ -409,6 +463,34 @@ impl LlmProvider for OpenAiProvider {
         let mut state = OpenAiStreamState::new();
         if tool_adapted {
             state.tool_adapted = true;
+        }
+
+        // Non-streamed responses (weak-model tier, or any request rendered
+        // with `stream: false`) carry a single JSON completion object instead
+        // of an SSE event stream: read the whole body and reduce it through
+        // the same stream state so downstream chunk shapes stay identical.
+        if non_streamed {
+            let body_text = tokio::select! {
+                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                result = response.text() => result.map_err(|e| {
+                    ProviderError::Network(format!(
+                        "failed to read response body: {}",
+                        describe_error_chain(&e)
+                    ))
+                })?,
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+                ProviderError::Other(format!("invalid JSON in non-streamed completion body: {e}"))
+            })?;
+            state.handle_non_stream_body(parsed);
+            let s = stream! {
+                let mut state = state;
+                while let Some(item) = state.pending.pop_front() {
+                    yield item;
+                }
+            }
+            .boxed();
+            return Ok(s);
         }
 
         let s = stream! {
@@ -784,5 +866,114 @@ mod tests {
         let chunks: Vec<CompletionChunk> =
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         assert_eq!(chunks.last().unwrap().usage, None);
+    }
+
+    /// A non-streamed completion body (`stream: false`, the weak-model
+    /// transport) reduces to the same canonical chunk shapes as a streamed
+    /// response: content, ONE whole tool-call arguments object, the
+    /// accumulated reasoning, and a terminal chunk carrying `usage`.
+    #[test]
+    fn non_stream_body_reduces_to_whole_tool_call_and_final() {
+        let mut state = OpenAiStreamState::new();
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Running the tests.",
+                        "reasoning_content": "thinking it through",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": "{\"command\": \"cargo test\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 5}
+            }"#,
+        )
+        .expect("fixture parses");
+
+        state.handle_non_stream_body(body);
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+
+        let content = chunks.iter().find(|c| !c.delta.is_empty()).expect("content chunk");
+        assert_eq!(content.delta, "Running the tests.");
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(
+            tool.arguments,
+            serde_json::json!({"command": "cargo test"}),
+            "arguments must arrive as ONE whole object, not truncated deltas"
+        );
+
+        let reasoning = chunks.iter().find_map(|c| c.reasoning.clone()).expect("reasoning chunk");
+        assert_eq!(reasoning, "thinking it through");
+
+        let final_chunk = chunks.iter().find(|c| c.is_final).expect("terminal chunk");
+        assert_eq!(
+            final_chunk.usage,
+            Some(CompletionUsage { prompt_tokens: Some(11), completion_tokens: Some(5) })
+        );
+    }
+
+    /// On the weak-model tier (`tool_adapted`), whole arguments emitted by a
+    /// non-streamed completion still get dot-notation keys re-nested before
+    /// leaving the connector — same as on the streamed transport.
+    #[test]
+    fn non_stream_body_unflattens_dotted_arguments_when_adapted() {
+        let mut state = OpenAiStreamState::new();
+        state.tool_adapted = true;
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "runner",
+                                "arguments": "{\"config.mode\": \"fast\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+        )
+        .expect("fixture parses");
+
+        state.handle_non_stream_body(body);
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(
+            tool.arguments,
+            serde_json::json!({"config": {"mode": "fast"}}),
+            "dotted arguments must be re-nested on the non-streamed transport too"
+        );
+    }
+
+    /// A non-streamed body without a `message` (degenerate response) must not
+    /// panic or emit phantom content: only the `[DONE]` terminator is
+    /// produced.
+    #[test]
+    fn non_stream_body_without_message_yields_final_only() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_non_stream_body(serde_json::json!({"choices": []}));
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        assert_eq!(chunks.len(), 1, "only the final chunk");
+        assert!(chunks[0].is_final);
     }
 }

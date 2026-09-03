@@ -133,7 +133,11 @@ impl Dialect for OllamaChatDialect {
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
-            "stream": true,
+            // The request's `stream` flag is honored on the wire: the
+            // weak-model tier (see `schema_loose::non_streaming_transport_active`)
+            // forces `false` in the connector so tool-call arguments arrive
+            // whole instead of as streamed deltas.
+            "stream": request.stream,
         });
 
         if let Some(temp) = request.temperature {
@@ -298,10 +302,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_is_always_true() {
-        let request = CompletionRequest { stream: false, ..Default::default() };
-        let body = render(&request, "llama3.3");
-        assert_eq!(body["stream"], true);
+    fn stream_flag_is_honored() {
+        let streaming = CompletionRequest { stream: true, ..Default::default() };
+        assert_eq!(render(&streaming, "llama3.3")["stream"], true);
+
+        // `stream: false` renders verbatim — this is how weak-model
+        // completions are requested non-streamed so their tool-call
+        // arguments arrive whole.
+        let non_streaming = CompletionRequest { stream: false, ..Default::default() };
+        assert_eq!(render(&non_streaming, "llama3.3")["stream"], false);
     }
 
     #[test]
@@ -467,6 +476,8 @@ mod tests {
                     tokens_out: None,
                 },
             ],
+            // Streaming is the default transport; the golden body reflects it.
+            stream: true,
             ..Default::default()
         };
         let body = render(&request, "gemma3");

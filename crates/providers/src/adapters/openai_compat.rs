@@ -57,7 +57,11 @@ impl Dialect for OpenAiChatDialect {
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
-            "stream": true,
+            // The request's `stream` flag is honored on the wire: the
+            // weak-model tier (see `schema_loose::non_streaming_transport_active`)
+            // forces `false` in the connector so tool-call arguments arrive
+            // whole instead of as streamed deltas.
+            "stream": request.stream,
         });
 
         if let Some(temp) = request.temperature {
@@ -428,6 +432,16 @@ mod tests {
         assert_eq!(body["stream"], true);
     }
 
+    /// The request's `stream` flag is honored on the wire: `false` renders
+    /// `"stream": false`, which is how weak-model completions are requested
+    /// non-streamed so their tool-call arguments arrive whole.
+    #[test]
+    fn stream_false_is_honored_in_body() {
+        let request = CompletionRequest { stream: false, ..Default::default() };
+        let body = render(&request, ReasoningEcho::IfPresent);
+        assert_eq!(body["stream"], false);
+    }
+
     #[test]
     fn model_is_set_in_body() {
         let request = CompletionRequest::default();
@@ -565,6 +579,8 @@ mod tests {
                     tokens_out: None,
                 },
             ],
+            // Streaming is the default transport; the golden body reflects it.
+            stream: true,
             ..Default::default()
         };
         let body = render(&request, ReasoningEcho::IfPresent);
