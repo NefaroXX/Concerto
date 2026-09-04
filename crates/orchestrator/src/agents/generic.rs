@@ -1832,9 +1832,13 @@ fn guard_coordinator_tool_call(
         }
     }
 
+    // Live-proven (Sep 2026 audit): zero-argument calls never correct on
+    // coaching — fail fast instead of burning the retry budget. Partial args
+    // keep bounded retries; the example can guide those repairs.
+    let has_keys = parsed.as_object().is_some_and(|map| !map.is_empty());
     let reject_count = guard_rejects.entry(tool_name.to_string()).or_insert(0);
     *reject_count += 1;
-    let exhausted = *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+    let exhausted = !has_keys || *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
     let content = tool_guard::corrective_message_text(tool_name, &errors, schema, exhausted);
     let payload = tool_guard::corrective_tool_result(tool_name, &errors, schema, exhausted);
     tracing::warn!(
@@ -3811,11 +3815,10 @@ mod tests {
         assert_eq!(result.tool_call_count, 1, "the rejected call still counts as a tool call");
         assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
         let payload = provider
-            .guard_reject_payload("invalid_tool_arguments")
-            .expect("corrective payload must reach the model");
+            .guard_reject_payload("tool_guard_exhausted")
+            .expect("exhausted payload must reach the model");
         assert_eq!(payload["tool"], "filesystem");
-        assert_eq!(payload["recovery"], "correct_and_retry");
-        assert_eq!(payload["example"]["operation"], "read");
+        assert_eq!(payload["recovery"], "stop_or_ask_user");
         assert!(
             payload["field_errors"].as_array().is_some_and(|errors| !errors.is_empty()),
             "field errors: {payload}"
@@ -3934,9 +3937,9 @@ mod tests {
         assert_eq!(result.tool_call_count, 2, "filesystem call + submission");
         assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
         let payload = provider
-            .guard_reject_payload("invalid_tool_arguments")
-            .expect("corrective payload must reach the model on the submission path");
+            .guard_reject_payload("tool_guard_exhausted")
+            .expect("exhausted payload must reach the model on the submission path");
         assert_eq!(payload["tool"], "filesystem");
-        assert_eq!(payload["recovery"], "correct_and_retry");
+        assert_eq!(payload["recovery"], "stop_or_ask_user");
     }
 }

@@ -1374,9 +1374,14 @@ impl AgentLoop {
             }
         }
 
+        // Live-proven (Sep 2026 audit): a model emitting zero-argument calls
+        // never corrects on coaching — retries only burn iterations. Fail
+        // fast on empty args; keep bounded retries for partial args (some
+        // keys present), where the example can actually guide a repair.
+        let has_keys = parsed.as_object().is_some_and(|map| !map.is_empty());
         let reject_count = self.tool_guard_rejects.entry(tc.name.clone()).or_insert(0);
         *reject_count += 1;
-        let exhausted = *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+        let exhausted = !has_keys || *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
         let content = tool_guard::corrective_message_text(&tc.name, &errors, schema, exhausted);
         let payload = tool_guard::corrective_tool_result(&tc.name, &errors, schema, exhausted);
         tracing::warn!(
@@ -3904,7 +3909,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(messages.len(), 1, "exactly one corrective tool message");
+        assert_eq!(messages.len(), 1, "exactly one exhausted tool message");
         assert!(
             messages[0].content.contains("Tool call invalid for 'filesystem'"),
             "content: {}",
@@ -3916,18 +3921,13 @@ mod tests {
             messages[0].content
         );
         assert!(
-            messages[0].content.contains("one of [\"read\""),
-            "enum hint from the advertised schema: {}",
-            messages[0].content
-        );
-        assert!(
-            messages[0].content.contains("Please retry with corrected arguments"),
-            "content: {}",
+            messages[0].content.contains("Stop calling 'filesystem'"),
+            "empty args fail fast with no coaching: {}",
             messages[0].content
         );
         let results = messages[0].tool_results.as_ref().unwrap();
         assert_eq!(results[0].id, "call_null");
-        assert_eq!(results[0].content["error"], "invalid_tool_arguments");
+        assert_eq!(results[0].content["error"], "tool_guard_exhausted");
         assert!(tool_events[0].summary.contains("invalid arguments"), "events: {tool_events:?}");
         assert!(files_modified.is_empty(), "rejected calls must not execute");
     }
@@ -3988,8 +3988,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_guard_bounds_corrective_retries_then_exhausts() {
-        // Two corrective retries per tool per run; the third consecutive
-        // rejection flips the message to the exhausted form so the model
+        // Partial args get two corrective retries per tool per run; the third
+        // consecutive rejection flips to the exhausted form so the model
         // stops ping-ponging malformed calls.
         let dir = tempfile::tempdir().unwrap();
         let (mut loop_, task, session) = guard_test_harness(dir.path());
@@ -4002,7 +4002,8 @@ mod tests {
         let tc = ToolCall {
             id: "call_bad".into(),
             name: "filesystem".into(),
-            arguments: serde_json::Value::Null,
+            // Partial args (unknown key only): retries apply.
+            arguments: serde_json::json!({"bogus": 1}),
         };
         for _ in 0..3 {
             loop_
@@ -4032,6 +4033,49 @@ mod tests {
         );
         let exhausted_payload = messages[2].tool_results.as_ref().unwrap()[0].content.clone();
         assert_eq!(exhausted_payload["error"], "tool_guard_exhausted");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_fails_fast_on_empty_arguments() {
+        // Live-proven (Sep 2026 audit): zero-argument calls never correct on
+        // coaching — the first rejection is already exhausted, no retries.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_empty".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].content.contains("Stop calling 'filesystem'"),
+            "empty args must fail fast: {}",
+            messages[0].content
+        );
+        let payload = messages[0].tool_results.as_ref().unwrap()[0].content.clone();
+        assert_eq!(payload["error"], "tool_guard_exhausted");
     }
 
     #[tokio::test]
