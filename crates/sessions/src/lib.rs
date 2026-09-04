@@ -9,10 +9,15 @@ pub mod audit;
 pub mod plan_bindings;
 pub mod plans;
 pub mod replay;
+pub mod resource_facts;
 pub mod spend;
 pub mod whiteboard;
 
 pub use plan_bindings::PlanBindingRecord;
+pub use resource_facts::{
+    ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
+    WorkspaceSnapshotPayload,
+};
 pub use whiteboard::{
     NewWhiteboardEvent, WhiteboardEvent, WhiteboardKind, WhiteboardScope, WhiteboardSubscription,
 };

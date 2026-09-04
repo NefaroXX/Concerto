@@ -51,6 +51,11 @@ pub enum WhiteboardKind {
     ReviewState,
     Consolidation,
     MemoryFact,
+    // ADR-65 evidence spine (additive). These are runtime-appended observed
+    // facts; older binaries reading the log see them as unknown kinds and must
+    // treat them as opaque — already the case for the JSON payload design.
+    ToolExecuted,
+    WorkspaceSnapshot,
 }
 
 impl WhiteboardKind {
@@ -74,6 +79,8 @@ impl WhiteboardKind {
             Self::ReviewState => "review-state",
             Self::Consolidation => "consolidation",
             Self::MemoryFact => "memory-fact",
+            Self::ToolExecuted => "tool-executed",
+            Self::WorkspaceSnapshot => "workspace-snapshot",
         }
     }
 
@@ -1011,6 +1018,8 @@ mod tests {
             (WhiteboardKind::ReviewState, "review-state"),
             (WhiteboardKind::Consolidation, "consolidation"),
             (WhiteboardKind::MemoryFact, "memory-fact"),
+            (WhiteboardKind::ToolExecuted, "tool-executed"),
+            (WhiteboardKind::WorkspaceSnapshot, "workspace-snapshot"),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.as_str(), expected, "as_str kebab-case");
@@ -1020,6 +1029,59 @@ mod tests {
                 "serde kebab-case"
             );
         }
+    }
+
+    /// ADR-65 evidence-spine kinds are ordinary log kinds: they append, load
+    /// back, dedup by event_id, and their payload survives the JSON round trip
+    /// exactly like the established kinds.
+    #[tokio::test]
+    async fn adr65_evidence_kinds_round_trip_through_the_log() {
+        let (_dir, pool) = test_pool(1).await;
+
+        let mut executed = new_event("ev-1", "agent-a", WhiteboardKind::ToolExecuted);
+        executed.payload = json!({
+            "tool": "apply_diff",
+            "args": { "path": "a.md" },
+            "success": true,
+            "generation": 3,
+            "paths": [{ "path": "a.md", "content_hash": "h1" }]
+        });
+        let mut snapshot = new_event("ev-2", "agent-a", WhiteboardKind::WorkspaceSnapshot);
+        snapshot.payload = json!({
+            "generation": 3,
+            "files": [{ "path": "a.md", "size_bytes": 42, "content_hash": "h1" }]
+        });
+
+        let stored_exec = append_whiteboard_event(&pool, &executed).await.expect("append executed");
+        let stored_snap = append_whiteboard_event(&pool, &snapshot).await.expect("append snapshot");
+
+        // Kinds serialize kebab-case on the wire.
+        assert_eq!(serde_json::to_value(stored_exec.kind).expect("kind"), json!("tool-executed"));
+        assert_eq!(
+            serde_json::to_value(stored_snap.kind).expect("kind"),
+            json!("workspace-snapshot")
+        );
+
+        // They are ordinary log rows: dedup by event_id, ordered by gate_seq.
+        let replay = append_whiteboard_event(&pool, &executed).await.expect("replay executed");
+        assert_eq!(replay.event_id, "ev-1", "dedup keeps the original row");
+        assert_eq!(replay.gate_seq, 1, "the duplicate did not advance the log");
+
+        let loaded =
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default()).await.expect("load");
+        assert_eq!(
+            loaded.iter().map(|ev| ev.kind).collect::<Vec<_>>(),
+            vec![WhiteboardKind::ToolExecuted, WhiteboardKind::WorkspaceSnapshot],
+            "both evidence kinds load back in append order"
+        );
+
+        // Nested evidence payloads survive the JSON round trip.
+        let decoded: WhiteboardEvent =
+            serde_json::from_str(&serde_json::to_string(&stored_snap).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(decoded.payload["files"][0]["path"], json!("a.md"));
+        assert_eq!(decoded.payload["files"][0]["size_bytes"], json!(42));
+        assert_eq!(decoded.payload["generation"], json!(3));
     }
 
     #[tokio::test]
