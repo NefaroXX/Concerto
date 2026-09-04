@@ -3845,6 +3845,14 @@ async fn run_multi_agent(
     // never resolve a serving pipe for unassigned roles, so tier 1 would be
     // skipped (or, worse, dispatch across pipes).
     .with_default_provider_config_id(Some(ProviderFactory::config_id(default_provider_config)));
+    // Run-continuity Phase 1: the coordinator persists resumable checkpoints
+    // (and reads them back on `continue`) through the session store. Without
+    // this the store stays `None`, `persist_checkpoint` silently no-ops, and
+    // stalled runs leave zero resumable state.
+    coordinator = coordinator.with_checkpoint_store(
+        session_store.clone(),
+        current_source_revision(&req.project_dir).await,
+    );
     // ADR-45 §4: user-configurable ladder knobs.
     if let Some(multi_agent) = &services.config.multi_agent {
         coordinator = coordinator.with_default_model_fallback(multi_agent.default_model_fallback);

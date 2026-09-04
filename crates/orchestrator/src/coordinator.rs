@@ -1311,6 +1311,15 @@ impl CoordinatorAgent {
 
     async fn persist_checkpoint(&self, checkpoint: &checkpoint::GraphCheckpoint) {
         let Some(store) = &self.session_store else {
+            // Never silent: a coordinator without a session store cannot
+            // leave resumable state, so `continue` can never resume it.
+            // (Live miss, Sep 2026: run_multi_agent never attached the
+            // store and stalled runs persisted zero rows with zero logs.)
+            tracing::warn!(
+                session_id = %checkpoint.session_id,
+                "no session store attached — orchestration checkpoint not persisted; \
+                 stalled runs will not be resumable"
+            );
             return;
         };
         let Ok(state_json) = serde_json::to_string(checkpoint) else {
