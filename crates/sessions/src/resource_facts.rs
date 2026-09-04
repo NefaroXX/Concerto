@@ -87,9 +87,10 @@ pub struct ToolExecutedPayload {
     pub success: bool,
     #[serde(default)]
     pub exit_code: Option<i32>,
-    /// Workspace `generation` at execution time.
+    /// Workspace `generation` (content-addressed string id, ADR-65) at
+    /// execution time.
     #[serde(default)]
-    pub generation: u64,
+    pub generation: String,
     /// The paths this tool execution affected/observed.
     #[serde(default)]
     pub paths: Vec<ObservedPath>,
@@ -99,9 +100,10 @@ pub struct ToolExecutedPayload {
 /// inventory taken before planning begins (ADR-65 §2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshotPayload {
-    /// Workspace `generation` id the snapshot captures.
+    /// Workspace `generation` (content-addressed string id, ADR-65 §2) the
+    /// snapshot captures.
     #[serde(default)]
-    pub generation: u64,
+    pub generation: String,
     /// The inventory entries.
     #[serde(default)]
     pub files: Vec<SnapshotEntry>,
@@ -115,8 +117,9 @@ pub struct WorkspaceSnapshotPayload {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceFactRow {
     pub path: String,
-    /// Workspace `generation` of the latest observation.
-    pub generation: u64,
+    /// Workspace `generation` (content-addressed string id) of the latest
+    /// observation.
+    pub generation: String,
     /// Observed byte size; `None` when not recorded.
     pub size_bytes: Option<u64>,
     /// Observed mtime (unix epoch ms); `None` when not recorded.
@@ -140,7 +143,7 @@ pub struct ResourceFactRow {
 #[derive(Debug, PartialEq, sqlx::FromRow)]
 struct ResourceFactRowDb {
     path: String,
-    generation: i64,
+    generation: String,
     size_bytes: Option<i64>,
     mtime_ms: Option<i64>,
     content_hash: Option<String>,
@@ -156,9 +159,7 @@ impl TryFrom<ResourceFactRowDb> for ResourceFactRow {
     fn try_from(row: ResourceFactRowDb) -> Result<Self, SessionError> {
         Ok(Self {
             path: row.path,
-            generation: u64::try_from(row.generation).map_err(|_| {
-                SessionError::Storage("negative generation in resource_facts".to_string())
-            })?,
+            generation: row.generation,
             size_bytes: row.size_bytes.map(u64::try_from).transpose().map_err(|_| {
                 SessionError::Storage("negative size_bytes in resource_facts".to_string())
             })?,
@@ -181,8 +182,9 @@ struct CleanObservation<'a> {
     agent_id: &'a str,
     /// Unix epoch ms of the observation event (`created_at`).
     observed_at: i64,
-    /// Workspace generation captured by the observation.
-    generation: u64,
+    /// Workspace generation (content-addressed string id) captured by the
+    /// observation.
+    generation: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +234,7 @@ async fn upsert_clean_row(
              dirty         = 0",
     )
     .bind(path)
-    .bind(to_i64(obs.generation)?)
+    .bind(obs.generation.as_str())
     .bind(size_bytes.map(to_i64).transpose()?)
     .bind(mtime_ms.map(to_i64).transpose()?)
     .bind(content_hash)
@@ -368,8 +370,12 @@ impl ResourceFacts {
         if payload.paths.is_empty() {
             return Ok(());
         }
-        let obs =
-            CleanObservation { event_id, agent_id, observed_at, generation: payload.generation };
+        let obs = CleanObservation {
+            event_id,
+            agent_id,
+            observed_at,
+            generation: payload.generation.clone(),
+        };
         let mut tx = self.pool.begin().await?;
         for path in &payload.paths {
             check_cancel(cancel)?;
@@ -399,8 +405,12 @@ impl ResourceFacts {
         cancel: &CancellationToken,
     ) -> Result<(), SessionError> {
         check_cancel(cancel)?;
-        let obs =
-            CleanObservation { event_id, agent_id, observed_at, generation: payload.generation };
+        let obs = CleanObservation {
+            event_id,
+            agent_id,
+            observed_at,
+            generation: payload.generation.clone(),
+        };
         let mut tx = self.pool.begin().await?;
         reconcile_snapshot(&mut tx, &obs, &payload.files).await?;
         tx.commit().await?;
@@ -461,7 +471,7 @@ impl ResourceFacts {
                 event_id: &event.event_id,
                 agent_id: &event.agent_id,
                 observed_at: event.created_at,
-                generation: 0,
+                generation: String::new(),
             };
             match event.kind {
                 WhiteboardKind::ToolExecuted => {
@@ -541,7 +551,7 @@ mod tests {
         CancellationToken::new()
     }
 
-    fn observed(path: &str, hash: &str, generation: u64) -> ToolExecutedPayload {
+    fn observed(path: &str, hash: &str, generation: &str) -> ToolExecutedPayload {
         ToolExecutedPayload {
             agent_id: Some("agent-a".to_owned()),
             task_id: None,
@@ -550,7 +560,7 @@ mod tests {
             args: json!({ "path": path }),
             success: true,
             exit_code: Some(0),
-            generation,
+            generation: generation.to_owned(),
             paths: vec![ObservedPath {
                 path: path.to_owned(),
                 size_bytes: Some(42),
@@ -627,6 +637,16 @@ mod tests {
             ]
         );
 
+        // The workspace generation is a content-addressed string id (ADR-65
+        // §2), so the column is TEXT, not INTEGER.
+        let generation_type: String = sqlx::query_scalar(
+            "SELECT type FROM pragma_table_info('resource_facts') WHERE name = 'generation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("generation column type query");
+        assert_eq!(generation_type, "TEXT", "generation column stores the string id");
+
         // A fresh table is empty.
         let store = ResourceFacts::new(pool);
         assert!(store.lookup("a.md", &token()).await.expect("lookup").is_none());
@@ -642,14 +662,14 @@ mod tests {
                 "ev-1",
                 "agent-a",
                 1_700_000_000_000,
-                &observed("a.md", "h1", 1),
+                &observed("a.md", "h1", "1"),
                 &token(),
             )
             .await
             .expect("observe");
 
         let row = store.lookup("a.md", &token()).await.expect("lookup").expect("row");
-        assert_eq!(row.generation, 1);
+        assert_eq!(row.generation, "1");
         assert_eq!(row.size_bytes, Some(42));
         assert_eq!(row.mtime_ms, Some(1_000));
         assert_eq!(row.content_hash.as_deref(), Some("h1"));
@@ -676,7 +696,7 @@ mod tests {
                 "ev-1",
                 "agent-a",
                 1_700_000_000_000,
-                &observed("a.md", "h1", 1),
+                &observed("a.md", "h1", "1"),
                 &token(),
             )
             .await
@@ -686,14 +706,14 @@ mod tests {
                 "ev-2",
                 "agent-b",
                 1_700_000_000_001,
-                &observed("a.md", "h2", 2),
+                &observed("a.md", "h2", "2"),
                 &token(),
             )
             .await
             .expect("second observation");
 
         let row = store.lookup("a.md", &token()).await.expect("lookup").expect("row");
-        assert_eq!(row.generation, 2);
+        assert_eq!(row.generation, "2");
         assert_eq!(row.content_hash.as_deref(), Some("h2"));
         assert_eq!(row.last_event_id.as_deref(), Some("ev-2"));
         assert_eq!(row.last_agent_id.as_deref(), Some("agent-b"));
@@ -710,7 +730,7 @@ mod tests {
                 "ev-1",
                 "agent-a",
                 1_700_000_000_000,
-                &observed("a.md", "h1", 1),
+                &observed("a.md", "h1", "1"),
                 &token(),
             )
             .await
@@ -735,14 +755,14 @@ mod tests {
         let (_dir, pool) = test_pool(1).await;
         let store = ResourceFacts::new(pool);
 
-        let mut b = observed("b.md", "hb", 1);
+        let mut b = observed("b.md", "hb", "1");
         b.paths[0].size_bytes = Some(7);
         store
             .apply_observed(
                 "ev-a",
                 "agent-a",
                 1_700_000_000_000,
-                &observed("a.md", "ha", 1),
+                &observed("a.md", "ha", "1"),
                 &token(),
             )
             .await
@@ -754,7 +774,7 @@ mod tests {
 
         // Snapshot lists only a.md (b.md vanished from the workspace).
         let snapshot = WorkspaceSnapshotPayload {
-            generation: 2,
+            generation: "2".to_owned(),
             files: vec![SnapshotEntry {
                 path: "a.md".to_owned(),
                 size_bytes: Some(100),
@@ -769,13 +789,13 @@ mod tests {
 
         let a = store.lookup("a.md", &token()).await.expect("lookup").expect("a row");
         assert!(!a.dirty, "snapshot-listed row is clean");
-        assert_eq!(a.generation, 2);
+        assert_eq!(a.generation, "2");
         assert_eq!(a.content_hash.as_deref(), Some("ha2"));
         assert_eq!(a.last_event_id.as_deref(), Some("snap-1"));
 
         let b = store.lookup("b.md", &token()).await.expect("lookup").expect("b row");
         assert!(b.dirty, "vanished row is kept but marked dirty");
-        assert_eq!(b.generation, 1, "observation preserved");
+        assert_eq!(b.generation, "1", "observation preserved");
         assert_eq!(b.last_event_id.as_deref(), Some("ev-b"), "observation preserved");
     }
 
@@ -796,13 +816,13 @@ mod tests {
 
     #[tokio::test]
     async fn evidence_payloads_round_trip_through_serde() {
-        let executed = observed("a.md", "h1", 3);
+        let executed = observed("a.md", "h1", "3");
         let json = serde_json::to_value(&executed).expect("serialize");
         let back: ToolExecutedPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, executed, "ToolExecuted payload round trips");
 
         let snapshot = WorkspaceSnapshotPayload {
-            generation: 3,
+            generation: "3".to_owned(),
             files: vec![SnapshotEntry {
                 path: "a.md".to_owned(),
                 size_bytes: Some(42),
@@ -817,7 +837,7 @@ mod tests {
         // All fields default, so documents missing them still decode.
         let minimal: ToolExecutedPayload =
             serde_json::from_value(json!({ "tool": "ls" })).expect("minimal decodes");
-        assert_eq!(minimal.generation, 0);
+        assert_eq!(minimal.generation, "");
         assert!(minimal.paths.is_empty());
         assert_eq!(minimal.tool, "ls");
     }
@@ -832,7 +852,7 @@ mod tests {
         //   observe a.md (gen 1) → observe b.md (gen 2) → write dirties both →
         //   observe b.md again → a snapshot lists only a.md (b vanished).
         let t0 = 1_700_000_000_000;
-        let payload_a = observed("a.md", "h1", 1);
+        let payload_a = observed("a.md", "h1", "1");
         append_evidence(
             &pool,
             "ev-1",
@@ -845,7 +865,7 @@ mod tests {
         store.apply_observed("ev-1", "agent-a", t0, &payload_a, &token()).await.expect("observe a");
 
         let t1 = t0 + 1;
-        let payload_b = observed("b.md", "h2", 2);
+        let payload_b = observed("b.md", "h2", "2");
         append_evidence(
             &pool,
             "ev-2",
@@ -873,7 +893,7 @@ mod tests {
             .expect("write dirties");
 
         let t3 = t0 + 3;
-        let payload_b2 = observed("b.md", "h2", 2);
+        let payload_b2 = observed("b.md", "h2", "2");
         append_evidence(
             &pool,
             "ev-4",
@@ -890,7 +910,7 @@ mod tests {
 
         let t4 = t0 + 4;
         let snapshot = WorkspaceSnapshotPayload {
-            generation: 2,
+            generation: "2".to_owned(),
             files: vec![SnapshotEntry {
                 path: "a.md".to_owned(),
                 size_bytes: Some(42),
@@ -913,7 +933,7 @@ mod tests {
         // them (the table is purely derived).
         sqlx::query(
             "INSERT INTO resource_facts (path, generation, observed_at, dirty) \
-             VALUES ('ghost.md', 0, 0, 0), ('phantom.md', 0, 0, 0)",
+             VALUES ('ghost.md', '', 0, 0), ('phantom.md', '', 0, 0)",
         )
         .execute(&pool)
         .await
@@ -923,14 +943,14 @@ mod tests {
 
         let a = store.lookup("a.md", &token()).await.expect("lookup").expect("a row");
         assert!(!a.dirty, "a.md clean from the snapshot");
-        assert_eq!(a.generation, 2);
+        assert_eq!(a.generation, "2");
         assert_eq!(a.content_hash.as_deref(), Some("h1"));
         assert_eq!(a.last_event_id.as_deref(), Some("ev-5"));
         assert_eq!(a.observed_at, t4, "observed_at comes from the event's created_at");
 
         let b = store.lookup("b.md", &token()).await.expect("lookup").expect("b row");
         assert!(b.dirty, "b.md vanished from the final snapshot → dirty");
-        assert_eq!(b.generation, 2, "last observation preserved");
+        assert_eq!(b.generation, "2", "last observation preserved");
         assert_eq!(b.last_event_id.as_deref(), Some("ev-4"), "last observation preserved");
         assert_eq!(b.observed_at, t3, "observed_at comes from the event's created_at");
 
@@ -986,7 +1006,7 @@ mod tests {
 
         // A valid sibling ToolExecuted fact, also in the log.
         let t_good = 1_700_000_000_001;
-        let payload_good = observed("good.md", "hg", 1);
+        let payload_good = observed("good.md", "hg", "1");
         append_evidence(
             &pool,
             "ev-good",
@@ -1027,7 +1047,7 @@ mod tests {
                 "ev-1",
                 "agent-a",
                 1_700_000_000_000,
-                &observed("a.md", "h1", 1),
+                &observed("a.md", "h1", "1"),
                 &cancelled,
             )
             .await;

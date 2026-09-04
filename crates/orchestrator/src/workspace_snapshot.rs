@@ -120,16 +120,13 @@ impl WorkspaceSnapshotRecord {
         lines.join("\n")
     }
 
-    /// The Phase 1 typed payload for persistence/reconcile.
-    ///
-    /// NOTE (ADR-65 §2 mismatch): Phase 1 modeled the generation as a numeric
-    /// `generation: u64`; §2 requires a deterministic *id* (a string). The
-    /// string id therefore rides the log as an additive `generation_id` key
-    /// (typed decoders drop unknown keys, so existing consumers are
-    /// unaffected) and the numeric field stays at its default `0`. See
-    /// [`snapshot_payload_json`].
+    /// The typed payload for persistence/reconcile: the content-addressed
+    /// string `generation` id plus the inventory entries (ADR-65 §2).
     pub fn as_payload(&self) -> WorkspaceSnapshotPayload {
-        WorkspaceSnapshotPayload { generation: 0, files: self.entries.clone() }
+        WorkspaceSnapshotPayload {
+            generation: self.generation.clone(),
+            files: self.entries.clone(),
+        }
     }
 }
 
@@ -344,7 +341,7 @@ async fn persist_snapshot(
         session_id: Some(session_id.to_owned()),
         plan_id: None,
         causation: None,
-        payload: snapshot_payload_json(record),
+        payload: serde_json::to_value(record.as_payload()).unwrap_or_default(),
         pre_image_hash: None,
         created_at: record.captured_at_ms as i64,
     };
@@ -376,22 +373,6 @@ async fn persist_snapshot(
             "failed to apply WorkspaceSnapshot to resource_facts; run continues (ADR-65 §2 fail-soft)"
         );
     }
-}
-
-/// The event payload carrying the inventory. The Phase 1 typed payload models
-/// `generation` as `u64` while ADR-65 §2 requires a deterministic generation
-/// *id* (a string). The string id therefore rides as an additive
-/// `generation_id` key that typed decoders drop harmlessly; numeric
-/// `generation` stays at its default `0`.
-fn snapshot_payload_json(record: &WorkspaceSnapshotRecord) -> serde_json::Value {
-    let mut value = serde_json::to_value(record.as_payload()).unwrap_or(serde_json::Value::Null);
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "generation_id".to_owned(),
-            serde_json::Value::String(record.generation.clone()),
-        );
-    }
-    value
 }
 
 /// Unix epoch milliseconds (UTC); `0` on a pre-epoch clock (never expected).
@@ -674,14 +655,14 @@ mod tests {
             "snapshot must precede planning in the global event order"
         );
 
-        // The log (source of truth) carries the string generation id even
-        // though the typed Phase 1 payload models it numerically.
-        let generation_id = snapshot
+        // The log (source of truth) carries the content-addressed string
+        // `generation` id under the typed `generation` key.
+        let generation = snapshot
             .payload
-            .get("generation_id")
+            .get("generation")
             .and_then(serde_json::Value::as_str)
-            .expect("generation_id present in payload");
-        assert_eq!(generation_id, record.generation);
+            .expect("generation present in payload");
+        assert_eq!(generation, record.generation);
 
         // The derived store applied the observation: clean rows for listed files.
         let facts = ResourceFacts::new(pool.clone());

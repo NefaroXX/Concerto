@@ -23,7 +23,7 @@
 
 CREATE TABLE IF NOT EXISTS resource_facts (
     path            TEXT    PRIMARY KEY,
-    generation      INTEGER NOT NULL,
+    generation      TEXT    NOT NULL,  -- content-addressed generation id (ADR-65 §2)
     size_bytes      INTEGER,
     mtime_ms        INTEGER,
     content_hash    TEXT,

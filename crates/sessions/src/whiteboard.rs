@@ -1043,12 +1043,12 @@ mod tests {
             "tool": "apply_diff",
             "args": { "path": "a.md" },
             "success": true,
-            "generation": 3,
+            "generation": "gen-3",
             "paths": [{ "path": "a.md", "content_hash": "h1" }]
         });
         let mut snapshot = new_event("ev-2", "agent-a", WhiteboardKind::WorkspaceSnapshot);
         snapshot.payload = json!({
-            "generation": 3,
+            "generation": "gen-3",
             "files": [{ "path": "a.md", "size_bytes": 42, "content_hash": "h1" }]
         });
 
@@ -1081,7 +1081,7 @@ mod tests {
                 .expect("deserialize");
         assert_eq!(decoded.payload["files"][0]["path"], json!("a.md"));
         assert_eq!(decoded.payload["files"][0]["size_bytes"], json!(42));
-        assert_eq!(decoded.payload["generation"], json!(3));
+        assert_eq!(decoded.payload["generation"], json!("gen-3"));
     }
 
     #[tokio::test]
