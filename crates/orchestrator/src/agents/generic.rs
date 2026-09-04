@@ -433,15 +433,19 @@ impl GenericSpecialistAgent {
                         content: tool_execution_description(&tool_call.name, &tool_call.arguments),
                     },
                 );
-                // Tool-call guard (VALIDATE → COERCE → INFER → REPAIR):
-                // normalize the provider-accumulated arguments before
-                // execution. Rejected calls never execute; the model receives
-                // a corrective tool result and retries on the next iteration.
+                // Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT →
+                // REPAIR): normalize the provider-accumulated arguments
+                // before execution. `text` is the assistant message that
+                // carried these tool calls — its intent feeds the guard's
+                // text-extraction backstop. Rejected calls never execute;
+                // the model receives a corrective tool result and retries on
+                // the next iteration.
                 let arguments = match guard_coordinator_tool_call(
                     &tool_call.name,
                     &tool_call.arguments,
                     executor,
                     &mut tool_guard_rejects,
+                    Some(text.as_str()),
                 ) {
                     GuardedArguments::Pass(arguments) => arguments,
                     GuardedArguments::Reject { content, payload } => {
@@ -1452,9 +1456,10 @@ impl GenericSpecialistAgent {
                             },
                         );
                         // Tool-call guard (VALIDATE → COERCE → INFER →
-                        // REPAIR), mirroring `run_freeform`: rejected calls
-                        // never execute and the model receives a corrective
-                        // tool result in the same conversation.
+                        // EXTRACT → REPAIR), mirroring `run_freeform`: the
+                        // assistant text feeds text extraction, and rejected
+                        // calls never execute — the model receives a
+                        // corrective tool result in the same conversation.
                         let arguments = match &self.tool_executor {
                             Some(executor) => {
                                 match guard_coordinator_tool_call(
@@ -1462,6 +1467,7 @@ impl GenericSpecialistAgent {
                                     &tool_call.arguments,
                                     executor,
                                     &mut tool_guard_rejects,
+                                    Some(text.as_str()),
                                 ) {
                                     GuardedArguments::Pass(arguments) => arguments,
                                     GuardedArguments::Reject { content, payload } => {
@@ -1756,7 +1762,7 @@ enum GuardedArguments {
 }
 
 /// Tool-call guard for the multi-agent coordinator path (VALIDATE → COERCE →
-/// INFER → REPAIR), mirroring the single-agent loop's
+/// INFER → EXTRACT → REPAIR), mirroring the single-agent loop's
 /// `AgentLoop::guard_tool_call` exactly:
 ///
 /// * parses `null`/empty/stringified arguments (including fenced JSON blocks)
@@ -1768,11 +1774,19 @@ enum GuardedArguments {
 ///   attempts per-tool heuristic inference for unresolved required fields,
 ///   accepting the repair only when the completed arguments re-validate
 ///   cleanly;
+/// * when structured arguments and heuristics both fail, recovers the
+///   arguments from the model's own assistant message text
+///   ([`tool_guard::extract_from_text`], live-audit backstop) when the text
+///   states the call (e.g. `operation="read" path="src/main.rs"`), merging
+///   and re-validating before anything executes;
 /// * otherwise injects a structured corrective result, bounded by
 ///   [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective retries per tool name
 ///   via `guard_rejects` (which must live for one agent run), so the model
 ///   retries with corrected arguments instead of stalling on raw executor
 ///   `missing field` errors.
+///
+/// `assistant_text` is the latest assistant message text (`None` skips text
+/// extraction, leaving the guard's behavior unchanged).
 ///
 /// Backend-protocol keys (`base_versions`, ADR-60 D5) are never stripped —
 /// the shared coercion layer treats them as reserved. Tools without a
@@ -1786,6 +1800,7 @@ fn guard_coordinator_tool_call(
     raw_arguments: &serde_json::Value,
     executor: &ToolExecutor,
     guard_rejects: &mut HashMap<String, u32>,
+    assistant_text: Option<&str>,
 ) -> GuardedArguments {
     let parsed = tool_guard::parse_tool_arguments(raw_arguments);
     let definitions = executor.tool_definitions();
@@ -1819,7 +1834,9 @@ fn guard_coordinator_tool_call(
     // validate.
     let mut repaired = coerced;
     if let Some(notes) = tool_guard::heuristic_infer(tool_name, &parsed, &mut repaired, schema) {
-        let (repaired, repair_coercions) = tool_guard::coerce_arguments(repaired, schema);
+        // The fills stay on the outer `repaired` (text extraction may merge
+        // over them below); the re-coerce validates a copy.
+        let (repaired, repair_coercions) = tool_guard::coerce_arguments(repaired.clone(), schema);
         if tool_guard::validate_arguments(&repaired, schema).is_empty() {
             tracing::warn!(
                 tool = %tool_name,
@@ -1829,6 +1846,23 @@ fn guard_coordinator_tool_call(
             );
             guard_rejects.remove(tool_name);
             return GuardedArguments::Pass(repaired);
+        }
+    }
+
+    // Text-intent extraction (live-audit backstop): when the structured
+    // arguments and heuristics both fail but the model's own message text
+    // states the call, recover the arguments from that text. Conservative by
+    // construction and accepted only when the merged arguments re-validate;
+    // anything else falls through to the corrective reject below unchanged —
+    // the fast-fail on empty args still applies when the text yields nothing.
+    if let Some(text) = assistant_text {
+        if let Some(extracted) = tool_guard::extract_from_text(text, tool_name, schema) {
+            let merged = tool_guard::merge_extracted_arguments(extracted, &repaired);
+            let (merged, _merge_coercions) = tool_guard::coerce_arguments(merged, schema);
+            if tool_guard::validate_arguments(&merged, schema).is_empty() {
+                guard_rejects.remove(tool_name);
+                return GuardedArguments::Pass(merged);
+            }
         }
     }
 
@@ -3832,6 +3866,72 @@ mod tests {
                 })
             }),
             "corrective message text must reach the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_extracts_arguments_from_assistant_text_and_executes() {
+        // Live-audit backstop shape on the multi-agent coordinator path: the
+        // model picks the right tool but emits `arguments: null` while its
+        // own message text states the call. The guard must recover the
+        // arguments from the assistant text and execute instead of rejecting
+        // with a corrective payload.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            // One completion carrying BOTH the intent-bearing text and the
+            // broken (null-args) tool call — exactly the audit's evidence
+            // shape.
+            CompletionChunk {
+                delta: "Filesystem operation=\"list\" path=\"src\"".into(),
+                reasoning: None,
+                tool_call: Some(ToolCall {
+                    id: "call_1".into(),
+                    name: "filesystem".into(),
+                    arguments: serde_json::Value::Null,
+                }),
+                is_final: true,
+                usage: None,
+            },
+            text_chunk("Done."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Read a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1);
+        assert!(
+            !provider.request_carried_guard_reject("tool_guard_exhausted"),
+            "a text-repairable call must not be rejected"
+        );
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![serde_json::json!({"operation": "list", "path": "src"})],
+            "executor must receive the text-extracted arguments"
         );
     }
 
