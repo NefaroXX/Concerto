@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
 use concerto_core::event::{EventBus, EventKind};
@@ -95,6 +96,11 @@ pub struct GenericSpecialistAgent {
     /// verbatim into every prompt this agent builds; empty when skills are
     /// disabled.
     skills_section: String,
+    /// ADR-65 §3: tool-evidence writer. When `Some`, every completed tool
+    /// command this agent executes is recorded as a `ToolExecuted` whiteboard
+    /// event attributed to this agent (its `id`) — fail-soft, never affects
+    /// tool results.
+    tool_facts: Option<ToolFactContext>,
 }
 
 impl GenericSpecialistAgent {
@@ -133,6 +139,7 @@ impl GenericSpecialistAgent {
             eval: None,
             eval_mode: false,
             skills_section: String::new(),
+            tool_facts: None,
         }
     }
 
@@ -164,6 +171,60 @@ impl GenericSpecialistAgent {
     pub fn with_skills_section(mut self, skills_section: &str) -> Self {
         self.skills_section = skills_section.to_string();
         self
+    }
+
+    /// Attach an ADR-65 §3 tool-evidence writer. When `Some`, every completed
+    /// tool command is recorded as a `ToolExecuted` whiteboard event
+    /// attributed to this agent's id — fail-soft, never affects tool results.
+    pub fn with_tool_facts(mut self, tool_facts: Option<ToolFactContext>) -> Self {
+        self.tool_facts = tool_facts;
+        self
+    }
+
+    /// ADR-65 §3: record a completed tool command as a `ToolExecuted`
+    /// whiteboard fact. Attribution is real, never inferred: this agent's
+    /// `ToolFactContext` carries its own id, and the per-call fact carries the
+    /// task id, run id, and workspace generation from the dispatch context.
+    /// Recording is fail-soft — a writer failure never affects the tool
+    /// result already returned to the model.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_tool_fact(
+        &self,
+        task: &SubTask,
+        context: &AgentContext,
+        tool: &str,
+        arguments: &serde_json::Value,
+        success: bool,
+        output_data: Option<&serde_json::Value>,
+        file_affecting: bool,
+        pre_image_hashes: HashMap<String, Option<String>>,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = task.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        let paths = crate::tool_facts::extract_affected_paths(arguments, output_data);
+        facts
+            .record_tool_executed(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: context.run_id.as_deref(),
+                    generation: context.workspace_generation.as_deref().unwrap_or(""),
+                    project_root: &context.session.project_dir,
+                    tool,
+                    args: arguments,
+                    success,
+                    exit_code: None,
+                    paths: &paths,
+                    file_affecting,
+                    pre_image_hashes,
+                },
+                cancel,
+            )
+            .await;
     }
 
     /// Build the prompt for this agent from its configured sections plus
@@ -491,8 +552,17 @@ impl GenericSpecialistAgent {
                     && arguments.get("operation").and_then(|value| value.as_str()).is_some_and(
                         |operation| matches!(operation, "write" | "delete" | "move" | "copy"),
                     ));
+                // ADR-65 §3: hash the pre-write state of every path this
+                // command will touch before it runs (fail-soft).
+                let pre_image_hashes = match &self.tool_facts {
+                    Some(facts) => {
+                        let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
+                        facts.pre_image_hashes(&affected, &cancel).await
+                    }
+                    None => HashMap::new(),
+                };
                 match executor
-                    .execute(&tool_call.name, arguments, &context.session, cancel.clone())
+                    .execute(&tool_call.name, arguments.clone(), &context.session, cancel.clone())
                     .await
                 {
                     Ok(output) => {
@@ -515,6 +585,20 @@ impl GenericSpecialistAgent {
                                 }
                             }
                         }
+                        // ADR-65 §3: record the completed (successful) tool
+                        // command with the paths it actually touched.
+                        self.record_tool_fact(
+                            task,
+                            &context,
+                            &tool_call.name,
+                            &arguments,
+                            true,
+                            Some(&output.data),
+                            is_file_change,
+                            pre_image_hashes.clone(),
+                            &cancel,
+                        )
+                        .await;
                         messages.push(Message {
                             role: Role::Tool,
                             content: String::new(),
@@ -530,6 +614,20 @@ impl GenericSpecialistAgent {
                         });
                     }
                     Err(error) => {
+                        // ADR-65 §3: record the completed (failed) tool
+                        // command too — evidence exists either way.
+                        self.record_tool_fact(
+                            task,
+                            &context,
+                            &tool_call.name,
+                            &arguments,
+                            false,
+                            None,
+                            is_file_change,
+                            pre_image_hashes.clone(),
+                            &cancel,
+                        )
+                        .await;
                         let _ = self.bus.publish_for_session(
                             task.session_id,
                             task.id.0,
@@ -1526,12 +1624,22 @@ impl GenericSpecialistAgent {
                                 .is_some_and(|operation| {
                                     matches!(operation, "write" | "delete" | "move" | "copy")
                                 }));
+                        // ADR-65 §3: hash the pre-write state of every path
+                        // this command will touch before it runs (fail-soft).
+                        let pre_image_hashes = match &self.tool_facts {
+                            Some(facts) => {
+                                let affected =
+                                    crate::tool_facts::extract_affected_paths(&arguments, None);
+                                facts.pre_image_hashes(&affected, &cancel).await
+                            }
+                            None => HashMap::new(),
+                        };
                         let result = match &self.tool_executor {
                             Some(executor) => {
                                 executor
                                     .execute(
                                         &tool_call.name,
-                                        arguments,
+                                        arguments.clone(),
                                         &context.session,
                                         cancel.clone(),
                                     )
@@ -1565,6 +1673,20 @@ impl GenericSpecialistAgent {
                                         }
                                     }
                                 }
+                                // ADR-65 §3: record the completed
+                                // (successful) tool command.
+                                self.record_tool_fact(
+                                    task,
+                                    &context,
+                                    &tool_call.name,
+                                    &arguments,
+                                    true,
+                                    Some(&output.data),
+                                    is_file_change,
+                                    pre_image_hashes.clone(),
+                                    &cancel,
+                                )
+                                .await;
                                 messages.push(Message {
                                     role: Role::Tool,
                                     content: String::new(),
@@ -1580,6 +1702,20 @@ impl GenericSpecialistAgent {
                                 });
                             }
                             Err(error) => {
+                                // ADR-65 §3: record the completed (failed)
+                                // tool command too.
+                                self.record_tool_fact(
+                                    task,
+                                    &context,
+                                    &tool_call.name,
+                                    &arguments,
+                                    false,
+                                    None,
+                                    is_file_change,
+                                    pre_image_hashes.clone(),
+                                    &cancel,
+                                )
+                                .await;
                                 let _ = self.bus.publish_for_session(
                                     task.session_id,
                                     task.id.0,
@@ -1925,6 +2061,8 @@ mod tests {
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
             workspace_snapshot_digest: None,
+            run_id: None,
+            workspace_generation: None,
         }
     }
 

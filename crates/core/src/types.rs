@@ -1467,6 +1467,16 @@ pub struct AgentContext {
     /// snapshot (e.g. readability or fail-soft); `Some` at dispatch time so
     /// every agent starts grounded in the deterministic inventory.
     pub workspace_snapshot_digest: Option<String>,
+    /// ADR-65 §3: the content-addressed workspace `generation` (see
+    /// `WorkspaceSnapshotRecord::generation`) at dispatch time, attached by the
+    /// coordinator so tool-executed evidence facts record the generation the
+    /// tool ran against. `None` when no snapshot barrier produced one.
+    pub workspace_generation: Option<String>,
+    /// ADR-65 §3: the multi-agent run identifier (`CheckpointScope::run_id`)
+    /// the current dispatch belongs to, attached by the coordinator so facts
+    /// are attributable to a run — **never inferred**: `None` when the caller
+    /// has no run concept (single-agent loop).
+    pub run_id: Option<String>,
 }
 
 impl AgentContext {
@@ -1488,6 +1498,8 @@ impl AgentContext {
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
             workspace_snapshot_digest: None,
+            workspace_generation: None,
+            run_id: None,
         }
     }
 }

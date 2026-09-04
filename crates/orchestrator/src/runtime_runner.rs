@@ -1735,6 +1735,12 @@ async fn execute_agent_loop(
     // drift from the intent gate's decision if the task-shaping code changes.
     execute_granted: bool,
     stage_tracker: &Arc<Mutex<StageTracker>>,
+    // ADR-65 §3: the session-DB pool backing the single-agent loop's
+    // tool-evidence writer (`ToolFactContext::new(pool, "single-agent")`).
+    // `None` when no sessions DB is available (the writer is a fail-soft
+    // no-op). Cloned from the write-gate pool in `run_shared_agent` before
+    // the gates consume it.
+    fact_pool: Option<sqlx::SqlitePool>,
 ) -> Result<AgentOutput, OrchestratorError> {
     // Audit C-03 (immediate fix): the LLM `SummarizeOldest` strategy is no
     // longer wired into the production runtime. Its failure path could delete
@@ -1788,7 +1794,10 @@ async fn execute_agent_loop(
     .with_retry_policy(retry_policy)
     .with_usage_model(model)
     .with_initial_messages(req.conversation_history)
-    .with_session_store(session_store);
+    .with_session_store(session_store)
+    .with_tool_facts(fact_pool.map(|pool| {
+        crate::tool_facts::ToolFactContext::new(Some(pool), crate::tool_facts::SINGLE_AGENT_FACT_ID)
+    }));
 
     // `task` is moved into the loop below; Ulid is Copy so the task id is
     // captured up front for spend attribution (Phase 3, issue #93).
@@ -3165,6 +3174,8 @@ pub async fn run_shared_agent(
     let plan_cancel_token = req.cancel_token.clone();
     // ADR-60 D7: the post-Plan binding insert below appends its whiteboard
     // event through this pool clone (the match consumes `gate_log_pool`).
+    // ADR-65 §3: the same clone backs the single-agent loop's tool-evidence
+    // writer (recorded via `.with_tool_facts` in `execute_agent_loop`).
     let d7_event_pool = gate_log_pool.clone();
     // ADR-60 D5: give the in-process single-agent loop the same always-on
     // write-gate protection the supervised agent-process path enforces. The
@@ -3210,6 +3221,7 @@ pub async fn run_shared_agent(
         effective_outcome,
         action_required,
         &stage_tracker,
+        d7_event_pool.clone(),
     )
     .await?;
 
@@ -3761,6 +3773,11 @@ async fn run_multi_agent(
         &skills_section,
         facade.as_ref(),
         merge_seeds,
+        // ADR-65 §3: the session-DB pool backs every registered specialist's
+        // tool-evidence writer. The snapshot barrier runs below, so the
+        // writer's per-call `generation` comes from `AgentContext` instead of
+        // being baked here.
+        gate_log_pool.clone(),
     ));
     // The feed task below resolves implement-stage roles from the registry,
     // so keep a clone before `registry` moves into the coordinator.
@@ -7366,6 +7383,7 @@ mod runtime_runner_tests {
             RequestedOutcome::Execute,
             true,
             &stage_tracker,
+            None, // no fact-writer pool in this test
         )
         .await
         .expect("action-required run should complete");
@@ -7425,6 +7443,7 @@ mod runtime_runner_tests {
             RequestedOutcome::Plan,
             false,
             &stage_tracker,
+            None, // no fact-writer pool in this test
         )
         .await
         .expect("plan run should complete");
@@ -7484,6 +7503,7 @@ mod runtime_runner_tests {
             RequestedOutcome::Execute,
             true,
             &stage_tracker,
+            None, // no fact-writer pool in this test
         )
         .await;
 
@@ -7605,6 +7625,7 @@ mod runtime_runner_tests {
             &HashMap::new(),
             "",
             true,
+            None, // no fact-writer pool in this test
         );
 
         let task_id = TaskId::new();

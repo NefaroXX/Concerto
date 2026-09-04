@@ -31,6 +31,7 @@ use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
 use crate::state::AgentState;
+use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 
 /// The single-agent loop driving plan → act → observe → plan cycles.
@@ -81,6 +82,12 @@ pub struct AgentLoop {
     /// Optional session store for persistence of tasks, messages, and events.
     /// When `None`, persistence is skipped (best-effort, warnings only).
     session_store: Option<Arc<dyn SessionStore>>,
+
+    /// ADR-65 §3: optional tool-evidence writer. When `Some`, every completed
+    /// tool command in this loop is recorded as a `ToolExecuted` whiteboard
+    /// event attributed to `"single-agent"`; the writer is fail-soft and never
+    /// affects tool results.
+    tool_facts: Option<ToolFactContext>,
 
     /// Model id and cumulative usage for session/dashboard accounting.
     usage_model: String,
@@ -283,6 +290,7 @@ impl AgentLoop {
             initial_messages: Vec::new(),
             retry_policy: RetryPolicy::default(),
             session_store: None,
+            tool_facts: None,
             usage_model: String::new(),
             usage_tokens_in: 0,
             usage_tokens_out: 0,
@@ -328,6 +336,15 @@ impl AgentLoop {
     /// and events. When `None`, persistence is skipped.
     pub fn with_session_store(mut self, store: Option<Arc<dyn SessionStore>>) -> Self {
         self.session_store = store;
+        self
+    }
+
+    /// Attach an ADR-65 §3 tool-evidence writer. When `Some`, every completed
+    /// tool command is recorded as a `ToolExecuted` whiteboard event
+    /// attributed to `"single-agent"`; the writer is fail-soft and never
+    /// affects tool results.
+    pub fn with_tool_facts(mut self, facts: Option<ToolFactContext>) -> Self {
+        self.tool_facts = facts;
         self
     }
 
@@ -1580,19 +1597,30 @@ impl AgentLoop {
             },
         );
 
-        match self.tool_executor.execute(&tc.name, arguments.clone(), &tc.id, session, cancel).await
+        // ADR-65 §3: a completed tool command is evidence. Capture the
+        // pre-write content hashes now (before execution) so the fact can
+        // record the workspace state prior to this command — the write
+        // classifier mirrors the in-arm file-change accounting below.
+        let file_affecting = crate::tool_facts::is_file_affecting_tool(&tc.name, &arguments);
+        let pre_image_hashes = match &self.tool_facts {
+            Some(facts) => {
+                let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
+                facts.pre_image_hashes(&affected, &cancel).await
+            }
+            None => HashMap::new(),
+        };
+
+        match self
+            .tool_executor
+            .execute(&tc.name, arguments.clone(), &tc.id, session, cancel.clone())
+            .await
         {
             Ok(output) => {
                 *tool_call_count += 1;
 
-                // Track file-changing tools separately
-                let is_file_changing = matches!(
-                    tc.name.as_str(),
-                    "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
-                ) || (tc.name == "filesystem"
-                    && matches!(filesystem_operation, Some("write" | "delete" | "move" | "copy")));
-
-                if is_file_changing {
+                // Track file-changing tools separately (classified just before
+                // execution above for the evidence writer).
+                if file_affecting {
                     *file_changing_tool_count += 1;
 
                     if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
@@ -1659,6 +1687,20 @@ impl AgentLoop {
                     tokens_in: None,
                     tokens_out: None,
                 });
+
+                self.record_tool_fact(
+                    session,
+                    task,
+                    &tc.name,
+                    &arguments,
+                    true,
+                    None,
+                    crate::tool_facts::extract_affected_paths(&arguments, Some(&output.data)),
+                    file_affecting,
+                    pre_image_hashes.clone(),
+                    &cancel,
+                )
+                .await;
             }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
@@ -1696,6 +1738,21 @@ impl AgentLoop {
                     tokens_in: None,
                     tokens_out: None,
                 });
+                // A policy-denied command never executed; record the refused
+                // attempt as a negative fact (nothing changed on disk).
+                self.record_tool_fact(
+                    session,
+                    task,
+                    &tc.name,
+                    &arguments,
+                    false,
+                    None,
+                    crate::tool_facts::extract_affected_paths(&arguments, None),
+                    file_affecting,
+                    pre_image_hashes.clone(),
+                    &cancel,
+                )
+                .await;
             }
             Err(e) => {
                 tool_events.push(ToolExecutionSummary {
@@ -1732,9 +1789,69 @@ impl AgentLoop {
                 tokens_in: None,
                 tokens_out: None,
                 });
+                // Execution errored before completing; record the failed
+                // attempt as a negative fact.
+                self.record_tool_fact(
+                    session,
+                    task,
+                    &tc.name,
+                    &arguments,
+                    false,
+                    None,
+                    crate::tool_facts::extract_affected_paths(&arguments, None),
+                    file_affecting,
+                    pre_image_hashes.clone(),
+                    &cancel,
+                )
+                .await;
             }
         }
         Ok(())
+    }
+
+    /// ADR-65 §3: record a completed (or refused) tool command as evidence.
+    /// The writer is fail-soft — a persistence failure can never fail the tool
+    /// result this loop is already returning. The single-agent loop has no
+    /// run/generation concept (no ADR-65 §2 barrier, no checkpoint run id), so
+    /// both are recorded honestly as absent.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_tool_fact(
+        &self,
+        session: &SessionContext,
+        task: &AgentTask,
+        tool: &str,
+        args: &serde_json::Value,
+        success: bool,
+        exit_code: Option<i32>,
+        paths: Vec<String>,
+        file_affecting: bool,
+        pre_image_hashes: HashMap<String, Option<String>>,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = session.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_tool_executed(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: None,
+                    generation: "",
+                    project_root: &self.project_root,
+                    tool,
+                    args,
+                    success,
+                    exit_code,
+                    paths: &paths,
+                    file_affecting,
+                    pre_image_hashes,
+                },
+                cancel,
+            )
+            .await;
     }
 }
 
@@ -1960,6 +2077,9 @@ mod tests {
     use concerto_memory::task_tree::TaskTreeStore;
     use concerto_memory::vector_store::SqliteVectorStore;
     use concerto_memory::vector_store::VectorStore;
+    use concerto_sessions::resource_facts::ResourceFacts;
+    use concerto_sessions::whiteboard::{load_whiteboard_events, WhiteboardLoadOpts};
+    use concerto_sessions::WhiteboardKind;
     use concerto_tools::filesystem::FilesystemTool;
     use concerto_tools::undo::UndoManager;
     use futures::stream;
@@ -3150,6 +3270,116 @@ mod tests {
             stdout.contains("hello from disk"),
             "running the program should print the greeting, got: {stdout}"
         );
+    }
+
+    /// A scratch sqlite pool with the sessions migrations applied — the same
+    /// shape `tool_facts` uses, so the loop's fact writer lands real rows.
+    async fn test_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let db_path = dir.path().join("agent_loop_tool_facts_test.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("test pool connects");
+        sqlx::migrate!("../sessions/migrations")
+            .run(&pool)
+            .await
+            .expect("sessions migrations apply");
+        (dir, pool)
+    }
+
+    #[tokio::test]
+    async fn filesystem_tool_calls_record_tool_executed_facts_end_to_end() {
+        // ADR-65 §3 end-to-end: with a real session-DB pool attached to the
+        // loop's fact writer, every completed tool command lands as a
+        // `ToolExecuted` whiteboard event attributed to the writer (never
+        // inferred), and the derived `resource_facts` store tracks the
+        // sequence: the read leaves a CLEAN row, the following write
+        // INVALIDATES it (dirty), and the write event carries the pre-image
+        // hash of the original content.
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"# original\n").expect("fixture written");
+
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+        };
+        let write_tc = ToolCall {
+            id: "call_2".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "note.md",
+                "content": "# updated\n",
+            }),
+        };
+        let calls = vec![vec![read_tc], vec![write_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        loop_ = loop_.with_tool_facts(Some(ToolFactContext::new(
+            Some(pool.clone()),
+            "single-agent".to_string(),
+        )));
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new_action_required(session_id, "update the note file");
+        let task_id = task.id.0.to_string();
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "read+write task should succeed: {:?}", result.err());
+
+        // Exactly two ToolExecuted facts for this run, both attributed to the
+        // loop's fact writer; payloads carry task attribution (never inferred).
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let executed: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(executed.len(), 2, "expected exactly two ToolExecuted events");
+        for event in &executed {
+            assert_eq!(event.agent_id, "single-agent", "event column carries the writer id");
+            assert_eq!(event.session_id.as_deref(), Some(session_id.to_string().as_str()));
+            assert_eq!(event.payload["tool"], serde_json::json!("filesystem"));
+            assert_eq!(event.payload["success"], serde_json::json!(true));
+            assert_eq!(event.payload["agent_id"], serde_json::json!(task_id));
+        }
+
+        // The read event records no pre-image (read-only); the write event
+        // carries the pre-write content hash of the ORIGINAL file.
+        assert_eq!(executed[0].pre_image_hash, None, "read-only event has no pre-image");
+        assert_eq!(
+            executed[1].pre_image_hash.as_deref(),
+            Some(blake3::hash(b"# original\n").to_hex().as_str()),
+            "write event carries the pre-write content hash"
+        );
+
+        // Derived store: the read left a clean row, the write invalidated it.
+        let store = ResourceFacts::new(pool);
+        let row = store
+            .lookup("note.md", &CancellationToken::new())
+            .await
+            .expect("lookup")
+            .expect("read observation created a resource_facts row");
+        assert!(row.dirty, "the write must have invalidated the cached row");
+        assert_eq!(row.last_agent_id.as_deref(), Some("single-agent"));
     }
 
     // -----------------------------------------------------------------------

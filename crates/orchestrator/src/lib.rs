@@ -53,6 +53,7 @@ pub mod state;
 pub mod subscriptions;
 pub mod supervisor;
 pub mod timeline;
+mod tool_facts;
 mod tool_guard;
 mod working_memory;
 pub mod workspace_snapshot;

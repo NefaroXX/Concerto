@@ -665,6 +665,11 @@ pub struct CoordinatorAgent {
     /// Never used to gate behavior in this phase — persistence/write gating is
     /// load-bearing only with the Phase 5/6 evidence checks.
     workspace_snapshot: Option<crate::workspace_snapshot::WorkspaceSnapshotRecord>,
+    /// ADR-65 §3: the run id (fresh per `execute_graph`, matching the
+    /// checkpoint scope) stamped into every dispatched agent's tool-evidence
+    /// facts, so a run's tool commands are attributable across task
+    /// boundaries. `None` only when no run has started yet.
+    run_id: Option<String>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -843,6 +848,7 @@ impl CoordinatorAgent {
             approved_plan_seed: None,
             review_store: None,
             workspace_snapshot: None,
+            run_id: None,
         }
     }
 
@@ -963,6 +969,11 @@ impl CoordinatorAgent {
             sentinel_capabilities(persona, StageKind::Execution),
         )
         .with_skills_section(&self.skills_section)
+        // ADR-65 §3: evidence attribution for the coordinator's own tool
+        // commands when it self-implements (no registration-time pool).
+        .with_tool_facts(self.review_store.clone().map(|pool| {
+            crate::tool_facts::ToolFactContext::new(Some(pool), "coordinator".to_string())
+        }))
     }
 
     /// ADR-58 P2+P3 (§3/R4): the unstaffed-`Execution` fallback persona — the
@@ -1309,6 +1320,12 @@ impl CoordinatorAgent {
         self.workspace_snapshot
             .as_ref()
             .map(crate::workspace_snapshot::WorkspaceSnapshotRecord::digest)
+    }
+
+    /// The pre-planning workspace generation id (ADR-65) for evidence
+    /// attribution; `None` when no snapshot was captured.
+    fn snapshot_generation(&self) -> Option<String> {
+        self.workspace_snapshot.as_ref().map(|snapshot| snapshot.generation.clone())
     }
 
     /// Attach the session's skills instructions (ADR-43, Task 4), injected
@@ -2369,6 +2386,9 @@ impl CoordinatorAgent {
             source_revision: self.source_revision.clone(),
             sequence_num: 0,
         };
+        // ADR-65 §3: stamp the run id (matching the checkpoint scope) so
+        // every dispatched agent records its tool evidence under this run.
+        self.run_id = Some(checkpoint_scope.run_id.to_string());
         refresh_working_memory(
             &mut context,
             &graph,
@@ -2864,6 +2884,8 @@ impl CoordinatorAgent {
                         expected_artifacts: task_artifacts,
                         workspace_capsule: task_capsule,
                         workspace_snapshot_digest: this.snapshot_digest(),
+                        run_id: this.run_id.clone(),
+                        workspace_generation: this.snapshot_generation(),
                     };
                     // ADR-35 §8 trigger 1 (stage absence): implement subtasks
                     // planned for the reserved `coordinator` role are executed
@@ -3041,6 +3063,8 @@ impl CoordinatorAgent {
                                     expected_artifacts: ladder_artifacts,
                                     workspace_capsule: None,
                                     workspace_snapshot_digest: self.snapshot_digest(),
+                                    run_id: self.run_id.clone(),
+                                    workspace_generation: self.snapshot_generation(),
                                 };
                                 match self
                                     .attempt_fallback_ladder(
@@ -3657,6 +3681,8 @@ impl CoordinatorAgent {
                             expected_artifacts: ladder_artifacts,
                             workspace_capsule: None,
                             workspace_snapshot_digest: self.snapshot_digest(),
+                            run_id: self.run_id.clone(),
+                            workspace_generation: self.snapshot_generation(),
                         };
                         let classify_err = OrchestratorError::AgentLoopError(error.clone());
                         match self
@@ -4487,6 +4513,8 @@ impl CoordinatorAgent {
                 expected_artifacts: Vec::new(),
                 workspace_capsule: None,
                 workspace_snapshot_digest: self.snapshot_digest(),
+                run_id: self.run_id.clone(),
+                workspace_generation: self.snapshot_generation(),
             };
 
             let result = self
@@ -4649,6 +4677,8 @@ impl CoordinatorAgent {
                             .unwrap_or_default(),
                         workspace_capsule: None,
                         workspace_snapshot_digest: self.snapshot_digest(),
+                        run_id: self.run_id.clone(),
+                        workspace_generation: self.snapshot_generation(),
                     };
                     // Select routing profile for coder revision
                     let coder_profile = self.model_selector.select_for_session(
@@ -5156,6 +5186,8 @@ impl CoordinatorAgent {
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
             workspace_snapshot_digest: self.snapshot_digest(),
+            run_id: self.run_id.clone(),
+            workspace_generation: self.snapshot_generation(),
         };
         let profile = self.model_selector.select_for_session(
             role,
@@ -5347,6 +5379,8 @@ impl CoordinatorAgent {
                                 expected_artifacts: Vec::new(),
                                 workspace_capsule: None,
                                 workspace_snapshot_digest: self.snapshot_digest(),
+                                run_id: self.run_id.clone(),
+                                workspace_generation: self.snapshot_generation(),
                             };
                             match self
                                 .attempt_fallback_ladder(
