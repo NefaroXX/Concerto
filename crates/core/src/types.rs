@@ -1462,6 +1462,11 @@ pub struct AgentContext {
     /// `None` when the timeline projection is unavailable or the feature is
     /// disabled; `Some` at dispatch time when the coordinator builds it.
     pub workspace_capsule: Option<WorkspaceCapsule>,
+    /// ADR-65 §2: the pre-planning workspace snapshot digest (generation id,
+    /// totals, top-level tree). `None` when the readiness barrier produced no
+    /// snapshot (e.g. readability or fail-soft); `Some` at dispatch time so
+    /// every agent starts grounded in the deterministic inventory.
+    pub workspace_snapshot_digest: Option<String>,
 }
 
 impl AgentContext {
@@ -1482,6 +1487,7 @@ impl AgentContext {
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
+            workspace_snapshot_digest: None,
         }
     }
 }

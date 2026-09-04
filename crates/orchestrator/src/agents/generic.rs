@@ -208,6 +208,15 @@ impl GenericSpecialistAgent {
             }
         }
 
+        // ADR-65 §2 (Phase 2): the pre-planning workspace snapshot digest —
+        // generation id, file/byte totals, top-level tree. Grounds the agent in
+        // the deterministic inventory captured before planning began.
+        if let Some(digest) = &context.workspace_snapshot_digest {
+            prompt.push_str("\n\n<workspace_snapshot>\n");
+            prompt.push_str(digest);
+            prompt.push_str("\n</workspace_snapshot>");
+        }
+
         if !context.previous_results.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&crate::memory_prompt::format_previous_results(
@@ -1915,6 +1924,7 @@ mod tests {
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
+            workspace_snapshot_digest: None,
         }
     }
 

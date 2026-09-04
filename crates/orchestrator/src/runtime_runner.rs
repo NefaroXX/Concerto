@@ -3953,7 +3953,7 @@ async fn run_multi_agent(
         Some(_) => task.clone(),
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
-    let context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
+    let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
     // Run-stage tracking (ADR-55 Phase 2a): the coordinator publishes
     // `SubTaskCreated` and gate-cycle (`ReviewCycleStarted` /
     // `ValidationCycleStarted`) events on the bus as the graph progresses, so
@@ -4012,6 +4012,28 @@ async fn run_multi_agent(
             }
         }
     });
+    // ---- ADR-65 §2 (Phase 2): workspace snapshot readiness barrier ----
+    //
+    // A read-only, deterministic, language-agnostic project-tree inventory
+    // (relative paths + size + mtime + cheap content hash) is captured BEFORE
+    // planning begins. Planning waits on THIS barrier — never on the
+    // asynchronously spawned vector indexing. The digest rides into every
+    // dispatched agent's context (via the snapshot attached to the
+    // coordinator), and a `WorkspaceSnapshot` whiteboard event + a
+    // `resource_facts` application are appended best-effort to the shared
+    // run database. Fail-soft by contract: an unreadable project dir (None) or
+    // an unpersistable snapshot degrades to a warning — the run proceeds.
+    let workspace_snapshot = crate::workspace_snapshot::run_snapshot_barrier(
+        gate_log_pool.as_ref(),
+        &project_dir,
+        &session_id.to_string(),
+        &req.cancel_token,
+    )
+    .await;
+    if let Some(snapshot) = workspace_snapshot {
+        context.workspace_snapshot_digest = Some(snapshot.digest());
+        coordinator = coordinator.with_workspace_snapshot(snapshot);
+    }
     let mut output = match coordinator
         .run(multi_task, context, req.cancel_token.clone(), req.resume_checkpoint_json.clone())
         .await

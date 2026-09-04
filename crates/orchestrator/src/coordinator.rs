@@ -659,6 +659,12 @@ pub struct CoordinatorAgent {
     /// review cycles to pre-Phase 3 behavior — observable via a debug log at
     /// cycle entry, never a run failure.
     review_store: Option<sqlx::SqlitePool>,
+    /// ADR-65 §2 (Phase 2): the pre-planning workspace snapshot captured by
+    /// the readiness barrier, threaded through to agent dispatch so every
+    /// dispatched agent receives the snapshot digest in its context.
+    /// Never used to gate behavior in this phase — persistence/write gating is
+    /// load-bearing only with the Phase 5/6 evidence checks.
+    workspace_snapshot: Option<crate::workspace_snapshot::WorkspaceSnapshotRecord>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -836,6 +842,7 @@ impl CoordinatorAgent {
             blueprint_facade: None,
             approved_plan_seed: None,
             review_store: None,
+            workspace_snapshot: None,
         }
     }
 
@@ -1283,6 +1290,25 @@ impl CoordinatorAgent {
     pub fn with_review_store(mut self, pool: Option<sqlx::SqlitePool>) -> Self {
         self.review_store = pool;
         self
+    }
+
+    /// ADR-65 §2 (Phase 2): attach the pre-planning workspace snapshot so its
+    /// digest rides into every dispatched agent's context. Purely additive in
+    /// this phase — the snapshot is never used to gate behavior here.
+    pub fn with_workspace_snapshot(
+        mut self,
+        snapshot: crate::workspace_snapshot::WorkspaceSnapshotRecord,
+    ) -> Self {
+        self.workspace_snapshot = Some(snapshot);
+        self
+    }
+
+    /// The pre-planning snapshot digest for context injection; `None` when the
+    /// readiness barrier produced no snapshot (readability or fail-soft).
+    fn snapshot_digest(&self) -> Option<String> {
+        self.workspace_snapshot
+            .as_ref()
+            .map(crate::workspace_snapshot::WorkspaceSnapshotRecord::digest)
     }
 
     /// Attach the session's skills instructions (ADR-43, Task 4), injected
@@ -2837,6 +2863,7 @@ impl CoordinatorAgent {
                         budget_remaining_usd: None,
                         expected_artifacts: task_artifacts,
                         workspace_capsule: task_capsule,
+                        workspace_snapshot_digest: this.snapshot_digest(),
                     };
                     // ADR-35 §8 trigger 1 (stage absence): implement subtasks
                     // planned for the reserved `coordinator` role are executed
@@ -3013,6 +3040,7 @@ impl CoordinatorAgent {
                                     budget_remaining_usd: None,
                                     expected_artifacts: ladder_artifacts,
                                     workspace_capsule: None,
+                                    workspace_snapshot_digest: self.snapshot_digest(),
                                 };
                                 match self
                                     .attempt_fallback_ladder(
@@ -3628,6 +3656,7 @@ impl CoordinatorAgent {
                             budget_remaining_usd: None,
                             expected_artifacts: ladder_artifacts,
                             workspace_capsule: None,
+                            workspace_snapshot_digest: self.snapshot_digest(),
                         };
                         let classify_err = OrchestratorError::AgentLoopError(error.clone());
                         match self
@@ -4457,6 +4486,7 @@ impl CoordinatorAgent {
                 budget_remaining_usd: None,
                 expected_artifacts: Vec::new(),
                 workspace_capsule: None,
+                workspace_snapshot_digest: self.snapshot_digest(),
             };
 
             let result = self
@@ -4618,6 +4648,7 @@ impl CoordinatorAgent {
                             .cloned()
                             .unwrap_or_default(),
                         workspace_capsule: None,
+                        workspace_snapshot_digest: self.snapshot_digest(),
                     };
                     // Select routing profile for coder revision
                     let coder_profile = self.model_selector.select_for_session(
@@ -5124,6 +5155,7 @@ impl CoordinatorAgent {
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
+            workspace_snapshot_digest: self.snapshot_digest(),
         };
         let profile = self.model_selector.select_for_session(
             role,
@@ -5314,6 +5346,7 @@ impl CoordinatorAgent {
                                 budget_remaining_usd: None,
                                 expected_artifacts: Vec::new(),
                                 workspace_capsule: None,
+                                workspace_snapshot_digest: self.snapshot_digest(),
                             };
                             match self
                                 .attempt_fallback_ladder(

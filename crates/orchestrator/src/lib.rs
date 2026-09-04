@@ -55,6 +55,7 @@ pub mod supervisor;
 pub mod timeline;
 mod tool_guard;
 mod working_memory;
+pub mod workspace_snapshot;
 
 #[path = "runtime_runner_persistent.rs"]
 pub mod runtime_runner;
