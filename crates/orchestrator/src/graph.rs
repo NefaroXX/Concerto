@@ -644,8 +644,18 @@ mod tests {
         // process boundaries via AgentOutput.checkpoint_json).
         let json = serde_json::to_value(&checkpoint).unwrap();
         let deserialized: GraphCheckpoint = serde_json::from_value(json).unwrap();
-        assert!(deserialized.validate_scope(session_id, "test", Some("abc123")).is_ok());
-        assert!(deserialized.validate_scope(session_id, "test", Some("different")).is_err());
+        // Run-continuity Phase 1: scope is session + project. Source-revision
+        // drift (the stalled run or the user committed between checkpoint and
+        // resume) must NOT reject a same-session resume.
+        assert!(deserialized.validate_scope(session_id, "test").is_ok());
+        assert!(
+            deserialized.validate_scope(session_id, "other-project").is_err(),
+            "cross-project checkpoints must still be rejected"
+        );
+        assert!(
+            deserialized.validate_scope(concerto_core::ids::Ulid::new(), "test").is_err(),
+            "cross-session checkpoints must still be rejected"
+        );
 
         // Restore the graph.
         let restored = restore_graph(&deserialized).unwrap();

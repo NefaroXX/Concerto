@@ -240,11 +240,21 @@ impl GraphCheckpoint {
         }
     }
 
+    /// Validate that this checkpoint may resume for `(session_id, project_id)`.
+    ///
+    /// Scope is **session + project only**: a same-session, same-project
+    /// resume must always be accepted (run-continuity Phase 1). The recorded
+    /// `source_revision` is advisory metadata for the audit trail, not a
+    /// scope bound — the stalled run (or the user) may legitimately commit
+    /// work between the checkpoint and the resume, and rejecting on that
+    /// drift destroyed the only resumable state a bare "continue" had.
+    /// Cross-session and cross-project checkpoints are still rejected, as is
+    /// anything the runtime cannot understand (schema) or that claims to be
+    /// already completed.
     pub fn validate_scope(
         &self,
         session_id: concerto_core::ids::Ulid,
         project_id: &str,
-        source_revision: Option<&str>,
     ) -> Result<(), String> {
         // The current and the last legacy schema version are both resumable;
         // anything else (a future version) must be rejected cleanly.
@@ -261,13 +271,6 @@ impl GraphCheckpoint {
         }
         if self.project_id != project_id {
             return Err("checkpoint belongs to a different project".into());
-        }
-        if self.source_revision.as_deref() != source_revision {
-            return Err(format!(
-                "checkpoint source revision {:?} differs from current revision {:?}",
-                self.source_revision.as_deref(),
-                source_revision
-            ));
         }
         if self.completed || self.stage == CheckpointStage::Completed {
             return Err("checkpoint is already completed".into());
@@ -1614,7 +1617,7 @@ mod tests {
         assert!(task.created_at.unix_timestamp() > 0, "restore falls back to now for v2");
 
         // The migration is also honored by scope validation (defense in depth).
-        assert!(loaded.validate_scope(loaded.session_id, "test", None).is_ok());
+        assert!(loaded.validate_scope(loaded.session_id, "test").is_ok());
     }
 
     #[test]
@@ -1631,7 +1634,7 @@ mod tests {
 
         // validate_scope also rejects unknown future versions cleanly.
         let future: GraphCheckpoint = serde_json::from_value(value).unwrap();
-        let scope_error = future.validate_scope(future.session_id, "test", None).unwrap_err();
+        let scope_error = future.validate_scope(future.session_id, "test").unwrap_err();
         assert!(
             scope_error.contains("incompatible with runtime schema"),
             "expected scope rejection, got: {scope_error}"

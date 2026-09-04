@@ -2342,6 +2342,53 @@ mod tests {
         assert!(store.load_orchestration_checkpoint(session.id).await.unwrap().is_none());
     }
 
+    /// Run-continuity Phase 1: the orchestration-checkpoint load is the
+    /// "newest NON-completed checkpoint" lookup that backs a bare "continue"
+    /// — a row marked completed (a settled run) must never be served, while
+    /// the same row before completion is.
+    #[tokio::test]
+    async fn orchestration_checkpoint_load_skips_completed_rows() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/checkpoint-project");
+        let session = store
+            .create_session(&project_dir, "provider", "model", CancellationToken::new())
+            .await
+            .unwrap();
+        let record = OrchestrationCheckpointRecord {
+            session_id: session.id,
+            run_id: Ulid::new(),
+            root_task_id: TaskId::new(),
+            project_id: "checkpoint-project".into(),
+            objective_hash: "objective-hash".into(),
+            schema_version: 3,
+            source_revision: None,
+            sequence_num: 1,
+            state_json: r#"{"stage":"Executing"}"#.into(),
+            completed: true,
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        // A completed row is invisible to the resume lookup.
+        store.save_orchestration_checkpoint(&record).await.unwrap();
+        assert!(
+            store.load_orchestration_checkpoint(session.id).await.unwrap().is_none(),
+            "a completed checkpoint must never be served for a resume"
+        );
+
+        // The same row before completion (a stalled run) IS served — the
+        // upsert flips `completed` back without inserting a second row.
+        let mut stalled = record.clone();
+        stalled.completed = false;
+        store.save_orchestration_checkpoint(&stalled).await.unwrap();
+        let loaded = store
+            .load_orchestration_checkpoint(session.id)
+            .await
+            .unwrap()
+            .expect("the stalled checkpoint is resumable");
+        assert!(!loaded.completed);
+        assert_eq!(loaded.run_id, record.run_id);
+    }
+
     // -----------------------------------------------------------------------
     // New tests added below (16 tests)
     // -----------------------------------------------------------------------

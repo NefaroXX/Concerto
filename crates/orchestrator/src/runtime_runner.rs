@@ -3033,12 +3033,8 @@ pub async fn run_shared_agent(
                         // before trusting the checkpoint (Finding 2 / #65).
                         let project_id_str =
                             concerto_core::helpers::project_id_hash(&req.project_dir);
-                        let source_revision = current_source_revision(&req.project_dir).await;
-                        if let Err(reason) = checkpoint.validate_scope(
-                            session_id,
-                            &project_id_str,
-                            source_revision.as_deref(),
-                        ) {
+                        if let Err(reason) = checkpoint.validate_scope(session_id, &project_id_str)
+                        {
                             tracing::warn!(
                                 %reason,
                                 "discarding checkpoint that failed scope validation on resume"
