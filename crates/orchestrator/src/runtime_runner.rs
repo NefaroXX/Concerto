@@ -3116,8 +3116,16 @@ pub async fn run_shared_agent(
                     Ok(checkpoint) if resume_requested => {
                         // Explicit "continue" / "resume" — validate scope
                         // before trusting the checkpoint (Finding 2 / #65).
-                        let project_id_str =
-                            concerto_core::helpers::project_id_hash(&req.project_dir);
+                        // ADR-60 D7 (interrupt-safe resume): the scope is the
+                        // checkpoint's OWN project-id definition — the row was
+                        // written from `SessionContext::project_id`
+                        // (`ProjectId::resolve`: git-remote hash or
+                        // canonicalized-path hash). Validating against the
+                        // unrelated 16-char path hash rejected every real row
+                        // with "belongs to a different project" and then
+                        // cleared it — the only resumable state a graceful
+                        // interrupt had produced never survived a resume.
+                        let project_id_str = resume_scope_project_id(&req.project_dir);
                         if let Err(reason) = checkpoint.validate_scope(session_id, &project_id_str)
                         {
                             tracing::warn!(
@@ -4801,6 +4809,22 @@ fn is_resume_request(input: &str) -> bool {
     )
 }
 
+/// The project scope a resume validates an orchestration checkpoint against.
+///
+/// This is the checkpoint's OWN project-id definition — the row's
+/// `project_id` is written by the coordinator from
+/// `SessionContext::project_id` ([`concerto_core::types::ProjectId::resolve`]:
+/// blake3 of the git default remote URL, or of the canonicalized absolute
+/// path for non-git projects). Scope validation must compare like with
+/// like; the previous use of the unrelated
+/// [`concerto_core::helpers::project_id_hash`] definition (SipHash of the
+/// path, 16 hex chars) could never match, so every real checkpoint row was
+/// discarded as "belongs to a different project" and then cleared on
+/// resume (ADR-60 D7 interrupt-safe resume, 2026-09-05).
+fn resume_scope_project_id(project_dir: &Path) -> String {
+    ProjectId::resolve(project_dir).0
+}
+
 /// ADR-55 Phase 2b (M2): discard the session's orchestration checkpoint
 /// before a plan-driven (Apply) Execute so the run re-plans from the
 /// approved plan instead of silently resuming an old partial graph — the
@@ -4857,6 +4881,39 @@ mod runtime_runner_tests {
         // A classifier's correlation id is shared unchanged with the router row.
         let shared = Ulid::new();
         assert_eq!(router_row_correlation_id(Some(shared)), shared);
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): the resume scope check must use the
+    /// checkpoint's own project-id definition. A coordinator-written row
+    /// (project_id = `ProjectId::resolve`) validated against the unrelated
+    /// path-hash definition never matched, so every real checkpoint was
+    /// discarded with "belongs to a different project" and cleared on
+    /// resume — the only resumable state a graceful interrupt left never
+    /// survived.
+    #[test]
+    fn resume_scope_uses_the_checkpoint_project_id_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let written = concerto_core::types::ProjectId::resolve(dir.path()).0;
+        assert_eq!(
+            resume_scope_project_id(dir.path()),
+            written,
+            "the resume scope must equal the project id the coordinator writes"
+        );
+        // The regression pin: the old definition is a DIFFERENT hash and
+        // could never validate a production row.
+        assert_ne!(
+            concerto_core::helpers::project_id_hash(dir.path()),
+            written,
+            "the path-hash definition must stay distinct from the checkpoint's"
+        );
+        // A different project dir resolves to a different scope (the check
+        // still rejects genuinely foreign checkpoints).
+        let other = tempfile::tempdir().expect("tempdir");
+        assert_ne!(
+            resume_scope_project_id(dir.path()),
+            resume_scope_project_id(other.path()),
+            "distinct project dirs must remain distinct scopes"
+        );
     }
 
     /// ADR-56 §1 fast paths: the negation-override and smalltalk routes are
