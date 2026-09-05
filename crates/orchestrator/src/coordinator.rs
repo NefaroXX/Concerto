@@ -25,7 +25,7 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentOutput, AgentRunResult, AgentStage, AgentTask,
-    DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskId,
+    DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskExecutionMode, TaskId,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
@@ -707,6 +707,12 @@ pub struct CoordinatorAgent {
     /// the architect is NOT re-invoked on the same objective — re-deriving an
     /// already-approved plan (silent re-decompose) is forbidden.
     approved_plan_seed: Option<ApprovedPlanSeed>,
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): the logged-evidence
+    /// dispatch seed for a checkpointless `continue` run. Consumed once by
+    /// `decompose_or_restore` (only when no checkpoint governs the run);
+    /// decompose then schedules from the evidence chain instead of
+    /// re-entering design. See [`HeadlessResumeSeed`].
+    headless_resume_seed: Option<HeadlessResumeSeed>,
     /// ADR-60 Deferred 3: session-DB pool backing review-cycle resumability
     /// (`ReviewState` whiteboard snapshots written before every reviewer
     /// invocation and read back on restart). `None` (the default) degrades
@@ -753,8 +759,40 @@ pub struct ApprovedPlanSeed {
     pub plan_id: String,
     /// Structured DesignDoc rehydrated from the `plan-approved` event.
     /// `None` when the planning run produced only text — decompose then keeps
-    /// its normal design stage rather than inventing a doc.
+    /// its normal design stage rather than inventing a document.
     pub design_doc: Option<DesignDoc>,
+}
+
+/// ADR-60 D7 (interrupt-safe resume, 2026-09-05): a checkpointless
+/// `continue`/resume run's dispatch seed, built by the runtime runner from the
+/// session's logged evidence chain (the newest hash-verified `plan-approved`
+/// payload plus the session's logged researcher/coder gate events).
+///
+/// The coordinator consumes it in `decompose_or_restore` when no checkpoint
+/// row governs the run: instead of re-entering design (a fresh architect +
+/// planner LLM decompose — the observed F2 failure), the evidence scheduler
+/// schedules the next dispatch from the log and every materialized dispatch is
+/// recorded as a whiteboard `Decision` event citing REAL evidence ids
+/// (ADR-65 §7). Verified design + recorded research facts ⇒ the coder is
+/// dispatched, not the architect; an architect/researcher re-dispatch on this
+/// path is impossible without its own recorded, evidence-backed decision.
+#[derive(Debug, Clone)]
+pub struct HeadlessResumeSeed {
+    /// The approved plan's ORIGINAL objective hash (the `plan-approved`
+    /// payload's `objective_hash`) — the hash a later implicit resume matches
+    /// the original objective text against.
+    pub objective_hash: String,
+    /// The approved plan text — the artifact this resume continues; recorded
+    /// as the resumed run's checkpoint objective for provenance.
+    pub plan_text: String,
+    /// Structured DesignDoc carried by the `plan-approved` payload when the
+    /// planning run produced one. `None` for text-only plans: the approved
+    /// plan text governs (carried by the task description's run-continuity
+    /// section) and no contract paths bind.
+    pub design_doc: Option<DesignDoc>,
+    /// The REAL `plan-approved` whiteboard event id — the evidence the
+    /// recorded dispatch decisions cite and the Decision `causation` anchor.
+    pub plan_approved_event_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1101,6 +1139,7 @@ impl CoordinatorAgent {
             eval_engine: None,
             blueprint_facade: None,
             approved_plan_seed: None,
+            headless_resume_seed: None,
             review_store: None,
             workspace_snapshot: None,
             run_id: None,
@@ -1555,6 +1594,19 @@ impl CoordinatorAgent {
     /// forbidden). Unseeded runs (the default) are byte-identical to pre-D7.
     pub fn with_approved_plan_seed(mut self, seed: ApprovedPlanSeed) -> Self {
         self.approved_plan_seed = Some(seed);
+        self
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): attach the logged
+    /// evidence-chain dispatch seed for a checkpointless `continue` run. When
+    /// no checkpoint governs the run, `decompose_or_restore` schedules the
+    /// next dispatch from the session's evidence (verified design + recorded
+    /// research facts ⇒ the coder) instead of re-entering design, and records
+    /// every dispatch as an evidence-backed whiteboard `Decision` event
+    /// (ADR-65 §7). Unseeded runs (the default) are byte-identical to
+    /// pre-amendment behavior.
+    pub fn with_headless_resume_seed(mut self, seed: HeadlessResumeSeed) -> Self {
+        self.headless_resume_seed = Some(seed);
         self
     }
 
@@ -2469,6 +2521,7 @@ impl CoordinatorAgent {
         cancel: &CancellationToken,
         resume_checkpoint_json: Option<String>,
     ) -> Result<DecomposeResult, OrchestratorError> {
+        let checkpoint_present = resume_checkpoint_json.is_some();
         if let Some(cp_json) = resume_checkpoint_json {
             match self.restore_and_evaluate(&cp_json, task, context, cancel).await {
                 Ok(Some(result)) => return Ok(result),
@@ -2478,6 +2531,22 @@ impl CoordinatorAgent {
                 // Phase-6 scheduler govern the new planning.
                 Ok(None) => {}
                 Err(error) => return Err(error),
+            }
+        }
+
+        // ADR-60 D7 (interrupt-safe resume, 2026-09-05): a `continue` run with
+        // NO checkpoint row to restore seeds its dispatch from the logged
+        // evidence chain instead of re-entering design — the newest
+        // hash-verified `plan-approved` payload and the session's logged
+        // researcher/coder gate events determine the next dispatch (verified
+        // design + research done ⇒ the coder, never the architect). Every
+        // materialized dispatch is recorded as an evidence-backed `Decision`
+        // event (ADR-65 §7). The checkpoint-restored path above keeps the §7
+        // evaluator; a genuinely fresh run (no seed attached) decomposes
+        // normally below.
+        if !checkpoint_present {
+            if let Some(seed) = self.headless_resume_seed.take() {
+                return self.decompose_from_evidence(task, context, cancel, seed).await;
             }
         }
 
@@ -4746,6 +4815,34 @@ impl CoordinatorAgent {
             EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
         );
 
+        // ── ADR-60 D7 (interrupt-safe resume, 2026-09-05): zero-work guard ─
+        // An action-required (build-classified) run that reaches the success
+        // exit with ZERO executed tool calls never performed the work it
+        // reports completing: subtasks were dispatched, every one answered in
+        // prose, and no tool ever ran — the live F1 acceptance failure (a
+        // "build" prompt produced a "completed" message with zero tool work
+        // past the single-agent and zero-file guards). Run-level mirror of
+        // the single-agent loop's zero-tool guard, evaluated where the whole
+        // run's tool count is known:
+        // - fully resolver-served runs are exempt — no subtask was
+        //   dispatched (the work was proven done from the timeline);
+        // - checkpoint-resumed runs keep the checkpoint's own tool count, so
+        //   only a run with genuinely zero tool work trips;
+        // - answer-only root tasks are out of scope by construction.
+        // The note downgrades the exit to Partial, and the stall gate below
+        // keeps the checkpoint resumable for a later resume.
+        let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
+        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && dispatched_subtasks
+            && total_tool_calls == 0
+        {
+            recoverable_notes.push(
+                "Zero-work guard: the task required tool work but zero tool calls executed \
+                 across the run; the completion claim was not backed by any executed tool."
+                    .to_owned(),
+            );
+        }
+
         let completion_status = if recoverable_notes.is_empty() {
             concerto_core::types::AgentCompletionStatus::Completed
         } else {
@@ -6474,11 +6571,77 @@ impl CoordinatorAgent {
         // justifies, among the currently registered agents. A stage with no
         // registered agent is never called (ADR-58, acceptance 6).
 
+        // The scheduler's view of the DesignDoc claim: the Phase-5 verifier's
+        // resolution mapped onto the scheduler's decision surface.
+        let doc_resolution =
+            scheduler_doc_resolution(&design_verdict, design_doc.as_ref(), &doc_event_ids);
+
+        // Consult the deterministic evidence scheduler and materialize its
+        // plan. Shared with the ADR-60 D7 (interrupt-safe resume) dispatch
+        // path, which hands in the approved plan's resolution instead of a
+        // verifier verdict.
+        self.schedule_and_materialize(
+            &mut graph,
+            task,
+            context,
+            cancel,
+            design_id,
+            design_role.as_ref(),
+            doc_resolution,
+            doc_event_ids,
+            binding_doc,
+            &implement_tag,
+        )
+        .await?;
+
+        Ok((graph, None))
+    }
+
+    /// Consult the deterministic evidence scheduler and materialize its plan
+    /// as ordered graph tasks (ADR-65 §6).
+    ///
+    /// Shared by the planner-failure fallback (the decompose tail above) and
+    /// the ADR-60 D7 interrupt-safe-resume dispatch path
+    /// ([`Self::decompose_from_evidence`], which hands in the approved
+    /// plan's resolution instead of a verifier verdict).
+    ///
+    /// A lone Exploration step is the rule-(b) deferred case: its facts must
+    /// land before the next decision, so the coordinator dispatches it inline
+    /// and re-consults the scheduler with refreshed evidence. Bounded by
+    /// construction: the loop state (`exploration_attempted`) makes the
+    /// second consultation terminal. Materialized steps chain onto
+    /// `design_id` (when a design stage ran) or onto each other; every
+    /// materialized dispatch is recorded as a whiteboard `Decision` event
+    /// citing the step's real evidence ids (ADR-65 §6), with doc-driven
+    /// decisions causally anchored at the claim event from `doc_event_ids`.
+    #[allow(clippy::too_many_arguments)]
+    async fn schedule_and_materialize(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        design_id: Option<TaskId>,
+        design_role: Option<&AgentId>,
+        doc_resolution: DocResolution,
+        doc_event_ids: Option<(String, String)>,
+        binding_doc: Option<&DesignDoc>,
+        implement_tag: &str,
+    ) -> Result<(), OrchestratorError> {
+        // The implement roster mirrors `decompose_task`'s resolution exactly:
+        // registered implement-stage agents, plus the reserved `coordinator`
+        // sentinel under the ADR-35 §8 self-execute standby (no registered
+        // implement-stage agent and an executor present).
+        let mut implement_ids = self.registry.ids_for_stage(&AgentStage::new(implement_tag));
+        let coordinator_self_implements = implement_ids.is_empty() && self.self_execute_available();
+        if coordinator_self_implements {
+            implement_ids.push(AgentId::new("coordinator"));
+        }
         // Build the scheduler candidate roster from the registry. The agents'
         // stage tags are the capability tags (ADR-58), and the tie-break is
         // the lexicographic id rank (the same rule `first_agent_for_stage`
         // uses).
-        let mut candidates = self.scheduler_candidates(&implement_tag);
+        let mut candidates = self.scheduler_candidates(implement_tag);
         // Preserve the ADR-35 §8 coordinator self-execute standby: with no
         // registered implement-stage agent (and an executor present) the
         // coordinator carries implementation itself as the reserved
@@ -6498,11 +6661,6 @@ impl CoordinatorAgent {
                     .into(),
             ));
         }
-
-        // The scheduler's view of the DesignDoc claim: the Phase-5 verifier's
-        // resolution mapped onto the scheduler's decision surface.
-        let doc_resolution =
-            scheduler_doc_resolution(&design_verdict, design_doc.as_ref(), &doc_event_ids);
 
         // Consult the scheduler. A lone Exploration step is the rule-(b)
         // deferred case: its facts must land before the next decision, so the
@@ -6574,12 +6732,8 @@ impl CoordinatorAgent {
             let completed_id = completed.id;
             match parent_id {
                 Some(design) => {
-                    let relationship = self.fallback_relationship(
-                        &graph,
-                        design,
-                        &completed.role,
-                        design_role.as_ref(),
-                    );
+                    let relationship =
+                        self.fallback_relationship(graph, design, &completed.role, design_role);
                     graph.add_child_with_relationship(
                         completed,
                         design,
@@ -6618,7 +6772,7 @@ impl CoordinatorAgent {
             match parent_id {
                 Some(parent) => {
                     let relationship =
-                        self.fallback_relationship(&graph, parent, &role, design_role.as_ref());
+                        self.fallback_relationship(graph, parent, &role, design_role);
                     graph.add_child_with_relationship(
                         subtask,
                         parent,
@@ -6661,7 +6815,128 @@ impl CoordinatorAgent {
             }
         }
 
-        Ok((graph, None))
+        Ok(())
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): decompose a
+    /// checkpointless `continue` run from the logged evidence chain.
+    ///
+    /// The dispatch state comes from the log, not from a fresh model
+    /// decompose: the seed's hash-verified `plan-approved` payload re-anchors
+    /// the verified design (a carried DesignDoc binds unconditionally — the
+    /// approval IS the evidence, exactly like the #152 seeded-doc path; a
+    /// text-only plan schedules as a doc-skipped implement step with the
+    /// approved plan text governing via the task description), and the
+    /// ADR-65 §6 evidence scheduler decides the next dispatch from the
+    /// workspace facts the interrupted run's agents recorded. Recorded
+    /// research facts ⇒ evidence sufficient ⇒ a single implement step — the
+    /// **coder**, never the architect. No recorded facts ⇒ the bounded
+    /// rule-(b) exploration step, itself recorded. Every materialized
+    /// dispatch is a whiteboard `Decision` event citing REAL evidence ids, so
+    /// ADR-65 §7 holds on the resume path too: an architect/researcher
+    /// re-dispatch here is impossible without its own recorded,
+    /// evidence-backed decision.
+    ///
+    /// Mirror of the fresh decompose / checkpoint-restore tail obligations
+    /// (graph validation, a durable plan artifact, the `MultiAgentModeStarted`
+    /// lifecycle event) with the checkpoint objective taken from the seed:
+    /// the recorded objective is the approved plan text and the objective hash
+    /// is the payload's ORIGINAL objective hash, so a later implicit resume
+    /// still matches the original objective text.
+    async fn decompose_from_evidence(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        seed: HeadlessResumeSeed,
+    ) -> Result<DecomposeResult, OrchestratorError> {
+        tracing::info!(
+            plan_approved_event = %seed.plan_approved_event_id,
+            has_design_doc = seed.design_doc.is_some(),
+            "ADR-60 D7: headless resume — scheduling from the logged evidence \
+             chain instead of re-entering design"
+        );
+        let mut graph = TaskGraph::new();
+        let doc = seed.design_doc;
+        // Keep the doc so checkpoints and expected-artifact derivation carry
+        // it, exactly like the seeded approved-plan path.
+        *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = doc.clone();
+        let contract_paths: Vec<String> = doc
+            .as_ref()
+            .map(|doc| doc.proposed_files.iter().map(|path| path.as_str().to_owned()).collect())
+            .unwrap_or_default();
+        let evidence_ids = vec![seed.plan_approved_event_id.clone()];
+        // Causation anchor for doc-driven dispatch decisions: the
+        // plan-approved event this resume continues (never fabricated).
+        let doc_event_ids =
+            Some((seed.plan_approved_event_id.clone(), seed.plan_approved_event_id.clone()));
+        let doc_resolution = match &doc {
+            Some(_) => {
+                DocResolution::Active { contract_paths: contract_paths.clone(), evidence_ids }
+            }
+            None => DocResolution::Skipped { evidence_ids },
+        };
+        self.last_doc_resolution = Some(match &doc {
+            Some(_) => checkpoint::CheckpointDocResolution::Active {
+                contract_paths,
+                claim_event_id: Some(seed.plan_approved_event_id.clone()),
+                verdict_event_id: None,
+            },
+            None => checkpoint::CheckpointDocResolution::Skipped {
+                claim_event_id: Some(seed.plan_approved_event_id.clone()),
+                verdict_event_id: None,
+            },
+        });
+        let binding_doc: Option<&DesignDoc> = doc.as_ref();
+        let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
+        self.schedule_and_materialize(
+            &mut graph,
+            task,
+            context,
+            cancel,
+            None, // no design stage ran — subtasks chain onto each other
+            None, // no design-role relationship applies
+            doc_resolution,
+            doc_event_ids,
+            binding_doc,
+            &implement_tag,
+        )
+        .await?;
+        TaskGraphValidator::validate(&graph)?;
+
+        // Mirror the fresh decompose / checkpoint-restore tail: a durable
+        // plan artifact + the lifecycle event.
+        let plan = PlanArtifact::from_graph(
+            Ulid::new().to_string(),
+            task,
+            &graph,
+            &self.expected_artifacts_snapshot(),
+        );
+        let plan_id = self.persist_plan_artifact(&plan);
+        self.last_plan_id = plan_id.clone();
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeStarted {
+                task_id: task.id,
+                subtask_count: graph.len(),
+                plan_id,
+            },
+        );
+        Ok(DecomposeResult {
+            graph,
+            completed_results: HashMap::new(),
+            total_cost: 0.0,
+            total_tool_calls: 0,
+            all_files: Vec::new(),
+            provider_metrics: Vec::new(),
+            subtask_attempts: HashMap::new(),
+            retry_feedback: HashMap::new(),
+            model_assignments: HashMap::new(),
+            action_ledger: Vec::new(),
+            objective: seed.plan_text,
+            objective_hash: seed.objective_hash,
+        })
     }
 
     // ── ADR-65 §6: evidence-driven fallback scheduling (read/write) ─────
@@ -7714,6 +7989,71 @@ mod tests {
                 )
             }),
             "no design-stage agent should mean no design subtask runs"
+        );
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05) — live F1: an
+    /// action-required (build-classified) run whose dispatched subtasks all
+    /// answered in prose (zero tool calls across the whole run) must NOT
+    /// report Completed. The run-level zero-work guard downgrades the exit to
+    /// Partial and names the omission. A non-implement subtask role is used
+    /// deliberately: the per-subtask zero-file guard does not apply to it, so
+    /// the run reaches the success exit — exactly the route the F1 claim took.
+    #[tokio::test]
+    async fn zero_tool_action_required_run_stalls_instead_of_completing() {
+        let bus = EventBus::new(256);
+        // A research-stage subtask answers prose-only (zero tools, zero
+        // files) and "succeeds" — the per-subtask guards pass it.
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "done")];
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            mocks,
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _id) = single_pending_graph(session_id, "researcher");
+        let rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let (output, _notes) = coordinator
+            .execute_graph(
+                // The ROOT task is action-required (a build-classified run);
+                // this is what arms the run-level zero-work guard.
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                graph,
+                HashMap::new(), // completed_results
+                0.0,            // total_cost
+                0,              // total_tool_calls
+                vec![],         // all_files
+                vec![],         // provider_metrics
+                HashMap::new(), // subtask_attempts
+                HashMap::new(), // retry_feedback
+                HashMap::new(), // model_assignments
+                Vec::new(),     // action_ledger
+                "build the thing".to_string(),
+                blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            )
+            .await
+            .expect("execute_graph returns");
+        let _ = rx;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a zero-tool action-required run must stall, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the omission is named in the final message: {}",
+            output.final_message
         );
     }
 
@@ -11554,6 +11894,273 @@ mod tests {
                 EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
             )),
             "the implement subtask still dispatches off the seeded doc"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D7 (interrupt-safe resume, 2026-09-05): a checkpointless
+    // `continue` run schedules from the logged evidence chain — verified
+    // design + recorded research facts ⇒ the CODER, never the architect;
+    // every dispatch is an evidence-backed `Decision` event (ADR-65 §7).
+    // ------------------------------------------------------------------
+
+    /// Build a headless-resume fixture: a real workspace, its snapshot
+    /// barrier record, an evidence pool, and a hash-verified `plan-approved`
+    /// event. Returns everything the headless-resume tests need.
+    async fn headless_resume_fixture(
+        session_id: Ulid,
+        barrier_applies_observations: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        sqlx::SqlitePool,
+        crate::workspace_snapshot::WorkspaceSnapshotRecord,
+        String, // plan-approved event id
+        HeadlessResumeSeed,
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let src = workspace.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(src.join("main.rs"), b"fn main() {}\n").expect("write src/main.rs");
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let cancel = CancellationToken::new();
+        // Production runs the barrier before planning; with a pool it also
+        // applies the inventory as observations. `barrier_applies_observations`
+        // = false simulates a resume whose evidence chain carries no research
+        // facts (the rule-(b) exploration arm).
+        let pool_for_barrier = barrier_applies_observations.then_some(&pool);
+        let snapshot = crate::workspace_snapshot::run_snapshot_barrier(
+            pool_for_barrier,
+            workspace.path(),
+            &session_id.to_string(),
+            &cancel,
+        )
+        .await
+        .expect("the barrier captures a readable project");
+
+        // The verified design: a structured doc proposing the grounded path.
+        let doc = DesignDoc {
+            goals: vec!["continue the build".to_owned()],
+            constraints: vec![],
+            proposed_files: vec![camino::Utf8PathBuf::from("src/main.rs")],
+            interface_sketch: String::new(),
+            risks: vec![],
+        };
+        let objective_hash = blake3::hash("build the thing".as_bytes()).to_hex().to_string();
+        let binding = crate::plan_approval::PlanBinding::new(
+            "plan-resume".to_owned(),
+            objective_hash.clone(),
+            None,
+            "# Plan\nstep 1: continue the build".to_owned(),
+        );
+        let stored = crate::plan_approval::append_plan_approved_event(
+            &pool,
+            session_id,
+            &binding,
+            Some(&doc),
+        )
+        .await
+        .expect("plan-approved event lands");
+        let seed = HeadlessResumeSeed {
+            objective_hash,
+            plan_text: binding.plan_text().to_owned(),
+            design_doc: Some(doc),
+            plan_approved_event_id: stored.event_id.clone(),
+        };
+        // The evidence pool's backing tempdir must outlive the caller's use
+        // of the pool (a closed file breaks every new SQLite connection), so
+        // it is returned alongside.
+        (workspace, _store_dir, pool, snapshot, stored.event_id, seed)
+    }
+
+    /// A checkpointless `continue` whose session log carries a hash-verified
+    /// `plan-approved` payload AND recorded research facts schedules the
+    /// IMPLEMENT step: the coder is dispatched, the architect is NEVER
+    /// re-invoked, and the dispatch is a `Decision` event citing the REAL
+    /// plan-approved event id (ADR-65 §7).
+    #[tokio::test]
+    async fn headless_resume_dispatches_the_coder_not_the_architect() {
+        let session_id = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, plan_event_id, seed) =
+            headless_resume_fixture(session_id, true).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            // Poisoned: a resume that re-enters design dispatches this and
+            // fails the run — the assertion below catches the dispatch.
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let (output, events) = run_for_test(
+            coordinator_with(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                PLAN_RESEARCH_CODER.into(),
+            )
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect"
+            )),
+            "the headless resume must never re-enter design (the architect is poisoned)"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "researcher"
+            )),
+            "research facts are recorded: the researcher is not re-dispatched"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "verified design + research done dispatches the coder"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the resumed build completes: {}",
+            output.final_message
+        );
+
+        // The dispatch Decision cites the REAL plan-approved event id.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(decisions.len(), 1, "one recorded dispatch decision: {decisions:?}");
+        let decision = decisions[0];
+        assert_eq!(decision.payload["selected_agent"], "coder");
+        assert!(
+            decision.payload["supporting_evidence_ids"]
+                .as_array()
+                .expect("supporting ids array")
+                .iter()
+                .any(|id| id == &plan_event_id),
+            "the Decision cites the plan-approved event as evidence: {:?}",
+            decision.payload
+        );
+        assert_eq!(
+            decision.causation.as_deref(),
+            Some(plan_event_id.as_str()),
+            "the doc-driven decision is causally anchored at the plan-approved event"
+        );
+    }
+
+    /// A checkpointless `continue` whose evidence chain has NO research facts
+    /// takes the bounded rule-(b) exploration FIRST (recorded), then the
+    /// implement step (recorded) — the architect is still never re-invoked,
+    /// and every dispatch carries its own evidence-backed `Decision` event.
+    #[tokio::test]
+    async fn headless_resume_without_research_facts_explores_first_then_implements() {
+        let session_id = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(session_id, false).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let (output, events) = run_for_test(
+            coordinator_with(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                PLAN_RESEARCH_CODER.into(),
+            )
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect"
+            )),
+            "no evidence-chain resume re-enters design"
+        );
+        let started: Vec<&AgentId> = events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::SubTaskStarted { role, .. } => Some(role),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            started.iter().any(|role| role.as_str() == "researcher"),
+            "an evidence gap explores first: {started:?}"
+        );
+        assert!(
+            started.iter().any(|role| role.as_str() == "coder"),
+            "the exploration is followed by the implement step: {started:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "explore-then-implement completes: {}",
+            output.final_message
+        );
+
+        // BOTH dispatches are recorded, in order, with real evidence.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let decisions: Vec<&concerto_sessions::whiteboard::WhiteboardEvent> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(decisions.len(), 2, "explore + implement both recorded: {decisions:?}");
+        assert_eq!(decisions[0].payload["selected_agent"], "researcher");
+        assert_eq!(decisions[0].payload["reason"], "evidence-gap-explore");
+        assert_eq!(decisions[1].payload["selected_agent"], "coder");
+        assert!(
+            decisions.iter().all(|decision| decision.payload["supporting_evidence_ids"]
+                .as_array()
+                .is_none_or(|ids| ids
+                    .iter()
+                    .all(|id| logged.iter().any(|event| &event.event_id == id)))),
+            "every cited evidence id is a REAL log row"
         );
     }
 

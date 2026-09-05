@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_runner::AgentRunner;
-use crate::coordinator::{ApprovedPlanSeed, CoordinatorAgent, OrchestrationDepth};
+use crate::coordinator::{
+    ApprovedPlanSeed, CoordinatorAgent, HeadlessResumeSeed, OrchestrationDepth,
+};
 use crate::intent_grants::{
     apply_intent_gate, outcome_name, router_route_name, IntentGrantStore, SessionIntentAuth,
 };
@@ -2316,6 +2318,13 @@ fn render_plan_ledger_section(ledger: &PlanLedger) -> String {
 /// plan approval sit at the tail of the session's log, so the newest window
 /// is the relevant one.
 const RUN_CONTINUITY_WINDOW: usize = 200;
+/// ADR-60 D7 (interrupt-safe resume): the wider bounded read the headless
+/// plan-anchor lookup uses. A long build can scroll the plan approval past
+/// the continuity window's newest 200 events, but the approval stays the
+/// dispatch anchor a headless resume re-derives from; this window bounds the
+/// extra read (same posture as the coordinator's 2000-event §7 resume
+/// window).
+const RUN_CONTINUITY_PLAN_WINDOW: usize = 2000;
 
 /// One session's run-continuity snapshot: the newest hash-verified
 /// `plan-approved` payload (when the session ever approved a plan) plus the
@@ -2324,6 +2333,10 @@ const RUN_CONTINUITY_WINDOW: usize = 200;
 struct RunContinuity {
     /// The session's last approved plan, artifact-hash verified at read.
     plan: Option<PlanApprovedPayload>,
+    /// The REAL whiteboard event id of the `plan-approved` row `plan` came
+    /// from — the evidence citation the headless-resume dispatch decisions
+    /// record (ADR-65 §7: never fabricated). `Some` iff `plan` is `Some`.
+    plan_approved_event_id: Option<String>,
     /// Carry-forward state from the session's gate-written ledger events.
     ledger: PlanLedger,
 }
@@ -2332,6 +2345,8 @@ impl RunContinuity {
     /// An empty snapshot seeds nothing — the truthful state for a fresh
     /// session or a pre-whiteboard log.
     fn is_empty(&self) -> bool {
+        // `plan_approved_event_id` is `Some` iff `plan` is `Some`, so the
+        // emptiness test needs neither field spelled out.
         self.plan.is_none() && self.ledger == PlanLedger::default()
     }
 }
@@ -2357,10 +2372,17 @@ fn run_continuity_applies(
 /// whiteboard cursor when one governs the run — only facts appended AFTER the
 /// cursor are folded into the resumed run's evidence view; pre-cursor events
 /// are state the checkpoint itself carries, never replayed prose.
+///
+/// ADR-60 D7 (interrupt-safe resume): on a HEADLESS resume (`headless_plan_anchor`,
+/// no checkpoint row governs the run) the plan approval is re-read
+/// independently of the continuity window — a long build can scroll the
+/// approval past the newest [`RUN_CONTINUITY_WINDOW`] events, but it stays the
+/// dispatch anchor the resume re-derives from.
 async fn load_run_continuity(
     pool: &sqlx::SqlitePool,
     session_id: Ulid,
     cursor_gate_seq: Option<u64>,
+    headless_plan_anchor: bool,
 ) -> Result<RunContinuity, concerto_sessions::SessionError> {
     // Read the newest tail of the session's log. `gate_seq` is global: with
     // a §7 cursor the evidence view starts exactly there; otherwise anchor
@@ -2384,14 +2406,16 @@ async fn load_run_continuity(
     )
     .await?;
 
-    // The newest approval only: an older plan could be stale, and digging
-    // backwards past an unverifiable one would trust a log the caller cannot
-    // attest to.
-    let plan =
+    let plan: Option<(PlanApprovedPayload, String)> = if headless_plan_anchor {
+        load_newest_plan_approval(pool, session_id).await?
+    } else {
+        // The newest approval only: an older plan could be stale, and digging
+        // backwards past an unverifiable one would trust a log the caller cannot
+        // attest to.
         events.iter().rev().find(|event| event.kind == WhiteboardKind::PlanApproved).and_then(
             |event| match serde_json::from_value::<PlanApprovedPayload>(event.payload.clone()) {
                 Ok(payload) if plan_artifact_hash(&payload.plan_text) == payload.artifact_hash => {
-                    Some(payload)
+                    Some((payload, event.event_id.clone()))
                 }
                 Ok(payload) => {
                     tracing::warn!(
@@ -2412,9 +2436,65 @@ async fn load_run_continuity(
                     None
                 }
             },
-        );
+        )
+    };
     let ledger = fold_ledger(&events);
-    Ok(RunContinuity { plan, ledger })
+    Ok(RunContinuity {
+        plan: plan.as_ref().map(|(payload, _)| payload.clone()),
+        plan_approved_event_id: plan.map(|(_, event_id)| event_id),
+        ledger,
+    })
+}
+
+/// The session's newest hash-verified `plan-approved` payload plus its REAL
+/// whiteboard event id, read independently of the run-continuity window
+/// (ADR-60 D7 interrupt-safe resume): the approval can be older than the
+/// newest [`RUN_CONTINUITY_WINDOW`] events on a long build, yet remains the
+/// dispatch anchor a headless resume re-derives from. Bounded by
+/// [`RUN_CONTINUITY_PLAN_WINDOW`] events back from the log head — an
+/// unreadable or unattested newest approval is skipped with a warn, never
+/// trusted.
+async fn load_newest_plan_approval(
+    pool: &sqlx::SqlitePool,
+    session_id: Ulid,
+) -> Result<Option<(PlanApprovedPayload, String)>, concerto_sessions::SessionError> {
+    let head = latest_gate_seq(pool).await?;
+    let after = head.saturating_sub(RUN_CONTINUITY_PLAN_WINDOW as u64);
+    let events = load_whiteboard_events(
+        pool,
+        &WhiteboardLoadOpts {
+            after_gate_seq: after,
+            session_id: Some(session_id.to_string()),
+            scope: None,
+            limit: RUN_CONTINUITY_PLAN_WINDOW,
+        },
+    )
+    .await?;
+    Ok(events.iter().rev().find(|event| event.kind == WhiteboardKind::PlanApproved).and_then(
+        |event| match serde_json::from_value::<PlanApprovedPayload>(event.payload.clone()) {
+            Ok(payload) if plan_artifact_hash(&payload.plan_text) == payload.artifact_hash => {
+                Some((payload, event.event_id.clone()))
+            }
+            Ok(payload) => {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    plan_id = %payload.plan_id,
+                    "session's newest plan-approved payload fails its artifact hash — \
+                     the headless resume skips it"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    event_id = %event.event_id,
+                    "session's newest plan-approved payload is unreadable — the headless \
+                     resume skips it"
+                );
+                None
+            }
+        },
+    ))
 }
 
 /// Render the run-continuity section appended to a `continue` run's task
@@ -2443,13 +2523,20 @@ fn run_continuity_description(continuity: &RunContinuity) -> String {
 /// nothing; a read error warns and leaves the task untouched — continuity
 /// bookkeeping never fails the run. `cursor_gate_seq` anchors the read at the
 /// checkpoint's whiteboard cursor (ADR-65 §7) when one governs the run.
+///
+/// ADR-60 D7 (interrupt-safe resume, 2026-09-05): when the run is HEADLESS
+/// (`headless_plan_anchor` — no checkpoint row governs this resume) and the
+/// log carries a hash-verified `plan-approved` payload, this ALSO returns the
+/// dispatch seed the coordinator consumes to schedule from the evidence
+/// chain (verified design + research done ⇒ the coder, never the architect).
 async fn seed_run_continuity(
     task: &mut AgentTask,
     pool: &sqlx::SqlitePool,
     session_id: Ulid,
     cursor_gate_seq: Option<u64>,
-) {
-    match load_run_continuity(pool, session_id, cursor_gate_seq).await {
+    headless_plan_anchor: bool,
+) -> Option<HeadlessResumeSeed> {
+    match load_run_continuity(pool, session_id, cursor_gate_seq, headless_plan_anchor).await {
         Ok(continuity) if !continuity.is_empty() => {
             tracing::info!(
                 session_id = %task.session_id,
@@ -2461,14 +2548,43 @@ async fn seed_run_continuity(
             );
             task.description.push_str("\n\n");
             task.description.push_str(&run_continuity_description(&continuity));
+            // ADR-60 D7 (interrupt-safe resume): the dispatch cursor rides the
+            // same verified payload — headless only, and only when the
+            // approval is attested with its real event id (the loader sets
+            // both from one row; a degraded read yields neither).
+            if headless_plan_anchor {
+                match (continuity.plan, continuity.plan_approved_event_id) {
+                    (Some(plan), Some(plan_approved_event_id)) => {
+                        return Some(HeadlessResumeSeed {
+                            objective_hash: plan.objective_hash,
+                            plan_text: plan.plan_text,
+                            design_doc: plan.design_doc,
+                            plan_approved_event_id,
+                        });
+                    }
+                    (Some(_), None) => {
+                        tracing::warn!(
+                            session_id = %task.session_id,
+                            "plan-approved payload loaded without its event id — the \
+                             headless resume proceeds without a dispatch seed (never \
+                             fabricates evidence)"
+                        );
+                    }
+                    (None, _) => {}
+                }
+            }
+            None
         }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(
-            %error,
-            session_id = %task.session_id,
-            "failed to load the session's run-continuity ledger; the resume run \
-             proceeds without it"
-        ),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session_id = %task.session_id,
+                "failed to load the session's run-continuity ledger; the resume run \
+                 proceeds without it"
+            );
+            None
+        }
     }
 }
 
@@ -3116,8 +3232,16 @@ pub async fn run_shared_agent(
                     Ok(checkpoint) if resume_requested => {
                         // Explicit "continue" / "resume" — validate scope
                         // before trusting the checkpoint (Finding 2 / #65).
-                        let project_id_str =
-                            concerto_core::helpers::project_id_hash(&req.project_dir);
+                        // ADR-60 D7 (interrupt-safe resume): the scope is the
+                        // checkpoint's OWN project-id definition — the row was
+                        // written from `SessionContext::project_id`
+                        // (`ProjectId::resolve`: git-remote hash or
+                        // canonicalized-path hash). Validating against the
+                        // unrelated 16-char path hash rejected every real row
+                        // with "belongs to a different project" and then
+                        // cleared it — the only resumable state a graceful
+                        // interrupt had produced never survived a resume.
+                        let project_id_str = resume_scope_project_id(&req.project_dir);
                         if let Err(reason) = checkpoint.validate_scope(session_id, &project_id_str)
                         {
                             tracing::warn!(
@@ -3207,9 +3331,23 @@ pub async fn run_shared_agent(
     // verified rehydration; this seeds only when that path did not fire.
     // Fail-soft: no pool, an empty log, or a read error leaves the task
     // untouched — continuity bookkeeping never fails the run.
+    //
+    // ADR-60 D7 (interrupt-safe resume, 2026-09-05): when the run is HEADLESS
+    // (no checkpoint row survived the checkpoint block above), the same
+    // verified payload also seeds the DISPATCH cursor — the resumed run
+    // schedules from the evidence chain (verified design + research done ⇒
+    // the coder) instead of re-entering design.
+    let mut headless_resume: Option<HeadlessResumeSeed> = None;
     if run_continuity_applies(apply_plan, &req.input, services.config.multi_agent.as_ref()) {
         if let Some(pool) = gate_log_pool.as_ref() {
-            seed_run_continuity(&mut task, pool, session_id, resume_cursor).await;
+            headless_resume = seed_run_continuity(
+                &mut task,
+                pool,
+                session_id,
+                resume_cursor,
+                req.resume_checkpoint_json.is_none(),
+            )
+            .await;
         }
     }
 
@@ -3244,6 +3382,7 @@ pub async fn run_shared_agent(
             intent_policy.clone(),
             gate_log_pool.clone(),
             resume_updated_at_ms,
+            headless_resume,
         )
         .await;
     }
@@ -3410,9 +3549,12 @@ async fn run_multi_agent(
     gate_log_pool: Option<sqlx::SqlitePool>,
     // ADR-65 §7: the checkpoint row's own `updated_at` — the v3 backfill
     // hint for the coordinator's additive §7 backfill. `None` for a fresh
-    // run (the backfill then treats the whole log as pre-cursor,
-    // fail-soft).
+    // run (the backfill then treats the whole log as pre-cursor, fail-soft).
     resume_cursor_hint_ms: Option<i64>,
+    // ADR-60 D7 (interrupt-safe resume, 2026-09-05): the logged-evidence
+    // dispatch seed for a checkpointless `continue` run — `None` for every
+    // other run shape (fresh, checkpoint-resumed, approved-plan Execute).
+    headless_resume: Option<HeadlessResumeSeed>,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -4032,6 +4174,24 @@ async fn run_multi_agent(
             design_doc: context.design_doc.clone(),
         });
     }
+    // ADR-60 D7 (interrupt-safe resume, 2026-09-05): a checkpointless
+    // `continue` run schedules from the logged evidence chain. The seed's
+    // verified plan re-anchors the design; the evidence scheduler then
+    // dispatches the coder (not the architect) and every dispatch is recorded
+    // as an evidence-backed `Decision` event (ADR-65 §7). The pool is
+    // attached here too when a seed rides along: the scheduler's evidence
+    // read (workspace observations) and the Decision appends need it, and
+    // this resume is a D7 whiteboard read by construction.
+    if let Some(seed) = headless_resume {
+        coordinator = coordinator.with_headless_resume_seed(seed);
+        if gate_log_pool.is_none() {
+            tracing::warn!(
+                "headless resume armed without a session DB pool — the evidence \
+                 scheduler will see no observations (rule-b exploration applies)"
+            );
+        }
+        coordinator = coordinator.with_review_store(gate_log_pool.clone());
+    }
     // ADR-60 Deferred 3 (issue #19 decoupling): review-cycle resumability
     // stays gated behind `[orchestration] supervisor_enabled` — the supervised
     // runtime's opt-in — and is deliberately independent of the D7
@@ -4615,9 +4775,31 @@ async fn drive_supervised_run(
     // Budget guard: a separate token so an overrun teardown can never be
     // misreported as user cancellation.
     let budget_cancel = CancellationToken::new();
+    // ADR-60 D7 (interrupt-safe resume): the user's cancel token was never
+    // wired into `run_until` — a cancelled supervised run kept driving its
+    // children to completion, and only THEN reported cancellation. A stop
+    // now reaches the supervisor directly: `run_until`'s teardown stops the
+    // children and persists the gate-boundary shutdown checkpoint
+    // (`Supervisor::checkpoint_at_shutdown` semantics) before the summary
+    // returns. The combined stop token is the budget token's child, so a
+    // budget expiry still cancels the run; a watcher forwards user
+    // cancellation into it.
+    let run_stop = budget_cancel.child_token();
+    let stop_watcher = {
+        let run_stop = run_stop.clone();
+        let user_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = user_cancel.cancelled() => run_stop.cancel(),
+                // The run ended (or the budget fired through the child):
+                // nothing to forward.
+                _ = run_stop.cancelled() => {}
+            }
+        })
+    };
     let driven = tokio::time::timeout(
         SUPERVISED_RUN_BUDGET,
-        supervisor.run_until(budget_cancel.clone(), |supervisor| {
+        supervisor.run_until(run_stop.clone(), |supervisor| {
             supervisor.agents().iter().all(|meta| {
                 expected.contains(&meta.agent_id)
                     && matches!(meta.state, AgentState::Completed | AgentState::Failed)
@@ -4625,6 +4807,7 @@ async fn drive_supervised_run(
         }),
     )
     .await;
+    stop_watcher.abort();
     let summary = match driven {
         Ok(summary) => summary,
         Err(_elapsed) => {
@@ -4801,6 +4984,22 @@ fn is_resume_request(input: &str) -> bool {
     )
 }
 
+/// The project scope a resume validates an orchestration checkpoint against.
+///
+/// This is the checkpoint's OWN project-id definition — the row's
+/// `project_id` is written by the coordinator from
+/// `SessionContext::project_id` ([`concerto_core::types::ProjectId::resolve`]:
+/// blake3 of the git default remote URL, or of the canonicalized absolute
+/// path for non-git projects). Scope validation must compare like with
+/// like; the previous use of the unrelated
+/// [`concerto_core::helpers::project_id_hash`] definition (SipHash of the
+/// path, 16 hex chars) could never match, so every real checkpoint row was
+/// discarded as "belongs to a different project" and then cleared on
+/// resume (ADR-60 D7 interrupt-safe resume, 2026-09-05).
+fn resume_scope_project_id(project_dir: &Path) -> String {
+    ProjectId::resolve(project_dir).0
+}
+
 /// ADR-55 Phase 2b (M2): discard the session's orchestration checkpoint
 /// before a plan-driven (Apply) Execute so the run re-plans from the
 /// approved plan instead of silently resuming an old partial graph — the
@@ -4857,6 +5056,39 @@ mod runtime_runner_tests {
         // A classifier's correlation id is shared unchanged with the router row.
         let shared = Ulid::new();
         assert_eq!(router_row_correlation_id(Some(shared)), shared);
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): the resume scope check must use the
+    /// checkpoint's own project-id definition. A coordinator-written row
+    /// (project_id = `ProjectId::resolve`) validated against the unrelated
+    /// path-hash definition never matched, so every real checkpoint was
+    /// discarded with "belongs to a different project" and cleared on
+    /// resume — the only resumable state a graceful interrupt left never
+    /// survived.
+    #[test]
+    fn resume_scope_uses_the_checkpoint_project_id_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let written = concerto_core::types::ProjectId::resolve(dir.path()).0;
+        assert_eq!(
+            resume_scope_project_id(dir.path()),
+            written,
+            "the resume scope must equal the project id the coordinator writes"
+        );
+        // The regression pin: the old definition is a DIFFERENT hash and
+        // could never validate a production row.
+        assert_ne!(
+            concerto_core::helpers::project_id_hash(dir.path()),
+            written,
+            "the path-hash definition must stay distinct from the checkpoint's"
+        );
+        // A different project dir resolves to a different scope (the check
+        // still rejects genuinely foreign checkpoints).
+        let other = tempfile::tempdir().expect("tempdir");
+        assert_ne!(
+            resume_scope_project_id(dir.path()),
+            resume_scope_project_id(other.path()),
+            "distinct project dirs must remain distinct scopes"
+        );
     }
 
     /// ADR-56 §1 fast paths: the negation-override and smalltalk routes are
@@ -6679,7 +6911,7 @@ mod runtime_runner_tests {
         )
         .await;
 
-        let continuity = load_run_continuity(&pool, session_id, None).await.expect("load");
+        let continuity = load_run_continuity(&pool, session_id, None, false).await.expect("load");
         assert!(
             continuity
                 .plan
@@ -6706,7 +6938,7 @@ mod runtime_runner_tests {
         // The seed mirrors the hook: a resume-shaped task grows the section.
         let mut task = build_run_task(session_id, true, false, None, None, "continue");
         assert_eq!(task.description, "continue");
-        seed_run_continuity(&mut task, &pool, session_id, None).await;
+        seed_run_continuity(&mut task, &pool, session_id, None, false).await;
         assert!(
             task.description.contains("<run-continuity>"),
             "the continuity section is appended: {}",
@@ -6722,6 +6954,106 @@ mod runtime_runner_tests {
                 && task.description.contains("cargo test exited 101"),
             "the ledger rides the section: {}",
             task.description
+        );
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): on a HEADLESS resume (no
+    /// checkpoint row governs the run) the verified `plan-approved` payload
+    /// also yields the dispatch seed — the original objective hash, the plan
+    /// text, and the REAL plan-approved event id. The checkpoint-governed
+    /// shape (`headless_plan_anchor = false`) never yields one.
+    #[tokio::test]
+    async fn headless_resume_seeds_the_dispatch_cursor_from_the_plan_approval() {
+        let (_dir, pool) = d7_pool().await;
+        let session_id = Ulid::new();
+        let binding = d7_binding();
+        append_plan_binding_event(
+            Some(&pool),
+            session_id,
+            &binding,
+            Some(&d7_design_doc()),
+            Some(&concerto_config::MultiAgentConfig::default()),
+        )
+        .await;
+
+        // Headless: the seed rides the verified payload.
+        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        let seed = seed_run_continuity(&mut task, &pool, session_id, None, true)
+            .await
+            .expect("the headless resume seeds from the verified approval");
+        assert_eq!(seed.objective_hash, binding.objective_hash(), "the ORIGINAL objective hash");
+        assert_eq!(seed.plan_text, binding.plan_text(), "the approved plan text");
+        assert!(
+            seed.design_doc.is_some(),
+            "the structured doc rides the seed so the architect is never re-derived"
+        );
+        // The event id must be a REAL plan-approved row in the log.
+        let logged =
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default()).await.expect("load");
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::PlanApproved
+                    && event.event_id == seed.plan_approved_event_id
+            }),
+            "the seed cites the REAL plan-approved event id"
+        );
+
+        // Checkpoint-governed: no dispatch seed (the §7 evaluator governs).
+        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        assert!(
+            seed_run_continuity(&mut task, &pool, session_id, None, false).await.is_none(),
+            "a checkpoint-governed resume never takes the headless dispatch cursor"
+        );
+    }
+
+    /// A long build scrolls the plan approval past the continuity window's
+    /// newest 200 events, but the headless dispatch anchor is read
+    /// independently (bounded by the wider plan window) — the approval is
+    /// still found, still hash-verified.
+    #[tokio::test]
+    async fn headless_plan_anchor_survives_window_scrolling() {
+        let (_dir, pool) = d7_pool().await;
+        let session_id = Ulid::new();
+        let binding = d7_binding();
+        append_plan_binding_event(
+            Some(&pool),
+            session_id,
+            &binding,
+            None,
+            Some(&concerto_config::MultiAgentConfig::default()),
+        )
+        .await;
+        // Scroll the approval out of the 200-event continuity window.
+        for index in 0..(RUN_CONTINUITY_WINDOW + 20) {
+            append_session_event(
+                &pool,
+                session_id,
+                &format!("filler-{index}"),
+                concerto_sessions::whiteboard::WhiteboardKind::Failure,
+                serde_json::json!({ "tool": "shell", "error": format!("e{index}") }),
+            )
+            .await;
+        }
+
+        // The in-window continuity read no longer sees the approval...
+        let windowed = load_run_continuity(&pool, session_id, None, false).await.expect("load");
+        assert!(
+            windowed.plan.is_none(),
+            "the approval scrolled past the continuity window (the prose seed degrades)"
+        );
+        // ...but the headless anchor read still finds it, hash-verified.
+        let anchored = load_newest_plan_approval(&pool, session_id).await.expect("anchor load");
+        let (payload, event_id) = anchored.expect("the approval is still reachable");
+        assert_eq!(payload.plan_id, binding.plan_id());
+        assert_eq!(payload.artifact_hash, binding.artifact_hash().unwrap_or_default());
+        assert!(
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default())
+                .await
+                .expect("load")
+                .iter()
+                .any(|event| event.event_id == event_id
+                    && event.kind == WhiteboardKind::PlanApproved),
+            "the anchor cites a REAL plan-approved row"
         );
     }
 
@@ -6764,7 +7096,8 @@ mod runtime_runner_tests {
         )
         .await;
 
-        let cursor_view = load_run_continuity(&pool, session_id, Some(cursor)).await.expect("load");
+        let cursor_view =
+            load_run_continuity(&pool, session_id, Some(cursor), false).await.expect("load");
         assert!(
             cursor_view.ledger.files_touched.contains(&"src/post.rs".to_owned()),
             "post-cursor facts are the evidence view: {:?}",
@@ -6777,7 +7110,7 @@ mod runtime_runner_tests {
         );
 
         // Without a cursor the legacy whole-window read still folds both.
-        let legacy = load_run_continuity(&pool, session_id, None).await.expect("load");
+        let legacy = load_run_continuity(&pool, session_id, None, false).await.expect("load");
         assert!(
             legacy.ledger.files_touched.contains(&"src/pre.rs".to_owned())
                 && legacy.ledger.files_touched.contains(&"src/post.rs".to_owned()),
@@ -6828,7 +7161,7 @@ mod runtime_runner_tests {
         )
         .await;
 
-        let continuity = load_run_continuity(&pool, session_id, None).await.expect("load");
+        let continuity = load_run_continuity(&pool, session_id, None, false).await.expect("load");
         assert!(continuity.plan.is_none(), "an unattested artifact is skipped, never trusted");
         assert!(
             continuity.ledger.files_touched.contains(&"src/main.rs".to_owned()),
@@ -6843,11 +7176,11 @@ mod runtime_runner_tests {
     async fn run_continuity_empty_log_is_a_noop() {
         let (_dir, pool) = d7_pool().await;
         let session_id = Ulid::new();
-        let continuity = load_run_continuity(&pool, session_id, None).await.expect("load");
+        let continuity = load_run_continuity(&pool, session_id, None, false).await.expect("load");
         assert!(continuity.is_empty(), "an empty log is the truthful empty state");
 
         let mut task = build_run_task(session_id, true, false, None, None, "continue");
-        seed_run_continuity(&mut task, &pool, session_id, None).await;
+        seed_run_continuity(&mut task, &pool, session_id, None, false).await;
         assert_eq!(
             task.description, "continue",
             "an empty ledger seeds nothing — the resume text is untouched"

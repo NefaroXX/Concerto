@@ -171,6 +171,14 @@ struct RevealState {
 const REVEAL_CHARS_PER_TICK: usize = 8;
 /// Milliseconds between reveal advances while a reveal is active.
 const REVEAL_TICK_MS: u64 = 16;
+/// ADR-60 D7 (interrupt-safe resume): how long a quit with a run still in
+/// flight waits for the cancelled run to unwind and persist its interrupted
+/// checkpoint before the process tears down. Bounded so the exit is never a
+/// hang; a miss is the documented hard-kill loss (the later `continue`
+/// resumes headless from the evidence chain). Generous enough for in-flight
+/// provider streams to observe the cancellation and the coordinator's cancel
+/// path to run its bounded SQLite write.
+const GRACEFUL_SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 pub struct App {
     bus: EventBus,
@@ -217,6 +225,14 @@ pub struct App {
     approval_sink: Arc<CliApprovalSink>,
     completion_tx: std::sync::mpsc::Sender<RunCompletion>,
     completion_rx: std::sync::mpsc::Receiver<RunCompletion>,
+    /// ADR-60 D7 (interrupt-safe resume): receiver for a REAL process SIGINT
+    /// (`tokio::signal::ctrl_c()`), armed by `run`. Raw mode intercepts the
+    /// Ctrl+C KEY for the TUI, so SIGINT arrives only from outside the TUI
+    /// (`kill -INT`, raw mode off, or a relayed terminal signal) — the paths
+    /// that previously terminated the process instantly and left the run
+    /// with no orchestration checkpoint. Drained by the event loop like the
+    /// other channels.
+    interrupt_rx: Option<std::sync::mpsc::Receiver<()>>,
     pub tool_log: VecDeque<ToolLogEntry>,
     tool_event_rx: Option<std::sync::mpsc::Receiver<EventKind>>,
     stage_rx: Option<std::sync::mpsc::Receiver<RunStage>>,
@@ -270,6 +286,7 @@ impl App {
             approval_sink,
             completion_tx,
             completion_rx,
+            interrupt_rx: None,
             tool_log: VecDeque::new(),
             tool_event_rx: None,
             stage_rx: None,
@@ -530,6 +547,19 @@ impl App {
         self.tool_event_rx = Some(tool_event_rx);
         let (stage_tx, stage_rx) = std::sync::mpsc::channel::<RunStage>();
         self.stage_rx = Some(stage_rx);
+        // ADR-60 D7 (interrupt-safe resume): arm a real SIGINT watcher. The
+        // TUI intercepts the Ctrl+C key in raw mode (the `Action::Cancel`
+        // path); this watcher covers every OTHER SIGINT source (`kill -INT`,
+        // raw mode off, terminal relay) — the paths that previously killed
+        // the process instantly, before the coordinator's cancel path could
+        // persist the interrupted checkpoint.
+        let (signal_tx, signal_rx) = std::sync::mpsc::channel::<()>();
+        self.interrupt_rx = Some(signal_rx);
+        rt.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = signal_tx.send(());
+            }
+        });
         let bus = self.bus.clone();
         tokio::spawn(async move {
             let mut receiver = bus.subscribe();
@@ -561,8 +591,15 @@ impl App {
         });
 
         let result = self.event_loop(terminal, &event_rx, rt);
+        // ADR-60 D7 (interrupt-safe resume): a run still in flight at quit
+        // is cancelled and given a bounded window to unwind, so the
+        // coordinator's cancel path persists the interrupted (completed=0)
+        // checkpoint BEFORE the process tears down. Missing the window is
+        // the documented hard-kill loss (the later `continue` then resumes
+        // headless from the evidence chain) — never a hang.
         if self.running {
             self.cancel_token.cancel();
+            self.await_run_settlement(GRACEFUL_SHUTDOWN_WAIT);
         }
         if let Some(prev) = self.memory.lock().unwrap_or_else(|error| error.into_inner()).take() {
             prev.cancel.cancel();
@@ -570,6 +607,47 @@ impl App {
         crossterm::terminal::disable_raw_mode()?;
         crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
         result
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): the shared interrupt path for the
+    /// in-TUI Ctrl+C key and a real SIGINT alike — cancel the run's token so
+    /// the coordinator's cancel branch persists the interrupted (completed=0)
+    /// checkpoint, and tell the user cancellation was requested. The run task
+    /// keeps unwinding on the runtime; the UI stays responsive.
+    fn handle_interrupt(&mut self) {
+        self.cancel_token.cancel();
+        self.push_line(Line::from("Cancellation requested…"));
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): wait, bounded, for the in-flight
+    /// run to settle after cancellation — the run task signals completion
+    /// only after `run_shared_agent` has returned, and the coordinator's
+    /// cancel path persists the interrupted checkpoint BEFORE that return, so
+    /// a settled completion implies the checkpoint (or the honest
+    /// absence thereof) is durable. A deadline miss is the documented
+    /// hard-kill loss (the later `continue` then resumes headless from the
+    /// evidence chain) — never a hang.
+    fn await_run_settlement(&mut self, grace: Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        while self.running {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match self.completion_rx.recv_timeout(deadline - now) {
+                Ok(completion) => {
+                    self.running = false;
+                    // Mirror the event loop's completion handling minimally:
+                    // the run task already published its final message; the
+                    // session id stays authoritative for the next dispatch.
+                    if let Ok(output) = &completion.result {
+                        self.session_id = Some(output.session_id);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
 
     fn event_loop(
@@ -603,6 +681,18 @@ impl App {
                 }
             }
 
+            // ADR-60 D7 (interrupt-safe resume): a REAL SIGINT takes the same
+            // cooperative-cancel path as the in-TUI Ctrl+C key.
+            if let Some(rx) = self.interrupt_rx.as_ref() {
+                let mut interrupted = false;
+                while rx.try_recv().is_ok() {
+                    interrupted = true;
+                }
+                if interrupted {
+                    self.handle_interrupt();
+                }
+            }
+
             // Run-stage transitions from the backend (ADR-55 Phase 2a); the
             // status bar shows only the latest stage.
             while let Ok(stage) = self
@@ -622,10 +712,7 @@ impl App {
             if event::poll(Duration::from_millis(poll_ms))? {
                 match self.handle_key(event::read()?) {
                     Action::Quit => break,
-                    Action::Cancel => {
-                        self.cancel_token.cancel();
-                        self.push_line(Line::from("Cancellation requested…"));
-                    }
+                    Action::Cancel => self.handle_interrupt(),
                     Action::Dispatch(message) => self.dispatch_message(message, rt),
                     Action::NewSession => self.start_new_session(rt),
                     Action::None => {}
@@ -1666,6 +1753,103 @@ mod tests {
             app.handle_key(key_event(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Cancel
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D7 (interrupt-safe resume): the graceful interrupt path.
+    // ------------------------------------------------------------------
+
+    fn test_agent_output(session_id: Ulid) -> AgentOutput {
+        AgentOutput {
+            task_id: concerto_core::types::TaskId(Ulid::new()),
+            session_id,
+            final_message: "done".into(),
+            files_modified: vec![],
+            tool_call_count: 0,
+            eval_result: None,
+            tool_events: vec![],
+            verification: vec![],
+            project_root: None,
+            completion_status: concerto_core::types::AgentCompletionStatus::Completed,
+            provider_metrics: vec![],
+            checkpoint_json: None,
+        }
+    }
+
+    /// The shared interrupt path cancels the run's token — the coordinator's
+    /// cancel branch persists the interrupted checkpoint off that token.
+    #[test]
+    fn handle_interrupt_cancels_the_run_token() {
+        let mut app = App::new();
+        app.running = true;
+        let token = app.cancel_token.clone();
+        app.handle_interrupt();
+        assert!(token.is_cancelled(), "the interrupt cancels the run token");
+        assert!(
+            app.messages.iter().any(|line| line.to_string().contains("Cancellation requested")),
+            "the user is told cancellation was requested"
+        );
+        assert!(app.running, "the run keeps unwinding; the app stays responsive");
+    }
+
+    /// A drained SIGINT takes the same cooperative-cancel path as the Ctrl+C
+    /// key (the process no longer dies on `kill -INT` before the run can
+    /// checkpoint).
+    #[test]
+    fn a_drained_sigint_cancels_the_run() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        app.interrupt_rx = Some(rx);
+        app.running = true;
+        let token = app.cancel_token.clone();
+        tx.send(()).expect("signal sent");
+        // Same drain the event loop runs, inline for a headless test.
+        if let Some(rx) = app.interrupt_rx.as_ref() {
+            let mut interrupted = false;
+            while rx.try_recv().is_ok() {
+                interrupted = true;
+            }
+            assert!(interrupted, "the signal was drained");
+            if interrupted {
+                app.handle_interrupt();
+            }
+        }
+        assert!(token.is_cancelled());
+    }
+
+    /// The bounded quit wait returns as soon as the run settles — the
+    /// coordinator's cancel path has already persisted its checkpoint by the
+    /// time the completion is sent.
+    #[test]
+    fn await_run_settlement_returns_when_the_run_settles() {
+        let mut app = App::new();
+        app.running = true;
+        let session_id = Ulid::new();
+        let tx = app.completion_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = tx.send(RunCompletion { result: Ok(test_agent_output(session_id)) });
+        });
+        app.await_run_settlement(Duration::from_secs(5));
+        assert!(!app.running, "the settled completion ends the run");
+        assert_eq!(app.session_id, Some(session_id), "the session id is retained");
+    }
+
+    /// The bounded quit wait NEVER hangs: without a completion it returns at
+    /// the deadline with the run still marked in flight (the hard-kill loss
+    /// the amendment documents, surfaced instead of a frozen terminal).
+    #[test]
+    fn await_run_settlement_bounds_the_wait() {
+        let mut app = App::new();
+        app.running = true;
+        let started = std::time::Instant::now();
+        app.await_run_settlement(Duration::from_millis(60));
+        assert!(app.running, "no completion arrived; the run is still in flight");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait is bounded by the grace, got: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
