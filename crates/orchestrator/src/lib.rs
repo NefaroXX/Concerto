@@ -51,6 +51,7 @@ mod read_cache;
 pub mod registry;
 pub mod resolver;
 pub mod resolver_integration;
+pub mod resume;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;

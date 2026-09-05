@@ -34,9 +34,10 @@ use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
 use concerto_sessions::whiteboard::append_whiteboard_event;
+use concerto_sessions::whiteboard::{load_whiteboard_events, WhiteboardLoadOpts};
 use concerto_sessions::{
     NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
-    SessionStore, WhiteboardKind,
+    SessionStore, WhiteboardEvent, WhiteboardKind,
 };
 
 use crate::agent_runner::AgentRunner;
@@ -60,6 +61,7 @@ use crate::relationship::{
     AgentHandoff, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
 use crate::resolver_integration::{self, ResolverOutcome};
+use crate::resume::{self, ResumeOutcome};
 use crate::state::OrchestratorState;
 use tracing::warn;
 
@@ -546,6 +548,22 @@ struct DecomposeResult {
     objective_hash: String,
 }
 
+/// ADR-65 §7: the outcome of a resume evaluation applied to the restored
+/// state. `Replan` returns no ledger — the caller falls through to fresh
+/// decomposition (the Phase-6 scheduler governs the new planning; the
+/// resume path itself never dispatches an agent).
+enum ResumeApplication {
+    Applied {
+        /// Ledger entries recording the resume decisions/rewrites, to be
+        /// carried into the resumed run's checkpoints.
+        ledger_entries: Vec<checkpoint::CheckpointAction>,
+        /// The subtask a Continue/Replace decision re-armed; its attempt
+        /// counter resets so the granted decision can actually dispatch.
+        re_armed: Option<TaskId>,
+    },
+    Replan,
+}
+
 /// The coordinator drives the full multi-agent lifecycle.
 pub struct CoordinatorAgent {
     registry: Arc<AgentRegistry>,
@@ -706,6 +724,24 @@ pub struct CoordinatorAgent {
     /// facts, so a run's tool commands are attributable across task
     /// boundaries. `None` only when no run has started yet.
     run_id: Option<String>,
+    /// ADR-65 §7: where the DesignDoc claim last stood (verdict + real event
+    /// ids), captured into every checkpoint. Restored from the checkpoint on
+    /// a resume so the §7 fields keep round-tripping; refreshed by the
+    /// Phase-5 verifier on every planning run. (The §7 whiteboard cursor is
+    /// stamped by `persist_checkpoint` at persist time — the log head then —
+    /// and needs no stored field here.)
+    last_doc_resolution: Option<checkpoint::CheckpointDocResolution>,
+    /// ADR-65 §7: the last scheduler dispatch still awaiting completion —
+    /// recorded when a dispatch decision is appended, cleared when its
+    /// subtask settles, and captured into every checkpoint as the pending
+    /// decision a resume may continue behind.
+    last_dispatch_decision: Option<checkpoint::CheckpointPendingDecision>,
+    /// ADR-65 §7: the checkpoint row's own `updated_at` (unix ms), threaded
+    /// from the runtime runner for pre-§7 (v3) checkpoints only — the hint
+    /// the additive backfill uses to derive "the last log event before the
+    /// checkpoint's own append". `None` (no hint) is fail-soft: the cursor
+    /// stays unknown and the resume treats the whole log as pre-cursor.
+    resume_cursor_hint_ms: Option<i64>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -742,6 +778,121 @@ fn execution_stage_tag(facade: Option<&BlueprintFacade>) -> String {
 /// ADR-65 §6: upper bound on the observation facts gathered per scheduler
 /// consultation, so heavy workspaces keep the evidence read bounded.
 const MAX_EVIDENCE_OBSERVATIONS: usize = 64;
+
+/// Map the Phase-5 verifier's verdict onto the checkpoint's §7 doc-resolution
+/// field: Active/Quarantined/Skipped + the REAL claim/decision event ids. A
+/// failed append yields no ids to cite — the ids stay `None` (never
+/// fabricated), but the resolution itself is still recorded.
+fn checkpoint_doc_resolution(
+    verdict: &Option<DesignDocVerdict>,
+    doc_event_ids: Option<&(String, String)>,
+) -> Option<checkpoint::CheckpointDocResolution> {
+    let evidence = doc_event_ids
+        .map(|(claim_id, decision_id)| (Some(claim_id.clone()), Some(decision_id.clone())))
+        .unwrap_or((None, None));
+    let (claim_event_id, verdict_event_id) = evidence;
+    let verdict = verdict.as_ref()?;
+    use crate::design_doc_verifier::DesignDocState;
+    Some(match verdict.state {
+        DesignDocState::Verified => checkpoint::CheckpointDocResolution::Active {
+            contract_paths: verdict.contract_paths.clone(),
+            claim_event_id,
+            verdict_event_id,
+        },
+        DesignDocState::Skipped => {
+            checkpoint::CheckpointDocResolution::Skipped { claim_event_id, verdict_event_id }
+        }
+        DesignDocState::Quarantined => {
+            checkpoint::CheckpointDocResolution::Quarantined {
+                reason_codes: verdict
+                    .reasons
+                    .iter()
+                    .filter_map(|reason| {
+                        // Kebab-case reason codes (mirrors the verifier's
+                        // wire form via serde rename).
+                        serde_json::to_value(reason.code)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                    })
+                    .collect(),
+                claim_event_id,
+                verdict_event_id,
+            }
+        }
+    })
+}
+
+/// ADR-65 §7: upper bound on the session log window a resume reads (newest
+/// events, anchored at the log head). Bounds the §7 evidence read; a session
+/// with a longer tail simply loses the earliest rows to the fail-soft
+/// degradation (the checkpoint ledger still carries the per-task outcomes).
+const RESUME_LOG_WINDOW: usize = 2000;
+
+/// The paths the run's OWN recorded writes explain (ADR-65 §7): the
+/// checkpoint's accumulated `all_files`, the completed results' reported
+/// `files_modified`, and — for the post-cursor tail — applied write paths
+/// and file-affecting tool paths (a read observation is NOT an own write: a
+/// stalled run's read of a path the user then edited IS an external change).
+/// Used to keep the F3 reconciliation honest: the run's own progress must
+/// never look like an external workspace change.
+fn own_write_paths(
+    checkpoint_all_files: &[camino::Utf8PathBuf],
+    completed_results: &HashMap<TaskId, AgentRunResult>,
+    post_cursor: &[WhiteboardEvent],
+    project_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let mut own = std::collections::HashSet::new();
+    let mut push = |raw: &str| {
+        if let Some(canonical) = crate::tool_facts::canonical_project_path(project_root, raw) {
+            own.insert(canonical);
+        }
+    };
+    for path in checkpoint_all_files {
+        push(path.as_str());
+    }
+    for result in completed_results.values() {
+        for path in &result.files_modified {
+            push(path.as_str());
+        }
+    }
+    for event in post_cursor {
+        match event.kind {
+            WhiteboardKind::WriteApplied => {
+                if let Some(path) = event
+                    .payload
+                    .get("input")
+                    .and_then(|input| input.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    push(path);
+                }
+            }
+            WhiteboardKind::ToolExecuted => {
+                let tool = event.payload.get("tool").and_then(serde_json::Value::as_str);
+                let args = event.payload.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                let file_affecting =
+                    tool.is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, &args));
+                if !(file_affecting
+                    && event.payload.get("success").and_then(serde_json::Value::as_bool)
+                        == Some(true))
+                {
+                    continue;
+                }
+                if let Some(paths) =
+                    event.payload.get("paths").and_then(serde_json::Value::as_array)
+                {
+                    for path in paths {
+                        if let Some(path) = path.get("path").and_then(serde_json::Value::as_str) {
+                            push(path);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    own
+}
 
 /// The deterministic graph description for a scheduled fallback step.
 fn fallback_step_description(step: &DispatchStep, task: &AgentTask) -> String {
@@ -953,7 +1104,18 @@ impl CoordinatorAgent {
             review_store: None,
             workspace_snapshot: None,
             run_id: None,
+            last_doc_resolution: None,
+            last_dispatch_decision: None,
+            resume_cursor_hint_ms: None,
         }
+    }
+
+    /// ADR-65 §7: thread the checkpoint row's own `updated_at` (unix ms) in
+    /// as the backfill hint for pre-§7 (v3) checkpoints. Only the additive
+    /// v4 backfill consumes it; present v4 fields are never overwritten.
+    pub fn with_resume_cursor_hint_ms(mut self, hint_ms: Option<i64>) -> Self {
+        self.resume_cursor_hint_ms = hint_ms;
+        self
     }
 
     /// Attach the ADR-45 tier-1b fallback target: the run's default provider
@@ -1514,7 +1676,25 @@ impl CoordinatorAgent {
         self
     }
 
-    async fn persist_checkpoint(&self, checkpoint: &checkpoint::GraphCheckpoint) {
+    async fn persist_checkpoint(&mut self, checkpoint: &mut checkpoint::GraphCheckpoint) {
+        // ADR-65 §7: stamp the whiteboard cursor at PERSIST time — the log
+        // head is the consistent cut this checkpoint is consistent with, so
+        // a resume reads only facts appended after it. Fail-soft: without a
+        // log pool (or on a read error) the cursor stays `None` and the
+        // resume treats the whole log as pre-cursor.
+        if checkpoint.whiteboard_cursor_gate_seq.is_none() {
+            if let Some(pool) = self.review_store.as_ref() {
+                match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
+                    Ok(head) => checkpoint.whiteboard_cursor_gate_seq = Some(head),
+                    Err(error) => {
+                        warn!(%error, "ADR-65 §7: cursor stamp read failed; checkpoint persists without a cursor")
+                    }
+                }
+            }
+        }
+        if checkpoint.snapshot_generation.is_none() {
+            checkpoint.snapshot_generation = self.snapshot_generation();
+        }
         let Some(store) = &self.session_store else {
             // Never silent: a coordinator without a session store cannot
             // leave resumable state, so `continue` can never resume it.
@@ -1652,6 +1832,10 @@ impl CoordinatorAgent {
     /// ladder guards (default-model / self-execution / escalation attempts).
     /// These are captured into every checkpoint so a resumed run does NOT
     /// re-walk ladder tiers that already fired before the interruption.
+    /// ADR-65 §7: the doc resolution and the pending dispatch decision ride
+    /// along so a resume restores state at the cursor instead of replaying
+    /// prose; the cursor itself is stamped at persist time (the log head
+    /// then) by `persist_checkpoint`.
     fn checkpoint_context(
         &self,
         model_assignments: &HashMap<TaskId, String>,
@@ -1665,6 +1849,9 @@ impl CoordinatorAgent {
             default_model_provider_attempted: self.default_model_provider_attempted.clone(),
             self_execute_attempted: self.self_execute_attempted.clone(),
             escalation_attempted: self.escalation_attempted.clone(),
+            doc_resolution: self.last_doc_resolution.clone(),
+            snapshot_generation: self.snapshot_generation(),
+            pending_decision: self.last_dispatch_decision.clone(),
         }
     }
 
@@ -2283,186 +2470,598 @@ impl CoordinatorAgent {
         resume_checkpoint_json: Option<String>,
     ) -> Result<DecomposeResult, OrchestratorError> {
         if let Some(cp_json) = resume_checkpoint_json {
-            let cp: crate::checkpoint::GraphCheckpoint =
-                crate::checkpoint::GraphCheckpoint::from_json(&cp_json).map_err(|e| {
-                    OrchestratorError::AgentLoopError(format!(
-                        "failed to deserialize resume checkpoint: {e}"
-                    ))
-                })?;
+            match self.restore_and_evaluate(&cp_json, task, context, cancel).await {
+                Ok(Some(result)) => return Ok(result),
+                // ADR-65 §7 Replan: the workspace objectively changed
+                // materially to the pending step. The resume path itself
+                // dispatches nothing — the fresh decompose below lets the
+                // Phase-6 scheduler govern the new planning.
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
 
-            // Validate checkpoint scope as a second safety net (the
-            // runtime_runner already does this, but we check again here
-            // for defense-in-depth). A scope mismatch is surfaced as a
-            // clean AgentLoopError so the caller can fall through to a
-            // fresh run rather than producing a corrupted partial output.
-            cp.validate_scope(task.session_id, &context.session.project_id.0).map_err(
-                |reason| {
-                    OrchestratorError::AgentLoopError(format!(
-                        "checkpoint scope validation failed: {reason}"
-                    ))
-                },
-            )?;
-
-            let graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
-                OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
-            })?;
-            let completed_results = cp.completed_results;
-            let total_cost = cp.total_cost;
-            let total_tool_calls = cp.total_tool_calls;
-            let all_files = cp.all_files;
-            let provider_metrics = cp.provider_metrics;
-            let subtask_attempts = cp.subtask_attempts;
-            let retry_feedback = cp.retry_feedback;
-            let model_assignments = cp.model_assignments;
-            let action_ledger = cp.action_ledger;
-            // Retain the original plan so subsequent checkpoints keep it too.
-            *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) =
-                cp.design_doc.clone();
-            // Retain expected-artifact expectations so the C-06 acceptance
-            // gate verifies the same files after a resume.
-            *self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()) =
-                cp.expected_artifacts.clone();
-            // Restore the ADR-42/ADR-45 ladder guards so a resumed run does
-            // NOT re-walk ladder tiers (default-model swap, default-provider
-            // re-dispatch, self-execution, escalation retry) that already
-            // fired before the interruption.
-            self.default_model_attempted = cp.default_model_attempted.clone();
-            self.default_model_provider_attempted = cp.default_model_provider_attempted.clone();
-            self.self_execute_attempted = cp.self_execute_attempted.clone();
-            self.escalation_attempted = cp.escalation_attempted.clone();
-
-            // ADR-52: a resumed run re-persists its durable plan artifact
-            // (idempotent overwrite of `plan-<run_id>.json`) so the plans dir
-            // stays a complete history of every plan execution, and carries
-            // the run's plan_id into the lifecycle event.
-            let plan = PlanArtifact::from_graph(
-                cp.run_id.to_string(),
-                task,
-                &graph,
-                &cp.expected_artifacts,
-            );
-            let plan_id = self.persist_plan_artifact(&plan);
-            // ADR-55 Phase 2b: retain the id so a planning-only run can bind
-            // its rendered plan to the durable artifact.
-            self.last_plan_id = plan_id.clone();
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                task.id.0,
-                EventKind::MultiAgentModeStarted {
-                    task_id: task.id,
-                    subtask_count: graph.len(),
-                    plan_id,
-                },
-            );
-            // Run-continuity Phase 1: keep recording the ORIGINAL objective
-            // (text + hash) in every checkpoint this resumed run persists —
-            // the resume input is a bare "continue", not the objective. The
-            // fields are trusted metadata from the validated v3 record; a
-            // corrupt value degrades the recorded objective text only and is
-            // never a reason to refuse the resume (fail-soft).
-            let objective = cp.objective.clone();
-            let objective_hash = cp.objective_hash.clone();
-            Ok(DecomposeResult {
-                graph,
-                completed_results,
-                total_cost,
-                total_tool_calls,
-                all_files,
-                provider_metrics,
-                subtask_attempts,
-                retry_feedback,
-                model_assignments,
-                action_ledger,
-                objective,
-                objective_hash,
-            })
-        } else {
-            // If the Architect agent fails (e.g. repeated malformed JSON
-            // from the LLM) we return a clean Partial result rather than
-            // propagating an error that hard-crashes the session.
-            let (graph, plan_artifact) =
-                match self.decompose_task(task, context, cancel, None).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task.id.0,
-                            EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: 0.0 },
-                        );
-                        return Err(e);
-                    }
-                };
-            TaskGraphValidator::validate(&graph)?;
-            let completed_results = graph
-                .all_tasks()
-                .into_iter()
-                .filter_map(|subtask| {
-                    subtask.deliverable.as_ref().map(|summary| {
-                        (
-                            subtask.id,
-                            AgentRunResult {
-                                task_id: subtask.id,
-                                role: subtask.role.clone(),
-                                outcome: AgentOutcome::Success,
-                                summary: summary.clone(),
-                                files_modified: Vec::new(),
-                                tool_call_count: 0,
-                                cost_usd: 0.0,
-                                latency_ms: 0,
-                                provider: String::new(),
-                                model: String::new(),
-                                tokens_in: 0,
-                                tokens_out: 0,
-                            },
-                        )
-                    })
+        // Fresh decompose path (also the ADR-65 §7 Replan destination).
+        // If the Architect agent fails (e.g. repeated malformed JSON
+        // from the LLM) we return a clean Partial result rather than
+        // propagating an error that hard-crashes the session.
+        let (graph, plan_artifact) = match self.decompose_task(task, context, cancel, None).await {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    task.id.0,
+                    EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: 0.0 },
+                );
+                return Err(e);
+            }
+        };
+        TaskGraphValidator::validate(&graph)?;
+        let completed_results = graph
+            .all_tasks()
+            .into_iter()
+            .filter_map(|subtask| {
+                subtask.deliverable.as_ref().map(|summary| {
+                    (
+                        subtask.id,
+                        AgentRunResult {
+                            task_id: subtask.id,
+                            role: subtask.role.clone(),
+                            outcome: AgentOutcome::Success,
+                            summary: summary.clone(),
+                            files_modified: Vec::new(),
+                            tool_call_count: 0,
+                            cost_usd: 0.0,
+                            latency_ms: 0,
+                            provider: String::new(),
+                            model: String::new(),
+                            tokens_in: 0,
+                            tokens_out: 0,
+                        },
+                    )
                 })
-                .collect();
-
-            // ADR-55 Phase 2b: the planning-only branch binds its rendered
-            // plan to the durable artifact id, so *both* decompose paths must
-            // persist one — including the heuristic-pipeline fallback, which
-            // by itself yields no `PlanArtifact` (observed live: a planner
-            // JSON parse failure left `plans/` empty and `plan_id` null even
-            // though the run completed and rendered a plan).
-            let plan_id = match plan_artifact {
-                Some(plan) => self.persist_plan_artifact(&plan),
-                None => {
-                    let fallback_plan = PlanArtifact::from_graph(
-                        Ulid::new().to_string(),
-                        task,
-                        &graph,
-                        &HashMap::new(),
-                    );
-                    self.persist_plan_artifact(&fallback_plan)
-                }
-            };
-            // ADR-55 Phase 2b: retain the id so a planning-only run can bind
-            // its rendered plan to the durable artifact.
-            self.last_plan_id = plan_id.clone();
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                task.id.0,
-                EventKind::MultiAgentModeStarted {
-                    task_id: task.id,
-                    subtask_count: graph.len(),
-                    plan_id,
-                },
-            );
-            Ok(DecomposeResult {
-                graph,
-                completed_results,
-                total_cost: 0.0,
-                total_tool_calls: 0,
-                all_files: Vec::new(),
-                provider_metrics: Vec::new(),
-                subtask_attempts: HashMap::new(),
-                retry_feedback: HashMap::new(),
-                model_assignments: HashMap::new(),
-                action_ledger: Vec::new(),
-                objective: task.description.clone(),
-                objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
             })
+            .collect();
+
+        // ADR-55 Phase 2b: the planning-only branch binds its rendered
+        // plan to the durable artifact id, so *both* decompose paths must
+        // persist one — including the heuristic-pipeline fallback, which
+        // by itself yields no `PlanArtifact` (observed live: a planner
+        // JSON parse failure left `plans/` empty and `plan_id` null even
+        // though the run completed and rendered a plan).
+        let plan_id = match plan_artifact {
+            Some(plan) => self.persist_plan_artifact(&plan),
+            None => {
+                let fallback_plan = PlanArtifact::from_graph(
+                    Ulid::new().to_string(),
+                    task,
+                    &graph,
+                    &HashMap::new(),
+                );
+                self.persist_plan_artifact(&fallback_plan)
+            }
+        };
+        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // its rendered plan to the durable artifact.
+        self.last_plan_id = plan_id.clone();
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeStarted {
+                task_id: task.id,
+                subtask_count: graph.len(),
+                plan_id,
+            },
+        );
+        Ok(DecomposeResult {
+            graph,
+            completed_results,
+            total_cost: 0.0,
+            total_tool_calls: 0,
+            all_files: Vec::new(),
+            provider_metrics: Vec::new(),
+            subtask_attempts: HashMap::new(),
+            retry_feedback: HashMap::new(),
+            model_assignments: HashMap::new(),
+            action_ledger: Vec::new(),
+            objective: task.description.clone(),
+            objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+        })
+    }
+
+    /// Restore the graph from `cp_json` and run the ADR-65 §7 resume
+    /// evaluation: read the facts appended after the checkpoint's whiteboard
+    /// cursor, compare workspace reality (fresh snapshot generation + F3
+    /// reconciliation), and choose — continue blocked task / replace agent /
+    /// skip / refresh evidence / replan — recording every outcome as a
+    /// whiteboard `Decision` event with REAL evidence ids (acceptance 8:
+    /// the append validates them). `Ok(None)` means Replan.
+    ///
+    /// Fail-soft by contract: a log read failure or an unreadable payload
+    /// degrades individual evaluation inputs, never the restore; only the
+    /// existing checkpoint/scope errors propagate.
+    async fn restore_and_evaluate(
+        &mut self,
+        cp_json: &str,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+    ) -> Result<Option<DecomposeResult>, OrchestratorError> {
+        let mut cp: crate::checkpoint::GraphCheckpoint =
+            crate::checkpoint::GraphCheckpoint::from_json(cp_json).map_err(|e| {
+                OrchestratorError::AgentLoopError(format!(
+                    "failed to deserialize resume checkpoint: {e}"
+                ))
+            })?;
+
+        // Validate checkpoint scope as a second safety net (the
+        // runtime_runner already does this, but we check again here
+        // for defense-in-depth). A scope mismatch is surfaced as a
+        // clean AgentLoopError so the caller can fall through to a
+        // fresh run rather than producing a corrupted partial output.
+        cp.validate_scope(task.session_id, &context.session.project_id.0).map_err(|reason| {
+            OrchestratorError::AgentLoopError(format!(
+                "checkpoint scope validation failed: {reason}"
+            ))
+        })?;
+
+        // ── ADR-65 §7: additive v4 backfill ──────────────────────────────
+        // Pre-§7 (v3) records carry no cursor/doc/snapshot fields; derive
+        // them from the log (additive, fail-soft). A log read below that
+        // fails degrades to an empty slice and every absent field stays
+        // absent — a resume must not fail because history is imperfect.
+        let log_window = self.read_resume_log_window(task.session_id, cancel).await;
+        resume::backfill_v4_fields(&mut cp, &log_window, self.resume_cursor_hint_ms);
+        // The evidence view: facts appended AFTER the cursor only (never the
+        // pre-cursor log — no prose replay, no pre-cursor fact replayed into
+        // a decision). A checkpoint without a cursor (backfill degraded)
+        // treats the whole log as pre-cursor: the conservative reading.
+        let post_cursor = match cp.whiteboard_cursor_gate_seq {
+            Some(cursor) => resume::split_at_cursor(&log_window, cursor).1,
+            None => &[],
+        };
+
+        let mut graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
+            OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
+        })?;
+        let completed_results = cp.completed_results;
+        let total_cost = cp.total_cost;
+        let total_tool_calls = cp.total_tool_calls;
+        let all_files = cp.all_files;
+        let provider_metrics = cp.provider_metrics;
+        let mut subtask_attempts = cp.subtask_attempts;
+        let retry_feedback = cp.retry_feedback;
+        let model_assignments = cp.model_assignments;
+        let action_ledger = cp.action_ledger;
+        // Retain the original plan so subsequent checkpoints keep it too.
+        *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = cp.design_doc.clone();
+        // Retain expected-artifact expectations so the C-06 acceptance
+        // gate verifies the same files after a resume.
+        *self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()) =
+            cp.expected_artifacts.clone();
+        // Restore the ADR-42/ADR-45 ladder guards so a resumed run does
+        // NOT re-walk ladder tiers (default-model swap, default-provider
+        // re-dispatch, self-execution, escalation retry) that already
+        // fired before the interruption.
+        self.default_model_attempted = cp.default_model_attempted.clone();
+        self.default_model_provider_attempted = cp.default_model_provider_attempted.clone();
+        self.self_execute_attempted = cp.self_execute_attempted.clone();
+        self.escalation_attempted = cp.escalation_attempted.clone();
+        // ADR-65 §7: keep the doc resolution and pending decision
+        // round-tripping — the resumed run's checkpoints carry them forward
+        // (a planning run refreshes them; a dispatch decision recorded below
+        // replaces the stale pending one).
+        self.last_doc_resolution = cp.doc_resolution.clone();
+        self.last_dispatch_decision = cp.pending_decision.clone();
+
+        // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
+        let pending_decision = cp.pending_decision.clone();
+        let snapshot_generation_at_checkpoint = cp.snapshot_generation.clone();
+        let application = self
+            .evaluate_and_apply_resume(
+                &mut graph,
+                task,
+                context,
+                &action_ledger,
+                &completed_results,
+                &all_files,
+                pending_decision.as_ref(),
+                snapshot_generation_at_checkpoint.as_deref(),
+                &log_window,
+                post_cursor,
+                cancel,
+            )
+            .await;
+        let ResumeApplication::Applied { ledger_entries, re_armed } = application else {
+            // Replan. The restored plan is superseded by workspace reality:
+            // clear the restored per-plan bookkeeping so the fresh decompose
+            // repopulates it for the new graph.
+            self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clear();
+            self.last_doc_resolution = None;
+            self.last_dispatch_decision = None;
+            warn!(
+                run_id = %cp.run_id,
+                "ADR-65 §7: resume chose REPLAN — the workspace objectively changed \
+                 materially to the pending step; delegating to the Phase-6 scheduler"
+            );
+            return Ok(None);
+        };
+        let mut action_ledger = action_ledger;
+        action_ledger.extend(ledger_entries);
+        if let Some(re_armed) = re_armed {
+            // The resume decision granted the re-armed step a fresh bounded
+            // attempt budget (the ladder guards stay restored, so no tier
+            // re-walks); without the reset the resumed run would exit
+            // Partial before ever dispatching the decided task.
+            subtask_attempts.insert(re_armed, 0);
+        }
+
+        // ADR-52: a resumed run re-persists its durable plan artifact
+        // (idempotent overwrite of `plan-<run_id>.json`) so the plans dir
+        // stays a complete history of every plan execution, and carries
+        // the run's plan_id into the lifecycle event.
+        let plan =
+            PlanArtifact::from_graph(cp.run_id.to_string(), task, &graph, &cp.expected_artifacts);
+        let plan_id = self.persist_plan_artifact(&plan);
+        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // its rendered plan to the durable artifact.
+        self.last_plan_id = plan_id.clone();
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeStarted {
+                task_id: task.id,
+                subtask_count: graph.len(),
+                plan_id,
+            },
+        );
+        // Run-continuity Phase 1: keep recording the ORIGINAL objective
+        // (text + hash) in every checkpoint this resumed run persists —
+        // the resume input is a bare "continue", not the objective. The
+        // fields are trusted metadata from the validated v3 record; a
+        // corrupt value degrades the recorded objective text only and is
+        // never a reason to refuse the resume (fail-soft).
+        let objective = cp.objective.clone();
+        let objective_hash = cp.objective_hash.clone();
+        Ok(Some(DecomposeResult {
+            graph,
+            completed_results,
+            total_cost,
+            total_tool_calls,
+            all_files,
+            provider_metrics,
+            subtask_attempts,
+            retry_feedback,
+            model_assignments,
+            action_ledger,
+            objective,
+            objective_hash,
+        }))
+    }
+
+    /// Read this session's log tail window for the resume evaluation
+    /// (ADR-65 §7 read side). Fail-soft: no log pool or a read error yields
+    /// an empty slice — the evaluation then relies on the checkpoint's own
+    /// ledger and workspace reality alone, and never fails the resume. The
+    /// window is a single bounded read of the newest events, anchored at the
+    /// log head.
+    async fn read_resume_log_window(
+        &self,
+        session_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Vec<WhiteboardEvent> {
+        let Some(pool) = self.review_store.as_ref() else {
+            return Vec::new();
+        };
+        let head = match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
+            Ok(head) => head,
+            Err(error) => {
+                warn!(%error, "ADR-65 §7: resume log read failed (head); treating the log as pre-cursor");
+                return Vec::new();
+            }
+        };
+        let after = head.saturating_sub(RESUME_LOG_WINDOW as u64);
+        match load_whiteboard_events(
+            pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: after,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: RESUME_LOG_WINDOW,
+            },
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                if cancel.is_cancelled() {
+                    return Vec::new();
+                }
+                warn!(%error, "ADR-65 §7: resume log window read failed (fail-soft); \
+                     the evaluation proceeds on the checkpoint ledger alone");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The ADR-65 §7 workspace-change verdict for a resume: the fresh
+    /// snapshot generation compared against the checkpoint's, plus the F3
+    /// reconciliation of the observed rows against the live filesystem —
+    /// changed/vanished paths the run's OWN recorded writes do not explain
+    /// are the externally-changed evidence. Fail-soft: every read/storage
+    /// failure degrades to "no change detected" on that axis.
+    async fn workspace_change_verdict(
+        &self,
+        checkpoint_generation: Option<&str>,
+        own_written: &std::collections::HashSet<String>,
+        cancel: &CancellationToken,
+    ) -> resume::WorkspaceChange {
+        let mut change = resume::WorkspaceChange::default();
+        if let (Some(recorded), Some(fresh)) = (checkpoint_generation, self.snapshot_generation()) {
+            change.generation_mismatch = recorded != fresh;
+        }
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else { return change };
+        let Some(pool) = self.review_store.as_ref() else { return change };
+        // ADR-65 F5c: reconcile only this project root's rows.
+        let root_hash = crate::tool_facts::project_root_hash(snapshot.project_root.as_std_path());
+        let rows = match ResourceFacts::new(pool.clone())
+            .list_observations(&root_hash, MAX_EVIDENCE_OBSERVATIONS, cancel)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "ADR-65 §7: workspace reconciliation read failed (fail-soft)");
+                }
+                return change;
+            }
+        };
+        for row in rows {
+            // ADR-65 F3: a row whose live stat (size, mtime) diverges from
+            // the observation — or whose file vanished — is stale.
+            let fresh = std::fs::metadata(snapshot.project_root.join(&row.path))
+                .ok()
+                .filter(|meta| {
+                    row.size_bytes.unwrap_or(0) == meta.len()
+                        && row.mtime_ms == crate::tool_facts::mtime_ms(meta)
+                })
+                .is_some();
+            if fresh {
+                continue;
+            }
+            let canonical = crate::tool_facts::canonical_project_path(
+                snapshot.project_root.as_std_path(),
+                &row.path,
+            )
+            .unwrap_or_else(|| row.path.clone());
+            if own_written.contains(&canonical) {
+                // Already explained by the run's own recorded writes.
+                continue;
+            }
+            change.externally_changed.push((row.path.clone(), row.last_event_id.clone()));
+        }
+        change
+    }
+
+    /// The ADR-65 §7 resume evaluation driver: gather the blocked step, its
+    /// post-cursor facts, the workspace-change verdict and the replacement
+    /// candidates, evaluate the deterministic policy, record the Decision
+    /// event (fail-soft, real evidence ids only), and apply the outcome to
+    /// the graph.
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_and_apply_resume(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        context: &AgentContext,
+        checkpoint_action_ledger: &[checkpoint::CheckpointAction],
+        completed_results: &HashMap<TaskId, AgentRunResult>,
+        checkpoint_all_files: &[camino::Utf8PathBuf],
+        pending_decision: Option<&checkpoint::CheckpointPendingDecision>,
+        checkpoint_snapshot_generation: Option<&str>,
+        log_window: &[WhiteboardEvent],
+        post_cursor: &[WhiteboardEvent],
+        cancel: &CancellationToken,
+    ) -> ResumeApplication {
+        // Steps a previous resume already skipped stay skipped — a recorded
+        // skip is terminal for this plan.
+        let skipped_ids: HashSet<TaskId> = checkpoint_action_ledger
+            .iter()
+            .filter(|action| action.kind == "resume-skipped")
+            .filter_map(|action| action.task_id)
+            .collect();
+        // The first blocked/failed step in graph order (callers of the
+        // restored run proceed step by step; later resumes handle the rest).
+        // Snapshot the decision inputs before any outcome mutates the graph.
+        let snapshot = graph.all_tasks().into_iter().find_map(|subtask| {
+            let is_candidate =
+                matches!(subtask.status, SubTaskStatus::Blocked | SubTaskStatus::Failed)
+                    && !skipped_ids.contains(&subtask.id);
+            if !is_candidate {
+                return None;
+            }
+            // Failed outcomes for this step: ledger `failed` entries
+            // (pre-cursor) plus post-cursor failure facts. The cursor keeps
+            // the two disjoint, so summing never double-counts; without a
+            // cursor the post-cursor view is empty (conservative).
+            let ledger_failures = checkpoint_action_ledger
+                .iter()
+                .filter(|action| action.kind == "failed" && action.task_id == Some(subtask.id))
+                .count() as u32;
+            let facts = resume::task_facts_after_cursor(post_cursor, &subtask.id.0.to_string());
+            Some((subtask.id, subtask.role.clone(), facts, ledger_failures))
+        });
+
+        let mut blocked: Option<resume::BlockedStep> = None;
+        let mut step_facts = resume::TaskFacts::default();
+        if let Some((task_id, role, facts, ledger_failures)) = snapshot {
+            step_facts = facts.clone();
+            // The capability class maps from the registry's stage tags
+            // (ADR-58): research → Explore, design → Design; everything
+            // else (including freeform workers) is Implement-class work.
+            let stage = self.stage_of(&role).map(|stage| stage.as_str().to_owned());
+            let class = match stage.as_deref() {
+                Some(tag) if tag == AgentStage::RESEARCH => resume::StepClass::Explore,
+                Some(tag) if tag == AgentStage::DESIGN => resume::StepClass::Design,
+                _ => resume::StepClass::Implement,
+            };
+            // Agents already tried for this step: its current role, every
+            // agent a logged decision selected, and the pending decision's
+            // selection. Replacement never re-selects a tried agent.
+            let mut tried_agents = vec![role.as_str().to_owned()];
+            tried_agents.extend(resume::selected_agents_after_cursor(log_window));
+            if let Some(pending) = pending_decision {
+                if !pending.selected_agent.is_empty() {
+                    tried_agents.push(pending.selected_agent.clone());
+                }
+            }
+            tried_agents.sort();
+            tried_agents.dedup();
+            // Acceptance 7: the recorded, evidence-backed decision gate —
+            // the pending decision or any logged Decision row explicitly
+            // selecting this step's agent with evidence ids.
+            let recorded_selection =
+                log_window.iter().any(|event| resume::decision_selects(event, role.as_str()))
+                    || pending_decision.is_some_and(|pending| {
+                        pending.selected_agent == role.as_str()
+                            && !pending.supporting_evidence_ids.is_empty()
+                    });
+            blocked = Some(resume::BlockedStep {
+                task_id,
+                agent: role.as_str().to_owned(),
+                class,
+                failure_count: ledger_failures + facts.failure_event_ids.len() as u32,
+                tried_agents,
+                recorded_selection,
+            });
+        }
+
+        // Replacement candidates: registered agents with the implement
+        // stage tag minus the tried agents, deterministic order
+        // (lexicographic — the registry map has no stable order). Design /
+        // explore steps are never replaced by the resume path (acceptance
+        // 7): continue-behind-decision or skip.
+        let candidates: Vec<String> = match blocked.as_ref().map(|step| step.class) {
+            Some(resume::StepClass::Implement) => {
+                let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
+                let mut ids = self.registry.ids_for_stage(&AgentStage::new(implement_tag));
+                ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                ids.into_iter()
+                    .map(|id| id.as_str().to_owned())
+                    .filter(|id| {
+                        blocked.as_ref().is_some_and(|step| !step.tried_agents.contains(id))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        // The workspace-change verdict: generation mismatch + the F3
+        // reconciliation restricted to paths the run's OWN writes do not
+        // explain.
+        let own_written = own_write_paths(
+            checkpoint_all_files,
+            completed_results,
+            post_cursor,
+            &context.session.project_dir,
+        );
+        let change = self
+            .workspace_change_verdict(checkpoint_snapshot_generation, &own_written, cancel)
+            .await;
+        let outcome = resume::evaluate(&resume::ResumeInput {
+            blocked_step: blocked.as_ref(),
+            replacement_candidates: &candidates,
+            pending_decision,
+            step_facts: &step_facts,
+            change: &change,
+        });
+
+        // Record the outcome as a whiteboard Decision event (ADR-65 §6/§7):
+        // reason + REAL evidence ids only — post-cursor task facts for a
+        // step outcome, the changed rows' observation ids for a workspace
+        // outcome. A fabricated id is rejected at append (acceptance 8), so
+        // never invent one.
+        let mut evidence_ids: Vec<String> = Vec::new();
+        if blocked.is_some() {
+            evidence_ids.extend(step_facts.progress_event_ids.iter().cloned());
+            evidence_ids.extend(step_facts.failure_event_ids.iter().cloned());
+        } else {
+            evidence_ids.extend(change.externally_changed.iter().filter_map(|(_, event_id)| {
+                event_id.as_ref().filter(|id| !id.is_empty()).cloned()
+            }));
+        }
+        evidence_ids.truncate(MAX_EVIDENCE_OBSERVATIONS);
+        self.append_resume_decision(task.session_id, &outcome, &evidence_ids).await;
+
+        match &outcome {
+            ResumeOutcome::Replan => ResumeApplication::Replan,
+            ResumeOutcome::RestoreAndContinue | ResumeOutcome::RefreshEvidence => {
+                ResumeApplication::Applied { ledger_entries: Vec::new(), re_armed: None }
+            }
+            ResumeOutcome::ContinueBlocked { .. }
+            | ResumeOutcome::ReplaceAgent { .. }
+            | ResumeOutcome::SkipStep { .. } => {
+                let ledger_entries = resume::apply_outcome(&mut *graph, &outcome, blocked.as_ref());
+                let re_armed = if outcome.dispatches() {
+                    blocked.as_ref().map(|step| step.task_id)
+                } else {
+                    None
+                };
+                ResumeApplication::Applied { ledger_entries, re_armed }
+            }
+        }
+    }
+
+    /// Append the whiteboard `Decision` event for a resume outcome
+    /// (ADR-65 §7): `selected_agent, reason, required_output,
+    /// supporting_evidence_ids` — real ids only (the append validates them,
+    /// acceptance 8) and fail-soft like every continuity write.
+    async fn append_resume_decision(
+        &self,
+        session_id: Ulid,
+        outcome: &ResumeOutcome,
+        evidence_ids: &[String],
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let required_output = match outcome {
+            ResumeOutcome::RestoreAndContinue => {
+                "Restored the graph; no blocked step to decide on".to_owned()
+            }
+            ResumeOutcome::ContinueBlocked { agent } => {
+                format!("Continue the blocked subtask with {agent} from the whiteboard cursor")
+            }
+            ResumeOutcome::ReplaceAgent { previous, replacement } => {
+                format!("Replace the blocked subtask's agent {previous} with {replacement}")
+            }
+            ResumeOutcome::SkipStep { agent } => {
+                format!("Skip the blocked subtask previously dispatched to {agent}")
+            }
+            ResumeOutcome::RefreshEvidence => {
+                "Refresh the workspace evidence (snapshot barrier re-ran); continue".to_owned()
+            }
+            ResumeOutcome::Replan => {
+                "Workspace objectively changed: replan via the evidence scheduler".to_owned()
+            }
+        };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": outcome.selected_agent().unwrap_or(""),
+                "reason": outcome.reason_code(),
+                "required_output": required_output,
+                "supporting_evidence_ids": evidence_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(error) = append_whiteboard_event(pool, &event).await {
+            warn!(%error, "ADR-65 §7: resume decision append failed (fail-soft)");
         }
     }
 
@@ -2559,7 +3158,7 @@ impl CoordinatorAgent {
             self.blueprint_facade.as_ref(),
         );
         checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-        let initial_execution_checkpoint = checkpoint::build_checkpoint(
+        let mut initial_execution_checkpoint = checkpoint::build_checkpoint(
             &checkpoint_scope,
             checkpoint::CheckpointStage::Executing,
             None,
@@ -2575,7 +3174,7 @@ impl CoordinatorAgent {
             &retry_feedback,
             &self.checkpoint_context(&model_assignments, &action_ledger),
         );
-        self.persist_checkpoint(&initial_execution_checkpoint).await;
+        self.persist_checkpoint(&mut initial_execution_checkpoint).await;
 
         // ADR-35 §5: lifecycle stages are resolved from the registry rather
         // than hardcoded role ids. A pipeline without a design-stage agent
@@ -2608,7 +3207,7 @@ impl CoordinatorAgent {
                     self.blueprint_facade.as_ref(),
                 );
                 checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let interrupted = checkpoint::build_checkpoint(
+                let mut interrupted = checkpoint::build_checkpoint(
                     &checkpoint_scope,
                     checkpoint::CheckpointStage::Executing,
                     None,
@@ -2624,7 +3223,7 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&interrupted).await;
+                self.persist_checkpoint(&mut interrupted).await;
                 return Err(OrchestratorError::Cancelled);
             }
 
@@ -2786,7 +3385,7 @@ impl CoordinatorAgent {
                         },
                     );
                     checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                    let cp = checkpoint::build_checkpoint(
+                    let mut cp = checkpoint::build_checkpoint(
                         &checkpoint_scope,
                         checkpoint::CheckpointStage::Executing,
                         None,
@@ -2802,7 +3401,7 @@ impl CoordinatorAgent {
                         &retry_feedback,
                         &self.checkpoint_context(&model_assignments, &action_ledger),
                     );
-                    self.persist_checkpoint(&cp).await;
+                    self.persist_checkpoint(&mut cp).await;
                     let checkpoint_json = serde_json::to_string(&cp).ok();
                     return Ok((
                         AgentOutput {
@@ -2847,7 +3446,7 @@ impl CoordinatorAgent {
                     EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
                 );
                 checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let cp = checkpoint::build_checkpoint(
+                let mut cp = checkpoint::build_checkpoint(
                     &checkpoint_scope,
                     checkpoint::CheckpointStage::Executing,
                     None,
@@ -2863,7 +3462,7 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&cp).await;
+                self.persist_checkpoint(&mut cp).await;
                 let checkpoint_json = serde_json::to_string(&cp).ok();
                 return Ok((
                     AgentOutput {
@@ -2885,7 +3484,7 @@ impl CoordinatorAgent {
             }
 
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-            let progress_checkpoint = checkpoint::build_checkpoint(
+            let mut progress_checkpoint = checkpoint::build_checkpoint(
                 &checkpoint_scope,
                 checkpoint::CheckpointStage::Executing,
                 None,
@@ -2901,7 +3500,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&progress_checkpoint).await;
+            self.persist_checkpoint(&mut progress_checkpoint).await;
 
             // ── 2a. Check budget once per batch ─────────────────────
             if self.spend_tracker.check(0.001).is_err() {
@@ -3306,6 +3905,13 @@ impl CoordinatorAgent {
                 };
 
                 // Record the outcome in the checkpoint action ledger.
+                // ADR-65 §7: the dispatched step settled — the pending
+                // decision it recorded no longer awaits completion.
+                if self.last_dispatch_decision.as_ref().and_then(|pending| pending.task_id)
+                    == Some(task_id)
+                {
+                    self.last_dispatch_decision = None;
+                }
                 action_ledger.push(checkpoint::CheckpointAction {
                     kind: if matches!(result.outcome, AgentOutcome::Success) {
                         "completed".into()
@@ -4031,7 +4637,7 @@ impl CoordinatorAgent {
                 self.blueprint_facade.as_ref(),
             );
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-            let completed_batch_checkpoint = checkpoint::build_checkpoint(
+            let mut completed_batch_checkpoint = checkpoint::build_checkpoint(
                 &checkpoint_scope,
                 checkpoint::CheckpointStage::Executing,
                 None,
@@ -4047,7 +4653,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&completed_batch_checkpoint).await;
+            self.persist_checkpoint(&mut completed_batch_checkpoint).await;
 
             if cancelled_during_batch {
                 return Err(OrchestratorError::Cancelled);
@@ -4074,7 +4680,7 @@ impl CoordinatorAgent {
                     EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
                 );
                 checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let cp = checkpoint::build_checkpoint(
+                let mut cp = checkpoint::build_checkpoint(
                     &checkpoint_scope,
                     checkpoint::CheckpointStage::Executing,
                     None,
@@ -4090,7 +4696,7 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&cp).await;
+                self.persist_checkpoint(&mut cp).await;
                 let checkpoint_json = serde_json::to_string(&cp).ok();
                 return Ok((
                     AgentOutput {
@@ -4158,7 +4764,7 @@ impl CoordinatorAgent {
         let stalled = run_is_stalled(completion_status, deliverables_missing, &graph);
         let checkpoint_json = if stalled {
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-            let cp = checkpoint::build_checkpoint(
+            let mut cp = checkpoint::build_checkpoint(
                 &checkpoint_scope,
                 checkpoint::CheckpointStage::Validating,
                 None,
@@ -4174,7 +4780,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&cp).await;
+            self.persist_checkpoint(&mut cp).await;
             serde_json::to_string(&cp).ok()
         } else {
             if let Some(store) = &self.session_store {
@@ -5765,6 +6371,11 @@ impl CoordinatorAgent {
                 // Seeded approved doc (D7) and doc-less runs verify nothing.
                 None => (None, None),
             };
+        // ADR-65 §7: capture where the doc claim stood so every checkpoint
+        // this run persists carries the resolution (a resume restores state,
+        // not prose). Real ids only — append failures leave them unset.
+        self.last_doc_resolution =
+            checkpoint_doc_resolution(&design_verdict, doc_event_ids.as_ref());
         let binding_doc: Option<&DesignDoc> = match (&design_verdict, design_doc.as_ref()) {
             (Some(verdict), Some(doc)) => verdict.state.is_active().then_some(doc),
             (Some(_), None) => None,
@@ -5934,7 +6545,7 @@ impl CoordinatorAgent {
                         }
                         // Rule (b): the scheduler returned the NEXT STEP ONLY —
                         // dispatch the exploration now, then re-consult.
-                        self.append_dispatch_decision(task.session_id, first, None).await;
+                        self.append_dispatch_decision(task.session_id, first, None, None).await;
                         if let Some(completed) =
                             self.run_fallback_exploration(first, task, context, cancel).await?
                         {
@@ -6022,7 +6633,7 @@ impl CoordinatorAgent {
             } else {
                 None
             };
-            self.append_dispatch_decision(task.session_id, step, causation).await;
+            self.append_dispatch_decision(task.session_id, step, causation, Some(subtask_id)).await;
             parent_id = Some(subtask_id);
         }
 
@@ -6183,12 +6794,26 @@ impl CoordinatorAgent {
     /// a fabricated id is rejected), and the failure is fail-soft for
     /// planning. The causation is the DesignDoc claim event for doc-driven
     /// decisions.
+    ///
+    /// ADR-65 §7: when the dispatch's subtask id is known it is recorded as
+    /// the coordinator's PENDING decision (the last scheduler `DispatchStep`
+    /// awaiting completion), captured into every checkpoint so a resume can
+    /// continue behind the recorded, evidence-backed decision.
     async fn append_dispatch_decision(
-        &self,
+        &mut self,
         session_id: Ulid,
         step: &DispatchStep,
         causation: Option<String>,
+        task_id: Option<TaskId>,
     ) {
+        self.last_dispatch_decision =
+            task_id.map(|task_id| checkpoint::CheckpointPendingDecision {
+                selected_agent: step.candidate_agent_id.clone(),
+                reason: step.reason.code().to_owned(),
+                required_output: step.required_output.clone(),
+                supporting_evidence_ids: step.supporting_evidence_ids.clone(),
+                task_id: Some(task_id),
+            });
         let Some(pool) = self.review_store.as_ref() else { return };
         let event = NewWhiteboardEvent {
             event_id: Ulid::new().to_string(),
@@ -11195,6 +11820,555 @@ mod tests {
             blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
             "the objective hash is the ORIGINAL objective's hash, not the resume input's"
         );
+        // ADR-65 §7: the resumed run's checkpoints keep carrying the §7
+        // state — the doc resolution captured by the verifier and the
+        // snapshot generation both survive into the post-resume row.
+        assert_eq!(
+            cp.schema_version,
+            checkpoint::GRAPH_CHECKPOINT_SCHEMA_VERSION,
+            "resumed checkpoints are canonical v4"
+        );
+        assert!(
+            cp.doc_resolution.is_some(),
+            "the doc resolution captured at verify time rides every persist"
+        );
+    }
+
+    // ── ADR-65 §7: continuation restores state at the whiteboard cursor ──
+
+    /// A hermetic review-store pool (the ADR-65 §7 evaluation's log source).
+    async fn resume_log_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let db_path = dir.path().join("resume_evidence_test.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("test pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+        (dir, pool)
+    }
+
+    /// A v4-shaped checkpoint JSON with one blocked/failed subtask (and an
+    /// optional failed-ledger count). The §7 fields sit behind the additive
+    /// schema surface exactly as `persist_checkpoint` writes them.
+    fn blocked_step_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        subtask_id: Ulid,
+        role: &str,
+        status: &str,
+        ledger_failed_entries: usize,
+        cursor: Option<u64>,
+    ) -> String {
+        let ledger: Vec<serde_json::Value> = (0..ledger_failed_entries)
+            .map(|_| {
+                serde_json::json!({
+                    "kind": "failed",
+                    "task_id": subtask_id.to_string(),
+                    "timestamp": [2026, 254, 0, 0, 0, 0, 0, 0, 0],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": Ulid::new().to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [{
+                "id": subtask_id.to_string(),
+                "parent_id": null,
+                "session_id": session_id.to_string(),
+                "role": role,
+                "description": "the blocked work",
+                "status": status,
+                "dependencies": [],
+                "deliverable": null,
+            }],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": ledger,
+            "whiteboard_cursor_gate_seq": cursor,
+        })
+        .to_string()
+    }
+
+    /// Append a `ToolExecuted` fact row attributed to a task (real id,
+    /// session-scoped — the shape the fact writer produces).
+    async fn append_tool_fact(
+        pool: &sqlx::SqlitePool,
+        session_id: Ulid,
+        event_id: &str,
+        task_id: &str,
+        success: bool,
+    ) -> WhiteboardEvent {
+        append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: event_id.to_owned(),
+                agent_id: "coder".to_owned(),
+                kind: WhiteboardKind::ToolExecuted,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "agent_id": "coder",
+                    "task_id": task_id,
+                    "tool": "filesystem",
+                    "args": { "operation": "read", "path": "src/main.rs" },
+                    "success": success,
+                    "generation": "",
+                    "paths": [],
+                }),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("fact row appended")
+    }
+
+    /// Resume decisions are recorded with reason codes and REAL evidence
+    /// ids; a restore-and-continue resets its graph in place.
+    #[tokio::test]
+    async fn resume_continues_progressing_blocked_step_from_the_cursor() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Pre-cursor: one failure fact BEFORE the cursor — checkpoint-era
+        // state, never replayed into the evidence view.
+        append_tool_fact(&pool, session_id, "ev-pre-fail", &subtask_id.to_string(), false).await;
+        // Post-cursor: a successful tool execution — the agent made progress.
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = Arc::new(AgentRegistry::new()); // no candidates
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+
+        // The step was re-armed for the SAME agent (facts show progress).
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "Continue re-arms the step");
+        assert_eq!(graph_task.role.as_str(), "coder", "progress ⇒ the same agent continues");
+        assert!(
+            result.action_ledger.iter().any(|entry| entry.kind == "resume-continued"),
+            "the decision lands in the checkpoint ledger"
+        );
+
+        // The evidence view is the log AFTER the cursor: the pre-cursor
+        // failure is not cited (no replay), the post-cursor progress fact
+        // is.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(decisions.len(), 1, "exactly one resume decision, got: {decisions:?}");
+        assert_eq!(decisions[0].payload["reason"], "resume-continue-blocked");
+        assert_eq!(decisions[0].payload["selected_agent"], "coder");
+        let cited: Vec<&str> = decisions[0].payload["supporting_evidence_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            cited,
+            vec!["ev-post-progress"],
+            "cited ids are the REAL post-cursor facts only (cursor respected), got: {cited:?}"
+        );
+    }
+
+    /// No progress ⇒ replace the agent, never a blind same-agent
+    /// re-dispatch (the 5-repeat live failure's first guard).
+    #[tokio::test]
+    async fn resume_replaces_the_blocked_step_agent_without_progress() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(MockExpertAgent::always_succeed(AgentId::new("coder"), "x")));
+        registry.register(Arc::new(
+            MockExpertAgent::always_succeed(AgentId::new("coder2"), "done")
+                .with_stage(Some(AgentStage::new("implement"))),
+        ));
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let registry = Arc::new(registry);
+        let mut coordinator = CoordinatorAgent::new(
+            registry.clone(),
+            AgentRunner::new(registry, bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            1, // one failed outcome before the checkpoint
+            None,
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(
+            graph_task.role.as_str(),
+            "coder2",
+            "no progress ⇒ replace the agent, never a blind same-coder re-dispatch"
+        );
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "the replacement re-arms");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decision = logged
+            .iter()
+            .find(|event| event.kind == WhiteboardKind::Decision)
+            .expect("the replace decision is recorded");
+        assert_eq!(decision.payload["reason"], "resume-replace-agent");
+        assert_eq!(decision.payload["selected_agent"], "coder2");
+        assert!(result.action_ledger.iter().any(|entry| entry.kind == "resume-replaced"));
+    }
+
+    /// Repeated identical failures with no alternative left ⇒ skip — the
+    /// bound that kills the documented 5-repeat failure: at most ONE bounded
+    /// same-agent continue is ever granted, then the step is skipped.
+    #[tokio::test]
+    async fn resume_skips_after_repeated_identical_failures() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // One more failure AFTER the checkpoint (2 in the ledger → 3 total),
+        // a real row the decision may cite.
+        let fact =
+            append_tool_fact(&pool, session_id, "ev-post-fail", &subtask_id.to_string(), false)
+                .await;
+
+        let registry = Arc::new(AgentRegistry::new()); // no alternative agent
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            2,
+            Some(fact.gate_seq - 1),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(
+            graph_task.status,
+            SubTaskStatus::Failed,
+            "the step is skipped (honest terminal state), never re-dispatched again"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decision = logged
+            .iter()
+            .find(|event| event.kind == WhiteboardKind::Decision)
+            .expect("the skip decision is recorded");
+        assert_eq!(decision.payload["reason"], "resume-skip-step");
+        // The skip cites the REAL post-cursor failure fact.
+        assert_eq!(
+            decision.payload["supporting_evidence_ids"],
+            serde_json::json!(["ev-post-fail"]),
+        );
+        assert!(result.action_ledger.iter().any(|entry| entry.kind == "resume-skipped"));
+    }
+
+    /// Acceptance 7 (e2e): with NO recorded, evidence-backed decision
+    /// selecting the architect, a blocked architect step is never re-armed
+    /// for dispatch — and with a recorded scheduler decision (a logged
+    /// Decision row explicitly selecting the researcher) plus progress
+    /// facts, the dispatch IS allowed.
+    #[tokio::test]
+    async fn resume_never_dispatches_architect_or_researcher_without_recorded_decision() {
+        // ── Negative: no recorded decision ⇒ the architect step stays
+        //    terminated, never re-armed. ──────────────────────────────────
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // The architect is registered with its design stage so the
+        // evaluation classifies the step as architect work (acceptance 7).
+        let mut architect_registry = AgentRegistry::new();
+        architect_registry
+            .register(Arc::new(MockExpertAgent::always_succeed(AgentId::new("architect"), "x")));
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            Arc::new(architect_registry),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "architect",
+            "Failed",
+            0,
+            None,
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+        let step = result.graph.all_tasks().into_iter().next().expect("the blocked step");
+        assert_ne!(
+            step.status,
+            SubTaskStatus::Pending,
+            "the architect step is NEVER re-armed for dispatch without a recorded decision"
+        );
+        assert_eq!(step.status, SubTaskStatus::Failed, "the step is skipped instead");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decision = logged
+            .iter()
+            .find(|event| event.kind == WhiteboardKind::Decision)
+            .expect("the skip decision is recorded");
+        assert_eq!(decision.payload["reason"], "resume-skip-step");
+
+        // ── Positive: a recorded, evidence-backed decision (the Phase-6
+        //    scheduler's logged dispatch decision) explicitly selects the
+        //    researcher, and post-cursor progress facts exist: the resume
+        //    continues the dispatch behind that decision. ─────────────────
+        let researcher_id = Ulid::new();
+        let progress = append_tool_fact(
+            &pool,
+            session_id,
+            "ev-research-progress",
+            &researcher_id.to_string(),
+            true,
+        )
+        .await;
+        // The scheduler's dispatch decision cites a REAL evidence id.
+        let scheduled_decision = append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "ev-scheduled-exploration".to_owned(),
+                agent_id: "coordinator".to_owned(),
+                kind: WhiteboardKind::Decision,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "selected_agent": "researcher",
+                    "reason": "evidence-gap-explore",
+                    "required_output": "Grounded fact inventory (tool reads only)",
+                    "supporting_evidence_ids": ["ev-research-progress"],
+                }),
+                pre_image_hash: None,
+                created_at: 2,
+            },
+        )
+        .await
+        .expect("the scheduler decision is recorded");
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            researcher_id,
+            "researcher",
+            "Blocked",
+            0,
+            Some(progress.gate_seq - 1),
+        );
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+        let step = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == researcher_id)
+            .expect("the blocked researcher step");
+        assert_eq!(
+            step.status,
+            SubTaskStatus::Pending,
+            "with a recorded, evidence-backed decision the dispatch is allowed"
+        );
+        assert_eq!(step.role.as_str(), "researcher");
+        let _ = scheduled_decision;
     }
 
     /// Run-continuity Phase 1 (Task D): a bare "continue" over a stored

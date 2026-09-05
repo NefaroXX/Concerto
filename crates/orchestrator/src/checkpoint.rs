@@ -19,12 +19,24 @@ use time::OffsetDateTime;
 
 use crate::graph::{Dependency, TaskGraph};
 
-pub const GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+/// ADR-65 §7 (Phase 7): the checkpoint schema carries the whiteboard cursor,
+/// the doc resolution, the snapshot generation, and the pending dispatch
+/// decision, so a continuation restores STATE at the cursor instead of
+/// replaying prose.
+pub const GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// Last schema version before the current one.  Records written at this
 /// version load under the current policy (new fields filled with serde
 /// defaults) and are migrated in-memory to the current version on load.
-pub const LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+
+/// Oldest schema version still migrated by the load policy. v2 predates the
+/// design-doc/lledger capture and the §7 cursor fields; it migrates through
+/// the same serde-default path (every later field defaults), so old rows keep
+/// restoring. The chain is additive only: each bump added optional,
+/// serde-defaulted keys, and serde ignores unknown fields — so a reader built
+/// for an older schema treats the newer keys as opaque.
+pub const OLDEST_MIGRATABLE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CheckpointStage {
@@ -91,6 +103,68 @@ pub struct CheckpointAction {
     pub evidence: Option<AcceptanceEvidence>,
 }
 
+/// ADR-65 §7: where the DesignDoc claim stood when the checkpoint was
+/// persisted, with the REAL log event ids that establish it (never fabricated
+/// — acceptance 8 validation applies to any decision citing them).
+///
+/// Serialized with a kebab-case `state` tag; the payload keys are additive
+/// schema keys, so older readers treat the whole field as opaque and newer
+/// reason codes can be added without another bump.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum CheckpointDocResolution {
+    /// The doc binds (Verified): its contract paths are consumed.
+    Active {
+        /// Grounded contract paths (verifier `contract_paths`).
+        #[serde(default)]
+        contract_paths: Vec<String>,
+        /// Real event id of the `design-doc` claim row.
+        #[serde(default)]
+        claim_event_id: Option<String>,
+        /// Real event id of the coordinator's verdict decision row.
+        #[serde(default)]
+        verdict_event_id: Option<String>,
+    },
+    /// The doc was quarantined; the machine-checkable codes ride along.
+    Quarantined {
+        /// Quarantine reason codes (kebab-case), deterministic order.
+        #[serde(default)]
+        reason_codes: Vec<String>,
+        #[serde(default)]
+        claim_event_id: Option<String>,
+        #[serde(default)]
+        verdict_event_id: Option<String>,
+    },
+    /// The doc was skipped (empty claim): the design is the repo.
+    Skipped {
+        #[serde(default)]
+        claim_event_id: Option<String>,
+        #[serde(default)]
+        verdict_event_id: Option<String>,
+    },
+}
+
+/// ADR-65 §7: the last scheduler `DispatchStep` awaiting completion at
+/// checkpoint time — the recorded, evidence-backed decision a resume may
+/// continue behind. Dispatches to architect/researcher-class agents on resume
+/// are allowed ONLY through a decision like this one (acceptance 7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPendingDecision {
+    /// The agent the recorded decision selected.
+    pub selected_agent: String,
+    /// The machine reason code of the dispatch decision (ADR-65 §6 shape).
+    pub reason: String,
+    /// What the dispatch must produce.
+    pub required_output: String,
+    /// The real event ids the decision consumed (validated at append).
+    #[serde(default)]
+    pub supporting_evidence_ids: Vec<String>,
+    /// The subtask the decision dispatched, when recorded (the §6 fallback
+    /// exploration decision precedes subtask materialization and stays None).
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+}
+
 /// Coordinator-side state captured into every checkpoint snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointContext {
@@ -106,6 +180,14 @@ pub struct CheckpointContext {
     pub default_model_provider_attempted: HashSet<TaskId>,
     pub self_execute_attempted: HashSet<TaskId>,
     pub escalation_attempted: HashSet<TaskId>,
+    /// ADR-65 §7: where the DesignDoc claim stood at save time (verdict +
+    /// real event ids). `None` when never resolved.
+    pub doc_resolution: Option<CheckpointDocResolution>,
+    /// ADR-65 §7: the workspace snapshot generation at save time, so a resume
+    /// can tell whether the workspace objectively changed since.
+    pub snapshot_generation: Option<String>,
+    /// ADR-65 §7: the last scheduler dispatch still awaiting completion.
+    pub pending_decision: Option<CheckpointPendingDecision>,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +284,28 @@ pub struct GraphCheckpoint {
     pub self_execute_attempted: HashSet<TaskId>,
     #[serde(default)]
     pub escalation_attempted: HashSet<TaskId>,
+    /// ADR-65 §7: the whiteboard cursor — the `gate_seq` of the last log
+    /// event applied when this checkpoint was persisted (the log head at
+    /// persist time). A resume reads only facts appended AFTER this cursor;
+    /// pre-cursor events are state, never replayed. `None` on pre-§7 (v3 and
+    /// older) records; the resume path backfills it from the log fail-soft.
+    #[serde(default)]
+    pub whiteboard_cursor_gate_seq: Option<u64>,
+    /// ADR-65 §7: where the DesignDoc claim stood at save time (Active /
+    /// Quarantined / Skipped + real event ids). `None` on records persisted
+    /// before the verdict was resolved, or by paths that did not capture it;
+    /// backfilled from the log on resume (additive, fail-soft).
+    #[serde(default)]
+    pub doc_resolution: Option<CheckpointDocResolution>,
+    /// ADR-65 §7: the workspace snapshot `generation` at save time. A resume
+    /// compares this against the fresh run's snapshot to detect an
+    /// objectively changed workspace.
+    #[serde(default)]
+    pub snapshot_generation: Option<String>,
+    /// ADR-65 §7: the last scheduler `DispatchStep` awaiting completion —
+    /// the recorded, evidence-backed decision a resume may continue behind.
+    #[serde(default)]
+    pub pending_decision: Option<CheckpointPendingDecision>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -211,10 +315,15 @@ const fn current_schema_version() -> u32 {
 impl GraphCheckpoint {
     /// Deserialize a checkpoint JSON string, applying the schema-version
     /// policy:
-    /// - current version (v3) loads as-is;
-    /// - legacy v2 records are migrated in-memory to v3 (serde fills the
-    ///   new fields with defaults);
+    /// - current version (v4) loads as-is;
+    /// - legacy v3 and v2 records are migrated in-memory to v4 (serde fills
+    ///   the newer fields with defaults; the §7 fields are then backfilled
+    ///   from the log by the resume path);
     /// - unknown future versions are rejected with a clear error.
+    ///
+    /// The bumps are additive only — every new field is optional and
+    /// serde-defaulted, so a reader built for an older schema treats the
+    /// newer keys as opaque when it loads the JSON.
     pub fn from_json(json: &str) -> Result<Self, String> {
         let mut checkpoint: GraphCheckpoint = serde_json::from_str(json)
             .map_err(|error| format!("failed to deserialize checkpoint: {error}"))?;
@@ -227,15 +336,25 @@ impl GraphCheckpoint {
         match self.schema_version {
             GRAPH_CHECKPOINT_SCHEMA_VERSION => Ok(()),
             LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION => {
-                // v2 -> v3: serde defaults already filled the new fields
-                // (design_doc=None, model_assignments={}, action_ledger=[],
-                // per-task timestamps None, ladder guard sets empty). Bump the
-                // recorded version so a resaved checkpoint is canonical v3.
+                // v3 -> v4: serde defaults already filled the §7 fields
+                // (cursor/doc/snapshot/pending all None). Bump the recorded
+                // version so a resaved checkpoint is canonical v4; the resume
+                // path backfills the §7 fields from the log (additive,
+                // fail-soft).
+                self.schema_version = GRAPH_CHECKPOINT_SCHEMA_VERSION;
+                Ok(())
+            }
+            OLDEST_MIGRATABLE_SCHEMA_VERSION => {
+                // v2 -> v4: the same additive-default path (design_doc,
+                // model_assignments, action_ledger, per-task timestamps, and
+                // the §7 fields all default). Bump so a resave is canonical.
                 self.schema_version = GRAPH_CHECKPOINT_SCHEMA_VERSION;
                 Ok(())
             }
             other => Err(format!(
-                "unsupported checkpoint schema version {other}: this runtime supports v{GRAPH_CHECKPOINT_SCHEMA_VERSION} and migrates v{LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION}"
+                "unsupported checkpoint schema version {other}: this runtime supports \
+                 v{GRAPH_CHECKPOINT_SCHEMA_VERSION} and migrates v{LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION} \
+                 and v{OLDEST_MIGRATABLE_SCHEMA_VERSION}"
             )),
         }
     }
@@ -256,10 +375,12 @@ impl GraphCheckpoint {
         session_id: concerto_core::ids::Ulid,
         project_id: &str,
     ) -> Result<(), String> {
-        // The current and the last legacy schema version are both resumable;
-        // anything else (a future version) must be rejected cleanly.
+        // The current and both migrated-legacy schema versions are
+        // resumable; anything else (a future version) must be rejected
+        // cleanly.
         if self.schema_version != GRAPH_CHECKPOINT_SCHEMA_VERSION
             && self.schema_version != LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION
+            && self.schema_version != OLDEST_MIGRATABLE_SCHEMA_VERSION
         {
             return Err(format!(
                 "checkpoint schema {} is incompatible with runtime schema {}",
@@ -378,6 +499,14 @@ pub fn build_checkpoint(
         default_model_provider_attempted: context.default_model_provider_attempted.clone(),
         self_execute_attempted: context.self_execute_attempted.clone(),
         escalation_attempted: context.escalation_attempted.clone(),
+        // ADR-65 §7 fields. The cursor is stamped at PERSIST time (the log
+        // head then), so the builder leaves it `None` for
+        // `persist_checkpoint` to fill; the rest come from the captured
+        // context.
+        whiteboard_cursor_gate_seq: None,
+        doc_resolution: context.doc_resolution.clone(),
+        snapshot_generation: context.snapshot_generation.clone(),
+        pending_decision: context.pending_decision.clone(),
     }
 }
 
@@ -1167,6 +1296,9 @@ mod tests {
                 default_model_attempted: HashSet::from([task_id]),
                 self_execute_attempted: HashSet::new(),
                 escalation_attempted: HashSet::new(),
+                doc_resolution: None,
+                snapshot_generation: None,
+                pending_decision: None,
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -1410,6 +1542,9 @@ mod tests {
                 default_model_attempted: HashSet::new(),
                 self_execute_attempted: HashSet::new(),
                 escalation_attempted: HashSet::new(),
+                doc_resolution: None,
+                snapshot_generation: None,
+                pending_decision: None,
             },
         );
 
@@ -1639,6 +1774,83 @@ mod tests {
             scope_error.contains("incompatible with runtime schema"),
             "expected scope rejection, got: {scope_error}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-65 §7: v4 fields round-trip; v3 records migrate additively
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn v4_fields_survive_json_round_trip() {
+        let doc_resolution = CheckpointDocResolution::Quarantined {
+            reason_codes: vec!["ungrounded-path".into()],
+            claim_event_id: Some("ev-claim".into()),
+            verdict_event_id: Some("ev-verdict".into()),
+        };
+        let pending = CheckpointPendingDecision {
+            selected_agent: "coder".into(),
+            reason: "doc-active-implement-with-contract".into(),
+            required_output: "Implement: build the thing".into(),
+            supporting_evidence_ids: vec!["ev-1".into(), "ev-2".into()],
+            task_id: Some(TaskId::new()),
+        };
+        let mut cp = build_minimal_checkpoint(&TaskGraph::new());
+        cp.whiteboard_cursor_gate_seq = Some(42);
+        cp.doc_resolution = Some(doc_resolution.clone());
+        cp.snapshot_generation = Some("gen-7".into());
+        cp.pending_decision = Some(pending.clone());
+
+        let json = serde_json::to_string(&cp).unwrap();
+        let loaded = GraphCheckpoint::from_json(&json).unwrap();
+        assert_eq!(loaded.whiteboard_cursor_gate_seq, Some(42), "cursor preserved");
+        assert_eq!(loaded.snapshot_generation.as_deref(), Some("gen-7"));
+        assert_eq!(loaded.doc_resolution, Some(doc_resolution), "doc resolution preserved");
+        assert_eq!(loaded.pending_decision, Some(pending), "pending decision preserved");
+        // Keys are stable kebab/JSON names: the pending decision serializes
+        // with the ADR-65 §6 payload shape.
+        assert!(json.contains("\"selected_agent\""));
+        assert!(json.contains("\"supporting_evidence_ids\""));
+    }
+
+    #[test]
+    fn v3_record_loads_under_v4_policy_with_section7_defaults() {
+        // A realistic v3-shaped record (the §7 fields did not exist): it
+        // migrates to the current version with every new key treated as
+        // absent, and restore proceeds exactly as before.
+        let json = r#"{
+            "schema_version": 3,
+            "run_id": "01HZ0X0X0X0X0X0X0X0X0X0X0X",
+            "session_id": "01HZ0X0X0X0X0X0X0X0X0X0X0X",
+            "root_task_id": "01HZ0X0X0X0X0X0X0X0X0X0X0X",
+            "project_id": "test",
+            "objective": "test objective",
+            "objective_hash": "hash",
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {}
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).unwrap();
+        assert_eq!(
+            loaded.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION,
+            "v3 record migrated to v4 on load"
+        );
+        // The §7 fields default to None; the resume path backfills them
+        // additively from the log (fail-soft).
+        assert!(loaded.whiteboard_cursor_gate_seq.is_none());
+        assert!(loaded.doc_resolution.is_none());
+        assert!(loaded.snapshot_generation.is_none());
+        assert!(loaded.pending_decision.is_none());
+        assert!(loaded.validate_scope(loaded.session_id, "test").is_ok());
     }
 
     // ------------------------------------------------------------------
