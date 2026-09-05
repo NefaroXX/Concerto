@@ -402,11 +402,8 @@ impl SimplePolicyEngine {
         &self,
         action: &PolicyAction<'_>,
     ) -> Option<(PolicyVerdict, String)> {
-        // 1. Check spend tracker if configured and action has estimated cost.
-        if let (Some(tracker), Some(cost)) = (&self.spend_tracker, action.estimated_cost_usd) {
-            if let Err(e) = tracker.check(cost) {
-                return Some((PolicyVerdict::Deny, format!("spend_cap_exceeded: {e}")));
-            }
+        if let Some((verdict, rule)) = self.check_spend_caps(action).await {
+            return Some((verdict, rule));
         }
 
         // 2. Check rate limiter if configured and this is a provider call.
@@ -424,6 +421,22 @@ impl SimplePolicyEngine {
             }
         }
 
+        None
+    }
+
+    /// Spend-cap check only (side-effect-free — never consumes a reservation).
+    ///
+    /// The ADR-65 F1a advisory path runs this instead of
+    /// [`Self::check_spend_and_rate_limits`] so it can deny when a cap is
+    /// exceeded without touching the rate limiter (token consumption would
+    /// break the advisory path's promise to have no side effects).
+    async fn check_spend_caps(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
+        // 1. Check spend tracker if configured and action has estimated cost.
+        if let (Some(tracker), Some(cost)) = (&self.spend_tracker, action.estimated_cost_usd) {
+            if let Err(e) = tracker.check(cost) {
+                return Some((PolicyVerdict::Deny, format!("spend_cap_exceeded: {e}")));
+            }
+        }
         None
     }
 }
@@ -712,6 +725,39 @@ impl PolicyEngine for SimplePolicyEngine {
 
     fn audit_log(&self) -> &dyn AuditLog {
         self.audit.as_ref()
+    }
+
+    /// ADR-65 F1a: identical checks to [`Self::evaluate`], but without
+    /// persisting a decision row and without consuming rate-limiter tokens.
+    ///
+    /// Used by the read-dedupe serve gate, which must be able to re-evaluate a
+    /// cached read's policy and fall through to normal execution on anything
+    /// but an explicit `Allow` — without duplicating the audit decision row the
+    /// original (or the imminent) `execute` writes.
+    async fn evaluate_advisory(
+        &self,
+        action: &PolicyAction<'_>,
+        cancel: CancellationToken,
+    ) -> Result<PolicyVerdict, PolicyError> {
+        if cancel.is_cancelled() {
+            return Err(PolicyError::Cancelled);
+        }
+
+        // 1. Check sandbox profile first (always enforced).
+        if let Some((verdict, _)) = self.check_sandbox(action) {
+            return Ok(verdict);
+        }
+
+        // 2. Check spend caps (no rate limiter: advisory must not consume).
+        if let Some((verdict, _)) = self.check_spend_caps(action).await {
+            return Ok(verdict);
+        }
+
+        // 3. Check configured policy rules.
+        match self.evaluate_rules(action) {
+            Some((verdict, _)) => Ok(verdict),
+            None => Ok(PolicyVerdict::Deny),
+        }
     }
 }
 
@@ -1208,6 +1254,68 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let result = engine.evaluate(&make_action("shell", &input), cancel).await;
+        assert!(matches!(result, Err(PolicyError::Cancelled)));
+    }
+
+    // ---- ADR-65 F1a: advisory evaluation (no audit rows, no side effects) ----
+
+    #[tokio::test]
+    async fn advisory_allow_matches_without_audit_row() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit.clone());
+        let input = empty_input();
+        let action = make_action("shell", &input);
+
+        let verdict = engine.evaluate_advisory(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+        assert!(
+            audit.entries.lock().unwrap().is_empty(),
+            "advisory evaluation must not persist a decision row"
+        );
+    }
+
+    #[tokio::test]
+    async fn advisory_default_deny_without_audit_row() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        // No rule matches "shell" → default deny, but still no audit row.
+        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit.clone());
+        let input = empty_input();
+        let action = make_action("shell", &input);
+
+        let verdict = engine.evaluate_advisory(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert!(audit.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn advisory_is_side_effect_free_next_to_evaluate() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit.clone());
+        let input = empty_input();
+        let action = make_action("shell", &input);
+
+        engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(audit.entries.lock().unwrap().len(), 1, "evaluate writes one decision row");
+        engine.evaluate_advisory(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            audit.entries.lock().unwrap().len(),
+            1,
+            "advisory evaluation must not add a second row"
+        );
+    }
+
+    #[tokio::test]
+    async fn advisory_cancellation_returns_error() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit);
+        let input = empty_input();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = engine.evaluate_advisory(&make_action("shell", &input), cancel).await;
         assert!(matches!(result, Err(PolicyError::Cancelled)));
     }
 

@@ -32,6 +32,35 @@ struct ExecutionAuditContext {
     facts: Option<CommandPolicyFacts>,
 }
 
+/// Construct the policy action for a tool call, shared by the executing path
+/// and the ADR-65 F1a serve gate so both evaluate the *exact* same action.
+fn build_action<'a>(
+    tool_name: &'a str,
+    input: &'a serde_json::Value,
+    tool: &dyn Tool,
+    session: &SessionContext,
+) -> PolicyAction<'a> {
+    PolicyAction {
+        tool_name,
+        input,
+        session_id: session.session_id,
+        correlation_id: crate::ids::new_id(),
+        capability_requirements: tool.capability_requirements(),
+        sandbox_profile: None,
+        // Estimate cost based on tool type — provider calls get a default estimate,
+        // other tools have zero estimated cost.
+        estimated_cost_usd: if tool_name == "provider" {
+            input.get("estimated_cost_usd").and_then(|v| v.as_f64()).or(Some(0.001))
+        } else {
+            None
+        },
+        // ADR-28 §6: pull structured command facts from the tool (e.g. the
+        // shell tool resolves executable/argv/cwd), so the policy engine
+        // and audit log reason about what actually runs, not just a string.
+        command_facts: tool.command_facts(input, session),
+    }
+}
+
 impl ToolExecutor {
     pub fn new(registry: Arc<ToolRegistry>, policy: Arc<dyn PolicyEngine>) -> Self {
         Self { registry, policy, approval_sink: None, event_bus: None }
@@ -421,25 +450,7 @@ impl ToolExecutor {
             message: format!("tool not found: {tool_name}"),
         })?;
 
-        let action = PolicyAction {
-            tool_name,
-            input: &input,
-            session_id: session.session_id,
-            correlation_id: crate::ids::new_id(),
-            capability_requirements: tool.capability_requirements(),
-            sandbox_profile: None,
-            // Estimate cost based on tool type — provider calls get a default estimate,
-            // other tools have zero estimated cost.
-            estimated_cost_usd: if tool_name == "provider" {
-                input.get("estimated_cost_usd").and_then(|v| v.as_f64()).or(Some(0.001))
-            } else {
-                None
-            },
-            // ADR-28 §6: pull structured command facts from the tool (e.g. the
-            // shell tool resolves executable/argv/cwd), so the policy engine
-            // and audit log reason about what actually runs, not just a string.
-            command_facts: tool.command_facts(&input, session),
-        };
+        let action = build_action(tool_name, &input, tool, session);
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
@@ -515,6 +526,79 @@ impl ToolExecutor {
             Err(PolicyError::InvalidRule(msg)) => {
                 Err(ToolError::PolicyDenied { rule: format!("invalid_policy_rule: {msg}") })
             }
+        }
+    }
+
+    /// ADR-65 F1a: side-effect-free policy gate for the read-dedupe serve path.
+    ///
+    /// Re-evaluates the action through [`PolicyEngine::evaluate_advisory`] (no
+    /// audit decision row, no quota consumption) and returns `true` only for an
+    /// explicit [`PolicyVerdict::Allow`]. Unknown tools, `Deny`,
+    /// `RequireApproval*`, or a policy error all return `false`, so the serve
+    /// gate falls through to the normal executor path — a cached read is
+    /// served only when the policy in force explicitly allows it.
+    ///
+    /// This must never be used for `provider` actions: the rate-limit check is
+    /// intentionally bypassed in the advisory path, and the serve gate only
+    /// ever consults it for file-read tools.
+    pub async fn policy_verdict_is_allow(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> bool {
+        let Some(tool) = self.registry.get(tool_name) else {
+            return false;
+        };
+        let action = build_action(tool_name, input, tool, session);
+        matches!(self.policy.evaluate_advisory(&action, cancel).await, Ok(PolicyVerdict::Allow))
+    }
+
+    /// ADR-65 F1b: persist a `ServedFromCache` audit row for a cached read.
+    ///
+    /// Called only when the serve gate served a cached read *without* executing
+    /// the tool, so no policy decision row precedes this entry: it gets a
+    /// fresh `correlation_id` and leaves the ADR-28 §6 execution fields `None`.
+    /// The served path is recorded in `argv` — the [`AuditEntry`] schema has no
+    /// dedicated path column — and `rule_matched` is `"served_from_cache"`.
+    ///
+    /// `ServedFromCache` rows count toward read-count grounding metrics exactly
+    /// like a real `ExecutionSucceeded` read row (ADR-65 §3.2). Fail-soft: a
+    /// write error is logged and never fails the serve.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_served_read_audit(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        path: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) {
+        let entry = AuditEntry {
+            tool_name: tool_name.to_owned(),
+            verdict: "ServedFromCache".to_owned(),
+            input_hash: crate::policy::compute_input_hash(input),
+            session_id: session.session_id,
+            correlation_id: crate::ids::new_id(),
+            timestamp: OffsetDateTime::now_utc(),
+            user_response: None,
+            rule_matched: Some("served_from_cache".to_owned()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: Some(vec![path.to_owned()]),
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+        };
+        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
+            tracing::error!(%error, "served-read audit write failed");
         }
     }
 
@@ -1610,5 +1694,115 @@ mod tests {
         // present, source_revision only when a revision was captured.
         assert_eq!(entries[0].plan_id.as_deref(), Some("01J4V6Q8X000000000000000002"));
         assert_eq!(entries[0].source_revision, None);
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-65 F1a/F1b: serve-gate re-evaluation and ServedFromCache audit
+    // ------------------------------------------------------------------
+
+    /// The serve gate returns true only for an explicit Allow and evaluates
+    /// through the advisory path (no decision row is written).
+    #[tokio::test]
+    async fn policy_verdict_is_allow_true_on_allow_without_audit_row() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            audit.clone(),
+        ));
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = test_session();
+        let input = serde_json::json!({"path": "src/a.rs"});
+
+        assert!(
+            executor
+                .policy_verdict_is_allow("echo", &input, &session, CancellationToken::new())
+                .await
+        );
+        assert!(
+            audit.entries.lock().unwrap().is_empty(),
+            "serve-gate re-evaluation must not write a decision row"
+        );
+    }
+
+    /// A denying policy forces the serve gate closed so the read falls through
+    /// to the normal executor path.
+    #[tokio::test]
+    async fn policy_verdict_is_allow_false_on_deny() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoDeny(Condition::Always)],
+            audit.clone(),
+        ));
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = test_session();
+
+        assert!(
+            !executor
+                .policy_verdict_is_allow(
+                    "echo",
+                    &serde_json::json!({}),
+                    &session,
+                    CancellationToken::new(),
+                )
+                .await
+        );
+        assert!(audit.entries.lock().unwrap().is_empty());
+    }
+
+    /// An unknown tool can never pass the serve gate even under an allow-all
+    /// policy (there is no action to re-evaluate).
+    #[tokio::test]
+    async fn policy_verdict_is_allow_false_on_unknown_tool() {
+        let executor = ToolExecutor::new(test_registry(), Arc::new(AllowPolicy));
+        let session = test_session();
+
+        assert!(
+            !executor
+                .policy_verdict_is_allow(
+                    "nonexistent",
+                    &serde_json::json!({}),
+                    &session,
+                    CancellationToken::new(),
+                )
+                .await
+        );
+    }
+
+    /// A served read records a single `ServedFromCache` row: fresh correlation
+    /// id, the served path in `argv` (the schema has no dedicated path column),
+    /// and no command-fact or execution-outcome fields.
+    #[tokio::test]
+    async fn record_served_read_audit_writes_served_from_cache_row() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = test_session();
+
+        executor
+            .record_served_read_audit(
+                "read_file",
+                &serde_json::json!({"path": "src/a.rs"}),
+                "src/a.rs",
+                &session,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "exactly one served-read row");
+        assert_eq!(entries[0].tool_name, "read_file");
+        assert_eq!(entries[0].verdict, "ServedFromCache");
+        assert_eq!(entries[0].rule_matched.as_deref(), Some("served_from_cache"));
+        assert_eq!(entries[0].argv.as_deref(), Some(&["src/a.rs".to_owned()][..]));
+        assert_eq!(entries[0].session_id, session.session_id);
+        // No decision row precedes a serve, so the correlation id is fresh and
+        // the input hash is derived from the served input.
+        assert_ne!(entries[0].correlation_id, Ulid::default());
+        assert!(!entries[0].input_hash.is_empty());
+        // A served read never executed: no command facts or outcome fields.
+        assert_eq!(entries[0].profile_id, None);
+        assert_eq!(entries[0].working_directory, None);
+        assert_eq!(entries[0].exit_code, None);
+        assert_eq!(entries[0].duration_ms, None);
     }
 }
