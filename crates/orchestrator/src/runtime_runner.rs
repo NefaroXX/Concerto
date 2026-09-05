@@ -4059,12 +4059,13 @@ async fn run_multi_agent(
     .with_agent_configs(agent_configs)
     .with_skills_section(skills_section)
     // ADR-58 P2+P3 (Batch 1): the resolved blueprint facade backs the
-    // sequencing guards in `Coordinator::stage_of` /
-    // `Coordinator::first_agent_for_stage` (`debug_assert!` comparing the
-    // registry answer against blueprint staffing). `None` when no resolved
-    // blueprint is attached (e.g. coordinators built in tests directly);
-    // guards then stay silent. Dispatch sites still consult the registry —
-    // replacing them with facade lookups is the Batch 2+ table (R1–R11).
+    // stage-kind resolutions (`role_in_kind_stage`, `execution_stage_tag`,
+    // `kind_stage_tag`). ADR-58 amendment (2026-09-05): the facade never
+    // enforces blueprint staffing — the registry built from `custom_agents`
+    // is the roster. `None` when no resolved blueprint is attached (e.g.
+    // coordinators built in tests directly). Dispatch sites consult the
+    // registry; dispatch authority belongs to the Coordinator (ADR-35
+    // amendment 2026-09-05).
     .with_blueprint_facade(facade)
     .with_default_model_provider(Some(default_model_provider), default_model_profile)
     .with_planning_profile(planning_profile)

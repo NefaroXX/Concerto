@@ -695,11 +695,13 @@ pub struct CoordinatorAgent {
     /// is registered. `None` (the default) preserves the pre-amendment
     /// behavior: a build task without a validator rejects acceptance.
     eval_engine: Option<Arc<concerto_eval::EvalEngine>>,
-    /// ADR-58 P2+P3 (Batch 1): the resolved blueprint's typed facade,
-    /// backing the sequencing guards in [`Self::stage_of`] and
-    /// [`Self::first_agent_for_stage`] (`debug_assert!` comparing the
-    /// registry answer against blueprint staffing). `None` for coordinators
-    /// built without a resolved blueprint (tests) — the guards stay silent.
+    /// ADR-58 P2+P3 (Batch 1): the resolved blueprint's typed facade, backing
+    /// the stage-kind resolutions in [`Self::role_in_kind_stage`] and the
+    /// stage-tag lookups (`execution_stage_tag` / `kind_stage_tag`). `None`
+    /// for coordinators built without a resolved blueprint (tests) — those
+    /// fall back to the canonical stage tags. ADR-58 amendment (2026-09-05):
+    /// the facade NEVER enforces blueprint staffing — the registry is the
+    /// roster.
     blueprint_facade: Option<BlueprintFacade>,
     /// ADR-60 D7 (#152): structured plan state rehydrated from the whiteboard
     /// for an approved-plan Execute run. Consumed once by the first
@@ -1206,10 +1208,13 @@ impl CoordinatorAgent {
     }
 
     /// ADR-58 P2+P3 (Batch 1): attach the resolved blueprint's typed facade,
-    /// backing the sequencing guards in [`Self::stage_of`] and
-    /// [`Self::first_agent_for_stage`]. Pass `None` (or omit the call) for
-    /// coordinators built without a resolved blueprint — the guards stay
-    /// silent.
+    /// backing the stage-kind resolutions (`role_in_kind_stage`,
+    /// `execution_stage_tag`, `kind_stage_tag`). Pass `None` (or omit the
+    /// call) for coordinators built without a resolved blueprint — canonical
+    /// stage tags apply.
+    ///
+    /// ADR-58 amendment (2026-09-05): the facade never enforces blueprint
+    /// staffing or dispatch order — the registry is the roster.
     ///
     /// ADR-58 P2+P3 (Batch 3a): the facade is also propagated to the cycle
     /// state so Rule B keys on the gate being executed (R11) and drives the
@@ -1909,30 +1914,14 @@ impl CoordinatorAgent {
 
     /// The declared stage tag of a registered agent, if any. `None` means
     /// the agent is freeform (no lifecycle participation).
+    ///
+    /// ADR-58 amendment (2026-09-05) / ADR-35 amendment (2026-09-05): the
+    /// registry is the roster and stage tags are DECLARED metadata —
+    /// informational (output-mode typing, verifier routing), never a
+    /// dispatch policy. The former registry-vs-blueprint staffing drift
+    /// `debug_assert!` is deleted: blueprint staffing is never enforced.
     fn stage_of(&self, role: &AgentId) -> Option<AgentStage> {
-        let answer = self.registry.get(role).and_then(|agent| agent.stage());
-        // ADR-58 P2+P3 (Batch 1) sequencing guard: when the resolved
-        // blueprint staffs this role, the registry's declared stage must
-        // equal the blueprint staffing tag. `debug_assert!` only — active in
-        // debug builds, silent in release and for coordinators built without
-        // a facade. Every Batch 2+ replacement site (R1–R11) funnels
-        // through this method, so a registry/blueprint drift fails here.
-        if let Some(facade) = &self.blueprint_facade {
-            debug_assert!(
-                match facade.stage_for_agent(role) {
-                    Some(staffed) => {
-                        answer.as_ref().map(AgentStage::as_str) == Some(staffed.def.tag.as_str())
-                    }
-                    // Role not staffed in the resolved blueprint: custom /
-                    // Freeform / run_once — nothing to compare against.
-                    None => true,
-                },
-                "registry stage {answer:?} for {role} diverges from resolved blueprint \
-                 staffing {:?}",
-                facade.stage_for_agent(role).map(|s| s.def.tag.as_str())
-            );
-        }
-        answer
+        self.registry.get(role).and_then(|agent| agent.stage())
     }
 
     /// Whether `role` participates in a stage of the given known kind —
@@ -1956,47 +1945,19 @@ impl CoordinatorAgent {
         }
     }
 
-    /// The single deterministic agent for a lifecycle stage, if any.
+    /// The first registered agent declaring `stage`, if any (lexicographic
+    /// tie-break on the id, so the resolution is deterministic).
     ///
-    /// ADR-35 §5: participants are resolved from the registry by stage tag
-    /// instead of hardcoded role ids. When several agents declare the same
-    /// stage, the lexicographically first id wins; a pipeline without any
-    /// agent for a stage simply skips that stage.
+    /// ADR-35 amendment (2026-09-05) / ADR-58 amendment (2026-09-05): this
+    /// lookup is output-mode typing and verifier routing ONLY (review /
+    /// validation / replan machinery) — never a dispatch authority. The
+    /// former blueprint `def.agents` staffing-equality `debug_assert!` is
+    /// deleted: blueprint staffing is never enforced, and the registry built
+    /// from `custom_agents` is the complete roster.
     fn first_agent_for_stage(&self, stage: &AgentStage) -> Option<AgentId> {
         let mut ids = self.registry.ids_for_stage(stage);
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        let answer = ids.into_iter().next();
-        // ADR-58 P2+P3 (Batch 1) sequencing guard: when the resolved
-        // blueprint defines this stage tag, the set of agents participating
-        // must equal the blueprint's `def.agents` staffing (sorted). The
-        // lexicographically-first id is the single deterministic participant
-        // both the registry path and the blueprint derive identically.
-        if let Some(facade) = &self.blueprint_facade {
-            debug_assert!(
-                match facade.stage_by_tag(stage.as_str()) {
-                    Some(staffed) => {
-                        let mut expected: Vec<&str> =
-                            staffed.def.agents.iter().map(String::as_str).collect();
-                        expected.sort_unstable();
-                        let mut actual: Vec<String> = self
-                            .registry
-                            .ids_for_stage(stage)
-                            .iter()
-                            .map(|a| a.as_str().to_string())
-                            .collect();
-                        actual.sort_unstable();
-                        actual.iter().map(String::as_str).collect::<Vec<_>>() == expected
-                    }
-                    // No such stage tag in the resolved blueprint: nothing to
-                    // compare against.
-                    None => true,
-                },
-                "registry staffing for {stage} diverges from resolved blueprint \
-                 def.agents {:?}",
-                facade.stage_by_tag(stage.as_str()).map(|s| s.def.agents.clone())
-            );
-        }
-        answer
+        ids.into_iter().next()
     }
 
     /// Publish a coordinator `AgentThought` describing a fallback-ladder step.
