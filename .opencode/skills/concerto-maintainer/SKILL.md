@@ -70,7 +70,7 @@ Behavior changes update README (promises/badges/crate count), docs/STATUS.md, re
 
 ## Gotchas
 
-- `deny.toml` exceptions intentional: unmaintained transitive advisories ignored; wasmtime pinned v28 (v43+ needs func_wrap migration). Read before editing.
+- `deny.toml` exceptions intentional: unmaintained transitive advisories ignored; wasmtime pinned 24.0.x (v43+ needs func_wrap migration). Read before editing.
 - No LanceDB — SqliteVectorStore only (archived ADR-10).
 - Doctests emit known non-fatal missing_docs E0602 warnings; CI omits `-D warnings` there deliberately.
 - Never bypass SimplePolicyEngine, ToolExecutor, VirtualFs.

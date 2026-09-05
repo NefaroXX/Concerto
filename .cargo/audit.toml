@@ -9,15 +9,17 @@ ignore = [
     "RUSTSEC-2023-0071",
     # yaml-rust — unmaintained, used by syntect for syntax highlighting
     "RUSTSEC-2024-0320",
-    # bincode — unmaintained, transitive dep
-    "RUSTSEC-2024-0384",
     # instant — unmaintained, transitive dep via iced
+    "RUSTSEC-2024-0384",
+    # paste — unmaintained, transitive dep
     "RUSTSEC-2024-0436",
     # number_prefix — unmaintained, transitive dep
     "RUSTSEC-2025-0119",
-    # paste — unmaintained, transitive dep
+    # bincode — unmaintained, transitive dep
     "RUSTSEC-2025-0141",
-    # wasmtime v28.0.1 — pinned for plugin sandbox, see deny.toml
+    # wasmtime 24.0.13 — pinned for plugin sandbox, see deny.toml for the full
+    # config+version neutralization rationale (Cranelift-only, no pooling, memory64
+    # off via host.rs tripwire, below vulnerable floors)
     "RUSTSEC-2025-0046",
     "RUSTSEC-2025-0118",
     "RUSTSEC-2026-0020",
@@ -33,7 +35,10 @@ ignore = [
     "RUSTSEC-2026-0094",
     "RUSTSEC-2026-0095",
     "RUSTSEC-2026-0096",
-    # quick-xml — constrained by upstream, DoS requires crafted XML
+    # wasmtime Linker-clone UAF — unaffected < 43.0.0; 24.0.13 predates the v43 line
+    "RUSTSEC-2026-0090",
+    # quick-xml — constrained by upstream (fix = 0.41.0), DoS requires crafted XML
+    # and this workspace performs no runtime XML parsing; see deny.toml
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
     # ttf-parser — unmaintained, no security issue

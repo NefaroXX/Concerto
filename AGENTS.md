@@ -100,12 +100,15 @@ cargo audit
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  **v28** (v43+ needs a `func_wrap` API migration). Read `deny.toml`
+  the **24.0.x** line (v43+ needs a `func_wrap` API migration). Read
+  `deny.toml`
   justification/scope before changing anything.
 - **Dependencies**: historical phase comments are not authorization to retain
   unused crates. Add a dependency only for a current, tested need. Wasmtime is
   pinned to the patched 24.0.x line for the current RustSec advisory; do not
-  move it to an unpatched release without checking the advisory and API.
+  move it to an unpatched release without checking the advisory and API
+  (`crates/plugins/src/host.rs` pins `config.wasm_memory64(false)` — keep
+  `winch` off on any bump, see deny.toml).
 - **Policy gates**: every file write / shell / git op is policy-gated and
   reversible via git stash/branch rollback. Don't bypass `SimplePolicyEngine` or
   `VirtualFs`.
