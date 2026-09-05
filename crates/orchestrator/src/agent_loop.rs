@@ -195,6 +195,21 @@ fn non_empty_reasoning(reasoning: Option<String>) -> Option<String> {
     }
 }
 
+/// The most recent assistant message text in `messages` — the cheapest
+/// source of the model's stated intent for tool-guard text extraction
+/// ([`AgentLoop::guard_tool_call`]). The assistant message that carried the
+/// tool call is pushed before tool execution starts, so it is always the
+/// last usable entry here. Whitespace-only texts are skipped; `None` when no
+/// usable text exists (extraction is then skipped and guard behavior is
+/// unchanged).
+fn latest_assistant_text(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
+        .map(|message| message.content.as_str())
+}
+
 impl AgentLoop {
     /// Create a new agent loop.
     #[allow(clippy::too_many_arguments)]
@@ -1305,9 +1320,9 @@ impl AgentLoop {
         self.state
     }
 
-    /// Tool-call guard (VALIDATE → COERCE → INFER → REPAIR): normalize
-    /// weak-model arguments against the tool's advertised JSON Schema before
-    /// the cycle budget or the executor sees the call.
+    /// Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT → REPAIR):
+    /// normalize weak-model arguments against the tool's advertised JSON
+    /// Schema before the cycle budget or the executor sees the call.
     ///
     /// * parses `null`/empty/stringified arguments (including fenced JSON
     ///   blocks) into an object;
@@ -1319,14 +1334,22 @@ impl AgentLoop {
     ///   `operation` from path shape, shell `command` recovered from a `cmd`
     ///   alias — accepting the result only when the completed arguments
     ///   re-validate cleanly;
+    /// * when structured arguments and heuristics both fail, recovers the
+    ///   arguments from the model's own assistant message text
+    ///   ([`tool_guard::extract_from_text`], live-audit backstop) when the
+    ///   text states the call (e.g. `operation="read" path="src/main.rs"`),
+    ///   merging and re-validating before anything executes;
     /// * otherwise injects a structured corrective `ToolResult` (bounded by
     ///   [`tool_guard::MAX_TOOL_GUARD_REJECTS`] per tool name per run) so the
     ///   model retries with corrected arguments.
     ///
+    /// `assistant_text` is the latest assistant message text (`None` skips
+    /// text extraction; see [`latest_assistant_text`]).
+    ///
     /// Tools without a schema in the registry pass through untouched — the
     /// executor and policy engine own unknown-tool errors. The guard adds no
     /// `await` points, so the caller's `CancellationToken` is unaffected.
-    fn guard_tool_call(&mut self, tc: &ToolCall) -> GuardOutcome {
+    fn guard_tool_call(&mut self, tc: &ToolCall, assistant_text: Option<&str>) -> GuardOutcome {
         let parsed = tool_guard::parse_tool_arguments(&tc.arguments);
         let definitions = self.tool_executor.tool_definitions();
         let Some(schema) =
@@ -1361,7 +1384,10 @@ impl AgentLoop {
         // errors (no silent guesses).
         let mut repaired = coerced;
         if let Some(notes) = tool_guard::heuristic_infer(&tc.name, &parsed, &mut repaired, schema) {
-            let (repaired, repair_coercions) = tool_guard::coerce_arguments(repaired, schema);
+            // The fills stay on the outer `repaired` (text extraction may
+            // merge over them below); the re-coerce validates a copy.
+            let (repaired, repair_coercions) =
+                tool_guard::coerce_arguments(repaired.clone(), schema);
             if tool_guard::validate_arguments(&repaired, schema).is_empty() {
                 tracing::warn!(
                     tool = %tc.name,
@@ -1374,9 +1400,33 @@ impl AgentLoop {
             }
         }
 
+        // Text-intent extraction (live-audit backstop): when the structured
+        // arguments and heuristics both fail but the model's own message text
+        // states the call (e.g. `operation="read" path="src/main.rs"`), the
+        // arguments are recovered from that text. Conservative by
+        // construction (see [`tool_guard::extract_from_text`]) and accepted
+        // only when the merged arguments re-validate cleanly; anything else
+        // falls through to the corrective reject below unchanged — the
+        // fast-fail on empty args still applies when the text yields nothing.
+        if let Some(text) = assistant_text {
+            if let Some(extracted) = tool_guard::extract_from_text(text, &tc.name, schema) {
+                let merged = tool_guard::merge_extracted_arguments(extracted, &repaired);
+                let (merged, _merge_coercions) = tool_guard::coerce_arguments(merged, schema);
+                if tool_guard::validate_arguments(&merged, schema).is_empty() {
+                    self.tool_guard_rejects.remove(&tc.name);
+                    return GuardOutcome::Pass(merged);
+                }
+            }
+        }
+
+        // Live-proven (Sep 2026 audit): a model emitting zero-argument calls
+        // never corrects on coaching — retries only burn iterations. Fail
+        // fast on empty args; keep bounded retries for partial args (some
+        // keys present), where the example can actually guide a repair.
+        let has_keys = parsed.as_object().is_some_and(|map| !map.is_empty());
         let reject_count = self.tool_guard_rejects.entry(tc.name.clone()).or_insert(0);
         *reject_count += 1;
-        let exhausted = *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+        let exhausted = !has_keys || *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
         let content = tool_guard::corrective_message_text(&tc.name, &errors, schema, exhausted);
         let payload = tool_guard::corrective_tool_result(&tc.name, &errors, schema, exhausted);
         tracing::warn!(
@@ -1409,12 +1459,16 @@ impl AgentLoop {
         tool_events: &mut Vec<ToolExecutionSummary>,
         messages: &mut Vec<Message>,
     ) -> Result<(), OrchestratorError> {
-        // Tool-call guard (VALIDATE → COERCE → REPAIR): normalize the
-        // provider-accumulated arguments against the tool's schema before
-        // anything else sees them. Rejected calls never execute and never
-        // touch the cycle budget; the model receives a corrective tool
-        // result instead and retries on the next iteration.
-        let arguments = match self.guard_tool_call(tc) {
+        // Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT → REPAIR):
+        // normalize the provider-accumulated arguments against the tool's
+        // schema before anything else sees them. The assistant message that
+        // carried these tool calls was pushed before execution started, so
+        // its text is available for the guard's text-intent extraction
+        // backstop. Rejected calls never execute and never touch the cycle
+        // budget; the model receives a corrective tool result instead and
+        // retries on the next iteration.
+        let assistant_text = latest_assistant_text(messages);
+        let arguments = match self.guard_tool_call(tc, assistant_text) {
             GuardOutcome::Pass(arguments) => arguments,
             GuardOutcome::Reject { summary, content, payload } => {
                 *tool_call_count += 1;
@@ -3904,7 +3958,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(messages.len(), 1, "exactly one corrective tool message");
+        assert_eq!(messages.len(), 1, "exactly one exhausted tool message");
         assert!(
             messages[0].content.contains("Tool call invalid for 'filesystem'"),
             "content: {}",
@@ -3916,18 +3970,13 @@ mod tests {
             messages[0].content
         );
         assert!(
-            messages[0].content.contains("one of [\"read\""),
-            "enum hint from the advertised schema: {}",
-            messages[0].content
-        );
-        assert!(
-            messages[0].content.contains("Please retry with corrected arguments"),
-            "content: {}",
+            messages[0].content.contains("Stop calling 'filesystem'"),
+            "empty args fail fast with no coaching: {}",
             messages[0].content
         );
         let results = messages[0].tool_results.as_ref().unwrap();
         assert_eq!(results[0].id, "call_null");
-        assert_eq!(results[0].content["error"], "invalid_tool_arguments");
+        assert_eq!(results[0].content["error"], "tool_guard_exhausted");
         assert!(tool_events[0].summary.contains("invalid arguments"), "events: {tool_events:?}");
         assert!(files_modified.is_empty(), "rejected calls must not execute");
     }
@@ -3988,8 +4037,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_guard_bounds_corrective_retries_then_exhausts() {
-        // Two corrective retries per tool per run; the third consecutive
-        // rejection flips the message to the exhausted form so the model
+        // Partial args get two corrective retries per tool per run; the third
+        // consecutive rejection flips to the exhausted form so the model
         // stops ping-ponging malformed calls.
         let dir = tempfile::tempdir().unwrap();
         let (mut loop_, task, session) = guard_test_harness(dir.path());
@@ -4002,7 +4051,8 @@ mod tests {
         let tc = ToolCall {
             id: "call_bad".into(),
             name: "filesystem".into(),
-            arguments: serde_json::Value::Null,
+            // Partial args (unknown key only): retries apply.
+            arguments: serde_json::json!({"bogus": 1}),
         };
         for _ in 0..3 {
             loop_
@@ -4032,6 +4082,49 @@ mod tests {
         );
         let exhausted_payload = messages[2].tool_results.as_ref().unwrap()[0].content.clone();
         assert_eq!(exhausted_payload["error"], "tool_guard_exhausted");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_fails_fast_on_empty_arguments() {
+        // Live-proven (Sep 2026 audit): zero-argument calls never correct on
+        // coaching — the first rejection is already exhausted, no retries.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_empty".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].content.contains("Stop calling 'filesystem'"),
+            "empty args must fail fast: {}",
+            messages[0].content
+        );
+        let payload = messages[0].tool_results.as_ref().unwrap()[0].content.clone();
+        assert_eq!(payload["error"], "tool_guard_exhausted");
     }
 
     #[tokio::test]
@@ -4184,6 +4277,71 @@ mod tests {
             messages[0].content.contains("guard-heuristic-ok"),
             "command output must be present: {}",
             messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_extracts_arguments_from_assistant_text_and_executes() {
+        // Live-audit backstop shape: the model picks the right tool but emits
+        // `arguments: null` while its own message text states the call. The
+        // guard must recover the arguments from the assistant text and
+        // execute instead of injecting the corrective reject.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        // The assistant message that carried the (broken) tool call — its
+        // text states the intended call explicitly.
+        messages.push(Message {
+            role: Role::Assistant,
+            content: "Listing the sources now: Filesystem operation=\"list\" path=\"src\"".into(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        });
+
+        let tc = ToolCall {
+            id: "call_text_extract".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tool_call_count, 1, "the text-repaired call executes");
+        assert_eq!(messages.len(), 2, "assistant text + executed tool result");
+        assert!(
+            messages[1].content.contains("status: success"),
+            "text-extracted call must execute: {}",
+            messages[1].content
+        );
+        assert!(
+            !messages[1].content.contains("tool_guard_exhausted"),
+            "no corrective payload expected: {}",
+            messages[1].content
+        );
+        assert!(
+            tool_events[0].success,
+            "the guard must let the text-repaired call through: {tool_events:?}"
         );
     }
 

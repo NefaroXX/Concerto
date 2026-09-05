@@ -31,8 +31,10 @@
 //! the accepted report is surfaced as canonical JSON in the run summary so
 //! the coordinator's existing snapshot path keeps working.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
 use concerto_core::event::{EventBus, EventKind};
 use concerto_core::executor::ToolExecutor;
@@ -302,6 +304,11 @@ impl GenericSpecialistAgent {
     /// Run the historical Freeform tool loop: execute any tool calls through
     /// the optional executor and report the final text as the summary.
     ///
+    /// Every tool call passes through the shared tool-call guard
+    /// ([`guard_coordinator_tool_call`]) before execution, so weak-model
+    /// argument defects (e.g. `arguments: null`) are repaired or answered
+    /// with a corrective tool result instead of raw executor errors.
+    ///
     /// (Private inherent helper — the `ExpertAgent` trait's `run` dispatches
     /// here when `output_mode` is `Freeform`.)
     async fn run_freeform(
@@ -338,6 +345,11 @@ impl GenericSpecialistAgent {
             tokens_in: None,
             tokens_out: None,
         }];
+        // Per-run corrective-retry streaks, mirroring the single-agent loop's
+        // `tool_guard_rejects` map: at most
+        // [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective injections per
+        // tool before the exhausted message tells the model to move on.
+        let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
         // NOTE: chars/4 is a heuristic until provider usage is plumbed through.
         let mut tokens_in = 0_u64;
         let mut tokens_out = 0_u64;
@@ -421,24 +433,57 @@ impl GenericSpecialistAgent {
                         content: tool_execution_description(&tool_call.name, &tool_call.arguments),
                     },
                 );
+                // Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT →
+                // REPAIR): normalize the provider-accumulated arguments
+                // before execution. `text` is the assistant message that
+                // carried these tool calls — its intent feeds the guard's
+                // text-extraction backstop. Rejected calls never execute;
+                // the model receives a corrective tool result and retries on
+                // the next iteration.
+                let arguments = match guard_coordinator_tool_call(
+                    &tool_call.name,
+                    &tool_call.arguments,
+                    executor,
+                    &mut tool_guard_rejects,
+                    Some(text.as_str()),
+                ) {
+                    GuardedArguments::Pass(arguments) => arguments,
+                    GuardedArguments::Reject { content, payload } => {
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task.id.0,
+                            EventKind::AgentThought {
+                                agent_id: agent_id.to_string(),
+                                content: content.clone(),
+                            },
+                        );
+                        messages.push(Message {
+                            role: Role::Tool,
+                            content,
+                            tool_calls: None,
+                            tool_results: Some(vec![ToolResult {
+                                id: tool_call.id,
+                                name: tool_call.name.clone(),
+                                content: payload,
+                            }]),
+                            reasoning_content: None,
+                            tokens_in: None,
+                            tokens_out: None,
+                        });
+                        continue;
+                    }
+                };
+                // The write classification reads the guarded arguments so a
+                // heuristically repaired filesystem write is still recorded.
                 let is_file_change = matches!(
                     tool_call.name.as_str(),
                     "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
                 ) || (tool_call.name == "filesystem"
-                    && tool_call
-                        .arguments
-                        .get("operation")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|operation| {
-                            matches!(operation, "write" | "delete" | "move" | "copy")
-                        }));
+                    && arguments.get("operation").and_then(|value| value.as_str()).is_some_and(
+                        |operation| matches!(operation, "write" | "delete" | "move" | "copy"),
+                    ));
                 match executor
-                    .execute(
-                        &tool_call.name,
-                        tool_call.arguments.clone(),
-                        &context.session,
-                        cancel.clone(),
-                    )
+                    .execute(&tool_call.name, arguments, &context.session, cancel.clone())
                     .await
                 {
                     Ok(output) => {
@@ -1147,8 +1192,9 @@ impl GenericSpecialistAgent {
     ///    bounded loop (max [`MAX_SUBMISSION_ATTEMPTS`] contract attempts);
     ///    after the bound the agent fails cleanly — it never restarts the run.
     /// 4. Non-contract tool calls go through the executor like `run_freeform`
-    ///    (policy-gated); they never count as submission attempts, so a
-    ///    tool-happy model is bounded by the hard [`MAX_TOOL_ITERATIONS`] cap.
+    ///    (tool-guard normalized, policy-gated); they never count as
+    ///    submission attempts, so a tool-happy model is bounded by the hard
+    ///    [`MAX_TOOL_ITERATIONS`] cap.
     /// 5. Providers that return text fall back to a tolerant parse of the
     ///    same shape (aliases included).
     ///
@@ -1241,6 +1287,9 @@ impl GenericSpecialistAgent {
         let mut validation_errors: Vec<String> = Vec::new();
         let mut files_modified: Vec<camino::Utf8PathBuf> = Vec::new();
         let mut iteration = 0_u32;
+        // Per-run corrective-retry streaks for executor tools, mirroring the
+        // single-agent loop's `tool_guard_rejects` map (see `run_freeform`).
+        let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
 
         let (summary, outcome) = 'submission: loop {
             if cancel.is_cancelled() {
@@ -1406,6 +1455,54 @@ impl GenericSpecialistAgent {
                                 ),
                             },
                         );
+                        // Tool-call guard (VALIDATE → COERCE → INFER →
+                        // EXTRACT → REPAIR), mirroring `run_freeform`: the
+                        // assistant text feeds text extraction, and rejected
+                        // calls never execute — the model receives a
+                        // corrective tool result in the same conversation.
+                        let arguments = match &self.tool_executor {
+                            Some(executor) => {
+                                match guard_coordinator_tool_call(
+                                    &tool_call.name,
+                                    &tool_call.arguments,
+                                    executor,
+                                    &mut tool_guard_rejects,
+                                    Some(text.as_str()),
+                                ) {
+                                    GuardedArguments::Pass(arguments) => arguments,
+                                    GuardedArguments::Reject { content, payload } => {
+                                        let _ = self.bus.publish_for_session(
+                                            task.session_id,
+                                            task.id.0,
+                                            EventKind::AgentThought {
+                                                agent_id: agent_id.to_string(),
+                                                content: content.clone(),
+                                            },
+                                        );
+                                        messages.push(Message {
+                                            role: Role::Tool,
+                                            content,
+                                            tool_calls: None,
+                                            tool_results: Some(vec![ToolResult {
+                                                id: tool_call.id.clone(),
+                                                name: tool_call.name.clone(),
+                                                content: payload,
+                                            }]),
+                                            reasoning_content: None,
+                                            tokens_in: None,
+                                            tokens_out: None,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            // No executor: nothing to guard; the legacy
+                            // "tool not found" error below keeps its shape.
+                            None => tool_call.arguments.clone(),
+                        };
+                        // The write classification reads the guarded
+                        // arguments so a heuristically repaired filesystem
+                        // write is still recorded.
                         let is_file_change = matches!(
                             tool_call.name.as_str(),
                             "write_file"
@@ -1414,8 +1511,7 @@ impl GenericSpecialistAgent {
                                 | "create_file"
                                 | "modify_file"
                         ) || (tool_call.name == "filesystem"
-                            && tool_call
-                                .arguments
+                            && arguments
                                 .get("operation")
                                 .and_then(|value| value.as_str())
                                 .is_some_and(|operation| {
@@ -1426,7 +1522,7 @@ impl GenericSpecialistAgent {
                                 executor
                                     .execute(
                                         &tool_call.name,
-                                        tool_call.arguments.clone(),
+                                        arguments,
                                         &context.session,
                                         cancel.clone(),
                                     )
@@ -1651,6 +1747,142 @@ fn truncate_preview(text: &str) -> String {
         truncated.push('…');
         truncated
     }
+}
+
+/// Outcome of the coordinator-path tool-call guard (mirrors the single-agent
+/// loop's `GuardOutcome` in `agent_loop.rs`).
+enum GuardedArguments {
+    /// Arguments are usable (possibly after coercion/repair); execute with
+    /// these instead of the raw provider arguments.
+    Pass(serde_json::Value),
+    /// Arguments are invalid even after repair; do not execute. Carries the
+    /// corrective tool-message text and structured payload to hand back to
+    /// the model so it retries with corrected arguments.
+    Reject { content: String, payload: serde_json::Value },
+}
+
+/// Tool-call guard for the multi-agent coordinator path (VALIDATE → COERCE →
+/// INFER → EXTRACT → REPAIR), mirroring the single-agent loop's
+/// `AgentLoop::guard_tool_call` exactly:
+///
+/// * parses `null`/empty/stringified arguments (including fenced JSON blocks)
+///   into a JSON object;
+/// * applies schema-guided safe coercions (string → number/boolean, enum case
+///   normalization, unknown-key stripping), logging every fix;
+/// * validates required fields, types, and enum membership against the tool's
+///   advertised schema (from [`ToolExecutor::tool_definitions`]); on failure
+///   attempts per-tool heuristic inference for unresolved required fields,
+///   accepting the repair only when the completed arguments re-validate
+///   cleanly;
+/// * when structured arguments and heuristics both fail, recovers the
+///   arguments from the model's own assistant message text
+///   ([`tool_guard::extract_from_text`], live-audit backstop) when the text
+///   states the call (e.g. `operation="read" path="src/main.rs"`), merging
+///   and re-validating before anything executes;
+/// * otherwise injects a structured corrective result, bounded by
+///   [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective retries per tool name
+///   via `guard_rejects` (which must live for one agent run), so the model
+///   retries with corrected arguments instead of stalling on raw executor
+///   `missing field` errors.
+///
+/// `assistant_text` is the latest assistant message text (`None` skips text
+/// extraction, leaving the guard's behavior unchanged).
+///
+/// Backend-protocol keys (`base_versions`, ADR-60 D5) are never stripped —
+/// the shared coercion layer treats them as reserved. Tools without a
+/// registry schema pass through untouched: the executor and policy engine
+/// own unknown-tool errors. The guard adds no `await` points, so the
+/// caller's `CancellationToken` is unaffected; callers stay bounded by their
+/// own iteration caps (`MAX_TOOL_ITERATIONS`) even when the model never
+/// corrects the arguments.
+fn guard_coordinator_tool_call(
+    tool_name: &str,
+    raw_arguments: &serde_json::Value,
+    executor: &ToolExecutor,
+    guard_rejects: &mut HashMap<String, u32>,
+    assistant_text: Option<&str>,
+) -> GuardedArguments {
+    let parsed = tool_guard::parse_tool_arguments(raw_arguments);
+    let definitions = executor.tool_definitions();
+    let Some(schema) =
+        definitions.iter().find(|definition| definition.name == tool_name).map(|d| &d.parameters)
+    else {
+        return GuardedArguments::Pass(parsed);
+    };
+
+    // The original parse result is kept for heuristic alias recovery:
+    // coercion strips hallucinated alias keys (`cmd`, `file`, ...), which
+    // are exactly the alternative field names the heuristics recover.
+    let (coerced, coercions) = tool_guard::coerce_arguments(parsed.clone(), schema);
+    if !coercions.is_empty() {
+        tracing::warn!(
+            tool = %tool_name,
+            coercions = ?coercions,
+            "coordinator tool-call guard coerced tool arguments"
+        );
+    }
+
+    let errors = tool_guard::validate_arguments(&coerced, schema);
+    if errors.is_empty() {
+        guard_rejects.remove(tool_name);
+        return GuardedArguments::Pass(coerced);
+    }
+
+    // Heuristic inference (adaptive tool-guard Solution 3): last-mile
+    // recovery before coaching the model — conservative by construction, and
+    // rejected with the original errors when the result still does not
+    // validate.
+    let mut repaired = coerced;
+    if let Some(notes) = tool_guard::heuristic_infer(tool_name, &parsed, &mut repaired, schema) {
+        // The fills stay on the outer `repaired` (text extraction may merge
+        // over them below); the re-coerce validates a copy.
+        let (repaired, repair_coercions) = tool_guard::coerce_arguments(repaired.clone(), schema);
+        if tool_guard::validate_arguments(&repaired, schema).is_empty() {
+            tracing::warn!(
+                tool = %tool_name,
+                heuristic_inferred = ?notes,
+                coercions = ?repair_coercions,
+                "coordinator tool-call guard heuristically inferred missing tool arguments"
+            );
+            guard_rejects.remove(tool_name);
+            return GuardedArguments::Pass(repaired);
+        }
+    }
+
+    // Text-intent extraction (live-audit backstop): when the structured
+    // arguments and heuristics both fail but the model's own message text
+    // states the call, recover the arguments from that text. Conservative by
+    // construction and accepted only when the merged arguments re-validate;
+    // anything else falls through to the corrective reject below unchanged —
+    // the fast-fail on empty args still applies when the text yields nothing.
+    if let Some(text) = assistant_text {
+        if let Some(extracted) = tool_guard::extract_from_text(text, tool_name, schema) {
+            let merged = tool_guard::merge_extracted_arguments(extracted, &repaired);
+            let (merged, _merge_coercions) = tool_guard::coerce_arguments(merged, schema);
+            if tool_guard::validate_arguments(&merged, schema).is_empty() {
+                guard_rejects.remove(tool_name);
+                return GuardedArguments::Pass(merged);
+            }
+        }
+    }
+
+    // Live-proven (Sep 2026 audit): zero-argument calls never correct on
+    // coaching — fail fast instead of burning the retry budget. Partial args
+    // keep bounded retries; the example can guide those repairs.
+    let has_keys = parsed.as_object().is_some_and(|map| !map.is_empty());
+    let reject_count = guard_rejects.entry(tool_name.to_string()).or_insert(0);
+    *reject_count += 1;
+    let exhausted = !has_keys || *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+    let content = tool_guard::corrective_message_text(tool_name, &errors, schema, exhausted);
+    let payload = tool_guard::corrective_tool_result(tool_name, &errors, schema, exhausted);
+    tracing::warn!(
+        tool = %tool_name,
+        reject_count,
+        exhausted,
+        errors = ?errors,
+        "coordinator tool-call guard rejected tool arguments; injecting corrective tool result"
+    );
+    GuardedArguments::Reject { content, payload }
 }
 
 #[cfg(test)]
@@ -2148,6 +2380,27 @@ mod tests {
                     .messages
                     .iter()
                     .any(|message| message.role == Role::User && message.content.contains(needle))
+            })
+        }
+
+        /// Whether any recorded request carried a `ToolResult` whose content
+        /// is a tool-guard corrective payload of the given `error` kind.
+        fn request_carried_guard_reject(&self, error: &str) -> bool {
+            self.guard_reject_payload(error).is_some()
+        }
+
+        /// The first recorded `ToolResult` content that is a tool-guard
+        /// corrective payload of the given `error` kind, if any.
+        fn guard_reject_payload(&self, error: &str) -> Option<serde_json::Value> {
+            self.calls.lock().unwrap().iter().find_map(|request| {
+                request.messages.iter().find_map(|message| {
+                    message.tool_results.as_ref().and_then(|results| {
+                        results.iter().find_map(|result| {
+                            (result.content.get("error").and_then(|v| v.as_str()) == Some(error))
+                                .then(|| result.content.clone())
+                        })
+                    })
+                })
             })
         }
     }
@@ -3468,5 +3721,325 @@ mod tests {
             tool_execution_description("shell", &serde_json::Value::String("nope".into())),
             "Executing tool shell (no arguments)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Tool-call guard on the coordinator path (multi-agent specialists)
+    // ------------------------------------------------------------------
+
+    /// Filesystem-named tool carrying the REAL filesystem schema; records
+    /// every executed input so tests can assert exactly what the guard let
+    /// through (and that rejected calls never execute).
+    struct RecordingFilesystemTool {
+        executed: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl RecordingFilesystemTool {
+        /// Register this tool in `registry`, returning the shared record of
+        /// executed inputs.
+        fn register_in(registry: &mut concerto_core::types::ToolRegistry) -> SharedExecutedInputs {
+            let executed: SharedExecutedInputs =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            registry.register(Box::new(Self { executed: std::sync::Arc::clone(&executed) }));
+            executed
+        }
+    }
+
+    /// Handle to the executed-input record shared with the registered tool.
+    type SharedExecutedInputs = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for RecordingFilesystemTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+        fn description(&self) -> &str {
+            "filesystem operations"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            concerto_tools::filesystem::FilesystemTool::new(camino::Utf8PathBuf::from("."))
+                .input_schema()
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            _session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            self.executed.lock().unwrap().push(input);
+            Ok(concerto_core::types::ToolOutput {
+                summary: "recorded".into(),
+                data: serde_json::json!({}),
+            })
+        }
+    }
+
+    /// A filesystem tool-call chunk with the given arguments (the weak-model
+    /// defect shape from the live audit).
+    fn filesystem_chunk(id: &str, arguments: serde_json::Value) -> CompletionChunk {
+        CompletionChunk {
+            reasoning: None,
+            delta: String::new(),
+            tool_call: Some(ToolCall { id: id.into(), name: "filesystem".into(), arguments }),
+            is_final: true,
+            usage: None,
+        }
+    }
+
+    fn recording_filesystem_executor() -> (SharedExecutedInputs, Arc<ToolExecutor>) {
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        let executed = RecordingFilesystemTool::register_in(&mut registry);
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let executor = Arc::new(concerto_core::executor::ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(concerto_core::policy::SimplePolicyEngine::new(
+                allow_all,
+                Arc::new(NullAudit),
+            )),
+        ));
+        (executed, executor)
+    }
+
+    #[tokio::test]
+    async fn tool_guard_rejects_null_arguments_with_corrective_result() {
+        // Audit scenario: a weak model calls filesystem with `arguments:
+        // null` on the multi-agent coordinator path. The guard must reject
+        // the call (never reaching the executor) and hand the model a
+        // structured corrective payload instead of the raw executor
+        // "missing field" error.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            filesystem_chunk("call_1", serde_json::Value::Null),
+            text_chunk("Done without tools."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Read a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1, "the rejected call still counts as a tool call");
+        assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
+        let payload = provider
+            .guard_reject_payload("tool_guard_exhausted")
+            .expect("exhausted payload must reach the model");
+        assert_eq!(payload["tool"], "filesystem");
+        assert_eq!(payload["recovery"], "stop_or_ask_user");
+        assert!(
+            payload["field_errors"].as_array().is_some_and(|errors| !errors.is_empty()),
+            "field errors: {payload}"
+        );
+        // The human-readable corrective sentence rides the Tool message too.
+        assert!(
+            provider.calls.lock().unwrap().iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    message.role == Role::Tool
+                        && message.content.contains("Tool call invalid for 'filesystem'")
+                })
+            }),
+            "corrective message text must reach the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_extracts_arguments_from_assistant_text_and_executes() {
+        // Live-audit backstop shape on the multi-agent coordinator path: the
+        // model picks the right tool but emits `arguments: null` while its
+        // own message text states the call. The guard must recover the
+        // arguments from the assistant text and execute instead of rejecting
+        // with a corrective payload.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            // One completion carrying BOTH the intent-bearing text and the
+            // broken (null-args) tool call — exactly the audit's evidence
+            // shape.
+            CompletionChunk {
+                delta: "Filesystem operation=\"list\" path=\"src\"".into(),
+                reasoning: None,
+                tool_call: Some(ToolCall {
+                    id: "call_1".into(),
+                    name: "filesystem".into(),
+                    arguments: serde_json::Value::Null,
+                }),
+                is_final: true,
+                usage: None,
+            },
+            text_chunk("Done."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Read a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1);
+        assert!(
+            !provider.request_carried_guard_reject("tool_guard_exhausted"),
+            "a text-repairable call must not be rejected"
+        );
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![serde_json::json!({"operation": "list", "path": "src"})],
+            "executor must receive the text-extracted arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristic_repair_executes_repaired_write() {
+        // A path+content filesystem call without `operation` is repaired by
+        // heuristic inference: the executor receives the completed arguments
+        // (operation=write), and the repaired write is recorded as a file
+        // change. `base_versions` (ADR-60 D5 gate protocol key) must survive
+        // the guard untouched.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            filesystem_chunk(
+                "call_1",
+                serde_json::json!({
+                    "path": "src/lib.rs",
+                    "content": "hello",
+                    "base_versions": { "src/lib.rs": "abc123" }
+                }),
+            ),
+            text_chunk("Wrote the file."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Write a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1);
+        assert!(
+            !provider.request_carried_guard_reject("invalid_tool_arguments"),
+            "a repairable call must not be rejected"
+        );
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![serde_json::json!({
+                "path": "src/lib.rs",
+                "content": "hello",
+                "base_versions": { "src/lib.rs": "abc123" },
+                "operation": "write"
+            })],
+            "executor must receive the repaired arguments, raw args never reach it"
+        );
+        // The write classification ran on the guarded arguments: without the
+        // guard this write would be missing from files_modified.
+        assert_eq!(result.files_modified, vec![camino::Utf8PathBuf::from("src/lib.rs")]);
+    }
+
+    #[tokio::test]
+    async fn tool_guard_rejects_null_arguments_on_submission_path() {
+        // Same defect on the structured-output (run_submission) path: a
+        // non-contract filesystem call with null arguments is answered with
+        // the corrective payload, never executed, and the model still
+        // completes its submission afterwards.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            filesystem_chunk("call_1", serde_json::Value::Null),
+            submission_chunk("call_2", valid_doc_args()),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("designer"),
+            "Designer".into(),
+            Some(AgentStage::new("design")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        )
+        .with_output_mode(OutputMode::DesignDoc);
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 2, "filesystem call + submission");
+        assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
+        let payload = provider
+            .guard_reject_payload("tool_guard_exhausted")
+            .expect("exhausted payload must reach the model on the submission path");
+        assert_eq!(payload["tool"], "filesystem");
+        assert_eq!(payload["recovery"], "stop_or_ask_user");
     }
 }

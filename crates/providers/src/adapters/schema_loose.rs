@@ -18,6 +18,10 @@
 //!    arguments example appended to their description. Field names in the
 //!    examples MUST match the real advertised schemas (shell uses `cwd`, not
 //!    `workdir`).
+//! 4. NON-STREAMED TRANSPORT — completions for the tier are requested with
+//!    `stream: false` so tool-call arguments arrive as one whole JSON object
+//!    instead of streamed deltas that weak models sometimes drop
+//!    mid-argument. See [`non_streaming_transport_active`].
 //!
 //! The round trip is closed by [`unflatten_tool_arguments`]: the owning
 //! connector re-nests dot-notation argument keys on the way back, so the
@@ -70,6 +74,20 @@ pub fn adaptive_tool_schemas_active(configured: ToolSchemaMode, model: &str) -> 
         ToolSchemaMode::Loose => true,
         ToolSchemaMode::Auto => is_weak_tool_calling_model(model),
     }
+}
+
+/// Resolve the wire transport for a completion request to `model`.
+///
+/// Weak tool-calling models can drop tool-call argument fragments
+/// mid-stream, truncating the JSON arguments. Completions for the loose
+/// tier are therefore requested **non-streamed** (`stream: false`) so every
+/// arguments object arrives whole. The decision shares the loose-tier
+/// predicate with [`adaptive_tool_schemas_active`] by construction — the
+/// schema adaptation and the transport switch are one weak-model tier, not
+/// two independent dials — so connectors resolve the tier once and apply
+/// both adaptations together. Strong models keep the streamed transport.
+pub fn non_streaming_transport_active(configured: ToolSchemaMode, model: &str) -> bool {
+    adaptive_tool_schemas_active(configured, model)
 }
 
 /// Name heuristic for models with weak tool-calling reliability.
@@ -404,6 +422,25 @@ mod tests {
         assert!(!adaptive_tool_schemas_active(ToolSchemaMode::Strict, "mimo-v2.5-free"));
         assert!(adaptive_tool_schemas_active(ToolSchemaMode::Auto, "mimo-v2.5-free"));
         assert!(!adaptive_tool_schemas_active(ToolSchemaMode::Auto, "claude-sonnet-4"));
+    }
+
+    /// The weak tier is one tier with two coupled adaptations: loose schemas
+    /// AND the non-streamed transport. Weak model names resolve to
+    /// non-streamed completions so tool-call arguments arrive whole; strong
+    /// names keep the streamed transport. Explicit `Loose`/`Strict` dials
+    /// still win over the name heuristic.
+    #[test]
+    fn weak_models_resolve_to_non_streamed_transport() {
+        assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "mimo-v2.5-free"));
+        assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "deepseek/deepseek-r1:free"));
+        assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "gpt-4o-mini"));
+
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, "claude-sonnet-4"));
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, "gpt-4o"));
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, ""));
+
+        assert!(non_streaming_transport_active(ToolSchemaMode::Loose, "gpt-4o"));
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Strict, "mimo-v2.5-free"));
     }
 
     /// Representative two-level nested schema: the promoted required leaf

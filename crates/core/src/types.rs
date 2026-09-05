@@ -660,7 +660,19 @@ pub const SYSTEM_PROMPT_BUILD: &str =
     destructive, expensive, or hard to undo — routine reads and edits do \
     not need confirmation. When you are unsure about the user's intent, \
     make a reasonable assumption, state it briefly, and proceed rather \
-    than stalling on a clarifying question.";
+    than stalling on a clarifying question.\n\
+    \n\
+    TOOL USE: every tool call is a JSON function call with one complete \
+    arguments object. Fill every required field exactly as named; never \
+    call a tool with empty or missing arguments.\n\
+    Examples:\n\
+    filesystem {\"operation\": \"read\", \"path\": \"src/main.rs\"}\n\
+    filesystem {\"operation\": \"list\", \"path\": \"src\"}\n\
+    filesystem {\"operation\": \"write\", \"path\": \"src/main.rs\", \"content\": \"fn main() {}\"}\n\
+    shell {\"command\": \"cargo test\"}\n\
+    filesystem operations: read, write, delete, exists, list, move, copy \
+    (write needs content; move/copy need destination). shell takes command \
+    (required) and optional cwd.";
 
 /// Chat-mode system prompt: conversational answer only, no tool use. Used for
 /// every non-Execute, non-Plan outcome (Answer, Diagnose, Review, Verify, and
@@ -1820,6 +1832,39 @@ mod tests {
             system_prompt_for(crate::intent::RequestedOutcome::Execute),
             SYSTEM_PROMPT_BUILD
         );
+    }
+
+    /// The build prompt must teach weak models the exact tool-call wire
+    /// format: JSON function calls with the real advertised field names
+    /// (`filesystem.operation/path/content`, `shell.command/cwd`) and a
+    /// concrete example per operation family. A wrong field name here would
+    /// teach models to hallucinate exactly the keys the tool-call guard has
+    /// to repair (see `crates/providers/src/adapters/schema_loose.rs`).
+    #[test]
+    fn system_prompt_build_documents_tool_call_format() {
+        let prompt = SYSTEM_PROMPT_BUILD;
+
+        // Format statement + the never-empty rule.
+        assert!(prompt.contains("JSON function call"), "{prompt}");
+        assert!(
+            prompt.contains("never call a tool with empty or missing arguments"),
+            "prompt must forbid empty/missing arguments: {prompt}"
+        );
+
+        // Concrete examples with the real field names.
+        assert!(prompt.contains(r#"{"operation": "read", "path": "src/main.rs"}"#), "{prompt}");
+        assert!(prompt.contains(r#"{"operation": "list", "path": "src"}"#), "{prompt}");
+        assert!(
+            prompt.contains(r#"{"operation": "write", "path": "src/main.rs", "content":"#),
+            "a write example with content must be shown: {prompt}"
+        );
+        assert!(prompt.contains(r#"{"command": "cargo test"}"#), "{prompt}");
+
+        // Real schema vocabulary: the operation enum, and `cwd` — never a
+        // made-up `workdir` key.
+        assert!(prompt.contains("read, write, delete, exists, list, move, copy"), "{prompt}");
+        assert!(prompt.contains("cwd"), "{prompt}");
+        assert!(!prompt.contains("workdir"), "shell has no workdir field: {prompt}");
     }
 
     #[test]

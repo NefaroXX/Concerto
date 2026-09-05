@@ -267,6 +267,54 @@ fn verify_expected_artifacts(
     }
 }
 
+/// The run's declared expected artifacts across all subtasks, de-duplicated
+/// (the C-06 acceptance view of the `expected_artifacts` snapshot).
+fn expected_artifact_list(
+    snapshot: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+) -> Vec<camino::Utf8PathBuf> {
+    let mut seen = HashSet::new();
+    snapshot.values().flatten().filter(|path| seen.insert((*path).clone())).cloned().collect()
+}
+
+/// Whether any declared expected artifact is unproduced on disk (missing,
+/// empty, or placeholder content). An empty declared set is vacuously
+/// produced — mirroring the C-06 acceptance gate's semantics.
+fn expected_artifacts_unproduced(
+    project_root: &camino::Utf8Path,
+    expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+) -> bool {
+    let expected = expected_artifact_list(expected_artifacts);
+    !expected.is_empty() && verify_expected_artifacts(project_root, &expected).is_err()
+}
+
+/// Run-continuity Phase 1: the stall predicate evaluated at a run's final
+/// exit. A run is STALLED — not cleanly done — when any of:
+///
+/// 1. its declared Completion is not complete (`Partial`),
+/// 2. its declared expected deliverables are unproduced on disk (vacuous
+///    when nothing is declared), or
+/// 3. any subtask remains `Failed` or `Blocked`.
+///
+/// A stalled run KEEPS its resumable orchestration checkpoint (persisted
+/// with `completed=false`); only a clean success clears it, so a later
+/// bare "continue" can always pick the run back up.
+fn run_is_stalled(
+    completion_status: concerto_core::types::AgentCompletionStatus,
+    deliverables_missing: bool,
+    graph: &TaskGraph,
+) -> bool {
+    if completion_status != concerto_core::types::AgentCompletionStatus::Completed {
+        return true;
+    }
+    if deliverables_missing {
+        return true;
+    }
+    graph
+        .all_tasks()
+        .iter()
+        .any(|subtask| matches!(subtask.status, SubTaskStatus::Failed | SubTaskStatus::Blocked))
+}
+
 /// Build a `Failed` run result that records an acceptance rejection (C-06).
 fn acceptance_failure_result(task: &AgentTask, summary: String) -> AgentRunResult {
     AgentRunResult {
@@ -453,6 +501,13 @@ struct DecomposeResult {
     retry_feedback: HashMap<TaskId, Vec<AgentRunResult>>,
     model_assignments: HashMap<TaskId, String>,
     action_ledger: Vec<checkpoint::CheckpointAction>,
+    /// The objective this run's checkpoints record. On a fresh run this is
+    /// the task description; on a checkpoint restore it is the ORIGINAL
+    /// objective carried in the checkpoint — a resumed run must keep
+    /// recording the original objective text + hash, not its (bare
+    /// "continue") input, so every later resume still names the same work.
+    objective: String,
+    objective_hash: String,
 }
 
 /// The coordinator drives the full multi-agent lifecycle.
@@ -1256,6 +1311,15 @@ impl CoordinatorAgent {
 
     async fn persist_checkpoint(&self, checkpoint: &checkpoint::GraphCheckpoint) {
         let Some(store) = &self.session_store else {
+            // Never silent: a coordinator without a session store cannot
+            // leave resumable state, so `continue` can never resume it.
+            // (Live miss, Sep 2026: run_multi_agent never attached the
+            // store and stalled runs persisted zero rows with zero logs.)
+            tracing::warn!(
+                session_id = %checkpoint.session_id,
+                "no session store attached — orchestration checkpoint not persisted; \
+                 stalled runs will not be resumable"
+            );
             return;
         };
         let Ok(state_json) = serde_json::to_string(checkpoint) else {
@@ -2026,16 +2090,13 @@ impl CoordinatorAgent {
             // for defense-in-depth). A scope mismatch is surfaced as a
             // clean AgentLoopError so the caller can fall through to a
             // fresh run rather than producing a corrupted partial output.
-            cp.validate_scope(
-                task.session_id,
-                &context.session.project_id.0,
-                self.source_revision.as_deref(),
-            )
-            .map_err(|reason| {
-                OrchestratorError::AgentLoopError(format!(
-                    "checkpoint scope validation failed: {reason}"
-                ))
-            })?;
+            cp.validate_scope(task.session_id, &context.session.project_id.0).map_err(
+                |reason| {
+                    OrchestratorError::AgentLoopError(format!(
+                        "checkpoint scope validation failed: {reason}"
+                    ))
+                },
+            )?;
 
             let graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
                 OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
@@ -2088,6 +2149,14 @@ impl CoordinatorAgent {
                     plan_id,
                 },
             );
+            // Run-continuity Phase 1: keep recording the ORIGINAL objective
+            // (text + hash) in every checkpoint this resumed run persists —
+            // the resume input is a bare "continue", not the objective. The
+            // fields are trusted metadata from the validated v3 record; a
+            // corrupt value degrades the recorded objective text only and is
+            // never a reason to refuse the resume (fail-soft).
+            let objective = cp.objective.clone();
+            let objective_hash = cp.objective_hash.clone();
             Ok(DecomposeResult {
                 graph,
                 completed_results,
@@ -2099,6 +2168,8 @@ impl CoordinatorAgent {
                 retry_feedback,
                 model_assignments,
                 action_ledger,
+                objective,
+                objective_hash,
             })
         } else {
             // If the Architect agent fails (e.g. repeated malformed JSON
@@ -2184,6 +2255,8 @@ impl CoordinatorAgent {
                 retry_feedback: HashMap::new(),
                 model_assignments: HashMap::new(),
                 action_ledger: Vec::new(),
+                objective: task.description.clone(),
+                objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
             })
         }
     }
@@ -2206,6 +2279,8 @@ impl CoordinatorAgent {
         mut retry_feedback: HashMap<TaskId, Vec<AgentRunResult>>,
         mut model_assignments: HashMap<TaskId, String>,
         mut action_ledger: Vec<checkpoint::CheckpointAction>,
+        run_objective: String,
+        run_objective_hash: String,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
         // ADR-52: the run-wide dispatch cap is per `execute_graph` invocation
         // (a fresh run or a resume from checkpoint restarts the counter).
@@ -2260,8 +2335,11 @@ impl CoordinatorAgent {
             session_id: task.session_id,
             root_task_id: task.id,
             project_id: context.session.project_id.0.clone(),
-            objective: task.description.clone(),
-            objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+            // Run-continuity Phase 1: the run objective (the ORIGINAL
+            // objective text on a resumed run, the task description on a
+            // fresh one) — never the (bare "continue") resume input.
+            objective: run_objective,
+            objective_hash: run_objective_hash,
             source_revision: self.source_revision.clone(),
             sequence_num: 0,
         };
@@ -3850,10 +3928,18 @@ impl CoordinatorAgent {
         } else {
             concerto_core::types::AgentCompletionStatus::Partial
         };
-        // Only serialise a checkpoint when the run was not fully completed.
-        let checkpoint_json = if completion_status
-            == concerto_core::types::AgentCompletionStatus::Partial
-        {
+        // ── Run-continuity Phase 1: stall gate at the final exit ────────
+        // A stalled run (declared-Completion false, declared deliverables
+        // unproduced, or a Failed/Blocked subtask) KEEPS its resumable
+        // checkpoint — persisted with completed=false — instead of
+        // clearing it; only a clean success clears, byte-identical to the
+        // pre-Phase-1 behavior.
+        let project_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+            .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
+        let deliverables_missing =
+            expected_artifacts_unproduced(&project_root, &self.expected_artifacts_snapshot());
+        let stalled = run_is_stalled(completion_status, deliverables_missing, &graph);
+        let checkpoint_json = if stalled {
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
             let cp = checkpoint::build_checkpoint(
                 &checkpoint_scope,
@@ -3936,6 +4022,8 @@ impl CoordinatorAgent {
             retry_feedback,
             model_assignments,
             action_ledger,
+            objective: run_objective,
+            objective_hash: run_objective_hash,
         } = match self.decompose_or_restore(&task, &context, &cancel, resume_checkpoint_json).await
         {
             Ok(result) => result,
@@ -4005,6 +4093,8 @@ impl CoordinatorAgent {
             retry_feedback,
             model_assignments,
             action_ledger,
+            run_objective,
+            run_objective_hash,
         )
         .await
         .map(|(output, _notes)| output)
@@ -4633,14 +4723,7 @@ impl CoordinatorAgent {
         }
         // Collect the run's expected artifacts across all implement
         // subtasks, de-duplicated.
-        let mut seen = HashSet::new();
-        let expected: Vec<camino::Utf8PathBuf> = self
-            .expected_artifacts_snapshot()
-            .values()
-            .flatten()
-            .filter(|path| seen.insert((*path).clone()))
-            .cloned()
-            .collect();
+        let expected = expected_artifact_list(&self.expected_artifacts_snapshot());
 
         match verify_expected_artifacts(project_root, &expected) {
             Ok(verified) => {
@@ -6911,6 +6994,8 @@ mod tests {
             ));
 
         // ── 3. Execute graph — replan should fire ───────────────────
+        let run_objective = task.description.clone();
+        let run_objective_hash = blake3::hash(run_objective.as_bytes()).to_hex().to_string();
         let result = coordinator
             .execute_graph(
                 task,
@@ -6926,6 +7011,8 @@ mod tests {
                 HashMap::new(), // retry_feedback
                 HashMap::new(), // model_assignments
                 Vec::new(),     // action_ledger
+                run_objective,
+                run_objective_hash,
             )
             .await;
 
@@ -7219,6 +7306,8 @@ mod tests {
                 HashMap::new(), // retry_feedback
                 HashMap::new(), // model_assignments
                 Vec::new(),     // action_ledger
+                "test task".to_string(),
+                blake3::hash("test task".as_bytes()).to_hex().to_string(),
             )
             .await
             .expect("execute_graph should succeed");
@@ -8935,6 +9024,8 @@ mod tests {
             ));
 
         // ── 3. Execute graph — should hit Partial fast-exit ─────────
+        let run_objective = task.description.clone();
+        let run_objective_hash = blake3::hash(run_objective.as_bytes()).to_hex().to_string();
         let result = coordinator
             .execute_graph(
                 task,
@@ -8950,6 +9041,8 @@ mod tests {
                 HashMap::new(), // retry_feedback
                 HashMap::new(), // model_assignments
                 Vec::new(),     // action_ledger
+                run_objective,
+                run_objective_hash,
             )
             .await;
 
@@ -9991,6 +10084,501 @@ mod tests {
             )),
             "the implement subtask still dispatches off the seeded doc"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Run-continuity Phase 1: stall gate + resume objective continuity
+    // ------------------------------------------------------------------
+
+    /// A wired coordinator whose orchestration checkpoints persist to an
+    /// in-memory SQLite store, so tests can assert the stall gate's
+    /// persist-vs-clear behavior on real storage. A session row is created
+    /// first — the checkpoint table FK-references it — and its id is
+    /// returned alongside the store so tests can read back what the
+    /// coordinator persisted.
+    async fn coordinator_with_store(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        plan_json: String,
+        project_dir: &std::path::Path,
+    ) -> (CoordinatorAgent, Arc<concerto_sessions::SqliteSessionStore>, Ulid) {
+        let store = Arc::new(
+            concerto_sessions::SqliteSessionStore::connect_in_memory()
+                .await
+                .expect("in-memory session store"),
+        );
+        let project = camino::Utf8PathBuf::from_path_buf(project_dir.to_path_buf())
+            .expect("test project dir is UTF-8");
+        let session_id = store
+            .create_session(&project, "mock", "test-model", CancellationToken::new())
+            .await
+            .expect("create session row")
+            .id;
+        let coordinator = coordinator_on_store(bus, registry, plan_json, store.clone());
+        (coordinator, store, session_id)
+    }
+
+    /// A coordinator wired to an EXISTING checkpoint store + session — used
+    /// for the resume phase of two-phase tests, which must share the first
+    /// phase's storage (and therefore its session row) to exercise the
+    /// persist/clear cycle across runs.
+    fn coordinator_on_store(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        plan_json: String,
+        store: Arc<concerto_sessions::SqliteSessionStore>,
+    ) -> CoordinatorAgent {
+        coordinator_with(bus, registry, plan_json)
+            .with_checkpoint_store(Some(store as Arc<dyn concerto_sessions::SessionStore>), None)
+    }
+
+    /// A stalled run (review unresolved → Partial) with a DesignDoc KEEPS its
+    /// orchestration checkpoint: persisted with completed=false, carrying the
+    /// original objective text + hash and the design doc, so a later bare
+    /// "continue" can restore it.
+    #[tokio::test]
+    async fn stalled_run_persists_checkpoint_with_design_doc() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) =
+            coordinator_with_store(bus.clone(), registry, PLAN_RESEARCH_CODER.into(), dir.path())
+                .await;
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the unresolved review leaves the run stalled: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "a stalled run surfaces its checkpoint");
+
+        // The store row survives the stalled run, marked not-completed.
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("a stalled run must persist its checkpoint");
+        assert!(!record.completed, "the stalled checkpoint is resumable");
+
+        let cp: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid persisted checkpoint");
+        assert!(!cp.completed && cp.stage != checkpoint::CheckpointStage::Completed);
+        assert_eq!(
+            cp.objective, "build the thing",
+            "the persisted objective is the run objective, not a resume input"
+        );
+        assert_eq!(
+            cp.objective_hash,
+            blake3::hash("build the thing".as_bytes()).to_hex().to_string()
+        );
+        assert!(cp.design_doc.is_some(), "the DesignDoc is preserved for the resume");
+    }
+
+    /// A fully-successful run CLEARS its orchestration checkpoint —
+    /// byte-identical to the pre-Phase-1 behavior — even though the run
+    /// persisted interim checkpoints along the way.
+    #[tokio::test]
+    async fn successful_run_clears_orchestration_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            PLAN_RESEARCH_CODER.into(),
+            dir.path(),
+        )
+        .await;
+
+        // Seed a stale row from an earlier partial run of this session — the
+        // successful run must leave NO row behind when it finishes.
+        store
+            .save_orchestration_checkpoint(&concerto_sessions::OrchestrationCheckpointRecord {
+                session_id,
+                run_id: Ulid::new(),
+                root_task_id: TaskId::new(),
+                project_id: "stale".into(),
+                objective_hash: "stale".into(),
+                schema_version: checkpoint::GRAPH_CHECKPOINT_SCHEMA_VERSION,
+                source_revision: None,
+                sequence_num: 1,
+                state_json: r#"{"stale":true}"#.into(),
+                completed: false,
+                updated_at: time::OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("seed stale checkpoint");
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the clean run completes: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_none(), "a completed run carries no checkpoint");
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "a clean success clears the orchestration checkpoint"
+        );
+    }
+
+    /// Run-continuity Phase 1 (Task A): a resumed run keeps recording the
+    /// ORIGINAL objective text + hash in every checkpoint it persists — the
+    /// resume input ("continue") never replaces it, so a later resume still
+    /// names the same work.
+    #[tokio::test]
+    async fn resumed_run_keeps_original_objective_in_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+
+        // ── Phase 1: fresh run stalls (review unresolved) ────────────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) =
+            coordinator_with_store(bus.clone(), registry, PLAN_RESEARCH_CODER.into(), dir.path())
+                .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let first = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("first run should succeed");
+        let stored =
+            first.checkpoint_json.clone().expect("the stalled first run carries a checkpoint");
+
+        // ── Phase 2: bare "continue" resumes from the stored checkpoint ──
+        let bus2 = EventBus::new(256);
+        // The architect is a canary: the resume path restores the graph and
+        // must never re-derive it.
+        let mocks2 = vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry2 = AgentRegistry::from_mocks(mocks2);
+        registry2.register(Arc::new(AlwaysRevise));
+        let registry2 = Arc::new(registry2);
+        // The resume phase shares phase 1's store and session row — the
+        // checkpoint cycle must survive across runs on the same session.
+        let mut coordinator2 = coordinator_on_store(bus2, registry2, String::new(), store.clone());
+        let continue_task = AgentTask::new(session_id, "continue");
+        let continue_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let second = coordinator2
+            .run(continue_task, continue_ctx, CancellationToken::new(), Some(stored))
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the resumed run stalls again on the unresolved review"
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stalled resume keeps its checkpoint");
+        let cp: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid resumed checkpoint");
+        assert_eq!(cp.objective, "build the thing", "the original objective survives the resume");
+        assert_eq!(
+            cp.objective_hash,
+            blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "the objective hash is the ORIGINAL objective's hash, not the resume input's"
+        );
+    }
+
+    /// Run-continuity Phase 1 (Task D): a bare "continue" over a stored
+    /// checkpoint restores the graph AND the DesignDoc — the architect is
+    /// NOT re-invoked (the poisoned canary would fail the run if it were) —
+    /// and the resumed run completes and clears the checkpoint.
+    #[tokio::test]
+    async fn continue_with_stored_checkpoint_skips_architect() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+
+        // ── Phase 1: fresh run stalls (review unresolved) ────────────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) =
+            coordinator_with_store(bus.clone(), registry, PLAN_RESEARCH_CODER.into(), dir.path())
+                .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let first = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("first run should succeed");
+        let stored =
+            first.checkpoint_json.clone().expect("the stalled first run carries a checkpoint");
+
+        // ── Phase 2: "continue" restores and completes ───────────────
+        let bus2 = EventBus::new(256);
+        let mut rx = bus2.subscribe();
+        let mocks2 = vec![
+            // Poisoned canary: any architect dispatch fails the run.
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        // The resume phase shares phase 1's store and session row.
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(mocks2)),
+            String::new(),
+            store.clone(),
+        );
+        let continue_task = AgentTask::new(session_id, "continue");
+        let continue_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let second = coordinator2
+            .run(continue_task, continue_ctx, CancellationToken::new(), Some(stored))
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the resumed run completes off the restored graph: {}",
+            second.final_message
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        assert!(
+            !events.iter().any(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            }),
+            "the architect must never be re-invoked on a checkpoint resume"
+        );
+        let doc = coordinator2
+            .design_doc_snapshot()
+            .expect("the DesignDoc is restored from the checkpoint");
+        assert_eq!(doc.goals, vec!["do the thing".to_owned()]);
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "the successful resumed run clears the checkpoint"
+        );
+    }
+
+    /// Fail-soft fallback: a resume-shaped run with NO stored checkpoint
+    /// decomposes fresh — the architect dispatches once and the run
+    /// completes exactly like a first run.
+    #[tokio::test]
+    async fn continue_without_checkpoint_falls_back_to_fresh_decompose() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            PLAN_RESEARCH_CODER.into(),
+            dir.path(),
+        )
+        .await;
+
+        // A bare "continue" whose session holds NO orchestration checkpoint.
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the fallback run completes like a fresh run: {}",
+            output.final_message
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let architect_dispatches = events
+            .iter()
+            .filter(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            })
+            .count();
+        assert_eq!(
+            architect_dispatches, 1,
+            "with nothing stored, a continue falls back to a fresh decompose (one architect pass)"
+        );
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "the successful fallback run still clears its checkpoint"
+        );
+    }
+
+    /// Unit test of the stall predicate: declared-Completion false, declared
+    /// deliverables unproduced, or a Failed/Blocked subtask each stall an
+    /// otherwise-completed run; only the clean combination does not.
+    #[test]
+    fn run_is_stalled_predicate() {
+        let completed = concerto_core::types::AgentCompletionStatus::Completed;
+        let partial = concerto_core::types::AgentCompletionStatus::Partial;
+
+        let mut graph = TaskGraph::default();
+        graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("researcher"),
+            description: "research".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+
+        // 1. declared Completion false → stalled.
+        assert!(run_is_stalled(partial, false, &graph));
+        // Clean success → not stalled.
+        assert!(!run_is_stalled(completed, false, &graph));
+        // 2. declared deliverables unproduced → stalled even when Completed.
+        assert!(run_is_stalled(completed, true, &graph));
+        // 3. a Blocked or Failed subtask → stalled even when Completed.
+        let mut blocked_graph = TaskGraph::default();
+        blocked_graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "blocked".into(),
+            status: SubTaskStatus::Blocked,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        assert!(run_is_stalled(completed, false, &blocked_graph));
+        let mut failed_graph = TaskGraph::default();
+        failed_graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "failed".into(),
+            status: SubTaskStatus::Failed,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        assert!(run_is_stalled(completed, false, &failed_graph));
+    }
+
+    /// The missing-deliverables clause: a non-empty declared set with an
+    /// unproduced file stalls; a produced file or an empty declared set
+    /// (vacuous) does not.
+    #[test]
+    fn expected_artifacts_unproduced_matches_c06_semantics() {
+        let dir = tempfile::tempdir().expect("tempdir for artifact check");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("tempdir path is valid UTF-8");
+
+        // Nothing declared → vacuously produced.
+        assert!(!expected_artifacts_unproduced(&root, &HashMap::new()));
+
+        // Declared but missing → unproduced.
+        let mut declared = HashMap::new();
+        declared.insert(TaskId::new(), vec![root.join("src/missing.rs")]);
+        assert!(expected_artifacts_unproduced(&root, &declared));
+
+        // Declared and produced with real content → produced.
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n")
+            .expect("write produced artifact");
+        let mut produced = HashMap::new();
+        produced.insert(TaskId::new(), vec![root.join("src/main.rs")]);
+        assert!(!expected_artifacts_unproduced(&root, &produced));
     }
 
     /// T5: the only agent dispatched during planning-only is the design

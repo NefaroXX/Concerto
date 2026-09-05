@@ -23,6 +23,12 @@
 //! accepted only after the completed arguments re-validate; otherwise the
 //! corrective reject below proceeds unchanged.
 //!
+//! Phase 2.75 (text-intent extraction, live-audit backstop): when the
+//! structured arguments AND heuristics both fail but the model's own message
+//! text states the call (e.g. `Filesystem operation="list" path="src"` beside
+//! `arguments: null`), the arguments are recovered from that text —
+//! conservative forms only, validated before anything executes.
+//!
 //! Provider-side coercion (`concerto_providers::protocol::ensure_arguments_object`)
 //! is left untouched — this is the orchestrator-side second line of defense.
 
@@ -305,6 +311,423 @@ pub(crate) fn heuristic_infer(
     } else {
         Some(notes)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.75 — text-intent extraction (live-audit backstop)
+// ---------------------------------------------------------------------------
+
+/// Marker values the weak model emits for "no value here" (live audit:
+/// `operation=<none>`). Never treated as literal data.
+const NONE_MARKERS: [&str; 3] = ["<none>", "none", "null"];
+
+/// Operation values that only inspect the workspace, so a bare-quoted path
+/// from the model's text may fill a path-like field. Any other operation
+/// value counts as mutating: path-like fields then require an anchored
+/// `key=value` form.
+const READ_LIKE_OPERATIONS: [&str; 12] = [
+    "read", "list", "exists", "ls", "get", "stat", "find", "search", "glob", "grep", "view", "cat",
+];
+
+/// Operation values that create or change file content. For these the
+/// schema's content-bearing property must be stated in the text too (audit
+/// rule: a write needs path AND content — never a guessed empty write).
+const WRITE_LIKE_OPERATIONS: [&str; 6] = ["write", "create", "edit", "modify", "append", "update"];
+
+/// Alias keys tried for the schema's single enum property.
+const OPERATION_ALIASES: [&str; 3] = ["operation", "op", "action"];
+
+/// Alias keys for path-like properties.
+const PATH_ALIASES: [&str; 3] = ["path", "file", "filepath"];
+
+/// Alias keys for command-like properties.
+const COMMAND_ALIASES: [&str; 2] = ["command", "cmd"];
+
+/// Property names that carry file content for write-like operations.
+const CONTENT_KEYS: [&str; 3] = ["content", "text", "body"];
+
+/// Invocation cues that may directly precede a bare-quoted shell command
+/// (`run "cargo test"`); without such a cue a quoted string is prose, not a
+/// command.
+const COMMAND_CUES: [&str; 7] = ["run", "exec", "execute", "bash", "sh", "shell", "invoke"];
+
+/// Upper bound for bare-quoted candidate tokens (paths are short); longer
+/// quoted spans are prose, not data candidates.
+const MAX_BARE_CANDIDATE_CHARS: usize = 1024;
+
+/// Recover tool-call arguments from the model's own assistant message text —
+/// the last-resort backstop when the structured `tool_calls` channel carries
+/// empty or unusable arguments but the text states the call (live audit:
+/// `Filesystem operation="list" path="src"` beside `arguments: null`).
+///
+/// Extraction is deliberately conservative:
+///
+/// * the schema's single enum property is filled only from an anchored
+///   `key=value` form (`operation=`, `op=`, `action=`) whose value matches a
+///   declared enum value case-insensitively — free text is never mined for
+///   enum words;
+/// * path-like (`path`/`file`/`filepath`) and command-like (`command`/`cmd`)
+///   properties accept anchored forms (`key="…"`, `key='…'`, `` key=`…` ``,
+///   and single-token `key=value` without spaces); a *bare* quoted token may
+///   fill a path only when it is the text's single quoted candidate, contains
+///   no spaces, and the operation is absent or read-like — commands are never
+///   synthesized from prose, so a bare command needs a directly preceding
+///   invocation cue (`run "cargo test"`);
+/// * `<none>`/`none`/null markers mean MISSING, never literal data, and
+///   block later bare fills for that field;
+/// * write-like operations additionally require the schema's content-bearing
+///   property (`content`/`text`/`body`) to be stated in the text, so an
+///   extractable write is never an empty-content guess.
+///
+/// Returns `Some` only when the extracted object covers every required schema
+/// field and validates cleanly via [`validate_arguments`]; the caller should
+/// still merge it over the coerced arguments ([`merge_extracted_arguments`])
+/// and re-validate (the execution gate stays mandatory). `None` — including
+/// for empty text — means "nothing usable in the text": the guard's behavior
+/// is then unchanged.
+pub(crate) fn extract_from_text(text: &str, tool_name: &str, schema: &Value) -> Option<Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let properties = schema.get("properties").and_then(Value::as_object)?;
+    // String-typed properties, in schema order — the only kind extraction
+    // can fill.
+    let string_props: Vec<(&str, &Value)> = properties
+        .iter()
+        .filter(|(_, prop)| schema_types(prop).contains(&"string"))
+        .map(|(name, prop)| (name.as_str(), prop))
+        .collect();
+    if string_props.is_empty() {
+        return None;
+    }
+    let enum_props: Vec<&str> = string_props
+        .iter()
+        .filter(|(_, prop)| enum_array(prop).is_some_and(|values| !values.is_empty()))
+        .map(|(name, _)| *name)
+        .collect();
+
+    // Alias table: text key → property name. A property's own name always
+    // matches; kind aliases are only added when unambiguous (no string
+    // property already claims that name, exactly one property of the kind
+    // exists).
+    let mut key_map: Vec<(&str, &str)> =
+        string_props.iter().map(|(name, _)| (*name, *name)).collect();
+    if enum_props.len() == 1 {
+        for alias in OPERATION_ALIASES {
+            push_unclaimed_alias(&mut key_map, alias, enum_props[0], &string_props);
+        }
+    }
+    let path_props = owned_names(&string_props, &PATH_ALIASES);
+    if path_props.len() == 1 {
+        for alias in PATH_ALIASES {
+            push_unclaimed_alias(&mut key_map, alias, path_props[0], &string_props);
+        }
+    }
+    let command_props = owned_names(&string_props, &COMMAND_ALIASES);
+    if command_props.len() == 1 {
+        for alias in COMMAND_ALIASES {
+            push_unclaimed_alias(&mut key_map, alias, command_props[0], &string_props);
+        }
+    }
+
+    let mut extracted: Map<String, Value> = Map::new();
+    // Fields the model explicitly marked as "no value" (`key=<none>`): never
+    // filled, so a later bare candidate cannot guess over the marker.
+    let mut explicit_missing: Vec<&str> = Vec::new();
+
+    // Anchored `key=value` scan, in priority order; the first anchored value
+    // for a property wins.
+    for &(key, prop_name) in &key_map {
+        if extracted.contains_key(prop_name) || explicit_missing.contains(&prop_name) {
+            continue;
+        }
+        let Some((raw_value, _quoted)) = find_keyed_value(text, key) else {
+            continue;
+        };
+        if is_none_marker(&raw_value) {
+            explicit_missing.push(prop_name);
+            continue;
+        }
+        let Some(prop) = string_props.iter().find(|(name, _)| *name == prop_name) else {
+            continue;
+        };
+        if enum_props.contains(&prop_name) {
+            // Enum properties only accept declared values (matched
+            // case-insensitively, stored with the declared spelling). A
+            // non-enum value at an anchored key is noise, not data.
+            let matched = enum_array(prop.1).and_then(|values| {
+                values.iter().find_map(|candidate| {
+                    candidate
+                        .as_str()
+                        .filter(|candidate| candidate.eq_ignore_ascii_case(&raw_value))
+                })
+            });
+            if let Some(declared) = matched {
+                extracted.insert(prop_name.to_string(), Value::String(declared.to_string()));
+            }
+        } else {
+            extracted.insert(prop_name.to_string(), Value::String(raw_value));
+        }
+    }
+
+    // Owned copy: the bare fills below mutate `extracted`, so the operation
+    // value cannot borrow from it.
+    let operation: Option<String> = enum_props
+        .first()
+        .and_then(|name| extracted.get(*name))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let bare_candidates = bare_quoted_candidates(text);
+
+    // Paths: exactly one bare quoted candidate may fill a path-like field,
+    // and only when the operation is absent or read-like (audit rule: reads
+    // and lists may fill from a single path; anything mutating needs the
+    // anchored form).
+    if operation.as_deref().is_none_or(is_read_like_operation) && path_props.len() == 1 {
+        let prop_name = path_props[0];
+        let unfilled = !extracted.contains_key(prop_name) && !explicit_missing.contains(&prop_name);
+        if unfilled && bare_candidates.len() == 1 {
+            let (_, only) = &bare_candidates[0];
+            // A multi-word quoted span is far more likely prose than a
+            // path, so bare path candidates must be space-free.
+            if !only.contains(' ') {
+                extracted.insert(prop_name.to_string(), Value::String(only.clone()));
+            }
+        }
+    }
+
+    // Commands: a bare quoted candidate counts only with a directly
+    // preceding invocation cue, and only when exactly one such candidate
+    // exists. Commands are never synthesized from prose.
+    if command_props.len() == 1 {
+        let prop_name = command_props[0];
+        let unfilled = !extracted.contains_key(prop_name) && !explicit_missing.contains(&prop_name);
+        if unfilled {
+            let cued: Vec<&String> = bare_candidates
+                .iter()
+                .filter(|(open_index, _)| has_invocation_cue(text, *open_index))
+                .map(|(_, value)| value)
+                .collect();
+            if let [only] = cued.as_slice() {
+                extracted.insert(prop_name.to_string(), Value::String((*only).clone()));
+            }
+        }
+    }
+
+    // Write-like operations must also state the content: a write recovered
+    // from text with no content in sight would be an empty-content guess.
+    if let Some(operation) = operation.as_deref() {
+        if WRITE_LIKE_OPERATIONS.contains(&operation) {
+            let content_prop = string_props
+                .iter()
+                .find(|(name, _)| CONTENT_KEYS.contains(name))
+                .map(|(name, _)| *name);
+            if let Some(content_name) = content_prop {
+                if !extracted.contains_key(content_name) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if extracted.is_empty() {
+        return None;
+    }
+    let extracted_value = Value::Object(extracted);
+    let required_covered = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .all(|field| extracted_value.get(field).is_some());
+    if !required_covered || !validate_arguments(&extracted_value, schema).is_empty() {
+        return None;
+    }
+    tracing::warn!(
+        tool = %tool_name,
+        text_extracted = ?extracted_value,
+        "tool-call guard extracted tool arguments from assistant text"
+    );
+    Some(extracted_value)
+}
+
+/// Merge text-extracted arguments over the guard's coerced arguments: the
+/// text-extracted values win (the model's text is its freshest statement of
+/// intent), non-`null` coerced values fill keys the text did not mention,
+/// and `null` slots are never carried into the merged result.
+pub(crate) fn merge_extracted_arguments(extracted: Value, current: &Value) -> Value {
+    let mut merged = match extracted {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    if let Some(current) = current.as_object() {
+        for (key, value) in current {
+            if !value.is_null() {
+                merged.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    Value::Object(merged)
+}
+
+/// Add `alias → prop_name` to `key_map` unless some string property already
+/// claims the alias name.
+fn push_unclaimed_alias<'a>(
+    key_map: &mut Vec<(&'a str, &'a str)>,
+    alias: &'a str,
+    prop_name: &'a str,
+    string_props: &[(&'a str, &Value)],
+) {
+    if !string_props.iter().any(|(name, _)| *name == alias) {
+        key_map.push((alias, prop_name));
+    }
+}
+
+/// Names of the string-typed properties whose name is one of `aliases`.
+fn owned_names<'a>(props: &[(&'a str, &Value)], aliases: &[&str]) -> Vec<&'a str> {
+    props.iter().filter(|(name, _)| aliases.contains(name)).map(|(name, _)| *name).collect()
+}
+
+/// Is `value` one of the model's "no value" markers (never literal data)?
+fn is_none_marker(value: &str) -> bool {
+    NONE_MARKERS.contains(&value.to_ascii_lowercase().as_str())
+}
+
+/// Is `operation` a value that only inspects the workspace?
+fn is_read_like_operation(operation: &str) -> bool {
+    READ_LIKE_OPERATIONS.contains(&operation.to_ascii_lowercase().as_str())
+}
+
+/// Find the first occurrence of `key=value` (optionally `key="value"`,
+/// `key='value'`, `` key=`value` ``) in `text`. `key` must start on a word
+/// boundary (so `filepath=` never matches the key `path`), and the value
+/// must start immediately after `=` — no spaces, the audit's evidence form.
+/// Returns the value with quotes stripped and whether it was quoted.
+/// Unterminated quoted values are rejected.
+fn find_keyed_value(text: &str, key: &str) -> Option<(String, bool)> {
+    let mut search_from = 0;
+    while let Some(offset) = text[search_from..].find(key) {
+        let start = search_from + offset;
+        let after_key = start + key.len();
+        let boundary_ok = start == 0
+            || text[..start].chars().next_back().is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if boundary_ok && text.as_bytes().get(after_key) == Some(&b'=') {
+            return read_value_token(&text[after_key + 1..]);
+        }
+        search_from = after_key;
+    }
+    None
+}
+
+/// Read the value token at the start of `rest` (immediately after `=`): a
+/// double/single/backtick-quoted span with an escape-aware closing scan, or
+/// an unquoted single token ending at whitespace, `,`, `)`, or `;`.
+fn read_value_token(rest: &str) -> Option<(String, bool)> {
+    match rest.chars().next()? {
+        '"' | '\'' | '`' => {
+            let value = closed_span(rest)?;
+            Some((value.to_string(), true))
+        }
+        _ => {
+            let end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() || matches!(c, ',' | ')' | ';'))
+                .map(|(index, _)| index)
+                .unwrap_or(rest.len());
+            let value = &rest[..end];
+            (!value.is_empty()).then(|| (value.to_string(), false))
+        }
+    }
+}
+
+/// The span between the quote at `rest[0]` and its (escape-aware) closing
+/// partner; `None` when unterminated or when `rest` does not start with a
+/// quote character.
+fn closed_span(rest: &str) -> Option<&str> {
+    let quote = rest.chars().next()?;
+    let mut escaped = false;
+    for (index, c) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return Some(&rest[1..index]);
+        }
+    }
+    None
+}
+
+/// All quoted/backticked single-line tokens in `text` that are plausible
+/// bare data candidates: double-quoted spans, backticked code spans, and
+/// single-quoted spans (which must open after a word boundary, so prose
+/// apostrophes — "isn't" — never form a span). Spans that directly follow
+/// `=` are claimed by the anchored `key="…"` scan and are not bare
+/// candidates. Empty, multi-line, and oversized spans are prose, not data
+/// candidates. Returns each candidate with the byte index of its opening
+/// quote.
+fn bare_quoted_candidates(text: &str) -> Vec<(usize, String)> {
+    let mut candidates = Vec::new();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    // Byte index after the last matched span; positions inside a matched
+    // span are never re-scanned as openings (a span's closing quote can
+    // never open another candidate).
+    let mut scan_from = 0;
+    for (position, &(index, opening)) in chars.iter().enumerate() {
+        if index < scan_from {
+            continue;
+        }
+        let quote = match opening {
+            '"' | '`' => opening,
+            '\'' => {
+                let opens_clean = index == 0
+                    || text[..index]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '['));
+                if !opens_clean {
+                    continue;
+                }
+                opening
+            }
+            _ => continue,
+        };
+        let Some(close_index) = chars[position + 1..]
+            .iter()
+            .find(|(_, c)| *c == quote)
+            .map(|(close_index, _)| *close_index)
+        else {
+            // Unterminated span: everything after it lives inside the span.
+            scan_from = text.len();
+            continue;
+        };
+        scan_from = close_index + 1;
+        // A quoted value directly after `=` belongs to the anchored scan.
+        if index > 0 && text.as_bytes()[index - 1] == b'=' {
+            continue;
+        }
+        let value = &text[index + opening.len_utf8()..close_index];
+        if value.is_empty()
+            || value.contains('\n')
+            || value.chars().count() > MAX_BARE_CANDIDATE_CHARS
+        {
+            continue;
+        }
+        candidates.push((index, value.to_string()));
+    }
+    candidates
+}
+
+/// Does the text directly before `open_index` end with an invocation cue
+/// word (e.g. `run "cargo test"`)?
+fn has_invocation_cue(text: &str, open_index: usize) -> bool {
+    let before = text[..open_index].trim_end();
+    let word: String =
+        before.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    let word = word.chars().rev().collect::<String>();
+    COMMAND_CUES.contains(&word.to_ascii_lowercase().as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -990,5 +1413,236 @@ mod tests {
             "inferred arguments must validate: {notes:?}"
         );
         assert_eq!(repaired["operation"], "read");
+    }
+
+    // -- text-intent extraction (live-audit backstop) --------------------------
+
+    #[test]
+    fn text_extraction_recovers_anchored_list_call() {
+        // REAL audit shape: the text states the call while `tool_calls`
+        // carries null arguments.
+        let extracted = extract_from_text(
+            "Filesystem operation=\"list\" path=\"src\"",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        let extracted = extracted.expect("anchored list call must extract");
+        assert_eq!(extracted, serde_json::json!({"operation": "list", "path": "src"}));
+        assert!(validate_arguments(&extracted, &filesystem_schema()).is_empty());
+    }
+
+    #[test]
+    fn text_extraction_treats_none_markers_as_missing() {
+        // Audit shape: `(operation=<none>, path=<none>)` states no value at
+        // all — the markers mean MISSING, never literal data, so extraction
+        // still fails.
+        let extracted = extract_from_text(
+            "I want the filesystem tool (operation=<none>, path=<none>)",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn text_extraction_recovers_quoted_shell_command_with_cue() {
+        // Audit shape: `run "cargo test"` — the quoted form after the `run`
+        // invocation cue is a command, not prose.
+        let extracted =
+            extract_from_text("Please run \"cargo test\" next", "shell", &shell_schema());
+        assert_eq!(extracted, Some(serde_json::json!({"command": "cargo test"})));
+    }
+
+    #[test]
+    fn text_extraction_never_takes_uncued_quoted_strings_as_commands() {
+        // Without an invocation cue a quoted string is prose: no command is
+        // synthesized from it.
+        let extracted =
+            extract_from_text("The plan says \"cargo test\" somewhere", "shell", &shell_schema());
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn text_extraction_accepts_anchored_command_form() {
+        let extracted =
+            extract_from_text("shell command=\"cargo test --lib\"", "shell", &shell_schema());
+        assert_eq!(extracted, Some(serde_json::json!({"command": "cargo test --lib"})));
+    }
+
+    #[test]
+    fn text_extraction_rejects_prose_only_text() {
+        // Prose with no structured clues: nothing is guessed.
+        for text in [
+            "I will read the main file now.",
+            "Let me think about which sources matter.",
+            "",
+            "   ",
+        ] {
+            let extracted = extract_from_text(text, "filesystem", &filesystem_schema());
+            assert!(extracted.is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn text_extraction_accepts_single_quote_and_unquoted_value_forms() {
+        let extracted = extract_from_text(
+            "filesystem operation='read' path=src/main.rs",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert_eq!(
+            extracted,
+            Some(serde_json::json!({"operation": "read", "path": "src/main.rs"}))
+        );
+    }
+
+    #[test]
+    fn text_extraction_accepts_backticked_path() {
+        let extracted = extract_from_text(
+            "filesystem operation=list path=`src`",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert_eq!(extracted, Some(serde_json::json!({"operation": "list", "path": "src"})));
+    }
+
+    #[test]
+    fn text_extraction_case_insensitive_enum_normalized_to_declared_value() {
+        let extracted = extract_from_text(
+            "Filesystem operation=LIST path=src",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert_eq!(extracted, Some(serde_json::json!({"operation": "list", "path": "src"})));
+    }
+
+    #[test]
+    fn text_extraction_rejects_values_outside_the_schema_enum() {
+        // Enum fields match the schema enum, never free text: `destroy` is
+        // not a declared value, so `operation` stays missing and extraction
+        // fails instead of guessing.
+        let extracted = extract_from_text(
+            "Filesystem operation=destroy path=src",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn text_extraction_write_requires_content_in_text() {
+        // Audit rule: a write needs path AND content stated in the text; the
+        // path-only write would be an empty-content guess.
+        let path_only = extract_from_text(
+            "Filesystem operation=\"write\" path=\"notes.txt\"",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert!(path_only.is_none());
+        let with_content = extract_from_text(
+            "Filesystem operation=\"write\" path=\"notes.txt\" content=\"hello\"",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert_eq!(
+            with_content,
+            Some(serde_json::json!({
+                "operation": "write",
+                "path": "notes.txt",
+                "content": "hello"
+            }))
+        );
+    }
+
+    #[test]
+    fn text_extraction_bare_single_path_fills_read() {
+        // Reads may fill from the text's single bare quoted path while the
+        // anchored form keeps the intent explicit; the anchored values
+        // themselves never count as bare candidates.
+        let extracted = extract_from_text(
+            "Filesystem operation=\"read\" on \"src/main.rs\" please",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert_eq!(
+            extracted,
+            Some(serde_json::json!({"operation": "read", "path": "src/main.rs"}))
+        );
+    }
+
+    #[test]
+    fn text_extraction_never_bare_fills_path_for_mutating_operations() {
+        // Mutating operations need anchored path evidence: a delete whose
+        // path is only available as a bare quoted string is not extracted.
+        let extracted = extract_from_text(
+            "Filesystem operation=\"delete\" on \"src/main.rs\"",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn text_extraction_skips_ambiguous_multi_candidate_paths() {
+        // Two bare quoted candidates are ambiguous: no path is guessed from
+        // them, so extraction fails with the path unresolved.
+        let extracted = extract_from_text(
+            "Filesystem operation=\"read\" compare \"a.rs\" and \"b.rs\"",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn text_extraction_never_mines_prose_apostrophes() {
+        // Prose apostrophes form neither spans nor data: two quoted phrases
+        // that are really prose yield nothing.
+        let extracted = extract_from_text(
+            "The model's answer wasn't right, I should read the file properly.",
+            "filesystem",
+            &filesystem_schema(),
+        );
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn text_extraction_works_against_the_real_filesystem_schema() {
+        // The audit evidence must extract against the schema the real tool
+        // advertises (schemars-derived, enum included).
+        let schema = FilesystemTool::new(camino::Utf8PathBuf::from(".")).input_schema();
+        let extracted =
+            extract_from_text("Filesystem operation=\"list\" path=\"src\"", "filesystem", &schema);
+        assert_eq!(extracted, Some(serde_json::json!({"operation": "list", "path": "src"})));
+        assert!(validate_arguments(&extracted.expect("real schema"), &schema).is_empty());
+    }
+
+    #[test]
+    fn text_extraction_without_properties_yields_none() {
+        // Free-form schemas declare nothing to extract against.
+        assert!(extract_from_text("operation=\"read\" path=\"x\"", "echo", &serde_json::json!({}))
+            .is_none());
+    }
+
+    // -- merge ---------------------------------------------------------------
+
+    #[test]
+    fn merge_prefers_extracted_values_and_skips_nulls() {
+        let extracted = serde_json::json!({"operation": "read", "path": "src"});
+        let current = serde_json::json!({
+            "path": "other",
+            "cwd": null,
+            "base_versions": { "src": "abc123" }
+        });
+        let merged = merge_extracted_arguments(extracted, &current);
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "operation": "read",
+                "path": "src",
+                "base_versions": { "src": "abc123" }
+            }),
+            "extracted wins its keys; coerced non-null values fill gaps; nulls dropped"
+        );
     }
 }
