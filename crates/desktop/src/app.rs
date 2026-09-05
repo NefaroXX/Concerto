@@ -42,7 +42,7 @@ use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ui::feedback::{ToastLevel, ToastManager};
@@ -294,6 +294,13 @@ pub struct App {
     /// Passed to `AgentRunRequest` on the next submit so the coordinator can
     /// resume the graph without re-architecting.
     pub resume_checkpoint_json: Option<String>,
+
+    /// ADR-60 D7 (interrupt-safe resume): bumped every time an in-flight run
+    /// settles (completion, failure, or the unwind after cancellation). The
+    /// window-close handler (project shell) polls this epoch to wait,
+    /// bounded, for the run's checkpoint to persist before the process
+    /// exits.
+    pub run_settle_epoch: Arc<AtomicU64>,
 
     /// Shared VirtualFs — the agent writes to this, and the diff viewer
     /// reads from it to show proposed changes and applies rejections.
@@ -795,6 +802,7 @@ impl App {
             multi_agent: initial_multi_agent,
             fast: false,
             resume_checkpoint_json: None,
+            run_settle_epoch: Arc::new(AtomicU64::new(0)),
             toasts: ToastManager::new(),
         };
         // Spec §6 (startup-fallback toast): when config loading fell back to
@@ -936,6 +944,7 @@ impl App {
             Message::Shortcut(shortcut) => self.handle_shortcut(shortcut),
             Message::AgentRunCompleted(session_id, res) => {
                 self.run_status = RunStatus::Idle;
+                self.note_run_settled();
                 // ADR-57 §3a: memory teardown may have been deferred while the
                 // run was active (a config edit that disables memory is not
                 // hot-applied mid-run); the run is over, so complete it now.
@@ -2266,6 +2275,7 @@ impl App {
             )
         } else {
             self.run_status = RunStatus::Idle;
+            self.note_run_settled();
             let _ = self.chat.update(views::chat::Message::AddAssistant(
                 "Concerto could not load its configuration. Open Settings, configure a provider, and save the settings before starting a task."
                     .to_string(),
@@ -3625,6 +3635,25 @@ impl App {
         self.current_theme.iced.clone()
     }
 
+    /// ADR-60 D7 (interrupt-safe resume): whether a run is in flight — the
+    /// window-close handler cancels it and waits for settlement instead of
+    /// exiting over it.
+    pub fn is_run_active(&self) -> bool {
+        self.run_status != RunStatus::Idle
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): the run-settlement epoch — bumped
+    /// every time an in-flight run settles. The window-close handler polls
+    /// this (bounded) so the coordinator's cancel path can persist the
+    /// interrupted checkpoint before the process exits.
+    pub fn run_settle_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.run_settle_epoch)
+    }
+
+    fn note_run_settled(&mut self) {
+        self.run_settle_epoch.fetch_add(1, Ordering::Release);
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
         let terminal_active = self.terminal_panel_open;
         let keyboard_sub =
@@ -4035,6 +4064,27 @@ mod tests {
     use concerto_core::CancellationToken;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    // ── ADR-60 D7 (interrupt-safe resume): the graceful window-close path ──
+
+    /// `is_run_active` reflects the run status, and every settle point bumps
+    /// the settlement epoch the window-close handler polls.
+    #[test]
+    fn run_settle_epoch_tracks_run_settlement() {
+        let (mut app, _) = App::new();
+        assert!(!app.is_run_active(), "idle at construction");
+        let before = app.run_settle_epoch().load(Ordering::Acquire);
+
+        app.run_status = RunStatus::Running;
+        assert!(app.is_run_active(), "a running run is active");
+
+        // The completion settle point: status back to Idle + epoch bump.
+        app.run_status = RunStatus::Idle;
+        app.note_run_settled();
+        assert!(!app.is_run_active());
+        let after = app.run_settle_epoch().load(Ordering::Acquire);
+        assert_eq!(after, before + 1, "a settled run bumps the epoch");
+    }
 
     /// Serializes tests that redirect `XDG_CONFIG_HOME` (which `dirs` reads
     /// for the config directory on Linux) against each other — env vars are

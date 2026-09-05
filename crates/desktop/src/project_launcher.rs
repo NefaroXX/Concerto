@@ -21,6 +21,10 @@ pub enum Message {
     ToggleReopenLast,
     CloseChooser,
     CloseRequested,
+    /// ADR-60 D7 (interrupt-safe resume): the graceful-close wait finished
+    /// (the run settled, or the bounded window lapsed) — the process may
+    /// exit now.
+    ExitAfterGracefulStop,
     /// ADR-44 §4: user allowed opening the pending out-of-root first project
     /// (for the process lifetime). Proceeds to create the app.
     RootConsentAllow,
@@ -28,6 +32,14 @@ pub enum Message {
     /// Aborts the open cleanly.
     RootConsentDeny,
 }
+
+/// ADR-60 D7 (interrupt-safe resume): how long a window close with a run in
+/// flight waits for the cancelled run to unwind and persist its interrupted
+/// checkpoint before the process exits. Bounded so the exit is never a hang;
+/// a miss is the documented hard-kill loss (the later `continue` resumes
+/// headless from the evidence chain). The desktop executor's own shutdown
+/// grace (750 ms) only reaps already-finished tasks after this wait.
+const GRACEFUL_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Top-level desktop state. The full application is only created after a
 /// project has been chosen, unless reopening the last project is explicitly
@@ -167,11 +179,51 @@ impl DesktopApp {
                 Task::none()
             }
             Message::CloseRequested => {
+                // ADR-60 D7 (interrupt-safe resume): a close with a run in
+                // flight cancels it and waits, bounded, for the run to
+                // settle — the coordinator's cancel path persists the
+                // interrupted (completed=0) checkpoint BEFORE
+                // `run_shared_agent` returns, so a settled epoch bump implies
+                // durable resumable state. Exiting over the run (the previous
+                // behavior) was the desktop's hard-kill: the executor drops
+                // its runtime 750 ms after exit and nothing lands.
+                let running = self.app.as_ref().is_some_and(app::App::is_run_active);
+                let settle_epoch =
+                    self.app.as_ref().map(|app| (app.cancel_token.clone(), app.run_settle_epoch()));
                 if let Some(app) = &self.app {
                     app.cancel_token.cancel();
                 }
-                iced::exit()
+                if !running {
+                    iced::exit()
+                } else {
+                    let (cancel_token, settle) =
+                        settle_epoch.expect("a running app carries the settle signal");
+                    // Defensive: the close request also cancelled the token
+                    // above; cancelling again is a no-op.
+                    cancel_token.cancel();
+                    Task::perform(
+                        async move {
+                            let start = settle.load(std::sync::atomic::Ordering::Acquire);
+                            let deadline = tokio::time::Instant::now() + GRACEFUL_SHUTDOWN_WAIT;
+                            loop {
+                                if settle.load(std::sync::atomic::Ordering::Acquire) != start {
+                                    return;
+                                }
+                                if tokio::time::Instant::now() >= deadline {
+                                    tracing::warn!(
+                                        "window closed while a run was active; the \
+                                         graceful-stop window lapsed before the run settled"
+                                    );
+                                    return;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        },
+                        |()| Message::ExitAfterGracefulStop,
+                    )
+                }
             }
+            Message::ExitAfterGracefulStop => iced::exit(),
             Message::RootConsentAllow => {
                 let Some(canonical) = self.pending_root_consent.take() else {
                     return Task::none();
