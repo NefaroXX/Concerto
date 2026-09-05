@@ -375,3 +375,61 @@ What actually shipped for §8 (vectors stay strictly derived):
   to `NullMemoryStore` with a warn instead of aborting the run. Integration
   tests prove the continuation loop completes with a forbid-write memory
   store wired in.
+
+## Implementation note (Phases 1–7 + remediation, 2026-09-05)
+
+What actually shipped for the remaining phases (Phases 4 and 8 have their own
+detailed notes above):
+
+**Phase 1 (evidence kinds + resource_facts table).** `WhiteboardKind` was
+extended additively with `ToolExecuted`, `WorkspaceSnapshot`, and `DesignDoc`
+kinds. The `resource_facts` derived table was added via migration 029 (plus
+030 for content-cache columns and 031 for per-root scoping). The table is
+rebuildable forward from the whiteboard log; content-cache columns are a
+hot-path affordance not repopulated by rebuild. Commits: `f276086`, `2b80df5`.
+
+**Phase 2 (workspace snapshot readiness barrier).** `workspace_snapshot.rs`
+produces a lightweight inventory (relative paths + size + mtime + optional
+content hash) before planning begins, appends a `WorkspaceSnapshot` event, and
+blocks dispatch until the snapshot is available. Vector indexing remains
+async. The snapshot digest is injected into agent context. Commit: `e904a3b`.
+
+**Phase 3 (tool-level fact writer).** `tool_facts.rs` records a
+`ToolExecuted` fact on every completed command with agent attribution (agent
+id, task id, run id), tool + canonical args, affected paths, success/failure,
+pre/post content hashes, and workspace generation. The fact writer is the
+single producer; no model ever authors `ToolExecuted` rows. Commit: `748c3d5`.
+
+**Phase 5 (DesignDoc verifier).** `design_doc_verifier.rs` implements the
+deterministic lifecycle `Proposed → Verified → Active | Quarantined | Skipped`.
+Each proposed-file intent (Create/Read/Update/Delete) is resolved against the
+snapshot + `resource_facts`. Mismatched claims are counted; the count plus the
+architect's read-count form the machine-checkable quarantine reason.
+Objective-path sufficiency is approximated by `snapshot_present ∧
+in-scope-facts` (the full objective-path metric from the ADR is deferred but
+safe because hallucinated docs quarantine deterministically). Commit: `cbf0ecb`.
+
+**Phase 6 (evidence-driven scheduling).** `evidence_scheduler.rs` replaces
+the hardcoded `design → research → implement` fallback. The coordinator
+derives unmet needs from evidence gaps and dispatches among registered agents.
+Every dispatch appends a `Decision` event with selected agent, reason, required
+output, and supporting evidence ids. Decision-event append validation rejects
+fabricated evidence ids. Commit: `b38d6b5`.
+
+**Phase 7 (continuation + resume).** `resume.rs` restores state at the
+whiteboard cursor. Checkpoint schema bumps to v4 (whiteboard cursor, active
+doc version, snapshot generation, pending decision). Resume compares the log
+since the cursor and chooses: continue, replace agent, skip, refresh evidence,
+or replan. Resume never dispatches architect/researcher without a recorded,
+evidence-backed decision. WriteApplied→dirty wiring is deferred but safe via
+serve/digest re-stat (the action digest re-stats every row against the live
+filesystem). Commit: `c3e0646`.
+
+**Security remediation (F1–F5).** Canonical per-root keys (`project_root_hash`
+scoping) prevent cross-root cache poisoning. Serve gates re-evaluate policy
+via `policy_verdict_is_allow` (ADR-65 F1a). Fresh digest re-stats rows
+against the live filesystem before rendering the action digest (ADR-65 F3).
+Content purge on dirty removes cached bytes. The serve path was hardened from
+an initial implementation that bypassed the policy engine — that omission is
+fixed: `maybe_serve_read` supplies a candidate, but the gate opens only on an
+explicit `Allow` verdict. Commits: `0c5c14e`, `1bd993a`, `781505d`, `3e09dfa`.

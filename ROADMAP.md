@@ -70,6 +70,23 @@ lifecycle decisions. What is true on `dev` today:
 - **Codebase-world-class Phase 0** merged via PR #63: `missing_docs` policy on
   crate roots, proptest for the shell parser (which caught a real bug),
   LSP integration tests, `run_shared_agent` decomposed into phases.
+- **Evidence spine (ADR-65, Phases 1–8, branch `feat/evidence-spine`):**
+  the whiteboard log is now the append-only evidence chain. `ToolExecuted` and
+  `WorkspaceSnapshot` facts are recorded on the execution hot path with agent
+  attribution; a derived `resource_facts` table (migrations 029–031) provides
+  the fast path for read deduplication and workspace-state queries. The
+  hardcoded `design → research → implement` fallback is replaced by
+  evidence-driven scheduling (`evidence_scheduler.rs`); a deterministic
+  DesignDoc verifier (`design_doc_verifier.rs`) resolves proposed-file intents
+  against the snapshot and `resource_facts`, quarantining hallucinated docs.
+  Continuation restores state at the whiteboard cursor (`resume.rs`,
+  checkpoint schema v4) and never dispatches architect/researcher without a
+  recorded, evidence-backed decision. Vectors stay strictly derived
+  (aggregate-only consolidation, retention controls, correct with vector
+  memory disabled). Security remediation F1–F5 (canonical per-root keys,
+  serve gates, fresh digest, content purge) hardened the read-cache serve
+  path. Verification: 3421 tests green, clippy/fmt clean, full workspace
+  build green.
 - **Frontend parity groundwork:** shared `ServicesBuilder`/`RequestBuilder`,
   unified `ContextOverflowStrategy`, structured `Vec<Message>` history, and a
   durable transcript restore path used by both frontends.
@@ -107,7 +124,9 @@ shape the roadmap.
   cancellation audit), security/polish (threat model, secret sanitizer,
   hardened WASM sandbox).
 - **Coordinator restart/resume:** checkpoint persistence to the session
-  database exists (`coordinator.rs::persist_checkpoint`); finish end-to-end
+  database exists (`coordinator.rs::persist_checkpoint`); ADR-65 Phase 7
+  (evidence-driven resume at the whiteboard cursor, checkpoint schema v4) is
+  implemented on `feat/evidence-spine`. The remaining gap is cross-process
   restart-resume so a Continue after application restart reconciles running
   tasks to pending without rerunning completed graph nodes (ADR-34 decision 2).
 - **Real FTS BM25 ranking:** propagate SQLite FTS5 `rank()` into hybrid
@@ -243,6 +262,7 @@ numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [41](docs/adrs/ADR-41.md) | Spend surfaces in status bar; no Dashboard page | Accepted |
 | [42](docs/adrs/ADR-42.md) | Coordinator resilience: failure-class fallback ladder | Accepted |
 | [43](docs/adrs/ADR-43.md) | Skills, MCP client, and extension manager | Accepted |
+| [65](docs/adrs/ADR-65-evidence-spine.md) | Evidence spine — facts, claims, decisions on one append-only chain | Accepted |
 
 When current behavior supersedes an ADR decision, update that ADR's status or
 add a superseding ADR; do not silently rewrite its historical context.

@@ -114,6 +114,13 @@ cargo audit
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`
 - Supervised agent-process (ADR-60 S5): `crates/orchestrator/src/gate_proxy.rs` (agent-process facade), `crates/orchestrator/src/supervisor.rs` (Completed semantics, ADR-60 S5)
 - Multi-agent coordinator: `crates/orchestrator/src/coordinator.rs`
+- Evidence spine — scheduling: `crates/orchestrator/src/evidence_scheduler.rs` (evidence-driven dispatch, replaces fixed fallback)
+- Evidence spine — DesignDoc verifier: `crates/orchestrator/src/design_doc_verifier.rs` (deterministic lifecycle Proposed→Verified/Active|Quarantined|Skipped)
+- Evidence spine — workspace snapshot: `crates/orchestrator/src/workspace_snapshot.rs` (readiness barrier, inventory)
+- Evidence spine — tool facts: `crates/orchestrator/src/tool_facts.rs` (hot-path fact writer with agent attribution)
+- Evidence spine — read cache: `crates/orchestrator/src/read_cache.rs` (safe read dedupe + action digest)
+- Evidence spine — resume: `crates/orchestrator/src/resume.rs` (continuation restores state at whiteboard cursor)
+- Evidence spine — resource facts store: `crates/sessions/src/resource_facts.rs` (derived `resource_facts` table, migrations 029–031)
 - Provider abstraction + factory: `crates/core/src/traits/provider.rs`, `crates/providers/src/factory.rs`
 - Tool execution safety: `crates/tools/src/virtual_fs.rs` (`VirtualFs`), `crates/core/src/policy.rs`
 - Plugin provider execution: `crates/plugins/src/provider_host.rs` (`PluginBackedProvider`)

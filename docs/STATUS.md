@@ -1,6 +1,6 @@
 # Concerto current status
 
-**Last reconciled with the source tree: 2026-08-24**
+**Last reconciled with the source tree: 2026-09-05**
 
 This is the public status source of truth. “Implemented” means the code path
 exists and has automated coverage; it does not mean every provider, model,
@@ -131,6 +131,24 @@ installer packages.
 The expected manual release checks are maintained in [Testing](../TESTING.md).
 
 ## What's new (unreleased)
+
+- 2026-09-05: **ADR-65 evidence spine — Phases 1–8 + security remediation
+  (branch `feat/evidence-spine`):** the whiteboard log is now the append-only
+  evidence chain. Phase 1 added `ToolExecuted`/`WorkspaceSnapshot` whiteboard
+  kinds and the `resource_facts` derived table (migrations 029–031). Phase 2
+  introduced the workspace snapshot readiness barrier. Phase 3 added the
+  tool-level fact writer with agent attribution. Phase 4 shipped safe read
+  deduplication and action digest, plus security remediation F1–F5 (canonical
+  per-root keys, serve gates, fresh digest, content purge). Phase 5 delivered
+  the deterministic DesignDoc verifier with lifecycle
+  Proposed→Verified/Active|Quarantined|Skipped. Phase 6 replaced the fixed
+  `design → research → implement` fallback with evidence-driven scheduling.
+  Phase 7 implemented continuation that restores state at the whiteboard
+  cursor (checkpoint schema v4 + `resume.rs`); resume never dispatches
+  architect/researcher without a recorded evidence-backed decision. Phase 8
+  ensured vectors stay strictly derived (aggregate-only consolidation,
+  retention controls, correct with vector memory disabled). Verification:
+  3421 tests green, clippy/fmt clean, full workspace build green.
 
 - 2026-08-24: **ADR-60 Phases 1–4 — supervised orchestrator + replay harness (branch `fix/orchestrator-supervisor-wiring`)** — Phase 1 thin-slice supervisor wiring (agent-process facade `gate_proxy.rs`/`supervisor.rs`, `Completed` semantics, budget-overrun 600s teardown); Phase 2 whiteboard-verified plan binding (plan_id + session bound to `CoordinatorAgent`, verified via whiteboard); Phase 3 review-cycle resumability Deferred 3 (whiteboard `ReviewStatePayload` events, WAL-before-invoke snapshots, `load_review_resume` rehydration, crash-safe replay); Phase 4 consolidation + replay harness + interpreter-probe fix (`agent_loop.rs` `python`→`python3` probe, Windows 577/1→578/0, Linux 578/0). CI verified 2026-08-24 Linux: fmt ✅ clippy ✅ build ✅ wasm ✅ deny ✅ ui-colors ✅ — workspace 3011 passed / 0 failed (orchestrator 578/0).
 - 2026-08-20: **ADR-60 D5 always-on write-conflict detection** on branch
