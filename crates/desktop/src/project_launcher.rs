@@ -187,20 +187,17 @@ impl DesktopApp {
                 // durable resumable state. Exiting over the run (the previous
                 // behavior) was the desktop's hard-kill: the executor drops
                 // its runtime 750 ms after exit and nothing lands.
-                let running = self.app.as_ref().is_some_and(app::App::is_run_active);
-                let settle_epoch =
-                    self.app.as_ref().map(|app| (app.cancel_token.clone(), app.run_settle_epoch()));
-                if let Some(app) = &self.app {
-                    app.cancel_token.cancel();
-                }
+                let Some(app) = self.app.as_ref() else {
+                    // No project open: nothing can be running — exit as
+                    // before.
+                    return iced::exit();
+                };
+                let running = app.is_run_active();
+                let settle = app.run_settle_epoch();
+                app.cancel_token.cancel();
                 if !running {
                     iced::exit()
                 } else {
-                    let (cancel_token, settle) =
-                        settle_epoch.expect("a running app carries the settle signal");
-                    // Defensive: the close request also cancelled the token
-                    // above; cancelling again is a no-op.
-                    cancel_token.cancel();
                     Task::perform(
                         async move {
                             let start = settle.load(std::sync::atomic::Ordering::Acquire);

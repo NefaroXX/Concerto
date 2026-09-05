@@ -169,18 +169,18 @@ Negative / costs:
   re-dispatched the architect instead of continuing the build — and that
   dispatch carried no recorded `Decision` event (ADR-65 §7). The D7
   amendment above now covers both sides. Implementation on branch
-  `feat/interrupt-safe-resume`: `bafcbae` (fix: the resume scope check
+  `feat/interrupt-safe-resume`: `17998a5` (fix: the resume scope check
   validates the checkpoint against its OWN project-id definition —
   `ProjectId::resolve` — where the unrelated path hash rejected every real
   row with "belongs to a different project" and then cleared it),
-  `8298fcc` (read side: a checkpointless `continue` seeds the dispatch
+  `0863f75` (read side: a checkpointless `continue` seeds the dispatch
   cursor from the evidence chain — newest hash-verified `plan-approved`
   payload + the §6 evidence scheduler; research done ⇒ the coder, every
-  dispatch a recorded `Decision` event), `29bc620` (run-level zero-work
+  dispatch a recorded `Decision` event), `c6b3468` (run-level zero-work
   guard for action-required runs — the F1 zero-tool-completed route),
-  `efd13bd` (CLI: SIGINT watcher + bounded graceful quit that persists the
-  interrupted checkpoint), `df4791f` (desktop: window close waits, bounded,
-  for the run to settle before exit), `7ed2d11` (supervised run: user
+  `ec27bdf` (CLI: SIGINT watcher + bounded graceful quit that persists the
+  interrupted checkpoint), `bc1ccd5` (desktop: window close waits, bounded,
+  for the run to settle before exit), `ef90c7e` (supervised run: user
   cancellation wired into `run_until`, so the gate-boundary shutdown
   checkpoint persists on cancel).
 
