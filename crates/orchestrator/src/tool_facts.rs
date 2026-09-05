@@ -16,12 +16,20 @@
 //!
 //! Attribution is never inferred: the caller passes its own `agent_id`,
 //! `task_id`, `run_id` and `generation` per call.
+//!
+//! Adr-65 F5 key agreement: every path this module records against the derived
+//! store (observations, pre-image lookups, write-invalidation) is reduced to the
+//! **canonical project-relative key** ([`canonical_project_path`]) scoped under
+//! the project root's blake3 hash ([`project_root_hash`]) — the same key space
+//! the `WorkspaceSnapshot` inventory uses, so rows are per-root, deduplicated,
+//! and dirtying/invalidation always lands on the shared key.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use concerto_core::ids::Ulid;
 use concerto_core::CancellationToken;
+use concerto_sessions::resource_facts::CACHE_LIMIT_BYTES;
 use concerto_sessions::whiteboard::append_whiteboard_event;
 use concerto_sessions::{
     NewWhiteboardEvent, ObservedPath, ResourceFacts, ToolExecutedPayload, WhiteboardKind,
@@ -34,8 +42,11 @@ use tracing::warn;
 pub const MAX_CANONICAL_ARGS_BYTES: usize = 4096;
 
 /// Files at or below this size get a fresh content hash after tool execution —
-/// mirrors the `workspace_snapshot` hashing budget so the walk stays bounded.
-pub const MAX_HASH_BYTES: u64 = 64 * 1024;
+/// the **single shared cache bound**: aliased from `concerto-sessions`
+/// (`resource_facts::CACHE_LIMIT_BYTES`), so the orchestrator and the derived
+/// store always agree on the hashing budget and there is exactly one constant
+/// to tune (ADR-65 F2b).
+pub const MAX_HASH_BYTES: u64 = CACHE_LIMIT_BYTES as u64;
 
 /// Identity tag for the single-agent loop's facts (no run/task ownership of a
 /// multi-agent run; ADR-65 §3 attribution is still explicit).
@@ -73,27 +84,38 @@ impl ToolFactContext {
     /// touch, straight from `resource_facts` (no filesystem access). Missing
     /// rows and lookup errors yield `None`; this is advisory — a `None` merely
     /// means "no clean cached hash to record".
+    ///
+    /// Keys are the **canonical project-relative** forms scoped under `root`
+    /// (ADR-65 F5c/F5d) so each returned key matches the row the observation
+    /// and the write-invalidation actually use; tool-reported spellings that
+    /// escape the project root are skipped (they have no row in this project's
+    /// fact set).
     pub async fn pre_image_hashes(
         &self,
+        project_root: &Path,
         paths: &[String],
         cancel: &CancellationToken,
     ) -> HashMap<String, Option<String>> {
         let Some(pool) = &self.pool else {
             return HashMap::new();
         };
+        let root_hash = project_root_hash(project_root);
         let facts = ResourceFacts::new(pool.clone());
         let mut out = HashMap::with_capacity(paths.len());
-        for path in paths {
-            match facts.lookup(path, cancel).await {
+        for raw in paths {
+            let Some(path) = canonical_project_path(project_root, raw) else {
+                continue;
+            };
+            match facts.lookup(&root_hash, &path, cancel).await {
                 Ok(Some(row)) => {
-                    out.insert(path.clone(), row.content_hash);
+                    out.insert(path, row.content_hash);
                 }
                 Ok(None) => {
-                    out.insert(path.clone(), None);
+                    out.insert(path, None);
                 }
                 Err(err) => {
                     warn!(%path, %err, agent_id = %self.agent_id, "tool fact: pre-image lookup failed");
-                    out.insert(path.clone(), None);
+                    out.insert(path, None);
                 }
             }
         }
@@ -117,6 +139,9 @@ impl ToolFactContext {
         let observed = observe_paths(fact.project_root, fact.paths).await;
         let event_id = Ulid::new().to_string();
         let created_at = unix_ms();
+        // ADR-65 F5c: the event pinpoints its project root so the derived rows
+        // land in the right per-root scope.
+        let root_hash = project_root_hash(fact.project_root);
 
         let event = NewWhiteboardEvent {
             event_id: event_id.clone(),
@@ -141,6 +166,7 @@ impl ToolFactContext {
                 "success": fact.success,
                 "exit_code": fact.exit_code,
                 "generation": fact.generation,
+                "project_root_hash": root_hash,
                 "paths": serde_json::to_value(&observed).unwrap_or_else(|_| serde_json::json!([])),
             }),
             pre_image_hash: single_path_pre_image(fact),
@@ -160,7 +186,14 @@ impl ToolFactContext {
         // Derive the store from the log entry (log remains the source of truth).
         let facts = ResourceFacts::new(pool.clone());
         if fact.file_affecting {
-            if let Err(err) = facts.invalidate_on_write(fact.paths, cancel).await {
+            if let Err(err) = facts
+                .invalidate_on_write(
+                    &root_hash,
+                    &canonical_project_paths(fact.project_root, fact.paths),
+                    cancel,
+                )
+                .await
+            {
                 warn!(
                     tool = fact.tool,
                     agent_id = %self.agent_id,
@@ -178,6 +211,7 @@ impl ToolFactContext {
                 success: fact.success,
                 exit_code: fact.exit_code,
                 generation: fact.generation.to_owned(),
+                project_root_hash: root_hash,
                 paths: observed,
                 // ADR-65 §4: an ordinary executed tool call is never a cache
                 // serve — served reads are recorded via `record_served_read`.
@@ -218,6 +252,9 @@ impl ToolFactContext {
             return;
         };
         let event_id = Ulid::new().to_string();
+        // ADR-65 F5c: the served fact stays inside its project root's scope so
+        // rebuild/attribution can tell which root (if any) it belongs to.
+        let root_hash = project_root_hash(fact.project_root);
         let event = NewWhiteboardEvent {
             event_id: event_id.clone(),
             agent_id: self.agent_id.clone(),
@@ -238,6 +275,7 @@ impl ToolFactContext {
                 "success": true,
                 "exit_code": serde_json::Value::Null,
                 "generation": fact.generation,
+                "project_root_hash": root_hash,
                 "paths": serde_json::json!([]),
                 "served_from": served_from,
             }),
@@ -260,12 +298,26 @@ impl ToolFactContext {
     /// has applied the observation (the row must already exist — this method
     /// only ever attaches content to an existing clean row). Fail-soft and
     /// bounded: no row, NUL bytes, or over-limit content all no-op silently.
-    pub async fn cache_read_content(&self, path: &str, content: &str, cancel: &CancellationToken) {
+    ///
+    /// The key is the canonical project-relative path scoped under `root`
+    /// (ADR-65 F5c/F5d); a path that escapes the project root is skipped.
+    pub async fn cache_read_content(
+        &self,
+        project_root: &Path,
+        path: &str,
+        content: &str,
+        cancel: &CancellationToken,
+    ) {
         let Some(pool) = &self.pool else {
             return;
         };
+        let Some(path) = canonical_project_path(project_root, path) else {
+            return;
+        };
         let facts = ResourceFacts::new(pool.clone());
-        if let Err(err) = facts.store_read_content(path, content, cancel).await {
+        if let Err(err) =
+            facts.store_read_content(&project_root_hash(project_root), &path, content, cancel).await
+        {
             warn!(
                 path,
                 agent_id = %self.agent_id,
@@ -335,22 +387,29 @@ fn canonical_args(args: &serde_json::Value) -> serde_json::Value {
 ///
 /// A tool often reports its own naming of the target (the key the pre-image
 /// map uses) plus the resolved absolute path echoed in its output — both
-/// spellings of the SAME file. Counting reported paths that actually carry a
-/// recorded pre-image distinguishes that one-target case from a genuine
+/// spellings of the SAME file. The pre-image map is keyed by canonical
+/// project-relative paths (ADR-65 F5d), so every reported spelling is reduced
+/// to its canonical key before matching; distinct canonical keys that carry a
+/// recorded pre-image distinguish the one-target case from a genuine
 /// multi-target write (which records several), so the event column stays
 /// hash-less unless exactly one target was written.
 fn single_path_pre_image(fact: &ToolExecutedFact<'_>) -> Option<String> {
     if !fact.file_affecting {
         return None;
     }
-    let recorded: Vec<&str> = fact
-        .paths
-        .iter()
-        .filter(|path| fact.pre_image_hashes.get(*path).map(|h| h.is_some()).unwrap_or(false))
-        .map(String::as_str)
-        .collect();
+    let mut recorded: Vec<String> = Vec::new();
+    for raw in fact.paths {
+        let Some(key) = canonical_project_path(fact.project_root, raw) else {
+            continue;
+        };
+        if fact.pre_image_hashes.get(&key).map(|hash| hash.is_some()).unwrap_or(false)
+            && !recorded.iter().any(|seen| seen == &key)
+        {
+            recorded.push(key);
+        }
+    }
     match recorded.as_slice() {
-        [raw] => fact.pre_image_hashes.get(*raw).and_then(|h| h.clone()),
+        [key] => fact.pre_image_hashes.get(key).and_then(|hash| hash.clone()),
         _ => None,
     }
 }
@@ -358,10 +417,18 @@ fn single_path_pre_image(fact: &ToolExecutedFact<'_>) -> Option<String> {
 /// Post-execution observations of the affected paths: size + mtime always,
 /// content hash for files ≤ [`MAX_HASH_BYTES`]. Paths that can no longer be
 /// resolved (deleted by the tool) are omitted from the observation.
+///
+/// Every observation key is the **canonical project-relative** path (ADR-65
+/// F5c/F5d); tool-reported spellings that escape the project root are skipped
+/// — they are never part of this project's fact set and would otherwise pollute
+/// the per-root row scope.
 async fn observe_paths(project_root: &Path, paths: &[String]) -> Vec<ObservedPath> {
     let mut out = Vec::with_capacity(paths.len());
     for raw in paths {
-        let resolved = resolve_path(project_root, raw);
+        let Some(path) = canonical_project_path(project_root, raw) else {
+            continue;
+        };
+        let resolved = resolve_path(project_root, &path);
         let Ok(meta) = std::fs::metadata(&resolved) else {
             continue;
         };
@@ -371,7 +438,7 @@ async fn observe_paths(project_root: &Path, paths: &[String]) -> Vec<ObservedPat
             None
         };
         out.push(ObservedPath {
-            path: raw.clone(),
+            path,
             size_bytes: Some(meta.len()),
             mtime_ms: mtime_ms(&meta),
             content_hash,
@@ -388,6 +455,75 @@ pub(crate) fn resolve_path(project_root: &Path, raw: &str) -> std::path::PathBuf
     } else {
         project_root.join(candidate)
     }
+}
+
+/// Lexically normalized, forward-slash absolute spelling of `root` — the
+/// project's canonical identity. Deliberately **no** `canonicalize()` (no
+/// symlink resolution, no filesystem access): the key must be stable regardless
+/// of mount state, so it is a pure function of the caller-supplied root path.
+pub(crate) fn canonical_project_root(root: &Path) -> String {
+    root.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_owned()
+}
+
+/// The blake3 project-root identity used to scope every `resource_facts` row
+/// (ADR-65 F5c): a stable hash of the canonical root spelling.
+pub fn project_root_hash(root: &Path) -> String {
+    blake3::hash(canonical_project_root(root).as_bytes()).to_hex().to_string()
+}
+
+/// Canonical project-relative key for a tool-reported path (ADR-65 F5d) — the
+/// single key space recorded against `resource_facts`, matching the
+/// `WorkspaceSnapshot` inventory's forward-slash relative paths.
+///
+/// The normalization is **lexical only** (deterministic, no filesystem access):
+/// backslashes become forward slashes, `.` components and interior `..`
+/// segments collapse, and absolute paths are stripped of the project root's own
+/// component prefix. A path that is absolute but *outside* the project root, or
+/// whose `..` segments would escape above it, yields `None` — such paths are
+/// never part of this project's rows (never observed, served, or hashed).
+///
+/// Returns `None` for an empty/root-only result.
+pub fn canonical_project_path(root: &Path, raw: &str) -> Option<String> {
+    let root_norm = canonical_project_root(root);
+    let raw_norm = raw.replace('\\', "/");
+    let components: Vec<&str> = raw_norm
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let relative: &[&str] = if raw_norm.starts_with('/') {
+        let root_components: Vec<&str> =
+            root_norm.split('/').filter(|component| !component.is_empty()).collect();
+        if root_norm.starts_with('/')
+            && components.len() > root_components.len()
+            && components[..root_components.len()] == root_components[..]
+        {
+            &components[root_components.len()..]
+        } else {
+            // Absolute, but not a component-prefix strip of the project root
+            // (or the root itself): outside the project — not observable.
+            return None;
+        }
+    } else {
+        &components
+    };
+    let mut stack: Vec<&str> = Vec::with_capacity(relative.len());
+    for component in relative {
+        if *component == ".." {
+            stack.pop()?;
+        } else {
+            stack.push(component);
+        }
+    }
+    if stack.is_empty() {
+        return None;
+    }
+    Some(stack.join("/"))
+}
+
+/// Reduce every spelling to its canonical key, dropping paths outside the
+/// project root (used by the write-invalidation fan-out).
+fn canonical_project_paths(root: &Path, raw_paths: &[String]) -> Vec<String> {
+    raw_paths.iter().filter_map(|raw| canonical_project_path(root, raw)).collect()
 }
 
 /// mtime as unix-epoch milliseconds (UTC-agnostic epoch time, the store's
@@ -545,6 +681,11 @@ mod tests {
         assert_eq!(payload["tool"], "filesystem");
         assert_eq!(payload["success"], true);
         assert_eq!(payload["generation"], "gen-abc");
+        assert_eq!(
+            payload["project_root_hash"].as_str().map(str::to_owned),
+            Some(project_root_hash(root.path())),
+            "the event pinpoints its project root scope (ADR-65 F5c)"
+        );
         assert_eq!(payload["args"]["operation"], "read");
         let paths = payload["paths"].as_array().expect("paths array");
         assert_eq!(paths.len(), 1, "affected path observed post-execution");
@@ -557,11 +698,16 @@ mod tests {
         assert!(event.pre_image_hash.is_none(), "read-only tool carries no pre-image hash");
 
         // Read-only success → clean row, safe to serve from cache.
-        let row =
-            store.lookup("a.md", &cancel).await.expect("lookup succeeds").expect("row observed");
+        let root_hash = project_root_hash(root.path());
+        let row = store
+            .lookup(&root_hash, "a.md", &cancel)
+            .await
+            .expect("lookup succeeds")
+            .expect("row observed");
         assert!(!row.dirty, "read-only success brands the row clean");
         assert_eq!(row.generation, "gen-abc");
         assert_eq!(row.last_agent_id.as_deref(), Some("writer-agent"));
+        assert_eq!(row.project_root_hash, root_hash, "row lands in the project root's scope");
     }
 
     #[tokio::test]
@@ -574,6 +720,7 @@ mod tests {
         let cancel = cancel();
 
         // Seed a clean cached fact, then record a successful write.
+        let root_hash = project_root_hash(root.path());
         store
             .apply_observed(
                 "evt-0",
@@ -588,6 +735,7 @@ mod tests {
                     success: true,
                     exit_code: None,
                     generation: "g0".to_owned(),
+                    project_root_hash: root_hash.clone(),
                     paths: vec![ObservedPath {
                         path: "b.rs".to_owned(),
                         size_bytes: Some(3),
@@ -601,7 +749,7 @@ mod tests {
             .await
             .expect("seed applies");
 
-        let pre_images = ctx.pre_image_hashes(&["b.rs".to_owned()], &cancel).await;
+        let pre_images = ctx.pre_image_hashes(root.path(), &["b.rs".to_owned()], &cancel).await;
         assert_eq!(
             pre_images.get("b.rs").and_then(|hash| hash.clone()).as_deref(),
             Some("pre"),
@@ -640,7 +788,8 @@ mod tests {
             "single-path write carries the pre-write hash"
         );
 
-        let row = store.lookup("b.rs", &cancel).await.expect("lookup").expect("row present");
+        let row =
+            store.lookup(&root_hash, "b.rs", &cancel).await.expect("lookup").expect("row present");
         assert!(row.dirty, "file-affecting success dirties the row");
     }
 
@@ -753,8 +902,9 @@ mod tests {
             "single-path write carries pre-image"
         );
         // The tool echoes the resolved absolute path of the SAME target in its
-        // output; the pre-image map is keyed by the tool's own naming, so the
-        // event still carries exactly one recorded pre-image.
+        // output; that spelling is reduced to its canonical key (ADR-65 F5d) —
+        // and here it does not canonicalize under the `"."` test root, so it is
+        // skipped and the single in-root spelling still yields the pre-image.
         let abs = Path::new("/sandbox").join("one.md");
         let abs_str = abs.to_string_lossy().into_owned();
         assert_eq!(
@@ -788,6 +938,102 @@ mod tests {
             single_path_pre_image(&make(false, &["one.md".to_owned()], root, &args, &single)),
             None,
             "read-only tool has no pre-image hash"
+        );
+    }
+
+    #[test]
+    fn canonical_project_path_collapses_dots_and_rejects_escapes() {
+        let root = Path::new("/work/proj");
+        assert_eq!(canonical_project_path(root, "a.md").as_deref(), Some("a.md"));
+        assert_eq!(canonical_project_path(root, "./a.md").as_deref(), Some("a.md"));
+        assert_eq!(canonical_project_path(root, "src/../a.md").as_deref(), Some("a.md"));
+        assert_eq!(
+            canonical_project_path(root, "src\\sub\\f.rs").as_deref(),
+            Some("src/sub/f.rs"),
+            "backslashes normalize to forward slashes"
+        );
+        assert_eq!(
+            canonical_project_path(root, "/work/proj/src/lib.rs").as_deref(),
+            Some("src/lib.rs"),
+            "absolute in-root paths strip to the canonical relative key"
+        );
+        assert!(
+            canonical_project_path(root, "/work/proj").is_none(),
+            "the root itself is not a file key"
+        );
+        assert!(canonical_project_path(root, "..").is_none(), "an escaping `..` is not observable");
+        assert!(
+            canonical_project_path(root, "../other/a.md").is_none(),
+            "a path above the root is not observable"
+        );
+        assert!(
+            canonical_project_path(root, "/etc/passwd").is_none(),
+            "an absolute path outside the root is not observable"
+        );
+        assert!(canonical_project_path(root, "").is_none(), "an empty path has no key");
+    }
+
+    #[test]
+    fn project_root_hash_is_stable_and_distinct() {
+        let a = Path::new("/work/proj");
+        let a_trailing = Path::new("/work/proj/");
+        let b = Path::new("/work/proj2");
+        assert_eq!(
+            project_root_hash(a),
+            project_root_hash(a_trailing),
+            "a trailing slash is insignificant to the canonical root identity"
+        );
+        assert_ne!(project_root_hash(a), project_root_hash(b), "different roots hash differently");
+    }
+
+    #[test]
+    fn single_path_pre_image_matches_canonical_spellings() {
+        let root = Path::new("/sandbox");
+        let args = serde_json::json!({});
+        let single = HashMap::from([("a.md".to_owned(), Some("h".to_owned()))]);
+
+        // "./a.md" and "a.md" canonicalize to the same key → still one target.
+        let paths = vec!["a.md".to_owned(), "./a.md".to_owned()];
+        let fact = ToolExecutedFact {
+            session_id: "s",
+            task_id: None,
+            run_id: None,
+            generation: "",
+            project_root: root,
+            tool: "t",
+            args: &args,
+            success: true,
+            exit_code: None,
+            paths: &paths,
+            file_affecting: true,
+            pre_image_hashes: single.clone(),
+        };
+        assert_eq!(
+            single_path_pre_image(&fact).as_deref(),
+            Some("h"),
+            "same canonical key from multiple spellings is still one target"
+        );
+
+        // The absolute in-root spelling collapses to the same key.
+        let paths = vec!["a.md".to_owned(), "/sandbox/a.md".to_owned()];
+        let fact = ToolExecutedFact {
+            session_id: "s",
+            task_id: None,
+            run_id: None,
+            generation: "",
+            project_root: root,
+            tool: "t",
+            args: &args,
+            success: true,
+            exit_code: None,
+            paths: &paths,
+            file_affecting: true,
+            pre_image_hashes: single,
+        };
+        assert_eq!(
+            single_path_pre_image(&fact).as_deref(),
+            Some("h"),
+            "raw + resolved spelling of one target still yields the pre-image"
         );
     }
 }

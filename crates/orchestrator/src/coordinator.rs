@@ -1353,15 +1353,19 @@ impl CoordinatorAgent {
     /// Fail-soft: an absent pool or a store error degrades to the bare
     /// snapshot digest with a warning, never a dispatch failure.
     async fn snapshot_digest(&self, cancel: &CancellationToken) -> Option<String> {
-        let base = self
-            .workspace_snapshot
-            .as_ref()
-            .map(crate::workspace_snapshot::WorkspaceSnapshotRecord::digest)?;
+        let snapshot = self.workspace_snapshot.as_ref()?;
+        let base = snapshot.digest();
         let Some(pool) = &self.review_store else {
             return Some(base);
         };
-        let observations = match ResourceFacts::new(pool.clone())
-            .list_observations(MAX_OBSERVATION_DIGEST_LINES, cancel)
+        // ADR-65 F5c: observations live in the snapshot's own project-root
+        // scope — rows from other roots (or legacy "") must not leak into the
+        // digest's claim about THIS workspace.
+        let root_hash = crate::tool_facts::project_root_hash(snapshot.project_root.as_std_path());
+        // The observations are BORROWED + locally refreshed below so the digest
+        // stays derived-truth; never persisted mutation of the source of truth.
+        let mut observations = match ResourceFacts::new(pool.clone())
+            .list_observations(&root_hash, MAX_OBSERVATION_DIGEST_LINES, cancel)
             .await
         {
             Ok(rows) => rows,
@@ -1372,6 +1376,32 @@ impl CoordinatorAgent {
         };
         if observations.is_empty() {
             return Some(base);
+        }
+        // ADR-65 F3: reconcile freshness NOW. A row whose current stat (size,
+        // mtime) diverges from the observation — or whose file vanished — is
+        // folded DIRTY so the action digest never claims an unchanged state the
+        // disk no longer matches. The re-dirty is also persisted best-effort so
+        // the derived store and the digest agree from here on.
+        let store = ResourceFacts::new(pool.clone());
+        for row in &mut observations {
+            let fresh = std::fs::metadata(snapshot.project_root.join(&row.path))
+                .ok()
+                .filter(|meta| {
+                    row.size_bytes.unwrap_or(0) == meta.len()
+                        && row.mtime_ms == crate::tool_facts::mtime_ms(meta)
+                })
+                .is_some();
+            if fresh {
+                continue;
+            }
+            row.dirty = true;
+            if let Err(err) = store.mark_dirty(&root_hash, &row.path, cancel).await {
+                warn!(
+                    %err,
+                    path = %row.path,
+                    "action digest: freshness mark_dirty failed; digest still shows the row as dirty"
+                );
+            }
         }
         let mut digest = String::from(&base);
         digest.push('\n');
@@ -11200,6 +11230,7 @@ mod tests {
     fn format_action_digest_renders_clean_and_dirty_rows_deterministically() {
         let rows = vec![
             ResourceFactRow {
+                project_root_hash: "root-a".to_owned(),
                 path: "src/main.rs".to_owned(),
                 generation: "g1".to_owned(),
                 size_bytes: Some(10),
@@ -11211,6 +11242,7 @@ mod tests {
                 dirty: false,
             },
             ResourceFactRow {
+                project_root_hash: "root-a".to_owned(),
                 path: "gen/config.yaml".to_owned(),
                 generation: "g1".to_owned(),
                 size_bytes: Some(5),
@@ -11222,6 +11254,7 @@ mod tests {
                 dirty: false,
             },
             ResourceFactRow {
+                project_root_hash: "root-a".to_owned(),
                 path: "notes/todo.md".to_owned(),
                 generation: "g2".to_owned(),
                 size_bytes: Some(4),
@@ -11247,6 +11280,7 @@ mod tests {
     #[test]
     fn format_action_digest_omits_hash_when_unhashed_row_is_clean() {
         let rows = vec![ResourceFactRow {
+            project_root_hash: "root-a".to_owned(),
             path: "big.bin".to_owned(),
             generation: "g1".to_owned(),
             size_bytes: Some(200 * 1024),
@@ -11266,7 +11300,8 @@ mod tests {
     /// The augmented digest injects an action block after the snapshot digest
     /// when a `review_store` pool with observations is present, and the row
     /// still carries the snapshot digest as a prefix (the injection is
-    /// additive, purely for context — ADR-65 §4).
+    /// additive, purely for context — ADR-65 §4). Rows are reconciled fresh
+    /// (ADR-65 F3) against real files under the snapshot's project root.
     #[tokio::test]
     async fn snapshot_digest_appends_action_digest_when_store_present() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -11285,9 +11320,28 @@ mod tests {
             .expect("pool connects");
         sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
 
+        // Real project root + real files: F3 re-stats each row NOW, so the
+        // observation must carry the file's ACTUAL metadata (size + mtime) —
+        // otherwise the freshness fold would (correctly) re-brand it dirty and
+        // the "unchanged-since" render below would be impossible to observe.
+        let root = tempfile::tempdir().expect("project root");
+        let lib_dir = root.path().join("src");
+        let data_dir = root.path().join("gen");
+        std::fs::create_dir_all(&lib_dir).expect("src dir");
+        std::fs::create_dir_all(&data_dir).expect("gen dir");
+        std::fs::write(lib_dir.join("lib.rs"), b"0123456789").expect("write lib.rs");
+        std::fs::write(data_dir.join("data.json"), br#"{"ok":true}"#).expect("write data.json");
+        let lib_meta = std::fs::metadata(lib_dir.join("lib.rs")).expect("lib.rs meta");
+        let data_meta = std::fs::metadata(data_dir.join("data.json")).expect("data.json meta");
+
         let facts = ResourceFacts::new(pool.clone());
         let cancel = CancellationToken::new();
-        let observed = |path: &str, content_hash: Option<&str>, generation: &str| {
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let observed = |path: &str,
+                        size: u64,
+                        mtime: Option<u64>,
+                        content_hash: Option<&str>,
+                        generation: &str| {
             concerto_sessions::ToolExecutedPayload {
                 agent_id: Some("coder".to_owned()),
                 task_id: None,
@@ -11297,39 +11351,53 @@ mod tests {
                 success: true,
                 exit_code: Some(0),
                 generation: generation.to_owned(),
+                project_root_hash: root_hash.clone(),
                 served_from: None,
                 paths: vec![concerto_sessions::ObservedPath {
                     path: path.to_owned(),
-                    size_bytes: Some(10),
-                    mtime_ms: Some(42),
+                    size_bytes: Some(size),
+                    mtime_ms: mtime,
                     content_hash: content_hash.map(String::from),
                 }],
             }
         };
-        // Row 1: clean, content-hashed observation.
+        // Row 1: clean, content-hashed observation whose metadata matches the
+        // real file — the F3 freshness fold leaves it unchanged.
         facts
             .apply_observed(
                 "ev-1",
                 "coder",
                 100,
-                &observed("src/lib.rs", Some("deadbeef00cafe01"), "g1"),
+                &observed(
+                    "src/lib.rs",
+                    lib_meta.len(),
+                    crate::tool_facts::mtime_ms(&lib_meta),
+                    Some("deadbeef00cafe01"),
+                    "g1",
+                ),
                 &cancel,
             )
             .await
             .expect("observe row 1");
         // Row 2: dirty (write uncertainty) — must render `changed` even though
-        // it carries a content hash.
+        // it carries a content hash and its file is fresh.
         facts
             .apply_observed(
                 "ev-2",
                 "coder",
                 200,
-                &observed("gen/data.json", Some("0123456789abcdef"), "g1"),
+                &observed(
+                    "gen/data.json",
+                    data_meta.len(),
+                    crate::tool_facts::mtime_ms(&data_meta),
+                    Some("0123456789abcdef"),
+                    "g1",
+                ),
                 &cancel,
             )
             .await
             .expect("observe row 2");
-        facts.mark_dirty("gen/data.json", &cancel).await.expect("dirty row 2");
+        facts.mark_dirty(&root_hash, "gen/data.json", &cancel).await.expect("dirty row 2");
 
         let coordinator =
             coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
@@ -11337,6 +11405,7 @@ mod tests {
                     generation: "gen-1".to_owned(),
                     entries: vec![],
                     captured_at_ms: 0,
+                    project_root: root.path().to_string_lossy().into_owned().into(),
                 })
                 .with_review_store(Some(pool));
 
@@ -11359,6 +11428,107 @@ mod tests {
         );
     }
 
+    /// A row whose file diverged from the observation — or vanished — is
+    /// folded DIRTY by the F3 freshness reconciliation, so the action digest
+    /// never claims an unchanged state the disk no longer matches.
+    #[tokio::test]
+    async fn snapshot_digest_reconciles_diverged_rows_as_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("action_digest_f3.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+
+        let root = tempfile::tempdir().expect("project root");
+        std::fs::write(root.path().join("lib.rs"), b"ORIGINAL-BYTES").expect("write lib.rs");
+        let meta = std::fs::metadata(root.path().join("lib.rs")).expect("meta");
+        let facts = ResourceFacts::new(pool.clone());
+        let cancel = CancellationToken::new();
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let payload = concerto_sessions::ToolExecutedPayload {
+            agent_id: Some("coder".to_owned()),
+            task_id: None,
+            run_id: None,
+            tool: "filesystem".to_owned(),
+            args: serde_json::json!({ "operation": "read", "path": "lib.rs" }),
+            success: true,
+            exit_code: Some(0),
+            generation: "g1".to_owned(),
+            project_root_hash: root_hash.clone(),
+            served_from: None,
+            paths: vec![concerto_sessions::ObservedPath {
+                path: "lib.rs".to_owned(),
+                size_bytes: Some(meta.len()),
+                mtime_ms: crate::tool_facts::mtime_ms(&meta),
+                content_hash: Some("cafecafecafecafe".to_owned()),
+            }],
+        };
+        facts.apply_observed("ev-1", "coder", 100, &payload, &cancel).await.expect("observe");
+
+        // Second row: a file that is observed clean and then DELETED — the F3
+        // freshness fold must render it changed (the metadata probe fails).
+        std::fs::write(root.path().join("gone.md"), b"will vanish").expect("write gone.md");
+        let gone_meta = std::fs::metadata(root.path().join("gone.md")).expect("meta gone");
+        let gone_payload = concerto_sessions::ToolExecutedPayload {
+            agent_id: Some("coder".to_owned()),
+            task_id: None,
+            run_id: None,
+            tool: "filesystem".to_owned(),
+            args: serde_json::json!({ "operation": "read", "path": "gone.md" }),
+            success: true,
+            exit_code: Some(0),
+            generation: "g1".to_owned(),
+            project_root_hash: root_hash.clone(),
+            served_from: None,
+            paths: vec![concerto_sessions::ObservedPath {
+                path: "gone.md".to_owned(),
+                size_bytes: Some(gone_meta.len()),
+                mtime_ms: crate::tool_facts::mtime_ms(&gone_meta),
+                content_hash: Some("feedfacefeedface".to_owned()),
+            }],
+        };
+        facts.apply_observed("ev-2", "coder", 150, &gone_payload, &cancel).await.expect("observe");
+
+        // The file changes (size divergence is deterministic) AFTER the
+        // observation — this is exactly the staleness F3 must surface.
+        std::fs::write(root.path().join("lib.rs"), b"LONGER THAN BEFORE").expect("rewrite");
+        // And the second file vanishes entirely.
+        std::fs::remove_file(root.path().join("gone.md")).expect("remove gone.md");
+
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_workspace_snapshot(crate::workspace_snapshot::WorkspaceSnapshotRecord {
+                    generation: "gen-1".to_owned(),
+                    entries: vec![],
+                    captured_at_ms: 0,
+                    project_root: root.path().to_string_lossy().into_owned().into(),
+                })
+                .with_review_store(Some(pool));
+
+        let digest = coordinator.snapshot_digest(&cancel).await.expect("snapshot present");
+        assert!(
+            digest.contains("lib.rs | changed"),
+            "a row whose file diverged from the observation renders changed (F3): {digest}"
+        );
+        assert!(
+            digest.contains("gone.md | changed"),
+            "a row whose file vanished renders changed (F3): {digest}"
+        );
+        assert!(
+            !digest.contains("unchanged-since"),
+            "no row may claim unchanged after divergence: {digest}"
+        );
+    }
+
     /// Without a store pool the digest degrades to the bare snapshot digest —
     /// the action block is an optimization, never a dispatch requirement.
     #[tokio::test]
@@ -11369,6 +11539,9 @@ mod tests {
                     generation: "gen-1".to_owned(),
                     entries: vec![],
                     captured_at_ms: 0,
+                    // Unused without a store (no root-hash lookup happens), but
+                    // the record type now always carries the root identity.
+                    project_root: "/proj".into(),
                 });
         let digest = coordinator.snapshot_digest(&CancellationToken::new()).await;
         let digest = digest.expect("snapshot present");

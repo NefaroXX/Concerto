@@ -599,15 +599,15 @@ impl GenericSpecialistAgent {
                 let pre_image_hashes = match &self.tool_facts {
                     Some(facts) => {
                         let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
-                        facts.pre_image_hashes(&affected, &cancel).await
+                        facts
+                            .pre_image_hashes(&context.session.project_dir, &affected, &cancel)
+                            .await
                     }
                     None => HashMap::new(),
                 };
                 // ADR-65 §4: safe read dedupe — a plain single-path filesystem
                 // read whose clean observation still matches the disk (re-statted
-                // now, content hash verified) is answered from the cache WITHOUT
-                // invoking the executor (and without re-running the policy
-                // engine — the accepted residual risk of the spec). Any doubt
+                // now, content hash verified) is a serve candidate. Any doubt
                 // degrades to normal execution; the model receives a
                 // byte-identical read result either way.
                 let serve = match &self.tool_facts {
@@ -623,7 +623,37 @@ impl GenericSpecialistAgent {
                     }
                     None => None,
                 };
+                // ADR-65 F1a: serve only when the policy engine explicitly
+                // allows the read through the advisory path (no decision row, no
+                // quota consumption); any non-Allow verdict runs the normal,
+                // fully policy-checked executor path below.
+                let serve = match serve {
+                    Some(serve)
+                        if executor
+                            .policy_verdict_is_allow(
+                                &tool_call.name,
+                                &arguments,
+                                &context.session,
+                                cancel.clone(),
+                            )
+                            .await =>
+                    {
+                        Some(serve)
+                    }
+                    _ => None,
+                };
                 if let Some(serve) = serve {
+                    // ADR-65 F1b: the serve consumed no executor decision row —
+                    // persist its own ServedFromCache audit row (fail-soft).
+                    executor
+                        .record_served_read_audit(
+                            &tool_call.name,
+                            &arguments,
+                            &serve.path,
+                            &context.session,
+                            cancel.clone(),
+                        )
+                        .await;
                     let served_summary =
                         format!("Read {} bytes from {}", serve.content.len(), serve.path);
                     let output = ToolOutput {
@@ -698,6 +728,7 @@ impl GenericSpecialistAgent {
                         if let Some(facts) = &self.tool_facts {
                             crate::read_cache::cache_read_output(
                                 facts,
+                                &context.session.project_dir,
                                 &tool_call.name,
                                 &arguments,
                                 &output.data,
@@ -1736,7 +1767,13 @@ impl GenericSpecialistAgent {
                             Some(facts) => {
                                 let affected =
                                     crate::tool_facts::extract_affected_paths(&arguments, None);
-                                facts.pre_image_hashes(&affected, &cancel).await
+                                facts
+                                    .pre_image_hashes(
+                                        &context.session.project_dir,
+                                        &affected,
+                                        &cancel,
+                                    )
+                                    .await
                             }
                             None => HashMap::new(),
                         };
@@ -1755,7 +1792,41 @@ impl GenericSpecialistAgent {
                             }
                             None => None,
                         };
+                        // ADR-65 F1a: serve only on an explicit policy Allow via
+                        // the advisory path; anything else runs the normal,
+                        // fully policy-checked executor path below.
+                        let serve = match &self.tool_executor {
+                            Some(executor) => match serve {
+                                Some(serve)
+                                    if executor
+                                        .policy_verdict_is_allow(
+                                            &tool_call.name,
+                                            &arguments,
+                                            &context.session,
+                                            cancel.clone(),
+                                        )
+                                        .await =>
+                                {
+                                    Some(serve)
+                                }
+                                _ => None,
+                            },
+                            None => None,
+                        };
                         if let Some(serve) = serve {
+                            // ADR-65 F1b: persist the ServedFromCache audit row
+                            // (fail-soft) — the serve consumed no decision row.
+                            if let Some(executor) = &self.tool_executor {
+                                executor
+                                    .record_served_read_audit(
+                                        &tool_call.name,
+                                        &arguments,
+                                        &serve.path,
+                                        &context.session,
+                                        cancel.clone(),
+                                    )
+                                    .await;
+                            }
                             let served_summary =
                                 format!("Read {} bytes from {}", serve.content.len(), serve.path);
                             let output = ToolOutput {
@@ -1848,6 +1919,7 @@ impl GenericSpecialistAgent {
                                 if let Some(facts) = &self.tool_facts {
                                     crate::read_cache::cache_read_output(
                                         facts,
+                                        &context.session.project_dir,
                                         &tool_call.name,
                                         &arguments,
                                         &output.data,

@@ -1605,18 +1605,15 @@ impl AgentLoop {
         let pre_image_hashes = match &self.tool_facts {
             Some(facts) => {
                 let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
-                facts.pre_image_hashes(&affected, &cancel).await
+                facts.pre_image_hashes(&self.project_root, &affected, &cancel).await
             }
             None => HashMap::new(),
         };
 
         // ADR-65 §4: safe read dedupe. A plain single-path filesystem read
         // whose clean observation still matches the disk (re-statted now,
-        // content hash verified) is answered from the cache WITHOUT invoking
-        // the executor — and therefore without re-running the policy engine,
-        // the accepted residual risk of the spec. Any doubt (_None_) degrades
-        // to normal execution below; the synthesized result is byte-identical
-        // to a real read of the same path.
+        // content hash verified) is a serve candidate. Any doubt (_None_)
+        // degrades to normal execution below.
         let serve = match &self.tool_facts {
             Some(facts) => {
                 crate::read_cache::maybe_serve_read(
@@ -1630,8 +1627,38 @@ impl AgentLoop {
             }
             None => None,
         };
+        // ADR-65 F1a: a cached read is served ONLY when the policy engine
+        // explicitly allows the read through the advisory path — re-evaluated
+        // here, per serve, so a served read is never a policy bypass. The
+        // advisory evaluation records no decision row and consumes no quota
+        // (see `ToolExecutor::policy_verdict_is_allow`); a non-`Allow` verdict
+        // falls through to the normal executor path below, where the full
+        // policy gate (Deny / RequireApproval) surfaces as usual.
+        let serve = match serve {
+            Some(serve)
+                if self
+                    .tool_executor
+                    .policy_verdict_is_allow(&tc.name, &arguments, session, cancel.clone())
+                    .await =>
+            {
+                Some(serve)
+            }
+            _ => None,
+        };
         if let Some(serve) = serve {
             *tool_call_count += 1;
+            // ADR-65 F1b: the serve consumed no executor decision row, so we
+            // persist its own ServedFromCache audit row (fail-soft: a write
+            // error is logged, never fails the serve).
+            self.tool_executor
+                .record_served_read_audit(
+                    &tc.name,
+                    &arguments,
+                    &serve.path,
+                    session,
+                    cancel.clone(),
+                )
+                .await;
             let served_summary = format!("Read {} bytes from {}", serve.content.len(), serve.path);
             tool_events.push(ToolExecutionSummary {
                 tool_name: tc.name.clone(),
@@ -1784,6 +1811,7 @@ impl AgentLoop {
                 if let Some(facts) = &self.tool_facts {
                     crate::read_cache::cache_read_output(
                         facts,
+                        &self.project_root,
                         &tc.name,
                         &arguments,
                         &output.data,
@@ -2642,12 +2670,30 @@ mod tests {
         approval: Arc<dyn ApprovalSink>,
         max_iterations: u32,
     ) -> AgentLoop {
+        make_loop_with_fs_tool_and_rules(
+            dir,
+            provider,
+            approval,
+            max_iterations,
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+        )
+    }
+
+    /// Same as `make_loop_with_fs_tool` but with an explicit policy rule set,
+    /// so tests can drive the ADR-65 F1a serve gate (Allow-only) through
+    /// real tool executions.
+    fn make_loop_with_fs_tool_and_rules(
+        dir: &std::path::Path,
+        provider: Arc<dyn LlmProvider>,
+        approval: Arc<dyn ApprovalSink>,
+        max_iterations: u32,
+        rules: Vec<PolicyRule>,
+    ) -> AgentLoop {
         let root = camino::Utf8PathBuf::from_path_buf(dir.to_path_buf()).unwrap();
         let mut registry = ToolRegistry::default();
         registry.register(Box::new(EchoTool));
         registry.register(Box::new(FilesystemTool::new(root.clone())));
-        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
-        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        let policy = Arc::new(SimplePolicyEngine::new(rules, Arc::new(TestAudit)));
         let executor = Arc::new(
             ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(approval.clone()),
         );
@@ -3501,15 +3547,278 @@ mod tests {
             "write event carries the pre-write content hash"
         );
 
-        // Derived store: the read left a clean row, the write invalidated it.
+        // Derived store: the read left a clean row, the write invalidated it —
+        // both under the loop project root's scope (ADR-65 F5c).
         let store = ResourceFacts::new(pool);
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
         let row = store
-            .lookup("note.md", &CancellationToken::new())
+            .lookup(&root_hash, "note.md", &CancellationToken::new())
             .await
             .expect("lookup")
             .expect("read observation created a resource_facts row");
         assert!(row.dirty, "the write must have invalidated the cached row");
         assert_eq!(row.last_agent_id.as_deref(), Some("single-agent"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-65 §4 / F1a-F1b / F2c: safe read-dedupe end to end
+    // -----------------------------------------------------------------------
+
+    /// A second, identical read of an observed file is SERVED from cache
+    /// without re-executing, and the serve appends its own `served_from` fact
+    /// (ADR-65 F1b): attribution to the original observation, empty paths (the
+    /// served read did not re-observe state), no dirtying of the row.
+    #[tokio::test]
+    async fn cached_read_is_served_and_records_a_served_from_fact() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"# stable\n").expect("fixture written");
+
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+        };
+        // Call 2 re-reads the identical path. The first read executed and
+        // cached; the second must be served without reaching the executor.
+        let calls = vec![vec![read_tc.clone()], vec![read_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        loop_ = loop_.with_tool_facts(Some(ToolFactContext::new(
+            Some(pool.clone()),
+            "single-agent".to_string(),
+        )));
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new_action_required(session_id, "read twice");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "read-only task should succeed: {:?}", result.err());
+
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let executed: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(executed.len(), 2, "one observation + one served-from fact");
+        let obs = executed[0];
+        let served = executed[1];
+
+        assert_eq!(
+            obs.payload["served_from"],
+            serde_json::Value::Null,
+            "the first read executed normally"
+        );
+        assert_eq!(
+            obs.payload["paths"].as_array().map(Vec::len),
+            Some(1),
+            "the observation carries the read path"
+        );
+        assert_eq!(
+            served.payload["served_from"].as_str(),
+            Some(obs.event_id.as_str()),
+            "the served fact attributes the original observation (F1b)"
+        );
+        assert_eq!(
+            served.payload["paths"].as_array().map(Vec::len),
+            Some(0),
+            "a served read never re-observes paths"
+        );
+
+        // The serve left the row clean, attributed to the ORIGINAL observation,
+        // and the content cache intact for the next identical read.
+        let store = ResourceFacts::new(pool);
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let row = store
+            .lookup(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("lookup")
+            .expect("row present");
+        assert!(!row.dirty, "a served read does not dirty the row");
+        assert_eq!(
+            row.last_event_id.as_deref(),
+            Some(obs.event_id.as_str()),
+            "the served read keeps the original observation as the row's last event"
+        );
+        let cached = store
+            .cached_read(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("cached read")
+            .expect("cached row");
+        assert_eq!(cached.content, "# stable\n", "the cache holds the exact served bytes");
+    }
+
+    /// F1a: a non-`Allow` policy verdict KEEPS the serve gate closed even when
+    /// a clean, content-cached row exists. Under a deny policy the read falls
+    /// through to the executor, which then surfaces the denial — a served read
+    /// is never a policy bypass.
+    #[tokio::test]
+    async fn deny_verdict_never_serves_a_cached_read() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"cached bytes\n").expect("fixture written");
+
+        // Loop A: allow-all policy, seeds the clean observation + content cache.
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+        };
+        let calls = vec![vec![read_tc.clone()], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut seeder = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        seeder = seeder
+            .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "seeder".to_string())));
+        let seeder_session = Ulid::new();
+        seeder
+            .run(
+                AgentTask::new_action_required(seeder_session, "seed the cache"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("seeder run");
+
+        // Loop B: SAME project root and fact writer, but an AutoDeny policy. The
+        // fully populated cache is a serve candidate — the F1a gate must refuse.
+        let calls = vec![vec![read_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut denier = make_loop_with_fs_tool_and_rules(
+            root.path(),
+            provider,
+            approval,
+            10,
+            vec![PolicyRule::AutoDeny(Condition::ToolName("filesystem".into()))],
+        );
+        denier = denier
+            .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "denier".to_string())));
+        let deny_session = Ulid::new();
+        denier
+            .run(
+                AgentTask::new_action_required(deny_session, "read under deny"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("denier run");
+
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(deny_session.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let denied: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(denied.len(), 1, "the deny run records its read attempt exactly once");
+        assert_eq!(
+            denied[0].payload["served_from"],
+            serde_json::Value::Null,
+            "a deny verdict must not serve the cached row (F1a)"
+        );
+        assert_eq!(
+            denied[0].payload["success"],
+            serde_json::json!(false),
+            "the read reached the executor and was denied there — policy was enforced"
+        );
+    }
+
+    /// F2c: a write invalidates the cached row AND purges its bytes, so a
+    /// subsequent identical read cannot be served — it executes fresh, observes
+    /// the new content, and re-caches it.
+    #[tokio::test]
+    async fn invalidation_purges_cache_and_forces_fresh_execution() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"# original\n").expect("fixture written");
+
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+        };
+        let write_tc = ToolCall {
+            id: "call_2".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "note.md",
+                "content": "# updated\n",
+            }),
+        };
+        let calls = vec![vec![read_tc.clone()], vec![write_tc], vec![read_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        loop_ = loop_.with_tool_facts(Some(ToolFactContext::new(
+            Some(pool.clone()),
+            "single-agent".to_string(),
+        )));
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new_action_required(session_id, "read, write, read");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "read/write/read task should succeed: {:?}", result.err());
+
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let executed: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(executed.len(), 3, "all three commands executed; none was served");
+        for event in &executed {
+            assert_eq!(
+                event.payload["served_from"],
+                serde_json::Value::Null,
+                "the invalidated row could not be served (F2c)"
+            );
+        }
+
+        // The fresh read re-observed the new content: row clean again, cache
+        // repopulated with the UPDATED bytes — proving no stale bytes survived.
+        let store = ResourceFacts::new(pool);
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let row = store
+            .lookup(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("lookup")
+            .expect("row present");
+        assert!(!row.dirty, "the post-invalidation read re-observed a clean row");
+        assert_eq!(
+            row.last_event_id.as_deref(),
+            Some(executed[2].event_id.as_str()),
+            "the fresh observation is the row's newest event"
+        );
+        let cached = store
+            .cached_read(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("cached read")
+            .expect("cached row");
+        assert_eq!(
+            cached.content, "# updated\n",
+            "the cache holds the fresh bytes, never stale ones"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -58,7 +58,11 @@ const DEFAULT_SKIP_COMPONENTS: &[&str] = &[
 /// Content hashing is applied "where cheap" (ADR-65 §2): files at or below
 /// this size are hashed; larger files record `content_hash: None` so the walk
 /// stays bounded on huge trees.
-const MAX_HASH_BYTES: u64 = 64 * 1024;
+/// Files ≤ this size get a content hash in the inventory — aliased to the
+/// **single shared cache bound** (`concerto-sessions::resource_facts`), so the
+/// walk, the derive, and the serve gate all agree on the hashing budget
+/// (ADR-65 F2b).
+const MAX_HASH_BYTES: u64 = concerto_sessions::resource_facts::CACHE_LIMIT_BYTES as u64;
 
 /// Author attribution for snapshot events. The runtime — not a model — authors
 /// `WorkspaceSnapshot` rows (ADR-65 §1); `coordinator` is the orchestrator
@@ -78,6 +82,10 @@ pub struct WorkspaceSnapshotRecord {
     pub entries: Vec<SnapshotEntry>,
     /// Unix epoch milliseconds (UTC) at capture time.
     pub captured_at_ms: u64,
+    /// The project root this snapshot was captured from — the identity that
+    /// scopes every derived `resource_facts` row (ADR-65 F5c) and feeds the
+    /// digest's freshness reconciliation (ADR-65 F3).
+    pub project_root: camino::Utf8PathBuf,
 }
 
 impl WorkspaceSnapshotRecord {
@@ -121,11 +129,16 @@ impl WorkspaceSnapshotRecord {
     }
 
     /// The typed payload for persistence/reconcile: the content-addressed
-    /// string `generation` id plus the inventory entries (ADR-65 §2).
+    /// string `generation` id, the inventory entries (ADR-65 §2), and the
+    /// project root's hash so every derived row lands in the right per-root
+    /// scope (ADR-65 F5c).
     pub fn as_payload(&self) -> WorkspaceSnapshotPayload {
         WorkspaceSnapshotPayload {
             generation: self.generation.clone(),
             files: self.entries.clone(),
+            project_root_hash: crate::tool_facts::project_root_hash(
+                self.project_root.as_std_path(),
+            ),
         }
     }
 }
@@ -310,6 +323,7 @@ pub async fn run_snapshot_barrier(
         generation: compute_generation(&entries),
         entries,
         captured_at_ms: unix_ms() as u64,
+        project_root: project_dir.to_string_lossy().into_owned().into(),
     };
 
     match pool {
@@ -544,6 +558,7 @@ mod tests {
                 },
             ],
             captured_at_ms: 7,
+            project_root: "/proj".into(),
         };
 
         let digest = record.digest();
@@ -564,8 +579,12 @@ mod tests {
                 content_hash: None,
             })
             .collect();
-        let record =
-            WorkspaceSnapshotRecord { generation: "gen".to_owned(), entries, captured_at_ms: 0 };
+        let record = WorkspaceSnapshotRecord {
+            generation: "gen".to_owned(),
+            entries,
+            captured_at_ms: 0,
+            project_root: "/proj".into(),
+        };
 
         let digest = record.digest();
         assert!(
@@ -664,10 +683,12 @@ mod tests {
             .expect("generation present in payload");
         assert_eq!(generation, record.generation);
 
-        // The derived store applied the observation: clean rows for listed files.
+        // The derived store applied the observation: clean rows for listed files,
+        // scoped under the snapshot's own project root (ADR-65 F5c).
         let facts = ResourceFacts::new(pool.clone());
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
         let row = facts
-            .lookup("src/main.rs", &cancel)
+            .lookup(&root_hash, "src/main.rs", &cancel)
             .await
             .expect("lookup succeeds")
             .expect("src/main.rs was observed");
