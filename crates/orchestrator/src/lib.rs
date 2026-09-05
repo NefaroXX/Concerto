@@ -25,6 +25,8 @@ pub mod cost;
 pub mod cycle;
 pub mod cycle_manager;
 pub mod delta;
+pub mod design_doc_verifier;
+pub mod evidence_scheduler;
 pub mod exec_backend;
 pub mod fingerprint;
 pub mod gate;
@@ -45,16 +47,20 @@ pub use relationship::{
 };
 pub mod planner;
 pub mod prompts;
+mod read_cache;
 pub mod registry;
 pub mod resolver;
 pub mod resolver_integration;
+pub mod resume;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;
 pub mod supervisor;
 pub mod timeline;
+mod tool_facts;
 mod tool_guard;
 mod working_memory;
+pub mod workspace_snapshot;
 
 #[path = "runtime_runner_persistent.rs"]
 pub mod runtime_runner;

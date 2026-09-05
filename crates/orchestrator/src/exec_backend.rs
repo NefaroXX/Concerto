@@ -52,6 +52,40 @@ pub trait ToolExecutionBackend: Send + Sync {
         acknowledged: bool,
         cancel: CancellationToken,
     );
+
+    /// ADR-65 F1a: re-evaluate a proposed tool call without recording a
+    /// decision row; returns `true` only for an explicit `Allow`.
+    ///
+    /// The in-process path delegates to the concrete executor's advisory gate
+    /// (see [`ToolExecutor::policy_verdict_is_allow`]). The default is `false`
+    /// because the supervised path never serves cached reads — the gate-proxy
+    /// child has no resource-facts store — so disable-by-default is the
+    /// truthful contract for every backend that does not override it.
+    async fn policy_verdict_is_allow(
+        &self,
+        _tool_name: &str,
+        _input: &serde_json::Value,
+        _session: &SessionContext,
+        _cancel: CancellationToken,
+    ) -> bool {
+        false
+    }
+
+    /// ADR-65 F1b: persist a `ServedFromCache` audit row for a cached read.
+    ///
+    /// Called only when the serve gate served a read *without* executing the
+    /// tool (see [`ToolExecutor::record_served_read_audit`]). The supervised
+    /// path uses the default no-op: its audit trail is written supervisor-side
+    /// (ADR-60 D4/D5) and it never serves, so there is nothing to record.
+    async fn record_served_read_audit(
+        &self,
+        _tool_name: &str,
+        _input: &serde_json::Value,
+        _path: &str,
+        _session: &SessionContext,
+        _cancel: CancellationToken,
+    ) {
+    }
 }
 
 /// The local (single-process) backend: plain delegation to the concrete
@@ -92,6 +126,27 @@ impl ToolExecutionBackend for ToolExecutor {
             cancel,
         )
         .await;
+    }
+
+    async fn policy_verdict_is_allow(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> bool {
+        ToolExecutor::policy_verdict_is_allow(self, tool_name, input, session, cancel).await
+    }
+
+    async fn record_served_read_audit(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        path: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) {
+        ToolExecutor::record_served_read_audit(self, tool_name, input, path, session, cancel).await;
     }
 }
 

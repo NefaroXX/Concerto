@@ -89,6 +89,26 @@ self-execution (only for subtasks with no expected file artifact) — before
 exiting the session gracefully with a partial/checkpoint outcome; hard failures
 never reassign to another agent. See ADR-42.
 
+### Evidence spine (ADR-65)
+
+The whiteboard log is the append-only evidence chain. Every completed command
+appends a `ToolExecuted` fact (agent attribution, tool + canonical args,
+affected paths, success/failure, content hashes). `WorkspaceSnapshot` facts
+bootstrap existing projects before planning. A derived `resource_facts` table
+(migrations 029–031) provides the fast path for read deduplication: unchanged
+files are served from cache with a `served_from` fact, avoiding redundant
+disk reads.
+
+Scheduling is evidence-driven (`evidence_scheduler.rs`), not a fixed
+`design → research → implement` fallback. The coordinator derives unmet needs
+from evidence gaps and dispatches among registered agents. A deterministic
+DesignDoc verifier (`design_doc_verifier.rs`) resolves proposed-file intents
+against the snapshot and `resource_facts`, quarantining hallucinated docs.
+Continuation restores state at the whiteboard cursor (`resume.rs`, checkpoint
+schema v4) and never dispatches architect/researcher without a recorded,
+evidence-backed decision. Vectors stay strictly derived (aggregate-only
+consolidation, correct with vector memory disabled).
+
 See [Multi-agent Collaboration](agent-collaboration.md).
 
 ## Provider layer

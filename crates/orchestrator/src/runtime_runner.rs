@@ -1206,6 +1206,20 @@ pub async fn init_memory_system(
     if let Err(error) = ttl.purge_expired(&project_id, CancellationToken::new()).await {
         tracing::warn!(%error, "failed to purge expired project memory");
     }
+    // ADR-65 §8: prune derived summary chunks (Fact/SessionSummary) past the
+    // configured retention — NEVER source chunks. Fail-soft: a failed prune
+    // only logs; the pass itself logs what it removed.
+    if let Err(error) = ttl
+        .prune_derived_summaries(
+            &project_id,
+            config.memory.summary_keep_per_session,
+            config.memory.summary_retention_days,
+            CancellationToken::new(),
+        )
+        .await
+    {
+        tracing::warn!(%error, "failed to prune derived summaries past retention");
+    }
     let decision_store = DecisionStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
     })?;
@@ -1735,6 +1749,12 @@ async fn execute_agent_loop(
     // drift from the intent gate's decision if the task-shaping code changes.
     execute_granted: bool,
     stage_tracker: &Arc<Mutex<StageTracker>>,
+    // ADR-65 §3: the session-DB pool backing the single-agent loop's
+    // tool-evidence writer (`ToolFactContext::new(pool, "single-agent")`).
+    // `None` when no sessions DB is available (the writer is a fail-soft
+    // no-op). Cloned from the write-gate pool in `run_shared_agent` before
+    // the gates consume it.
+    fact_pool: Option<sqlx::SqlitePool>,
 ) -> Result<AgentOutput, OrchestratorError> {
     // Audit C-03 (immediate fix): the LLM `SummarizeOldest` strategy is no
     // longer wired into the production runtime. Its failure path could delete
@@ -1788,7 +1808,10 @@ async fn execute_agent_loop(
     .with_retry_policy(retry_policy)
     .with_usage_model(model)
     .with_initial_messages(req.conversation_history)
-    .with_session_store(session_store);
+    .with_session_store(session_store)
+    .with_tool_facts(fact_pool.map(|pool| {
+        crate::tool_facts::ToolFactContext::new(Some(pool), crate::tool_facts::SINGLE_AGENT_FACT_ID)
+    }));
 
     // `task` is moved into the loop below; Ulid is Copy so the task id is
     // captured up front for spend attribution (Phase 3, issue #93).
@@ -1916,6 +1939,27 @@ fn cached_store_for_project(
 fn reset_memory_services(memory: &Mutex<Option<ActiveMemoryServices>>) {
     if let Some(previous) = memory.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
         previous.cancel.cancel();
+    }
+}
+
+/// Turn the memory-services selection into the store a run uses: a healthy
+/// store, or `NullMemoryStore` when memory was disabled/absent or when init
+/// FAILED. A run's correctness (plan, scheduling, execute, resume — ADR-65
+/// acceptance 9) never depends on vector memory, so an init failure must log
+/// and degrade, never abort the run.
+fn memory_store_or_disabled(
+    selection: Result<Option<Arc<dyn MemoryStore>>, OrchestratorError>,
+) -> Arc<dyn MemoryStore> {
+    match selection {
+        Ok(Some(store)) => store,
+        Ok(None) => Arc::new(NullMemoryStore),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "memory init failed — the run proceeds without memory (vector store absent)"
+            );
+            Arc::new(NullMemoryStore)
+        }
     }
 }
 
@@ -2308,15 +2352,27 @@ fn run_continuity_applies(
 /// `plan-approved` payload (verified against its own artifact hash — an
 /// unattested artifact is skipped with a warn, never trusted) plus the ledger
 /// folded from the session's gate-written events.
+///
+/// ADR-65 §7: `cursor_gate_seq` anchors the read at the checkpoint's
+/// whiteboard cursor when one governs the run — only facts appended AFTER the
+/// cursor are folded into the resumed run's evidence view; pre-cursor events
+/// are state the checkpoint itself carries, never replayed prose.
 async fn load_run_continuity(
     pool: &sqlx::SqlitePool,
     session_id: Ulid,
+    cursor_gate_seq: Option<u64>,
 ) -> Result<RunContinuity, concerto_sessions::SessionError> {
-    // Read the newest tail of the session's log. `gate_seq` is global, so
-    // anchor the cursor `RUN_CONTINUITY_WINDOW` events back from the head and
-    // rely on the session filter to keep only this session's rows.
-    let head = latest_gate_seq(pool).await?;
-    let after = head.saturating_sub(RUN_CONTINUITY_WINDOW as u64);
+    // Read the newest tail of the session's log. `gate_seq` is global: with
+    // a §7 cursor the evidence view starts exactly there; otherwise anchor
+    // the cursor `RUN_CONTINUITY_WINDOW` events back from the head and rely
+    // on the session filter to keep only this session's rows.
+    let after = match cursor_gate_seq {
+        Some(cursor) => cursor,
+        None => {
+            let head = latest_gate_seq(pool).await?;
+            head.saturating_sub(RUN_CONTINUITY_WINDOW as u64)
+        }
+    };
     let events = load_whiteboard_events(
         pool,
         &WhiteboardLoadOpts {
@@ -2385,9 +2441,15 @@ fn run_continuity_description(continuity: &RunContinuity) -> String {
 /// Load the session's run-continuity snapshot and append it to the task
 /// description when the log carries anything. Fail-soft: an empty log seeds
 /// nothing; a read error warns and leaves the task untouched — continuity
-/// bookkeeping never fails the run.
-async fn seed_run_continuity(task: &mut AgentTask, pool: &sqlx::SqlitePool, session_id: Ulid) {
-    match load_run_continuity(pool, session_id).await {
+/// bookkeeping never fails the run. `cursor_gate_seq` anchors the read at the
+/// checkpoint's whiteboard cursor (ADR-65 §7) when one governs the run.
+async fn seed_run_continuity(
+    task: &mut AgentTask,
+    pool: &sqlx::SqlitePool,
+    session_id: Ulid,
+    cursor_gate_seq: Option<u64>,
+) {
+    match load_run_continuity(pool, session_id, cursor_gate_seq).await {
         Ok(continuity) if !continuity.is_empty() => {
             tracing::info!(
                 session_id = %task.session_id,
@@ -2615,10 +2677,12 @@ pub async fn run_shared_agent(
     // project. A project switch cancels and drops the previous project's
     // lifecycle so its store/indexer/sync services are never reused (audit
     // G1); `None` means memory is disabled and `NullMemoryStore` is used.
-    let memory: Arc<dyn MemoryStore> =
-        select_or_init_memory_services(&services, &req.project_dir, req.memory_enabled)
-            .await?
-            .unwrap_or_else(|| Arc::new(NullMemoryStore));
+    // ADR-65 acceptance 9: memory is OPTIONAL for a run's correctness — an
+    // init failure (missing/unopenable DB, failed migration) degrades to the
+    // null store with a warn instead of aborting the run.
+    let memory: Arc<dyn MemoryStore> = memory_store_or_disabled(
+        select_or_init_memory_services(&services, &req.project_dir, req.memory_enabled).await,
+    );
 
     // 6. Session creation and event recording
     let (session_id, session_store, event_recorder, transcript_recorder) =
@@ -2993,6 +3057,13 @@ pub async fn run_shared_agent(
 
     // The spend carry-forward moved up before the intent classifier (Phase 2c
     // §6 ordering); `session_manager` still gates the checkpoint/resume block.
+    // ADR-65 §7: the checkpoint row's own `updated_at` (backfill hint for
+    // pre-§7 v3 checkpoints) and the checkpoint's whiteboard cursor (anchors
+    // the run-continuity read at the cursor — the resumed run's evidence view
+    // is the log AFTER it, never a replay of pre-cursor prose). Declared
+    // here so both the checkpoint block and the continuity seed see them.
+    let mut resume_updated_at_ms: Option<i64> = None;
+    let mut resume_cursor: Option<u64> = None;
     if let Some(ref session_manager) = session_manager {
         if !req.force_single_agent {
             let resume_requested = is_resume_request(&req.input);
@@ -3020,7 +3091,21 @@ pub async fn run_shared_agent(
                             "failed to load orchestration checkpoint: {error}"
                         ))
                     })?
-                    .map(|record| record.state_json);
+                    .map(|record| {
+                        // ADR-65 §7: the row's own updated_at backs the
+                        // additive v4 backfill for pre-§7 (v3) checkpoints.
+                        resume_updated_at_ms =
+                            i64::try_from(record.updated_at.unix_timestamp_nanos() / 1_000_000)
+                                .ok();
+                        let cursor =
+                            crate::checkpoint::GraphCheckpoint::from_json(&record.state_json)
+                                .ok()
+                                .and_then(|checkpoint| checkpoint.whiteboard_cursor_gate_seq);
+                        if cursor.is_some() {
+                            resume_cursor = cursor;
+                        }
+                        record.state_json
+                    });
             }
 
             if let Some(checkpoint_json) = req.resume_checkpoint_json.as_ref() {
@@ -3050,6 +3135,10 @@ pub async fn run_shared_agent(
                                     "failed to clear checkpoint after scope validation failure",
                                 );
                             }
+                        } else {
+                            // The checkpoint governs this run: its cursor
+                            // anchors the §7 evidence view.
+                            resume_cursor = checkpoint.whiteboard_cursor_gate_seq;
                         }
                     }
                     Ok(checkpoint) => {
@@ -3120,7 +3209,7 @@ pub async fn run_shared_agent(
     // untouched — continuity bookkeeping never fails the run.
     if run_continuity_applies(apply_plan, &req.input, services.config.multi_agent.as_ref()) {
         if let Some(pool) = gate_log_pool.as_ref() {
-            seed_run_continuity(&mut task, pool, session_id).await;
+            seed_run_continuity(&mut task, pool, session_id, resume_cursor).await;
         }
     }
 
@@ -3154,6 +3243,7 @@ pub async fn run_shared_agent(
             &stage_tracker,
             intent_policy.clone(),
             gate_log_pool.clone(),
+            resume_updated_at_ms,
         )
         .await;
     }
@@ -3165,6 +3255,8 @@ pub async fn run_shared_agent(
     let plan_cancel_token = req.cancel_token.clone();
     // ADR-60 D7: the post-Plan binding insert below appends its whiteboard
     // event through this pool clone (the match consumes `gate_log_pool`).
+    // ADR-65 §3: the same clone backs the single-agent loop's tool-evidence
+    // writer (recorded via `.with_tool_facts` in `execute_agent_loop`).
     let d7_event_pool = gate_log_pool.clone();
     // ADR-60 D5: give the in-process single-agent loop the same always-on
     // write-gate protection the supervised agent-process path enforces. The
@@ -3210,6 +3302,7 @@ pub async fn run_shared_agent(
         effective_outcome,
         action_required,
         &stage_tracker,
+        d7_event_pool.clone(),
     )
     .await?;
 
@@ -3315,6 +3408,11 @@ async fn run_multi_agent(
     stage_tracker: &Arc<Mutex<StageTracker>>,
     intent_policy: Arc<dyn PolicyEngine>,
     gate_log_pool: Option<sqlx::SqlitePool>,
+    // ADR-65 §7: the checkpoint row's own `updated_at` — the v3 backfill
+    // hint for the coordinator's additive §7 backfill. `None` for a fresh
+    // run (the backfill then treats the whole log as pre-cursor,
+    // fail-soft).
+    resume_cursor_hint_ms: Option<i64>,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -3761,6 +3859,11 @@ async fn run_multi_agent(
         &skills_section,
         facade.as_ref(),
         merge_seeds,
+        // ADR-65 §3: the session-DB pool backs every registered specialist's
+        // tool-evidence writer. The snapshot barrier runs below, so the
+        // writer's per-call `generation` comes from `AgentContext` instead of
+        // being baked here.
+        gate_log_pool.clone(),
     ));
     // The feed task below resolves implement-stage roles from the registry,
     // so keep a clone before `registry` moves into the coordinator.
@@ -3853,6 +3956,9 @@ async fn run_multi_agent(
         session_store.clone(),
         current_source_revision(&req.project_dir).await,
     );
+    // ADR-65 §7: the checkpoint row's own updated_at backs the additive v4
+    // backfill for pre-§7 (v3) checkpoints (fail-soft when absent).
+    coordinator = coordinator.with_resume_cursor_hint_ms(resume_cursor_hint_ms);
     // ADR-45 §4: user-configurable ladder knobs.
     if let Some(multi_agent) = &services.config.multi_agent {
         coordinator = coordinator.with_default_model_fallback(multi_agent.default_model_fallback);
@@ -3953,7 +4059,7 @@ async fn run_multi_agent(
         Some(_) => task.clone(),
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
-    let context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
+    let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
     // Run-stage tracking (ADR-55 Phase 2a): the coordinator publishes
     // `SubTaskCreated` and gate-cycle (`ReviewCycleStarted` /
     // `ValidationCycleStarted`) events on the bus as the graph progresses, so
@@ -4012,6 +4118,28 @@ async fn run_multi_agent(
             }
         }
     });
+    // ---- ADR-65 §2 (Phase 2): workspace snapshot readiness barrier ----
+    //
+    // A read-only, deterministic, language-agnostic project-tree inventory
+    // (relative paths + size + mtime + cheap content hash) is captured BEFORE
+    // planning begins. Planning waits on THIS barrier — never on the
+    // asynchronously spawned vector indexing. The digest rides into every
+    // dispatched agent's context (via the snapshot attached to the
+    // coordinator), and a `WorkspaceSnapshot` whiteboard event + a
+    // `resource_facts` application are appended best-effort to the shared
+    // run database. Fail-soft by contract: an unreadable project dir (None) or
+    // an unpersistable snapshot degrades to a warning — the run proceeds.
+    let workspace_snapshot = crate::workspace_snapshot::run_snapshot_barrier(
+        gate_log_pool.as_ref(),
+        &project_dir,
+        &session_id.to_string(),
+        &req.cancel_token,
+    )
+    .await;
+    if let Some(snapshot) = workspace_snapshot {
+        context.workspace_snapshot_digest = Some(snapshot.digest());
+        coordinator = coordinator.with_workspace_snapshot(snapshot);
+    }
     let mut output = match coordinator
         .run(multi_task, context, req.cancel_token.clone(), req.resume_checkpoint_json.clone())
         .await
@@ -5893,9 +6021,63 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // Spend-log persistence (Phase 3, issue #93)
+    // ADR-65 acceptance 9: memory is optional — disabled, absent, or a
+    // failed init all degrade to `NullMemoryStore`, never aborting a run.
     // ------------------------------------------------------------------
 
+    /// A healthy selection hands back the SAME store (identity-checked).
+    #[test]
+    fn memory_store_or_disabled_keeps_a_healthy_store() {
+        let store: Arc<dyn MemoryStore> = Arc::new(NullMemoryStore);
+        let selected = memory_store_or_disabled(Ok(Some(store.clone())));
+        assert!(Arc::ptr_eq(&store, &selected), "a healthy memory system is never replaced");
+    }
+
+    /// The degraded shapes (`None` selection and a failed init) both yield a
+    /// usable null store: retired-empty retrieves, silent discarding writes —
+    /// exactly the behavior of the store a memory-disabled run uses.
+    #[test]
+    fn memory_store_or_disabled_degraded_selection_behaves_null() {
+        for selection in [Ok(None), Err(OrchestratorError::AgentLoopError("boom".into()))] {
+            let selected = memory_store_or_disabled(selection);
+            let query = concerto_core::memory::MemoryQuery {
+                text: "anything".into(),
+                project_id: concerto_core::types::ProjectId("p".into()),
+                namespace: concerto_core::memory::MemoryNamespace::Project(
+                    concerto_core::types::ProjectId("p".into()),
+                ),
+                top_k: 5,
+                filters: vec![],
+            };
+            let retrieved = tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(selected.retrieve(&query, CancellationToken::new()));
+            assert!(retrieved.expect("retrieve").is_empty(), "disabled memory retrieves nothing");
+
+            let entry = concerto_core::memory::MemoryEntry {
+                id: concerto_core::memory::MemoryId(concerto_core::ids::Ulid::new()),
+                project_id: concerto_core::types::ProjectId("p".into()),
+                namespace: concerto_core::memory::MemoryNamespace::Project(
+                    concerto_core::types::ProjectId("p".into()),
+                ),
+                content: "x".into(),
+                chunk_type: concerto_core::memory::ChunkType::Fact,
+                model_id: None,
+                model_version: None,
+                metadata: serde_json::Value::Null,
+                expires_at: None,
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            let stored = tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(selected.store(entry, CancellationToken::new()));
+            assert!(stored.is_ok(), "the null store accepts (and discards) writes");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Spend-log persistence (Phase 3, issue #93)
+    // ------------------------------------------------------------------
     /// One spend record is persisted per completed provider call with the
     /// settled actual cost, exactly the data `persist_spend_records` receives
     /// from the run output. Exercises the best-effort path against a real
@@ -6497,7 +6679,7 @@ mod runtime_runner_tests {
         )
         .await;
 
-        let continuity = load_run_continuity(&pool, session_id).await.expect("load");
+        let continuity = load_run_continuity(&pool, session_id, None).await.expect("load");
         assert!(
             continuity
                 .plan
@@ -6524,7 +6706,7 @@ mod runtime_runner_tests {
         // The seed mirrors the hook: a resume-shaped task grows the section.
         let mut task = build_run_task(session_id, true, false, None, None, "continue");
         assert_eq!(task.description, "continue");
-        seed_run_continuity(&mut task, &pool, session_id).await;
+        seed_run_continuity(&mut task, &pool, session_id, None).await;
         assert!(
             task.description.contains("<run-continuity>"),
             "the continuity section is appended: {}",
@@ -6540,6 +6722,67 @@ mod runtime_runner_tests {
                 && task.description.contains("cargo test exited 101"),
             "the ledger rides the section: {}",
             task.description
+        );
+    }
+
+    /// ADR-65 §7: a cursor-anchored continuity read folds ONLY events
+    /// appended after the cursor — pre-cursor rows are checkpoint state,
+    /// never replayed prose — while the no-cursor read keeps the legacy
+    /// whole-window behavior.
+    #[tokio::test]
+    async fn run_continuity_respects_the_whiteboard_cursor() {
+        const WRITE_APPLIED: concerto_sessions::whiteboard::WhiteboardKind =
+            concerto_sessions::whiteboard::WhiteboardKind::WriteApplied;
+        let (_dir, pool) = d7_pool().await;
+        let session_id = Ulid::new();
+
+        // Pre-cursor rows: the state the checkpoint itself carries.
+        append_session_event(
+            &pool,
+            session_id,
+            "pre-write",
+            WRITE_APPLIED,
+            serde_json::json!({ "pre_images": { "src/pre.rs": "h" } }),
+        )
+        .await;
+        let stored =
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default()).await.expect("load");
+        let cursor = stored
+            .iter()
+            .filter(|event| event.kind == WRITE_APPLIED)
+            .map(|event| event.gate_seq)
+            .max()
+            .expect("a pre-cursor write row exists");
+
+        // The post-cursor row: appended after the checkpoint.
+        append_session_event(
+            &pool,
+            session_id,
+            "post-write",
+            WRITE_APPLIED,
+            serde_json::json!({ "pre_images": { "src/post.rs": "h" } }),
+        )
+        .await;
+
+        let cursor_view = load_run_continuity(&pool, session_id, Some(cursor)).await.expect("load");
+        assert!(
+            cursor_view.ledger.files_touched.contains(&"src/post.rs".to_owned()),
+            "post-cursor facts are the evidence view: {:?}",
+            cursor_view.ledger
+        );
+        assert!(
+            !cursor_view.ledger.files_touched.contains(&"src/pre.rs".to_owned()),
+            "pre-cursor events are NOT replayed into the evidence view: {:?}",
+            cursor_view.ledger
+        );
+
+        // Without a cursor the legacy whole-window read still folds both.
+        let legacy = load_run_continuity(&pool, session_id, None).await.expect("load");
+        assert!(
+            legacy.ledger.files_touched.contains(&"src/pre.rs".to_owned())
+                && legacy.ledger.files_touched.contains(&"src/post.rs".to_owned()),
+            "no cursor → the legacy window reads the whole tail: {:?}",
+            legacy.ledger
         );
     }
 
@@ -6585,7 +6828,7 @@ mod runtime_runner_tests {
         )
         .await;
 
-        let continuity = load_run_continuity(&pool, session_id).await.expect("load");
+        let continuity = load_run_continuity(&pool, session_id, None).await.expect("load");
         assert!(continuity.plan.is_none(), "an unattested artifact is skipped, never trusted");
         assert!(
             continuity.ledger.files_touched.contains(&"src/main.rs".to_owned()),
@@ -6600,11 +6843,11 @@ mod runtime_runner_tests {
     async fn run_continuity_empty_log_is_a_noop() {
         let (_dir, pool) = d7_pool().await;
         let session_id = Ulid::new();
-        let continuity = load_run_continuity(&pool, session_id).await.expect("load");
+        let continuity = load_run_continuity(&pool, session_id, None).await.expect("load");
         assert!(continuity.is_empty(), "an empty log is the truthful empty state");
 
         let mut task = build_run_task(session_id, true, false, None, None, "continue");
-        seed_run_continuity(&mut task, &pool, session_id).await;
+        seed_run_continuity(&mut task, &pool, session_id, None).await;
         assert_eq!(
             task.description, "continue",
             "an empty ledger seeds nothing — the resume text is untouched"
@@ -7344,6 +7587,7 @@ mod runtime_runner_tests {
             RequestedOutcome::Execute,
             true,
             &stage_tracker,
+            None, // no fact-writer pool in this test
         )
         .await
         .expect("action-required run should complete");
@@ -7403,6 +7647,7 @@ mod runtime_runner_tests {
             RequestedOutcome::Plan,
             false,
             &stage_tracker,
+            None, // no fact-writer pool in this test
         )
         .await
         .expect("plan run should complete");
@@ -7462,6 +7707,7 @@ mod runtime_runner_tests {
             RequestedOutcome::Execute,
             true,
             &stage_tracker,
+            None, // no fact-writer pool in this test
         )
         .await;
 
@@ -7583,6 +7829,7 @@ mod runtime_runner_tests {
             &HashMap::new(),
             "",
             true,
+            None, // no fact-writer pool in this test
         );
 
         let task_id = TaskId::new();

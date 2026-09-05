@@ -133,6 +133,9 @@ fn register_seeded_agents(
     eval_root: &std::path::Path,
     skills_section: &str,
     facade: Option<&BlueprintFacade>,
+    // ADR-65 §3: the session-DB pool backing every registered specialist's
+    // tool-evidence writer; `None` (tests, pools unavailable) disables it.
+    fact_pool: Option<sqlx::SqlitePool>,
 ) {
     for (id, cfg) in merged {
         if cfg.disabled || id.as_str() == "coordinator" {
@@ -186,8 +189,14 @@ fn register_seeded_agents(
         let bus_owned = bus.clone();
         let retry_policy_owned = retry_policy.clone();
         let eval_root_owned = eval_root.to_path_buf();
+        let fact_pool_owned = fact_pool.clone();
         let factory_id = id_owned.clone();
         let build = move |provider: Arc<dyn LlmProvider>| -> Arc<dyn ExpertAgent> {
+            // ADR-65 §3: stamp the shared pool onto this specific agent's
+            // evidence writer (agent identity is never inferred).
+            let fact_ctx = fact_pool_owned.clone().map(|pool| {
+                crate::tool_facts::ToolFactContext::new(Some(pool), id_owned.to_string())
+            });
             // Verify-stage (Acceptance-kind) agent: with the eval capability
             // on, the attached engine runs the test suite with no LLM call;
             // with it off, `with_eval(None)` still enables eval mode so the
@@ -218,7 +227,8 @@ fn register_seeded_agents(
                     )
                     .with_output_mode(output_mode)
                     .with_eval(eval)
-                    .with_skills_section(&skills),
+                    .with_skills_section(&skills)
+                    .with_tool_facts(fact_ctx),
                 );
             }
             Arc::new(
@@ -234,7 +244,8 @@ fn register_seeded_agents(
                     capabilities.clone(),
                 )
                 .with_output_mode(output_mode)
-                .with_skills_section(&skills),
+                .with_skills_section(&skills)
+                .with_tool_facts(fact_ctx),
             )
         };
         registry.register_with_factory(factory_id, build(get_provider(id)), Arc::new(build));
@@ -382,6 +393,7 @@ impl AgentRegistry {
             std::path::Path::new("."),
             skills_section,
             None,
+            None, // Adr-65 §3: no fact-writer pool on the default construction path
         );
         // Retain the merged configs so the planner roster can describe each
         // role (ADR-35 phase 4, roster enrichment).
@@ -414,6 +426,7 @@ impl AgentRegistry {
         agent_configs: &HashMap<AgentId, CustomAgentConfig>,
         skills_section: &str,
         merge_seeds: bool,
+        fact_pool: Option<sqlx::SqlitePool>,
     ) -> Self {
         let merged = merged_agent_configs(agent_configs, merge_seeds);
         // Audit A-01: the eval engine is attached to the validator seed
@@ -430,6 +443,7 @@ impl AgentRegistry {
             std::path::Path::new("."),
             skills_section,
             None,
+            fact_pool,
         )
     }
 
@@ -449,6 +463,7 @@ impl AgentRegistry {
         eval_root: &std::path::Path,
         skills_section: &str,
         facade: Option<&BlueprintFacade>,
+        fact_pool: Option<sqlx::SqlitePool>,
     ) -> Self {
         let get_provider = |id: &AgentId| -> Arc<dyn LlmProvider> {
             role_providers.get(id).cloned().unwrap_or_else(|| default_provider.clone())
@@ -465,6 +480,7 @@ impl AgentRegistry {
             eval_root,
             skills_section,
             facade,
+            fact_pool,
         );
         // Retain the merged configs so the planner roster can describe each
         // role (ADR-35 phase 4, roster enrichment). Covers
@@ -491,6 +507,7 @@ impl AgentRegistry {
         agent_configs: &HashMap<AgentId, CustomAgentConfig>,
         skills_section: &str,
         merge_seeds: bool,
+        fact_pool: Option<sqlx::SqlitePool>,
     ) -> Self {
         Self::build_with_roles_for_project_with_facade(
             role_providers,
@@ -503,6 +520,7 @@ impl AgentRegistry {
             skills_section,
             None,
             merge_seeds,
+            fact_pool,
         )
     }
 
@@ -517,6 +535,9 @@ impl AgentRegistry {
     /// `None` (tests, manually constructed registries) keeps the exact
     /// pre-resolution raw-config path — byte-identical on the default
     /// `standard` blueprint.
+    ///
+    /// `fact_pool` (ADR-65 §3) backs every registered specialist's
+    /// tool-evidence writer; `None` (tests, pools unavailable) disables it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_with_roles_for_project_with_facade(
         role_providers: HashMap<AgentId, Arc<dyn LlmProvider>>,
@@ -529,6 +550,7 @@ impl AgentRegistry {
         skills_section: &str,
         facade: Option<&BlueprintFacade>,
         merge_seeds: bool,
+        fact_pool: Option<sqlx::SqlitePool>,
     ) -> Self {
         // Audit §3.2: `memory` was threaded in only to be forwarded to
         // `build_with_roles`, which itself ignored it (underscore-prefixed).
@@ -549,6 +571,7 @@ impl AgentRegistry {
             project_root,
             skills_section,
             facade,
+            fact_pool,
         )
     }
 }
@@ -801,6 +824,7 @@ mod tests {
             &configs,
             "",
             true,
+            None, // no fact-writer pool in this test
         );
 
         let docs =
@@ -832,6 +856,7 @@ mod tests {
             configs,
             "",
             true,
+            None, // no fact-writer pool in this test
         )
     }
 
@@ -1042,6 +1067,7 @@ mod tests {
             &HashMap::new(),
             "",
             true,
+            None, // no fact-writer pool in this test
         );
 
         let validator =
@@ -1115,6 +1141,7 @@ mod tests {
             "",
             Some(&facade),
             true,
+            None, // no fact-writer pool in this test
         );
 
         let validator =

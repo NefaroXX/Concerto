@@ -9,10 +9,15 @@ pub mod audit;
 pub mod plan_bindings;
 pub mod plans;
 pub mod replay;
+pub mod resource_facts;
 pub mod spend;
 pub mod whiteboard;
 
 pub use plan_bindings::PlanBindingRecord;
+pub use resource_facts::{
+    CachedRead, ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
+    WorkspaceSnapshotPayload,
+};
 pub use whiteboard::{
     NewWhiteboardEvent, WhiteboardEvent, WhiteboardKind, WhiteboardScope, WhiteboardSubscription,
 };
@@ -48,6 +53,11 @@ pub enum SessionError {
     Serialization(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// A write was rejected by a structural validation rule before it could
+    /// land (ADR-65 §1: a claim or decision referencing evidence must
+    /// reference existing event ids — the append is rejected).
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl From<sqlx::Error> for SessionError {

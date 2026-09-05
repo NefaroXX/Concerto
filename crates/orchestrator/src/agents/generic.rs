@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
 use concerto_core::event::{EventBus, EventKind};
@@ -43,7 +44,8 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
     CompletionRequest, DesignDoc, EvalResult, Message, OutputMode, ResearchReport, ReviewReport,
-    ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition, ToolResult,
+    ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition, ToolOutput,
+    ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -95,6 +97,11 @@ pub struct GenericSpecialistAgent {
     /// verbatim into every prompt this agent builds; empty when skills are
     /// disabled.
     skills_section: String,
+    /// ADR-65 §3: tool-evidence writer. When `Some`, every completed tool
+    /// command this agent executes is recorded as a `ToolExecuted` whiteboard
+    /// event attributed to this agent (its `id`) — fail-soft, never affects
+    /// tool results.
+    tool_facts: Option<ToolFactContext>,
 }
 
 impl GenericSpecialistAgent {
@@ -133,6 +140,7 @@ impl GenericSpecialistAgent {
             eval: None,
             eval_mode: false,
             skills_section: String::new(),
+            tool_facts: None,
         }
     }
 
@@ -164,6 +172,101 @@ impl GenericSpecialistAgent {
     pub fn with_skills_section(mut self, skills_section: &str) -> Self {
         self.skills_section = skills_section.to_string();
         self
+    }
+
+    /// Attach an ADR-65 §3 tool-evidence writer. When `Some`, every completed
+    /// tool command is recorded as a `ToolExecuted` whiteboard event
+    /// attributed to this agent's id — fail-soft, never affects tool results.
+    pub fn with_tool_facts(mut self, tool_facts: Option<ToolFactContext>) -> Self {
+        self.tool_facts = tool_facts;
+        self
+    }
+
+    /// ADR-65 §3: record a completed tool command as a `ToolExecuted`
+    /// whiteboard fact. Attribution is real, never inferred: this agent's
+    /// `ToolFactContext` carries its own id, and the per-call fact carries the
+    /// task id, run id, and workspace generation from the dispatch context.
+    /// Recording is fail-soft — a writer failure never affects the tool
+    /// result already returned to the model.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_tool_fact(
+        &self,
+        task: &SubTask,
+        context: &AgentContext,
+        tool: &str,
+        arguments: &serde_json::Value,
+        success: bool,
+        output_data: Option<&serde_json::Value>,
+        file_affecting: bool,
+        pre_image_hashes: HashMap<String, Option<String>>,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = task.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        let paths = crate::tool_facts::extract_affected_paths(arguments, output_data);
+        facts
+            .record_tool_executed(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: context.run_id.as_deref(),
+                    generation: context.workspace_generation.as_deref().unwrap_or(""),
+                    project_root: &context.session.project_dir,
+                    tool,
+                    args: arguments,
+                    success,
+                    exit_code: None,
+                    paths: &paths,
+                    file_affecting,
+                    pre_image_hashes,
+                },
+                cancel,
+            )
+            .await;
+    }
+
+    /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
+    /// `served_from` (the original observation's event id) and empty paths —
+    /// see `ToolFactContext::record_served_read`. Fail-soft, like every
+    /// evidence write; never affects the tool result already returned.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_served_read_fact(
+        &self,
+        task: &SubTask,
+        context: &AgentContext,
+        tool: &str,
+        arguments: &serde_json::Value,
+        served_from: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = task.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_served_read(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: context.run_id.as_deref(),
+                    generation: context.workspace_generation.as_deref().unwrap_or(""),
+                    project_root: &context.session.project_dir,
+                    tool,
+                    args: arguments,
+                    success: true,
+                    exit_code: None,
+                    paths: &[],
+                    file_affecting: false,
+                    pre_image_hashes: HashMap::new(),
+                },
+                served_from,
+                cancel,
+            )
+            .await;
     }
 
     /// Build the prompt for this agent from its configured sections plus
@@ -206,6 +309,15 @@ impl GenericSpecialistAgent {
                 prompt.push_str("\n\n");
                 prompt.push_str(&formatted);
             }
+        }
+
+        // ADR-65 §2 (Phase 2): the pre-planning workspace snapshot digest —
+        // generation id, file/byte totals, top-level tree. Grounds the agent in
+        // the deterministic inventory captured before planning began.
+        if let Some(digest) = &context.workspace_snapshot_digest {
+            prompt.push_str("\n\n<workspace_snapshot>\n");
+            prompt.push_str(digest);
+            prompt.push_str("\n</workspace_snapshot>");
         }
 
         if !context.previous_results.is_empty() {
@@ -482,8 +594,98 @@ impl GenericSpecialistAgent {
                     && arguments.get("operation").and_then(|value| value.as_str()).is_some_and(
                         |operation| matches!(operation, "write" | "delete" | "move" | "copy"),
                     ));
+                // ADR-65 §3: hash the pre-write state of every path this
+                // command will touch before it runs (fail-soft).
+                let pre_image_hashes = match &self.tool_facts {
+                    Some(facts) => {
+                        let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
+                        facts
+                            .pre_image_hashes(&context.session.project_dir, &affected, &cancel)
+                            .await
+                    }
+                    None => HashMap::new(),
+                };
+                // ADR-65 §4: safe read dedupe — a plain single-path filesystem
+                // read whose clean observation still matches the disk (re-statted
+                // now, content hash verified) is a serve candidate. Any doubt
+                // degrades to normal execution; the model receives a
+                // byte-identical read result either way.
+                let serve = match &self.tool_facts {
+                    Some(facts) => {
+                        crate::read_cache::maybe_serve_read(
+                            facts,
+                            &context.session.project_dir,
+                            &tool_call.name,
+                            &arguments,
+                            &cancel,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                // ADR-65 F1a: serve only when the policy engine explicitly
+                // allows the read through the advisory path (no decision row, no
+                // quota consumption); any non-Allow verdict runs the normal,
+                // fully policy-checked executor path below.
+                let serve = match serve {
+                    Some(serve)
+                        if executor
+                            .policy_verdict_is_allow(
+                                &tool_call.name,
+                                &arguments,
+                                &context.session,
+                                cancel.clone(),
+                            )
+                            .await =>
+                    {
+                        Some(serve)
+                    }
+                    _ => None,
+                };
+                if let Some(serve) = serve {
+                    // ADR-65 F1b: the serve consumed no executor decision row —
+                    // persist its own ServedFromCache audit row (fail-soft).
+                    executor
+                        .record_served_read_audit(
+                            &tool_call.name,
+                            &arguments,
+                            &serve.path,
+                            &context.session,
+                            cancel.clone(),
+                        )
+                        .await;
+                    let served_summary =
+                        format!("Read {} bytes from {}", serve.content.len(), serve.path);
+                    let output = ToolOutput {
+                        summary: served_summary.clone(),
+                        data: serde_json::json!({ "content": serve.content, "path": serve.path }),
+                    };
+                    self.record_served_read_fact(
+                        task,
+                        &context,
+                        &tool_call.name,
+                        &arguments,
+                        &serve.event_id,
+                        &cancel,
+                    )
+                    .await;
+                    messages.push(Message {
+                        role: Role::Tool,
+                        content: String::new(),
+                        tool_calls: None,
+                        tool_results: Some(vec![ToolResult {
+                            id: tool_call.id,
+                            name: tool_call.name.clone(),
+                            content: serde_json::to_value(&output).unwrap_or_default(),
+                        }]),
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    continue;
+                }
                 match executor
-                    .execute(&tool_call.name, arguments, &context.session, cancel.clone())
+                    .execute(&tool_call.name, arguments.clone(), &context.session, cancel.clone())
                     .await
                 {
                     Ok(output) => {
@@ -506,6 +708,34 @@ impl GenericSpecialistAgent {
                                 }
                             }
                         }
+                        // ADR-65 §3: record the completed (successful) tool
+                        // command with the paths it actually touched.
+                        self.record_tool_fact(
+                            task,
+                            &context,
+                            &tool_call.name,
+                            &arguments,
+                            true,
+                            Some(&output.data),
+                            is_file_change,
+                            pre_image_hashes.clone(),
+                            &cancel,
+                        )
+                        .await;
+                        // ADR-65 §4: cache the exact bytes of a successful plain
+                        // read (after the observation above, so the row exists)
+                        // so an identical later read can be served. Fail-soft.
+                        if let Some(facts) = &self.tool_facts {
+                            crate::read_cache::cache_read_output(
+                                facts,
+                                &context.session.project_dir,
+                                &tool_call.name,
+                                &arguments,
+                                &output.data,
+                                &cancel,
+                            )
+                            .await;
+                        }
                         messages.push(Message {
                             role: Role::Tool,
                             content: String::new(),
@@ -521,6 +751,20 @@ impl GenericSpecialistAgent {
                         });
                     }
                     Err(error) => {
+                        // ADR-65 §3: record the completed (failed) tool
+                        // command too — evidence exists either way.
+                        self.record_tool_fact(
+                            task,
+                            &context,
+                            &tool_call.name,
+                            &arguments,
+                            false,
+                            None,
+                            is_file_change,
+                            pre_image_hashes.clone(),
+                            &cancel,
+                        )
+                        .await;
                         let _ = self.bus.publish_for_session(
                             task.session_id,
                             task.id.0,
@@ -1517,12 +1761,111 @@ impl GenericSpecialistAgent {
                                 .is_some_and(|operation| {
                                     matches!(operation, "write" | "delete" | "move" | "copy")
                                 }));
+                        // ADR-65 §3: hash the pre-write state of every path
+                        // this command will touch before it runs (fail-soft).
+                        let pre_image_hashes = match &self.tool_facts {
+                            Some(facts) => {
+                                let affected =
+                                    crate::tool_facts::extract_affected_paths(&arguments, None);
+                                facts
+                                    .pre_image_hashes(
+                                        &context.session.project_dir,
+                                        &affected,
+                                        &cancel,
+                                    )
+                                    .await
+                            }
+                            None => HashMap::new(),
+                        };
+                        // ADR-65 §4: safe read dedupe (same rule as the
+                        // freeform loop above; any doubt → execute normally).
+                        let serve = match &self.tool_facts {
+                            Some(facts) => {
+                                crate::read_cache::maybe_serve_read(
+                                    facts,
+                                    &context.session.project_dir,
+                                    &tool_call.name,
+                                    &arguments,
+                                    &cancel,
+                                )
+                                .await
+                            }
+                            None => None,
+                        };
+                        // ADR-65 F1a: serve only on an explicit policy Allow via
+                        // the advisory path; anything else runs the normal,
+                        // fully policy-checked executor path below.
+                        let serve = match &self.tool_executor {
+                            Some(executor) => match serve {
+                                Some(serve)
+                                    if executor
+                                        .policy_verdict_is_allow(
+                                            &tool_call.name,
+                                            &arguments,
+                                            &context.session,
+                                            cancel.clone(),
+                                        )
+                                        .await =>
+                                {
+                                    Some(serve)
+                                }
+                                _ => None,
+                            },
+                            None => None,
+                        };
+                        if let Some(serve) = serve {
+                            // ADR-65 F1b: persist the ServedFromCache audit row
+                            // (fail-soft) — the serve consumed no decision row.
+                            if let Some(executor) = &self.tool_executor {
+                                executor
+                                    .record_served_read_audit(
+                                        &tool_call.name,
+                                        &arguments,
+                                        &serve.path,
+                                        &context.session,
+                                        cancel.clone(),
+                                    )
+                                    .await;
+                            }
+                            let served_summary =
+                                format!("Read {} bytes from {}", serve.content.len(), serve.path);
+                            let output = ToolOutput {
+                                summary: served_summary.clone(),
+                                data: serde_json::json!({
+                                    "content": serve.content,
+                                    "path": serve.path
+                                }),
+                            };
+                            self.record_served_read_fact(
+                                task,
+                                &context,
+                                &tool_call.name,
+                                &arguments,
+                                &serve.event_id,
+                                &cancel,
+                            )
+                            .await;
+                            messages.push(Message {
+                                role: Role::Tool,
+                                content: String::new(),
+                                tool_calls: None,
+                                tool_results: Some(vec![ToolResult {
+                                    id: tool_call.id.clone(),
+                                    name: tool_call.name.clone(),
+                                    content: serde_json::to_value(&output).unwrap_or_default(),
+                                }]),
+                                reasoning_content: None,
+                                tokens_in: None,
+                                tokens_out: None,
+                            });
+                            continue;
+                        }
                         let result = match &self.tool_executor {
                             Some(executor) => {
                                 executor
                                     .execute(
                                         &tool_call.name,
-                                        arguments,
+                                        arguments.clone(),
                                         &context.session,
                                         cancel.clone(),
                                     )
@@ -1556,6 +1899,34 @@ impl GenericSpecialistAgent {
                                         }
                                     }
                                 }
+                                // ADR-65 §3: record the completed
+                                // (successful) tool command.
+                                self.record_tool_fact(
+                                    task,
+                                    &context,
+                                    &tool_call.name,
+                                    &arguments,
+                                    true,
+                                    Some(&output.data),
+                                    is_file_change,
+                                    pre_image_hashes.clone(),
+                                    &cancel,
+                                )
+                                .await;
+                                // ADR-65 §4: cache the exact bytes of a
+                                // successful plain read (after the observation
+                                // above). Fail-soft.
+                                if let Some(facts) = &self.tool_facts {
+                                    crate::read_cache::cache_read_output(
+                                        facts,
+                                        &context.session.project_dir,
+                                        &tool_call.name,
+                                        &arguments,
+                                        &output.data,
+                                        &cancel,
+                                    )
+                                    .await;
+                                }
                                 messages.push(Message {
                                     role: Role::Tool,
                                     content: String::new(),
@@ -1571,6 +1942,20 @@ impl GenericSpecialistAgent {
                                 });
                             }
                             Err(error) => {
+                                // ADR-65 §3: record the completed (failed)
+                                // tool command too.
+                                self.record_tool_fact(
+                                    task,
+                                    &context,
+                                    &tool_call.name,
+                                    &arguments,
+                                    false,
+                                    None,
+                                    is_file_change,
+                                    pre_image_hashes.clone(),
+                                    &cancel,
+                                )
+                                .await;
                                 let _ = self.bus.publish_for_session(
                                     task.session_id,
                                     task.id.0,
@@ -1915,6 +2300,9 @@ mod tests {
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
+            workspace_snapshot_digest: None,
+            run_id: None,
+            workspace_generation: None,
         }
     }
 

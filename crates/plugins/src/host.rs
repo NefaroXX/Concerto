@@ -39,6 +39,14 @@ impl PluginHost {
         config.wasm_multi_memory(false);
         config.wasm_bulk_memory(true);
         config.wasm_tail_call(false);
+        // Load-bearing security tripwire: wasmtime >= 32 defaults memory64 to
+        // ON, and RUSTSEC-2026-0096 (aarch64 Cranelift sandbox escape) and
+        // RUSTSEC-2026-0086 (Winch + table64 host data leak) require 64-bit
+        // linear memories as a precondition. This explicit `false` ensures a
+        // future wasmtime version bump cannot silently flip the default and
+        // reopen those advisories. The `winch` feature must also stay off
+        // (workspace Cargo.toml enables only `cranelift` + `async`).
+        config.wasm_memory64(false);
         config.consume_fuel(true);
         config.epoch_interruption(true);
         // Run host functions asynchronously (ADR-38): host functions await host

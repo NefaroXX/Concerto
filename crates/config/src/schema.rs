@@ -539,6 +539,16 @@ pub struct MemoryConfig {
     /// `.gitignore` and `.concertoignore`.
     #[serde(default)]
     pub ignore_file: Option<Utf8PathBuf>,
+    /// ADR-65 §8 retention for derived summary chunks (`Fact` +
+    /// `SessionSummary`): keep the newest N per session bucket and prune
+    /// older ones. `0` disables the count cap (keep everything).
+    #[serde(default = "default_summary_keep_per_session")]
+    pub summary_keep_per_session: u32,
+    /// ADR-65 §8 retention window (days) for derived summary chunks:
+    /// summaries older than this are pruned at memory init. `0` disables the
+    /// age-based prune. Source chunks are never window-pruned here.
+    #[serde(default = "default_summary_retention_days")]
+    pub summary_retention_days: u16,
 }
 
 fn default_memory_enabled() -> bool {
@@ -549,6 +559,14 @@ fn default_memory_ttl_days() -> u16 {
     30
 }
 
+fn default_summary_keep_per_session() -> u32 {
+    20
+}
+
+fn default_summary_retention_days() -> u16 {
+    365
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -556,6 +574,8 @@ impl Default for MemoryConfig {
             ttl_days: default_memory_ttl_days(),
             exclude_patterns: Vec::new(),
             ignore_file: None,
+            summary_keep_per_session: default_summary_keep_per_session(),
+            summary_retention_days: default_summary_retention_days(),
         }
     }
 }
@@ -565,6 +585,11 @@ impl MemoryConfig {
         if !(1..=365).contains(&self.ttl_days) {
             return Err(ConfigError::InvalidValue(
                 "memory.ttl_days must be between 1 and 365".into(),
+            ));
+        }
+        if self.summary_retention_days > 365 {
+            return Err(ConfigError::InvalidValue(
+                "memory.summary_retention_days must be 0 (disabled) or between 1 and 365".into(),
             ));
         }
         Ok(())

@@ -100,12 +100,15 @@ cargo audit
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  **v28** (v43+ needs a `func_wrap` API migration). Read `deny.toml`
+  the **24.0.x** line (v43+ needs a `func_wrap` API migration). Read
+  `deny.toml`
   justification/scope before changing anything.
 - **Dependencies**: historical phase comments are not authorization to retain
   unused crates. Add a dependency only for a current, tested need. Wasmtime is
   pinned to the patched 24.0.x line for the current RustSec advisory; do not
-  move it to an unpatched release without checking the advisory and API.
+  move it to an unpatched release without checking the advisory and API
+  (`crates/plugins/src/host.rs` pins `config.wasm_memory64(false)` — keep
+  `winch` off on any bump, see deny.toml).
 - **Policy gates**: every file write / shell / git op is policy-gated and
   reversible via git stash/branch rollback. Don't bypass `SimplePolicyEngine` or
   `VirtualFs`.
@@ -114,6 +117,13 @@ cargo audit
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`
 - Supervised agent-process (ADR-60 S5): `crates/orchestrator/src/gate_proxy.rs` (agent-process facade), `crates/orchestrator/src/supervisor.rs` (Completed semantics, ADR-60 S5)
 - Multi-agent coordinator: `crates/orchestrator/src/coordinator.rs`
+- Evidence spine — scheduling: `crates/orchestrator/src/evidence_scheduler.rs` (evidence-driven dispatch, replaces fixed fallback)
+- Evidence spine — DesignDoc verifier: `crates/orchestrator/src/design_doc_verifier.rs` (deterministic lifecycle Proposed→Verified/Active|Quarantined|Skipped)
+- Evidence spine — workspace snapshot: `crates/orchestrator/src/workspace_snapshot.rs` (readiness barrier, inventory)
+- Evidence spine — tool facts: `crates/orchestrator/src/tool_facts.rs` (hot-path fact writer with agent attribution)
+- Evidence spine — read cache: `crates/orchestrator/src/read_cache.rs` (safe read dedupe + action digest)
+- Evidence spine — resume: `crates/orchestrator/src/resume.rs` (continuation restores state at whiteboard cursor)
+- Evidence spine — resource facts store: `crates/sessions/src/resource_facts.rs` (derived `resource_facts` table, migrations 029–031)
 - Provider abstraction + factory: `crates/core/src/traits/provider.rs`, `crates/providers/src/factory.rs`
 - Tool execution safety: `crates/tools/src/virtual_fs.rs` (`VirtualFs`), `crates/core/src/policy.rs`
 - Plugin provider execution: `crates/plugins/src/provider_host.rs` (`PluginBackedProvider`)
