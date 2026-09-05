@@ -12049,6 +12049,122 @@ mod tests {
         );
     }
 
+    /// ADR-65 §8 / acceptance 9: a memory store that FORBIDS writes — wired
+    /// into the continuation loop to prove no path touches vector memory
+    /// while restoring an evidenced checkpoint. Retrieve mirrors the
+    /// disabled behavior (empty).
+    struct ForbiddenMemoryStore;
+
+    #[async_trait::async_trait]
+    impl MemoryStore for ForbiddenMemoryStore {
+        async fn retrieve(
+            &self,
+            _query: &concerto_core::memory::MemoryQuery,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<concerto_core::memory::MemoryChunk>, concerto_core::MemoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _entry: concerto_core::memory::MemoryEntry,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::memory::MemoryId, concerto_core::MemoryError> {
+            panic!("vector memory write attempted with memory disabled (ADR-65 acceptance 9)")
+        }
+
+        async fn invalidate(
+            &self,
+            _id: concerto_core::memory::MemoryId,
+            _cancel: CancellationToken,
+        ) -> Result<(), concerto_core::MemoryError> {
+            Ok(())
+        }
+    }
+
+    /// ADR-65 acceptance 9: the blocked-step continuation loop completes with
+    /// vector memory entirely DISABLED, and no path ever writes a memory
+    /// entry (the store panics on any write — the run's success is the proof).
+    #[tokio::test]
+    async fn continuation_loop_completes_with_vector_memory_disabled() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Pre-cursor failure (checkpoint-era, never replayed) + post-cursor
+        // progress fact: the same evidence shape the Phase 7 continue test
+        // uses.
+        append_tool_fact(&pool, session_id, "ev-pre-fail", &subtask_id.to_string(), false).await;
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = Arc::new(AgentRegistry::new()); // no candidates
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds without vector memory");
+
+        // The restore still reads the log, re-arms the step, and appends its
+        // decision — projected memory was simply never consulted for state.
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "Continue re-arms the step");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(decisions.len(), 1, "exactly one resume decision");
+        assert_eq!(decisions[0].payload["selected_agent"], "coder");
+        assert_eq!(decisions[0].payload["reason"], "resume-continue-blocked");
+    }
+
     /// No progress ⇒ replace the agent, never a blind same-agent
     /// re-dispatch (the 5-repeat live failure's first guard).
     #[tokio::test]

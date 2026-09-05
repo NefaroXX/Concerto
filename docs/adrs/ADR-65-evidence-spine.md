@@ -341,3 +341,37 @@ under, so the store lookup and the re-stat target the same canonical scope.
 
 Fail-soft: absent pool, absent snapshot, or store error ⇒ bare snapshot digest
 + warning; the digest itself is not a decision input yet (Phase 2 scope).
+
+## Implementation note (Phase 8 — §8 shipped, 2026-09-05)
+
+What actually shipped for §8 (vectors stay strictly derived):
+
+- **Audit.** Two runtime producers embed session/log-derived content into
+  vector chunks: the D6 consolidation projection (`Fact` chunks) and the
+  agent-loop task summary (`SessionSummary`). The consolidation projection
+  previously embedded decision `reason` text verbatim (and, defensively, the
+  whole payload JSON when no known key matched) — a violation of the §8 rule
+  that decision records are never vectorized. It now embeds **aggregate-only**
+  text: per-author decision counts, selected-agent outcome distributions,
+  approval counts with the newest gate sequence, and resolved review status
+  distributions. No reason, `required_output`, evidence id, artifact hash, or
+  raw payload JSON reaches an embedding — authoritative records live only in
+  the log. Fold windows whose aggregates are identical converge to the same
+  chunk id (idempotent upsert) instead of minting spurious supersessions.
+- **Retention.** `TtlManager::prune_derived_summaries` prunes `Fact` +
+  `SessionSummary` vector rows only (source chunks untouched): a per-session
+  count cap (`memory.summary_keep_per_session`, default 20, 0 keeps all) and
+  an age window (`memory.summary_retention_days`, default 365, 0 disables the
+  window). Session buckets come from the chunk metadata sidecar's
+  `session_id` (consolidation projections stamp the folded window's session
+  id); rows without attribution retain project-wide in one shared bucket.
+  Removal is a hard delete of vector rows plus best-effort FTS deletion,
+  idempotent, CancellationToken-aware, and logged.
+- **Disabled store (acceptance 9).** Vector memory was already optional on
+  every Phases 1–7 path (snapshot barrier → `resource_facts`, read dedupe,
+  verifier, scheduler, resume — none reference the vector store; the
+  consolidator is only constructed when memory is enabled). The remaining
+  hard edge was fixed: a memory-system init failure during a run now degrades
+  to `NullMemoryStore` with a warn instead of aborting the run. Integration
+  tests prove the continuation loop completes with a forbid-write memory
+  store wired in.

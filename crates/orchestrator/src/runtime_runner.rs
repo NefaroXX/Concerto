@@ -1206,6 +1206,20 @@ pub async fn init_memory_system(
     if let Err(error) = ttl.purge_expired(&project_id, CancellationToken::new()).await {
         tracing::warn!(%error, "failed to purge expired project memory");
     }
+    // ADR-65 §8: prune derived summary chunks (Fact/SessionSummary) past the
+    // configured retention — NEVER source chunks. Fail-soft: a failed prune
+    // only logs; the pass itself logs what it removed.
+    if let Err(error) = ttl
+        .prune_derived_summaries(
+            &project_id,
+            config.memory.summary_keep_per_session,
+            config.memory.summary_retention_days,
+            CancellationToken::new(),
+        )
+        .await
+    {
+        tracing::warn!(%error, "failed to prune derived summaries past retention");
+    }
     let decision_store = DecisionStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
     })?;
@@ -1928,6 +1942,27 @@ fn reset_memory_services(memory: &Mutex<Option<ActiveMemoryServices>>) {
     }
 }
 
+/// Turn the memory-services selection into the store a run uses: a healthy
+/// store, or `NullMemoryStore` when memory was disabled/absent or when init
+/// FAILED. A run's correctness (plan, scheduling, execute, resume — ADR-65
+/// acceptance 9) never depends on vector memory, so an init failure must log
+/// and degrade, never abort the run.
+fn memory_store_or_disabled(
+    selection: Result<Option<Arc<dyn MemoryStore>>, OrchestratorError>,
+) -> Arc<dyn MemoryStore> {
+    match selection {
+        Ok(Some(store)) => store,
+        Ok(None) => Arc::new(NullMemoryStore),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "memory init failed — the run proceeds without memory (vector store absent)"
+            );
+            Arc::new(NullMemoryStore)
+        }
+    }
+}
+
 /// Select or initialise the project-scoped memory services for a run.
 ///
 /// Same project as the previous run → reuse the cached store. Different
@@ -2642,10 +2677,12 @@ pub async fn run_shared_agent(
     // project. A project switch cancels and drops the previous project's
     // lifecycle so its store/indexer/sync services are never reused (audit
     // G1); `None` means memory is disabled and `NullMemoryStore` is used.
-    let memory: Arc<dyn MemoryStore> =
-        select_or_init_memory_services(&services, &req.project_dir, req.memory_enabled)
-            .await?
-            .unwrap_or_else(|| Arc::new(NullMemoryStore));
+    // ADR-65 acceptance 9: memory is OPTIONAL for a run's correctness — an
+    // init failure (missing/unopenable DB, failed migration) degrades to the
+    // null store with a warn instead of aborting the run.
+    let memory: Arc<dyn MemoryStore> = memory_store_or_disabled(
+        select_or_init_memory_services(&services, &req.project_dir, req.memory_enabled).await,
+    );
 
     // 6. Session creation and event recording
     let (session_id, session_store, event_recorder, transcript_recorder) =
@@ -5984,9 +6021,63 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // Spend-log persistence (Phase 3, issue #93)
+    // ADR-65 acceptance 9: memory is optional — disabled, absent, or a
+    // failed init all degrade to `NullMemoryStore`, never aborting a run.
     // ------------------------------------------------------------------
 
+    /// A healthy selection hands back the SAME store (identity-checked).
+    #[test]
+    fn memory_store_or_disabled_keeps_a_healthy_store() {
+        let store: Arc<dyn MemoryStore> = Arc::new(NullMemoryStore);
+        let selected = memory_store_or_disabled(Ok(Some(store.clone())));
+        assert!(Arc::ptr_eq(&store, &selected), "a healthy memory system is never replaced");
+    }
+
+    /// The degraded shapes (`None` selection and a failed init) both yield a
+    /// usable null store: retired-empty retrieves, silent discarding writes —
+    /// exactly the behavior of the store a memory-disabled run uses.
+    #[test]
+    fn memory_store_or_disabled_degraded_selection_behaves_null() {
+        for selection in [Ok(None), Err(OrchestratorError::AgentLoopError("boom".into()))] {
+            let selected = memory_store_or_disabled(selection);
+            let query = concerto_core::memory::MemoryQuery {
+                text: "anything".into(),
+                project_id: concerto_core::types::ProjectId("p".into()),
+                namespace: concerto_core::memory::MemoryNamespace::Project(
+                    concerto_core::types::ProjectId("p".into()),
+                ),
+                top_k: 5,
+                filters: vec![],
+            };
+            let retrieved = tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(selected.retrieve(&query, CancellationToken::new()));
+            assert!(retrieved.expect("retrieve").is_empty(), "disabled memory retrieves nothing");
+
+            let entry = concerto_core::memory::MemoryEntry {
+                id: concerto_core::memory::MemoryId(concerto_core::ids::Ulid::new()),
+                project_id: concerto_core::types::ProjectId("p".into()),
+                namespace: concerto_core::memory::MemoryNamespace::Project(
+                    concerto_core::types::ProjectId("p".into()),
+                ),
+                content: "x".into(),
+                chunk_type: concerto_core::memory::ChunkType::Fact,
+                model_id: None,
+                model_version: None,
+                metadata: serde_json::Value::Null,
+                expires_at: None,
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            let stored = tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(selected.store(entry, CancellationToken::new()));
+            assert!(stored.is_ok(), "the null store accepts (and discards) writes");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Spend-log persistence (Phase 3, issue #93)
+    // ------------------------------------------------------------------
     /// One spend record is persisted per completed provider call with the
     /// settled actual cost, exactly the data `persist_spend_records` receives
     /// from the run output. Exercises the best-effort path against a real

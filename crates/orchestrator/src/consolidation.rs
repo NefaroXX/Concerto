@@ -32,6 +32,17 @@
 //!   cap at [`DISCLOSURE_MAX_CHUNKS`] chunks (the supervisor's
 //!   `retrieve-memory` handler clamps to this).
 //!
+//! ## ADR-65 §8 — vectors stay strictly derived
+//!
+//! This projection is one of the two producers of `Fact`/`SessionSummary`
+//! vector chunks from session-log data (the other is the agent-loop task
+//! summary). Its chunk text is therefore **aggregate-only**: per-author
+//! decision counts, selected-agent outcome distributions, approval counts,
+//! and resolved review statuses. No decision reason, no `required_output`,
+//! no evidence-id list, no artifact hash, and no raw payload JSON ever
+//! reaches the embedded content — those are authoritative records and live
+//! only in the log, which stays the source of truth.
+//!
 //! ## Deliberately deferred (documented, not built)
 //!
 //! Real embedding-model vectors (the slice uses deterministic feature-hash
@@ -77,10 +88,6 @@ const SCOPE_CONSOLIDATION: &str = "consolidation";
 
 /// Group key for foldable events that carry no `plan_id`.
 const UNPLANNED_GROUP: &str = "run";
-
-/// Per-summary-line char cap (truncated on a char boundary, deterministically)
-/// so one huge decision cannot dominate a chunk.
-const SUMMARY_LINE_MAX_CHARS: usize = 200;
 
 /// Feature-hash embedding dimension. Deterministic placeholder until a real
 /// embedder is wired into the supervised spine (see module docs).
@@ -275,6 +282,12 @@ impl Consolidator {
             source_event_ids.extend(members.iter().map(|event| event.event_id.clone()));
             superseded_event_ids.extend(chunk_superseded.iter().cloned());
 
+            // ADR-65 §8 retention: stamp the folded window's session id
+            // (minimum of the ones present — deterministic) so per-session
+            // summary retention can group these projections. Omitted when the
+            // folded events carry no session attribution.
+            let session_id = members.iter().filter_map(|event| event.session_id.clone()).min();
+
             let metadata = serde_json::json!({
                 "kind": "adr60-d6-consolidation",
                 "group_key": group_key,
@@ -285,6 +298,7 @@ impl Consolidator {
                 "world_time_min_ms": members.iter().map(|e| e.created_at).min().unwrap_or(0),
                 "world_time_max_ms": members.iter().map(|e| e.created_at).max().unwrap_or(0),
                 "ingestion_time_ms": ingestion_time_ms,
+                "session_id": session_id,
             });
             let vector = feature_hash_embedding(&summary);
             self.store
@@ -448,70 +462,101 @@ fn review_state_target(event: &WhiteboardEvent) -> String {
         .map_or_else(|| event.event_id.clone(), ToOwned::to_owned)
 }
 
-/// Deterministic one-level summary of a group's foldable events (oldest
-/// first), skipping `skip` event ids (the within-fold supersessions: the
-/// digest projects current facts; history stays in the log + provenance). No
-/// wall-clock content: two passes over the same event window must produce
+/// Deterministic one-level AGGREGATE summary of a group's foldable events
+/// (oldest first), skipping `skip` event ids (the within-fold supersessions:
+/// the digest projects current facts; history stays in the log + provenance).
+///
+/// ADR-65 §8: the embedded text carries ONLY counts, per-author attribution,
+/// selected-agent outcome distributions, and resolved statuses — never a
+/// decision reason, required output, evidence-id list, artifact hash, or any
+/// raw payload JSON, truncated or otherwise. The authoritative record lives
+/// in the log alone; a vector row must stay a lossy derived view.
+/// No wall-clock content: two passes over the same event window must produce
 /// byte-identical chunk text, which is what makes the projection idempotent.
 fn build_group_summary(group_key: &str, events: &[WhiteboardEvent], skip: &[String]) -> String {
-    let mut lines = Vec::with_capacity(events.len() + 1);
+    let is_live = |event: &WhiteboardEvent| !skip.iter().any(|id| id == &event.event_id);
+
+    // Per-author decision counts and selected-agent outcome distribution
+    // (agent ids are attribution quantities, not payload content).
+    let mut decisions_by_author: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut outcomes: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut decision_total = 0usize;
+    for event in
+        events.iter().filter(|event| is_live(event) && event.kind == WhiteboardKind::Decision)
+    {
+        decision_total += 1;
+        *decisions_by_author.entry(event.agent_id.as_str()).or_insert(0) += 1;
+        if let Some(selected) = event
+            .payload
+            .get("selected_agent")
+            .and_then(|value| value.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            *outcomes.entry(selected).or_insert(0) += 1;
+        }
+    }
+
+    // Approvals aggregate to a count + the newest sequence: the artifact hash
+    // and plan body are authoritative and never summarized into the vector.
+    let approvals: Vec<&WhiteboardEvent> = events
+        .iter()
+        .filter(|event| is_live(event) && event.kind == WhiteboardKind::PlanApproved)
+        .collect();
+    let newest_approval_seq = approvals.iter().map(|event| event.gate_seq).max().unwrap_or(0);
+
+    // Review snapshots: the survivors are the newest per target; aggregate
+    // the resolved status distribution (machine statuses only).
+    let reviews: Vec<&WhiteboardEvent> = events
+        .iter()
+        .filter(|event| is_live(event) && event.kind == WhiteboardKind::ReviewState)
+        .collect();
+    let mut review_targets: BTreeMap<&str, ()> = BTreeMap::new();
+    let mut statuses: BTreeMap<&str, usize> = BTreeMap::new();
+    for event in &reviews {
+        let target = event
+            .payload
+            .get("review_target_hash")
+            .and_then(|value| value.as_str())
+            .or_else(|| event.payload.get("review_target").and_then(|value| value.as_str()));
+        if let Some(target) = target {
+            review_targets.insert(target, ());
+        }
+        if let Some(status) = event.payload.get("status").and_then(|value| value.as_str()) {
+            *statuses.entry(status).or_insert(0) += 1;
+        }
+    }
+
+    let mut lines = Vec::with_capacity(5);
     lines.push(format!(
-        "Consolidated whiteboard facts for {} (through gate_seq {}):",
-        group_key,
+        "Consolidated whiteboard activity for {group_key} (through gate_seq {}):",
         events.iter().map(|event| event.gate_seq).max().unwrap_or(0)
     ));
-    for event in events {
-        if skip.iter().any(|id| id == &event.event_id) {
-            continue;
+    if decision_total > 0 {
+        let authors: Vec<String> =
+            decisions_by_author.iter().map(|(agent, count)| format!("{agent}: {count}")).collect();
+        lines.push(format!("- decisions: {decision_total} ({})", authors.join(", ")));
+        if !outcomes.is_empty() {
+            let outcomes: Vec<String> =
+                outcomes.iter().map(|(agent, count)| format!("{agent}={count}")).collect();
+            lines.push(format!("- decision outcomes: {}", outcomes.join(", ")));
         }
-        let line = match event.kind {
-            WhiteboardKind::Decision => format!(
-                "- decision [{} @seq {}]: {}",
-                event.agent_id,
-                event.gate_seq,
-                truncate_line(&first_string(
-                    &event.payload,
-                    &["decision", "what", "summary", "note", "description", "reason"],
-                ))
-            ),
-            WhiteboardKind::PlanApproved => format!(
-                "- plan approved {}: artifact {}",
-                event.payload.get("plan_id").and_then(|value| value.as_str()).unwrap_or("?"),
-                event.payload.get("artifact_hash").and_then(|value| value.as_str()).unwrap_or("?"),
-            ),
-            WhiteboardKind::ReviewState => format!(
-                "- review [{}]: target {} status {} revisions {}",
-                event.payload.get("implement_role").and_then(|value| value.as_str()).unwrap_or("?"),
-                event.payload.get("review_target").and_then(|value| value.as_str()).unwrap_or("?"),
-                event.payload.get("status").and_then(|value| value.as_str()).unwrap_or("?"),
-                event.payload.get("retry_count").and_then(|value| value.as_u64()).unwrap_or(0),
-            ),
-            _ => continue,
-        };
-        lines.push(line);
+    }
+    if !approvals.is_empty() {
+        lines.push(format!(
+            "- plan approvals: {} (newest at gate_seq {newest_approval_seq})",
+            approvals.len()
+        ));
+    }
+    if !reviews.is_empty() {
+        let rendered: Vec<String> =
+            statuses.iter().map(|(status, count)| format!("{status}={count}")).collect();
+        lines.push(format!(
+            "- reviews: {} target(s), statuses: {}",
+            review_targets.len(),
+            rendered.join(", ")
+        ));
     }
     lines.join("\n")
-}
-
-/// Probe `payload` for the first present string field among `keys`, falling
-/// back to the compact JSON itself so a foreign payload shape still lands in
-/// the summary (defensive extraction, mirroring `fold_ledger`'s posture).
-fn first_string(payload: &serde_json::Value, keys: &[&str]) -> String {
-    for key in keys {
-        if let Some(value) = payload.get(*key).and_then(|value| value.as_str()) {
-            return value.to_owned();
-        }
-    }
-    serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
-}
-
-/// Truncate one summary line to [`SUMMARY_LINE_MAX_CHARS`] on a char boundary.
-fn truncate_line(line: &str) -> String {
-    if line.chars().count() <= SUMMARY_LINE_MAX_CHARS {
-        return line.to_owned();
-    }
-    let truncated: String = line.chars().take(SUMMARY_LINE_MAX_CHARS).collect();
-    format!("{truncated}…")
 }
 
 /// Deterministic projection chunk id: identical inputs (project, group, and
@@ -765,9 +810,22 @@ mod tests {
         );
 
         let content = &plan_rows[0].content;
-        assert!(content.contains("use sqlite wal"), "decisions summarized: {content}");
-        assert!(content.contains("plan approved plan-1"), "approval fact present");
-        assert!(content.contains("status completed"), "newest review status present");
+        // ADR-65 §8: the projection embeds aggregates only.
+        assert!(content.contains("decisions: 2 (agent-a: 2)"), "decisions aggregated: {content}");
+        assert!(
+            content.contains(&format!("plan approvals: 1 (newest at gate_seq {})", p_new.gate_seq)),
+            "approval count + newest sequence present: {content}"
+        );
+        assert!(
+            content.contains("reviews: 1 target(s), statuses: completed=1"),
+            "resolved review status present: {content}"
+        );
+        // No authoritative payload text: decision reasons, artifact hashes,
+        // or superseded statuses.
+        assert!(!content.contains("use sqlite wal"), "reason text never projected: {content}");
+        assert!(!content.contains("gate every write"), "decision text never projected");
+        assert!(!content.contains("aaa"), "artifact hash never projected: {content}");
+        assert!(!content.contains("bbb"), "artifact hash never projected");
         assert!(!content.contains("revision-queued"), "superseded snapshot not projected");
 
         // The unplanned group got its own chunk.
@@ -828,8 +886,11 @@ mod tests {
             append(&pool, event(None, WhiteboardKind::Decision, json!({"decision": "v1"}))).await;
         consolidator.consolidate_once(CancellationToken::new()).await.expect("pass 1");
 
-        let d2 =
-            append(&pool, event(None, WhiteboardKind::Decision, json!({"decision": "v2"}))).await;
+        // A DIFFERENT aggregate in the second window (a decision by another
+        // author changes the per-author counts and thus the chunk identity).
+        let mut d2_event = event(None, WhiteboardKind::Decision, json!({"decision": "v2"}));
+        d2_event.agent_id = "agent-b".to_owned();
+        let d2 = append(&pool, d2_event).await;
         assert_eq!(
             consolidator.consolidate_once(CancellationToken::new()).await.expect("pass 2"),
             1
@@ -849,7 +910,15 @@ mod tests {
             "prior projection invalidated, never deleted"
         );
         let live = rows.iter().find(|row| !row.tombstoned).expect("live projection");
-        assert!(live.content.contains("v2"));
+        assert!(
+            live.content.contains("decisions: 1 (agent-b: 1)"),
+            "aggregates differ between passes, so the second fold mints a new row: {}",
+            live.content
+        );
+        assert!(
+            !live.content.contains("v1") && !live.content.contains("v2"),
+            "decision text is never projected (ADR-65 §8)"
+        );
         let metadata = projection_metadata(&rows, &live.chunk_id);
         assert_eq!(metadata["source_event_ids"], json!([d2.event_id]));
         assert_eq!(
@@ -867,6 +936,100 @@ mod tests {
             Some(1),
             "the tombstoned predecessor chunk is cited by id"
         );
+    }
+
+    /// ADR-65 §8 (no-fact-leak): a run whose whiteboard log carries
+    /// authoritative `ToolExecuted`, `Decision`, and `DesignDoc` events with
+    /// distinctive payload content must NOT surface any of that payload
+    /// verbatim in ANY vector chunk row (Fact, SessionSummary, or otherwise).
+    /// Only aggregate/derived text may be projected. The decision's
+    /// selected-agent attribution IS projected as an aggregate count.
+    #[tokio::test]
+    async fn decision_payloads_are_never_embedded_verbatim() {
+        let (_dir, pool) = test_pool().await;
+        let (_store, consolidator) = consolidator(pool.clone()).await;
+
+        // Distinctive fragments that would identify a leak. Each must be
+        // absent from every stored chunk's embedded content.
+        let secret_arg_hash = "ARGS-HASH-9f8e7d6c5b4a3210-uniquely-leak-detecting";
+        let secret_post_hash = "POST-HASH-ef12cd34-unique-leak-marker-5678";
+        let secret_reason = "REASON-FRAGMENT-do-not-embed-this-lemma-42";
+        let secret_output = "REQUIRED-OUTPUT-unique-leak-probe-999";
+        let secret_doc = "DESIGN-DOC-SECRET-claim-text-4242";
+
+        let tool_fact = append(
+            &pool,
+            event(
+                None,
+                WhiteboardKind::ToolExecuted,
+                json!({
+                    "agent_id": "coder",
+                    "task_id": "t1",
+                    "tool": "filesystem",
+                    "args": { "operation": "read", "path": "src/hotspot.rs" },
+                    "args_hash": secret_arg_hash,
+                    "paths": ["src/hotspot.rs"],
+                    "pre_hashes": { "src/hotspot.rs": secret_arg_hash },
+                    "post_hashes": { "src/hotspot.rs": secret_post_hash },
+                    "success": true,
+                    "generation": "gen-77"
+                }),
+            ),
+        )
+        .await;
+        // The decision cites the REAL observed fact (append validation):
+        // evidence ids reference existing event ids (ADR-65 acceptance 8).
+        let secret_evidence = tool_fact.event_id.clone();
+        append(
+            &pool,
+            event(
+                None,
+                WhiteboardKind::Decision,
+                json!({
+                    "selected_agent": "coder",
+                    "reason": secret_reason,
+                    "required_output": secret_output,
+                    "supporting_evidence_ids": [secret_evidence],
+                }),
+            ),
+        )
+        .await;
+        append(&pool, event(None, WhiteboardKind::DesignDoc, json!({ "claim": secret_doc }))).await;
+
+        let projected =
+            consolidator.consolidate_once(CancellationToken::new()).await.expect("pass");
+        assert_eq!(projected, 1, "only the Decision folds (ToolExecuted/DesignDoc are unresolved)");
+
+        // Read EVERY chunk row of the project (any chunk type).
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, content FROM vector_store")
+            .fetch_all(&pool)
+            .await
+            .expect("all rows");
+        assert!(!rows.is_empty(), "at least one projection row exists");
+        for (id, content) in &rows {
+            for (label, fragment) in [
+                ("tool args hash", secret_arg_hash),
+                ("post hash", secret_post_hash),
+                ("decision reason", secret_reason),
+                ("evidence id", secret_evidence.as_str()),
+                ("required output", secret_output),
+                ("design doc claim", secret_doc),
+            ] {
+                assert!(
+                    !content.contains(fragment),
+                    "leak: chunk {id} embedded {label} verbatim: {content}"
+                );
+            }
+        }
+
+        // The derived aggregate IS present: selected-agent outcome
+        // distribution, no reason text.
+        let content = rows[0].1.clone();
+        assert!(
+            rows.iter().any(|row| row.1.contains("decision outcomes: coder=1")),
+            "aggregate outcome present: {rows:?}"
+        );
+        assert!(!content.contains(secret_reason), "reason absent");
     }
 
     #[tokio::test]
