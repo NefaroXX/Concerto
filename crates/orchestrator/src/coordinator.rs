@@ -25,7 +25,7 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentOutput, AgentRunResult, AgentStage, AgentTask,
-    DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskId,
+    DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskExecutionMode, TaskId,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
@@ -4815,6 +4815,34 @@ impl CoordinatorAgent {
             EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
         );
 
+        // ── ADR-60 D7 (interrupt-safe resume, 2026-09-05): zero-work guard ─
+        // An action-required (build-classified) run that reaches the success
+        // exit with ZERO executed tool calls never performed the work it
+        // reports completing: subtasks were dispatched, every one answered in
+        // prose, and no tool ever ran — the live F1 acceptance failure (a
+        // "build" prompt produced a "completed" message with zero tool work
+        // past the single-agent and zero-file guards). Run-level mirror of
+        // the single-agent loop's zero-tool guard, evaluated where the whole
+        // run's tool count is known:
+        // - fully resolver-served runs are exempt — no subtask was
+        //   dispatched (the work was proven done from the timeline);
+        // - checkpoint-resumed runs keep the checkpoint's own tool count, so
+        //   only a run with genuinely zero tool work trips;
+        // - answer-only root tasks are out of scope by construction.
+        // The note downgrades the exit to Partial, and the stall gate below
+        // keeps the checkpoint resumable for a later resume.
+        let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
+        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && dispatched_subtasks
+            && total_tool_calls == 0
+        {
+            recoverable_notes.push(
+                "Zero-work guard: the task required tool work but zero tool calls executed \
+                 across the run; the completion claim was not backed by any executed tool."
+                    .to_owned(),
+            );
+        }
+
         let completion_status = if recoverable_notes.is_empty() {
             concerto_core::types::AgentCompletionStatus::Completed
         } else {
@@ -7961,6 +7989,71 @@ mod tests {
                 )
             }),
             "no design-stage agent should mean no design subtask runs"
+        );
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05) — live F1: an
+    /// action-required (build-classified) run whose dispatched subtasks all
+    /// answered in prose (zero tool calls across the whole run) must NOT
+    /// report Completed. The run-level zero-work guard downgrades the exit to
+    /// Partial and names the omission. A non-implement subtask role is used
+    /// deliberately: the per-subtask zero-file guard does not apply to it, so
+    /// the run reaches the success exit — exactly the route the F1 claim took.
+    #[tokio::test]
+    async fn zero_tool_action_required_run_stalls_instead_of_completing() {
+        let bus = EventBus::new(256);
+        // A research-stage subtask answers prose-only (zero tools, zero
+        // files) and "succeeds" — the per-subtask guards pass it.
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "done")];
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            mocks,
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _id) = single_pending_graph(session_id, "researcher");
+        let rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let (output, _notes) = coordinator
+            .execute_graph(
+                // The ROOT task is action-required (a build-classified run);
+                // this is what arms the run-level zero-work guard.
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                graph,
+                HashMap::new(), // completed_results
+                0.0,            // total_cost
+                0,              // total_tool_calls
+                vec![],         // all_files
+                vec![],         // provider_metrics
+                HashMap::new(), // subtask_attempts
+                HashMap::new(), // retry_feedback
+                HashMap::new(), // model_assignments
+                Vec::new(),     // action_ledger
+                "build the thing".to_string(),
+                blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            )
+            .await
+            .expect("execute_graph returns");
+        let _ = rx;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a zero-tool action-required run must stall, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the omission is named in the final message: {}",
+            output.final_message
         );
     }
 
