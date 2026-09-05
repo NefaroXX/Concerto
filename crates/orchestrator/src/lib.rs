@@ -26,6 +26,7 @@ pub mod cycle;
 pub mod cycle_manager;
 pub mod delta;
 pub mod design_doc_verifier;
+pub mod evidence_scheduler;
 pub mod exec_backend;
 pub mod fingerprint;
 pub mod gate;

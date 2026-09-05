@@ -264,6 +264,21 @@ fn push_field(buf: &mut Vec<u8>, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
+/// The evidence ids a Decision event's payload references, if any.
+///
+/// ADR-65 §6 fixes the Decision payload shape as `selected_agent, reason,
+/// required_output, supporting_evidence_ids`; the ids are read from the
+/// optional `supporting_evidence_ids` key (absent or non-array ⇒ empty).
+/// Any other payload — including every pre-existing Decision payload —
+/// validates as referencing nothing.
+fn decision_evidence_ids(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get("supporting_evidence_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
 /// Append a whiteboard event and return the stored row.
 ///
 /// `gate_seq` (global) and `agent_seq` (per-agent) are assigned inside a
@@ -276,14 +291,43 @@ fn push_field(buf: &mut Vec<u8>, value: &[u8]) {
 /// a no-op that returns the existing row (`INSERT OR IGNORE`), per the
 /// at-least-once + dedup contract. The returned row is the DB authority —
 /// duplicate inserts never mutate sequencing state.
+///
+/// Evidence-reference validation (ADR-65 §1, acceptance 8): a `Decision`
+/// event whose payload carries `supporting_evidence_ids` must reference
+/// EXISTING event ids — a fabricated coordinator evidence id fails
+/// validation and the append is rejected. The check runs inside the append
+/// transaction so the log cannot gain a decision citing an id it does not
+/// hold. (Claim kinds carry no citation field in the current schema, so
+/// there is nothing to validate on them yet; `causation` is deliberately
+/// unvalidated — it may legally carry non-event trigger strings such as
+/// workspace generations.)
 pub async fn append_whiteboard_event(
     pool: &sqlx::SqlitePool,
     event: &NewWhiteboardEvent,
 ) -> Result<WhiteboardEvent, SessionError> {
     let payload_json = serde_json::to_string(&event.payload)?;
     let content_hash = compute_content_hash(event)?;
+    let evidence_ids = if event.kind == WhiteboardKind::Decision {
+        decision_evidence_ids(&event.payload)
+    } else {
+        Vec::new()
+    };
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    for id in &evidence_ids {
+        let known: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM whiteboard_events WHERE event_id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if known.is_none() {
+            return Err(SessionError::Validation(format!(
+                "decision event {} references unknown evidence id {id:?}",
+                event.event_id
+            )));
+        }
+    }
 
     sqlx::query(
         "INSERT OR IGNORE INTO whiteboard_events
@@ -1092,6 +1136,66 @@ mod tests {
         assert_eq!(decoded.payload["files"][0]["path"], json!("a.md"));
         assert_eq!(decoded.payload["files"][0]["size_bytes"], json!(42));
         assert_eq!(decoded.payload["generation"], json!("gen-3"));
+    }
+
+    /// ADR-65 §1 acceptance 8: a Decision event citing REAL evidence ids
+    /// appends; one citing a fabricated id is rejected at append and nothing
+    /// lands. Decisions without the payload key (every pre-existing payload
+    /// shape) and non-Decision kinds are unaffected.
+    #[tokio::test]
+    async fn decision_evidence_ids_are_validated_at_append() {
+        let (_dir, pool) = test_pool(1).await;
+
+        // A real evidence event to cite.
+        append_whiteboard_event(
+            &pool,
+            &new_event("ev-real", "agent-a", WhiteboardKind::ToolExecuted),
+        )
+        .await
+        .expect("evidence event appended");
+
+        // A Decision citing the real id appends.
+        let mut citing = new_event("dec-1", "coordinator", WhiteboardKind::Decision);
+        citing.payload = json!({
+            "selected_agent": "coder",
+            "reason": "evidence-sufficient-implement",
+            "required_output": "Implement: obj",
+            "supporting_evidence_ids": ["ev-real"],
+        });
+        append_whiteboard_event(&pool, &citing).await.expect("real evidence ids are accepted");
+
+        // A Decision citing a fabricated id is REJECTED at append.
+        let mut fabricated = new_event("dec-2", "coordinator", WhiteboardKind::Decision);
+        fabricated.payload = json!({
+            "selected_agent": "coder",
+            "reason": "evidence-gap-explore",
+            "required_output": "Grounded fact inventory",
+            "supporting_evidence_ids": ["ev-fabricated"],
+        });
+        let err = append_whiteboard_event(&pool, &fabricated)
+            .await
+            .expect_err("a fabricated evidence id must be rejected");
+        assert!(matches!(err, SessionError::Validation(_)), "got: {err:?}");
+
+        // Nothing landed for the rejected decision.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM whiteboard_events WHERE event_id = 'dec-2'")
+                .fetch_one(&pool)
+                .await
+                .expect("row count");
+        assert_eq!(count, 0, "the rejected decision never lands");
+
+        // A Decision payload without the key (every pre-existing shape) is
+        // unaffected.
+        append_whiteboard_event(&pool, &new_event("dec-3", "agent-a", WhiteboardKind::Decision))
+            .await
+            .expect("payload without evidence ids appends");
+
+        // Non-Decision kinds are never evidence-validated, even when they
+        // carry a lookalike key.
+        let mut executed = new_event("ev-2", "agent-a", WhiteboardKind::ToolExecuted);
+        executed.payload = json!({ "supporting_evidence_ids": ["ev-fabricated"] });
+        append_whiteboard_event(&pool, &executed).await.expect("non-Decision kinds unvalidated");
     }
 
     #[tokio::test]
