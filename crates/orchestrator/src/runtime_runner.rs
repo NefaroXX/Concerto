@@ -4775,9 +4775,31 @@ async fn drive_supervised_run(
     // Budget guard: a separate token so an overrun teardown can never be
     // misreported as user cancellation.
     let budget_cancel = CancellationToken::new();
+    // ADR-60 D7 (interrupt-safe resume): the user's cancel token was never
+    // wired into `run_until` — a cancelled supervised run kept driving its
+    // children to completion, and only THEN reported cancellation. A stop
+    // now reaches the supervisor directly: `run_until`'s teardown stops the
+    // children and persists the gate-boundary shutdown checkpoint
+    // (`Supervisor::checkpoint_at_shutdown` semantics) before the summary
+    // returns. The combined stop token is the budget token's child, so a
+    // budget expiry still cancels the run; a watcher forwards user
+    // cancellation into it.
+    let run_stop = budget_cancel.child_token();
+    let stop_watcher = {
+        let run_stop = run_stop.clone();
+        let user_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = user_cancel.cancelled() => run_stop.cancel(),
+                // The run ended (or the budget fired through the child):
+                // nothing to forward.
+                _ = run_stop.cancelled() => {}
+            }
+        })
+    };
     let driven = tokio::time::timeout(
         SUPERVISED_RUN_BUDGET,
-        supervisor.run_until(budget_cancel.clone(), |supervisor| {
+        supervisor.run_until(run_stop.clone(), |supervisor| {
             supervisor.agents().iter().all(|meta| {
                 expected.contains(&meta.agent_id)
                     && matches!(meta.state, AgentState::Completed | AgentState::Failed)
@@ -4785,6 +4807,7 @@ async fn drive_supervised_run(
         }),
     )
     .await;
+    stop_watcher.abort();
     let summary = match driven {
         Ok(summary) => summary,
         Err(_elapsed) => {
