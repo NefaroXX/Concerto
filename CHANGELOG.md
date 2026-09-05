@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Evidence spine (ADR-65):** multi-agent runs are grounded in a single
+  append-only whiteboard evidence chain — runtime-written tool facts with agent
+  attribution, a deterministic workspace-snapshot readiness barrier, safe read
+  dedupe with action digests, DesignDoc verification (hallucinated docs cannot
+  bind), evidence-driven dispatch (Decision events reference real evidence ids),
+  and cursor-based continuation that never re-dispatches architects/researchers
+  without a recorded evidence-backed decision. Whiteboard facts/decisions stay
+  in structured SQL; vector memory is strictly derived summaries.
 - **Always-on write-conflict detection (ADR-60 D5):** versioned gated writes
   now carry per-target `base_versions` claims — `GateRequest.base_version`
   (single) became a `base_versions` map with `#[serde(default)]` wire
