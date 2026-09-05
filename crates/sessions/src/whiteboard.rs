@@ -56,6 +56,14 @@ pub enum WhiteboardKind {
     // treat them as opaque — already the case for the JSON payload design.
     ToolExecuted,
     WorkspaceSnapshot,
+    /// ADR-65 §5: the DesignDoc produced for a planning stage, recorded as an
+    /// evidence-backed CLAIM. Payload is the serialized `DesignDoc`; the
+    /// deterministic verifier later resolves that claim against grounded
+    /// observations to either bind it (Verified) or quarantine it. Note this
+    /// is an *assertion about the intended workspace contract*, not a record
+    /// of observed reality — so it is spelled `design-doc`, not folded into
+    /// the runtime-observed kinds above.
+    DesignDoc,
 }
 
 impl WhiteboardKind {
@@ -81,6 +89,7 @@ impl WhiteboardKind {
             Self::MemoryFact => "memory-fact",
             Self::ToolExecuted => "tool-executed",
             Self::WorkspaceSnapshot => "workspace-snapshot",
+            Self::DesignDoc => "design-doc",
         }
     }
 
@@ -1020,6 +1029,7 @@ mod tests {
             (WhiteboardKind::MemoryFact, "memory-fact"),
             (WhiteboardKind::ToolExecuted, "tool-executed"),
             (WhiteboardKind::WorkspaceSnapshot, "workspace-snapshot"),
+            (WhiteboardKind::DesignDoc, "design-doc"),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.as_str(), expected, "as_str kebab-case");

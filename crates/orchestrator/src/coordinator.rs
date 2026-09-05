@@ -33,8 +33,10 @@ use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
+use concerto_sessions::whiteboard::append_whiteboard_event;
 use concerto_sessions::{
-    OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts, SessionStore,
+    NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
+    SessionStore, WhiteboardKind,
 };
 
 use crate::agent_runner::AgentRunner;
@@ -42,6 +44,9 @@ use crate::agents::GenericSpecialistAgent;
 use crate::checkpoint;
 use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
 use crate::delta::FileDeltaTracker;
+use crate::design_doc_verifier::{
+    collect_design_doc_evidence, degraded_verdict, verify_design_doc, DesignDocVerdict,
+};
 use crate::graph::{Dependency, TaskGraph, TaskGraphValidator};
 use crate::plan_approval::{
     append_review_state_event, load_review_resume, review_target_identity, ReviewCycleStatus,
@@ -5252,9 +5257,11 @@ impl CoordinatorAgent {
     /// `NoAffordableModel` / `PinnedModelNotFound` — classified as
     /// `LimitReached`) is folded into the same recovery path as a run failure,
     /// resolved once per attempt inside the retry loop. Returns the completed
-    /// design task plus a validated, non-empty `DesignDoc` on a genuine
-    /// Success; otherwise the failure that the caller's recovery loop class
-    /// decides on.
+    /// design task plus a parseable `DesignDoc` on a genuine Success
+    /// (ADR-65 §5: even an EMPTY doc completes the design stage — the
+    /// deterministic verifier decides afterwards whether it binds, skips, or
+    /// quarantines; only an unparseable summary stays a failure); otherwise
+    /// the failure that the caller's recovery loop class decides on.
     async fn design_stage_attempt(
         &self,
         arch_task: &SubTask,
@@ -5286,21 +5293,20 @@ impl CoordinatorAgent {
         let result =
             self.runner.run(role.clone(), arch_task, arch_ctx, &profile, cancel.clone()).await?;
 
-        // A genuine Success carrying a non-empty, parseable DesignDoc completes
-        // the design stage.
+        // A genuine Success carrying a parseable DesignDoc completes the
+        // design stage — empty or not. Whether the (possibly empty) doc binds
+        // is the verifier's call, resolved later in decompose_task (ADR-65 §5).
         if let Some(doc) = crate::prompts::parse_json_substring(&result.summary) {
-            if !Self::is_empty_design_doc(&doc) {
-                let mut completed_arch = arch_task.clone();
-                completed_arch.status = SubTaskStatus::Completed;
-                completed_arch.deliverable = Some(result.summary.clone());
-                return Ok((completed_arch, doc));
-            }
+            let mut completed_arch = arch_task.clone();
+            completed_arch.status = SubTaskStatus::Completed;
+            completed_arch.deliverable = Some(result.summary.clone());
+            return Ok((completed_arch, doc));
         }
 
         // The model completed a run but produced no usable plan — a Failed /
-        // Blocked outcome or a Success with an empty/unparseable DesignDoc. Any
-        // of these is a recoverable attempt that the recovery loop may retry,
-        // escalate, or rescue via the ladder.
+        // Blocked outcome or a Success with an unparseable DesignDoc. Any of
+        // these is a recoverable attempt that the recovery loop may retry and
+        // (only when the retries are exhausted) rescue via the ladder.
         Err(match &result.outcome {
             AgentOutcome::Failed { .. } => OrchestratorError::AgentLoopError(format!(
                 "Design agent failed: {}",
@@ -5313,7 +5319,7 @@ impl CoordinatorAgent {
                 ))
             }
             _ => OrchestratorError::AgentLoopError(
-                "Design agent produced an empty DesignDoc".to_string(),
+                "Design agent produced an unparseable DesignDoc".to_string(),
             ),
         })
     }
@@ -5482,9 +5488,11 @@ impl CoordinatorAgent {
                             {
                                 FallbackOutcome::Success(result) => {
                                     // A ladder tier produced a genuine Success;
-                                    // accept its DesignDoc when it is real.
+                                    // accept its DesignDoc whether or not it is
+                                    // empty — the verifier decides binding,
+                                    // skipping, or quarantine (ADR-65 §5).
                                     match crate::prompts::parse_json_substring(&result.summary) {
-                                        Some(doc) if !Self::is_empty_design_doc(&doc) => {
+                                        Some(doc) => {
                                             let mut completed_arch = arch_task.clone();
                                             completed_arch.status = SubTaskStatus::Completed;
                                             completed_arch.deliverable = Some(result.summary);
@@ -5511,15 +5519,6 @@ impl CoordinatorAgent {
                 }
             }
         }
-    }
-
-    /// `true` when a parsed `DesignDoc` carries no meaningful content beyond
-    /// serde defaults (the empty shape the recovery loop treats as a failed
-    /// attempt).
-    fn is_empty_design_doc(doc: &DesignDoc) -> bool {
-        doc.proposed_files.is_empty()
-            && doc.goals.is_empty()
-            && doc.interface_sketch.trim().is_empty()
     }
 
     /// Decompose a user task into a DAG of `SubTask` nodes.
@@ -5663,11 +5662,43 @@ impl CoordinatorAgent {
         // without re-running the Architect on resume (C-05).
         *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = design_doc.clone();
 
+        // ── ADR-65 §5: resolve the DesignDoc claim against evidence ────────
+        // The doc becomes a binding contract (planner claims, expected
+        // artifacts, research heuristics) ONLY when the deterministic,
+        // model-free verifier marks it Verified — every proposed path grounded
+        // against the pre-planning snapshot and the session's ToolExecuted
+        // facts. Quarantined/Skipped docs stay advisory and the pipeline
+        // degrades to the unverified path; never a hard error.
+        //
+        // A seeded approved-plan doc (ADR-60 D7) is human-approved — its
+        // approval IS the evidence — so it binds unconditionally and is never
+        // re-verified (the architect is not re-invoked for it; `design_id` is
+        // None on that path).
+        let binding_doc: Option<&DesignDoc> = match design_id.as_ref() {
+            // Agent-produced doc: resolve the (possibly empty) claim.
+            Some(_arch_id) => match (design_doc.as_ref(), design_role.as_ref()) {
+                (Some(doc), Some(author)) => {
+                    let verdict = self
+                        .verify_design_doc_claim(doc, Some(author), task.session_id, cancel)
+                        .await?;
+                    self.append_design_doc_events(task.session_id, Some(author), doc, &verdict)
+                        .await;
+                    verdict.state.is_active().then_some(doc)
+                }
+                // No parsed doc despite an architect run: nothing binds
+                // (defensive; the design stage returns Err before this state).
+                _ => None,
+            },
+            // Seeded approved doc (D7): binds without re-verification. No doc
+            // at all: nothing to bind.
+            None => design_doc.as_ref(),
+        };
+
         let planner = TaskPlanner;
         match planner
             .plan(
                 task,
-                design_doc.as_ref(),
+                binding_doc,
                 &planner_agents,
                 self.planning_provider.clone(),
                 &self.retry_policy,
@@ -5748,8 +5779,10 @@ impl CoordinatorAgent {
         // to gather context before implementation runs. Single-file,
         // no-risk changes go straight from design to implementation. An
         // unparseable plan (LLM didn't return valid JSON) is treated
-        // conservatively as needing research.
-        let needs_research = match &design_doc {
+        // conservatively as needing research. Only a VERIFIED, binding doc
+        // informs the heuristic; a Quarantined/Skipped doc (ADR-65 §5) is
+        // treated like no plan at all.
+        let needs_research = match &binding_doc {
             Some(doc) => doc.proposed_files.len() > 1 || !doc.risks.is_empty(),
             None => true,
         };
@@ -5849,7 +5882,9 @@ impl CoordinatorAgent {
         }
 
         // Emit creation events and populate expected artifacts for every
-        // implement-stage subtask from the DesignDoc's proposed_files.
+        // implement-stage subtask from the BINDING DesignDoc's proposed_files
+        // (ADR-65 §5): contract paths only ever come from a Verified doc; a
+        // Quarantined/Skipped doc contributes none.
         for subtask in graph.all_tasks() {
             let _ = self.bus.publish_for_session(
                 task.session_id,
@@ -5861,7 +5896,7 @@ impl CoordinatorAgent {
                 },
             );
             if implement_ids.contains(&subtask.role) {
-                if let Some(ref doc) = design_doc {
+                if let Some(doc) = binding_doc {
                     self.expected_artifacts
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -5871,6 +5906,145 @@ impl CoordinatorAgent {
         }
 
         Ok((graph, None))
+    }
+
+    // ── ADR-65 §5: DesignDoc claim resolution (read/write whiteboard) ───
+
+    /// Resolve a DesignDoc claim against deterministic evidence — the
+    /// pre-planning workspace snapshot plus the session's `ToolExecuted`
+    /// facts — via the model-free verifier, and return the verdict.
+    ///
+    /// Fail-soft by contract: an evidence-store failure degrades the claim to
+    /// a Quarantined (non-empty) / Skipped (empty) verdict with a warning —
+    /// planning must never crash because the whiteboard read failed. Only an
+    /// explicit cancellation propagates as an error.
+    async fn verify_design_doc_claim(
+        &self,
+        doc: &DesignDoc,
+        author: Option<&AgentId>,
+        session_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Result<DesignDocVerdict, OrchestratorError> {
+        let proposed: Vec<String> =
+            doc.proposed_files.iter().map(|path| path.as_str().to_owned()).collect();
+        match collect_design_doc_evidence(
+            self.review_store.as_ref(),
+            session_id,
+            author,
+            self.workspace_snapshot.as_ref(),
+            cancel,
+        )
+        .await
+        {
+            Ok(mut input) => {
+                // The evidence gatherer shapes the workspace facts; the doc's
+                // own claim (its proposed paths) is filled in here so the pure
+                // verifier resolves the ACTUAL design, not an empty one.
+                input.proposed_paths = proposed;
+                Ok(verify_design_doc(&input))
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(OrchestratorError::Cancelled);
+                }
+                tracing::warn!(
+                    %err,
+                    author = ?author,
+                    "ADR-65 §5: evidence store unavailable; design doc advisory (fail-soft)"
+                );
+                Ok(degraded_verdict(&proposed, 0))
+            }
+        }
+    }
+
+    /// Persist a DesignDoc claim and its verdict as whiteboard events
+    /// (ADR-65 §5 write side): a `DesignDoc` kind event carries the serialized
+    /// doc, and a `Decision` kind event (causation = the claim's `event_id`)
+    /// carries the verdict. Both appends are fail-soft by contract — evidence
+    /// logging must never break planning — and a failed claim append suppresses
+    /// the orphaned decision append.
+    async fn append_design_doc_events(
+        &self,
+        session_id: Ulid,
+        author: Option<&AgentId>,
+        doc: &DesignDoc,
+        verdict: &DesignDocVerdict,
+    ) {
+        let Some(pool) = self.review_store.as_ref() else {
+            return;
+        };
+        let created_at = crate::tool_facts::unix_ms();
+        // The claim is authored by the architect that produced the doc (or the
+        // coordinator when attribution is unavailable); the decision is always
+        // the coordinator's finding.
+        let claim_author =
+            author.map(|id| id.as_str().to_owned()).unwrap_or_else(|| "coordinator".to_owned());
+        let claim_id = Ulid::new().to_string();
+        let doc_payload = match serde_json::to_value(doc) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "ADR-65 §5: design-doc claim serialization failed; claim not recorded"
+                );
+                return;
+            }
+        };
+        if let Err(err) = append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: claim_id.clone(),
+                agent_id: claim_author,
+                kind: WhiteboardKind::DesignDoc,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: doc_payload,
+                pre_image_hash: None,
+                created_at,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                %err,
+                "ADR-65 §5: design-doc claim append failed (fail-soft); decision not recorded"
+            );
+            return;
+        }
+        let verdict_payload = match serde_json::to_value(verdict) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "ADR-65 §5: design-doc verdict serialization failed; decision not recorded"
+                );
+                return;
+            }
+        };
+        if let Err(err) = append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: Ulid::new().to_string(),
+                agent_id: "coordinator".to_owned(),
+                kind: WhiteboardKind::Decision,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: Some(claim_id),
+                payload: verdict_payload,
+                pre_image_hash: None,
+                created_at,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                %err,
+                "ADR-65 §5: design-doc decision append failed (fail-soft)"
+            );
+        }
     }
 
     fn add_managed_dependency(
@@ -6081,7 +6255,8 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Regression: Fix 5 — DesignDoc content validation rejects empty doc
+    // Regression: Fix 5 — DesignDoc content validation accepts empty doc
+    // (ADR-65 §5: an empty claim is SKIPPED, never rejected)
     // ------------------------------------------------------------------
 
     /// The empty DesignDoc JSON has no proposed_files, no goals, and an
@@ -6089,8 +6264,13 @@ mod tests {
     const EMPTY_DESIGN_DOC_JSON: &str = r#"{"goals":[],"proposed_files":[],"interface_sketch":""}"#;
 
     #[tokio::test]
-    async fn decompose_task_rejects_empty_design_doc() {
-        // Create a mock Architect whose summary is an empty DesignDoc.
+    async fn empty_design_doc_is_skipped_not_rejected() {
+        // ADR-65 §5: an empty DesignDoc is a VALID claim — the verifier
+        // resolves it to Skipped (NO_OBSERVATIONS_NO_DESIGN / NO_DESIGN_NEEDED)
+        // instead of failing the design stage. The Partial result below must
+        // therefore come from a LATER stage — this roster registers no
+        // implement-stage agent, so planning cannot build a fallback pipeline —
+        // never from the design stage rejecting the empty doc.
         let mocks =
             vec![MockExpertAgent::always_succeed(AgentId::new("architect"), EMPTY_DESIGN_DOC_JSON)];
 
@@ -6104,11 +6284,19 @@ mod tests {
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
-            "empty DesignDoc should produce Partial completion"
+            "empty DesignDoc should still produce a Partial completion when planning cannot proceed"
         );
         assert!(
             output.final_message.contains("could not produce a valid plan"),
             "expected 'could not produce a valid plan' in final_message, got: {}",
+            output.final_message
+        );
+        // The failure is the missing implement-stage agent — the empty doc was
+        // accepted by the design stage and must not be called a "rejected
+        // design".
+        assert!(
+            output.final_message.contains("no implementation-stage agent is registered"),
+            "the Partial must be caused by the missing implement agent, got: {}",
             output.final_message
         );
     }
@@ -6236,6 +6424,49 @@ mod tests {
         )
     }
 
+    /// A pre-planning `WorkspaceSnapshot` whose inventory grounds the given
+    /// proposed paths, so the ADR-65 §5 verifier resolves a DesignDoc claiming
+    /// them to Verified (Active) — the doc BINDS and the coordinator reaches
+    /// the planner with `Some`, recreating the pre-Phase-5 harness where a
+    /// design doc reached the planner unconditionally.
+    ///
+    /// Without this, the no-evidence unit harness degrades every non-empty doc
+    /// to Quarantined (nothing binds: `expected_artifacts` stays empty, the
+    /// proposed_files membership check is off) and coordinator-level tests
+    /// (C-06 artifact gates, review/validation cycles, zero-file guard, custom
+    /// dispatch, checkpoint resume) would silently exercise the passive path
+    /// instead of their intended gates. The evidence pipeline only reads
+    /// `entry.path`, so a synthetic inventory is a faithful stand-in for a
+    /// real workspace walk here.
+    fn grounded_snapshot(proposed: &[&str]) -> crate::workspace_snapshot::WorkspaceSnapshotRecord {
+        crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "g1".to_owned(),
+            entries: proposed
+                .iter()
+                .map(|path| concerto_sessions::ObservedPath {
+                    path: (*path).to_owned(),
+                    size_bytes: Some(1),
+                    mtime_ms: Some(1),
+                    content_hash: Some("deadbeef".to_owned()),
+                })
+                .collect(),
+            captured_at_ms: 1,
+            project_root: "work".into(),
+        }
+    }
+
+    /// `coordinator_with` plus a grounded workspace snapshot for the design
+    /// doc's proposed files — see [`grounded_snapshot`].
+    fn coordinator_with_grounded(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        plan_json: String,
+        proposed: &[&str],
+    ) -> CoordinatorAgent {
+        coordinator_with(bus, registry, plan_json)
+            .with_workspace_snapshot(grounded_snapshot(proposed))
+    }
+
     /// Run a wired coordinator to completion and collect all bus events.
     /// The workspace root is a throwaway temp dir so mocks may safely write
     /// expected artifacts (audit C-06) without touching the source tree.
@@ -6300,7 +6531,12 @@ mod tests {
         )));
 
         let (output, events) = run_for_test(
-            coordinator_with(bus.clone(), Arc::new(registry), plan_json.into()),
+            coordinator_with_grounded(
+                bus.clone(),
+                Arc::new(registry),
+                plan_json.into(),
+                &["src/auth.rs"],
+            ),
             bus.clone(),
         )
         .await;
@@ -6627,10 +6863,11 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 PLAN_RESEARCH_CODER.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -6819,10 +7056,11 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 plan_json.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -6862,10 +7100,11 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
         ];
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 PLAN_RESEARCH_CODER.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -9436,10 +9675,11 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, _events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 PLAN_RESEARCH_CODER.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -9472,10 +9712,11 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, _events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 PLAN_RESEARCH_CODER.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -9516,10 +9757,11 @@ mod tests {
         std::fs::write(dir.path().join("src/a.rs"), "TODO: implement\n")
             .expect("write placeholder file");
         let rx = bus.subscribe();
-        let mut coordinator = coordinator_with(
+        let mut coordinator = coordinator_with_grounded(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(mocks)),
             PLAN_RESEARCH_CODER.into(),
+            &["src/a.rs"],
         );
         let task = AgentTask::new(Ulid::new(), "test task");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
@@ -9561,10 +9803,11 @@ mod tests {
             ),
         ];
         let (output, _events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 PLAN_RESEARCH_CODER.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -9774,8 +10017,12 @@ mod tests {
             "TODO: implement\n".into(),
         )));
         registry.register(Arc::new(real_eval_validator(&bus, &project_root)));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into());
+        let mut coordinator = coordinator_with_grounded(
+            bus.clone(),
+            Arc::new(registry),
+            PLAN_RESEARCH_CODER.into(),
+            &["src/main.rs"],
+        );
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -9831,8 +10078,12 @@ mod tests {
         )));
         registry.register(Arc::new(AlwaysRevise));
         registry.register(Arc::new(real_eval_validator(&bus, &project_root)));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into());
+        let mut coordinator = coordinator_with_grounded(
+            bus.clone(),
+            Arc::new(registry),
+            PLAN_RESEARCH_CODER.into(),
+            &["src/main.rs"],
+        );
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -9920,9 +10171,13 @@ mod tests {
             "// real implementation\npub fn main() {}\n".into(),
         )));
         registry.register(Arc::new(AlwaysRevise));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into())
-                .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
+        let mut coordinator = coordinator_with_grounded(
+            bus.clone(),
+            Arc::new(registry),
+            PLAN_RESEARCH_CODER.into(),
+            &["src/main.rs"],
+        )
+        .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -10009,9 +10264,13 @@ mod tests {
             AgentId::new("reviewer"),
             "approved",
         )));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into())
-                .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
+        let mut coordinator = coordinator_with_grounded(
+            bus.clone(),
+            Arc::new(registry),
+            PLAN_RESEARCH_CODER.into(),
+            &["src/main.rs"],
+        )
+        .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -10269,7 +10528,17 @@ mod tests {
             .await
             .expect("create session row")
             .id;
-        let coordinator = coordinator_on_store(bus, registry, plan_json, store.clone());
+        // Every caller pairs this helper with the standard `DESIGN_DOC_JSON`
+        // (proposes `src/a.rs`), so ground that path once here: without a
+        // snapshot the ADR-65 §5 verifier degrades the doc to Quarantined and
+        // the checkpoint/resume tests would exercise the passive path instead
+        // of their intended artifact gates.
+        let coordinator = coordinator_with(bus, registry, plan_json)
+            .with_workspace_snapshot(grounded_snapshot(&["src/a.rs"]))
+            .with_checkpoint_store(
+                Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+                None,
+            );
         (coordinator, store, session_id)
     }
 
@@ -11547,5 +11816,172 @@ mod tests {
         let digest = digest.expect("snapshot present");
         assert!(!digest.contains("<action_digest>"));
         assert!(digest.starts_with("workspace-snapshot generation=gen-1"));
+    }
+
+    /// ADR-65 §5 binding-state contract at the coordinator seam: the
+    /// `binding_doc` handed to the planner is `Some` ONLY when the
+    /// model-free verifier marks the claim active (Verified). A Quarantined
+    /// doc resolves to a passive verdict — the coordinator then feeds the
+    /// planner `None`, so the proposed_files membership check is NOT applied
+    /// (the planner-side ON/OFF semantics are pinned by the planner's own
+    /// `design_doc_contract_enforces_proposed_files_membership` test).
+    #[tokio::test]
+    async fn verify_design_doc_claim_active_only_when_grounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("binding_state.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+
+        let root = std::path::Path::new("/proj/binding");
+        let root_hash = crate::tool_facts::project_root_hash(root);
+        let session_id = Ulid::new();
+        let project_root = camino::Utf8PathBuf::from(root.to_string_lossy().into_owned());
+        let snapshot = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "gen-1".to_owned(),
+            entries: vec![concerto_sessions::ObservedPath {
+                path: "src/main.rs".to_owned(),
+                size_bytes: Some(1024),
+                mtime_ms: Some(1),
+                content_hash: None,
+            }],
+            captured_at_ms: 0,
+            project_root: project_root.clone(),
+        };
+
+        // The author's grounded read fact: counts as evidence AND grounds
+        // nothing new (the snapshot already carries src/main.rs), but proves
+        // the coordinator's claim resolution runs against the session log.
+        let executed_payload = concerto_sessions::ToolExecutedPayload {
+            agent_id: Some("architect".to_owned()),
+            task_id: None,
+            run_id: None,
+            tool: "read_file".to_owned(),
+            args: serde_json::json!({}),
+            success: true,
+            exit_code: Some(0),
+            generation: "gen-1".to_owned(),
+            project_root_hash: root_hash.clone(),
+            served_from: None,
+            paths: vec![concerto_sessions::ObservedPath {
+                path: "src/main.rs".to_owned(),
+                size_bytes: Some(1024),
+                mtime_ms: Some(1),
+                content_hash: None,
+            }],
+        };
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "ev-arch-read".to_owned(),
+                agent_id: "architect".to_owned(),
+                kind: WhiteboardKind::ToolExecuted,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::to_value(executed_payload).expect("payload serializes"),
+                pre_image_hash: None,
+                created_at: 100,
+            },
+        )
+        .await
+        .expect("append author read fact");
+
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_review_store(Some(pool))
+                .with_workspace_snapshot(snapshot);
+        let cancel = CancellationToken::new();
+        let author = AgentId::new("architect");
+
+        // Grounded claim → Verified → active → the doc BINDS (enforced).
+        let grounded = DesignDoc {
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            proposed_files: vec![camino::Utf8PathBuf::from("src/main.rs")],
+            interface_sketch: String::new(),
+            risks: Vec::new(),
+        };
+        let verdict = coordinator
+            .verify_design_doc_claim(&grounded, Some(&author), session_id, &cancel)
+            .await
+            .expect("claim resolves");
+        assert_eq!(verdict.state, crate::design_doc_verifier::DesignDocState::Verified);
+        assert!(verdict.state.is_active(), "a verified doc must be a binding contract");
+        assert_eq!(verdict.contract_paths, vec!["src/main.rs"]);
+        assert_eq!(verdict.author_read_count, 1, "the author's read fact was counted");
+        coordinator.append_design_doc_events(session_id, Some(&author), &grounded, &verdict).await;
+
+        // Ungrounded claim → Quarantined → NOT active → the doc stays ADVISORY
+        // (the planner receives `binding_doc = None` and enforces nothing).
+        let hallucinated = DesignDoc {
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            proposed_files: vec![camino::Utf8PathBuf::from("src/hallucinated.rs")],
+            interface_sketch: String::new(),
+            risks: Vec::new(),
+        };
+        let verdict = coordinator
+            .verify_design_doc_claim(&hallucinated, Some(&author), session_id, &cancel)
+            .await
+            .expect("claim resolves");
+        assert_eq!(verdict.state, crate::design_doc_verifier::DesignDocState::Quarantined);
+        assert!(!verdict.state.is_active(), "a quarantined doc must stay passive");
+        assert!(verdict.contract_paths.is_empty(), "no contract paths from an ungrounded doc");
+        assert_eq!(verdict.reject_count, 1);
+        coordinator
+            .append_design_doc_events(session_id, Some(&author), &hallucinated, &verdict)
+            .await;
+
+        // Lifecycle (ADR-65 §5): both claims were recorded as `DesignDoc`
+        // events and each decision as a `Decision` event carrying the verdict
+        // state — verified for the grounded claim, quarantined for the other.
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            coordinator.review_store.as_ref().expect("review store attached"),
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let claims: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::DesignDoc).collect();
+        assert_eq!(claims.len(), 2, "both claims recorded: {:?}", claims.len());
+        let decisions: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(decisions.len(), 2, "both decisions recorded: {:?}", decisions.len());
+        let states: Vec<Option<&str>> = decisions
+            .iter()
+            .map(|event| event.payload.get("state").and_then(|value| value.as_str()))
+            .collect();
+        assert!(
+            states.contains(&Some("verified")),
+            "the grounded claim's decision must be verified, got: {states:?}"
+        );
+        assert!(
+            states.contains(&Some("quarantined")),
+            "the ungrounded claim's decision must be quarantined, got: {states:?}"
+        );
+        for claim in &claims {
+            assert!(
+                decisions
+                    .iter()
+                    .any(|decision| decision.causation.as_deref() == Some(claim.event_id.as_str())),
+                "every claim event has a decision caused by it"
+            );
+        }
     }
 }
