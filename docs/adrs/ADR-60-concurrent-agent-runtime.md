@@ -89,6 +89,9 @@ Per owner decision (2026-08-18): this is a new decision, not recovered intent. N
 - Silent re-decompose is forbidden (issue fix #4): divergence from the approved plan requires explicit user re-approval.
 - One persistence layer total: the event log + its projections (checkpoints, hybrid memory store, transcript views). Explicitly resolves the issue's "do not conflate with the memory subsystem" note: RAG retrieval is *not* the continuity mechanism (the issue is correct on that); the log is. The memory store remains a projection on top of the log, and #152's fix rides the log.
 - **Amendment (run-continuity, session-keyed):** the D7 read also fires for explicit `continue`/resume runs that carry no approved-plan binding (a resume after a failed Execute, or a reopened project). It is read-side only: the gate already persists the substrate keyed by the run's session id (`write-applied` rows carry the files touched, `failure` rows the failed commands), and the session's newest hash-verified `plan-approved` payload re-anchors the last approved artifact. No new event kind and no summary row — the log stays the sole source of truth, folded at read time with the same ledger grammar as the plan-keyed path. Gated by the same `plan_binding_source` switch; `legacy` keeps the pre-D7 behavior. A fresh session or empty log seeds nothing (truthful empty state).
+- **Amendment (interrupt-safe resume, 2026-09-05):** live acceptance of the evidence-spine build exposed a gap on both sides of the 2026-08-24 amendment: a multi-agent build run, interrupted with Ctrl+C after the coder started, then re-run with `continue`, re-dispatched the **architect** instead of continuing the build. Two decisions close it:
+  - **Write side — checkpoint on graceful interrupt.** A graceful stop materializes the orchestration checkpoint before teardown, the same `completed=0` row the stall path writes. The terminal and desktop apps gain a signal/window-close handler (SIGINT/Ctrl+C, app close) that cancels the run and invokes the supervisor's `checkpoint_at_shutdown` (implemented today, exercised only by tests). A hard-killed run leaves no row, a later `continue` finds nothing to resume, and the run re-derives from scratch — the observed failure.
+  - **Read side — headless resume from the evidence chain.** When a `continue`/resume request finds **no** checkpoint row (a killed run, or a reopened project with prior whiteboard events), the coordinator seeds dispatch state from the logged evidence instead of re-entering design: the newest hash-verified `plan-approved` payload and the logged researcher/coder gate events determine the next dispatch (verified design + research done → dispatch the **coder**, not the architect). This extends the 2026-08-24 amendment from "fold the ledger prose" to "fold the ledger prose *and* the dispatch cursor". It does **not** relax ADR-65 §7: re-calling the architect or researcher still requires a recorded, evidence-backed `Decision` event; a resume path with no such decision continues the nearest non-redundant step.
 
 ### D8. Scope boundaries
 
@@ -159,6 +162,14 @@ Negative / costs:
   schedule, and inventing one (a global execution cap) would be a throughput
   regression rationing a resource nobody contends for. Decision text above is
   unchanged; the notes extend D4 the way the D3/D5/D6 notes do.
+- 2026-09-05 — v1.4, run-continuation amendment extended (interrupt-safe
+  resume). Live acceptance of the evidence-spine build (hexview smoke test)
+  failed: Ctrl+C after the coder started left no checkpoint (no app signal
+  handler; `checkpoint_at_shutdown` was test-only), so the `continue` rerun
+  re-dispatched the architect instead of continuing the build — and that
+  dispatch carried no recorded `Decision` event (ADR-65 §7). The D7
+  amendment above now covers both sides; implementation commits are recorded
+  here when landed.
 
 ### D5 implementation notes — always-on injection & per-target claims (2026-08)
 
