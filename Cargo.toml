@@ -154,7 +154,7 @@ tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
 tree-sitter-typescript = "0.23"
 
-fastembed = "4"
+fastembed = "6"
 
 # ---- Recursive directory walking (Phase 4) ----
 walkdir = "2"
