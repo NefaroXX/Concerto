@@ -9,7 +9,7 @@ re-run and must not be edited once they have shipped.
 ## Numbering convention
 
 - `NNN_description.sql`, zero-padded to three digits.
-- New migrations take the next free number — currently **024**.
+- New migrations take the next free number — currently **031**.
 - Do not renumber existing files: gaps are permanent and harmless.
 
 ## Known gaps (005, 006, 009, 010, 011)
@@ -24,4 +24,4 @@ These were **never committed** in any branch of this repo's history:
 
 The gaps are presumed squashed or renumbered during early development, before
 those large phase commits (which bundled many uncommitted steps). The numbers
-stay intentionally unused; the next migration is 024.
+stay intentionally unused; the next migration is 031.

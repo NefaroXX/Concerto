@@ -19,6 +19,12 @@
 //! - **Dirtying events never rewrite observation columns.** `WriteApplied`,
 //!   watcher change hints, and shell/git side effects flip `dirty = 1` only;
 //!   the cached observation history survives for audit and reconciliation.
+//! - **Rows are scoped per project root (ADR-65 F5c, migration 031).** The row
+//!   identity is the `(project_root_hash, path)` pair, so two roots observing
+//!   the same relative path never clobber each other. Legacy rows written
+//!   before roots were recorded carry the empty hash `''` — preserved for
+//!   attribution and rebuild, but never served (the serve path requires a
+//!   matching non-empty root hash).
 //! - **A missing row is also "uncertain".** `lookup` answers `None`; dirtying
 //!   an absent path is a no-op (there is nothing to mark, and the read path
 //!   already treats absence as execute-normally).
@@ -37,11 +43,13 @@ use crate::check_cancel;
 use crate::whiteboard::WhiteboardKind;
 use crate::SessionError;
 
-/// ADR-65 §4: maximum cached read content size in bytes. Mirrors the effective
-/// serve bound — files above this size are never content-cached (and files
-/// above `MAX_HASH_BYTES` in the orchestrator are never hashable), so the
-/// content cache stays a small, bounded side table.
-pub const CACHE_LIMIT_BYTES: usize = 128 * 1024;
+/// ADR-65 §4 / F2b: maximum cached read content size in bytes. This is the
+/// **single** shared bound for the whole evidence path: the orchestrator's
+/// hashing budget (`tool_facts::MAX_HASH_BYTES`) aliases this constant, so the
+/// effective serve bound equals the store cap — files above 64 KiB are never
+/// hashable and therefore never content-cached, keeping the cache a small,
+/// bounded side table.
+pub const CACHE_LIMIT_BYTES: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Typed payload models
@@ -97,6 +105,11 @@ pub struct ToolExecutedPayload {
     /// execution time.
     #[serde(default)]
     pub generation: String,
+    /// Identity of the project root this observation belongs to (blake3 hex of
+    /// the canonical root, ADR-65 F5c). `""` for legacy events that predate
+    /// per-root scoping — their rows are preserved but never served.
+    #[serde(default)]
+    pub project_root_hash: String,
     /// The paths this tool execution affected/observed.
     #[serde(default)]
     pub paths: Vec<ObservedPath>,
@@ -116,6 +129,10 @@ pub struct WorkspaceSnapshotPayload {
     /// snapshot captures.
     #[serde(default)]
     pub generation: String,
+    /// Identity of the project root this snapshot belongs to (blake3 hex,
+    /// ADR-65 F5c). `""` for legacy events — preserved, never served.
+    #[serde(default)]
+    pub project_root_hash: String,
     /// The inventory entries.
     #[serde(default)]
     pub files: Vec<SnapshotEntry>,
@@ -129,6 +146,9 @@ pub struct WorkspaceSnapshotPayload {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceFactRow {
     pub path: String,
+    /// Project root identity (blake3 hex) this row is scoped to. `""` marks a
+    /// legacy pre-scoping row — preserved for attribution, never served.
+    pub project_root_hash: String,
     /// Workspace `generation` (content-addressed string id) of the latest
     /// observation.
     pub generation: String,
@@ -168,6 +188,7 @@ pub struct CachedRead {
 #[derive(Debug, PartialEq, sqlx::FromRow)]
 struct ResourceFactRowDb {
     path: String,
+    project_root_hash: String,
     generation: String,
     size_bytes: Option<i64>,
     mtime_ms: Option<i64>,
@@ -192,6 +213,7 @@ impl TryFrom<ResourceFactRowDb> for ResourceFactRow {
     fn try_from(row: ResourceFactRowDb) -> Result<Self, SessionError> {
         Ok(Self {
             path: row.path,
+            project_root_hash: row.project_root_hash,
             generation: row.generation,
             size_bytes: row.size_bytes.map(u64::try_from).transpose().map_err(|_| {
                 SessionError::Storage("negative size_bytes in resource_facts".to_string())
@@ -218,6 +240,8 @@ struct CleanObservation<'a> {
     /// Workspace generation (content-addressed string id) captured by the
     /// observation.
     generation: String,
+    /// Project root identity the observation is scoped to (ADR-65 F5c).
+    project_root_hash: &'a str,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,10 +277,10 @@ async fn upsert_clean_row(
 ) -> Result<(), SessionError> {
     sqlx::query(
         "INSERT INTO resource_facts
-             (path, generation, size_bytes, mtime_ms, content_hash,
+             (path, project_root_hash, generation, size_bytes, mtime_ms, content_hash,
               last_event_id, last_agent_id, observed_at, dirty)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-         ON CONFLICT(path) DO UPDATE SET
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+         ON CONFLICT(project_root_hash, path) DO UPDATE SET
              generation    = excluded.generation,
              size_bytes    = excluded.size_bytes,
              mtime_ms      = excluded.mtime_ms,
@@ -267,6 +291,7 @@ async fn upsert_clean_row(
              dirty         = 0",
     )
     .bind(path)
+    .bind(obs.project_root_hash)
     .bind(obs.generation.as_str())
     .bind(size_bytes.map(to_i64).transpose()?)
     .bind(mtime_ms.map(to_i64).transpose()?)
@@ -279,30 +304,64 @@ async fn upsert_clean_row(
     Ok(())
 }
 
-/// Flip one row's `dirty` flag to 1, leaving the observation columns untouched.
-/// A missing row is a no-op (absent = uncertain = execute normally).
-async fn mark_dirty_row(conn: &mut sqlx::SqliteConnection, path: &str) -> Result<(), SessionError> {
-    sqlx::query("UPDATE resource_facts SET dirty = 1 WHERE path = ?")
-        .bind(path)
-        .execute(conn)
-        .await?;
+/// Flip one row's `dirty` flag to 1 and **purge its cached content** (ADR-65
+/// F2a: a dirtying event means the cached bytes are no longer trustworthy, so
+/// nothing stale may remain to serve). The observation columns are left
+/// untouched. A missing row is a no-op (absent = uncertain = execute normally).
+async fn mark_dirty_row(
+    conn: &mut sqlx::SqliteConnection,
+    project_root_hash: &str,
+    path: &str,
+) -> Result<(), SessionError> {
+    sqlx::query(
+        "UPDATE resource_facts
+         SET dirty = 1, content_cached = NULL, content_cached_bytes = NULL
+         WHERE project_root_hash = ? AND path = ?",
+    )
+    .bind(project_root_hash)
+    .bind(path)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Flip every row for `path` across **all** roots dirty and purge their cached
+/// content. Used by `rebuild_from_log`'s `WriteApplied` fold: such events carry
+/// no project-root attribution, so dirtying every root that observed the path
+/// is the conservative (never-stale) choice.
+async fn mark_dirty_row_all_roots(
+    conn: &mut sqlx::SqliteConnection,
+    path: &str,
+) -> Result<(), SessionError> {
+    sqlx::query(
+        "UPDATE resource_facts
+         SET dirty = 1, content_cached = NULL, content_cached_bytes = NULL
+         WHERE path = ?",
+    )
+    .bind(path)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
 /// Apply a workspace snapshot to `conn`: upsert every listed file clean, then
-/// mark previously-clean rows that **vanished** from the listing dirty (kept,
-/// never deleted — their observation attribution survives).
+/// mark previously-clean rows for **this root** that **vanished** from the
+/// listing dirty (kept, never deleted — their observation attribution
+/// survives).
 async fn reconcile_snapshot(
     conn: &mut sqlx::SqliteConnection,
     obs: &CleanObservation<'_>,
     files: &[SnapshotEntry],
 ) -> Result<(), SessionError> {
-    // Pre-state of clean rows only: rows already dirty stay dirty, and the
-    // just-upserted snapshot rows must not be dirtied by the vanish pass.
-    let clean_before: Vec<String> =
-        sqlx::query_scalar("SELECT path FROM resource_facts WHERE dirty = 0")
-            .fetch_all(&mut *conn)
-            .await?;
+    // Pre-state of clean rows only, scoped to this project root: rows already
+    // dirty stay dirty, and the just-upserted snapshot rows must not be
+    // dirtied by the vanish pass.
+    let clean_before: Vec<String> = sqlx::query_scalar(
+        "SELECT path FROM resource_facts WHERE dirty = 0 AND project_root_hash = ?",
+    )
+    .bind(obs.project_root_hash)
+    .fetch_all(&mut *conn)
+    .await?;
 
     for entry in files {
         upsert_clean_row(
@@ -319,7 +378,7 @@ async fn reconcile_snapshot(
     let listed: HashSet<&str> = files.iter().map(|e| e.path.as_str()).collect();
     for path in clean_before {
         if !listed.contains(path.as_str()) {
-            mark_dirty_row(conn, &path).await?;
+            mark_dirty_row(conn, obs.project_root_hash, &path).await?;
         }
     }
     Ok(())
@@ -354,37 +413,41 @@ impl ResourceFacts {
         Self { pool }
     }
 
-    /// Look up the cached fact for `path`; `Ok(None)` when nothing has been
-    /// observed (equivalently: state uncertain, execute normally).
+    /// Look up the cached fact for `path` within `project_root_hash`; `Ok(None)`
+    /// when nothing has been observed for that root (equivalently: state
+    /// uncertain, execute normally).
     pub async fn lookup(
         &self,
+        project_root_hash: &str,
         path: &str,
         cancel: &CancellationToken,
     ) -> Result<Option<ResourceFactRow>, SessionError> {
         check_cancel(cancel)?;
         let row = sqlx::query_as::<_, ResourceFactRowDb>(
-            "SELECT path, generation, size_bytes, mtime_ms, content_hash,
-                    last_event_id, last_agent_id, observed_at, dirty
-             FROM resource_facts WHERE path = ?",
+            "SELECT path, project_root_hash, generation, size_bytes, mtime_ms,
+                    content_hash, last_event_id, last_agent_id, observed_at, dirty
+             FROM resource_facts WHERE project_root_hash = ? AND path = ?",
         )
+        .bind(project_root_hash)
         .bind(path)
         .fetch_optional(&self.pool)
         .await?;
         row.map(ResourceFactRow::try_from).transpose()
     }
 
-    /// Mark `path` dirty — its cached observation is no longer trusted. The
+    /// Mark `path` dirty within `project_root_hash` — its cached observation is
+    /// no longer trusted, and its cached content is purged (ADR-65 F2a). The
     /// observation columns are left untouched; a missing row is a no-op.
     pub async fn mark_dirty(
         &self,
+        project_root_hash: &str,
         path: &str,
         cancel: &CancellationToken,
     ) -> Result<(), SessionError> {
         check_cancel(cancel)?;
-        sqlx::query("UPDATE resource_facts SET dirty = 1 WHERE path = ?")
-            .bind(path)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        mark_dirty_row(&mut tx, project_root_hash, path).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -408,6 +471,7 @@ impl ResourceFacts {
             agent_id,
             observed_at,
             generation: payload.generation.clone(),
+            project_root_hash: payload.project_root_hash.as_str(),
         };
         let mut tx = self.pool.begin().await?;
         for path in &payload.paths {
@@ -426,28 +490,33 @@ impl ResourceFacts {
         Ok(())
     }
 
-    /// ADR-65 §4: fetch the cached content for `path` together with its
-    /// observation row. `Ok(None)` when the path was never observed OR never
-    /// content-cached — the caller then must not serve and executes normally.
-    /// The caller still validates the cache (fresh stat + hash) before serving;
-    /// this method never judges freshness.
+    /// ADR-65 §4: fetch the cached content for `path` (scoped to
+    /// `project_root_hash`) together with its observation row. `Ok(None)` when
+    /// the path was never observed for that root OR never content-cached — the
+    /// caller then must not serve and executes normally. The caller still
+    /// validates the cache (fresh stat + hash) before serving; this method
+    /// never judges freshness.
     pub async fn cached_read(
         &self,
+        project_root_hash: &str,
         path: &str,
         cancel: &CancellationToken,
     ) -> Result<Option<CachedRead>, SessionError> {
         check_cancel(cancel)?;
-        let Some(row) = self.lookup(path, cancel).await? else {
+        let Some(row) = self.lookup(project_root_hash, path, cancel).await? else {
             return Ok(None);
         };
         // Decode through a struct so a NULL `content_cached` stays `None`
         // (query_scalar + fetch_optional would conflate NULL with "") — a row
         // that was never content-cached is not servable.
-        let cached: Option<ContentCacheRow> =
-            sqlx::query_as("SELECT content_cached FROM resource_facts WHERE path = ?")
-                .bind(path)
-                .fetch_optional(&self.pool)
-                .await?;
+        let cached: Option<ContentCacheRow> = sqlx::query_as(
+            "SELECT content_cached FROM resource_facts \
+             WHERE project_root_hash = ? AND path = ?",
+        )
+        .bind(project_root_hash)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
         let Some(ContentCacheRow { content_cached: Some(content) }) = cached else {
             return Ok(None);
         };
@@ -455,13 +524,15 @@ impl ResourceFacts {
     }
 
     /// ADR-65 §4: store the exact bytes of a successful read as the content
-    /// cache for `path`. Returns `Ok(true)` when stored, `Ok(false)` when the
-    /// content was refused (NUL bytes, over [`CACHE_LIMIT_BYTES`], or no row
-    /// to attach it to — the row must exist from the observation already).
-    /// Errors only for genuine store failures; callers treat every failure as
-    /// "not cached, no harm done" (the cache is derived, never a requirement).
+    /// cache for `path` within `project_root_hash`. Returns `Ok(true)` when
+    /// stored, `Ok(false)` when the content was refused (NUL bytes, over
+    /// [`CACHE_LIMIT_BYTES`], or no row to attach it to — the row must exist
+    /// from the observation already). Errors only for genuine store failures;
+    /// callers treat every failure as "not cached, no harm done" (the cache is
+    /// derived, never a requirement).
     pub async fn store_read_content(
         &self,
+        project_root_hash: &str,
         path: &str,
         content: &str,
         cancel: &CancellationToken,
@@ -476,33 +547,37 @@ impl ResourceFacts {
         let stored = sqlx::query(
             "UPDATE resource_facts
              SET content_cached = ?, content_cached_bytes = ?
-             WHERE path = ?",
+             WHERE project_root_hash = ? AND path = ?",
         )
         .bind(content)
         .bind(to_i64(content.len() as u64)?)
+        .bind(project_root_hash)
         .bind(path)
         .execute(&self.pool)
         .await?;
         Ok(stored.rows_affected() == 1)
     }
 
-    /// ADR-65 §4 action digest: the newest `limit` observed paths, newest
-    /// `observed_at` first with a deterministic path tiebreak. The caller
-    /// renders each row as unchanged/dirty — never gates behavior on the list
-    /// alone (rows carry the `dirty` honesty bit).
+    /// ADR-65 §4 action digest: the newest `limit` observed paths **within
+    /// `project_root_hash`**, newest `observed_at` first with a deterministic
+    /// path tiebreak. The caller renders each row as unchanged/dirty — never
+    /// gates behavior on the list alone (rows carry the `dirty` honesty bit).
     pub async fn list_observations(
         &self,
+        project_root_hash: &str,
         limit: usize,
         cancel: &CancellationToken,
     ) -> Result<Vec<ResourceFactRow>, SessionError> {
         check_cancel(cancel)?;
         let rows = sqlx::query_as::<_, ResourceFactRowDb>(
-            "SELECT path, generation, size_bytes, mtime_ms, content_hash,
-                    last_event_id, last_agent_id, observed_at, dirty
+            "SELECT path, project_root_hash, generation, size_bytes, mtime_ms,
+                    content_hash, last_event_id, last_agent_id, observed_at, dirty
              FROM resource_facts
+             WHERE project_root_hash = ?
              ORDER BY observed_at DESC, path ASC
              LIMIT ?",
         )
+        .bind(project_root_hash)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
@@ -526,6 +601,7 @@ impl ResourceFacts {
             agent_id,
             observed_at,
             generation: payload.generation.clone(),
+            project_root_hash: payload.project_root_hash.as_str(),
         };
         let mut tx = self.pool.begin().await?;
         reconcile_snapshot(&mut tx, &obs, &payload.files).await?;
@@ -545,18 +621,22 @@ impl ResourceFacts {
         self.reconcile_from_snapshot(event_id, agent_id, observed_at, payload, cancel).await
     }
 
-    /// Invalidate the cache for every affected path (e.g. a `WriteApplied`
-    /// event, a watcher change hint, or observed shell/git side effects):
-    /// each is marked dirty; absent paths are ignored.
+    /// Invalidate the cache for every affected path **within
+    /// `project_root_hash`** (e.g. a `WriteApplied` event, a watcher change
+    /// hint, or observed shell/git side effects): each is marked dirty and its
+    /// cached content purged; absent paths are ignored.
     pub async fn invalidate_on_write(
         &self,
+        project_root_hash: &str,
         paths: &[String],
         cancel: &CancellationToken,
     ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
         for path in paths {
             check_cancel(cancel)?;
-            self.mark_dirty(path, cancel).await?;
+            mark_dirty_row(&mut tx, project_root_hash, path).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -565,8 +645,11 @@ impl ResourceFacts {
     ///
     /// - `ToolExecuted` upserts each affected path clean (attribution from the
     ///   event columns, `observed_at` from the event `created_at` — so a
-    ///   replay reproduces the original wall times).
-    /// - `WriteApplied` dirties the paths its payload names.
+    ///   replay reproduces the original wall times; `project_root_hash` folds
+    ///   from the payload, `''` for legacy events).
+    /// - `WriteApplied` dirties the paths its payload names **across every
+    ///   root** that observed them — the event carries no root attribution, so
+    ///   the conservative choice is to dirty all of them.
     /// - `WorkspaceSnapshot` reconciles like a live snapshot.
     /// - Events with unparseable evidence payloads are skipped defensively —
     ///   one malformed sibling event never blocks the rebuild.
@@ -588,6 +671,7 @@ impl ResourceFacts {
                 agent_id: &event.agent_id,
                 observed_at: event.created_at,
                 generation: String::new(),
+                project_root_hash: "",
             };
             match event.kind {
                 WhiteboardKind::ToolExecuted => {
@@ -596,7 +680,11 @@ impl ResourceFacts {
                     else {
                         continue;
                     };
-                    let obs = CleanObservation { generation: payload.generation, ..obs };
+                    let obs = CleanObservation {
+                        generation: payload.generation,
+                        project_root_hash: payload.project_root_hash.as_str(),
+                        ..obs
+                    };
                     for path in &payload.paths {
                         upsert_clean_row(
                             &mut tx,
@@ -611,7 +699,7 @@ impl ResourceFacts {
                 }
                 WhiteboardKind::WriteApplied => {
                     for path in write_applied_paths(&event.payload) {
-                        mark_dirty_row(&mut tx, &path).await?;
+                        mark_dirty_row_all_roots(&mut tx, &path).await?;
                     }
                 }
                 WhiteboardKind::WorkspaceSnapshot => {
@@ -620,7 +708,11 @@ impl ResourceFacts {
                     else {
                         continue;
                     };
-                    let obs = CleanObservation { generation: payload.generation, ..obs };
+                    let obs = CleanObservation {
+                        generation: payload.generation,
+                        project_root_hash: payload.project_root_hash.as_str(),
+                        ..obs
+                    };
                     reconcile_snapshot(&mut tx, &obs, &payload.files).await?;
                 }
                 _ => {}
@@ -638,6 +730,7 @@ mod tests {
     use serde_json::json;
     use sqlx::pool::PoolOptions;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+    use sqlx::Connection;
     use tempfile::TempDir;
 
     use crate::whiteboard::{append_whiteboard_event, NewWhiteboardEvent};
@@ -667,6 +760,12 @@ mod tests {
         CancellationToken::new()
     }
 
+    /// Two distinct project roots for scope-isolation tests (ADR-65 F5c). The
+    /// `observed()` helper brands everything with `ROOT_A`; tests that need the
+    /// other root re-brand a payload explicitly.
+    const ROOT_A: &str = "root-a";
+    const ROOT_B: &str = "root-b";
+
     fn observed(path: &str, hash: &str, generation: &str) -> ToolExecutedPayload {
         ToolExecutedPayload {
             agent_id: Some("agent-a".to_owned()),
@@ -677,6 +776,7 @@ mod tests {
             success: true,
             exit_code: Some(0),
             generation: generation.to_owned(),
+            project_root_hash: ROOT_A.to_owned(),
             paths: vec![ObservedPath {
                 path: path.to_owned(),
                 size_bytes: Some(42),
@@ -714,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_029_applies_and_has_expected_shape() {
+    async fn migrations_produce_resource_facts_with_scoped_composite_primary_key() {
         let (_dir, pool) = test_pool(1).await;
 
         let objects: Vec<String> = sqlx::query_scalar(
@@ -731,7 +831,7 @@ mod tests {
         );
         assert!(
             objects.iter().any(|n| n == "idx_resource_facts_dirty_path"),
-            "dirty/path index exists; got: {objects:?}"
+            "dirty/root index exists; got: {objects:?}"
         );
 
         let columns: Vec<String> =
@@ -743,6 +843,7 @@ mod tests {
             columns,
             vec![
                 "path",
+                "project_root_hash",
                 "generation",
                 "size_bytes",
                 "mtime_ms",
@@ -756,6 +857,17 @@ mod tests {
             ]
         );
 
+        // Row identity is the (project_root_hash, path) pair (ADR-65 F5c,
+        // migration 031) — two roots observing the same relative path must not
+        // clobber each other, so the primary key is the scoped composite.
+        let pk: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('resource_facts') WHERE pk > 0 ORDER BY pk",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("pk query");
+        assert_eq!(pk, vec!["project_root_hash", "path"], "scoped composite primary key");
+
         // The workspace generation is a content-addressed string id (ADR-65
         // §2), so the column is TEXT, not INTEGER.
         let generation_type: String = sqlx::query_scalar(
@@ -766,9 +878,10 @@ mod tests {
         .expect("generation column type query");
         assert_eq!(generation_type, "TEXT", "generation column stores the string id");
 
-        // A fresh table is empty.
+        // A fresh table is empty, even for the legacy empty root hash.
         let store = ResourceFacts::new(pool);
-        assert!(store.lookup("a.md", &token()).await.expect("lookup").is_none());
+        assert!(store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").is_none());
+        assert!(store.lookup("", "a.md", &token()).await.expect("lookup").is_none());
     }
 
     #[tokio::test]
@@ -787,7 +900,7 @@ mod tests {
             .await
             .expect("observe");
 
-        let row = store.lookup("a.md", &token()).await.expect("lookup").expect("row");
+        let row = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row");
         assert_eq!(row.generation, "1");
         assert_eq!(row.size_bytes, Some(42));
         assert_eq!(row.mtime_ms, Some(1_000));
@@ -798,8 +911,8 @@ mod tests {
         assert!(!row.dirty, "an observation brands the row clean");
 
         // Dirtying flips the flag but preserves the observation columns.
-        store.mark_dirty("a.md", &token()).await.expect("mark dirty");
-        let row = store.lookup("a.md", &token()).await.expect("lookup").expect("row");
+        store.mark_dirty(ROOT_A, "a.md", &token()).await.expect("mark dirty");
+        let row = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row");
         assert!(row.dirty, "marked dirty");
         assert_eq!(row.content_hash.as_deref(), Some("h1"));
         assert_eq!(row.last_event_id.as_deref(), Some("ev-1"));
@@ -831,7 +944,7 @@ mod tests {
             .await
             .expect("second observation");
 
-        let row = store.lookup("a.md", &token()).await.expect("lookup").expect("row");
+        let row = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row");
         assert_eq!(row.generation, "2");
         assert_eq!(row.content_hash.as_deref(), Some("h2"));
         assert_eq!(row.last_event_id.as_deref(), Some("ev-2"));
@@ -856,15 +969,15 @@ mod tests {
             .expect("observe");
 
         store
-            .invalidate_on_write(&["a.md".to_owned(), "ghost.md".to_owned()], &token())
+            .invalidate_on_write(ROOT_A, &["a.md".to_owned(), "ghost.md".to_owned()], &token())
             .await
             .expect("invalidate");
 
-        let row = store.lookup("a.md", &token()).await.expect("lookup").expect("row");
+        let row = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row");
         assert!(row.dirty, "touched path is dirty");
         assert_eq!(row.content_hash.as_deref(), Some("h1"), "observation preserved");
         assert!(
-            store.lookup("ghost.md", &token()).await.expect("lookup").is_none(),
+            store.lookup(ROOT_A, "ghost.md", &token()).await.expect("lookup").is_none(),
             "dirtying an absent path is a no-op — it must not conjure a row"
         );
     }
@@ -894,6 +1007,7 @@ mod tests {
         // Snapshot lists only a.md (b.md vanished from the workspace).
         let snapshot = WorkspaceSnapshotPayload {
             generation: "2".to_owned(),
+            project_root_hash: ROOT_A.to_owned(),
             files: vec![SnapshotEntry {
                 path: "a.md".to_owned(),
                 size_bytes: Some(100),
@@ -906,13 +1020,13 @@ mod tests {
             .await
             .expect("apply snapshot");
 
-        let a = store.lookup("a.md", &token()).await.expect("lookup").expect("a row");
+        let a = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("a row");
         assert!(!a.dirty, "snapshot-listed row is clean");
         assert_eq!(a.generation, "2");
         assert_eq!(a.content_hash.as_deref(), Some("ha2"));
         assert_eq!(a.last_event_id.as_deref(), Some("snap-1"));
 
-        let b = store.lookup("b.md", &token()).await.expect("lookup").expect("b row");
+        let b = store.lookup(ROOT_A, "b.md", &token()).await.expect("lookup").expect("b row");
         assert!(b.dirty, "vanished row is kept but marked dirty");
         assert_eq!(b.generation, "1", "observation preserved");
         assert_eq!(b.last_event_id.as_deref(), Some("ev-b"), "observation preserved");
@@ -942,6 +1056,7 @@ mod tests {
 
         let snapshot = WorkspaceSnapshotPayload {
             generation: "3".to_owned(),
+            project_root_hash: ROOT_A.to_owned(),
             files: vec![SnapshotEntry {
                 path: "a.md".to_owned(),
                 size_bytes: Some(42),
@@ -957,6 +1072,7 @@ mod tests {
         let minimal: ToolExecutedPayload =
             serde_json::from_value(json!({ "tool": "ls" })).expect("minimal decodes");
         assert_eq!(minimal.generation, "");
+        assert_eq!(minimal.project_root_hash, "", "root hash defaults empty for legacy events");
         assert!(minimal.paths.is_empty());
         assert_eq!(minimal.tool, "ls");
     }
@@ -1007,7 +1123,7 @@ mod tests {
         )
         .await;
         store
-            .invalidate_on_write(&["a.md".to_owned(), "b.md".to_owned()], &token())
+            .invalidate_on_write(ROOT_A, &["a.md".to_owned(), "b.md".to_owned()], &token())
             .await
             .expect("write dirties");
 
@@ -1030,6 +1146,7 @@ mod tests {
         let t4 = t0 + 4;
         let snapshot = WorkspaceSnapshotPayload {
             generation: "2".to_owned(),
+            project_root_hash: ROOT_A.to_owned(),
             files: vec![SnapshotEntry {
                 path: "a.md".to_owned(),
                 size_bytes: Some(42),
@@ -1049,10 +1166,12 @@ mod tests {
         store.apply_snapshot("ev-5", "agent-a", t4, &snapshot, &token()).await.expect("snapshot");
 
         // Phantom rows whose events are NOT in the log: the rebuild must erase
-        // them (the table is purely derived).
+        // them (the table is purely derived). They live on the legacy empty
+        // root, which the wipe-and-rebuild naturally clears.
         sqlx::query(
-            "INSERT INTO resource_facts (path, generation, observed_at, dirty) \
-             VALUES ('ghost.md', '', 0, 0), ('phantom.md', '', 0, 0)",
+            "INSERT INTO resource_facts
+                 (path, project_root_hash, generation, observed_at, dirty) \
+             VALUES ('ghost.md', '', 0, 0, 0), ('phantom.md', '', 0, 0, 0)",
         )
         .execute(&pool)
         .await
@@ -1060,14 +1179,14 @@ mod tests {
 
         store.rebuild_from_log(&token()).await.expect("rebuild");
 
-        let a = store.lookup("a.md", &token()).await.expect("lookup").expect("a row");
+        let a = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("a row");
         assert!(!a.dirty, "a.md clean from the snapshot");
         assert_eq!(a.generation, "2");
         assert_eq!(a.content_hash.as_deref(), Some("h1"));
         assert_eq!(a.last_event_id.as_deref(), Some("ev-5"));
         assert_eq!(a.observed_at, t4, "observed_at comes from the event's created_at");
 
-        let b = store.lookup("b.md", &token()).await.expect("lookup").expect("b row");
+        let b = store.lookup(ROOT_A, "b.md", &token()).await.expect("lookup").expect("b row");
         assert!(b.dirty, "b.md vanished from the final snapshot → dirty");
         assert_eq!(b.generation, "2", "last observation preserved");
         assert_eq!(b.last_event_id.as_deref(), Some("ev-4"), "last observation preserved");
@@ -1075,14 +1194,14 @@ mod tests {
 
         for phantom in ["ghost.md", "phantom.md"] {
             assert!(
-                store.lookup(phantom, &token()).await.expect("lookup").is_none(),
+                store.lookup(ROOT_A, phantom, &token()).await.expect("lookup").is_none(),
                 "{phantom} erased by rebuild — only the log is authoritative"
             );
         }
 
         // Idempotency: a second rebuild reproduces the exact same table.
         let before: Vec<ResourceFactRowDb> = sqlx::query_as(
-            "SELECT path, generation, size_bytes, mtime_ms, content_hash,
+            "SELECT path, project_root_hash, generation, size_bytes, mtime_ms, content_hash,
                     last_event_id, last_agent_id, observed_at, dirty
              FROM resource_facts ORDER BY path",
         )
@@ -1091,7 +1210,7 @@ mod tests {
         .expect("snapshot rows");
         store.rebuild_from_log(&token()).await.expect("rebuild again");
         let after: Vec<ResourceFactRowDb> = sqlx::query_as(
-            "SELECT path, generation, size_bytes, mtime_ms, content_hash,
+            "SELECT path, project_root_hash, generation, size_bytes, mtime_ms, content_hash,
                     last_event_id, last_agent_id, observed_at, dirty
              FROM resource_facts ORDER BY path",
         )
@@ -1143,7 +1262,7 @@ mod tests {
         store.rebuild_from_log(&token()).await.expect("rebuild despite broken payload");
 
         assert!(
-            store.lookup("good.md", &token()).await.expect("lookup").is_some(),
+            store.lookup(ROOT_A, "good.md", &token()).await.expect("lookup").is_some(),
             "a valid sibling event still folds into the rebuild"
         );
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_facts")
@@ -1173,7 +1292,7 @@ mod tests {
         assert!(res.is_err(), "a cancelled token aborts before writing");
 
         assert!(
-            store.lookup("a.md", &token()).await.expect("lookup").is_none(),
+            store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").is_none(),
             "nothing was written before the abort"
         );
 
@@ -1197,17 +1316,19 @@ mod tests {
             .expect("observe");
 
         assert!(
-            store.store_read_content("a.md", "hello world", &token()).await.expect("store"),
+            store.store_read_content(ROOT_A, "a.md", "hello world", &token()).await.expect("store"),
             "content cached for an existing clean row"
         );
 
-        let cached = store.cached_read("a.md", &token()).await.expect("read").expect("cached");
+        let cached =
+            store.cached_read(ROOT_A, "a.md", &token()).await.expect("read").expect("cached");
         assert_eq!(cached.content, "hello world", "exact bytes preserved");
         assert_eq!(cached.row.content_hash.as_deref(), Some("h1"));
         assert_eq!(cached.row.last_event_id.as_deref(), Some("ev-1"), "row carries attribution");
 
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT content_cached_bytes FROM resource_facts WHERE path = 'a.md'",
+            "SELECT content_cached_bytes FROM resource_facts \
+             WHERE project_root_hash = 'root-a' AND path = 'a.md'",
         )
         .fetch_one(&store.pool)
         .await
@@ -1232,17 +1353,17 @@ mod tests {
 
         let too_big = "x".repeat(CACHE_LIMIT_BYTES + 1);
         assert!(
-            !store.store_read_content("a.md", &too_big, &token()).await.expect("refused"),
+            !store.store_read_content(ROOT_A, "a.md", &too_big, &token()).await.expect("refused"),
             "content over the cache limit is refused, not stored"
         );
         let with_nul = "a\0b";
         assert!(
-            !store.store_read_content("a.md", with_nul, &token()).await.expect("refused"),
+            !store.store_read_content(ROOT_A, "a.md", with_nul, &token()).await.expect("refused"),
             "NUL-bearing content is refused (TEXT column stays clean)"
         );
 
         assert_eq!(
-            store.cached_read("a.md", &token()).await.expect("read").map(|c| c.content),
+            store.cached_read(ROOT_A, "a.md", &token()).await.expect("read").map(|c| c.content),
             None,
             "nothing cached after the refusals"
         );
@@ -1253,11 +1374,11 @@ mod tests {
         let (_dir, pool) = test_pool(1).await;
         let store = ResourceFacts::new(pool);
         assert!(
-            !store.store_read_content("ghost.md", "x", &token()).await.expect("noop"),
+            !store.store_read_content(ROOT_A, "ghost.md", "x", &token()).await.expect("noop"),
             "no row to attach the cache to → refused"
         );
         assert_eq!(
-            store.cached_read("ghost.md", &token()).await.expect("absent"),
+            store.cached_read(ROOT_A, "ghost.md", &token()).await.expect("absent"),
             None,
             "an absent path has no cached read"
         );
@@ -1274,7 +1395,7 @@ mod tests {
             .await
             .expect("observe");
         assert_eq!(
-            store.cached_read("big.bin", &token()).await.expect("no cache"),
+            store.cached_read(ROOT_A, "big.bin", &token()).await.expect("no cache"),
             None,
             "observed without cached content is not servable"
         );
@@ -1298,18 +1419,18 @@ mod tests {
             .await
             .expect("observe c");
 
-        let all = store.list_observations(10, &token()).await.expect("all rows");
+        let all = store.list_observations(ROOT_A, 10, &token()).await.expect("all rows");
         let paths: Vec<&str> = all.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(paths, vec!["c.md", "b.md", "a.md"], "newest observed_at first");
         assert!(all.iter().all(|row| !row.dirty), "all observed rows clean");
 
-        let capped = store.list_observations(2, &token()).await.expect("capped rows");
+        let capped = store.list_observations(ROOT_A, 2, &token()).await.expect("capped rows");
         let paths: Vec<&str> = capped.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(paths, vec!["c.md", "b.md"], "limit honored, newest kept");
 
         // Dirty rows surface with their honesty bit intact for the renderer.
-        store.mark_dirty("b.md", &token()).await.expect("dirty");
-        let rows = store.list_observations(10, &token()).await.expect("rows");
+        store.mark_dirty(ROOT_A, "b.md", &token()).await.expect("dirty");
+        let rows = store.list_observations(ROOT_A, 10, &token()).await.expect("rows");
         let b = rows.iter().find(|row| row.path == "b.md").expect("b row");
         assert!(b.dirty, "dirty flag preserved through list_observations");
     }
@@ -1326,5 +1447,274 @@ mod tests {
         let minimal: ToolExecutedPayload =
             serde_json::from_value(json!({ "tool": "ls" })).expect("minimal decodes");
         assert_eq!(minimal.served_from, None, "old events decode with served_from absent");
+    }
+
+    #[tokio::test]
+    async fn migration_031_preserves_legacy_rows_under_the_empty_root_hash() {
+        // Apply migrations up to 030 on a dedicated connection, seed legacy
+        // (pre-scoping) rows exactly as 029/030 produce them, then let 031
+        // apply — the rebuild must preserve every legacy row under `''`.
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let path = dir.path().join("preserve.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(SqliteSynchronous::Normal);
+        let mut conn =
+            sqlx::sqlite::SqliteConnection::connect_with(&options).await.expect("connect");
+
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(30, &mut conn).await.expect("migrations up to 030 apply");
+
+        // Legacy rows: path is the whole identity; one carries a content cache.
+        sqlx::query(
+            "INSERT INTO resource_facts
+                 (path, generation, size_bytes, mtime_ms, content_hash,
+                  last_event_id, last_agent_id, observed_at, dirty, content_cached,
+                  content_cached_bytes)
+             VALUES ('legacy-a.md', '1', 42, 1000, 'ha',
+                     'ev-1', 'agent-a', 1700000000000, 0, 'cached-bytes', 12),
+                    ('legacy-b.md', '2', NULL, NULL, NULL,
+                     'ev-2', 'agent-b', 1700000000001, 1, NULL, NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed legacy rows");
+
+        migrator.run(&mut conn).await.expect("migration 031 applies");
+
+        let rows: Vec<ResourceFactRowDb> = sqlx::query_as(
+            "SELECT path, project_root_hash, generation, size_bytes, mtime_ms,
+                    content_hash, last_event_id, last_agent_id, observed_at, dirty
+             FROM resource_facts ORDER BY path",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("post-migration rows");
+
+        assert_eq!(rows.len(), 2, "both legacy rows survive the 031 rebuild");
+        let a = rows.iter().find(|r| r.path == "legacy-a.md").expect("row a");
+        assert_eq!(a.project_root_hash, "", "legacy row stays under the empty root hash");
+        assert_eq!(a.generation, "1");
+        assert_eq!(a.content_hash.as_deref(), Some("ha"));
+        assert_eq!(a.last_event_id.as_deref(), Some("ev-1"));
+        assert!(a.dirty == 0, "clean flag preserved");
+        let b = rows.iter().find(|r| r.path == "legacy-b.md").expect("row b");
+        assert_eq!(b.project_root_hash, "", "legacy row stays under the empty root hash");
+        assert!(b.dirty == 1, "dirty flag preserved");
+
+        let cached: Option<String> = sqlx::query_scalar(
+            "SELECT content_cached FROM resource_facts WHERE path = 'legacy-a.md'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("cached content query");
+        assert_eq!(cached.as_deref(), Some("cached-bytes"), "content cache survives 031");
+
+        // The empty root never serves (F5c): a plain lookup under `''` still
+        // sees the preserved rows, but scoped roots do not.
+        let pool = sqlx::SqlitePool::connect_with(options).await.expect("pool connects");
+        let store = ResourceFacts::new(pool);
+        assert!(
+            store.lookup("", "legacy-a.md", &token()).await.expect("lookup").is_some(),
+            "legacy row is visible under the empty root hash"
+        );
+        assert!(
+            store.lookup(ROOT_A, "legacy-a.md", &token()).await.expect("lookup").is_none(),
+            "legacy row is not visible under a real root"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_facts_scope_rows_per_project_root() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool);
+
+        // Both roots observe `a.md` — same relative path, different files.
+        let mut a = observed("a.md", "ha1", "1");
+        store
+            .apply_observed("ev-ra", "agent-a", 1_700_000_000_000, &a, &token())
+            .await
+            .expect("observe under root A");
+        a.project_root_hash = ROOT_B.to_owned();
+        a.paths[0].content_hash = Some("hb1".to_owned());
+        store
+            .apply_observed("ev-rb", "agent-b", 1_700_000_000_001, &a, &token())
+            .await
+            .expect("observe under root B");
+
+        // Scoped lookups never leak across roots (F5c).
+        let row_a = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row a");
+        assert_eq!(row_a.project_root_hash, ROOT_A);
+        assert_eq!(row_a.content_hash.as_deref(), Some("ha1"));
+        assert_eq!(row_a.last_agent_id.as_deref(), Some("agent-a"));
+
+        let row_b = store.lookup(ROOT_B, "a.md", &token()).await.expect("lookup").expect("row b");
+        assert_eq!(row_b.project_root_hash, ROOT_B);
+        assert_eq!(row_b.content_hash.as_deref(), Some("hb1"));
+        assert_eq!(row_b.last_agent_id.as_deref(), Some("agent-b"));
+
+        // The legacy empty root sees none of the scoped rows.
+        assert!(
+            store.lookup("", "a.md", &token()).await.expect("lookup").is_none(),
+            "empty-root lookup must not match scoped rows"
+        );
+
+        // Dirtying is scoped too: only root B's row flips.
+        store.mark_dirty(ROOT_B, "a.md", &token()).await.expect("mark dirty");
+        assert!(
+            !store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row").dirty,
+            "root A unaffected by a root B dirty"
+        );
+        assert!(
+            store.lookup(ROOT_B, "a.md", &token()).await.expect("lookup").expect("row").dirty,
+            "root B row is dirty"
+        );
+
+        // list_observations is scoped per root — same path, one row each.
+        let for_a = store.list_observations(ROOT_A, 10, &token()).await.expect("rows");
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].path, "a.md");
+        assert_eq!(for_a[0].project_root_hash, ROOT_A);
+        let for_b = store.list_observations(ROOT_B, 10, &token()).await.expect("rows");
+        assert_eq!(for_b.len(), 1);
+        assert!(for_b[0].dirty);
+    }
+
+    #[tokio::test]
+    async fn marking_dirty_purges_the_cached_content() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool.clone());
+        store
+            .apply_observed(
+                "ev-1",
+                "agent-a",
+                1_700_000_000_000,
+                &observed("a.md", "h1", "1"),
+                &token(),
+            )
+            .await
+            .expect("observe");
+        assert!(
+            store.store_read_content(ROOT_A, "a.md", "hello world", &token()).await.expect("store"),
+            "content cached while the row is clean"
+        );
+        assert!(
+            store.cached_read(ROOT_A, "a.md", &token()).await.expect("read").is_some(),
+            "cached read available before dirtying"
+        );
+
+        // Dirtying must purge the stale cached bytes (ADR-65 F2a).
+        store.mark_dirty(ROOT_A, "a.md", &token()).await.expect("mark dirty");
+
+        assert!(
+            store.cached_read(ROOT_A, "a.md", &token()).await.expect("read").is_none(),
+            "dirtying purges the cached content — nothing stale may remain to serve"
+        );
+        let row = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row");
+        assert!(row.dirty);
+        assert_eq!(row.content_hash.as_deref(), Some("h1"), "observation columns survive");
+        assert_eq!(row.last_event_id.as_deref(), Some("ev-1"), "observation columns survive");
+
+        // The columns are hard-NULL in storage, not just hidden by the API.
+        let cached: Option<String> = sqlx::query_scalar(
+            "SELECT content_cached FROM resource_facts \
+             WHERE project_root_hash = 'root-a' AND path = 'a.md'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("cached content query");
+        assert_eq!(cached, None, "content_cached is NULL after a dirty");
+
+        // Re-caching after a fresh observation is allowed (the row is clean
+        // again), proving the purge did not corrupt the row.
+        store
+            .apply_observed(
+                "ev-2",
+                "agent-a",
+                1_700_000_000_001,
+                &observed("a.md", "h1", "1"),
+                &token(),
+            )
+            .await
+            .expect("re-observe");
+        assert!(
+            store.store_read_content(ROOT_A, "a.md", "hello again", &token()).await.expect("store"),
+            "a clean row can be cached again after a dirty purged it"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_folds_project_root_hash_and_dirties_all_roots_on_write_applied() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool.clone());
+
+        // The same relative path observed under two different roots.
+        let t0 = 1_700_000_000_000;
+        let payload_a = observed("a.md", "ha1", "1");
+        append_evidence(
+            &pool,
+            "ev-root-a",
+            "agent-a",
+            WhiteboardKind::ToolExecuted,
+            serde_json::to_value(&payload_a).unwrap(),
+            t0,
+        )
+        .await;
+        store
+            .apply_observed("ev-root-a", "agent-a", t0, &payload_a, &token())
+            .await
+            .expect("observe root A");
+
+        let mut payload_b = observed("a.md", "hb1", "2");
+        payload_b.project_root_hash = ROOT_B.to_owned();
+        append_evidence(
+            &pool,
+            "ev-root-b",
+            "agent-b",
+            WhiteboardKind::ToolExecuted,
+            serde_json::to_value(&payload_b).unwrap(),
+            t0 + 1,
+        )
+        .await;
+        store
+            .apply_observed("ev-root-b", "agent-b", t0 + 1, &payload_b, &token())
+            .await
+            .expect("observe root B");
+
+        // A WriteApplied names the path without root attribution: the rebuild
+        // must dirty the row under EVERY root that observed it.
+        append_evidence(
+            &pool,
+            "ev-write",
+            "agent-c",
+            WhiteboardKind::WriteApplied,
+            json!({ "pre_images": { "a.md": "pre-a" } }),
+            t0 + 2,
+        )
+        .await;
+
+        store.rebuild_from_log(&token()).await.expect("rebuild");
+
+        let row_a = store.lookup(ROOT_A, "a.md", &token()).await.expect("lookup").expect("row a");
+        assert_eq!(row_a.project_root_hash, ROOT_A, "root folds from the ToolExecuted payload");
+        assert!(row_a.dirty, "all-roots dirty on WriteApplied");
+        assert_eq!(row_a.content_hash.as_deref(), Some("ha1"));
+        assert_eq!(row_a.last_event_id.as_deref(), Some("ev-root-a"), "attribution preserved");
+
+        let row_b = store.lookup(ROOT_B, "a.md", &token()).await.expect("lookup").expect("row b");
+        assert_eq!(row_b.project_root_hash, ROOT_B, "root folds from the ToolExecuted payload");
+        assert!(row_b.dirty, "all-roots dirty on WriteApplied");
+        assert_eq!(row_b.content_hash.as_deref(), Some("hb1"));
+        assert_eq!(row_b.last_event_id.as_deref(), Some("ev-root-b"), "attribution preserved");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_facts")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 2, "one row per root, no cross-root clobbering");
     }
 }
