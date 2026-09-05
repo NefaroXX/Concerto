@@ -1610,6 +1610,82 @@ impl AgentLoop {
             None => HashMap::new(),
         };
 
+        // ADR-65 §4: safe read dedupe. A plain single-path filesystem read
+        // whose clean observation still matches the disk (re-statted now,
+        // content hash verified) is answered from the cache WITHOUT invoking
+        // the executor — and therefore without re-running the policy engine,
+        // the accepted residual risk of the spec. Any doubt (_None_) degrades
+        // to normal execution below; the synthesized result is byte-identical
+        // to a real read of the same path.
+        let serve = match &self.tool_facts {
+            Some(facts) => {
+                crate::read_cache::maybe_serve_read(
+                    facts,
+                    &self.project_root,
+                    &tc.name,
+                    &arguments,
+                    &cancel,
+                )
+                .await
+            }
+            None => None,
+        };
+        if let Some(serve) = serve {
+            *tool_call_count += 1;
+            let served_summary = format!("Read {} bytes from {}", serve.content.len(), serve.path);
+            tool_events.push(ToolExecutionSummary {
+                tool_name: tc.name.clone(),
+                operation: Some("read".to_string()),
+                path: Some(Utf8PathBuf::from(&serve.path)),
+                success: true,
+                summary: served_summary.clone(),
+            });
+            let served_data = serde_json::json!({
+                "content": serve.content,
+                "path": serve.path,
+            });
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                correlation_id,
+                EventKind::ToolExecutionFinished {
+                    tool_name: tc.name.clone(),
+                    duration_ms: 0,
+                    success: true,
+                    detail: Some(served_summary.clone()),
+                },
+            );
+            let tool_result_content = format!(
+                "TOOL_RESULT\ntool: {}\nid: {}\nstatus: success\nsummary: {}\ndata: {}",
+                tc.name,
+                tc.id,
+                served_summary,
+                serde_json::to_string(&served_data).unwrap_or_else(|_| "{}".to_string())
+            );
+            messages.push(Message {
+                role: Role::Tool,
+                content: tool_result_content.clone(),
+                tool_calls: None,
+                tool_results: Some(vec![concerto_core::types::ToolResult {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    content: serde_json::json!({ "summary": served_summary, "data": served_data }),
+                }]),
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            });
+            self.record_served_read_fact(
+                session,
+                task,
+                &tc.name,
+                &arguments,
+                &serve.event_id,
+                &cancel,
+            )
+            .await;
+            return Ok(());
+        }
+
         match self
             .tool_executor
             .execute(&tc.name, arguments.clone(), &tc.id, session, cancel.clone())
@@ -1701,6 +1777,20 @@ impl AgentLoop {
                     &cancel,
                 )
                 .await;
+
+                // ADR-65 §4: cache the exact bytes of a successful plain read
+                // (runs after the observation above, so the row exists) so an
+                // identical later read can be served from cache. Fail-soft.
+                if let Some(facts) = &self.tool_facts {
+                    crate::read_cache::cache_read_output(
+                        facts,
+                        &tc.name,
+                        &arguments,
+                        &output.data,
+                        &cancel,
+                    )
+                    .await;
+                }
             }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
@@ -1849,6 +1939,46 @@ impl AgentLoop {
                     file_affecting,
                     pre_image_hashes,
                 },
+                cancel,
+            )
+            .await;
+    }
+
+    /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
+    /// `served_from` (the original observation's event id). The fact's paths
+    /// are intentionally empty — see `ToolFactContext::record_served_read`.
+    /// Fail-soft, like every evidence write.
+    async fn record_served_read_fact(
+        &self,
+        session: &SessionContext,
+        task: &AgentTask,
+        tool: &str,
+        args: &serde_json::Value,
+        served_from: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = session.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_served_read(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: None,
+                    generation: "",
+                    project_root: &self.project_root,
+                    tool,
+                    args,
+                    success: true,
+                    exit_code: None,
+                    paths: &[],
+                    file_affecting: false,
+                    pre_image_hashes: HashMap::new(),
+                },
+                served_from,
                 cancel,
             )
             .await;

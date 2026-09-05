@@ -37,6 +37,12 @@ use crate::check_cancel;
 use crate::whiteboard::WhiteboardKind;
 use crate::SessionError;
 
+/// ADR-65 §4: maximum cached read content size in bytes. Mirrors the effective
+/// serve bound — files above this size are never content-cached (and files
+/// above `MAX_HASH_BYTES` in the orchestrator are never hashable), so the
+/// content cache stays a small, bounded side table.
+pub const CACHE_LIMIT_BYTES: usize = 128 * 1024;
+
 // ---------------------------------------------------------------------------
 // Typed payload models
 // ---------------------------------------------------------------------------
@@ -94,6 +100,12 @@ pub struct ToolExecutedPayload {
     /// The paths this tool execution affected/observed.
     #[serde(default)]
     pub paths: Vec<ObservedPath>,
+    /// ADR-65 §4 read-dedupe: when a read was **served from cache** instead of
+    /// invoking the executor, the `event_id` of the observation the served
+    /// content is attributable to (`last_event_id` of the verified clean row).
+    /// `None` for every ordinary executed tool call.
+    #[serde(default)]
+    pub served_from: Option<String>,
 }
 
 /// Payload of a `WorkspaceSnapshot` whiteboard event — a read-only workspace
@@ -137,6 +149,19 @@ pub struct ResourceFactRow {
     pub dirty: bool,
 }
 
+/// One verified cacheable read: the observation row the content belongs to
+/// plus the cached content bytes themselves (ADR-65 §4). The caller (not the
+/// store) is responsible for the never-stale validation: a fresh `stat`
+/// matching `row.size_bytes`/`row.mtime_ms` and `blake3(content) ==
+/// row.content_hash`. `content_cached` is `NULL` for any row that was never
+/// cached, so `[`ResourceFacts::cached_read`]` answers `None` for those.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedRead {
+    pub row: ResourceFactRow,
+    /// The cached exact bytes of the last read of `row.path`.
+    pub content: String,
+}
+
 /// Raw row shape for `resource_facts` decoding (TEXT columns stay strings;
 /// integer columns come back as `i64`). `PartialEq` supports test assertions
 /// over whole-table snapshots during rebuild idempotency checks.
@@ -151,6 +176,14 @@ struct ResourceFactRowDb {
     last_agent_id: Option<String>,
     observed_at: i64,
     dirty: i64,
+}
+
+/// One-column decode for the content cache: `Option<String>` here keeps a
+/// `NULL` `content_cached` distinguishable from an absent row and from `""` —
+/// the query_scalar + `Option` combination would conflate all three.
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct ContentCacheRow {
+    content_cached: Option<String>,
 }
 
 impl TryFrom<ResourceFactRowDb> for ResourceFactRow {
@@ -393,6 +426,89 @@ impl ResourceFacts {
         Ok(())
     }
 
+    /// ADR-65 §4: fetch the cached content for `path` together with its
+    /// observation row. `Ok(None)` when the path was never observed OR never
+    /// content-cached — the caller then must not serve and executes normally.
+    /// The caller still validates the cache (fresh stat + hash) before serving;
+    /// this method never judges freshness.
+    pub async fn cached_read(
+        &self,
+        path: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<CachedRead>, SessionError> {
+        check_cancel(cancel)?;
+        let Some(row) = self.lookup(path, cancel).await? else {
+            return Ok(None);
+        };
+        // Decode through a struct so a NULL `content_cached` stays `None`
+        // (query_scalar + fetch_optional would conflate NULL with "") — a row
+        // that was never content-cached is not servable.
+        let cached: Option<ContentCacheRow> =
+            sqlx::query_as("SELECT content_cached FROM resource_facts WHERE path = ?")
+                .bind(path)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(ContentCacheRow { content_cached: Some(content) }) = cached else {
+            return Ok(None);
+        };
+        Ok(Some(CachedRead { row, content }))
+    }
+
+    /// ADR-65 §4: store the exact bytes of a successful read as the content
+    /// cache for `path`. Returns `Ok(true)` when stored, `Ok(false)` when the
+    /// content was refused (NUL bytes, over [`CACHE_LIMIT_BYTES`], or no row
+    /// to attach it to — the row must exist from the observation already).
+    /// Errors only for genuine store failures; callers treat every failure as
+    /// "not cached, no harm done" (the cache is derived, never a requirement).
+    pub async fn store_read_content(
+        &self,
+        path: &str,
+        content: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, SessionError> {
+        check_cancel(cancel)?;
+        if content.as_bytes().contains(&0) {
+            return Ok(false);
+        }
+        if content.len() > CACHE_LIMIT_BYTES {
+            return Ok(false);
+        }
+        let stored = sqlx::query(
+            "UPDATE resource_facts
+             SET content_cached = ?, content_cached_bytes = ?
+             WHERE path = ?",
+        )
+        .bind(content)
+        .bind(to_i64(content.len() as u64)?)
+        .bind(path)
+        .execute(&self.pool)
+        .await?;
+        Ok(stored.rows_affected() == 1)
+    }
+
+    /// ADR-65 §4 action digest: the newest `limit` observed paths, newest
+    /// `observed_at` first with a deterministic path tiebreak. The caller
+    /// renders each row as unchanged/dirty — never gates behavior on the list
+    /// alone (rows carry the `dirty` honesty bit).
+    pub async fn list_observations(
+        &self,
+        limit: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResourceFactRow>, SessionError> {
+        check_cancel(cancel)?;
+        let rows = sqlx::query_as::<_, ResourceFactRowDb>(
+            "SELECT path, generation, size_bytes, mtime_ms, content_hash,
+                    last_event_id, last_agent_id, observed_at, dirty
+             FROM resource_facts
+             ORDER BY observed_at DESC, path ASC
+             LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ResourceFactRow::try_from).collect()
+    }
+
     /// Apply a `WorkspaceSnapshot` observation: upsert every listed file as
     /// clean, and mark previously-clean rows that vanished from the listing
     /// dirty (kept for attribution). Runs atomically in one transaction.
@@ -567,6 +683,7 @@ mod tests {
                 mtime_ms: Some(1_000),
                 content_hash: Some(hash.to_owned()),
             }],
+            served_from: None,
         }
     }
 
@@ -634,6 +751,8 @@ mod tests {
                 "last_agent_id",
                 "observed_at",
                 "dirty",
+                "content_cached",
+                "content_cached_bytes",
             ]
         );
 
@@ -1060,5 +1179,152 @@ mod tests {
 
         let res = store.rebuild_from_log(&cancelled).await;
         assert!(res.is_err(), "rebuild aborts on a cancelled token");
+    }
+
+    #[tokio::test]
+    async fn store_read_content_caches_exact_bytes_for_an_observed_path() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool);
+        store
+            .apply_observed(
+                "ev-1",
+                "agent-a",
+                1_700_000_000_000,
+                &observed("a.md", "h1", "1"),
+                &token(),
+            )
+            .await
+            .expect("observe");
+
+        assert!(
+            store.store_read_content("a.md", "hello world", &token()).await.expect("store"),
+            "content cached for an existing clean row"
+        );
+
+        let cached = store.cached_read("a.md", &token()).await.expect("read").expect("cached");
+        assert_eq!(cached.content, "hello world", "exact bytes preserved");
+        assert_eq!(cached.row.content_hash.as_deref(), Some("h1"));
+        assert_eq!(cached.row.last_event_id.as_deref(), Some("ev-1"), "row carries attribution");
+
+        let bytes: i64 = sqlx::query_scalar(
+            "SELECT content_cached_bytes FROM resource_facts WHERE path = 'a.md'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("bytes column query");
+        assert_eq!(bytes, 11, "content_cached_bytes mirrors the byte length");
+    }
+
+    #[tokio::test]
+    async fn store_read_content_refuses_oversized_and_nul_content() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool);
+        store
+            .apply_observed(
+                "ev-1",
+                "agent-a",
+                1_700_000_000_000,
+                &observed("a.md", "h1", "1"),
+                &token(),
+            )
+            .await
+            .expect("observe");
+
+        let too_big = "x".repeat(CACHE_LIMIT_BYTES + 1);
+        assert!(
+            !store.store_read_content("a.md", &too_big, &token()).await.expect("refused"),
+            "content over the cache limit is refused, not stored"
+        );
+        let with_nul = "a\0b";
+        assert!(
+            !store.store_read_content("a.md", with_nul, &token()).await.expect("refused"),
+            "NUL-bearing content is refused (TEXT column stays clean)"
+        );
+
+        assert_eq!(
+            store.cached_read("a.md", &token()).await.expect("read").map(|c| c.content),
+            None,
+            "nothing cached after the refusals"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_read_content_without_a_row_is_a_noop() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool);
+        assert!(
+            !store.store_read_content("ghost.md", "x", &token()).await.expect("noop"),
+            "no row to attach the cache to → refused"
+        );
+        assert_eq!(
+            store.cached_read("ghost.md", &token()).await.expect("absent"),
+            None,
+            "an absent path has no cached read"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_is_none_for_observed_but_never_cached_rows() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool);
+        let mut big = observed("big.bin", "h1", "1");
+        big.paths[0].content_hash = None; // > hashing budget: never content-cached
+        store
+            .apply_observed("ev-1", "agent-a", 1_700_000_000_000, &big, &token())
+            .await
+            .expect("observe");
+        assert_eq!(
+            store.cached_read("big.bin", &token()).await.expect("no cache"),
+            None,
+            "observed without cached content is not servable"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_observations_orders_newest_first_and_respects_the_limit() {
+        let (_dir, pool) = test_pool(1).await;
+        let store = ResourceFacts::new(pool);
+        let t0 = 1_700_000_000_000;
+        store
+            .apply_observed("ev-a", "agent-a", t0, &observed("a.md", "ha", "1"), &token())
+            .await
+            .expect("observe a");
+        store
+            .apply_observed("ev-b", "agent-a", t0 + 1, &observed("b.md", "hb", "1"), &token())
+            .await
+            .expect("observe b");
+        store
+            .apply_observed("ev-c", "agent-a", t0 + 2, &observed("c.md", "hc", "1"), &token())
+            .await
+            .expect("observe c");
+
+        let all = store.list_observations(10, &token()).await.expect("all rows");
+        let paths: Vec<&str> = all.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(paths, vec!["c.md", "b.md", "a.md"], "newest observed_at first");
+        assert!(all.iter().all(|row| !row.dirty), "all observed rows clean");
+
+        let capped = store.list_observations(2, &token()).await.expect("capped rows");
+        let paths: Vec<&str> = capped.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(paths, vec!["c.md", "b.md"], "limit honored, newest kept");
+
+        // Dirty rows surface with their honesty bit intact for the renderer.
+        store.mark_dirty("b.md", &token()).await.expect("dirty");
+        let rows = store.list_observations(10, &token()).await.expect("rows");
+        let b = rows.iter().find(|row| row.path == "b.md").expect("b row");
+        assert!(b.dirty, "dirty flag preserved through list_observations");
+    }
+
+    #[tokio::test]
+    async fn served_from_round_trips_and_defaults_to_none() {
+        let mut executed = observed("a.md", "h1", "1");
+        assert_eq!(executed.served_from, None, "ordinary facts carry no served_from");
+        executed.served_from = Some("ev-1".to_owned());
+        let json = serde_json::to_value(&executed).expect("serialize");
+        let back: ToolExecutedPayload = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.served_from.as_deref(), Some("ev-1"), "served_from round trips");
+
+        let minimal: ToolExecutedPayload =
+            serde_json::from_value(json!({ "tool": "ls" })).expect("minimal decodes");
+        assert_eq!(minimal.served_from, None, "old events decode with served_from absent");
     }
 }

@@ -62,6 +62,13 @@ impl ToolFactContext {
         self
     }
 
+    /// The backing pool, so sibling modules (e.g. the read-dedupe cache in
+    /// [`crate::read_cache`]) can query the same `resource_facts` store the
+    /// writer keeps in sync. `None` when the writer is disabled.
+    pub(crate) fn pool(&self) -> Option<&sqlx::SqlitePool> {
+        self.pool.as_ref()
+    }
+
     /// Read the pre-write `content_hash` for every path the tool is about to
     /// touch, straight from `resource_facts` (no filesystem access). Missing
     /// rows and lookup errors yield `None`; this is advisory — a `None` merely
@@ -172,6 +179,9 @@ impl ToolFactContext {
                 exit_code: fact.exit_code,
                 generation: fact.generation.to_owned(),
                 paths: observed,
+                // ADR-65 §4: an ordinary executed tool call is never a cache
+                // serve — served reads are recorded via `record_served_read`.
+                served_from: None,
             };
             if let Err(err) =
                 facts.apply_observed(&event_id, &self.agent_id, created_at, &payload, cancel).await
@@ -183,6 +193,85 @@ impl ToolFactContext {
                     "tool fact: apply_observed failed"
                 );
             }
+        }
+    }
+
+    /// ADR-65 §4: record that a read was **served from cache** rather than
+    /// executed. The `served_from` fact is a `ToolExecuted` whiteboard event
+    /// with `served_from` set to the verified clean row's `last_event_id` and
+    /// **empty `paths`** — reconstructing paths from `list_observations` could
+    /// fold a possibly-empty `generation` and clobber the clean row's
+    /// generation, so the served fact deliberately does NOT re-sync the
+    /// derived store. Fail-soft: never fails the caller.
+    pub async fn record_served_read(
+        &self,
+        fact: &ToolExecutedFact<'_>,
+        served_from: &str,
+        cancel: &CancellationToken,
+    ) {
+        // Cancellation is intentionally not consulted: appending the served
+        // fact is a single bounded write straight after an already-completed
+        // tool result; the caller's cancel token was already honored when the
+        // serve decision was made.
+        let _ = cancel;
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let event_id = Ulid::new().to_string();
+        let event = NewWhiteboardEvent {
+            event_id: event_id.clone(),
+            agent_id: self.agent_id.clone(),
+            kind: WhiteboardKind::ToolExecuted,
+            scope: String::new(),
+            session_id: Some(fact.session_id.to_owned()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "agent_id": fact.task_attribution().map_or_else(
+                    || self.agent_id.clone(),
+                    |agent_id| agent_id.to_owned()
+                ),
+                "task_id": fact.task_id,
+                "run_id": fact.run_id,
+                "tool": fact.tool,
+                "args": canonical_args(fact.args),
+                "success": true,
+                "exit_code": serde_json::Value::Null,
+                "generation": fact.generation,
+                "paths": serde_json::json!([]),
+                "served_from": served_from,
+            }),
+            pre_image_hash: None,
+            created_at: unix_ms(),
+        };
+        if let Err(err) = append_whiteboard_event(pool, &event).await {
+            warn!(
+                tool = fact.tool,
+                agent_id = %self.agent_id,
+                %err,
+                "tool fact: served read append failed; fact dropped"
+            );
+        }
+    }
+
+    /// ADR-65 §4: cache the exact bytes of a successful plain filesystem read
+    /// into `resource_facts` content cache, so an identical later read can be
+    /// served without re-reading the disk. Runs AFTER `record_tool_executed`
+    /// has applied the observation (the row must already exist — this method
+    /// only ever attaches content to an existing clean row). Fail-soft and
+    /// bounded: no row, NUL bytes, or over-limit content all no-op silently.
+    pub async fn cache_read_content(&self, path: &str, content: &str, cancel: &CancellationToken) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let facts = ResourceFacts::new(pool.clone());
+        if let Err(err) = facts.store_read_content(path, content, cancel).await {
+            warn!(
+                path,
+                agent_id = %self.agent_id,
+                %err,
+                "tool fact: read content cache write failed; cache skipped"
+            );
         }
     }
 }
@@ -292,7 +381,7 @@ async fn observe_paths(project_root: &Path, paths: &[String]) -> Vec<ObservedPat
 }
 
 /// Resolve a tool-reported path against the project root when relative.
-fn resolve_path(project_root: &Path, raw: &str) -> std::path::PathBuf {
+pub(crate) fn resolve_path(project_root: &Path, raw: &str) -> std::path::PathBuf {
     let candidate = Path::new(raw);
     if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -303,7 +392,7 @@ fn resolve_path(project_root: &Path, raw: &str) -> std::path::PathBuf {
 
 /// mtime as unix-epoch milliseconds (UTC-agnostic epoch time, the store's
 /// convention).
-fn mtime_ms(meta: &std::fs::Metadata) -> Option<u64> {
+pub(crate) fn mtime_ms(meta: &std::fs::Metadata) -> Option<u64> {
     let modified = meta.modified().ok()?;
     modified.duration_since(std::time::UNIX_EPOCH).ok().map(|duration| duration.as_millis() as u64)
 }
@@ -505,6 +594,7 @@ mod tests {
                         mtime_ms: Some(1),
                         content_hash: Some("pre".to_owned()),
                     }],
+                    served_from: None,
                 },
                 &cancel,
             )

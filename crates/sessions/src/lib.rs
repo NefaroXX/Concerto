@@ -15,7 +15,7 @@ pub mod whiteboard;
 
 pub use plan_bindings::PlanBindingRecord;
 pub use resource_facts::{
-    ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
+    CachedRead, ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
     WorkspaceSnapshotPayload,
 };
 pub use whiteboard::{

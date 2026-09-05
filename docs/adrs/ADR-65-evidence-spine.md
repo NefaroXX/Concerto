@@ -214,3 +214,94 @@ Negative / accepted:
 8. Fabricated coordinator evidence ids are rejected at append.
 9. System remains correct with vector memory disabled.
 10. Clippy/fmt/test green on the workspace; new tests cover 1–9.
+
+## Implementation note (Phase 4 — §4 shipped, 2026-09-04)
+
+ADRs document the first plan, not the final route. This note records what
+actually shipped for §4 (resource fast path + safe read dedupe) so future
+maintenance reads code against intent, not against an idealized spec.
+
+### Migration 030 (content cache columns)
+
+The derived table is `resource_facts` from migration 029. Phase 4 adds two
+nullable columns via migration **030** (`content_cached TEXT`,
+`content_cached_bytes INTEGER`); 030 was the next free number. The cached
+content is **repudiable by rebuild**: `rebuild_from_log` replays observations
+forward from the whiteboard log as ordered by migration 029, so content columns
+are deliberately **not** repopulated by a rebuild — they are a hot-path
+performance affordance layered over the derived view, which itself is always
+rebuildable from the log (ADR-64 derived-view rule).
+
+### Serve predicate (never-stale)
+
+`maybe_serve_read` serves **only** when every rule holds:
+
+1. **Plain read only.** Tool is `filesystem`, operation is `read`, and the
+   canonical args contain exactly `{operation, path}` with a non-empty `path`.
+   Everything else (globs, dirs, multi-file, other tools) executes normally.
+2. **Row exists and is clean.** `resource_facts[P]` present with `dirty == 0`.
+3. **The disk agrees right now.** A fresh `std::fs::metadata` on the resolved
+   path must match the row's `size_bytes` **and** `mtime_ms`. The row alone is
+   never trusted; reuse of `resolve_path`/`mtime_ms` from `tool_facts` keeps the
+   re-stat on the exact path the observation hashed.
+4. **Cached content is self-consistent.** The cached bytes (when present)
+   re-hash to the row's `content_hash` — a cache-vs-row integrity check that
+   never requires an extra disk read.
+
+Any doubt degrades to normal execution — the model still receives a
+byte-identical read result, the runtime just pays for it. Residual risk is
+accepted precisely once: a rewrite that lands within one millisecond and keeps
+both size and mtime identical is indistinguishable from "unchanged" (a
+filesystem timestamp limitation, not an implementation gap).
+
+**Escape hatches.** Serving is per-call and self-disabling:
+
+- A `dirty` row (any write, shell/git side effect, watcher hint) never serves;
+  observation stores clean rows, so the watcher's dirty marking is the safety
+  switch (ADR-65 §4 "dirty-on-uncertain").
+- Per-rule failures (metadata error, hash absent, cache absent, hash mismatch)
+  all return serve-`None` and execute normally.
+
+**Effective size bound.** Rows with `content_hash == None` never serve.
+`observe_paths` hashes only content up to `MAX_HASH_BYTES` (64 KiB,
+`tool_facts.rs`), so the effective guaranteed-serve bound is ≤ 64 KiB per file,
+regardless of the larger `CACHE_LIMIT_BYTES` (128 KiB) store cap.
+
+### Cache write (hot path, exact bytes)
+
+`cache_read_output` runs at execute sites **after** the observation (`ToolExecuted`
+append) so the row exists, and stores the executor's returned
+`data["content"]` — the exact bytes the model just received, with no extra disk
+read. Store-side guards: NUL bytes are rejected (SQLite TEXT), and content over
+`CACHE_LIMIT_BYTES` is rejected. A failed cache write is logged-and-ignored:
+dedupe is an optimization, never a correctness input.
+
+### Served facts
+
+A served read appends a `ToolExecuted` fact with `served_from = <original
+observation's event id>`, `success: true`, and **empty paths**. Empty paths are
+intentional: a served read did not re-observe state, so recording paths would
+re-clobber the row's `generation`/dirty semantics on rebuild. Served facts are
+attribution and audit (Acceptance criteria 3) without pretending to be a fresh
+observation.
+
+### No-policy-recheck note (accepted)
+
+The policy engine lives inside `ToolExecutor::execute`
+(`core/src/executor.rs`). Serving bypasses the executor, so the policy gate is
+**not** re-evaluated for a served read. Residual risk accepted by §4: the read
+already passed policy the first time, anything it could now serve is
+byte-identical to that earlier approved result, and force-fresh execution is
+always available via a `dirty` row or an args change. Recorded here because it
+is the one place a careful reviewer will diff against the spec.
+
+### Action digest
+
+`CoordinatorAgent::snapshot_digest` is now async and, when a `review_store`
+pool is present, appends an `<action_digest>...</action_digest>` block after the
+snapshot digest: the newest 20 observed paths by `observed_at DESC, path ASC`,
+rendered `path | unchanged-since <event_id> | hash-<first 8 hex>` for clean
+rows (hash segment omitted when no content hash was recorded) or
+`path | changed` when dirty. Queried fresh on every dispatch, so agents see what
+changed since planning. Fail-soft: absent pool or store error ⇒ bare snapshot
+digest + warning; the digest itself is not a decision input yet (Phase 2 scope).

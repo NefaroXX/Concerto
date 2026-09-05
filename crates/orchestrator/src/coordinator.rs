@@ -33,7 +33,9 @@ use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
-use concerto_sessions::{OrchestrationCheckpointRecord, SessionStore};
+use concerto_sessions::{
+    OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts, SessionStore,
+};
 
 use crate::agent_runner::AgentRunner;
 use crate::agents::GenericSpecialistAgent;
@@ -180,6 +182,33 @@ fn is_artifact_failure(error: &str) -> bool {
 /// Files larger than this are treated as substantive by construction, so
 /// acceptance only performs bounded reads (audit C-06).
 const MAX_PLACEHOLDER_SCAN_BYTES: u64 = 64 * 1024;
+
+/// ADR-65 §4: newest observed rows folded into the action digest injected
+/// into dispatched agent contexts (bounded so the prompt stays lean).
+const MAX_OBSERVATION_DIGEST_LINES: usize = 20;
+
+/// Render observed `resource_facts` rows as the compact action-digest block:
+/// clean rows as `path | unchanged-since <event_id> | hash-<first 8 hex>` (the
+/// hash segment is omitted when the observation recorded no content hash),
+/// dirty rows as `path | changed`. Deterministic — the input ordering is
+/// already newest-first with a path tiebreak ([`ResourceFacts::list_observations`]).
+fn format_action_digest(rows: &[ResourceFactRow]) -> String {
+    let mut lines = vec![String::from("<action_digest>")];
+    for row in rows {
+        match (&row.dirty, &row.last_event_id, &row.content_hash) {
+            (true, ..) | (false, None, _) => lines.push(format!("{} | changed", row.path)),
+            (false, Some(event_id), Some(hash)) => {
+                let head: String = hash.chars().take(8).collect();
+                lines.push(format!("{} | unchanged-since {} | hash-{}", row.path, event_id, head));
+            }
+            (false, Some(event_id), None) => {
+                lines.push(format!("{} | unchanged-since {}", row.path, event_id));
+            }
+        }
+    }
+    lines.push(String::from("</action_digest>"));
+    lines.join("\n")
+}
 
 /// Minimal stub-marker set for the placeholder predicate (audit C-06).
 ///
@@ -1316,10 +1345,38 @@ impl CoordinatorAgent {
 
     /// The pre-planning snapshot digest for context injection; `None` when the
     /// readiness barrier produced no snapshot (readability or fail-soft).
-    fn snapshot_digest(&self) -> Option<String> {
-        self.workspace_snapshot
+    ///
+    /// ADR-65 §4: augmented with a compact per-observation **action digest** —
+    /// the newest [`MAX_OBSERVATION_DIGEST_LINES`] observed paths from the
+    /// derived `resource_facts` store, queried fresh on every dispatch so the
+    /// agent sees what changed since planning rather than a stale snapshot.
+    /// Fail-soft: an absent pool or a store error degrades to the bare
+    /// snapshot digest with a warning, never a dispatch failure.
+    async fn snapshot_digest(&self, cancel: &CancellationToken) -> Option<String> {
+        let base = self
+            .workspace_snapshot
             .as_ref()
-            .map(crate::workspace_snapshot::WorkspaceSnapshotRecord::digest)
+            .map(crate::workspace_snapshot::WorkspaceSnapshotRecord::digest)?;
+        let Some(pool) = &self.review_store else {
+            return Some(base);
+        };
+        let observations = match ResourceFacts::new(pool.clone())
+            .list_observations(MAX_OBSERVATION_DIGEST_LINES, cancel)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(%err, "action digest: observation list unavailable; falling back to the snapshot digest only");
+                return Some(base);
+            }
+        };
+        if observations.is_empty() {
+            return Some(base);
+        }
+        let mut digest = String::from(&base);
+        digest.push('\n');
+        digest.push_str(&format_action_digest(&observations));
+        Some(digest)
     }
 
     /// The pre-planning workspace generation id (ADR-65) for evidence
@@ -2883,7 +2940,7 @@ impl CoordinatorAgent {
                         budget_remaining_usd: None,
                         expected_artifacts: task_artifacts,
                         workspace_capsule: task_capsule,
-                        workspace_snapshot_digest: this.snapshot_digest(),
+                        workspace_snapshot_digest: this.snapshot_digest(&cancel_clone).await,
                         run_id: this.run_id.clone(),
                         workspace_generation: this.snapshot_generation(),
                     };
@@ -3062,7 +3119,7 @@ impl CoordinatorAgent {
                                     budget_remaining_usd: None,
                                     expected_artifacts: ladder_artifacts,
                                     workspace_capsule: None,
-                                    workspace_snapshot_digest: self.snapshot_digest(),
+                                    workspace_snapshot_digest: self.snapshot_digest(&cancel).await,
                                     run_id: self.run_id.clone(),
                                     workspace_generation: self.snapshot_generation(),
                                 };
@@ -3680,7 +3737,7 @@ impl CoordinatorAgent {
                             budget_remaining_usd: None,
                             expected_artifacts: ladder_artifacts,
                             workspace_capsule: None,
-                            workspace_snapshot_digest: self.snapshot_digest(),
+                            workspace_snapshot_digest: self.snapshot_digest(&cancel).await,
                             run_id: self.run_id.clone(),
                             workspace_generation: self.snapshot_generation(),
                         };
@@ -4512,7 +4569,7 @@ impl CoordinatorAgent {
                 budget_remaining_usd: None,
                 expected_artifacts: Vec::new(),
                 workspace_capsule: None,
-                workspace_snapshot_digest: self.snapshot_digest(),
+                workspace_snapshot_digest: self.snapshot_digest(cancel).await,
                 run_id: self.run_id.clone(),
                 workspace_generation: self.snapshot_generation(),
             };
@@ -4661,6 +4718,13 @@ impl CoordinatorAgent {
                         created_at: time::OffsetDateTime::now_utc(),
                         completed_at: None,
                     };
+                    let coder_artifacts = self
+                        .expected_artifacts
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&task_id)
+                        .cloned()
+                        .unwrap_or_default();
                     let coder_ctx = AgentContext {
                         session: context.session.clone(),
                         parent_task: Some(task.clone()),
@@ -4668,15 +4732,9 @@ impl CoordinatorAgent {
                         retrieved_chunks: context.retrieved_chunks.clone(),
                         previous_results: vec![result],
                         budget_remaining_usd: None,
-                        expected_artifacts: self
-                            .expected_artifacts
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .get(&task_id)
-                            .cloned()
-                            .unwrap_or_default(),
+                        expected_artifacts: coder_artifacts,
                         workspace_capsule: None,
-                        workspace_snapshot_digest: self.snapshot_digest(),
+                        workspace_snapshot_digest: self.snapshot_digest(cancel).await,
                         run_id: self.run_id.clone(),
                         workspace_generation: self.snapshot_generation(),
                     };
@@ -5185,7 +5243,7 @@ impl CoordinatorAgent {
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
-            workspace_snapshot_digest: self.snapshot_digest(),
+            workspace_snapshot_digest: self.snapshot_digest(cancel).await,
             run_id: self.run_id.clone(),
             workspace_generation: self.snapshot_generation(),
         };
@@ -5378,7 +5436,7 @@ impl CoordinatorAgent {
                                 budget_remaining_usd: None,
                                 expected_artifacts: Vec::new(),
                                 workspace_capsule: None,
-                                workspace_snapshot_digest: self.snapshot_digest(),
+                                workspace_snapshot_digest: self.snapshot_digest(cancel).await,
                                 run_id: self.run_id.clone(),
                                 workspace_generation: self.snapshot_generation(),
                             };
@@ -11132,5 +11190,189 @@ mod tests {
             stage_fallback_persona(None, AgentStage::VALIDATE, coordinator_fallback()),
             coordinator_fallback(),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-65 §4: action digest (snapshot ⨁ observations)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn format_action_digest_renders_clean_and_dirty_rows_deterministically() {
+        let rows = vec![
+            ResourceFactRow {
+                path: "src/main.rs".to_owned(),
+                generation: "g1".to_owned(),
+                size_bytes: Some(10),
+                mtime_ms: Some(1),
+                content_hash: Some("0123456789abcdef".to_owned()),
+                last_event_id: Some("ev-2".to_owned()),
+                last_agent_id: Some("coder".to_owned()),
+                observed_at: 200,
+                dirty: false,
+            },
+            ResourceFactRow {
+                path: "gen/config.yaml".to_owned(),
+                generation: "g1".to_owned(),
+                size_bytes: Some(5),
+                mtime_ms: Some(3),
+                content_hash: Some("fedcba9876543210".to_owned()),
+                last_event_id: Some("ev-1".to_owned()),
+                last_agent_id: Some("researcher".to_owned()),
+                observed_at: 100,
+                dirty: false,
+            },
+            ResourceFactRow {
+                path: "notes/todo.md".to_owned(),
+                generation: "g2".to_owned(),
+                size_bytes: Some(4),
+                mtime_ms: Some(2),
+                content_hash: None,
+                last_event_id: Some("ev-3".to_owned()),
+                last_agent_id: Some("coder".to_owned()),
+                observed_at: 150,
+                dirty: true,
+            },
+        ];
+        let digest = super::format_action_digest(&rows);
+        assert_eq!(
+            digest,
+            "<action_digest>\n\
+             src/main.rs | unchanged-since ev-2 | hash-01234567\n\
+             gen/config.yaml | unchanged-since ev-1 | hash-fedcba98\n\
+             notes/todo.md | changed\n\
+             </action_digest>"
+        );
+    }
+
+    #[test]
+    fn format_action_digest_omits_hash_when_unhashed_row_is_clean() {
+        let rows = vec![ResourceFactRow {
+            path: "big.bin".to_owned(),
+            generation: "g1".to_owned(),
+            size_bytes: Some(200 * 1024),
+            mtime_ms: Some(1),
+            content_hash: None,
+            last_event_id: Some("ev-9".to_owned()),
+            last_agent_id: Some("coder".to_owned()),
+            observed_at: 100,
+            dirty: false,
+        }];
+        assert_eq!(
+            super::format_action_digest(&rows),
+            "<action_digest>\nbig.bin | unchanged-since ev-9\n</action_digest>"
+        );
+    }
+
+    /// The augmented digest injects an action block after the snapshot digest
+    /// when a `review_store` pool with observations is present, and the row
+    /// still carries the snapshot digest as a prefix (the injection is
+    /// additive, purely for context — ADR-65 §4).
+    #[tokio::test]
+    async fn snapshot_digest_appends_action_digest_when_store_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("action_digest_test.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+
+        let facts = ResourceFacts::new(pool.clone());
+        let cancel = CancellationToken::new();
+        let observed = |path: &str, content_hash: Option<&str>, generation: &str| {
+            concerto_sessions::ToolExecutedPayload {
+                agent_id: Some("coder".to_owned()),
+                task_id: None,
+                run_id: None,
+                tool: "filesystem".to_owned(),
+                args: serde_json::json!({ "operation": "read", "path": path }),
+                success: true,
+                exit_code: Some(0),
+                generation: generation.to_owned(),
+                served_from: None,
+                paths: vec![concerto_sessions::ObservedPath {
+                    path: path.to_owned(),
+                    size_bytes: Some(10),
+                    mtime_ms: Some(42),
+                    content_hash: content_hash.map(String::from),
+                }],
+            }
+        };
+        // Row 1: clean, content-hashed observation.
+        facts
+            .apply_observed(
+                "ev-1",
+                "coder",
+                100,
+                &observed("src/lib.rs", Some("deadbeef00cafe01"), "g1"),
+                &cancel,
+            )
+            .await
+            .expect("observe row 1");
+        // Row 2: dirty (write uncertainty) — must render `changed` even though
+        // it carries a content hash.
+        facts
+            .apply_observed(
+                "ev-2",
+                "coder",
+                200,
+                &observed("gen/data.json", Some("0123456789abcdef"), "g1"),
+                &cancel,
+            )
+            .await
+            .expect("observe row 2");
+        facts.mark_dirty("gen/data.json", &cancel).await.expect("dirty row 2");
+
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_workspace_snapshot(crate::workspace_snapshot::WorkspaceSnapshotRecord {
+                    generation: "gen-1".to_owned(),
+                    entries: vec![],
+                    captured_at_ms: 0,
+                })
+                .with_review_store(Some(pool));
+
+        let digest = coordinator.snapshot_digest(&cancel).await.expect("snapshot present");
+        assert!(
+            digest.starts_with("workspace-snapshot generation=gen-1"),
+            "the snapshot digest remains the prefix: {digest}"
+        );
+        assert!(
+            digest.contains("<action_digest>"),
+            "the clean row injects into the action digest: {digest}"
+        );
+        assert!(
+            digest.contains("src/lib.rs | unchanged-since ev-1 | hash-deadbeef"),
+            "clean content-hashed row renders with the abbreviated hash: {digest}"
+        );
+        assert!(
+            digest.contains("gen/data.json | changed"),
+            "dirty rows render as changed: {digest}"
+        );
+    }
+
+    /// Without a store pool the digest degrades to the bare snapshot digest —
+    /// the action block is an optimization, never a dispatch requirement.
+    #[tokio::test]
+    async fn snapshot_digest_falls_back_to_snapshot_without_store() {
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_workspace_snapshot(crate::workspace_snapshot::WorkspaceSnapshotRecord {
+                    generation: "gen-1".to_owned(),
+                    entries: vec![],
+                    captured_at_ms: 0,
+                });
+        let digest = coordinator.snapshot_digest(&CancellationToken::new()).await;
+        let digest = digest.expect("snapshot present");
+        assert!(!digest.contains("<action_digest>"));
+        assert!(digest.starts_with("workspace-snapshot generation=gen-1"));
     }
 }

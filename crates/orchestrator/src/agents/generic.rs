@@ -44,7 +44,8 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
     CompletionRequest, DesignDoc, EvalResult, Message, OutputMode, ResearchReport, ReviewReport,
-    ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition, ToolResult,
+    ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition, ToolOutput,
+    ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -222,6 +223,47 @@ impl GenericSpecialistAgent {
                     file_affecting,
                     pre_image_hashes,
                 },
+                cancel,
+            )
+            .await;
+    }
+
+    /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
+    /// `served_from` (the original observation's event id) and empty paths —
+    /// see `ToolFactContext::record_served_read`. Fail-soft, like every
+    /// evidence write; never affects the tool result already returned.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_served_read_fact(
+        &self,
+        task: &SubTask,
+        context: &AgentContext,
+        tool: &str,
+        arguments: &serde_json::Value,
+        served_from: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = task.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_served_read(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: context.run_id.as_deref(),
+                    generation: context.workspace_generation.as_deref().unwrap_or(""),
+                    project_root: &context.session.project_dir,
+                    tool,
+                    args: arguments,
+                    success: true,
+                    exit_code: None,
+                    paths: &[],
+                    file_affecting: false,
+                    pre_image_hashes: HashMap::new(),
+                },
+                served_from,
                 cancel,
             )
             .await;
@@ -561,6 +603,57 @@ impl GenericSpecialistAgent {
                     }
                     None => HashMap::new(),
                 };
+                // ADR-65 §4: safe read dedupe — a plain single-path filesystem
+                // read whose clean observation still matches the disk (re-statted
+                // now, content hash verified) is answered from the cache WITHOUT
+                // invoking the executor (and without re-running the policy
+                // engine — the accepted residual risk of the spec). Any doubt
+                // degrades to normal execution; the model receives a
+                // byte-identical read result either way.
+                let serve = match &self.tool_facts {
+                    Some(facts) => {
+                        crate::read_cache::maybe_serve_read(
+                            facts,
+                            &context.session.project_dir,
+                            &tool_call.name,
+                            &arguments,
+                            &cancel,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                if let Some(serve) = serve {
+                    let served_summary =
+                        format!("Read {} bytes from {}", serve.content.len(), serve.path);
+                    let output = ToolOutput {
+                        summary: served_summary.clone(),
+                        data: serde_json::json!({ "content": serve.content, "path": serve.path }),
+                    };
+                    self.record_served_read_fact(
+                        task,
+                        &context,
+                        &tool_call.name,
+                        &arguments,
+                        &serve.event_id,
+                        &cancel,
+                    )
+                    .await;
+                    messages.push(Message {
+                        role: Role::Tool,
+                        content: String::new(),
+                        tool_calls: None,
+                        tool_results: Some(vec![ToolResult {
+                            id: tool_call.id,
+                            name: tool_call.name.clone(),
+                            content: serde_json::to_value(&output).unwrap_or_default(),
+                        }]),
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    continue;
+                }
                 match executor
                     .execute(&tool_call.name, arguments.clone(), &context.session, cancel.clone())
                     .await
@@ -599,6 +692,19 @@ impl GenericSpecialistAgent {
                             &cancel,
                         )
                         .await;
+                        // ADR-65 §4: cache the exact bytes of a successful plain
+                        // read (after the observation above, so the row exists)
+                        // so an identical later read can be served. Fail-soft.
+                        if let Some(facts) = &self.tool_facts {
+                            crate::read_cache::cache_read_output(
+                                facts,
+                                &tool_call.name,
+                                &arguments,
+                                &output.data,
+                                &cancel,
+                            )
+                            .await;
+                        }
                         messages.push(Message {
                             role: Role::Tool,
                             content: String::new(),
@@ -1634,6 +1740,55 @@ impl GenericSpecialistAgent {
                             }
                             None => HashMap::new(),
                         };
+                        // ADR-65 §4: safe read dedupe (same rule as the
+                        // freeform loop above; any doubt → execute normally).
+                        let serve = match &self.tool_facts {
+                            Some(facts) => {
+                                crate::read_cache::maybe_serve_read(
+                                    facts,
+                                    &context.session.project_dir,
+                                    &tool_call.name,
+                                    &arguments,
+                                    &cancel,
+                                )
+                                .await
+                            }
+                            None => None,
+                        };
+                        if let Some(serve) = serve {
+                            let served_summary =
+                                format!("Read {} bytes from {}", serve.content.len(), serve.path);
+                            let output = ToolOutput {
+                                summary: served_summary.clone(),
+                                data: serde_json::json!({
+                                    "content": serve.content,
+                                    "path": serve.path
+                                }),
+                            };
+                            self.record_served_read_fact(
+                                task,
+                                &context,
+                                &tool_call.name,
+                                &arguments,
+                                &serve.event_id,
+                                &cancel,
+                            )
+                            .await;
+                            messages.push(Message {
+                                role: Role::Tool,
+                                content: String::new(),
+                                tool_calls: None,
+                                tool_results: Some(vec![ToolResult {
+                                    id: tool_call.id.clone(),
+                                    name: tool_call.name.clone(),
+                                    content: serde_json::to_value(&output).unwrap_or_default(),
+                                }]),
+                                reasoning_content: None,
+                                tokens_in: None,
+                                tokens_out: None,
+                            });
+                            continue;
+                        }
                         let result = match &self.tool_executor {
                             Some(executor) => {
                                 executor
@@ -1687,6 +1842,19 @@ impl GenericSpecialistAgent {
                                     &cancel,
                                 )
                                 .await;
+                                // ADR-65 §4: cache the exact bytes of a
+                                // successful plain read (after the observation
+                                // above). Fail-soft.
+                                if let Some(facts) = &self.tool_facts {
+                                    crate::read_cache::cache_read_output(
+                                        facts,
+                                        &tool_call.name,
+                                        &arguments,
+                                        &output.data,
+                                        &cancel,
+                                    )
+                                    .await;
+                                }
                                 messages.push(Message {
                                     role: Role::Tool,
                                     content: String::new(),
