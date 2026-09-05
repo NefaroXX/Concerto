@@ -98,6 +98,17 @@ surface, and persist merge-aware and atomically.
 8. **Non-goals (unchanged).** TOML diff/preview panel; canvas DAG editor;
    migration runner (P5); post-seed `config.toml` wholesale rewriting.
 
+## Amendment (2026-09-05) — blueprints are advisory in the editor
+
+Revised **in place** (no new ADR number). The Studio's blueprint editing
+surface remains roster/config CRUD, but blueprints (including the seeded
+`standard` one) are **advisory data**: editing a blueprint never enforces
+staffing or dispatch order (ADR-58 amendment 2026-09-05, ADR-35 amendment
+2026-09-05). The Studio's authoritative surface is `custom_agents` — add,
+edit, disable, delete agents freely; the Coordinator consumes them as context.
+`seed_orchestration_roster` behavior is unchanged (it materializes the seeds
+as the user's own editable config).
+
 ## Consequences
 
 - The config file is the sanctioned user-editable artifact; Studio and

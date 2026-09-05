@@ -175,6 +175,26 @@ summaries of log activity (`Fact`/`SessionSummary` chunks). Never
 vectorize authoritative facts or decision records. The system must remain
 correct with vector memory disabled entirely.
 
+## Amendment (2026-09-05) — evidence is coordinator context, not a compiled dispatcher
+
+Revised **in place** (per the project owner's standing instruction, no new ADR
+number). §6's intent — "the coordinator derives unmet needs from evidence gaps
+and chooses among the currently registered agents" — is retained, but the
+implementation over-built it into a compiled decision function
+(`evidence_scheduler` rules (a)–(f)) that became a pipeline authority. **The
+scheduler is removed**: no compiled rule selects an agent. Evidence (facts,
+claims, decisions) is injected into the Coordinator's context as guidance; the
+Coordinator decides via the policy-gated `call_specialist` tool (ADR-35
+amendment 2026-09-05).
+
+**Unchanged (killed by nothing in this amendment):** every dispatch appends an
+evidence-backed `Decision` event (`selected_agent, reason, required_output,
+supporting_evidence_ids`); fabricated evidence ids are rejected at append
+(acceptance 8); removing agents from the roster only removes them from the
+Coordinator's context (acceptance 6); resume (§7) restores from the ledger at
+the cursor, and calling architect/researcher again remains allowed only behind
+a recorded, evidence-backed decision (acceptance 7).
+
 ## Consequences
 
 Positive:

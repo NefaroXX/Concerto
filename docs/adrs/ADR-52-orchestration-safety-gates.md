@@ -141,6 +141,18 @@ coordinator integration tests, **not** as a chaos harness:
   (`crates/orchestrator/src/planner.rs`, `crates/sessions/src/plans.rs`) and a
   config round-trip for the new field.
 
+## Amendment (2026-09-05) — planner artifacts are advisory, never a workload
+
+Revised **in place** (per the project owner's standing instruction, no new ADR
+number). §2's planner-as-data mechanism is retained **only as an advisory
+record**. `TaskPlanner::plan` output is **never materialized as `SubTask`
+roles or dependencies** by `decompose_task` (ADR-35 amendment 2026-09-05); the
+Coordinator decides dispatch through `call_specialist`. Plan files persist
+only when the Coordinator invokes the optional advisor; on resume they are
+context, not authoritative. The safety gates this ADR defines — step caps, run
+doom guard, exit gates, zero-work guard — are **unchanged**; they are the
+post-action compensation layers and remain the correctness mechanism.
+
 ## Consequences
 
 - **Positive.** Unbounded multi-agent runs can no longer burn tokens forever —
