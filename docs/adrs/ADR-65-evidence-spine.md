@@ -239,7 +239,10 @@ rebuildable from the log (ADR-64 derived-view rule).
 1. **Plain read only.** Tool is `filesystem`, operation is `read`, and the
    canonical args contain exactly `{operation, path}` with a non-empty `path`.
    Everything else (globs, dirs, multi-file, other tools) executes normally.
-2. **Row exists and is clean.** `resource_facts[P]` present with `dirty == 0`.
+2. **Row exists, is clean, and is scoped to this project root.** `resource_facts[P]`
+   present within the **canonical project-root scope** (ADR-65 F5c) with
+   `dirty == 0`. Rows are keyed by `(project_root_hash, path)`; a row observed
+   under another root — or the legacy `''` root — is invisible and never serves.
 3. **The disk agrees right now.** A fresh `std::fs::metadata` on the resolved
    path must match the row's `size_bytes` **and** `mtime_ms`. The row alone is
    never trusted; reuse of `resolve_path`/`mtime_ms` from `tool_facts` keeps the
@@ -247,6 +250,12 @@ rebuildable from the log (ADR-64 derived-view rule).
 4. **Cached content is self-consistent.** The cached bytes (when present)
    re-hash to the row's `content_hash` — a cache-vs-row integrity check that
    never requires an extra disk read.
+5. **The policy engine explicitly allows the read.** (ADR-65 F1a) A served read
+   is not a policy bypass: the side-effect-free advisory evaluation
+   (`ToolExecutor::policy_verdict_is_allow`) is re-run per serve, and only an
+   explicit `Allow` verdict opens the gate. `Deny`/`RequireApproval`/unknown-tool
+   all fall through to the executor, where the full policy gate (and approval)
+   surfaces as usual.
 
 Any doubt degrades to normal execution — the model still receives a
 byte-identical read result, the runtime just pays for it. Residual risk is
@@ -259,22 +268,27 @@ filesystem timestamp limitation, not an implementation gap).
 - A `dirty` row (any write, shell/git side effect, watcher hint) never serves;
   observation stores clean rows, so the watcher's dirty marking is the safety
   switch (ADR-65 §4 "dirty-on-uncertain").
-- Per-rule failures (metadata error, hash absent, cache absent, hash mismatch)
-  all return serve-`None` and execute normally.
+- Per-rule failures (metadata error, hash absent, cache absent, hash mismatch,
+  non-`Allow` policy verdict, path escaping the root) all return serve-`None`
+  and execute normally.
 
 **Effective size bound.** Rows with `content_hash == None` never serve.
-`observe_paths` hashes only content up to `MAX_HASH_BYTES` (64 KiB,
-`tool_facts.rs`), so the effective guaranteed-serve bound is ≤ 64 KiB per file,
-regardless of the larger `CACHE_LIMIT_BYTES` (128 KiB) store cap.
+`observe_paths` hashes only content up to `MAX_HASH_BYTES`, which **aliases**
+the store's `CACHE_LIMIT_BYTES` (64 KiB, ADR-65 F2b) — one shared cache bound
+for both the orchestrator and the `resource_facts` store, so the guaranteed
+serve bound equals the content-cache capacity (≤ 64 KiB per file).
 
 ### Cache write (hot path, exact bytes)
 
 `cache_read_output` runs at execute sites **after** the observation (`ToolExecuted`
 append) so the row exists, and stores the executor's returned
 `data["content"]` — the exact bytes the model just received, with no extra disk
-read. Store-side guards: NUL bytes are rejected (SQLite TEXT), and content over
-`CACHE_LIMIT_BYTES` is rejected. A failed cache write is logged-and-ignored:
-dedupe is an optimization, never a correctness input.
+read. The key is the **canonical project-relative path** scoped under the
+project root's hash (ADR-65 F5c/F5d), so alternate spellings of the same file
+(`./x`, `a/../x`, absolute-within-root) collapse to one key, and paths escaping
+the root are never cached. Store-side guards: NUL bytes are rejected (SQLite
+TEXT), and content over `CACHE_LIMIT_BYTES` is rejected. A failed cache write is
+logged-and-ignored: dedupe is an optimization, never a correctness input.
 
 ### Served facts
 
@@ -285,23 +299,45 @@ re-clobber the row's `generation`/dirty semantics on rebuild. Served facts are
 attribution and audit (Acceptance criteria 3) without pretending to be a fresh
 observation.
 
-### No-policy-recheck note (accepted)
+Because the serve consumed no executor decision row, the serve additionally
+persists its own **`ServedFromCache` audit row** via
+`ToolExecutor::record_served_read_audit` (ADR-65 F1b): a fresh correlation id
+(there is no prior decision to correlate with), `rule_matched =
+"served_from_cache"`, and the served path alone in `argv` (the audit schema has
+no separate path column).
 
-The policy engine lives inside `ToolExecutor::execute`
-(`core/src/executor.rs`). Serving bypasses the executor, so the policy gate is
-**not** re-evaluated for a served read. Residual risk accepted by §4: the read
-already passed policy the first time, anything it could now serve is
-byte-identical to that earlier approved result, and force-fresh execution is
-always available via a `dirty` row or an args change. Recorded here because it
-is the one place a careful reviewer will diff against the spec.
+### Policy re-evaluation on serve (ADR-65 F1a)
+
+Early in Phase 4 the serve path bypassed the executor — and therefore the policy
+engine — entirely. That omission is **fixed**: `maybe_serve_read` supplies a
+serve candidate, but the gate opens only when the side-effect-free advisory
+evaluation (`policy_verdict_is_allow`) returns `PolicyVerdict::Allow`. The
+advisory path records **no decision row and consumes no quota**, so a served
+read is audited as `ServedFromCache` without pretending a fresh decision was
+made; a non-`Allow` verdict falls through to the executor, where the normal
+`Deny`/`RequireApproval` gate applies. This is the one place a careful reviewer
+should still diff against the spec: the advisory evaluation is deliberately
+"allow-all or nothing" and never counts token spend.
 
 ### Action digest
 
 `CoordinatorAgent::snapshot_digest` is now async and, when a `review_store`
 pool is present, appends an `<action_digest>...</action_digest>` block after the
-snapshot digest: the newest 20 observed paths by `observed_at DESC, path ASC`,
+snapshot digest: the newest 20 observed paths — **scoped to the snapshot's
+canonical project-root hash** (ADR-65 F5c) — by `observed_at DESC, path ASC`,
 rendered `path | unchanged-since <event_id> | hash-<first 8 hex>` for clean
 rows (hash segment omitted when no content hash was recorded) or
-`path | changed` when dirty. Queried fresh on every dispatch, so agents see what
-changed since planning. Fail-soft: absent pool or store error ⇒ bare snapshot
-digest + warning; the digest itself is not a decision input yet (Phase 2 scope).
+`path | changed` otherwise. Queried fresh on every dispatch, so agents see what
+changed since planning.
+
+**Freshness reconciliation (ADR-65 F3).** The digest does not trust the stored
+`dirty` flag alone: every row's path is re-statted against the live filesystem
+via the snapshot's `project_root`. A row whose size or mtime no longer matches
+its observation — or whose file has vanished entirely — is folded **dirty**
+(and the store's `mark_dirty` is invoked, best-effort, so the cache purge also
+happens). A row that was already dirty renders `changed` as before. The
+`WorkspaceSnapshotRecord` therefore carries the `project_root` it was captured
+under, so the store lookup and the re-stat target the same canonical scope.
+
+Fail-soft: absent pool, absent snapshot, or store error ⇒ bare snapshot digest
++ warning; the digest itself is not a decision input yet (Phase 2 scope).
