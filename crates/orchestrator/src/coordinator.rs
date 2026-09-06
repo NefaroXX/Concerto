@@ -890,13 +890,13 @@ pub struct ApprovedPlanSeed {
 /// payload plus the session's logged researcher/coder gate events).
 ///
 /// The coordinator consumes it in `decompose_or_restore` when no checkpoint
-/// row governs the run: instead of re-entering design (a fresh architect +
-/// planner LLM decompose — the observed F2 failure), the evidence scheduler
-/// schedules the next dispatch from the log and every materialized dispatch is
-/// recorded as a whiteboard `Decision` event citing REAL evidence ids
-/// (ADR-65 §7). Verified design + recorded research facts ⇒ the coder is
-/// dispatched, not the architect; an architect/researcher re-dispatch on this
-/// path is impossible without its own recorded, evidence-backed decision.
+/// row governs the run: instead of re-entering design (a fresh decompose —
+/// the observed F2 failure), the restored CONTEXT seeds the Coordinator's
+/// decision loop and it re-decides the next dispatch from the log's
+/// evidence. Every dispatch is recorded as a whiteboard `Decision` event
+/// citing REAL evidence ids (ADR-65 §7); an architect/researcher re-dispatch
+/// on this path is impossible without its own recorded, evidence-backed
+/// decision.
 #[derive(Debug, Clone)]
 pub struct HeadlessResumeSeed {
     /// The approved plan's ORIGINAL objective hash (the `plan-approved`
@@ -3265,7 +3265,8 @@ impl CoordinatorAgent {
                 "Refresh the workspace evidence (snapshot barrier re-ran); continue".to_owned()
             }
             ResumeOutcome::Replan => {
-                "Workspace objectively changed: replan via the evidence scheduler".to_owned()
+                "Workspace objectively changed: the Coordinator re-decides on a fresh decompose"
+                    .to_owned()
             }
         };
         let event = NewWhiteboardEvent {
@@ -7913,14 +7914,41 @@ mod tests {
 
     /// Planning provider that serves one scripted Coordinator turn per
     /// request, in order. Beyond the script it returns an empty final text
-    /// (the loop then stops in prose).
+    /// (the loop then stops in prose). Captures every request it receives so
+    /// tests can assert on the injected prompt (roster, evidence) and count
+    /// the loop's model turns.
     struct TurnProvider {
         turns: std::sync::Mutex<std::collections::VecDeque<CoordinatorTurn>>,
+        requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
     }
 
     impl TurnProvider {
         fn new(turns: Vec<CoordinatorTurn>) -> Self {
-            Self { turns: std::sync::Mutex::new(turns.into()) }
+            Self {
+                turns: std::sync::Mutex::new(turns.into()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The prompts this provider has seen so far (first message content).
+        fn prompts(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    request
+                        .messages
+                        .first()
+                        .map(|message| message.content.clone())
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+
+        /// How many model turns the provider has served.
+        fn turn_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
         }
     }
 
@@ -7928,9 +7956,10 @@ mod tests {
     impl concerto_core::traits::provider::LlmProvider for TurnProvider {
         async fn stream_completion(
             &self,
-            _request: concerto_core::types::CompletionRequest,
+            request: concerto_core::types::CompletionRequest,
             _cancel: CancellationToken,
         ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
             let turn = self
                 .turns
                 .lock()
@@ -8061,6 +8090,65 @@ mod tests {
         final_text: String,
     ) -> CoordinatorAgent {
         coordinator_with_turns(bus, registry, vec![CoordinatorTurn::Text(final_text)])
+    }
+
+    /// [`coordinator_with_turns`] plus a handle on the mock provider, so a
+    /// test can assert on the injected prompt (roster/evidence) and the
+    /// loop's model-turn count.
+    fn coordinator_with_turns_captured(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+    ) -> (CoordinatorAgent, Arc<TurnProvider>) {
+        let provider = Arc::new(TurnProvider::new(turns));
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let runner = AgentRunner::new(registry.clone(), bus.clone(), spend_tracker.clone());
+        let profiles: Vec<concerto_core::types::RoutingProfile> = vec![
+            concerto_core::types::RoutingProfile {
+                provider_config_id: "test".into(),
+                provider: "test".into(),
+                model: "cheap".into(),
+                cost_per_1k_tokens: 0.001,
+                avg_latency_ms: 100,
+                context_window: 8192,
+                supports_tool_calling: true,
+                base_url: None,
+                description: None,
+            },
+            concerto_core::types::RoutingProfile {
+                provider_config_id: "test".into(),
+                provider: "test".into(),
+                model: "mid".into(),
+                cost_per_1k_tokens: 0.005,
+                avg_latency_ms: 100,
+                context_window: 8192,
+                supports_tool_calling: true,
+                base_url: None,
+                description: None,
+            },
+        ];
+        let routing = Arc::new(RoutingEngine::new(
+            profiles.clone(),
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig {
+                pins: std::collections::HashMap::new(),
+                ..Default::default()
+            },
+            EventBus::default(),
+        ));
+        let model_registry = Arc::new(ModelRegistry::from_profiles(profiles));
+        let model_selector = Arc::new(ModelSelector::new(model_registry, routing));
+        let coordinator = CoordinatorAgent::new(
+            registry,
+            runner,
+            model_selector,
+            spend_tracker,
+            bus.clone(),
+            Arc::clone(&provider) as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(NullMemoryStore),
+        )
+        .with_policy_engine(coordinator_allow_all_policy());
+        (coordinator, provider)
     }
 
     /// A pre-planning `WorkspaceSnapshot` whose inventory grounds the given
@@ -13808,6 +13896,353 @@ mod tests {
         );
         // The default reason (no notes) is the coordinator's own choice.
         assert_eq!(decisions[0].payload["reason"], "coordinator_choice");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-35 amendment (2026-09-05) contract tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Contract 1b: a `Decision` event citing a FABRICATED evidence id is
+    /// rejected at append (ADR-65 acceptance 8) — the append side re-lands
+    /// the record WITHOUT the rejected citations (fail-soft), so the ledger
+    /// always carries the dispatch record and never a fabricated id.
+    #[tokio::test]
+    async fn fabricated_evidence_id_is_rejected_at_append() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let (output, _events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist_with(
+                        "researcher",
+                        "inspect",
+                        None,
+                        &["ev-fabricated-0001"],
+                    )]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "a rejected citation must not fail the dispatch, got: {}",
+            output.final_message
+        );
+
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(decisions.len(), 1, "the dispatch record still lands: {decisions:?}");
+        let cited = decisions[0].payload["supporting_evidence_ids"]
+            .as_array()
+            .expect("supporting ids array");
+        assert!(
+            !cited.iter().any(|id| id == "ev-fabricated-0001"),
+            "the fabricated id must not appear on the log: {cited:?}"
+        );
+        assert!(cited.is_empty(), "the re-append drops the rejected citations: {cited:?}");
+    }
+
+    /// Contract 2: the Coordinator's prompt carries EVERY registered agent's
+    /// context (id, name, role, stage, capabilities, output_mode,
+    /// instructions) — and an agent that is not registered (deleted or
+    /// disabled) is ABSENT: context, not policy.
+    #[tokio::test]
+    async fn roster_injection_lists_every_registered_agent_and_omits_deleted() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            vec![
+                (
+                    AgentId::new("researcher"),
+                    concerto_config::CustomAgentConfig {
+                        id: "researcher".into(),
+                        name: "Researcher".into(),
+                        role: "evidence gathering".into(),
+                        stage: Some(concerto_core::AgentStage::new("research")),
+                        prompt_sections: concerto_config::PromptSections {
+                            system_instructions: "Ground the workspace with tool reads."
+                                .to_string(),
+                            ..Default::default()
+                        },
+                        capabilities: concerto_config::AgentCapabilities {
+                            fs_read: Some(true),
+                            ..Default::default()
+                        },
+                        ..design_doc_config("researcher")
+                    },
+                ),
+                (
+                    AgentId::new("coder"),
+                    concerto_config::CustomAgentConfig {
+                        id: "coder".into(),
+                        name: "Coder".into(),
+                        role: "implementation".into(),
+                        stage: Some(concerto_core::AgentStage::new("implement")),
+                        prompt_sections: concerto_config::PromptSections {
+                            system_instructions: "Implement the requested change.".to_string(),
+                            ..Default::default()
+                        },
+                        capabilities: concerto_config::AgentCapabilities {
+                            fs_read: Some(true),
+                            fs_write: Some(true),
+                            ..Default::default()
+                        },
+                        ..design_doc_config("coder")
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // `ghost` is deliberately NOT registered (a deleted/disabled agent).
+
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("nothing to dispatch".into())],
+        );
+        let mut coordinator = coordinator;
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            dir.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("run should succeed");
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 1, "one model turn");
+        let prompt = &prompts[0];
+        // Every REGISTERED agent's context is present.
+        for (id, name, role, stage, capability, mode) in [
+            ("researcher", "Researcher", "evidence gathering", "research", "fs_read", "design_doc"),
+            ("coder", "Coder", "implementation", "implement", "fs_read", "design_doc"),
+        ] {
+            assert!(prompt.contains(&format!("id: {id}")), "roster lists {id}: {prompt}");
+            assert!(prompt.contains(&format!("name: {name}")), "roster lists {id}'s name");
+            assert!(prompt.contains(&format!("role: {role}")), "roster lists {id}'s role");
+            assert!(
+                prompt.contains(&format!("stage: {stage}")),
+                "roster lists {id}'s stage as informational metadata"
+            );
+            assert!(prompt.contains(capability), "roster lists {id}'s declared capabilities");
+            assert!(prompt.contains(&format!("output_mode: {mode}")), "roster lists {id}'s mode");
+            assert!(prompt.contains("instructions:"), "roster carries the instruction excerpt");
+        }
+        // The deleted/disabled agent is absent.
+        assert!(!prompt.contains("ghost"), "an unregistered agent must not appear in the roster");
+    }
+
+    /// Contract 3: arbitrary-agent acceptance — an agent with NO stage tag
+    /// (`auditor`, never seen by any lifecycle machinery) is fully callable
+    /// from context alone: the Coordinator's call dispatches it and the run
+    /// completes.
+    #[tokio::test]
+    async fn stageless_custom_agent_is_callable_by_the_coordinator() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("auditor"), "audited")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("auditor", "audit the run")]),
+                    CoordinatorTurn::Text("audit recorded".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        let dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "auditor")
+        });
+        assert!(dispatched, "the stageless custom agent must be dispatchable: {events:?}");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "the run completes off the Coordinator's own decision: {}",
+            output.final_message
+        );
+    }
+
+    /// Contract 4: a `call_specialist` for an unregistered (deleted or
+    /// disabled) agent returns a structured tool ERROR — no crash, no
+    /// dispatch — and the Coordinator finishes its run.
+    #[tokio::test]
+    async fn call_specialist_for_a_deleted_agent_is_a_tool_error_not_a_crash() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    // The roster has no `reviewer` — a deleted/disabled id.
+                    CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review")]),
+                    CoordinatorTurn::Text("adjusted after the refusal".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "reviewer"
+            )),
+            "a deleted agent is never dispatched: {events:?}"
+        );
+        let refused = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("unknown_agent")
+            )
+        });
+        assert!(refused, "the tool error surfaces to the Coordinator: {events:?}");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "the tool error must not crash the run, got: {}",
+            output.final_message
+        );
+    }
+
+    /// Contract 5 (run level, through the decision loop): an action-required
+    /// run whose only dispatch executed ZERO tool calls trips the run-level
+    /// zero-work guard at the exit — the per-call guard flagged the
+    /// implement-stage call too (both nets hold).
+    #[tokio::test]
+    async fn decision_loop_zero_tool_action_required_run_stalls() {
+        let bus = EventBus::new(256);
+        // A researcher answers prose-only (zero tools) and "succeeds".
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "done")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("nothing more to do".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                // The ROOT task is action-required: this arms the run-level
+                // zero-work guard at the exit.
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a zero-tool action-required run must stall, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the run-level guard names the omission: {}",
+            output.final_message
+        );
+        let flagged = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("Zero-work guard")
+            )
+        });
+        assert!(
+            !flagged,
+            "the research-stage call is NOT flagged per-call (the per-call guard is \
+             implement-scoped); the run-level guard is the net here"
+        );
+    }
+
+    /// Contract 6: a checkpointless `continue` re-enters ONLY the
+    /// Coordinator's decision loop — the planner is never re-invoked (the
+    /// mock provider's turn script would desync if an extra planning call
+    /// happened) and the Coordinator re-decides from the restored context.
+    #[tokio::test]
+    async fn headless_resume_re_enters_the_decision_loop_not_the_planner() {
+        let session_id = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(session_id, true).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                CoordinatorTurn::Text("resumed build finished".into()),
+            ],
+        );
+        let coordinator = coordinator
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed);
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the resumed build completes: {}",
+            output.final_message
+        );
+        // Exactly TWO model turns: the dispatch turn and the final summary.
+        // A planner re-entry would add provider calls and desync the script.
+        assert_eq!(
+            provider.turn_count(),
+            2,
+            "the resume runs the decision loop only — no planner re-entry"
+        );
     }
 
     /// ADR-58 P2+P3 (Batch 3a): without an attached facade the

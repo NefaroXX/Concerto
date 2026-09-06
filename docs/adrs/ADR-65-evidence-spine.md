@@ -435,6 +435,9 @@ derives unmet needs from evidence gaps and dispatches among registered agents.
 Every dispatch appends a `Decision` event with selected agent, reason, required
 output, and supporting evidence ids. Decision-event append validation rejects
 fabricated evidence ids. Commit: `b38d6b5`.
+*(Superseded by the 2026-09-05 amendment above: the scheduler module is
+removed; dispatch authority is the Coordinator's `call_specialist` tool, and
+the Decision-event discipline — including append validation — is kept.)*
 
 **Phase 7 (continuation + resume).** `resume.rs` restores state at the
 whiteboard cursor. Checkpoint schema bumps to v4 (whiteboard cursor, active
