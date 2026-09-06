@@ -32,10 +32,13 @@
 //!   `user_response`. The classifier-created [`Ulid`] is returned to the
 //!   caller so the router's own row for the same event shares the correlation
 //!   id.
-//! - **Never grants** (§4): the classifier classifies; [`apply_classifier_decision`]
-//!   only re-routes, and the caller sends the result through the exact
-//!   confirmation machinery — a re-routed Execute still requires the user's
-//!   confirmation dialog.
+//! - **Never calls beyond itself** (§7): the utterance-only one-shot call is
+//!   the ONLY model call here — [`apply_classifier_decision`] only re-routes,
+//!   and the GRANT consequence of the re-routed result is decided by the run
+//!   loop's gate, not by this module: under ADR-55 Phase 2d a re-routed
+//!   outcome at or above the threshold auto-grants (no dialog), while the
+//!   negation fast path and a zero-confidence `AskUser` remain hard
+//!   read-only (2d §2).
 //!
 //! Audit-row scope (documented interpretation): an *invocation* means the
 //! provider call fired. When the call never fires — classifier disabled, no
@@ -212,9 +215,9 @@ pub async fn classify_ambiguity(ctx: ClassifierContext<'_>) -> Option<Classifier
 /// Path-selection decision (§3/§4): re-route the deterministic result only
 /// when the classified confidence is at or above the configured threshold. The
 /// threshold is validated `>= LOW_CONFIDENCE_THRESHOLD` at config load, so a
-/// re-route always satisfies the gate's arm-1 dialog predicate too — no
-/// configured threshold can create a `[threshold, LOW_CONFIDENCE_THRESHOLD)`
-/// band (§2).
+/// re-route always satisfies the gate's auto-grant predicate too (ADR-55
+/// Phase 2d §1) — no configured threshold can create a
+/// `[threshold, LOW_CONFIDENCE_THRESHOLD)` band (§2).
 pub fn should_reroute(outcome: &ClassifyOutcome, threshold: f32) -> bool {
     outcome.confidence >= threshold
 }
@@ -222,12 +225,13 @@ pub fn should_reroute(outcome: &ClassifyOutcome, threshold: f32) -> bool {
 /// Apply a confident classifier suggestion to the routing output (§3/§4).
 ///
 /// Replaces the deterministic route and its confidence with the classified
-/// outcome + confidence so the gate (`bound_plan_for_approval` /
-/// `apply_intent_gate`) treats a re-routed Execute exactly like a
-/// deterministic confident Execute — including the arm-1 confirmation dialog
-/// (the classifier classifies, never grants). Returns whether a re-route
-/// happened. The caller keeps the pre-replacement route name (captured before
-/// the classifier call) for the router-decision audit row (§5).
+/// outcome + confidence so the gate (`crate::intent_grants::apply_intent_gate`)
+/// treats a re-routed result exactly like a deterministic route of the same
+/// outcome and confidence. Under ADR-55 Phase 2d §1 the consequence of that
+/// high-confidence route is an automatic grant (no dialog) — the re-route
+/// itself stays path selection only. Returns whether a re-route happened. The
+/// caller keeps the pre-replacement route name (captured before the
+/// classifier call) for the router-decision audit row (§5).
 pub fn apply_classifier_decision(routing: &mut RouterOutput, call: &ClassifierCall) -> bool {
     let Some(outcome) = call.outcome.as_ref() else {
         return false;

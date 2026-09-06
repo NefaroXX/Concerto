@@ -1,13 +1,17 @@
-//! Session-scoped, non-durable intent grants (ADR-55 §4).
+//! Session-scoped, non-durable intent grants (ADR-55 §4, Phase 2d §1).
 //!
-//! The router classifies; the classifier never grants (ADR-55 §1). Only a
-//! confirmed user decision can create a grant. This module owns the run-scoped
-//! grant store and the [`IntentAuthorization`] provider that feeds
-//! [`SimplePolicyEngine::with_intent_auth`] under `Condition::IntentAuthorized`.
+//! ADR-55 Phase 2d: routing **is** the decision. A high-confidence route to
+//! one of the five action-grantable outcomes auto-grants the same
+//! `filesystem`/`git` scopes a confirmed `Apply` holds today — no
+//! [`ApprovalSink`] call, no dialog, no modal (2d §1). The hard read-only
+//! invariants are unchanged (2d §2): the negation-override rule never grants,
+//! and a zero-confidence `AskUser` route never grants — with the classifier
+//! off it still opens the AskUser modal (ADR-56 §3, byte-identical offline
+//! chain), with a real classification it lands as a read-only answer-only run.
 //!
-//! Grants are created fresh per `run_shared_agent` call, so they are bound to a
-//! single run/session by construction and are re-confirmed on every resume
-//! (non-durable — nothing is persisted).
+//! Grants are created fresh per `run_shared_agent` call, so they are bound to
+//! a single run/session by construction and re-apply automatically through
+//! routing on every resume (non-durable — nothing is persisted; 2d §4).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,8 +51,10 @@ impl IntentGrantStore {
 
     /// Record a grant covering `scope` for the confirmed `intent`.
     ///
-    /// Callers are the run loop, exclusively after a user confirmation
-    /// (ADR-55 §1/§4) — never from routing or classification.
+    /// Callers are the run loop, after either a high-confidence route
+    /// (auto-grant, ADR-55 Phase 2d §1) or an explicit user decision in the
+    /// AskUser modal (the classifier-off chain, ADR-56 §3) — never from
+    /// routing or classification alone below the threshold.
     pub fn grant(&self, intent: RequestedOutcome, scope: &'static str) {
         self.grants.lock().unwrap_or_else(|e| e.into_inner()).push(GrantEntry { intent, scope });
     }
@@ -76,10 +82,10 @@ impl IntentGrantStore {
 
 /// Authorization state source for one run (ADR-55 §2/§4).
 ///
-/// `is_read_only_intent` starts `true`: a run stays read-only until the user
-/// confirms a mutating intent through the approval sink — the conservative
-/// reading when no confirmation surface is available (a `None` response never
-/// lets a mutation slip through). Only the run loop changes it.
+/// `is_read_only_intent` starts `true`: a run stays read-only until routing
+/// auto-grants (ADR-55 Phase 2d §1) or the user confirms a mutating intent
+/// through the AskUser modal (the classifier-off chain). Only the run loop
+/// changes it.
 pub struct SessionIntentAuth {
     store: Arc<IntentGrantStore>,
     read_only: AtomicBool,
@@ -132,6 +138,18 @@ pub fn router_route_name(route: &RouterRoute) -> &'static str {
     }
 }
 
+/// The routing **path kind** for audit envelopes (ADR-55 Phase 2d §5/A2):
+/// the [`RouterRoute`] variant name, distinguishing a deterministic corpus
+/// hit from the LLM classifier path (`RuleHit` | `LlmClassifier`).
+pub fn router_path_name(route: &RouterRoute) -> &'static str {
+    match route {
+        RouterRoute::RuleHit { .. } => "RuleHit",
+        RouterRoute::LlmClassifier => "LlmClassifier",
+        RouterRoute::AskUser => "AskUser",
+        _ => "Unknown",
+    }
+}
+
 /// The audit `user_response` value for a requested outcome (ADR-55 §5.2).
 pub fn outcome_name(outcome: RequestedOutcome) -> &'static str {
     match outcome {
@@ -148,77 +166,137 @@ pub fn outcome_name(outcome: RequestedOutcome) -> &'static str {
 /// Grant the two in-scope, mutate-local tool classes for a **confirmed**
 /// Execute: filesystem local mutations and git local mutations (ADR-55 §2).
 ///
-/// Shared by the two paths that carry a confirmed Execute decision: a picked
-/// `Execute` in [`apply_intent_gate`] and a picked `Apply` on a stored plan
-/// binding (see `crate::plan_approval::apply_plan_decision`). Mutate-local,
-/// in-scope grants never cover shell (never grantable) and never cover
-/// Consequential/destructive actions (decided before the grant is consulted),
-/// so this helper can never widen them.
+/// Shared by the paths that carry a confirmed Execute decision: an `Apply`
+/// decision on a stored plan binding (see
+/// `crate::plan_approval::apply_plan_decision`) and a picked `Execute` in the
+/// AskUser modal. Mutate-local, in-scope grants never cover shell (never
+/// grantable) and never cover Consequential/destructive actions (decided
+/// before the grant is consulted), so this helper can never widen them.
 pub fn grant_execute(store: &IntentGrantStore) {
     store.grant(RequestedOutcome::Execute, "filesystem");
     store.grant(RequestedOutcome::Execute, "git");
 }
 
-/// Apply the ADR-55 gate to a routed request and return the run's EFFECTIVE
-/// outcome — what the user actually confirmed — plus the audit confirmation
-/// value (`granted` | `declined` | `dismissed` | `n/a`). `n/a` means the gate
-/// never prompted (deterministic read-only outcomes); `dismissed` means a
-/// prompt WAS shown but the confirmation surface returned no answer.
+/// Grant the two in-scope, mutate-local tool classes for `intent`
+/// (ADR-55 Phase 2d §1): the same `filesystem`/`git` scopes a confirmed
+/// `Apply` holds, bound to the routed outcome instead of `Execute`.
 ///
-/// - `Execute` with confidence >= [`LOW_CONFIDENCE_THRESHOLD`] asks the sink;
-///   `Some(Execute)` grants filesystem + git (explicit user authorization), a
-///   picked read-only outcome re-routes the run to that outcome (read-only,
-///   no grant), and `None` (dialog dismissed) keeps the router's Execute but
-///   read-only, and is audited as `"dismissed"` (not `"n/a"` — a prompt was
-///   shown).
-/// - [`RouterRoute::AskUser`] (ambiguous input) asks with all six outcomes; a
-///   picked `Execute` grants, any other pick re-routes read-only, and a
-///   dismissed dialog degrades to `Answer` read-only, audited as `"dismissed"`.
-/// - Deterministic read-only outcomes never prompt and are audited as `"n/a"`.
+/// Only the auto-grant route ([`is_auto_grant_route`]) and the AskUser-modal
+/// grant path reach this; shell stays never-grantable and Consequential
+/// actions are decided before the grant is ever consulted (ADR-55 §Decision 2
+/// capability tiers — the auto-grant only upgrades `RequireApproval`, never
+/// overrides `Deny`).
+pub fn grant_outcome(store: &IntentGrantStore, intent: RequestedOutcome) {
+    store.grant(intent, "filesystem");
+    store.grant(intent, "git");
+}
+
+/// The five action-grantable outcomes (ADR-55 Phase 2d §1).
+fn is_action_grantable_outcome(outcome: RequestedOutcome) -> bool {
+    matches!(
+        outcome,
+        RequestedOutcome::Execute
+            | RequestedOutcome::Plan
+            | RequestedOutcome::Verify
+            | RequestedOutcome::Review
+            | RequestedOutcome::Diagnose
+    )
+}
+
+/// ADR-55 Phase 2d §1: does `routing` decide the run's authority on its own?
 ///
-/// Authority is the user decision only: deterministic routing and (later) the
-/// LLM classifier can classify but never grant (ADR-55 §1). A read-only run
-/// hard-denies all mutation — filesystem, shell, and git — even under session
-/// auto-approve (B-1).
+/// True exactly when the outcome is one of the five action-grantable
+/// outcomes, the confidence is at or above [`LOW_CONFIDENCE_THRESHOLD`], and
+/// the route is a deterministic rule hit **other than the negation override**
+/// or the LLM classifier path. The negation corpus keeps first-match-wins
+/// priority ahead of any model output (ADR-56 §1a), so a permissive model can
+/// never make a read-only request writable — a `negation_override` hit never
+/// grants even though it carries high confidence. `AskUser` (confidence
+/// `0.0`) never qualifies (2d §2 hard read-only), and neither does
+/// smalltalk (routes to `Answer`, outside the grantable set).
+pub fn is_auto_grant_route(routing: &RouterOutput) -> bool {
+    if routing.confidence < LOW_CONFIDENCE_THRESHOLD
+        || !is_action_grantable_outcome(routing.outcome)
+    {
+        return false;
+    }
+    match routing.route {
+        RouterRoute::RuleHit { rule } => rule != "negation_override",
+        RouterRoute::LlmClassifier => true,
+        _ => false,
+    }
+}
+
+/// ADR-55 Phase 2d §1/§3: is `routing` a confident Execute that auto-grants
+/// (and may therefore auto-Apply a stored plan binding)?
+pub fn is_confident_auto_grant_execute(routing: &RouterOutput) -> bool {
+    is_auto_grant_route(routing) && routing.outcome == RequestedOutcome::Execute
+}
+
+/// The `{rule, confidence, route, outcome}` envelope of an auto-granted
+/// routing audit row (ADR-55 Phase 2d §5/A2): `rule`/`route` name the path
+/// that granted (`router_route_name` / [`router_path_name`]), `confidence`
+/// is the decision-time confidence, and `outcome` the effective outcome.
+pub fn auto_grant_envelope(routing: &RouterOutput) -> String {
+    serde_json::json!({
+        "rule": router_route_name(&routing.route),
+        "route": router_path_name(&routing.route),
+        "outcome": outcome_name(routing.outcome),
+        "confidence": routing.confidence,
+    })
+    .to_string()
+}
+
+/// Apply the ADR-55 gate (Phase 2d) to a routed request and return the run's
+/// EFFECTIVE outcome plus the audit confirmation value (`auto_granted` |
+/// `granted` | `declined` | `dismissed` | `n/a`).
+///
+/// - **Auto-grant (2d §1):** a route that satisfies [`is_auto_grant_route`]
+///   (one of the five action-grantable outcomes at `>=`
+///   [`LOW_CONFIDENCE_THRESHOLD`] via a non-negation rule hit or the LLM
+///   classifier) grants `filesystem`+`git` outright and is audited as
+///   `"auto_granted"` — no [`ApprovalSink`] call, no dialog, no modal. The
+///   negation-override rule and `AskUser` never reach this arm (2d §2 hard
+///   read-only).
+/// - **AskUser modal (ADR-56 §3, byte-identical offline chain):** when
+///   `allow_ask_user_modal` is true — the classifier disabled, unavailable,
+///   or fail-soft (no real classification) — the ambiguous input still opens
+///   the six-outcome modal: a picked `Execute` grants (`"granted"`), any
+///   other pick re-routes read-only (`"declined"`), a dismissed dialog
+///   degrades to `Answer` read-only (`"dismissed"`).
+/// - **AskUser, classified (2d §2):** when a real classification happened and
+///   the caller declined to re-route (below threshold), the zero-confidence
+///   input lands as a read-only answer-only run (`"n/a"`, no prompt): the
+///   user escalates by rephrasing with clearer intent, never by clicking.
+/// - Deterministic read-only outcomes never prompt and are audited as
+///   `"n/a"`.
+///
+/// Capability tiers are untouched (ADR-55 §Decision 2): the grant only
+/// upgrades `RequireApproval`, never overrides `Deny`, and never covers
+/// Consequential actions. A read-only run hard-denies all mutation —
+/// filesystem, shell, and git — even under session auto-approve (B-1).
 pub async fn apply_intent_gate(
     routing: &RouterOutput,
     approval_sink: &dyn ApprovalSink,
     store: &IntentGrantStore,
     auth: &SessionIntentAuth,
     cancel: CancellationToken,
+    allow_ask_user_modal: bool,
 ) -> (RequestedOutcome, &'static str) {
+    // ADR-55 Phase 2d §1: routing is the decision — grant instead of prompt.
+    if is_auto_grant_route(routing) {
+        grant_outcome(store, routing.outcome);
+        auth.set_read_only(false);
+        return (routing.outcome, "auto_granted");
+    }
     let (effective, confirmation) = match routing.outcome {
-        RequestedOutcome::Execute if routing.confidence >= LOW_CONFIDENCE_THRESHOLD => {
-            match approval_sink
-                .request_intent_confirmation(
-                    format!(
-                        "The request looks like it wants to change code (router confidence \
-                         {:.2}). Confirm the run's mutation scope, or pick a read-only \
-                         outcome.",
-                        routing.confidence,
-                    ),
-                    &[
-                        RequestedOutcome::Execute,
-                        RequestedOutcome::Plan,
-                        RequestedOutcome::Review,
-                        RequestedOutcome::Answer,
-                    ],
-                    cancel.clone(),
-                )
-                .await
-            {
-                Some(RequestedOutcome::Execute) => (RequestedOutcome::Execute, "granted"),
-                Some(other) => (other, "declined"),
-                // The dialog WAS shown and the user dismissed it: audit it as
-                // "dismissed", not "n/a" (which is reserved for paths that
-                // never prompted).
-                None => (RequestedOutcome::Execute, "dismissed"),
-            }
-        }
-        // AskUser route: the deterministic router found nothing conclusive
-        // (Phase 0 yields outcome Answer with confidence 0.0). Ask instead of
-        // guessing — read-only unless the user picks Execute.
-        RequestedOutcome::Answer if routing.route == RouterRoute::AskUser => {
+        // AskUser route: the deterministic router found nothing conclusive.
+        // The modal survives only where the deterministic chain stands alone
+        // (classifier off/unreachable/fail-soft — ADR-56 §3); a real
+        // classification that was not re-routed lands read-only answer-only.
+        RequestedOutcome::Answer
+            if routing.route == RouterRoute::AskUser && allow_ask_user_modal =>
+        {
             match approval_sink
                 .request_intent_confirmation(
                     "I could not confidently tell what you want. Pick the intent for this run \
@@ -398,13 +476,16 @@ mod tests {
             router_route_name(&RouterRoute::RuleHit { rule: "execute_keyword" }),
             "execute_keyword"
         );
+        assert_eq!(router_path_name(&RouterRoute::AskUser), "AskUser");
+        assert_eq!(router_path_name(&RouterRoute::LlmClassifier), "LlmClassifier");
+        assert_eq!(router_path_name(&RouterRoute::RuleHit { rule: "execute_keyword" }), "RuleHit");
         assert_eq!(outcome_name(RequestedOutcome::Execute), "Execute");
         assert_eq!(outcome_name(RequestedOutcome::Plan), "Plan");
         assert_eq!(outcome_name(RequestedOutcome::Verify), "Verify");
     }
 
     // ------------------------------------------------------------------
-    // apply_intent_gate (ADR-55 §1/§2/§4/§6)
+    // apply_intent_gate (ADR-55 Phase 2d §1/§2/§4; ADR-56 §3)
     // ------------------------------------------------------------------
 
     /// Approval sink stub that records how many times the intent-confirmation
@@ -455,101 +536,181 @@ mod tests {
         std::env::temp_dir().join("concerto-intent-grants-test")
     }
 
+    /// A2 (ADR-55 Phase 2d §6): a `build <objective>` request routes Execute
+    /// at confidence >= 0.7 via `RuleHit` → the run loop AUTO-GRANTS
+    /// `filesystem`+`git` — no approval sink call, no dialog, no modal.
     #[tokio::test]
-    async fn gate_grants_only_on_confirmed_execute() {
-        let store = Arc::new(IntentGrantStore::new());
-        let auth = SessionIntentAuth::new(store.clone());
-        let sink = StubIntentSink::new(Some(RequestedOutcome::Execute));
-
-        let routing = concerto_core::intent::route("implement the login feature", project_dir());
-        assert_eq!(routing.outcome, RequestedOutcome::Execute);
-
-        let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
-
-        assert_eq!(effective, RequestedOutcome::Execute, "confirmed Execute stays Execute");
-        assert_eq!(confirmation, "granted");
-        assert_eq!(sink.calls.load(Ordering::SeqCst), 1, "exactly one confirmation prompt");
-        assert_eq!(
-            sink.prompts.lock().unwrap_or_else(|e| e.into_inner())[0],
-            vec![
-                RequestedOutcome::Execute,
-                RequestedOutcome::Plan,
-                RequestedOutcome::Review,
-                RequestedOutcome::Answer,
-            ],
-            "execute confirmation offers the mutation + read-only alternatives"
-        );
-        assert!(!auth.is_read_only(), "a confirmed Execute run is mutation-capable");
-        assert!(store.covers("filesystem"), "fs mutations are in scope");
-        assert!(store.covers("git"), "git local mutations are in scope");
-    }
-
-    #[tokio::test]
-    async fn gate_declines_when_user_picks_a_read_only_outcome() {
+    async fn a2_confident_execute_auto_grants_without_dialog() {
         let store = Arc::new(IntentGrantStore::new());
         let auth = SessionIntentAuth::new(store.clone());
         let sink = StubIntentSink::new(Some(RequestedOutcome::Plan));
 
         let routing = concerto_core::intent::route("implement the login feature", project_dir());
-        let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
+        assert_eq!(routing.outcome, RequestedOutcome::Execute, "premise: Execute route");
+        assert!(
+            routing.confidence >= LOW_CONFIDENCE_THRESHOLD,
+            "premise: confidence at or above the threshold"
+        );
+        assert!(is_auto_grant_route(&routing), "premise: routing decides on its own");
 
-        assert_eq!(effective, RequestedOutcome::Plan, "picking Plan re-routes the run to Plan");
-        assert_eq!(confirmation, "declined");
-        assert!(auth.is_read_only(), "redirecting to a read-only outcome keeps the run read-only");
-        assert!(store.is_empty(), "no grant was created");
+        let (effective, confirmation) =
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), false)
+                .await;
+
+        assert_eq!(effective, RequestedOutcome::Execute, "the routed Execute stands");
+        assert_eq!(confirmation, "auto_granted", "the auto decision is audited as auto_granted");
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            0,
+            "no approval sink call, no modal, no click (2d §1)"
+        );
+        assert!(!auth.is_read_only(), "the auto-granted run is mutation-capable");
+        assert!(store.covers("filesystem"), "fs mutations are in scope");
+        assert!(store.covers("git"), "git local mutations are in scope");
     }
 
-    #[tokio::test]
-    async fn gate_without_a_confirmation_surface_stays_read_only() {
-        let store = Arc::new(IntentGrantStore::new());
-        let auth = SessionIntentAuth::new(store.clone());
-        // `None` is the conservative reading: no sink implements the surface.
-        let sink = StubIntentSink::new(None);
-
+    /// A2 (audit half): the auto-grant envelope carries the
+    /// `{rule, confidence, route, outcome}` story the ADR names.
+    #[test]
+    fn a2_auto_grant_envelope_names_rule_route_and_confidence() {
         let routing = concerto_core::intent::route("implement the login feature", project_dir());
-        let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
-
-        assert_eq!(
-            effective,
-            RequestedOutcome::Execute,
-            "dismissed dialog keeps the routed intent"
+        let envelope: serde_json::Value =
+            serde_json::from_str(&auto_grant_envelope(&routing)).expect("valid envelope JSON");
+        assert_eq!(envelope["rule"], "execute_keyword");
+        assert_eq!(envelope["route"], "RuleHit");
+        assert_eq!(envelope["outcome"], "Execute");
+        assert!(
+            envelope["confidence"].as_f64().unwrap_or(0.0) >= f64::from(LOW_CONFIDENCE_THRESHOLD),
+            "the envelope carries the decision-time confidence"
         );
-        assert_eq!(
-            confirmation, "dismissed",
-            "a shown-but-dismissed prompt is audited as dismissed"
-        );
-        assert!(auth.is_read_only(), "a missing response never lets a mutation slip through");
-        assert!(store.is_empty());
     }
 
+    /// A3 (ADR-55 Phase 2d §2): `don't build <objective>` hits the negation
+    /// corpus first-match-wins → hard read-only: zero grants, no prompt, no
+    /// spend, even though the negation route carries confidence 0.9.
     #[tokio::test]
-    async fn gate_never_prompts_for_read_only_outcomes() {
+    async fn a3_negation_override_never_grants_or_prompts() {
         let store = Arc::new(IntentGrantStore::new());
         let auth = SessionIntentAuth::new(store.clone());
         let sink = StubIntentSink::new(Some(RequestedOutcome::Execute));
 
-        let routing = concerto_core::intent::route("review the parser code", project_dir());
-        assert_eq!(routing.outcome, RequestedOutcome::Review);
+        let routing = concerto_core::intent::route("don't build accord", project_dir());
+        assert!(
+            matches!(routing.route, RouterRoute::RuleHit { rule: "negation_override" }),
+            "premise: the negation corpus wins over the execute keyword"
+        );
+        assert!(
+            !is_auto_grant_route(&routing),
+            "a negation-override hit never auto-grants, whatever its confidence"
+        );
 
         let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), true).await;
 
-        assert_eq!(effective, RequestedOutcome::Review);
-        assert_eq!(confirmation, "n/a");
-        assert_eq!(sink.calls.load(Ordering::SeqCst), 0, "read-only outcomes never prompt");
+        assert_eq!(effective, RequestedOutcome::Answer);
+        assert_eq!(confirmation, "n/a", "no prompt was shown");
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            0,
+            "the negation path never opens any dialog"
+        );
+        assert!(auth.is_read_only(), "the run stays hard read-only");
+        assert!(store.is_empty(), "zero grants");
+    }
+
+    /// A4 (ADR-55 Phase 2d §2): `hmm` routes `AskUser` at confidence 0.0.
+    /// With a real classification behind it (no modal allowed), the
+    /// zero-confidence input lands as a read-only answer-only run: zero
+    /// grants, zero writes, no click — the user escalates by rephrasing.
+    #[tokio::test]
+    async fn a4_ask_user_zero_confidence_lands_read_only_answer_only() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+        let sink = StubIntentSink::new(Some(RequestedOutcome::Execute));
+
+        let routing = concerto_core::intent::route("hmm", project_dir());
+        assert_eq!(routing.route, RouterRoute::AskUser, "premise: ambiguous input");
+        assert_eq!(routing.outcome, RequestedOutcome::Answer);
+        assert_eq!(routing.confidence, 0.0, "premise: zero confidence");
+        assert!(!is_auto_grant_route(&routing), "AskUser never auto-grants (2d §2)");
+
+        let (effective, confirmation) =
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), false)
+                .await;
+
+        assert_eq!(effective, RequestedOutcome::Answer, "read-only answer-only run");
+        assert_eq!(confirmation, "n/a", "no prompt, no dismissal — just read-only");
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 0, "no modal at the zero-confidence path");
         assert!(auth.is_read_only());
-        assert!(store.is_empty());
+        assert!(store.is_empty(), "zero grants");
+    }
+
+    /// A2-family coverage: all five action-grantable outcomes auto-grant
+    /// fs+git from a confident rule hit — Plan, Verify, Review, Diagnose —
+    /// each without any sink call (2d §1).
+    #[tokio::test]
+    async fn a2_all_five_outcomes_auto_grant_at_confidence() {
+        for (input, expected) in [
+            ("plan the refactor", RequestedOutcome::Plan),
+            ("run the tests", RequestedOutcome::Verify),
+            ("review the parser code", RequestedOutcome::Review),
+            ("diagnose the failing build", RequestedOutcome::Diagnose),
+        ] {
+            let store = Arc::new(IntentGrantStore::new());
+            let auth = SessionIntentAuth::new(store.clone());
+            let sink = StubIntentSink::new(Some(RequestedOutcome::Execute));
+
+            let routing = concerto_core::intent::route(input, project_dir());
+            assert_eq!(routing.outcome, expected, "premise for {input:?}");
+            assert!(
+                routing.confidence >= LOW_CONFIDENCE_THRESHOLD,
+                "premise confidence for {input:?}"
+            );
+
+            let (effective, confirmation) =
+                apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), false)
+                    .await;
+            assert_eq!(effective, expected);
+            assert_eq!(confirmation, "auto_granted", "{input:?} auto-grants (2d §1)");
+            assert_eq!(sink.calls.load(Ordering::SeqCst), 0, "{input:?} never prompts");
+            assert!(!auth.is_read_only(), "{input:?} run is mutation-capable");
+            assert!(store.covers("filesystem") && store.covers("git"));
+        }
+    }
+
+    /// ADR-56 §4 flip (ADR-55 Phase 2d §1): a classifier-rerouted Execute at
+    /// or above the threshold auto-grants exactly like a rule-hit Execute —
+    /// the confirmation dialog is gone from the re-routed path too.
+    #[tokio::test]
+    async fn llm_classifier_reroute_auto_grants_at_threshold() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+        let sink = StubIntentSink::new(Some(RequestedOutcome::Plan));
+
+        // Reconstruct the post-classifier routing state the wrapper produces
+        // when it re-routes an AskUser ambiguity into a confident Execute.
+        let mut routing = concerto_core::intent::route("hmm", project_dir());
+        routing.outcome = RequestedOutcome::Execute;
+        routing.confidence = 0.92;
+        routing.route = RouterRoute::LlmClassifier;
+        assert!(is_auto_grant_route(&routing), "the LlmClassifier path grants (2d §1)");
+
+        let (effective, confirmation) =
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), false)
+                .await;
+
+        assert_eq!(effective, RequestedOutcome::Execute);
+        assert_eq!(confirmation, "auto_granted");
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 0, "no dialog on the classifier path");
+        assert!(!auth.is_read_only());
+        assert!(store.covers("filesystem") && store.covers("git"));
     }
 
     /// A small-talk-routed greeting ("hi, lets work on something") yields a
     /// deterministic read-only `Answer` via `RuleHit { rule: "smalltalk" }`,
     /// NOT `RouterRoute::AskUser` — so `apply_intent_gate` takes the
-    /// `outcome => (outcome, "n/a")` arm (the AskUser modal fires only for
-    /// `RequestedOutcome::Answer if routing.route == RouterRoute::AskUser`)
-    /// and never calls `request_intent_confirmation`.
+    /// `outcome => (outcome, "n/a")` arm and never calls
+    /// `request_intent_confirmation`. Smalltalk is outside the grantable set.
     #[tokio::test]
     async fn gate_never_prompts_for_smalltalk_greetings() {
         let store = Arc::new(IntentGrantStore::new());
@@ -561,7 +722,7 @@ mod tests {
         assert!(matches!(routing.route, RouterRoute::RuleHit { rule: "smalltalk" }));
 
         let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), true).await;
 
         assert_eq!(effective, RequestedOutcome::Answer);
         assert_eq!(confirmation, "n/a");
@@ -574,12 +735,17 @@ mod tests {
         assert!(store.is_empty());
     }
 
+    /// Offline/classifier-disabled chain (ADR-56 §3): with the modal allowed,
+    /// an ambiguous input still opens the six-outcome AskUser modal — picked
+    /// Execute grants, a picked read-only outcome re-routes, a dismissed
+    /// dialog degrades to a read-only Answer. Byte-identical to the
+    /// pre-2d behavior.
     #[tokio::test]
     async fn gate_ask_user_prompts_with_all_outcomes() {
         let project = project_dir();
 
         // Picking Execute on an ambiguous request grants (explicit user
-        // authorization — the classifier/rule path itself can never grant).
+        // authorization in the classifier-off chain).
         let store = Arc::new(IntentGrantStore::new());
         let auth = SessionIntentAuth::new(store.clone());
         let sink = StubIntentSink::new(Some(RequestedOutcome::Execute));
@@ -589,7 +755,7 @@ mod tests {
         assert_eq!(routing.outcome, RequestedOutcome::Answer);
 
         let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), true).await;
 
         assert_eq!(effective, RequestedOutcome::Execute);
         assert_eq!(confirmation, "granted");
@@ -614,7 +780,7 @@ mod tests {
         let auth = SessionIntentAuth::new(store.clone());
         let sink = StubIntentSink::new(Some(RequestedOutcome::Diagnose));
         let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), true).await;
         assert_eq!(effective, RequestedOutcome::Diagnose);
         assert_eq!(confirmation, "declined");
         assert!(auth.is_read_only());
@@ -625,10 +791,51 @@ mod tests {
         let auth = SessionIntentAuth::new(store.clone());
         let sink = StubIntentSink::new(None);
         let (effective, confirmation) =
-            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new()).await;
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), true).await;
         assert_eq!(effective, RequestedOutcome::Answer, "dismissed ask degrades to Answer");
         assert_eq!(confirmation, "dismissed", "a shown-but-dismissed ask is audited as dismissed");
         assert!(auth.is_read_only());
         assert!(store.is_empty());
+    }
+
+    /// Capability tiers are untouched (ADR-55 §Decision 2): the auto-grant
+    /// only upgrades `RequireApproval` — shell stays approval-gated and
+    /// Consequential actions (push, delete) are decided before the grant is
+    /// ever consulted, never blanket-covered.
+    #[tokio::test]
+    async fn a2_auto_grant_never_covers_shell_or_consequential() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+
+        let routing = concerto_core::intent::route("implement the login feature", project_dir());
+        let sink = StubIntentSink::new(None);
+        let (effective, confirmation) =
+            apply_intent_gate(&routing, &sink, &store, &auth, CancellationToken::new(), false)
+                .await;
+        assert_eq!(confirmation, "auto_granted");
+        assert_eq!(effective, RequestedOutcome::Execute);
+        assert!(!auth.is_read_only());
+
+        let push_input = serde_json::json!({"operation": "push"});
+        let push = action("git", &push_input);
+        assert_eq!(
+            auth.verdict(&push),
+            IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL },
+            "Consequential egress is never blanket-covered by the auto-grant"
+        );
+        let shell_input = serde_json::json!({"cmd": "rm -rf target"});
+        let shell = action("shell", &shell_input);
+        assert_eq!(
+            auth.verdict(&shell),
+            IntentVerdict::RequireApproval { rule: RULE_SHELL_REQUIRES_APPROVAL },
+            "shell stays approval-gated (never grantable)"
+        );
+        let delete_input = serde_json::json!({"operation": "delete", "path": "src/main.rs"});
+        let delete = action("filesystem", &delete_input);
+        assert_eq!(
+            auth.verdict(&delete),
+            IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL },
+            "destructive ops are Consequential and never auto-covered"
+        );
     }
 }
