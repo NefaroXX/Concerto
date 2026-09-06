@@ -226,13 +226,29 @@ pub fn transcript_entry_from_event_with_labels(
                 content: format!("Delegated subtask {child_id} to {role:?}: {reason}"),
             })
         }
-        EventKind::RoutingDecided { task_id, role, provider, model, reason } => {
-            Some(TranscriptEntry::Activity {
-                agent: "Coordinator".to_string(),
-                content: format!(
-                    "Routed {role:?} subtask {task_id} to {provider}/{model}: {reason}"
-                ),
-            })
+        EventKind::RoutingDecided { task_id, role, provider, model, reason, intent } => {
+            match intent {
+                // ADR-55 Phase 2d §5: an intent-routing record tells the
+                // routing decision story ({rule, confidence, route, outcome},
+                // auto-granted or not) instead of a model assignment.
+                Some(decision) => Some(TranscriptEntry::Activity {
+                    agent: "Coordinator".to_string(),
+                    content: format!(
+                        "Intent routed to {} (rule {}, route {}, confidence {:.2}): {}",
+                        decision.outcome,
+                        decision.rule,
+                        decision.route,
+                        decision.confidence,
+                        if decision.auto_granted { "auto-granted" } else { "read-only" }
+                    ),
+                }),
+                None => Some(TranscriptEntry::Activity {
+                    agent: "Coordinator".to_string(),
+                    content: format!(
+                        "Routed {role:?} subtask {task_id} to {provider}/{model}: {reason}"
+                    ),
+                }),
+            }
         }
         EventKind::AgentHandoff { from, to, task_id, rationale } => {
             Some(TranscriptEntry::Activity {
@@ -650,6 +666,8 @@ mod tests {
             provider: "openrouter".into(),
             model: "example/model".into(),
             reason: "configured".into(),
+            // Model-routing row: no intent payload (ADR-55 2d §5).
+            intent: None,
         });
         assert_eq!(
             routed,
@@ -802,6 +820,8 @@ mod tests {
                 provider: "openrouter".into(),
                 model: "example/model".into(),
                 reason: "configured".into(),
+                // Model-routing row: no intent payload (ADR-55 2d §5).
+                intent: None,
             },
             &labels,
         );
