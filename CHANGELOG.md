@@ -116,6 +116,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracking is enabled
 
 ### Fixed
+- **Negation veto false-positive (`concerto-core`):** the read-only
+  `negation_override` veto now fires only for a **task-level prohibition** — a
+  negation-corpus match that stands alone or precedes every explicit action
+  keyword. Requirement clauses after an action request ("build X … do NOT read
+  it as UTF-8", "must not panic", "don't touch the parser") are constraints on
+  the artifact, not prohibitions of the action, and no longer demote explicit
+  build/verify requests to read-only (ADR-55 Phase 2d §2a). Reassurance
+  markers (`don't panic`, `don't worry`, `don't forget`) never veto. The hard
+  read-only wall is unchanged once fired; standalone "stop" lands `AskUser`
+  (0.0, still read-only) rather than the veto corpus.
+- **Silent empty read-only completions (`concerto-orchestrator`):** when a
+  read-only run's provider returns empty text, the completion now synthesizes
+  an explanation (read-only + "no files changed" + rephrase hint) instead of a
+  bare empty "done" — non-empty model text is never overridden and
+  action-capable routes (Execute/Plan) never get the fallback.
 - Orchestration Studio no longer rebuilds its graph, loads a tokenizer, or
   writes the full configuration during every UI edit; configuration is saved
   only on explicit request, with visible dirty/success/failure state
