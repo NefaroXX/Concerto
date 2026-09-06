@@ -201,6 +201,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provides explicit user revocation.
 
 ### Changed
+- **Automatic intent gating (ADR-55 Phase 2d, ADR-56 amendment; issue #27):**
+  routing is the decision — a high-confidence route (>= 0.7) to one of the
+  five action-grantable outcomes (`Execute`/`Plan`/`Verify`/`Review`/
+  `Diagnose`) via a deterministic rule hit or the LLM classifier auto-grants
+  the same `filesystem`/`git` scopes a confirmed Apply held, with no approval
+  dialog, no modal, no click. The plan-approval Apply/Replan dialog is removed
+  from the hot path: a confident Execute over a stored plan binding
+  auto-Applies the persisted plan hash-verified, loud-failing on drift (never
+  silently re-decomposing). Hard read-only invariants are unchanged: the
+  negation corpus keeps first-match-wins priority ahead of any model output,
+  and a zero-confidence `AskUser` route never grants — with the classifier off
+  it still opens the AskUser modal (byte-identical offline chain); with a real
+  classification it lands as a read-only answer-only run. Every auto decision
+  is audited (`intent_router: auto_granted` with a `{rule, confidence, route}`
+  envelope, a `session_events` `RoutingDecided` record, and the `auto_apply`
+  plan-decision variant) under one correlation id. Grants stay non-durable,
+  Consequential actions stay unconditionally gated (`Deny` is final), and
+  spend-cap semantics are unchanged.
 - **The Coordinator decides (ADR-35 amendment 2026-09-05):** dispatch authority
   moved from code to the Coordinator. A policy-gated `call_specialist`
   coordinator tool dispatches registered specialists (roster context injected

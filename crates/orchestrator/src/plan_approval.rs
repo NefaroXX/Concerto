@@ -283,15 +283,15 @@ pub fn plan_registry() -> &'static Arc<PlanApprovalRegistry> {
 /// the in-process registry.
 ///
 /// Called when phrase arming finds no in-memory binding — the ordinary case
-/// after an app restart between a planning run and the user's "i approve the
-/// plan" — so the approval still surfaces the real dialog instead of
-/// silently re-planning. Returns the re-seeded binding (also inserted under
-/// the `(session_id, objective_hash)` key, newest-wins) or `None` when no
-/// durable row exists. Fail-soft: a storage error logs and returns `None`,
-/// leaving the run to fall through to the unchanged generic intent gate. The
-/// rehydrated binding is also verified against its artifact hash (ADR-55 §1
-/// pending): a tampered or legacy unverifiable row logs and returns `None`
-/// and is never re-seeded into the registry.
+/// after an app restart between a planning run and the user's confident
+/// Execute follow-up — so the auto-Apply still executes the real persisted
+/// plan instead of silently re-planning. Returns the re-seeded binding (also
+/// inserted under the `(session_id, objective_hash)` key, newest-wins) or
+/// `None` when no durable row exists. Fail-soft: a storage error logs and
+/// returns `None`, leaving the run to fall through to the unchanged generic
+/// intent gate. The rehydrated binding is also verified against its artifact
+/// hash (ADR-55 §1 pending): a tampered or legacy unverifiable row logs and
+/// returns `None` and is never re-seeded into the registry.
 pub async fn rehydrate_durable_binding(
     store: &dyn concerto_sessions::SessionStore,
     session_id: Ulid,
@@ -997,6 +997,20 @@ pub fn apply_plan_decision(
         Some(_) => (RequestedOutcome::Execute, "dismissed"),
         None => (RequestedOutcome::Execute, "dismissed"),
     }
+}
+
+/// ADR-55 Phase 2d §3: the run's auto-Apply of a hash-verified plan binding.
+///
+/// The coordinator decides — no click: a confident Execute over a stored
+/// binding executes the persisted plan outright, carrying the SAME in-scope
+/// `filesystem` + `git` grants a confirmed `Apply` holds (`grant_execute`),
+/// audited as `"auto_granted"` (the run's routing row) plus `"auto_apply"`
+/// (the plan-decision row the caller writes via `record_plan_decision`).
+/// Grants stay non-durable (§4) and never cover shell or Consequential
+/// actions.
+pub fn apply_auto_plan_decision(store: &Arc<IntentGrantStore>) -> (RequestedOutcome, &'static str) {
+    grant_execute(store);
+    (RequestedOutcome::Execute, "auto_granted")
 }
 
 #[cfg(test)]

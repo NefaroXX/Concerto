@@ -879,3 +879,93 @@ grant persistence; no streaming classification.
   stands).
 - **C6** — the superseding test contract for
   `llm_classifier_is_never_produced_in_phase_0` lands (§7).
+
+## Addendum (Phase 2d) — Automatic intent gating: the Coordinator decides, no clicks (issue #27)
+
+Issue #27 lands the click-tax removal: `route()` + classifier result **is** the
+decision, grants are automatic at high confidence, and the interactive
+plan/execute confirmation dialog is deleted from the hot path. This addendum
+supersedes, **in part**:
+
+- **Decision §1 "hard rule"** — "the classifier (and the deterministic router)
+  can *classify*, never *grant*": replaced by high-confidence auto-grant (§1
+  below) for the five action-grantable outcomes. The AskUser zero-confidence
+  path never grants (§2).
+- **Decision §3** — "Plan agreement — an explicit dialog": the
+  `ApprovalSink` Apply-it dialog is deleted from the hot path; routing +
+  auto-grant replaces the user click.
+- **Decision §4** — "re-confirmed on resume": grants stay non-durable, but
+  re-confirmation happens through routing (auto re-grant), never a dialog.
+- **1d §3 interception** — "No mutation is possible without an explicit Apply":
+  auto-Apply from a hash-verified binding replaces the Apply/Replan/Dismiss
+  clicks. Replan remains reachable only via an explicit new Plan request.
+
+**Unchanged and load-bearing (compose with, do not revoke):** Decision §2
+capability tiers (`Consequential` never covered by blanket authorization;
+`IntentAuthorized` only upgrades `RequireApproval`, never overrides `Deny`);
+Decision §5 audit chain; 1d §2 binding registry (process-scoped, keyed by
+`(session_id, objective_hash)`, newest-wins, 16 KiB `plan_text` cap); 1d §4
+`record_plan_decision` seam; 1d §5 source-revision identity; 1e §2
+gate-covers-all-runs; 2b checkpoint precedence; ADR-56 §1a negation fast path
+(read-only can never be upgraded to writable by any model output or rule).
+No whiteboard / ledger / checkpoint persistence / supervisor changes; no new
+LLM calls beyond the existing classifier (ADR-56 §7).
+
+### 1. Auto-grant — routing is the decision
+
+For outcomes `Execute | Plan | Verify | Review | Diagnose` with
+`confidence >= concerto_core::LOW_CONFIDENCE_THRESHOLD` (0.7) reached via
+`RouterRoute::RuleHit` **or** `RouterRoute::LlmClassifier`, the run loop
+auto-grants in `IntentGrantStore` with the same `filesystem`/`git` scopes a
+confirmed `Apply` holds today. No `ApprovalSink` call, no dialog, no modal.
+The classifier wrapper remains mounted after the two fast paths (ADR-56 §1)
+and its threshold validation (>= 0.7, no band creation, ADR-56 §4) is
+unchanged — the invariant shift is only *what happens after a high-confidence
+route*: grant instead of prompt.
+
+### 2. AskUser and negation — hard read-only invariant
+
+`AskUser` (confidence `0.0`) and `NegationOverride` (`don't`, `never`,
+`without touching`, ...) remain **hard read-only**: no grant, no tool write,
+no spend. The negation read-only invariant continues to rest on the
+`NEGATION_PHRASES` corpus running first-match-wins ahead of any model (ADR-56
+§1a) — a permissive model can never make a read-only request writable. A
+zero-confidence input that needs action lands as a read-only answer-only run
+with an audit row; the user escalates by rephrasing with clearer intent, not
+by clicking a modal.
+
+### 3. Plan→Execute auto-Apply — hash-verified binding
+
+When a plan-approved binding exists (1d §2; inserted post-run on a
+Plan-effective `Ok` run) and the next input routes `Execute` at confidence,
+the run auto-`Apply`s the persisted `DesignDoc`: `artifact_hash` verified,
+**loud-fail on drift** (never silent re-decompose — 2b checkpoint precedence
+and ADR-65 §7 resume semantics unchanged). No `approve the plan` click.
+
+### 4. Resume auto re-grant
+
+On resume, grants re-apply automatically through routing (Decision §4
+non-durability retained, dialog channel removed): a high-confidence
+action-required route re-grants; an `AskUser`-routed resume stays read-only.
+No modal at the resume boundary.
+
+### 5. Audit — observable, not blocking
+
+Every auto decision writes to `sessions.db:audit_log` labeled
+`intent_router: auto_granted` with `{rule, confidence, route}` plus a
+`session_events` `RoutingDecided` record. `record_plan_decision` (1d §4)
+gains auto variants (`auto_apply` / `auto_granted`). Denial, negation, and
+AskUser paths keep their existing audit rows.
+
+### 6. Acceptance (issue #27)
+
+- **A1** — `cargo test -p concerto-orchestrator --lib` + `cargo clippy -D
+  warnings` green; `intent` tests green.
+- **A2** — `build accord` → immediate Execute run, no click modal;
+  `audit_log` shows `auto_granted` + `RuleHit|LlmClassifier` +
+  `confidence >= 0.7`.
+- **A3** — `don't build accord` → `NegationOverride` → read-only, zero
+  writes.
+- **A4** — `hmm` (`AskUser` `0.0`) → zero writes, zero grants.
+- **A5** — `plan: X` then `execute` (no `approve` click) → auto-`Apply` from
+  the persisted `DesignDoc`, hash-verified.

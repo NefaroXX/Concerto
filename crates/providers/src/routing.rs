@@ -158,6 +158,8 @@ impl RoutingEngine {
                         provider: profile.provider.clone(),
                         model: profile.model.clone(),
                         reason: format!("explicit provider/model assignment for {role}"),
+                        // Model-routing row: no intent payload (ADR-55 2d §5).
+                        intent: None,
                     },
                 );
                 return Ok(profile.clone());
@@ -188,6 +190,8 @@ impl RoutingEngine {
                 provider: selected.provider.clone(),
                 model: selected.model.clone(),
                 reason: format!("lowest-cost compatible unassigned model for {role}"),
+                // Model-routing row: no intent payload (ADR-55 2d §5).
+                intent: None,
             },
         );
 

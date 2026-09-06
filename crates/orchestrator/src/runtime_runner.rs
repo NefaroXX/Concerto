@@ -9,12 +9,13 @@ use crate::coordinator::{
     ApprovedPlanSeed, CoordinatorAgent, HeadlessResumeSeed, OrchestrationDepth,
 };
 use crate::intent_grants::{
-    apply_intent_gate, outcome_name, router_route_name, IntentGrantStore, SessionIntentAuth,
+    apply_intent_gate, auto_grant_envelope, is_confident_auto_grant_execute, outcome_name,
+    router_path_name, router_route_name, IntentGrantStore, SessionIntentAuth,
 };
 use crate::plan_approval::{
-    append_plan_approved_event, apply_plan_decision, fold_ledger, load_approved_plan,
-    plan_artifact_hash, plan_registry, rehydrate_durable_binding, verified_binding,
-    ApprovedPlanContext, PlanApprovedPayload, PlanBinding, PlanLedger,
+    append_plan_approved_event, apply_auto_plan_decision, fold_ledger, load_approved_plan,
+    plan_artifact_hash, plan_registry, rehydrate_durable_binding, ApprovedPlanContext,
+    PlanApprovedPayload, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
 use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
@@ -28,7 +29,7 @@ use concerto_config::RelationshipSemantics;
 use concerto_config::ResolvedBlueprint;
 use concerto_config::StageKind;
 use concerto_core::error::{PolicyError, ProviderError};
-use concerto_core::event::{Event, EventBus, EventKind};
+use concerto_core::event::{Event, EventBus, EventKind, IntentRouteDecision};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{PlanDecision, RequestedOutcome, RouterOutput, RouterRoute, RunStage};
@@ -48,7 +49,7 @@ use concerto_core::types::{
 use concerto_core::types::{Condition, PolicyRule};
 use concerto_core::{
     inject_intent_gate_rule, CancellationToken, IntentAuthorization, OrchestratorError,
-    PolicyPresets, RpmLimiter, SimplePolicyEngine, SpendTracker, LOW_CONFIDENCE_THRESHOLD,
+    PolicyPresets, RpmLimiter, SimplePolicyEngine, SpendTracker,
 };
 use concerto_sessions::audit::SqliteAuditLog;
 use concerto_sessions::whiteboard::{
@@ -2023,159 +2024,69 @@ async fn select_or_init_memory_services(
     Ok(Some(mem))
 }
 
-/// ADR-55 Phase 2b: which prompts arm the real Apply/Replan dialog instead of
-/// the generic intent gate (`None` fall-through).
+/// ADR-55 Phase 2d §3: resolve the plan binding a confident Execute
+/// auto-Applies — the coordinator decides, no clicks.
 ///
-/// Three cases arm it, newest-wins per match:
+/// Two sources, in order:
 ///
-/// - **Exact-objective Execute replay** (Phase 1d, unchanged): a confident
-///   Execute request whose input hash matches a stored binding.
-/// - **Exact-objective replay under another outcome**: the user re-sends the
-///   original plan-shaping prompt (the router re-classifies it — e.g. a
-///   `plan1:` prompt lands in `Diagnose`, and re-sending it after the plan
-///   renders must not silently re-run analysis). The stored binding is the
-///   authoritative artifact for that objective, so the dialog offers
-///   Apply/Replan. Excluded only for pure-text `Answer` replays.
-/// - **Natural-language approval** ([`is_plan_approval_phrase`]): the input to
-///   hash is an approval of the just-rendered plan, which routes as a fresh
-///   `Plan` run because the router's `plan` keyword wins. The planning-only
-///   run bound the rendered plan under its *own* input hash (M3), so the
-///   session-wide newest binding is the plan being approved — surfacing the
-///   dialog turns "i approve the plan" into an audited Apply instead of a
-///   second plan presentation.
+/// - **Exact-objective binding** (1d §2 registry, keyed
+///   `(session_id, objective_hash)`): a confident Execute whose input hash
+///   matches a stored binding auto-Applies it. The binding's plan text is
+///   verified against its creation-time artifact hash; a binding that no
+///   longer matches (tampered or corrupted storage) is a **loud failure**
+///   (`Err`) — never a silent fall-through into a fresh re-decompose of the
+///   same objective (2d §3: "artifact_hash verified, loud-fail on drift").
+/// - **Session-newest durable binding** (§11/§12 lineage): with no
+///   exact-objective hit, the session's newest durable `plan_bindings` row
+///   (which may have been planned for an earlier objective) is rehydrated
+///   and auto-Applied. This leg stays fail-soft (§11 posture): a missing row,
+///   a storage error, or an unverifiable/tampered row returns `Ok(None)` and
+///   the run falls through to the generic intent gate — a fresh objective is
+///   not a re-decompose of the stored plan.
 ///
-/// Every match is verified against the binding's artifact hash (ADR-55 §1
-/// pending) before it arms the dialog: a binding whose plan text no longer
-/// matches its creation-time hash — or an unverifiable legacy binding — falls
-/// through to the generic gate.
-pub fn bound_plan_for_approval(
+/// `Ok(None)` = no binding to auto-Apply (generic gate decides). Any other
+/// outcome of the routing (Plan, Diagnose, ...) never intercepts: auto-Apply
+/// fires only for a confident Execute, and Replan remains reachable only via
+/// an explicit new Plan request (2d addendum, 1d §3 superseded).
+async fn resolve_auto_apply_binding(
     routing: &RouterOutput,
     session_id: Ulid,
     objective_hash: &str,
-    input: &str,
-) -> Option<PlanBinding> {
-    let registry = plan_registry();
-    if routing.outcome == RequestedOutcome::Execute
-        && routing.confidence >= LOW_CONFIDENCE_THRESHOLD
-    {
-        if let Some(binding) = registry.pending(session_id, objective_hash) {
-            return verified_binding(binding);
+    session_store: Option<&Arc<dyn SessionStore>>,
+    cancel: CancellationToken,
+) -> Result<Option<PlanBinding>, OrchestratorError> {
+    if !is_confident_auto_grant_execute(routing) {
+        return Ok(None);
+    }
+    if let Some(raw) = plan_registry().pending(session_id, objective_hash) {
+        if raw.artifact_verifies() {
+            return Ok(Some(raw));
+        }
+        // ADR-55 Phase 2d §3: the approved plan for THIS objective drifted
+        // from its artifact hash. Executing anything else would be a silent
+        // re-decompose — fail the run loudly instead.
+        return Err(OrchestratorError::Unrecoverable {
+            message: format!(
+                "approved plan binding for objective {objective_hash} drifted from its artifact \
+                 hash (plan {}); refusing to silently re-decompose — re-plan explicitly to \
+                 replace it (ADR-55 Phase 2d §3)",
+                raw.plan_id(),
+            ),
+        });
+    }
+    if let Some(store) = session_store {
+        // Fail-soft (§11/§12 posture): a missing row, a storage error, or an
+        // unverifiable row falls through to the generic intent gate.
+        if let Some(binding) = rehydrate_durable_binding(store.as_ref(), session_id, cancel).await {
+            tracing::info!(
+                %session_id,
+                plan_id = %binding.plan_id(),
+                "auto-Apply armed from the session-newest durable plan binding"
+            );
+            return Ok(Some(binding));
         }
     }
-    if routing.outcome != RequestedOutcome::Answer {
-        if let Some(binding) = registry.pending(session_id, objective_hash) {
-            return verified_binding(binding);
-        }
-    }
-    if is_plan_approval_phrase(input) {
-        if let Some(binding) = registry.latest_for_session(session_id) {
-            return verified_binding(binding);
-        }
-    }
-    None
-}
-
-/// Short natural-language approvals of a rendered plan.
-///
-/// Every phrase names the plan or an approval of it; change-execution
-/// phrasing like "apply the fix" (an Execute intent) never false-positives.
-/// Bare approvals ("yes", "i approve") are intentionally included: the
-/// lookup guard — a `(session_id)` binding must exist — keeps them inert
-/// until a plan run actually rendered one, and the binding is consumed
-/// (removed in-memory and in durable storage) when an Apply executes, so a
-/// later bare "yes" in a fresh context cannot re-arm the dialog.
-pub fn is_plan_approval_phrase(input: &str) -> bool {
-    const PHRASES: &[&str] = &[
-        "approve the plan",
-        "approve plan",
-        "approved the plan",
-        "approved it",
-        "approve it",
-        "i approve",
-        "i approve of",
-        "i agree",
-        "approved",
-        "yes",
-        "yes, approve",
-        "yep",
-        "sounds good",
-        "looks good",
-        "go ahead",
-        "proceed",
-        "do it",
-        "apply the plan",
-        "apply the stored plan",
-        "apply plan",
-        "apply it",
-        "execute the plan",
-        "execute plan",
-        "run the plan",
-        "run plan",
-        "implement the plan",
-        "proceed with the plan",
-        "proceed with plan",
-        "yes, execute the plan",
-        "yes, apply the plan",
-        "looks good, execute",
-        "looks good, apply",
-    ];
-    /// Denials/hesitations that must never arm the dialog even though they
-    /// contain an approval phrase ("don't approve the plan", "not yet").
-    const NEGATIONS: &[&str] =
-        &["don't", "do not", "not yet", "never", "wait", "hold on", "actually no"];
-    let lower = input.trim().to_ascii_lowercase();
-    if NEGATIONS.iter().any(|neg| lower.contains(neg)) {
-        return false;
-    }
-    PHRASES.iter().any(|phrase| lower.contains(phrase))
-}
-
-/// ADR-55 §11: does `routing` ask for a confident Execute?
-///
-/// Mirrors the predicate [`bound_plan_for_approval`] and
-/// [`crate::intent_grants::apply_intent_gate`] use (Execute with confidence at
-/// or above [`LOW_CONFIDENCE_THRESHOLD`]), so the binding-driven arming path
-/// engages exactly when the generic gate would already escalate to a user
-/// confirmation — surfacing the stored plan text is strictly more informative
-/// than a bare "may I execute?" ask.
-fn is_confident_execute(routing: &RouterOutput) -> bool {
-    routing.outcome == RequestedOutcome::Execute && routing.confidence >= LOW_CONFIDENCE_THRESHOLD
-}
-
-/// ADR-55 §11: arm the Apply/Replan dialog from the session's newest durable
-/// plan binding when the router classified a confident Execute but neither
-/// the approval-phrase nor the exact-objective-hash path armed one.
-///
-/// Round-4 live finding: a user typed "execute" after a `plan:` run; the
-/// router classified a confident Execute, but because "execute" is neither an
-/// approval phrase nor the plan objective hash, no binding armed — the
-/// coordinator re-planned from "execute", the LLM planner returned empty
-/// (retry + heuristic fallback), and no files were ever written, while the
-/// session's newest durable plan sat unused. This path turns that "execute"
-/// into the same audited Apply/Replan dialog the phrase/hash paths produce,
-/// showing the STORED plan text.
-///
-/// Pure (no I/O) so the mapping is unit-testable: the caller loads
-/// [`concerto_sessions::PlanBindingRecord`] and passes it in. `None` keeps
-/// the run on the unchanged generic intent gate (fail-soft). The restored
-/// binding is verified against its artifact hash (ADR-55 §1 pending): a
-/// tampered or legacy unverifiable row falls through to the generic gate.
-fn arm_binding_for_confident_execute(
-    routing: &RouterOutput,
-    session_record: Option<PlanBindingRecord>,
-) -> Option<PlanBinding> {
-    if !is_confident_execute(routing) {
-        return None;
-    }
-    let record = session_record?;
-    verified_binding(PlanBinding::restored(
-        record.plan_id,
-        record.objective_hash,
-        record.source_revision,
-        record.plan_text,
-        record.artifact_hash,
-        record.created_at,
-    ))
+    Ok(None)
 }
 
 /// Decide whether the run's task should be action-required (B-2).
@@ -2819,12 +2730,13 @@ pub async fn run_shared_agent(
     // transcript now carries the prompt for both modes.
     transcript_recorder.record_user_message(req.input.clone()).await;
 
-    // 6b. Intent routing + user confirmation (ADR-55 §1/§2/§4/§6). Runs for
-    // every run — the gate is always on (ADR-55 Phase 1e). The router
-    // classifies; only a confirmed user decision grants — `None` from the sink
-    // keeps the run read-only so a mutation never slips through unconfirmed.
-    // Every routing decision is snapshotted to the audit through the
-    // correlation-id chain (ADR-55 §5.2); a failed audit write is fail-soft.
+    // 6b. Intent routing + authorization (ADR-55 §1/§2/§4/§6, Phase 2d).
+    // Runs for every run — the gate is always on (ADR-55 Phase 1e). ADR-55
+    // Phase 2d: routing is the decision — a high-confidence action outcome
+    // auto-grants (no dialog, no modal, no click), the negation corpus and
+    // the zero-confidence AskUser route stay hard read-only, and every auto
+    // decision is snapshotted to the audit through the correlation-id chain
+    // (§5); a failed audit write is fail-soft.
     let mut routing = concerto_core::intent::route(&req.input, req.project_dir.clone());
     let plan_objective_hash = blake3::hash(req.input.as_bytes()).to_hex().to_string();
 
@@ -2863,12 +2775,21 @@ pub async fn run_shared_agent(
     // configured threshold re-routes the deterministic result to the suggested
     // outcome; below-threshold, disabled, malformed, cancelled, spend-capped,
     // or failed calls fail soft and the deterministic result above stands
-    // unchanged (ADR-56 §3/§4). The classifier never grants (§8): a re-routed
-    // Execute still goes through the exact confirmation machinery below
-    // (`bound_plan_for_approval` / `apply_intent_gate`). The audit chain is
-    // untouched — `router_route` (captured above) and the classifier's shared
-    // correlation id feed the same two-row chain as before (§5).
+    // unchanged (ADR-56 §3/§4). ADR-55 Phase 2d: the grant consequence of a
+    // high-confidence route is automatic (§1) — the classifier call itself is
+    // unchanged. The audit chain is untouched — `router_route` (captured
+    // above) and the classifier's shared correlation id feed the same two-row
+    // chain as before (§5).
     let mut classifier_correlation_id: Option<Ulid> = None;
+    // ADR-55 Phase 2d §2 / ADR-56 §3: did a REAL classification happen for
+    // this event? The AskUser modal survives only where the deterministic
+    // chain stands alone — classifier disabled, unavailable, or fail-soft (no
+    // model output to trust). A real classification that was not re-routed
+    // (below threshold) leaves the AskUser route standing at confidence 0.0,
+    // which lands as a read-only answer-only run: the user rephrases, never
+    // clicks (2d §2) — and an AskUser-routed resume shows no modal either
+    // (2d §4).
+    let mut classifier_classified = false;
     let classifier_enabled =
         services.config.intent.as_ref().is_some_and(|intent| intent.classifier_enabled);
     if classifier_enabled && classifier_applies_to(&routing.route) {
@@ -2884,6 +2805,7 @@ pub async fn run_shared_agent(
         };
         if let Some(call) = crate::intent_classifier::classify_ambiguity(ctx).await {
             classifier_correlation_id = Some(call.correlation_id);
+            classifier_classified = call.outcome.is_some();
             if crate::intent_classifier::apply_classifier_decision(&mut routing, &call) {
                 tracing::info!(
                     %session_id,
@@ -2895,165 +2817,96 @@ pub async fn run_shared_agent(
             }
         }
     }
+    let allow_ask_user_modal = !classifier_classified;
 
-    // ADR-55 Phase 1d: a confident Execute request checks the process-scoped
-    // plan binding registry for the exact same objective. On a hit the generic
-    // intent confirmation is replaced by a real, audited Apply/Replan dialog
-    // (ADR-55 §3); on a miss the generic gate path below is byte-identical to
-    // pre-Phase-1d. The mode picker no longer exists, so every Execute request
-    // is a candidate.
-    //
-    // ADR-55 Phase 2b (live-fix): the same dialog must also arm when the user
-    // approves a just-rendered plan in natural language — "i approve the
-    // plan" hashes differently than the original objective and the router's
-    // `plan` keyword re-classifies it as a brand-new Plan run, so without this
-    // the approval silently re-plans instead of executing. See
-    // [`bound_plan_for_approval`] / [`is_plan_approval_phrase`].
-    let mut bound = bound_plan_for_approval(&routing, session_id, &plan_objective_hash, &req.input);
+    // ADR-55 Phase 2d §3 (plan→Execute auto-Apply): a confident Execute over
+    // a stored plan binding executes the persisted plan outright — the
+    // process-scoped exact-objective binding first, else the session-newest
+    // durable row — hash-verified, loud-fail on drift, no `approve the plan`
+    // click. Any other routing (including a re-sent plan prompt, which is an
+    // explicit new Plan request) never intercepts. See
+    // [`resolve_auto_apply_binding`].
+    let bound = resolve_auto_apply_binding(
+        &routing,
+        session_id,
+        &plan_objective_hash,
+        session_store.as_ref(),
+        req.cancel_token.clone(),
+    )
+    .await?;
 
-    // ADR-55 Phase 2b live-fix (restart-safe dialog): the in-memory registry
-    // is process-scoped, so after an app restart between the planning run and
-    // the user's approval the phrase arming above finds no binding. Rehydrate
-    // the session's newest DURABLE binding (concerto-sessions `plan_bindings`,
-    // same (session_id, objective_hash) key semantics, newest-wins) and
-    // re-seed the in-process registry with it, then arm the dialog exactly as
-    // an in-process hit would. Fail-soft: a storage error or a missing row
-    // falls through to the generic intent gate unchanged.
-    if bound.is_none() && is_plan_approval_phrase(&req.input) {
-        if let Some(store) = &session_store {
-            bound = rehydrate_durable_binding(store.as_ref(), session_id, req.cancel_token.clone())
-                .await;
-        }
-    }
-
-    // ADR-55 §11 (binding-driven arming, round-4 live-fix): a confident
-    // Execute — "execute", "apply the fix", ... — that armed no binding via
-    // the phrase or exact-objective-hash paths above must not silently
-    // re-plan. Round-4 live evidence: typing "execute" after a `plan:` run
-    // routed as confident Execute, no binding armed, the coordinator
-    // re-planned from "execute", the planner came back empty, and no files
-    // were written — while the session's newest durable plan sat unused.
-    // Arm the same Apply/Replan dialog from that stored plan (its text is
-    // what the dialog shows; the existing `Some(binding)` arm below captures
-    // it before consumption and builds the run task from it). Fail-soft like
-    // [`rehydrate_durable_binding`]: a storage error or a missing row falls
-    // through to the generic intent gate unchanged.
-    if bound.is_none() && is_confident_execute(&routing) {
-        if let Some(store) = &session_store {
-            match store.load_newest_plan_binding(session_id, req.cancel_token.clone()).await {
-                Ok(record) => {
-                    bound = arm_binding_for_confident_execute(&routing, record);
-                    // Mirror the durable row into the process-scoped registry
-                    // (same re-seed as [`rehydrate_durable_binding`]) so the
-                    // dialog's Apply branch consumes it in both stores.
-                    if let Some(binding) = &bound {
-                        plan_registry().insert(session_id, binding.clone());
-                        tracing::info!(
-                            %session_id,
-                            plan_id = %binding.plan_id(),
-                            "armed Apply/Replan dialog from the session-newest durable plan binding"
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        "durable plan binding lookup failed for a confident Execute; \
-                         falling through to the generic intent gate"
-                    );
-                }
-            }
-        }
-    }
-
-    // Decide how the run may proceed: a stored plan binding for this
-    // objective triggers an Apply/Replan dialog (0f/1c), otherwise the
-    // intent gate decides. The dialog's Apply decision additionally feeds
-    // the ADR-55 Phase 2b (M2) checkpoint suppression below.
+    // Decide how the run may proceed: a stored plan binding under a confident
+    // Execute triggers the auto-Apply (2d §3), otherwise the intent gate
+    // decides (auto-grant at high confidence, AskUser modal only in the
+    // classifier-off chain). The auto-Apply additionally feeds the ADR-55
+    // Phase 2b (M2) checkpoint suppression below.
     let mut plan_decision: Option<PlanDecision> = None;
-    // ADR-55 Phase 2b (M3, live-fix): an Apply decision consumes the stored
+    // ADR-55 Phase 2b (M3, live-fix): the auto-Apply consumes the stored
     // binding below, so capture it BEFORE that consumption — the Execute run's
     // task must be built from the approved plan text, which is only available
     // while the binding still exists.
     let mut applied_plan: Option<PlanBinding> = None;
-    // ADR-60 D7: the source revision snapshot the user's Apply answer was
-    // made at (the Apply/Replan dialog names both revisions). The divergence
-    // guard below fails loudly when the tree moves AFTER this snapshot — a
-    // change between approval and dispatch is silent divergence, never
-    // something the user saw.
+    // ADR-60 D7: the source revision snapshot the auto-Apply decision was
+    // made at. The divergence guard below fails loudly when the tree moves
+    // AFTER this snapshot — a change between decision and dispatch is silent
+    // divergence, never something a user saw.
     let mut approval_time_revision: Option<String> = None;
     let (effective, confirmation) = match bound {
         Some(binding) => {
+            // ADR-55 Phase 2d §3: auto-Apply — no dialog. The binding was
+            // hash-verified at interception ([`resolve_auto_apply_binding`]);
+            // consume it in both stores so a later confident Execute cannot
+            // re-apply an already-executed plan.
             let objective_hash = binding.objective_hash();
             let current_revision = current_source_revision(&req.project_dir).await;
             approval_time_revision = current_revision.clone();
             let binding_revision = binding.source_revision().unwrap_or("unknown");
-            // The wording names the plan id and avoids claiming the plan was
-            // made "for this objective": phrase/hash arming loads the plan
-            // bound to the current objective, but ADR-55 §11 arming loads the
-            // session-newest durable plan, which may have been planned for an
-            // earlier objective — the user must be able to tell what they are
-            // approving.
-            let question = format!(
-                "A stored plan exists for this session (plan {plan_id}, planned at source \
-                 revision {binding_revision}; current checkout {current_revision}). Apply it \
-                 now (mutation-capable), or replan first (read-only)?",
-                plan_id = binding.plan_id(),
-                current_revision = current_revision.as_deref().unwrap_or("unknown"),
-            );
-            let decision = services
-                .approval_sink
-                .request_plan_approval(
-                    session_id,
-                    binding.plan_id(),
-                    question,
-                    binding.plan_text(),
-                    binding.created_at(),
-                    req.cancel_token.clone(),
-                )
-                .await;
-            // The dialog is an audited approval-sink call: the decision is
-            // snapshotted under the synthetic `intent:plan` identity with
-            // plan_id + source revision in the user response, so the audit
-            // trail ties the decision back to the binding that produced it.
+            // The auto decision is audited under the synthetic `intent:plan`
+            // identity with plan_id + source revision in the user response
+            // (`auto_apply`, ADR-55 Phase 2d §5), sharing the routing event's
+            // correlation id, so the audit trail ties the auto-Apply back to
+            // the binding and the routing decision that produced it.
             executor
                 .record_plan_decision(
                     session_id,
-                    Ulid::new(),
+                    router_row_correlation_id(classifier_correlation_id),
                     binding.plan_id(),
                     objective_hash,
                     current_revision.as_deref(),
-                    decision.map_or("dismissed", PlanDecision::name),
+                    // ADR-55 Phase 2d §5: the plan-decision seam gains the
+                    // `auto_apply` variant.
+                    "auto_apply",
                     req.cancel_token.clone(),
                 )
                 .await;
+            tracing::info!(
+                %session_id,
+                plan_id = %binding.plan_id(),
+                plan_revision = %binding_revision,
+                current_revision = %current_revision.as_deref().unwrap_or("unknown"),
+                "auto-Applying the hash-verified stored plan (ADR-55 Phase 2d §3, no dialog)"
+            );
             // The decision rides along for ADR-55 Phase 2b (M2) checkpoint
             // suppression below.
-            plan_decision = decision;
-            // An Apply decision CONSUMES the stored plan: drop the session's
+            plan_decision = Some(PlanDecision::Apply);
+            // The auto-Apply CONSUMES the stored plan: drop the session's
             // binding in the in-memory registry and in durable storage so a
-            // later bare approval ("yes", "i approve") cannot re-arm the
-            // dialog for an already-executed plan. A missing durable row is
-            // a no-op (fail-soft).
-            if matches!(plan_decision, Some(PlanDecision::Apply)) {
-                // ADR-55 Phase 2b (M3, live-fix): capture the binding BEFORE
-                // consuming it so the Execute run below can describe the
-                // approved plan instead of the "i approve" phrase.
-                applied_plan = Some(binding.clone());
-                plan_registry().remove(session_id, objective_hash);
-                if let Some(store) = &session_store {
-                    if let Err(error) = store
-                        .delete_plan_binding(session_id, objective_hash, req.cancel_token.clone())
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            "failed to clear durable plan binding after apply"
-                        );
-                    }
+            // later confident Execute cannot re-apply an already-executed
+            // plan. A missing durable row is a no-op (fail-soft).
+            // ADR-55 Phase 2b (M3, live-fix): capture the binding BEFORE
+            // consuming it so the Execute run below can describe the
+            // approved plan.
+            applied_plan = Some(binding.clone());
+            plan_registry().remove(session_id, objective_hash);
+            if let Some(store) = &session_store {
+                if let Err(error) = store
+                    .delete_plan_binding(session_id, objective_hash, req.cancel_token.clone())
+                    .await
+                {
+                    tracing::warn!(%error, "failed to clear durable plan binding after apply");
                 }
             }
-            apply_plan_decision(decision, &store, &routing)
+            apply_auto_plan_decision(&store)
         }
         None => {
             apply_intent_gate(
@@ -3062,6 +2915,7 @@ pub async fn run_shared_agent(
                 &store,
                 &auth,
                 req.cancel_token.clone(),
+                allow_ask_user_modal,
             )
             .await
         }
@@ -3087,12 +2941,10 @@ pub async fn run_shared_agent(
             (Some(binding), Some(pool)) => match load_approved_plan(pool, binding).await {
                 Ok(Some(context)) => {
                     // Divergence guard, revision axis: the tree may not move
-                    // between the user's Apply answer and dispatch. A
-                    // divergence the dialog itself surfaced was explicitly
-                    // approved (it named both revisions); anything after that
-                    // snapshot is silent and fails the run. Unverifiable
-                    // revisions (git absent) degrade with a warn — the
-                    // artifact hash above still guards content integrity.
+                    // between the auto-Apply decision snapshot and dispatch.
+                    // Unverifiable revisions (git absent) degrade with a warn
+                    // — the artifact hash above still guards content
+                    // integrity.
                     let now_revision = current_source_revision(&req.project_dir).await;
                     match (&now_revision, &approval_time_revision) {
                         (Some(now), Some(approved_at)) if now != approved_at => {
@@ -3100,7 +2952,7 @@ pub async fn run_shared_agent(
                                 message: format!(
                                     "approved plan {} diverged from its approval: source \
                                      revision moved from {approved_at} to {now} after the \
-                                     Apply decision — explicit re-approval is required \
+                                     Apply decision — an explicit re-plan is required \
                                      (ADR-60 D7 forbids silent divergence)",
                                     binding.plan_id(),
                                 ),
@@ -3144,9 +2996,9 @@ pub async fn run_shared_agent(
 
     // The plan-decision helper grants but never mutates the read-only flag
     // (it owns only the store), so normalize it here from the confirmation.
-    // Idempotent with `apply_intent_gate`, which already sets the same value
-    // on its own paths.
-    auth.set_read_only(confirmation != "granted");
+    // Idempotent with `apply_intent_gate` and `apply_auto_plan_decision`,
+    // which already set the same value on their own paths.
+    auth.set_read_only(!matches!(confirmation, "granted" | "auto_granted"));
     let effective_outcome = effective;
     // The task-shape decision below must follow the gate's read-only state,
     // not just the effective outcome: a dismissed/absent confirmation keeps
@@ -3154,22 +3006,64 @@ pub async fn run_shared_agent(
     // immediately after the gate set it.
     let gate_read_only = auth.is_read_only();
 
-    executor
-        .record_routing_decision(
+    // ADR-55 Phase 2d §5: every auto decision writes the `intent_router:
+    // auto_granted` audit row — carrying the `{rule, confidence, route,
+    // outcome}` envelope — plus a `session_events` `RoutingDecided` record
+    // under the SAME correlation id. Denial, negation, and AskUser paths keep
+    // their existing `record_routing_decision` rows.
+    let routing_correlation_id =
+        // ADR-55 Phase 2c §5/C4: share the classifier's correlation id when a
+        // call happened; otherwise mint a fresh per-event id —
+        // `Ulid::default()` is the all-zero nil id and must never reach the
+        // audit (see `router_row_correlation_id`).
+        router_row_correlation_id(classifier_correlation_id);
+    if confirmation == "auto_granted" {
+        executor
+            .record_auto_intent_decision(
+                session_id,
+                routing_correlation_id,
+                &req.input,
+                router_route,
+                &auto_grant_envelope(&routing),
+                req.cancel_token.clone(),
+            )
+            .await;
+        if let Err(error) = services.bus.publish_for_session(
             session_id,
-            // ADR-55 Phase 2c §5/C4: share the classifier's correlation id
-            // when a call happened; otherwise mint a fresh per-event id —
-            // `Ulid::default()` is the all-zero nil id and must never reach
-            // the audit (see `router_row_correlation_id`).
-            router_row_correlation_id(classifier_correlation_id),
-            &req.input,
-            router_route,
-            outcome_name(effective),
-            routing.confidence,
-            confirmation,
-            req.cancel_token.clone(),
-        )
-        .await;
+            routing_correlation_id,
+            EventKind::RoutingDecided {
+                // The intent decision precedes the run task; the id
+                // identifies this routing record itself.
+                task_id: TaskId::new(),
+                role: AgentId::new("intent_router"),
+                provider: provider.provider_name().to_owned(),
+                model: model.clone(),
+                reason: "auto_granted".to_owned(),
+                intent: Some(IntentRouteDecision {
+                    outcome: outcome_name(effective).to_owned(),
+                    rule: router_route_name(&routing.route).to_owned(),
+                    confidence: routing.confidence,
+                    route: router_path_name(&routing.route).to_owned(),
+                    auto_granted: true,
+                }),
+            },
+        ) {
+            tracing::warn!(%error, %session_id, "failed to publish the intent routing event");
+        }
+    } else {
+        executor
+            .record_routing_decision(
+                session_id,
+                routing_correlation_id,
+                &req.input,
+                router_route,
+                outcome_name(effective),
+                routing.confidence,
+                confirmation,
+                req.cancel_token.clone(),
+            )
+            .await;
+    }
 
     // The spend carry-forward moved up before the intent classifier (Phase 2c
     // §6 ordering); `session_manager` still gates the checkpoint/resume block.
@@ -5035,6 +4929,7 @@ async fn current_source_revision(project_dir: &std::path::Path) -> Option<String
 #[cfg(test)]
 mod runtime_runner_tests {
     use super::*;
+    use crate::intent_grants::is_auto_grant_route;
     use crate::plan_approval::plan_artifact_hash;
     use crate::services::ServicesBuilder;
     use concerto_core::error::ToolError;
@@ -7425,340 +7320,204 @@ mod runtime_runner_tests {
         concerto_core::intent::route(input, std::path::PathBuf::from("/tmp"))
     }
 
-    /// Live-fix regression: "i approve the plan" hashes differently than the
-    /// original objective and routes as `Plan` (the `plan` keyword wins), so
-    /// the approval must arm the Apply/Replan dialog through the session-wide
-    /// newest binding — never silently re-trigger a planning run.
-    #[test]
-    fn approval_phrase_arms_dialog_via_session_binding() {
-        let session = Ulid::new();
-        let hash = "0123456789abcdef0123456789abcdef".to_owned();
-        plan_registry().insert(
-            session,
-            PlanBinding::new("plan-1".into(), hash, None, "step 1: build verdict".into()),
-        );
-
-        let routing = routing("i approve the plan");
-        assert_eq!(
-            routing.outcome,
-            RequestedOutcome::Plan,
-            "regression premise: the approval phrase routes as a new Plan run"
-        );
-        let binding = bound_plan_for_approval(
-            &routing,
-            session,
-            "fedcba9876543210fedcba9876543210",
-            "i approve the plan",
-        );
-        assert_eq!(
-            binding.map(|b| b.plan_id().to_owned()),
-            Some("plan-1".to_owned()),
-            "approving the rendered plan in natural language must surface the dialog"
-        );
-    }
-
-    /// The dialog must NOT arm for plan-named change requests ("apply the
-    /// fix" is an Execute intent about a change, not an approval of a stored
-    /// plan) nor when the session holds no binding at all.
-    ///
-    /// Scope note: this pins `bound_plan_for_approval`'s phrase/hash behavior
-    /// in isolation. At run level, ADR-55 §11 later supersedes the "apply the
-    /// fix" premise: a confident Execute with a durable session-newest row
-    /// arms the dialog via `arm_binding_for_confident_execute`.
-    #[test]
-    fn approval_phrase_requires_session_binding_and_plan_coupled_language() {
-        let session = Ulid::new();
-        let hash = "0123456789abcdef0123456789abcdef".to_owned();
-        let routing_out = routing("i approve the plan");
-
-        // Phrase but no binding: falls through to the generic gate.
-        assert!(
-            bound_plan_for_approval(&routing_out, session, &hash, "i approve the plan").is_none(),
-            "no session binding, no dialog"
-        );
-
-        // Binding but change-execution language under a *different* objective:
-        // "apply the fix" is an Execute intent about a change, not an approval
-        // of the stored plan, and it does not hash to the binding's objective.
-        plan_registry().insert(
-            session,
-            PlanBinding::new("plan-1".into(), hash.clone(), None, "step 1: build verdict".into()),
-        );
-        assert!(
-            bound_plan_for_approval(
-                &routing("apply the fix"),
-                session,
-                "ffffffffffffffffffffffffffffffff",
-                "apply the fix"
-            )
-            .is_none(),
-            "\"apply the fix\" names a change, not the stored plan"
-        );
-        plan_registry().remove(session, &hash);
-    }
-
-    /// Live-fix: bare real-world approvals ("I approve", "yes") are phrases,
-    /// while denials/hesitations containing an approval word never are.
-    #[test]
-    fn approval_phrases_cover_bare_approvals_and_reject_denials() {
-        for input in [
-            "I approve",
-            "i approve the plan",
-            "yes",
-            "yes, do it",
-            "yep",
-            "approved",
-            "approved it",
-            "go ahead",
-            "looks good",
-            "sounds good",
-            "proceed with the plan",
-            "run the plan",
-            "run plan",
-        ] {
-            assert!(is_plan_approval_phrase(input), "expected an approval phrase: {input:?}");
-        }
-        for input in [
-            "don't approve the plan",
-            "don't apply it",
-            "do not apply",
-            "not yet",
-            "never",
-            "wait, i need to review this first",
-            "hold on",
-            "actually no",
-            "i don't approve",
-        ] {
-            assert!(
-                !is_plan_approval_phrase(input),
-                "expected a denial, not an approval: {input:?}"
-            );
-        }
-        // Change-execution language stays out (Execute intent, not approval).
-        assert!(!is_plan_approval_phrase("apply the fix"));
-    }
-
-    /// Live-fix (restart-safe dialog): a durable binding in the session DB
-    /// rehydrates into the once-empty in-process registry and then arms the
-    /// dialog for the approval phrase exactly like an in-process hit.
+    /// ADR-55 Phase 2d §4: resume re-grants through routing only. A resume
+    /// phrase ("continue") routes as an ambiguous `AskUser` input — with a
+    /// real classification standing behind it (no modal allowed) it lands as
+    /// a read-only answer-only run: zero grants, no modal at the resume
+    /// boundary. A high-confidence action route on a resumed input would
+    /// re-grant automatically (non-durable grants re-apply through routing);
+    /// the checkpoint/headless-resume capability itself (`is_resume_request`,
+    /// `run_continuity_applies`) is untouched by the gate.
     #[tokio::test]
-    async fn durable_binding_rehydrates_and_arms_dialog() {
+    async fn ask_user_routed_resume_stays_read_only_without_modal() {
+        /// Counting sink: any confirmation call would show up here.
+        struct CountingSink(AtomicUsize);
+        #[async_trait]
+        impl ApprovalSink for CountingSink {
+            async fn request_approval(
+                &self,
+                _action: &concerto_core::types::PolicyAction<'_>,
+                _cancel: CancellationToken,
+            ) -> ApprovalDecision {
+                ApprovalDecision::Deny
+            }
+            async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {
+            }
+            async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
+                true
+            }
+            async fn request_intent_confirmation(
+                &self,
+                _question: String,
+                _options: &[RequestedOutcome],
+                _cancel: CancellationToken,
+            ) -> Option<RequestedOutcome> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        }
+
+        let routed = routing("continue");
+        assert_eq!(routed.route, RouterRoute::AskUser, "premise: a resume phrase is ambiguous");
+        assert_eq!(routed.outcome, RequestedOutcome::Answer);
+        assert!(is_resume_request("continue"), "premise: the checkpoint branch still sees it");
+
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+        let sink = CountingSink(AtomicUsize::new(0));
+        let (effective, confirmation) =
+            apply_intent_gate(&routed, &sink, &store, &auth, CancellationToken::new(), false).await;
+        assert_eq!(effective, RequestedOutcome::Answer, "read-only answer-only resume");
+        assert_eq!(confirmation, "n/a", "no modal at the resume boundary (2d §4)");
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0, "no modal was offered");
+        assert!(auth.is_read_only());
+        assert!(store.is_empty(), "an AskUser-routed resume never grants");
+    }
+
+    /// ADR-55 Phase 2d: natural-language approvals ("i approve the plan",
+    /// "yes") are ordinary inputs — no phrase gate arms anything. The phrase
+    /// routes as a fresh Plan run (the `plan` keyword wins) and under 2d §1 a
+    /// confident Plan rule hit auto-grants; the interception itself fires
+    /// only for a confident Execute over a stored binding
+    /// ([`resolve_auto_apply_binding`]).
+    #[test]
+    fn approval_phrases_are_ordinary_inputs_under_auto_gating() {
+        let approval_routed = routing("i approve the plan");
+        assert_eq!(
+            approval_routed.outcome,
+            RequestedOutcome::Plan,
+            "premise: the approval phrase routes as a new Plan run"
+        );
+        assert!(
+            !is_confident_auto_grant_execute(&approval_routed),
+            "a Plan-routed approval phrase never intercepts the plan binding"
+        );
+        // The same objective with an Execute-routed input intercepts — the
+        // routing decides, not the phrasing.
+        assert!(
+            is_confident_auto_grant_execute(&routing("apply the fix")),
+            "premise: a change-execution phrase routes a confident Execute"
+        );
+        // Denial phrasing rides the negation corpus, which never grants
+        // (ADR-56 §1a) — the corpus, not a phrase list, is the guard.
+        let denied = routing("don't approve the plan");
+        assert!(
+            matches!(denied.route, RouterRoute::RuleHit { rule: "negation_override" }),
+            "premise: denials are negation overrides"
+        );
+        assert!(
+            !is_auto_grant_route(&denied),
+            "a negation override never auto-grants, whatever it routes to"
+        );
+    }
+
+    /// Live-fix (restart-safe auto-Apply): a durable binding in the session
+    /// DB rehydrates into the once-empty in-process registry so a confident
+    /// Execute after an app restart still auto-Applies the real persisted
+    /// plan (ADR-55 Phase 2d §3), with its original age preserved.
+    #[tokio::test]
+    async fn durable_binding_rehydrates_for_auto_apply() {
         use concerto_sessions::{PlanBindingRecord, SqliteSessionStore};
 
-        let store = SqliteSessionStore::connect_in_memory().await.expect("in-memory store");
-        let session = Ulid::new();
-        let created_at =
-            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
-        store
-            .save_plan_binding(
-                &PlanBindingRecord {
-                    session_id: session,
-                    objective_hash: "obj-hash-1".to_owned(),
-                    plan_id: "plan-1".to_owned(),
-                    plan_text: "step 1: build verdict".to_owned(),
-                    source_revision: Some("abc1234".to_owned()),
-                    artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
-                    created_at,
-                },
-                CancellationToken::new(),
-            )
-            .await
-            .expect("durable save");
-
-        // Simulate a restart: the process registry holds nothing for this
-        // session; rehydration must restore the binding WITH its original age.
-        let binding = rehydrate_durable_binding(&store, session, CancellationToken::new())
-            .await
-            .expect("rehydrated binding");
-        assert_eq!(binding.plan_id(), "plan-1");
-        assert_eq!(binding.created_at(), created_at, "original age preserved");
-
-        // The re-seeded registry now arms the dialog for the approval phrase
-        // under the phrase branch (a fresh input hash never matches).
-        let out = bound_plan_for_approval(
-            &routing("i approve the plan"),
-            session,
-            "fedcba9876543210fedcba9876543210",
-            "i approve the plan",
-        );
-        assert_eq!(out.map(|b| b.plan_id().to_owned()), Some("plan-1".to_owned()));
-    }
-
-    /// ADR-55 §11 (round-4 live-fix): a confident Execute with a durable
-    /// session-newest plan record arms the Apply/Replan dialog with the
-    /// STORED plan — plan_id, original objective hash, plan text, source
-    /// revision and original age all preserved — so "execute" executes the
-    /// stored plan instead of silently re-planning.
-    #[test]
-    fn confident_execute_arms_dialog_from_durable_session_newest_binding() {
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteSessionStore::connect_in_memory().await.expect("in-memory store"));
         let session = Ulid::new();
         let created_at =
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
         let record = PlanBindingRecord {
             session_id: session,
-            objective_hash: "obj-hash-original".to_owned(),
+            objective_hash: "obj-hash-1".to_owned(),
             plan_id: "plan-1".to_owned(),
             plan_text: "step 1: build verdict".to_owned(),
             source_revision: Some("abc1234".to_owned()),
             artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
             created_at,
         };
+        store.save_plan_binding(&record, CancellationToken::new()).await.expect("durable save");
+
+        // Simulate a restart: the process registry holds nothing for this
+        // session; rehydration must restore the binding WITH its original age.
+        let binding = rehydrate_durable_binding(store.as_ref(), session, CancellationToken::new())
+            .await
+            .expect("rehydrated binding");
+        assert_eq!(binding.plan_id(), "plan-1");
+        assert_eq!(binding.created_at(), created_at, "original age preserved");
+
+        // The interception resolves the re-seeded binding for a confident
+        // Execute (a fresh input hash never matches the exact-objective key).
+        let resolved = resolve_auto_apply_binding(
+            &routing("execute"),
+            session,
+            "00000000000000000000000000000000",
+            Some(&store),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resolution succeeds");
+        assert_eq!(
+            resolved.map(|b| b.plan_id().to_owned()),
+            Some("plan-1".to_owned()),
+            "a confident Execute after a restart auto-Applies the persisted plan"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-55 Phase 2d §3 / A5: plan→Execute auto-Apply — a confident
+    // Execute over a stored binding executes the persisted plan outright,
+    // hash-verified; drift on the exact-objective leg is a LOUD failure,
+    // never a silent re-decompose.
+    // ------------------------------------------------------------------
+
+    /// A5: a confident Execute whose input hash matches a stored binding
+    /// resolves that binding for auto-Apply — the ORIGINAL plan objective,
+    /// plan text, source revision and age all preserved.
+    #[test]
+    fn a5_confident_execute_auto_applies_exact_objective_binding() {
+        let session = Ulid::new();
+        let hash = "0123456789abcdef0123456789abcdef".to_owned();
+        plan_registry().insert(
+            session,
+            PlanBinding::restored(
+                "plan-1".into(),
+                hash.clone(),
+                Some("abc1234".into()),
+                "step 1: build verdict".into(),
+                Some(plan_artifact_hash("step 1: build verdict")),
+                time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
+            ),
+        );
 
         let routed = routing("apply the fix");
         assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
         assert!(
-            routed.confidence >= LOW_CONFIDENCE_THRESHOLD,
-            "premise: the routing is confident enough to arm"
+            is_confident_auto_grant_execute(&routed),
+            "premise: the routing auto-grants on its own (2d §1)"
         );
 
-        let binding = arm_binding_for_confident_execute(&routed, Some(record))
-            .expect("confident Execute with a durable row arms the dialog");
+        let resolved = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_auto_apply_binding(
+                &routed,
+                session,
+                &hash,
+                None,
+                CancellationToken::new(),
+            ))
+            .expect("resolution succeeds");
+        let binding = resolved.expect("the exact-objective binding auto-Applies");
         assert_eq!(binding.plan_id(), "plan-1");
-        assert_eq!(
-            binding.objective_hash(),
-            "obj-hash-original",
-            "the binding keeps the ORIGINAL plan objective, not the execute input (ADR-55 §11)"
-        );
+        assert_eq!(binding.objective_hash(), hash, "the ORIGINAL plan objective");
         assert_eq!(binding.plan_text(), "step 1: build verdict");
         assert_eq!(binding.source_revision(), Some("abc1234"));
-        assert_eq!(binding.created_at(), created_at, "original age preserved");
+        plan_registry().remove(session, &hash);
     }
 
-    /// ADR-55 §11: a confident Execute with NO durable row falls through to
-    /// the generic intent gate (fail-soft) — no dialog, no plan executed.
-    #[test]
-    fn confident_execute_without_durable_binding_stays_on_generic_gate() {
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
-        assert!(
-            arm_binding_for_confident_execute(&routed, None).is_none(),
-            "no durable row means the unchanged generic gate decides"
-        );
-    }
-
-    /// ADR-55 §12: the user's natural follow-up word "execute" (bare) routes
-    /// as a confident Execute and arms the dialog from the durable binding —
-    /// the exact gap observed in live rounds 4/5 where it fell to the
-    /// generic AskUser list modal instead.
-    #[test]
-    fn bare_execute_arms_dialog_from_durable_binding() {
-        let session = Ulid::new();
-        let record = PlanBindingRecord {
-            session_id: session,
-            objective_hash: "obj-hash-original".to_owned(),
-            plan_id: "plan-1".to_owned(),
-            plan_text: "step 1: build verdict".to_owned(),
-            source_revision: Some("abc1234".to_owned()),
-            artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
-            created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
-                .expect("valid timestamp"),
-        };
-
-        let routed = routing("execute");
-        assert_eq!(
-            routed.outcome,
-            RequestedOutcome::Execute,
-            "premise: bare execute routes Execute"
-        );
-        assert!(routed.confidence >= LOW_CONFIDENCE_THRESHOLD, "premise: confident enough to arm");
-
-        let binding = arm_binding_for_confident_execute(&routed, Some(record))
-            .expect("bare Execute with a durable row arms the dialog");
-        assert_eq!(binding.plan_id(), "plan-1");
-        assert_eq!(
-            binding.objective_hash(),
-            "obj-hash-original",
-            "the binding keeps the ORIGINAL plan objective, not the execute input (ADR-55 §11)"
-        );
-        assert_eq!(binding.plan_text(), "step 1: build verdict");
-    }
-
-    /// ADR-55 §11: only a confident EXECUTE outcome arms from the durable
-    /// session-newest binding. Non-Execute outcomes (e.g. "i approve the
-    /// plan" routing as a fresh Plan run) keep their own phrase/hash paths
-    /// untouched — this fallback never hijacks them.
-    #[test]
-    fn non_execute_outcome_never_arms_from_durable_binding() {
-        let session = Ulid::new();
-        let record = PlanBindingRecord {
-            session_id: session,
-            objective_hash: "obj-hash-original".to_owned(),
-            plan_id: "plan-1".to_owned(),
-            plan_text: "step 1: build verdict".to_owned(),
-            source_revision: None,
-            artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
-            created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
-                .expect("valid timestamp"),
-        };
-
-        let routed = routing("i approve the plan");
-        assert_eq!(routed.outcome, RequestedOutcome::Plan, "premise: plan keyword wins");
-        assert!(
-            arm_binding_for_confident_execute(&routed, Some(record)).is_none(),
-            "a non-Execute outcome never arms from durable storage"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // ADR-55 §1 (pending): diff-vs-artifact — the dialog's plan text must
-    // match the binding's creation-time artifact hash or it falls through to
-    // the generic intent gate (fail-soft, no dialog).
-    // ------------------------------------------------------------------
-
-    /// A durable row whose plan_text was altered after creation (tampered or
-    /// corrupted storage) must NOT arm the dialog: the text no longer matches
-    /// the artifact hash captured at insert time.
-    #[test]
-    fn tampered_durable_plan_text_falls_through_to_generic_gate() {
-        let session = Ulid::new();
-        let record = PlanBindingRecord {
-            session_id: session,
-            objective_hash: "obj-hash-original".to_owned(),
-            plan_id: "plan-1".to_owned(),
-            plan_text: "step 1: build verdict AND delete everything".to_owned(),
-            source_revision: Some("abc1234".to_owned()),
-            artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
-            created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
-                .expect("valid timestamp"),
-        };
-
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
-        assert!(
-            arm_binding_for_confident_execute(&routed, Some(record)).is_none(),
-            "plan text that does not match its artifact hash never arms the dialog"
-        );
-    }
-
-    /// A legacy durable row (written before migration 025) carries no artifact
-    /// hash. It is unverifiable, and per ADR-55 the verification is
-    /// load-bearing: fall through to the generic intent gate.
-    #[test]
-    fn legacy_durable_row_without_artifact_hash_falls_through() {
-        let session = Ulid::new();
-        let record = PlanBindingRecord {
-            session_id: session,
-            objective_hash: "obj-hash-original".to_owned(),
-            plan_id: "plan-1".to_owned(),
-            plan_text: "step 1: build verdict".to_owned(),
-            source_revision: Some("abc1234".to_owned()),
-            artifact_hash: None,
-            created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
-                .expect("valid timestamp"),
-        };
-
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
-        assert!(
-            arm_binding_for_confident_execute(&routed, Some(record)).is_none(),
-            "an unverifiable legacy row falls through to the generic gate"
-        );
-    }
-
-    /// The registry arming path verifies too: an in-memory binding whose plan
-    /// text was altered after insert (hash mismatch) must not arm the dialog.
-    #[test]
-    fn registry_binding_with_tampered_text_does_not_arm_dialog() {
+    /// A5 (loud-fail on drift): a stored binding whose plan text no longer
+    /// matches its creation-time artifact hash must fail the run LOUDLY —
+    /// never silently fall through to a fresh re-decompose of the same
+    /// objective (ADR-55 Phase 2d §3).
+    #[tokio::test]
+    async fn a5_drifted_exact_objective_binding_loud_fails_never_redecomposes() {
         let session = Ulid::new();
         let hash = "0123456789abcdef0123456789abcdef".to_owned();
         plan_registry().insert(
@@ -7773,20 +7532,211 @@ mod runtime_runner_tests {
             ),
         );
 
-        // "apply the fix" is a confident Execute replaying the objective the
-        // binding is keyed on — the tampered binding must fall through.
         let routed = routing("apply the fix");
         assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
+        let resolved =
+            resolve_auto_apply_binding(&routed, session, &hash, None, CancellationToken::new())
+                .await;
         assert!(
-            bound_plan_for_approval(&routed, session, &hash, "apply the fix").is_none(),
-            "a registry binding with altered plan text never arms the dialog"
+            resolved.is_err(),
+            "a drifted exact-objective binding is a loud failure, not a fall-through"
         );
         plan_registry().remove(session, &hash);
     }
 
+    /// A5: with no exact-objective hit, the session-newest DURABLE binding
+    /// (plan bound by an earlier `plan:` run, possibly under an older
+    /// objective) is resolved for auto-Apply — "execute" executes the stored
+    /// plan, no `approve` click (§11/§12 lineage under 2d).
+    #[tokio::test]
+    async fn a5_confident_execute_auto_applies_session_newest_durable_binding() {
+        use concerto_sessions::SqliteSessionStore;
+
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteSessionStore::connect_in_memory().await.expect("in-memory store"));
+        let session = Ulid::new();
+        store
+            .save_plan_binding(
+                &PlanBindingRecord {
+                    session_id: session,
+                    objective_hash: "obj-hash-original".to_owned(),
+                    plan_id: "plan-1".to_owned(),
+                    plan_text: "step 1: build verdict".to_owned(),
+                    source_revision: Some("abc1234".to_owned()),
+                    artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
+                    created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+                        .expect("valid timestamp"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("durable save");
+
+        let routed = routing("execute");
+        assert_eq!(
+            routed.outcome,
+            RequestedOutcome::Execute,
+            "premise: bare execute routes a confident Execute"
+        );
+        let resolved = resolve_auto_apply_binding(
+            &routed,
+            session,
+            "11111111111111111111111111111111",
+            Some(&store),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resolution succeeds");
+        let binding = resolved.expect("the session-newest durable plan auto-Applies");
+        assert_eq!(binding.plan_id(), "plan-1");
+        assert_eq!(
+            binding.objective_hash(),
+            "obj-hash-original",
+            "the binding keeps the ORIGINAL plan objective, not the execute input (§11)"
+        );
+        assert_eq!(binding.plan_text(), "step 1: build verdict");
+    }
+
+    /// A5 (fail-soft leg): an unverifiable session-newest durable row —
+    /// tampered text or a legacy row without an artifact hash — falls through
+    /// to the generic intent gate (`Ok(None)`), never arms an auto-Apply.
+    #[tokio::test]
+    async fn a5_unverifiable_session_newest_binding_falls_through_fail_soft() {
+        use concerto_sessions::SqliteSessionStore;
+
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteSessionStore::connect_in_memory().await.expect("in-memory store"));
+        let session = Ulid::new();
+        let created_at =
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        // Tampered: text altered after creation, hash kept.
+        store
+            .save_plan_binding(
+                &PlanBindingRecord {
+                    session_id: session,
+                    objective_hash: "obj-hash-1".to_owned(),
+                    plan_id: "plan-1".to_owned(),
+                    plan_text: "step 1: build verdict AND delete everything".to_owned(),
+                    source_revision: Some("abc1234".to_owned()),
+                    artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
+                    created_at,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("tampered save");
+
+        let routed = routing("apply the fix");
+        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
+        let resolved = resolve_auto_apply_binding(
+            &routed,
+            session,
+            "22222222222222222222222222222222",
+            Some(&store),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resolution succeeds");
+        assert!(
+            resolved.is_none(),
+            "an unverifiable session-newest row never auto-Applies (fail-soft, §11 posture)"
+        );
+
+        // A legacy row without any artifact hash is unverifiable too.
+        let session = Ulid::new();
+        store
+            .save_plan_binding(
+                &PlanBindingRecord {
+                    session_id: session,
+                    objective_hash: "obj-hash-2".to_owned(),
+                    plan_id: "plan-2".to_owned(),
+                    plan_text: "step 1: build verdict".to_owned(),
+                    source_revision: Some("abc1234".to_owned()),
+                    artifact_hash: None,
+                    created_at,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("legacy save");
+        let resolved = resolve_auto_apply_binding(
+            &routed,
+            session,
+            "33333333333333333333333333333333",
+            Some(&store),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resolution succeeds");
+        assert!(resolved.is_none(), "a legacy row without a hash falls through");
+    }
+
+    /// A5: a confident Execute with NO stored binding resolves `Ok(None)` —
+    /// the generic intent gate decides (auto-grant, 2d §1).
+    #[tokio::test]
+    async fn a5_confident_execute_without_binding_stays_on_generic_gate() {
+        let routed = routing("apply the fix");
+        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
+        let resolved = resolve_auto_apply_binding(
+            &routed,
+            Ulid::new(),
+            "44444444444444444444444444444444",
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resolution succeeds");
+        assert!(resolved.is_none(), "no durable row means the generic gate decides");
+    }
+
+    /// A5 / 2d §3 scope: only a confident EXECUTE intercepts the binding.
+    /// Non-Execute routings — including a re-sent plan prompt (an explicit
+    /// new Plan request — Replan's only remaining route) and a re-sent
+    /// objective under Diagnose/Review/Verify — never auto-Apply.
+    #[tokio::test]
+    async fn a5_non_execute_routing_never_auto_applies() {
+        let store: Arc<dyn SessionStore> = Arc::new(
+            concerto_sessions::SqliteSessionStore::connect_in_memory()
+                .await
+                .expect("in-memory store"),
+        );
+        let session = Ulid::new();
+        store
+            .save_plan_binding(
+                &PlanBindingRecord {
+                    session_id: session,
+                    objective_hash: "obj-hash-original".to_owned(),
+                    plan_id: "plan-1".to_owned(),
+                    plan_text: "step 1: build verdict".to_owned(),
+                    source_revision: None,
+                    artifact_hash: Some(plan_artifact_hash("step 1: build verdict")),
+                    created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+                        .expect("valid timestamp"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("durable save");
+
+        for input in ["i approve the plan", "diagnose this crash"] {
+            let routed = routing(input);
+            assert_ne!(routed.outcome, RequestedOutcome::Execute, "premise for {input:?}");
+            let resolved = resolve_auto_apply_binding(
+                &routed,
+                session,
+                "55555555555555555555555555555555",
+                Some(&store),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("resolution succeeds");
+            assert!(resolved.is_none(), "a non-Execute routing never auto-Applies ({input:?})");
+        }
+    }
+
     /// End-to-end through real SQLite: a binding tampered IN STORAGE after
     /// insert is rejected at rehydration — it must not be re-seeded into the
-    /// registry and must not arm the dialog.
+    /// registry and must never auto-Apply.
     #[tokio::test]
     async fn rehydration_rejects_tampered_durable_binding() {
         use concerto_sessions::SqliteSessionStore;
@@ -7832,44 +7782,6 @@ mod runtime_runner_tests {
         assert!(
             rehydrate_durable_binding(&store, session, CancellationToken::new()).await.is_none(),
             "a durable binding whose text no longer matches its artifact hash is not rehydrated"
-        );
-    }
-
-    /// Deterministic replay of the exact original objective arms the dialog
-    /// under the observed `Diagnose` routing too (the live `plan1:` prompt
-    /// landed in Diagnose) and under Plan; pure-text Answer replays never do.
-    #[test]
-    fn exact_objective_replay_arms_dialog_under_planning_routes() {
-        let session = Ulid::new();
-        let hash = "0123456789abcdef0123456789abcdef".to_owned();
-        plan_registry().insert(
-            session,
-            PlanBinding::new("plan-1".into(), hash.clone(), None, "step 1: build verdict".into()),
-        );
-
-        for (input, expected_route) in [
-            ("draft a plan for the refactor", RequestedOutcome::Plan),
-            ("diagnose this crash", RequestedOutcome::Diagnose),
-            ("give me a code review of this change", RequestedOutcome::Review),
-            ("please verify the release build", RequestedOutcome::Verify),
-        ] {
-            let routing = routing(input);
-            assert_eq!(routing.outcome, expected_route);
-            let binding = bound_plan_for_approval(&routing, session, &hash, input);
-            assert!(
-                binding.is_some(),
-                "exact-objective replay under {expected_route:?} must arm the dialog"
-            );
-        }
-        assert!(
-            bound_plan_for_approval(
-                &routing("What is the fastest way to sort a list?"),
-                session,
-                &hash,
-                "What is the fastest way to sort a list?"
-            )
-            .is_none(),
-            "a pure-text Answer replay never arms the dialog"
         );
     }
 

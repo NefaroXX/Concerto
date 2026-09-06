@@ -281,11 +281,12 @@ impl IntentConfig {
     /// [`RetryConfig::validate`].
     ///
     /// The threshold is bound to `concerto_core::LOW_CONFIDENCE_THRESHOLD`
-    /// (not a literal): the intent gate's `is_confident_execute`/arm-1 dialog
-    /// uses that constant, so a configured threshold below it could re-route a
-    /// classifier Execute at a confidence the gate treats as ambiguous —
-    /// landing it in the read-only wildcard instead of the confirmation
-    /// dialog (ADR-55 Phase 2c §2, never-grant invariant).
+    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 Phase
+    /// 2d §1) uses that constant, so a configured threshold below it could
+    /// re-route a classifier Execute at a confidence the gate treats as
+    /// ambiguous — landing it in the read-only wildcard instead of the
+    /// auto-grant (ADR-55 Phase 2c §2 invariant retained by the ADR-56
+    /// amendment).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.classifier_confidence_threshold.is_finite()
             || self.classifier_confidence_threshold < concerto_core::LOW_CONFIDENCE_THRESHOLD
