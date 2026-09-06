@@ -76,7 +76,8 @@ lifecycle decisions. What is true on `dev` today:
   attribution; a derived `resource_facts` table (migrations 029–031) provides
   the fast path for read deduplication and workspace-state queries. The
   hardcoded `design → research → implement` fallback is replaced by
-  evidence-driven scheduling (`evidence_scheduler.rs`); a deterministic
+  Coordinator-decided dispatch (the `call_specialist` tool, ADR-35 amendment
+  2026-09-05); a deterministic
   DesignDoc verifier (`design_doc_verifier.rs`) resolves proposed-file intents
   against the snapshot and `resource_facts`, quarantining hallucinated docs.
   Continuation restores state at the whiteboard cursor (`resume.rs`,

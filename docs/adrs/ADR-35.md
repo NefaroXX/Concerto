@@ -212,6 +212,58 @@ executor (declared verification commands, `require_verification` semantics)
 when capable. Acceptance is rejected only when verification is required and
 cannot be performed at all. Vacuous-accept policy unchanged.
 
+## Amendment (2026-09-05) — the Coordinator decides; planner and stage sequencing are advisory
+
+Revised **in place**, not superseded (per the project owner's standing
+instruction: no new ADR numbers). This amendment reconciles the document with
+the requirement already quoted in the Revision record above — the Coordinator
+"gets context about other agents ... and figures out how to delegate; the
+current five agents are only a known-working default preset". The **code**
+over-built beyond this contract: a pre-run planner whose output was
+materialized verbatim as graph roles, blueprint staffing equality enforced
+against the registry, and a compiled evidence scheduler. All three are revoked
+here; contradictions elsewhere in this document resolve in favor of this
+amendment.
+
+### 1. Dispatch authority belongs to the Coordinator, not to code
+
+- The Coordinator calls registered agents through a policy-gated
+  `call_specialist(agent_id, task, notes)` tool. It decides *which* agent and
+  *when*, from the agents' **context injected into its prompt** (id, name,
+  role, declared capabilities, output mode, system instructions) plus the
+  run's recorded evidence.
+- No agent is called because its stage tag exists. The stage table in §2 is
+  **informational vocabulary** (output-mode typing, verifier routing) — it is
+  not a dispatch policy and imposes no ordering.
+
+### 2. The planner is demoted to an advisory tool
+
+- §4's "passes control to the planner" is revoked. `TaskPlanner` output is
+  **never materialized as `SubTask` roles/dependencies** by
+  `decompose_task`/`decompose_from_evidence`. It may exist only as an
+  optional, coordinator-invoked advisor ("draft a work breakdown") whose plan
+  is context the Coordinator may use or ignore; `PLAN.md`/plan artifacts are
+  advisory records, never an authoritative workload.
+
+### 3. Registry is the roster; staffing is never enforced
+
+- The registry built from `custom_agents` config (ADR-58) is the roster.
+  Blueprint `def.agents` staffing equality checks and drift asserts are
+  **deleted**; a blueprint is advisory data at most.
+
+### 4. No compiled dispatch policy
+
+- There is no scheduler/decision-function that selects agents. Evidence
+  (ADR-65 facts, claims, decisions) is injected into the Coordinator's
+  context as guidance; the Coordinator selects, and every selection is
+  recorded as an evidence-backed `Decision` event (ADR-65 §6/§7 ledger, kept).
+
+### 5. Safety nets unchanged (post-action compensation)
+
+- Write gates, `SimplePolicyEngine`, `VirtualFs`, the zero-work guard, and the
+  checkpoint/resume ledger remain. Correctness is enforced **after** action —
+  verify, attribute, gate, revise — not by pre-empting the Coordinator.
+
 ## Consequences
 
 ### Positive

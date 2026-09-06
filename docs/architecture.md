@@ -99,11 +99,14 @@ bootstrap existing projects before planning. A derived `resource_facts` table
 files are served from cache with a `served_from` fact, avoiding redundant
 disk reads.
 
-Scheduling is evidence-driven (`evidence_scheduler.rs`), not a fixed
-`design → research → implement` fallback. The coordinator derives unmet needs
-from evidence gaps and dispatches among registered agents. A deterministic
+Dispatch authority belongs to the Coordinator (ADR-35 amendment
+2026-09-05): no compiled scheduler or planner governs dispatch. The
+Coordinator decides through the policy-gated `call_specialist` tool, working
+from the roster injected into its prompt and the session's recorded evidence;
+every dispatch appends an evidence-backed `Decision` event. A deterministic
 DesignDoc verifier (`design_doc_verifier.rs`) resolves proposed-file intents
-against the snapshot and `resource_facts`, quarantining hallucinated docs.
+against the snapshot and `resource_facts`, quarantining hallucinated docs —
+an optional policy-gated check, never a mandatory stage.
 Continuation restores state at the whiteboard cursor (`resume.rs`, checkpoint
 schema v4) and never dispatches architect/researcher without a recorded,
 evidence-backed decision. Vectors stay strictly derived (aggregate-only
