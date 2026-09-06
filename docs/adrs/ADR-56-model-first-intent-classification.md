@@ -223,3 +223,43 @@ remain in force. Where this ADR is silent, ADR-55 governs.
 - Audit: two rows per classifier-eligible event — the router row keeps the
   pre-replacement route name, the classifier row keeps
   `rule_matched = "llm_classifier"` with the shared correlation id.
+
+## Amendment (2026-09-06) — the classifier may auto-grant at high confidence (issue #27, superseded in part)
+
+ADR-55 Addendum (Phase 2d) lands automatic intent gating: `route()` +
+classifier result is the decision, and high-confidence outcomes auto-grant.
+This amendment supersedes, **in part**, two §4/§8 invariants as finalized by
+2d:
+
+- **§4 "The classifier never grants"** — "a re-routed Execute still passes
+  through the confirmation dialog and grants machinery (arm-1 gate; the 2c §4
+  never-grant invariant is unchanged)": replaced by 2d §1 — a re-routed
+  `Execute` (or `Plan`/`Verify`/`Review`/`Diagnose`) at
+  `confidence >= classifier_confidence_threshold` **auto-grants** with the
+  standard `filesystem`/`git` scopes; no confirmation dialog.
+- **§8 "The model classifies, never authorizes"** — "it can never produce an
+  unconfirmed mutation": a high-confidence misclassification (>= 0.7) can now
+  produce an unconfirmed mutation. This is the deliberate, accepted trade of
+  issue #27 (the click added no information above the threshold) and is
+  bounded — never silent — by:
+
+  1. the negation fast path (§1a) runs before any model and is an absolute
+     read-only veto; `NEGATION_PHRASES` remains load-bearing;
+  2. `AskUser` (confidence `0.0`) never auto-grants — hard read-only (2d §2);
+  3. `AutoDeny` danger patterns and `Deny`-is-final run first in the policy
+     engine; `IntentAuthorized` only upgrades `RequireApproval`, never
+     overrides `Deny` (ADR-55 §Decision 2);
+  4. `Consequential` tier and unscoped actions are outside any blanket grant
+     (ADR-55 §Decision 2) — the auto-grant carries exactly the
+     `filesystem`/`git` scopes a confirmed `Apply` holds today;
+  5. spend cap + reserve-before-call (§7) gate the classifier call itself;
+  6. every auto decision is audited (`intent_router: auto_granted` +
+     `RoutingDecided`, 2d §5) — observable, not blocking.
+
+**Unchanged:** §1a/§1b fast paths and their precedence; §3 offline fallback
+chain (classifier off/unreachable → byte-identical deterministic chain with
+the AskUser modal standing — the modal survives only where no confidence
+exists, not as a click tax on confident routes); §4 threshold validation
+(`classifier_confidence_threshold >= LOW_CONFIDENCE_THRESHOLD` at config
+load; no `[threshold, 0.7)` band); §5 audit chain; §6 utterance-only prompt;
+§7 cost semantics.
