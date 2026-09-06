@@ -934,6 +934,28 @@ zero-confidence input that needs action lands as a read-only answer-only run
 with an audit row; the user escalates by rephrasing with clearer intent, not
 by clicking a modal.
 
+**2a. Negation trigger — task-level prohibition vs. constraint clause
+(2026-09-06)**
+
+`negation_override` fires only for a **task-level prohibition**: the matched
+phrase either stands alone (short input) or precedes any explicit action
+keyword (`verify`/`plan`/`review`/`diagnose`/`execute`). A requirement clause
+that appears *after* an explicit action request — "build X … do NOT read it as
+UTF-8", "… must not panic", "… don't touch the parser" — constrains the
+artifact the user asked for; it does not prohibit the action. It must not
+demote the run: it passes through as ordinary task text so the constraint
+reaches the executor in the prompt. Reassurance markers (`don't panic`,
+`don't worry`, `don't forget`) never fire the veto in any position.
+
+The hard read-only wall is unchanged **once fired**: negation still beats every
+model and rule (ADR-56 §1a), and a genuine prohibition ("don't do it",
+"just answer", "no changes", "don't build accord") vetoes exactly as before.
+This narrows only *when the veto triggers*; it cannot make a read-only request
+writable — a prohibition-first or prohibition-only message still grants
+nothing (§1 auto-grant composes with the wall unchanged). Standalone `"stop"`
+is deliberately **not** a corpus member — "stop the service and restart it"
+is an action request — and lands `AskUser` (0.0), still hard read-only (§2).
+
 ### 3. Plan→Execute auto-Apply — hash-verified binding
 
 When a plan-approved binding exists (1d §2; inserted post-run on a
@@ -969,3 +991,11 @@ AskUser paths keep their existing audit rows.
 - **A4** — `hmm` (`AskUser` `0.0`) → zero writes, zero grants.
 - **A5** — `plan: X` then `execute` (no `approve` click) → auto-`Apply` from
   the persisted `DesignDoc`, hash-verified.
+- **A6** — "Build a Rust CLI tool called hexview … do NOT read it as a UTF-8
+  string … must not panic … don't panic" → routes to a grantable outcome
+  (`Verify`/`Execute`, ≥ 0.7, non-negation), **not** `negation_override`; the
+  coordinator runs and writes files.
+- **A7** — A3 plus "don't do it", "just answer", "no changes" → `NegationOverride`
+  read-only, zero writes, zero grants. Standalone "stop" (deliberately not a
+  corpus member; "stop the service" is an action request) → `AskUser` 0.0,
+  also hard read-only (§2), zero writes, zero grants.

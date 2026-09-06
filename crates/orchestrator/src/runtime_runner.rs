@@ -400,6 +400,23 @@ async fn maintain_context_after_run(
     }
 }
 
+/// When a read-only run produced no model text, synthesize an explanation so
+/// the completion is never a silent "done". Returns `None` for action-capable
+/// outcomes (`Execute`/`Plan`), where an empty reply must not be masked.
+fn read_only_fallback_message(outcome: RequestedOutcome, route: &RouterRoute) -> Option<String> {
+    if matches!(outcome, RequestedOutcome::Execute | RequestedOutcome::Plan) {
+        return None;
+    }
+    let message = if matches!(route, RouterRoute::RuleHit { rule: "negation_override" }) {
+        "Read-only: this request was interpreted as a no-change/prohibition instruction, so \
+         nothing was modified. Rephrase with an explicit action (e.g. 'build X') to make changes."
+    } else {
+        "Read-only response — no files were changed. Rephrase with an explicit action \
+         (e.g. 'build X') to make changes."
+    };
+    Some(message.to_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_text_only(
     task: &AgentTask,
@@ -411,6 +428,11 @@ async fn run_text_only(
     bus: &EventBus,
     skills_section: &str,
     cancel: CancellationToken,
+    // ADR-55 Phase 2d §2a: what the caller already knows at the text-only
+    // branch, used to explain an empty read-only completion instead of
+    // completing silently.
+    effective_outcome: RequestedOutcome,
+    route: &RouterRoute,
 ) -> Result<AgentOutput, OrchestratorError> {
     // Text-only outcomes use the system prompt derived from the intent-gate
     // outcome (ADR-55 Phase 1e); append the enabled skills section (ADR-43) so
@@ -475,10 +497,18 @@ async fn run_text_only(
         cost_usd: provider.approximate_cost(tokens_in, tokens_out),
         latency_ms: started.elapsed().as_millis() as u64,
     };
+    // A read-only run that produced no model text must not complete as a
+    // silent "done": synthesize an explanation instead of an empty reply.
+    // Non-empty model text is never overridden ("done" stays "done").
+    let final_message = if text.trim().is_empty() {
+        read_only_fallback_message(effective_outcome, route).unwrap_or(text)
+    } else {
+        text
+    };
     Ok(AgentOutput {
         task_id: task.id,
         session_id: task.session_id,
-        final_message: text,
+        final_message,
         files_modified: Vec::new(),
         tool_call_count: 0,
         eval_result: None,
@@ -3270,6 +3300,7 @@ pub async fn run_shared_agent(
             transcript_recorder,
             action_required,
             effective_outcome,
+            &routing.route,
             plan_objective_hash,
             approved_context.as_ref(),
             &stage_tracker,
@@ -3436,6 +3467,10 @@ async fn run_multi_agent(
     transcript_recorder: TranscriptRecorderGuard,
     action_required: bool,
     effective_outcome: RequestedOutcome,
+    // ADR-55 Phase 2d §2a: the router route of this run, threaded to the
+    // text-only branch so an empty read-only completion can be explained
+    // (negation veto vs. any other read-only outcome).
+    routing_route: &RouterRoute,
     plan_objective_hash: String,
     approved_plan: Option<&ApprovedPlanContext>,
     stage_tracker: &Arc<Mutex<StageTracker>>,
@@ -3750,6 +3785,8 @@ async fn run_multi_agent(
             &services.bus,
             &services.skills.section(),
             req.cancel_token.clone(),
+            effective_outcome,
+            routing_route,
         )
         .await?;
         // The single text-only provider call succeeded — the run is complete.
@@ -6314,6 +6351,49 @@ mod runtime_runner_tests {
             assert!(
                 !task_action_required(outcome, true),
                 "{outcome:?} stays answer-only when read-only"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // read_only_fallback_message (ADR-55 Phase 2d §2a): a read-only run that
+    // produced no model text completes with an explanation, never a silent
+    // empty reply; action-capable outcomes are never masked.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn negation_route_gets_prohibition_specific_fallback() {
+        let note = read_only_fallback_message(
+            RequestedOutcome::Answer,
+            &RouterRoute::RuleHit { rule: "negation_override" },
+        )
+        .expect("negation route is read-only and must explain the empty reply");
+        assert!(note.contains("Read-only"), "note names the read-only state: {note}");
+        assert!(note.contains("Rephrase"), "note tells the user how to proceed: {note}");
+    }
+
+    #[test]
+    fn non_negation_read_only_outcomes_get_generic_fallback() {
+        for (outcome, route) in [
+            (RequestedOutcome::Answer, RouterRoute::AskUser),
+            (RequestedOutcome::Diagnose, RouterRoute::AskUser),
+            (RequestedOutcome::Review, RouterRoute::RuleHit { rule: "review_keyword" }),
+            (RequestedOutcome::Verify, RouterRoute::RuleHit { rule: "question" }),
+        ] {
+            let note = read_only_fallback_message(outcome, &route).unwrap_or_else(|| {
+                panic!("{outcome:?} via {route:?} is read-only and must explain the empty reply")
+            });
+            assert!(note.contains("Read-only"), "{outcome:?}: {note}");
+            assert!(note.contains("Rephrase"), "{outcome:?}: {note}");
+        }
+    }
+
+    #[test]
+    fn action_capable_outcomes_get_no_fallback() {
+        for outcome in [RequestedOutcome::Execute, RequestedOutcome::Plan] {
+            assert!(
+                read_only_fallback_message(outcome, &RouterRoute::AskUser).is_none(),
+                "{outcome:?} is action-capable; an empty reply must not be masked"
             );
         }
     }
