@@ -334,6 +334,15 @@ impl AgentRegistry {
         self.configs.get(id)
     }
 
+    /// Test-only: attach config metadata (roster rendering + output-mode
+    /// typing) to mock-registered agents. Coordinator unit tests register
+    /// mock agents directly and still need the roster/typing surface that
+    /// production derives from `custom_agents` configs.
+    #[cfg(test)]
+    pub(crate) fn attach_configs_for_test(&mut self, configs: HashMap<AgentId, CustomAgentConfig>) {
+        self.configs.extend(configs);
+    }
+
     /// List all registered agent IDs.
     pub fn ids(&self) -> Vec<AgentId> {
         self.agents.keys().cloned().collect()

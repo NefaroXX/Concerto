@@ -4090,7 +4090,11 @@ async fn run_multi_agent(
     // is the run's default provider. Without this the fallback ladder could
     // never resolve a serving pipe for unassigned roles, so tier 1 would be
     // skipped (or, worse, dispatch across pipes).
-    .with_default_provider_config_id(Some(ProviderFactory::config_id(default_provider_config)));
+    .with_default_provider_config_id(Some(ProviderFactory::config_id(default_provider_config)))
+    // ADR-35 amendment (2026-09-05): the run's policy engine gates every
+    // `call_specialist` decision exactly like any tool call — the same
+    // engine the shared executor enforces, never bypassed.
+    .with_policy_engine(intent_policy.clone());
     // Run-continuity Phase 1: the coordinator persists resumable checkpoints
     // (and reads them back on `continue`) through the session store. Without
     // this the store stays `None`, `persist_checkpoint` silently no-ops, and
