@@ -201,6 +201,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provides explicit user revocation.
 
 ### Changed
+- **The Coordinator decides (ADR-35 amendment 2026-09-05):** dispatch authority
+  moved from code to the Coordinator. A policy-gated `call_specialist`
+  coordinator tool dispatches registered specialists (roster context injected
+  into the Coordinator prompt; every dispatch appends an evidence-backed
+  whiteboard `Decision` event whose cited ids are validated at append); each
+  call materializes a chained `SubTask` node, so the graph records what the
+  Coordinator did. The compiled evidence scheduler is removed, the planner is
+  demoted to an optional `draft_plan` advisor (never materialized as roles),
+  and blueprint staffing equality/stage sequencing are no longer enforced.
+  Safety layers are unchanged: write gates, policy engine, VirtualFs, zero-work
+  guard, step caps/doom guard (the decision loop counts toward the run cap),
+  and the checkpoint/resume ledger.
 - Removed subjective capability-tier routing. Explicit provider/model pins are
   authoritative; unassigned routing uses objective tool support and budget data
 - Memory documentation and runtime contract now identify SQLite FTS5/vector
