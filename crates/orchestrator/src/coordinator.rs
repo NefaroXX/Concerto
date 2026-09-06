@@ -6477,6 +6477,9 @@ impl CoordinatorAgent {
         }];
         let mut summary = String::new();
         let mut advisory_plan: Option<PlanArtifact> = None;
+        // Whether the loop ran out of iterations (as opposed to stopping in
+        // prose) — only then is the structural-bound note warranted.
+        let mut hit_iteration_bound = true;
 
         for _iteration in 0..MAX_DISPATCH_ITERATIONS {
             if cancel.is_cancelled() {
@@ -6532,6 +6535,7 @@ impl CoordinatorAgent {
 
             if tool_calls.is_empty() {
                 summary = text;
+                hit_iteration_bound = false;
                 break;
             }
 
@@ -6625,7 +6629,7 @@ impl CoordinatorAgent {
             }
         }
 
-        if summary.is_empty() && !cancel.is_cancelled() {
+        if hit_iteration_bound && !cancel.is_cancelled() {
             // The structural bound ran out with tool calls still pending.
             // Finish in prose: the recorded dispatches stay, the loop stops.
             ledger.notes.push(format!(
@@ -14242,6 +14246,58 @@ mod tests {
             provider.turn_count(),
             2,
             "the resume runs the decision loop only — no planner re-entry"
+        );
+    }
+
+    /// Contract 1c (ADR-35 amendment §2 / ADR-52 amendment): the optional
+    /// `draft_plan` advisor is ADVISORY ONLY — the Coordinator may invoke it,
+    /// the draft comes back as context text, and NOTHING is materialized:
+    /// no SubTask roles, no dispatch, no graph nodes. The graph stays the
+    /// record of what the Coordinator actually did (here: nothing).
+    #[tokio::test]
+    async fn draft_plan_advisor_never_materializes_roles() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![ToolCall {
+                    id: "call-draft".to_string(),
+                    name: DRAFT_PLAN_TOOL.to_string(),
+                    arguments: serde_json::json!({}),
+                }]),
+                CoordinatorTurn::Text("I considered the draft; dispatching nothing yet".into()),
+            ],
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        // The advisor ran (the provider saw a second planning turn for the
+        // draft) but NO specialist was dispatched and the graph is empty.
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "the advisor dispatches nothing: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "no SubTask node may be materialized from the draft: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "an advisory-only turn completes without dispatching, got: {}",
+            output.final_message
+        );
+        // The advisor consumed planning-provider turns beyond the loop's own
+        // (loop turn 1 + the advisor's internal planner call), and the loop
+        // still stopped in prose after the tool result.
+        assert!(
+            provider.turn_count() >= 2,
+            "the advisor runs its own planning turn: {}",
+            provider.turn_count()
         );
     }
 
