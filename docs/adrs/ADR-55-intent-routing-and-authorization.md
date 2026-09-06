@@ -948,11 +948,13 @@ reaches the executor in the prompt. Reassurance markers (`don't panic`,
 `don't worry`, `don't forget`) never fire the veto in any position.
 
 The hard read-only wall is unchanged **once fired**: negation still beats every
-model and rule (ADR-56 §1a), and a genuine prohibition ("stop", "don't do it",
+model and rule (ADR-56 §1a), and a genuine prohibition ("don't do it",
 "just answer", "no changes", "don't build accord") vetoes exactly as before.
 This narrows only *when the veto triggers*; it cannot make a read-only request
 writable — a prohibition-first or prohibition-only message still grants
-nothing (§1 auto-grant composes with the wall unchanged).
+nothing (§1 auto-grant composes with the wall unchanged). Standalone `"stop"`
+is deliberately **not** a corpus member — "stop the service and restart it"
+is an action request — and lands `AskUser` (0.0), still hard read-only (§2).
 
 ### 3. Plan→Execute auto-Apply — hash-verified binding
 
@@ -993,5 +995,7 @@ AskUser paths keep their existing audit rows.
   string … must not panic … don't panic" → routes to a grantable outcome
   (`Verify`/`Execute`, ≥ 0.7, non-negation), **not** `negation_override`; the
   coordinator runs and writes files.
-- **A7** — A3 plus "stop", "don't do it", "just answer" → `NegationOverride`
-  read-only, zero writes, zero grants.
+- **A7** — A3 plus "don't do it", "just answer", "no changes" → `NegationOverride`
+  read-only, zero writes, zero grants. Standalone "stop" (deliberately not a
+  corpus member; "stop the service" is an action request) → `AskUser` 0.0,
+  also hard read-only (§2), zero writes, zero grants.
