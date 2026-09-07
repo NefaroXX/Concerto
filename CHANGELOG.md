@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Universal text-fallback tool driver (ADR-66):** harness-level
+  prompt-based tool calling (schema injection, strict parser,
+  repair-by-reprompt, bounded attempts) engages automatically for providers
+  without native function calling, so any chat model can drive agent tools;
+  native preferred, fallback labeled in transcript + audit.
+
+### Fixed
+- **Negation veto false-positive (`concerto-core`):** the read-only
+
 - **Evidence spine (ADR-65):** multi-agent runs are grounded in a single
   append-only whiteboard evidence chain — runtime-written tool facts with agent
   attribution, a deterministic workspace-snapshot readiness barrier, safe read
@@ -116,6 +125,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracking is enabled
 
 ### Fixed
+- **Silent tool-call degradation removed (ADR-66):** tool-requiring runs
+  either drive tools or fail loud naming provider/model/capability — never
+  silent text. Per-model capability resolution (config override > advertised
+  flags > family table > provider default) with refusal before spend; the Zen
+  Responses path and plugin providers refuse tool-carrying requests instead
+  of dropping them (plugins gated to AnswerOnly); `muse-spark-*` no longer
+  misroutes to the Muse/Responses dialect; Google weak models gain the
+  loose-schema adapter path.
 - **Negation veto false-positive (`concerto-core`):** the read-only
   `negation_override` veto now fires only for a **task-level prohibition** — a
   negation-corpus match that stands alone or precedes every explicit action
