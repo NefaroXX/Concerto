@@ -97,6 +97,11 @@ pub struct GenericSpecialistAgent {
     /// verbatim into every prompt this agent builds; empty when skills are
     /// disabled.
     skills_section: String,
+    /// Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C),
+    /// threaded from the runtime's resolved shell settings. Injected into
+    /// every prompt this agent builds; empty when no card was provided
+    /// (manual/test constructions).
+    environment_card: String,
     /// ADR-65 §3: tool-evidence writer. When `Some`, every completed tool
     /// command this agent executes is recorded as a `ToolExecuted` whiteboard
     /// event attributed to this agent (its `id`) — fail-soft, never affects
@@ -140,6 +145,7 @@ impl GenericSpecialistAgent {
             eval: None,
             eval_mode: false,
             skills_section: String::new(),
+            environment_card: String::new(),
             tool_facts: None,
         }
     }
@@ -171,6 +177,15 @@ impl GenericSpecialistAgent {
     /// string to disable injection.
     pub fn with_skills_section(mut self, skills_section: &str) -> Self {
         self.skills_section = skills_section.to_string();
+        self
+    }
+
+    /// Attach the pre-rendered OS/shell identity card (custom-ai-shell plan,
+    /// Phase C), injected into every prompt this agent builds. Pass an empty
+    /// string to disable injection (manual/test constructions without resolved
+    /// shell settings).
+    pub fn with_environment_card(mut self, environment_card: &str) -> Self {
+        self.environment_card = environment_card.to_string();
         self
     }
 
@@ -292,6 +307,14 @@ impl GenericSpecialistAgent {
         // ADR-43 Task 4: session skills apply to every specialist prompt.
         if !self.skills_section.is_empty() {
             prompt.push_str(&self.skills_section);
+            prompt.push_str("\n\n");
+        }
+        // OS/shell identity card (custom-ai-shell plan, Phase C): specialists
+        // execute shell tools, so they must know the host OS and the selected
+        // agent shell's dialect. Only appended when the runtime supplied a
+        // card — manual/test constructions without one are unchanged.
+        if !self.environment_card.is_empty() {
+            prompt.push_str(&self.environment_card);
             prompt.push_str("\n\n");
         }
         prompt.push_str(&task.description);
@@ -2679,6 +2702,76 @@ mod tests {
         };
         let prompt = agent.build_prompt(&task, &ctx()).await;
         assert!(!prompt.contains("## Skills"), "unexpected skills section: {prompt}");
+        assert!(prompt.contains("Implement the feature"));
+    }
+
+    #[tokio::test]
+    async fn build_prompt_injects_environment_card() {
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            Arc::new(MockProvider::default()),
+            None,
+            EventBus::new(1024),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        )
+        .with_skills_section("## Skills\nWrite tests first.")
+        .with_environment_card(
+            "## Environment\n- OS: linux (x86_64)\n- Agent shell: OS default (`bash`)",
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Implement the feature".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let prompt = agent.build_prompt(&task, &ctx()).await;
+        assert!(prompt.contains("## Environment"), "identity card missing: {prompt}");
+        // Card comes after skills, before the task description.
+        let skills = prompt.find("## Skills").unwrap();
+        let card = prompt.find("## Environment").unwrap();
+        let task_text = prompt.find("Implement the feature").unwrap();
+        assert!(skills < card && card < task_text, "card ordering wrong: {prompt}");
+    }
+
+    #[tokio::test]
+    async fn build_prompt_omits_environment_card_when_empty() {
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            Arc::new(MockProvider::default()),
+            None,
+            EventBus::new(1024),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Implement the feature".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let prompt = agent.build_prompt(&task, &ctx()).await;
+        assert!(!prompt.contains("## Environment"), "unexpected identity card: {prompt}");
         assert!(prompt.contains("Implement the feature"));
     }
 
