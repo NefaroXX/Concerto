@@ -1071,20 +1071,23 @@ fn resolve_provider(
     selected: Option<String>,
     selected_model: Option<&str>,
     plugin_providers: &std::collections::HashMap<String, Arc<dyn LlmProvider>>,
-) -> Result<Arc<dyn LlmProvider>, OrchestratorError> {
+) -> Result<(Arc<dyn LlmProvider>, Option<String>), OrchestratorError> {
     let creds = CredentialStore::new();
     let build = |provider: &concerto_config::ProviderConfig| {
         let mut provider = provider.clone();
         if let Some(model) = selected_model.filter(|model| !model.trim().is_empty()) {
             provider.model = model.to_string();
         }
-        ProviderFactory::build(&provider, &creds)
+        // Carry the resolved config id so callers can consult the matching
+        // `[model_profiles.<id>]` overrides (ADR-66 §3 capability override).
+        let config_id = ProviderFactory::config_id(&provider);
+        ProviderFactory::build(&provider, &creds).map(|built| (built, Some(config_id)))
     };
 
     // 1. Preferred ID from UI — look up the provider by id
     if let Some(id) = selected.as_deref() {
         if let Some(provider) = plugin_providers.get(id) {
-            return Ok(provider.clone());
+            return Ok((provider.clone(), None));
         }
         if let Some(ms) = &config.model_settings {
             if let Some(p) = ms.providers.iter().find(|p| p.id == id) {
@@ -1124,26 +1127,32 @@ fn resolve_provider(
 
     if config.primary_provider.as_deref() == Some("plugin") || config.primary_provider.is_none() {
         if let Some(provider) = plugin_providers.values().next() {
-            return Ok(provider.clone());
+            return Ok((provider.clone(), None));
         }
     }
 
     // 6. Env‑var fallbacks
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         tracing::info!("no provider config; using ANTHROPIC_API_KEY env fallback");
-        return Ok(Arc::new(concerto_providers::anthropic::AnthropicProvider::new(
-            key,
-            "claude-sonnet-4-6".to_string(),
-            15,
-        )));
+        return Ok((
+            Arc::new(concerto_providers::anthropic::AnthropicProvider::new(
+                key,
+                "claude-sonnet-4-6".to_string(),
+                15,
+            )),
+            None,
+        ));
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         tracing::info!("no provider config; using OPENAI_API_KEY env fallback");
-        return Ok(Arc::new(concerto_providers::openai::OpenAiProvider::new(
-            key,
-            "gpt-4o".to_string(),
-            15,
-        )));
+        return Ok((
+            Arc::new(concerto_providers::openai::OpenAiProvider::new(
+                key,
+                "gpt-4o".to_string(),
+                15,
+            )),
+            None,
+        ));
     }
 
     // 7. No provider configured — hard error, no mock fallback
@@ -1544,21 +1553,40 @@ fn build_tool_registry(
 /// Delegates to the existing [`resolve_model_id`] and [`resolve_provider`]
 /// functions. Returns both values so callers need not duplicate the resolution
 /// logic.
+/// A fully-resolved run model: the built provider, the effective model name,
+/// and the offering provider-config id (`None` for plugin-backed and
+/// env-fallback providers).
+type ResolvedRunModel = (Arc<dyn LlmProvider>, String, Option<String>);
+
 fn resolve_provider_and_model(
     config: &AppConfig,
     selected_provider_id: Option<String>,
     selected_model: Option<String>,
     plugin_providers: &HashMap<String, Arc<dyn LlmProvider>>,
-) -> Result<(Arc<dyn LlmProvider>, String), OrchestratorError> {
+) -> Result<ResolvedRunModel, OrchestratorError> {
     let model =
         resolve_model_id(config, selected_provider_id.as_deref(), selected_model.as_deref());
-    let provider = resolve_provider(
+    let (provider, provider_config_id) = resolve_provider(
         config,
         selected_provider_id,
         selected_model.as_deref(),
         plugin_providers,
     )?;
-    Ok((provider, model))
+    Ok((provider, model, provider_config_id))
+}
+
+/// The `supports_tool_calling` explicit-config override for the resolved
+/// provider configuration, if one is set (ADR-66 §3 precedence level 1).
+///
+/// `provider_config_id` is `None` for plugin-backed and env-fallback
+/// providers, which have no `[model_profiles.<id>]` entry to consult.
+fn tool_support_override(config: &AppConfig, provider_config_id: Option<&str>) -> Option<bool> {
+    let settings = config.model_settings.as_ref()?;
+    let id = provider_config_id?;
+    settings
+        .model_profile_overrides
+        .get(id)
+        .and_then(|override_config| override_config.supports_tool_calling)
 }
 
 /// Create the policy engine, audit log, spend tracker, and tool executor.
@@ -2702,7 +2730,7 @@ pub async fn run_shared_agent(
     let registry = Arc::new(registry);
 
     // 3. Resolve provider and final effective model
-    let (provider, model) = resolve_provider_and_model(
+    let (provider, model, provider_config_id) = resolve_provider_and_model(
         &services.config,
         req.selected_provider_id.clone(),
         req.selected_model.clone(),
@@ -3232,6 +3260,51 @@ pub async fn run_shared_agent(
     // enforced by the gate itself. The gate is always on — there is no legacy
     // mode picker.
     let action_required = task_action_required(effective_outcome, gate_read_only);
+
+    // ADR-66 §2(a) fail-fast selection gate: a tool-requiring run (Execute,
+    // or Plan — which runs the full coordinator at planning-only depth)
+    // resolved onto a provider/model without native tool support is a hard
+    // error BEFORE any agent spend. The refusal names provider, model, and
+    // the missing capability, and is audited (`capability_gate` / Refused)
+    // so it is observable — never a silent text-only run. The resolution
+    // follows the ADR-66 §3 precedence: explicit config override first,
+    // then the built-in family table, then the provider default.
+    if action_required || effective_outcome == RequestedOutcome::Plan {
+        let override_flag = tool_support_override(&services.config, provider_config_id.as_deref());
+        if let Err(refusal) = concerto_providers::capability::require_tool_support(
+            provider.provider_name(),
+            &model,
+            override_flag,
+            None,
+        ) {
+            let ProviderError::CapabilityRefused {
+                provider: refused_provider,
+                model: refused_model,
+                capability,
+            } = &refusal
+            else {
+                unreachable!("require_tool_support only fails with CapabilityRefused");
+            };
+            tracing::error!(
+                provider = %refused_provider,
+                model = %refused_model,
+                capability = %capability,
+                "tool-requiring task resolved onto a model without tool support (ADR-66)"
+            );
+            executor
+                .record_capability_refusal(
+                    session_id,
+                    Ulid::new(),
+                    refused_provider,
+                    refused_model,
+                    capability,
+                    "selection",
+                    req.cancel_token.clone(),
+                )
+                .await;
+            return Err(OrchestratorError::Provider(refusal));
+        }
+    }
     // ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
     // not the approval phrase. `req.input` is still recorded in the transcript
     // and audit; only the task the agents execute is replaced. ADR-60 D7: a
@@ -4993,6 +5066,76 @@ mod runtime_runner_tests {
         // A classifier's correlation id is shared unchanged with the router row.
         let shared = Ulid::new();
         assert_eq!(router_row_correlation_id(Some(shared)), shared);
+    }
+
+    /// ADR-66 §3: the selection-time tool-capability gate refuses a
+    /// tool-requiring run resolved onto a model without tool support (the
+    /// built-in family table: Zen-served genuine Muse models), passes for
+    /// near-misses and defaults, and honors the explicit-config override
+    /// (precedence level 1).
+    #[test]
+    fn selection_gate_refuses_tool_requiring_runs_without_tool_support() {
+        // Genuine Muse model on Zen → refused, naming everything.
+        let error =
+            concerto_providers::capability::require_tool_support("opencode", "muse-v2", None, None)
+                .expect_err("Muse models have no tool support");
+        match error {
+            ProviderError::CapabilityRefused { ref provider, ref model, ref capability } => {
+                assert_eq!(provider, "opencode");
+                assert_eq!(model, "muse-v2");
+                assert_eq!(capability, "tool_calling");
+            }
+            other => panic!("expected CapabilityRefused, got: {other:?}"),
+        }
+        // Near-miss keeps the provider default → allowed.
+        assert!(concerto_providers::capability::require_tool_support(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            None,
+            None,
+        )
+        .is_ok());
+        // The refusal is permanent: retrying cannot add the capability.
+        assert!(!error.is_transient());
+    }
+
+    /// ADR-66 §3 precedence level 1: `tool_support_override` reads the
+    /// `[model_profiles.<id>]` explicit override for the resolved provider
+    /// config only.
+    #[test]
+    fn tool_support_override_reads_the_resolved_config_override() {
+        let mut config = AppConfig::default();
+        assert_eq!(tool_support_override(&config, None), None, "no config id → no override");
+
+        let settings = concerto_config::ModelSettings {
+            providers: vec![concerto_config::ProviderConfig {
+                id: "zen-muse".into(),
+                provider: "opencode".into(),
+                model: "muse-v2".into(),
+                ..Default::default()
+            }],
+            model_profile_overrides: std::iter::once((
+                "zen-muse".to_string(),
+                concerto_config::ModelProfileOverride {
+                    supports_tool_calling: Some(true),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        config.model_settings = Some(settings);
+
+        assert_eq!(
+            tool_support_override(&config, Some("zen-muse")),
+            Some(true),
+            "explicit override must be surfaced for the resolved config"
+        );
+        assert_eq!(
+            tool_support_override(&config, Some("unrelated-id")),
+            None,
+            "unrelated configs have no override"
+        );
     }
 
     /// ADR-60 D7 (interrupt-safe resume): the resume scope check must use the

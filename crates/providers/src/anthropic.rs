@@ -270,7 +270,7 @@ impl LlmProvider for AnthropicProvider {
                         let id = v["id"].as_str()?.to_string();
                         let name =
                             v["display_name"].as_str().or(v["id"].as_str()).map(String::from);
-                        Some(ModelInfo { id, name, owned_by: None })
+                        Some(ModelInfo { id, name, owned_by: None, supports_tool_calling: None })
                     })
                     .collect::<Vec<_>>()
             })

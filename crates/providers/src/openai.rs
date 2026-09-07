@@ -386,7 +386,12 @@ impl LlmProvider for OpenAiProvider {
                     .filter_map(|v| {
                         let id = v["id"].as_str()?.to_string();
                         let owned_by = v["owned_by"].as_str().map(String::from);
-                        Some(ModelInfo { id: id.clone(), name: Some(id), owned_by })
+                        Some(ModelInfo {
+                            id: id.clone(),
+                            name: Some(id),
+                            owned_by,
+                            supports_tool_calling: None,
+                        })
                     })
                     .collect::<Vec<_>>()
             })

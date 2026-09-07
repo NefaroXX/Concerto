@@ -86,6 +86,56 @@ pub trait ToolExecutionBackend: Send + Sync {
         _cancel: CancellationToken,
     ) {
     }
+
+    /// ADR-66: persist a capability-refusal audit row (`capability_gate`).
+    ///
+    /// The default is a warn-log no-op mirroring `record_served_read_audit`:
+    /// the supervised path's audit trail is written supervisor-side
+    /// (ADR-60 D4/D5) and never records rows through this seam.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_capability_refusal(
+        &self,
+        _session_id: Ulid,
+        _correlation_id: Ulid,
+        provider: &str,
+        model: &str,
+        capability: &str,
+        seam: &str,
+        _cancel: CancellationToken,
+    ) {
+        tracing::warn!(
+            provider,
+            model,
+            capability,
+            seam,
+            "capability refusal (supervised backend: audit row written supervisor-side)"
+        );
+    }
+
+    /// ADR-66 §4: persist a text-fallback driver audit row (`tool_driver`).
+    ///
+    /// Default warn-log no-op, mirroring `record_capability_refusal`.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_tool_driver_event(
+        &self,
+        _session_id: Ulid,
+        _correlation_id: Ulid,
+        provider: &str,
+        model: &str,
+        event: &str,
+        verdict: &str,
+        detail: &str,
+        _cancel: CancellationToken,
+    ) {
+        tracing::warn!(
+            provider,
+            model,
+            event,
+            verdict,
+            detail,
+            "tool driver event (supervised backend: audit row written supervisor-side)"
+        );
+    }
 }
 
 /// The local (single-process) backend: plain delegation to the concrete
@@ -147,6 +197,54 @@ impl ToolExecutionBackend for ToolExecutor {
         cancel: CancellationToken,
     ) {
         ToolExecutor::record_served_read_audit(self, tool_name, input, path, session, cancel).await;
+    }
+
+    async fn record_capability_refusal(
+        &self,
+        session_id: Ulid,
+        correlation_id: Ulid,
+        provider: &str,
+        model: &str,
+        capability: &str,
+        seam: &str,
+        cancel: CancellationToken,
+    ) {
+        ToolExecutor::record_capability_refusal(
+            self,
+            session_id,
+            correlation_id,
+            provider,
+            model,
+            capability,
+            seam,
+            cancel,
+        )
+        .await;
+    }
+
+    async fn record_tool_driver_event(
+        &self,
+        session_id: Ulid,
+        correlation_id: Ulid,
+        provider: &str,
+        model: &str,
+        event: &str,
+        verdict: &str,
+        detail: &str,
+        cancel: CancellationToken,
+    ) {
+        ToolExecutor::record_tool_driver_event(
+            self,
+            session_id,
+            correlation_id,
+            provider,
+            model,
+            event,
+            verdict,
+            detail,
+            cancel,
+        )
+        .await;
     }
 }
 

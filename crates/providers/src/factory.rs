@@ -169,9 +169,14 @@ impl ProviderFactory {
                 Arc::new(provider)
             }
             "google" => {
-                // Google/Gemini has no loose-schema path yet; the
-                // `tool_schema_mode` dial is tolerated but inert for it.
-                Arc::new(GoogleProvider::new(key, config.model.clone(), config.timeout_seconds))
+                // ADR-66 §4 family: the Gemini connector now carries the
+                // loose-schema path for weak models (same schema_loose
+                // family as OpenAI/Ollama), so the `tool_schema_mode` dial
+                // is live here.
+                Arc::new(
+                    GoogleProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config)),
+                )
             }
             "openrouter" => {
                 let mut provider =
@@ -286,7 +291,21 @@ impl ProviderFactory {
                     cost_per_1k_tokens,
                     avg_latency_ms,
                     context_window: 8192,
-                    supports_tool_calling: true,
+                    // ADR-66 §3: per-model capability resolution. The
+                    // explicit-config override (level 1) is applied below
+                    // from `model_profile_overrides`, so it is passed as
+                    // `None` here to keep the override application at its
+                    // existing site. Advertised `list_models` flags (level
+                    // 2) are a runtime listing concept — the cached model
+                    // catalog carries names only, so the profile path
+                    // resolves via family table (level 3) and provider
+                    // default (level 4).
+                    supports_tool_calling: crate::capability::resolve_tool_support(
+                        &config.provider,
+                        &config.model,
+                        None,
+                        None,
+                    ),
                     base_url: config.api_base.clone(),
                     description: None,
                 };
@@ -816,5 +835,83 @@ mod tests {
         let settings = ModelSettings::default();
         let profiles = ProviderFactory::build_profiles(&settings);
         assert!(profiles.is_empty(), "empty settings should produce no profiles");
+    }
+
+    /// ADR-66 §3: `build_profiles` resolves `supports_tool_calling` per
+    /// model — a Zen-served genuine Muse model (Responses dialect, no tool
+    /// declarations) resolves to `false`, while the `muse-spark-*`
+    /// near-miss keeps the provider default (`true`, OpenAI-compatible
+    /// dialect with native tools).
+    #[test]
+    fn build_profiles_resolves_tool_support_per_model() {
+        let settings = ModelSettings {
+            providers: vec![
+                ProviderConfig {
+                    id: "zen-muse".into(),
+                    provider: "opencode".into(),
+                    model: "muse-v2".into(),
+                    ..Default::default()
+                },
+                ProviderConfig {
+                    id: "zen-spark".into(),
+                    provider: "opencode".into(),
+                    model: "muse-spark-1.2-contributor-free".into(),
+                    ..Default::default()
+                },
+                ProviderConfig {
+                    id: "openai-main".into(),
+                    provider: "openai".into(),
+                    model: "gpt-4o".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        let by_id = |id: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile.provider_config_id == id)
+                .unwrap_or_else(|| panic!("missing profile {id}"))
+        };
+        assert!(!by_id("zen-muse").supports_tool_calling, "genuine Muse has no tool support");
+        assert!(
+            by_id("zen-spark").supports_tool_calling,
+            "muse-spark near-miss keeps the OpenAI-compatible default"
+        );
+        assert!(by_id("openai-main").supports_tool_calling);
+    }
+
+    /// ADR-66 §3 precedence level 1: the explicit-config override wins over
+    /// the per-model resolution in `build_profiles`.
+    #[test]
+    fn build_profiles_explicit_override_wins() {
+        let mut settings = ModelSettings {
+            providers: vec![ProviderConfig {
+                id: "zen-muse".into(),
+                provider: "opencode".into(),
+                model: "muse-v2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        settings.model_profile_overrides.insert(
+            "zen-muse".into(),
+            concerto_config::ModelProfileOverride {
+                supports_tool_calling: Some(true),
+                ..Default::default()
+            },
+        );
+        let profiles = ProviderFactory::build_profiles(&settings);
+        assert!(profiles[0].supports_tool_calling, "explicit override must beat the family table");
+    }
+
+    /// Plugin-backed provider configs (the plugins crate registers
+    /// `plugin:<id>` providers outside `ProviderFactory::build`, but
+    /// profiles may still be built for them) resolve to no tool support via
+    /// the provider default (decision (a): gated to AnswerOnly tasks).
+    #[test]
+    fn capability_resolution_plugin_backed_defaults_false() {
+        assert!(!crate::capability::resolve_tool_support("plugin:my-llm", "any-model", None, None));
     }
 }

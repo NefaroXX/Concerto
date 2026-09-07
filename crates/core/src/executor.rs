@@ -492,6 +492,126 @@ impl ToolExecutor {
         }
     }
 
+    /// Persist an ADR-66 capability refusal as a distinct audit entry.
+    ///
+    /// A capability refusal is not tied to any tool call, so `tool_name` is
+    /// the synthetic `"capability_gate"` and `input_hash` is empty. The row
+    /// is observable and diagnosable (ADR-66 consequences: "every capability
+    /// refusal writes audit rows — never silent"): `verdict` is `Refused`,
+    /// `rule_matched` carries the refusing seam (`selection` before any
+    /// spend, or `request_build` at the wire-path guard), and `user_response`
+    /// holds the JSON envelope `{provider, model, capability, seam}`. The
+    /// ADR-28 §6 execution fields stay `None`: there is no command behind a
+    /// capability refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_capability_refusal(
+        &self,
+        session_id: crate::ids::Ulid,
+        correlation_id: crate::ids::Ulid,
+        provider: &str,
+        model: &str,
+        capability: &str,
+        seam: &str,
+        cancel: CancellationToken,
+    ) {
+        let entry = AuditEntry {
+            tool_name: "capability_gate".to_owned(),
+            verdict: "Refused".to_owned(),
+            input_hash: String::new(),
+            session_id,
+            correlation_id,
+            timestamp: OffsetDateTime::now_utc(),
+            user_response: Some(
+                serde_json::json!({
+                    "provider": provider,
+                    "model": model,
+                    "capability": capability,
+                    "seam": seam,
+                })
+                .to_string(),
+            ),
+            rule_matched: Some(seam.to_owned()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+        };
+        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
+            tracing::error!(%error, "capability-refusal audit write failed");
+        } else {
+            tracing::debug!(provider, model, capability, seam, "capability refusal recorded");
+        }
+    }
+
+    /// Persist an ADR-66 §4 text-fallback driver event as a distinct audit
+    /// entry.
+    ///
+    /// Fallback engagements must stay observable (ADR-66: "fallback turns
+    /// are labeled in the transcript and audit — `tool_driver: fallback`").
+    /// `tool_name` is the synthetic `"tool_driver"`, `verdict` is
+    /// `"fallback"` (an engagement or a repair turn) or `"exhausted"` (the
+    /// bounded-repair budget ran out — the loud terminal state),
+    /// `rule_matched` carries the event (`engage` | `repair` |
+    /// `exhausted`), and `user_response` holds the JSON envelope
+    /// `{provider, model, event, detail}`. The ADR-28 §6 execution fields
+    /// stay `None`: there is no command behind a driver event.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_tool_driver_event(
+        &self,
+        session_id: crate::ids::Ulid,
+        correlation_id: crate::ids::Ulid,
+        provider: &str,
+        model: &str,
+        event: &str,
+        verdict: &str,
+        detail: &str,
+        cancel: CancellationToken,
+    ) {
+        let entry = AuditEntry {
+            tool_name: "tool_driver".to_owned(),
+            verdict: verdict.to_owned(),
+            input_hash: String::new(),
+            session_id,
+            correlation_id,
+            timestamp: OffsetDateTime::now_utc(),
+            user_response: Some(
+                serde_json::json!({
+                    "provider": provider,
+                    "model": model,
+                    "event": event,
+                    "detail": detail,
+                })
+                .to_string(),
+            ),
+            rule_matched: Some(event.to_owned()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+        };
+        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
+            tracing::error!(%error, "tool-driver audit write failed");
+        } else {
+            tracing::debug!(provider, model, event, verdict, "tool driver event recorded");
+        }
+    }
+
     /// Look up `tool_name`, evaluate policy, and — if allowed — execute.
     pub async fn execute(
         &self,

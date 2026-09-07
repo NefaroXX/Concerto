@@ -14,11 +14,53 @@ pub struct GoogleProvider {
     model: String,
     timeout_secs: u64,
     dialect: GeminiChatDialect,
+    /// Tool-schema presentation tier (adaptive tool schemas, ADR-66 §4
+    /// family). Weak Gemini models stall on strict nested JSON-Schema
+    /// parameters, so the loose tier flattens nested properties to
+    /// dot-notation leaves, enriches enums, and appends argument examples;
+    /// emitted `functionCall.args` are re-nested on the way back. `Auto`
+    /// (the default) keeps every non-weak model on the verbatim strict
+    /// schema. See `crate::adapters::schema_loose`.
+    tool_schema_mode: concerto_config::ToolSchemaMode,
 }
 
 impl GoogleProvider {
     pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
-        Self { api_key, model, timeout_secs, dialect: GeminiChatDialect }
+        Self {
+            api_key,
+            model,
+            timeout_secs,
+            dialect: GeminiChatDialect,
+            tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+        }
+    }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas).
+    ///
+    /// Applies to the Gemini wire path: when the resolved model matches the
+    /// loose tier, tool definitions are rewritten in place before the
+    /// dialect renders the body and emitted function-call arguments are
+    /// re-nested from dot-notation back into the tools' original nested
+    /// shape. Strict models are untouched. See `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.tool_schema_mode = mode;
+        self
+    }
+
+    /// Rewrite the request's tool definitions in place when the loose tier
+    /// is active for `model`. Returns whether adaptation happened so the
+    /// stream parser can re-nest emitted arguments.
+    fn adapt_tools_for(&self, request: &mut CompletionRequest, model: &str) -> bool {
+        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+            self.tool_schema_mode,
+            model,
+        );
+        if tool_adapted {
+            if let Some(tools) = request.tools.as_mut() {
+                crate::adapters::schema_loose::adapt_tool_definitions(tools);
+            }
+        }
+        tool_adapted
     }
 }
 
@@ -90,7 +132,7 @@ impl LlmProvider for GoogleProvider {
                         let id = full_name.strip_prefix("models/").unwrap_or(full_name).to_string();
                         let name = v["displayName"].as_str().map(String::from);
                         let owned_by = Some("google".to_string());
-                        Some(ModelInfo { id, name, owned_by })
+                        Some(ModelInfo { id, name, owned_by, supports_tool_calling: None })
                     })
                     .collect::<Vec<_>>()
             })
@@ -118,6 +160,14 @@ impl LlmProvider for GoogleProvider {
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
             model, self.api_key
         );
+
+        // Adaptive tool schemas (weak-model tier, ADR-66 §4 family): when
+        // the resolved model matches the loose tier, rewrite the request's
+        // tool definitions in place before the dialect renders the body.
+        // Strict models are untouched — their wire output stays
+        // byte-identical.
+        let mut request = request;
+        let tool_adapted = self.adapt_tools_for(&mut request, &model);
 
         // Request-body rendering now lives in `crate::adapters::google`
         // (`GeminiChatDialect`); stream parsing remains here in the connector.
@@ -219,7 +269,16 @@ impl LlmProvider for GoogleProvider {
                                                             .get("name")
                                                             .and_then(|v| v.as_str())
                                                             .unwrap_or("unknown");
-                                                        let args = function_call_args(fc);
+                                                        let mut args = function_call_args(fc);
+                                                        // Adaptive tool schemas: re-nest
+                                                        // dot-notation arguments from
+                                                        // loose-schema streams before the
+                                                        // executor or the tool-call guard
+                                                        // validates against the nested
+                                                        // schema.
+                                                        if tool_adapted {
+                                                            crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+                                                        }
                                                         // Gemini does not provide a unique call ID,
                                                         // so we generate sequential IDs per stream.
                                                         fc_counter += 1;
@@ -299,6 +358,7 @@ impl LlmProvider for GoogleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use concerto_core::types::ToolDefinition;
 
     #[test]
     fn google_provider_new_sets_fields() {
@@ -396,5 +456,88 @@ mod tests {
         // Well-formed object args -> unchanged.
         let fc = serde_json::json!({"name": "shell", "args": {"command": "ls"}});
         assert_eq!(function_call_args(&fc), serde_json::json!({"command": "ls"}));
+    }
+
+    /// ADR-66 §4 family: the loose tier flattens nested properties for the
+    /// active tier and the adapted arguments re-nest into the tools'
+    /// original nested shape. (Note: every `gemini-*` name contains the
+    /// weak-tier "mini" hint — "ge**mini**" — so under `Auto` all Gemini
+    /// models adapt; the explicit dials pin the tier for this test.)
+    #[test]
+    fn google_loose_schema_tier_resolves_and_round_trips() {
+        let strict_provider = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Strict);
+        let loose_provider = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Loose);
+
+        let mut request = CompletionRequest {
+            tools: Some(vec![ToolDefinition {
+                name: "runner".into(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "config": {
+                            "type": "object",
+                            "properties": {"mode": {"type": "string"}},
+                            "required": ["mode"]
+                        }
+                    },
+                    "required": ["config"]
+                }),
+            }]),
+            ..Default::default()
+        };
+
+        // Strict dial: request untouched.
+        assert!(!strict_provider.adapt_tools_for(&mut request, "gemini-2.0-flash"));
+        assert!(
+            request
+                .tools
+                .as_ref()
+                .and_then(|t| t.first())
+                .is_some_and(|tool| tool.parameters["properties"].get("config").is_some()),
+            "strict model keeps the nested schema"
+        );
+
+        // Loose tier: flattens the nested property.
+        assert!(loose_provider.adapt_tools_for(&mut request, "gemini-2.0-flash"));
+        let tool = request.tools.as_ref().and_then(|t| t.first()).expect("tool present");
+        assert!(
+            tool.parameters["properties"].get("config.mode").is_some(),
+            "loose tier flattens nested properties: {}",
+            tool.parameters
+        );
+
+        // The wire round trip: dotted arguments emitted by the weak model
+        // re-nest into the original nested shape.
+        let fc = serde_json::json!({"name": "runner", "args": {"config.mode": "fast"}});
+        let mut args = function_call_args(&fc);
+        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+        assert_eq!(args, serde_json::json!({"config": {"mode": "fast"}}));
+    }
+
+    /// Explicit `Strict` dials win over the weak-model name heuristic.
+    #[test]
+    fn google_strict_dial_disables_adaptation() {
+        let strict = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Strict);
+        let loose = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Loose);
+        let mut request = CompletionRequest {
+            tools: Some(vec![ToolDefinition {
+                name: "t".into(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "opts": {"type": "object", "properties": {"x": {"type": "string"}}}
+                    }
+                }),
+            }]),
+            ..Default::default()
+        };
+        assert!(!strict.adapt_tools_for(&mut request, "mimo-v2.5-free"));
+        assert!(loose.adapt_tools_for(&mut request, "gemini-2.0-flash"));
     }
 }

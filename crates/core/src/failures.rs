@@ -270,6 +270,15 @@ impl From<OrchestratorError> for ClassifiedFailure {
                     audience = FailureAudience::User;
                     code = "PROVIDER_ERROR".to_string();
                     user_message = format!("The model provider reported an error: {message}");
+                }
+                ProviderError::CapabilityRefused { provider, model, capability } => {
+                    audience = FailureAudience::User;
+                    code = "PROVIDER_CAPABILITY_REFUSED".to_string();
+                    user_message = format!(
+                        "The task requires tool use, but provider '{provider}' model '{model}' \
+                         does not support the '{capability}' capability. Choose a tool-capable \
+                         model for this task."
+                    );
                 } // No `_` arm on purpose (ADR-54): every current variant maps to
                   // a specific code, and adding a new variant must fail
                   // compilation so its classification is decided consciously.

@@ -117,7 +117,10 @@ cargo audit
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`
 - Supervised agent-process (ADR-60 S5): `crates/orchestrator/src/gate_proxy.rs` (agent-process facade), `crates/orchestrator/src/supervisor.rs` (Completed semantics, ADR-60 S5)
 - Multi-agent coordinator: `crates/orchestrator/src/coordinator.rs`
-- Evidence spine — scheduling: `crates/orchestrator/src/evidence_scheduler.rs` (evidence-driven dispatch, replaces fixed fallback)
+- Evidence spine — dispatch consults evidence (no separate scheduler module):
+  `crates/orchestrator/src/coordinator.rs` decision loop cites
+  `supporting_evidence_ids`; snapshot digest via `workspace_snapshot.rs`.
+  Advisory, not a dispatch gate (pre-smoke review 2026-09-07).
 - Evidence spine — DesignDoc verifier: `crates/orchestrator/src/design_doc_verifier.rs` (deterministic lifecycle Proposed→Verified/Active|Quarantined|Skipped)
 - Evidence spine — workspace snapshot: `crates/orchestrator/src/workspace_snapshot.rs` (readiness barrier, inventory)
 - Evidence spine — tool facts: `crates/orchestrator/src/tool_facts.rs` (hot-path fact writer with agent attribution)

@@ -160,6 +160,60 @@ impl ToolExecutionBackend for InProcessGateBackend {
             .record_ack_decision(session_id, correlation_id, message, acknowledged, cancel)
             .await;
     }
+
+    async fn record_capability_refusal(
+        &self,
+        session_id: Ulid,
+        correlation_id: Ulid,
+        provider: &str,
+        model: &str,
+        capability: &str,
+        seam: &str,
+        cancel: CancellationToken,
+    ) {
+        // In-process the loop writes through the shared policy engine's
+        // audit log (same channel as `record_ack_decision`); the supervised
+        // path keeps the trait default (supervisor-side rows, ADR-60 D4/D5).
+        self.executor
+            .record_capability_refusal(
+                session_id,
+                correlation_id,
+                provider,
+                model,
+                capability,
+                seam,
+                cancel,
+            )
+            .await;
+    }
+
+    async fn record_tool_driver_event(
+        &self,
+        session_id: Ulid,
+        correlation_id: Ulid,
+        provider: &str,
+        model: &str,
+        event: &str,
+        verdict: &str,
+        detail: &str,
+        cancel: CancellationToken,
+    ) {
+        // In-process the loop writes through the shared policy engine's
+        // audit log (same channel as `record_ack_decision`); the supervised
+        // path keeps the trait default (supervisor-side rows, ADR-60 D4/D5).
+        self.executor
+            .record_tool_driver_event(
+                session_id,
+                correlation_id,
+                provider,
+                model,
+                event,
+                verdict,
+                detail,
+                cancel,
+            )
+            .await;
+    }
 }
 
 /// Map a gate failure onto the loop's tool error taxonomy, byte-identical to
