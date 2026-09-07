@@ -43,9 +43,9 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
-    CompletionRequest, DesignDoc, EvalResult, Message, OutputMode, ResearchReport, ReviewReport,
-    ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition, ToolOutput,
-    ToolResult,
+    CompletionRequest, CompletionUsage, DesignDoc, EvalResult, Message, OutputMode, ResearchReport,
+    ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall, ToolChoice,
+    ToolDefinition, ToolOutput, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -469,36 +469,94 @@ impl GenericSpecialistAgent {
         let mut files_modified = Vec::new();
         let mut summary = String::new();
 
+        // ADR-66 §4: the universal text-fallback driver engages
+        // automatically when the provider lacks native tool support (never
+        // for plugin providers — those are hard-gated to AnswerOnly tasks
+        // with an explicit error). Fallback-driven requests carry no wire
+        // tool declarations; the driver's prompt section replaces them.
+        let mut tool_driver = (!tool_defs.is_empty()
+            && crate::tool_driver::fallback_engaged(self.provider.provider_name(), model))
+        .then(|| crate::tool_driver::TextToolDriver::new(tool_defs.clone()));
+        if let Some(_driver) = tool_driver.as_ref() {
+            // The prompt section is injected per request by
+            // [`TextToolDriver::augment_request`] (inserting its own System
+            // message when none exists), so the wire request never carries
+            // tool declarations and the conversation history stays clean.
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::AgentThought {
+                    agent_id: agent_id.to_string(),
+                    content: format!(
+                        "tool_driver: fallback engaged (provider '{}', model '{model}')",
+                        self.provider.provider_name()
+                    ),
+                },
+            );
+            self.record_tool_driver_event(
+                task,
+                model,
+                "engage",
+                "fallback",
+                "text-fallback tool driver engaged (no native tool support)",
+                &cancel,
+            )
+            .await;
+        }
+
         for iteration in 0..MAX_TOOL_ITERATIONS {
             if cancel.is_cancelled() {
                 return Err(OrchestratorError::Cancelled);
             }
 
-            let request = CompletionRequest {
+            let mut request = CompletionRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: (!tool_defs.is_empty()).then_some(tool_defs.clone()),
+                tools: match &tool_driver {
+                    // Fallback-driven requests carry no wire tool
+                    // declarations (ADR-66 §4 driver contract).
+                    Some(_) => None,
+                    None => (!tool_defs.is_empty()).then_some(tool_defs.clone()),
+                },
                 tool_choice: None,
                 temperature: Some(0.7),
                 max_tokens: Some(8192),
                 stream: false,
             };
+            if let Some(driver) = tool_driver.as_ref() {
+                driver.augment_request(&mut request);
+            }
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
             let estimated_tokens_in =
                 request.messages.iter().map(|message| message.content.len() as u64).sum::<u64>()
                     / 4;
 
-            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
-                &self.provider,
-                &request,
-                &self.retry_policy,
-                &self.bus,
-                task.session_id,
-                task.id,
-                &cancel,
-            )
-            .await?;
+            let (text, reasoning, tool_calls, usage) =
+                match self.complete_provider_audited(&request, task, &cancel).await {
+                    Ok(turn) => turn,
+                    Err(error) => return Err(error),
+                };
+            // ADR-66 §4: resolve the turn through the text-fallback driver —
+            // structured tool-call blocks parsed from the text, bounded
+            // repair on malformed blocks, loud failure on bound exhaustion.
+            // Native turns (driver inactive) pass through untouched.
+            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
+                Some(driver) => {
+                    self.freeform_driver_turn(
+                        driver,
+                        task,
+                        model,
+                        text,
+                        reasoning,
+                        usage,
+                        &mut messages,
+                        &cancel,
+                    )
+                    .await?
+                }
+                None => (text, reasoning, tool_calls, usage),
+            };
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
             let usage_in = usage.as_ref().and_then(|u| u.prompt_tokens);
@@ -963,6 +1021,217 @@ impl GenericSpecialistAgent {
             }
         } else {
             default_summary
+        }
+    }
+
+    /// One provider completion with the ADR-66 capability-refusal audit:
+    /// a `ProviderError::CapabilityRefused` surfacing here (a tool-carrying
+    /// request that reached an incapable wire path) is recorded as a
+    /// `capability_gate` / Refused audit row (fail-soft) before the error
+    /// propagates — observable and diagnosable, never silent.
+    async fn complete_provider_audited(
+        &self,
+        request: &CompletionRequest,
+        task: &SubTask,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
+    {
+        match crate::prompts::complete_provider_request(
+            &self.provider,
+            request,
+            &self.retry_policy,
+            &self.bus,
+            task.session_id,
+            task.id,
+            cancel,
+        )
+        .await
+        {
+            Ok(turn) => Ok(turn),
+            Err(OrchestratorError::Provider(
+                concerto_core::error::ProviderError::CapabilityRefused {
+                    provider,
+                    model,
+                    capability,
+                },
+            )) => {
+                // ADR-66: every capability refusal is audited (fail-soft —
+                // the row write must not mask the refusal itself), then the
+                // error propagates loudly.
+                if let Some(executor) = &self.tool_executor {
+                    executor
+                        .record_capability_refusal(
+                            task.session_id,
+                            task.id.0,
+                            &provider,
+                            &model,
+                            &capability,
+                            "request_build",
+                            cancel.clone(),
+                        )
+                        .await;
+                }
+                Err(OrchestratorError::Provider(
+                    concerto_core::error::ProviderError::CapabilityRefused {
+                        provider,
+                        model,
+                        capability,
+                    },
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Persist an ADR-66 §4 `tool_driver` audit row through the optional
+    /// executor (fail-soft no-op without one).
+    async fn record_tool_driver_event(
+        &self,
+        task: &SubTask,
+        model: &str,
+        event: &str,
+        verdict: &str,
+        detail: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(executor) = &self.tool_executor else { return };
+        executor
+            .record_tool_driver_event(
+                task.session_id,
+                task.id.0,
+                self.provider.provider_name(),
+                model,
+                event,
+                verdict,
+                detail,
+                cancel.clone(),
+            )
+            .await;
+    }
+
+    /// ADR-66 §4: resolve one Freeform provider turn through the
+    /// text-fallback driver.
+    ///
+    /// Parses the turn's text for structured tool-call blocks. A malformed
+    /// block is repaired by re-prompting (bounded by
+    /// [`crate::tool_driver::MAX_REPAIR_ATTEMPTS`], each attempt audited and
+    /// labeled); bound exhaustion fails the run loudly — never a silent
+    /// completion. A turn with no block at all is a final answer in plain
+    /// text and keeps the loop's existing summary semantics.
+    #[allow(clippy::too_many_arguments)]
+    async fn freeform_driver_turn(
+        &self,
+        driver: &mut crate::tool_driver::TextToolDriver,
+        task: &SubTask,
+        model: &str,
+        mut text: String,
+        mut reasoning: Option<String>,
+        mut usage: Option<CompletionUsage>,
+        messages: &mut Vec<Message>,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
+    {
+        let mut attempts = 0u32;
+        loop {
+            match driver.parse_turn(&text) {
+                crate::tool_driver::DriverTurn::ToolCalls(calls) => {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: self.id.as_str().to_string(),
+                            content: format!(
+                                "tool_driver: fallback turn — {} tool call(s) parsed",
+                                calls.len()
+                            ),
+                        },
+                    );
+                    self.record_tool_driver_event(
+                        task,
+                        model,
+                        "turn",
+                        "fallback",
+                        &format!("{} tool call(s) parsed from text", calls.len()),
+                        cancel,
+                    )
+                    .await;
+                    return Ok((text, reasoning, calls, usage));
+                }
+                crate::tool_driver::DriverTurn::FinalAnswer(final_text) => {
+                    return Ok((final_text, reasoning, Vec::new(), usage));
+                }
+                crate::tool_driver::DriverTurn::Malformed { reason } => {
+                    if attempts >= crate::tool_driver::MAX_REPAIR_ATTEMPTS {
+                        self.record_tool_driver_event(
+                            task,
+                            model,
+                            "exhausted",
+                            "exhausted",
+                            &format!(
+                                "bounded repair exhausted after {attempts} attempts: {reason}"
+                            ),
+                            cancel,
+                        )
+                        .await;
+                        return Err(OrchestratorError::AgentLoopError(format!(
+                            "tool_driver: text-fallback repair exhausted after {attempts} attempts \
+                             (provider '{}', model '{model}'): {reason}",
+                            self.provider.provider_name()
+                        )));
+                    }
+                    attempts += 1;
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: self.id.as_str().to_string(),
+                            content: format!(
+                                "tool_driver: fallback repair attempt {attempts}: {reason}"
+                            ),
+                        },
+                    );
+                    self.record_tool_driver_event(
+                        task,
+                        model,
+                        "repair",
+                        "fallback",
+                        &format!("repair attempt {attempts}: {reason}"),
+                        cancel,
+                    )
+                    .await;
+                    // Re-prompt: the malformed reply stays in the history so
+                    // the model can see its own defect, followed by the
+                    // repair instruction.
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: reasoning.clone(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    messages.push(crate::tool_driver::TextToolDriver::repair_message(&reason));
+                    let mut request = CompletionRequest {
+                        model: model.to_string(),
+                        messages: messages.clone(),
+                        tools: None,
+                        tool_choice: None,
+                        temperature: Some(0.7),
+                        max_tokens: Some(8192),
+                        stream: false,
+                    };
+                    driver.augment_request(&mut request);
+                    let (repaired_text, repaired_reasoning, _, repaired_usage) =
+                        match self.complete_provider_audited(&request, task, cancel).await {
+                            Ok(turn) => turn,
+                            Err(error) => return Err(error),
+                        };
+                    usage = crate::tool_driver::merge_usage(usage, repaired_usage);
+                    text = repaired_text;
+                    reasoning = repaired_reasoning.or(reasoning);
+                }
+            }
         }
     }
 
@@ -2431,6 +2700,33 @@ mod tests {
         }
     }
 
+    /// Capturing audit log for the ADR-66 `tool_driver` /
+    /// `capability_gate` row assertions.
+    #[derive(Clone)]
+    struct CapturingAudit(Arc<std::sync::Mutex<Vec<concerto_core::traits::policy::AuditEntry>>>);
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::policy::AuditLog for CapturingAudit {
+        async fn record(
+            &self,
+            entry: concerto_core::traits::policy::AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), concerto_core::error::PolicyError> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).push(entry);
+            Ok(())
+        }
+    }
+
+    impl CapturingAudit {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn entries(&self) -> Vec<concerto_core::traits::policy::AuditEntry> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
+        }
+    }
+
     /// A file-writing tool that reports no path in its output, so the agent
     /// must fall back to the call arguments when recording file changes.
     struct WriteFileTool;
@@ -2468,10 +2764,77 @@ mod tests {
     struct SequencedProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<CompletionChunk>>,
     }
-
     impl SequencedProvider {
         fn new(responses: Vec<CompletionChunk>) -> Self {
             Self { responses: std::sync::Mutex::new(responses.into()) }
+        }
+    }
+
+    /// A text-only provider for the ADR-66 §4 fallback tests: each
+    /// `stream_completion` call pops the next plain-text reply (the last
+    /// scripted reply repeats once the script ends). Named `opencode` so,
+    /// paired with the `muse-v2` model, the exact production engagement
+    /// predicate fires.
+    struct TextSequencedProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+        saw_wire_tools: Arc<std::sync::atomic::AtomicBool>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TextSequencedProvider {
+        fn new(replies: Vec<String>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                saw_wire_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls_made(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for TextSequencedProvider {
+        async fn stream_completion(
+            &self,
+            request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, concerto_core::error::ProviderError> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                self.saw_wire_tools.store(true, Ordering::SeqCst);
+            }
+            let reply = {
+                let mut queue = self.replies.lock().unwrap_or_else(|error| error.into_inner());
+                if queue.len() > 1 {
+                    queue.pop_front().unwrap_or_default()
+                } else {
+                    // The last scripted reply repeats once the script ends —
+                    // an always-malformed provider keeps emitting the same
+                    // defect, which is what the exhaustion test needs.
+                    queue.back().cloned().unwrap_or_default()
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(CompletionChunk {
+                delta: reply,
+                reasoning: None,
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            })])))
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "opencode"
         }
     }
 
@@ -4429,5 +4792,181 @@ mod tests {
             .expect("exhausted payload must reach the model on the submission path");
         assert_eq!(payload["tool"], "filesystem");
         assert_eq!(payload["recovery"], "stop_or_ask_user");
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-66 §4: universal text-fallback driver (coordinator Freeform path)
+    // -------------------------------------------------------------------
+
+    /// Build a Freeform specialist wired for the fallback tests: a real
+    /// executor with [`WriteFileTool`] behind a capturing audit log.
+    fn fallback_agent(
+        provider: Arc<dyn LlmProvider>,
+        audit: CapturingAudit,
+    ) -> GenericSpecialistAgent {
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        registry.register(Box::new(WriteFileTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let executor = Arc::new(concerto_core::executor::ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(concerto_core::policy::SimplePolicyEngine::new(allow_all, Arc::new(audit))),
+        ));
+        GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            provider,
+            Some(executor),
+            EventBus::new(256),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        )
+    }
+
+    fn fallback_task() -> SubTask {
+        SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "write the file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        }
+    }
+
+    /// ADR-66 A5: a simulated text-only specialist provider completes a
+    /// tool task through the fallback driver — the tool-call block parses,
+    /// executes through the real executor, and no wire tool declarations
+    /// are ever sent.
+    #[tokio::test]
+    async fn freeform_fallback_completes_tool_task() {
+        let block = "<tool_calls>\n\
+            [{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/fb.rs\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextSequencedProvider::new(vec![
+            block.to_string(),
+            "Wrote the file via the text driver.".to_string(),
+        ]));
+        let agent = fallback_agent(provider.clone(), CapturingAudit::new());
+        let task = fallback_task();
+        let result = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect("fallback-driven freeform run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success), "{:?}", result.outcome);
+        assert!(
+            result.summary.contains("Wrote the file via the text driver."),
+            "final answer must surface as the summary: {}",
+            result.summary
+        );
+        assert!(
+            !provider.saw_wire_tools.load(std::sync::atomic::Ordering::SeqCst),
+            "fallback-driven requests must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: a malformed block is repaired by re-prompting — the
+    /// specialist sees its defect plus the format instruction, and the next
+    /// reply parses.
+    #[tokio::test]
+    async fn freeform_fallback_repairs_malformed_block() {
+        let valid = "<tool_calls>\n\
+            [{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/repaired.rs\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextSequencedProvider::new(vec![
+            "<tool_calls>\nnot json\n</tool_calls>".to_string(),
+            valid.to_string(),
+            "Done.".to_string(),
+        ]));
+        let agent = fallback_agent(provider.clone(), CapturingAudit::new());
+        let task = fallback_task();
+        let result = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect("repaired freeform run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        // 3 provider calls: malformed turn + repair re-prompt + final answer.
+        assert_eq!(provider.calls_made(), 3);
+        assert!(
+            !provider.saw_wire_tools.load(std::sync::atomic::Ordering::SeqCst),
+            "repair re-prompts must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: bound exhaustion fails the specialist run loudly — the
+    /// error names the driver and the exhaustion, never a silent summary.
+    #[tokio::test]
+    async fn freeform_fallback_exhaustion_fails_loudly() {
+        let provider = Arc::new(TextSequencedProvider::new(vec![
+            "<tool_calls>\nstill not json\n</tool_calls>".to_string(),
+        ]));
+        let agent = fallback_agent(provider, CapturingAudit::new());
+        let task = fallback_task();
+        let error = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect_err("bound exhaustion must fail the run loudly");
+        let message = error.to_string();
+        assert!(message.contains("tool_driver"), "the failure must name the driver: {message}");
+        assert!(message.contains("muse-v2"), "the failure must name the model: {message}");
+    }
+
+    /// ADR-66: a capability refusal surfacing from the specialist's
+    /// provider call is audited (`capability_gate` / Refused) and then
+    /// propagates loudly.
+    #[tokio::test]
+    async fn freeform_capability_refusal_is_audited_and_loud() {
+        use concerto_core::error::ProviderError;
+
+        struct RefusingProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for RefusingProvider {
+            async fn stream_completion(
+                &self,
+                _request: CompletionRequest,
+                _cancel: CancellationToken,
+            ) -> Result<CompletionStream, ProviderError> {
+                Err(ProviderError::CapabilityRefused {
+                    provider: "opencode".into(),
+                    model: "muse-v2".into(),
+                    capability: "tool_calling".into(),
+                })
+            }
+            fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+                concerto_core::types::TokenBudget::new(128_000, 4_096)
+            }
+            fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+                0.0
+            }
+            fn provider_name(&self) -> &'static str {
+                "opencode"
+            }
+        }
+
+        let audit = CapturingAudit::new();
+        let agent = fallback_agent(Arc::new(RefusingProvider), audit.clone());
+        let task = fallback_task();
+        let error = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect_err("a capability refusal must fail the run loudly");
+        let message = error.to_string();
+        assert!(
+            message.contains("tool_calling"),
+            "the refusal must name the missing capability: {message}"
+        );
+        let refusal_rows: Vec<_> = audit
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.tool_name == "capability_gate")
+            .collect();
+        assert_eq!(refusal_rows.len(), 1, "exactly one refusal audit row");
+        assert_eq!(refusal_rows[0].verdict, "Refused");
+        assert_eq!(refusal_rows[0].rule_matched.as_deref(), Some("request_build"));
     }
 }

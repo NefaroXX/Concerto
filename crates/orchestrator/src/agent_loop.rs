@@ -31,6 +31,7 @@ use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
 use crate::state::AgentState;
+use crate::tool_driver::{self, DriverTurn, TextToolDriver};
 use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 
@@ -550,6 +551,45 @@ impl AgentLoop {
                 &retrieved_memory_block,
             );
 
+            // ADR-66 §4: the universal text-fallback driver engages
+            // automatically when the provider lacks native tool support
+            // (never for plugin providers — those are hard-gated to
+            // AnswerOnly tasks with an explicit error). Fallback-driven
+            // requests carry no wire tool declarations; the driver's prompt
+            // section replaces them. First engagement is audited once per
+            // run and labeled in the event stream.
+            let mut tool_driver = self.resolve_tool_driver();
+            let mut request = request;
+            if let Some(driver) = tool_driver.as_ref() {
+                driver.augment_request(&mut request);
+                if iteration == 1 {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        correlation_id,
+                        EventKind::AgentThought {
+                            agent_id: "single-agent".to_string(),
+                            content: format!(
+                                "tool_driver: fallback engaged (provider '{}', model '{}')",
+                                self.provider.provider_name(),
+                                self.usage_model
+                            ),
+                        },
+                    );
+                    self.tool_executor
+                        .record_tool_driver_event(
+                            task.session_id,
+                            correlation_id,
+                            self.provider.provider_name(),
+                            &self.usage_model,
+                            "engage",
+                            "fallback",
+                            "text-fallback tool driver engaged (no native tool support)",
+                            cancel.clone(),
+                        )
+                        .await;
+                }
+            }
+
             // Publish lifecycle event before provider call
             let _ = self.bus.publish_for_session(
                 task.session_id,
@@ -605,6 +645,32 @@ impl AgentLoop {
                     self.state = AgentState::Failed;
                     return Err(e);
                 }
+            };
+
+            // ADR-66 §4: resolve the turn through the text-fallback driver —
+            // structured tool-call blocks parsed from the text, bounded
+            // repair on malformed blocks, loud failure on bound exhaustion.
+            // Native turns (driver inactive) pass through untouched.
+            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
+                Some(driver) => {
+                    self.driver_resolve_turn(
+                        driver,
+                        &task,
+                        iteration,
+                        &files_modified,
+                        &tool_events,
+                        &verification,
+                        &retrieved_memory_block,
+                        text,
+                        reasoning,
+                        usage,
+                        &mut messages,
+                        correlation_id,
+                        &cancel,
+                    )
+                    .await?
+                }
+                None => (text, reasoning, tool_calls, usage),
             };
 
             // Publish lifecycle event after provider call succeeds
@@ -841,6 +907,165 @@ impl AgentLoop {
         request
     }
 
+    /// Resolve the ADR-66 §4 text-fallback driver for this loop.
+    ///
+    /// `Some` only when there are tools to drive and the provider/model
+    /// resolves to no native tool support (plugin providers are excluded —
+    /// they are hard-gated to AnswerOnly tasks with an explicit error, and
+    /// the driver must not bypass that gate).
+    fn resolve_tool_driver(&self) -> Option<TextToolDriver> {
+        let tools = self.tool_executor.tool_definitions();
+        if tools.is_empty() {
+            return None;
+        }
+        if !tool_driver::fallback_engaged(self.provider.provider_name(), &self.usage_model) {
+            return None;
+        }
+        Some(TextToolDriver::new(tools))
+    }
+
+    /// ADR-66 §4: resolve one provider turn through the text-fallback
+    /// driver.
+    ///
+    /// Parses the turn's text for structured tool-call blocks. A malformed
+    /// block is repaired by re-prompting (bounded by
+    /// [`tool_driver::MAX_REPAIR_ATTEMPTS`], each attempt audited and
+    /// labeled); bound exhaustion fails the run loudly — never a silent
+    /// completion. A turn with no block at all is a final answer in plain
+    /// text; the loop's own completion semantics (including the
+    /// action-required gate) decide whether that answer satisfies the task.
+    #[allow(clippy::too_many_arguments)]
+    async fn driver_resolve_turn(
+        &mut self,
+        driver: &mut TextToolDriver,
+        task: &AgentTask,
+        iteration: u32,
+        files_modified: &[Utf8PathBuf],
+        tool_events: &[ToolExecutionSummary],
+        verification: &[VerificationSummary],
+        retrieved_memory_block: &str,
+        mut text: String,
+        mut reasoning: Option<String>,
+        mut usage: Option<CompletionUsage>,
+        messages: &mut Vec<Message>,
+        correlation_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
+    {
+        let provider = self.provider.provider_name();
+        let model = self.usage_model.clone();
+        let mut attempts = 0u32;
+        loop {
+            match driver.parse_turn(&text) {
+                DriverTurn::ToolCalls(calls) => {
+                    // Fallback turns are labeled in the event stream and the
+                    // audit log (ADR-66: `tool_driver: fallback`).
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        correlation_id,
+                        EventKind::AgentThought {
+                            agent_id: "single-agent".to_string(),
+                            content: format!(
+                                "tool_driver: fallback turn — {} tool call(s) parsed",
+                                calls.len()
+                            ),
+                        },
+                    );
+                    self.tool_executor
+                        .record_tool_driver_event(
+                            task.session_id,
+                            correlation_id,
+                            provider,
+                            &model,
+                            "turn",
+                            "fallback",
+                            &format!("{} tool call(s) parsed from text", calls.len()),
+                            cancel.clone(),
+                        )
+                        .await;
+                    return Ok((text, reasoning, calls, usage));
+                }
+                DriverTurn::FinalAnswer(final_text) => {
+                    return Ok((final_text, reasoning, Vec::new(), usage));
+                }
+                DriverTurn::Malformed { reason } => {
+                    if attempts >= tool_driver::MAX_REPAIR_ATTEMPTS {
+                        self.tool_executor
+                            .record_tool_driver_event(
+                                task.session_id,
+                                correlation_id,
+                                provider,
+                                &model,
+                                "exhausted",
+                                "exhausted",
+                                &format!(
+                                    "bounded repair exhausted after {attempts} attempts: {reason}"
+                                ),
+                                cancel.clone(),
+                            )
+                            .await;
+                        return Err(OrchestratorError::AgentLoopError(format!(
+                            "tool_driver: text-fallback repair exhausted after {attempts} attempts \
+                             (provider '{provider}', model '{model}'): {reason}"
+                        )));
+                    }
+                    attempts += 1;
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        correlation_id,
+                        EventKind::AgentThought {
+                            agent_id: "single-agent".to_string(),
+                            content: format!(
+                                "tool_driver: fallback repair attempt {attempts}: {reason}"
+                            ),
+                        },
+                    );
+                    self.tool_executor
+                        .record_tool_driver_event(
+                            task.session_id,
+                            correlation_id,
+                            provider,
+                            &model,
+                            "repair",
+                            "fallback",
+                            &format!("repair attempt {attempts}: {reason}"),
+                            cancel.clone(),
+                        )
+                        .await;
+                    // Re-prompt: the malformed reply stays in the history so
+                    // the model can see its own defect, followed by the
+                    // repair instruction.
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: reasoning.clone(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    messages.push(TextToolDriver::repair_message(&reason));
+                    let mut request = self.build_provider_request(
+                        &task.description,
+                        iteration,
+                        messages,
+                        files_modified,
+                        tool_events,
+                        verification,
+                        retrieved_memory_block,
+                    );
+                    driver.augment_request(&mut request);
+                    let (repaired_text, repaired_reasoning, _, repaired_usage) = self
+                        .call_provider_with_retry(&request, task.session_id, task.id, cancel)
+                        .await?;
+                    usage = tool_driver::merge_usage(usage, repaired_usage);
+                    text = repaired_text;
+                    reasoning = repaired_reasoning.or(reasoning);
+                }
+            }
+        }
+    }
+
     /// Phase 4: Call the LLM provider through the shared retry boundary and
     /// collect the streaming response into text and tool calls.
     ///
@@ -856,7 +1081,7 @@ impl AgentLoop {
         cancel: &CancellationToken,
     ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
     {
-        crate::prompts::complete_provider_request(
+        match crate::prompts::complete_provider_request(
             &self.provider,
             request,
             &self.retry_policy,
@@ -866,6 +1091,35 @@ impl AgentLoop {
             cancel,
         )
         .await
+        {
+            Ok(turn) => Ok(turn),
+            Err(OrchestratorError::Provider(ProviderError::CapabilityRefused {
+                provider,
+                model,
+                capability,
+            })) => {
+                // ADR-66: every capability refusal is audited (fail-soft —
+                // the row write must not mask the refusal itself), then the
+                // error propagates loudly (§2(b): never send tool-less).
+                self.tool_executor
+                    .record_capability_refusal(
+                        session_id,
+                        Ulid::new(),
+                        &provider,
+                        &model,
+                        &capability,
+                        "request_build",
+                        cancel.clone(),
+                    )
+                    .await;
+                Err(OrchestratorError::Provider(ProviderError::CapabilityRefused {
+                    provider,
+                    model,
+                    capability,
+                }))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Phase 5: Process the provider's text response and tool calls.
@@ -2203,7 +2457,7 @@ async fn verify_file_changes(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2218,7 +2472,7 @@ mod tests {
     use concerto_core::policy::SimplePolicyEngine;
     use concerto_core::traits::approval::ApprovalDecision;
     use concerto_core::traits::memory::MemoryStore;
-    use concerto_core::traits::policy::AuditLog;
+    use concerto_core::traits::policy::{AuditEntry, AuditLog};
     use concerto_core::traits::provider::{CompletionStream, LlmProvider};
     use concerto_core::traits::tool::Tool;
     use concerto_core::types::{
@@ -2298,7 +2552,6 @@ mod tests {
         responses: Vec<Vec<ToolCall>>,
         call_count: AtomicUsize,
     }
-
     impl ScriptedProvider {
         fn new(responses: Vec<Vec<ToolCall>>) -> Self {
             Self { responses, call_count: AtomicUsize::new(0) }
@@ -2347,6 +2600,74 @@ mod tests {
                     .collect()
             };
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A text-only provider: each `stream_completion` call pops the next
+    /// queued plain-text reply (delivered as one final chunk). Models the
+    /// ADR-66 §4 fallback world — the provider can never emit a native tool
+    /// call — and is named `opencode` so, paired with the `muse-v2` usage
+    /// model, the exact production engagement predicate fires (Zen-served
+    /// Muse models have no native tool support).
+    struct TextScriptedProvider {
+        replies: Vec<String>,
+        call_count: AtomicUsize,
+        /// Whether any request reached this provider still carrying wire
+        /// tool declarations. Fallback-driven requests must never carry any
+        /// (the fail-loud seams and the driver contract, ADR-66 §4).
+        saw_wire_tools: Arc<AtomicBool>,
+    }
+
+    impl TextScriptedProvider {
+        fn new(replies: Vec<String>) -> Self {
+            Self {
+                replies,
+                call_count: AtomicUsize::new(0),
+                saw_wire_tools: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// The reply served on call N (the last scripted reply repeats once
+        /// the script ends — an always-malformed provider keeps emitting the
+        /// same defect, which is what the exhaustion test needs).
+        fn reply_at(&self, idx: usize) -> String {
+            match self.replies.get(idx) {
+                Some(reply) => reply.clone(),
+                None => self.replies.last().cloned().unwrap_or_default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TextScriptedProvider {
+        fn provider_name(&self) -> &'static str {
+            "opencode"
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+
+        async fn stream_completion(
+            &self,
+            request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, ProviderError> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                self.saw_wire_tools.store(true, Ordering::SeqCst);
+            }
+            Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                delta: self.reply_at(idx),
+                reasoning: None,
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            })])))
         }
     }
 
@@ -2445,6 +2766,33 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<(), concerto_core::error::PolicyError> {
             Ok(())
+        }
+    }
+
+    /// An audit log that captures every entry for assertions (ADR-66 §4
+    /// `tool_driver` row tests).
+    #[derive(Clone)]
+    struct CapturingAudit(Arc<std::sync::Mutex<Vec<AuditEntry>>>);
+
+    #[async_trait]
+    impl AuditLog for CapturingAudit {
+        async fn record(
+            &self,
+            entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), concerto_core::error::PolicyError> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).push(entry);
+            Ok(())
+        }
+    }
+
+    impl CapturingAudit {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn entries(&self) -> Vec<AuditEntry> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
         }
     }
 
@@ -3470,6 +3818,229 @@ mod tests {
             .await
             .expect("sessions migrations apply");
         (dir, pool)
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-66 §4: universal text-fallback driver (single-agent loop)
+    // -----------------------------------------------------------------------
+
+    /// ADR-66 A5: a simulated text-only provider (no native tool support —
+    /// a Zen-served Muse model) completes a multi-turn tool task through
+    /// the fallback driver: the tool-call block is parsed, executed through
+    /// the real FilesystemTool, the materialized file lands on disk, and
+    /// the no-declaration contract holds (no wire tools ever sent).
+    #[tokio::test]
+    async fn text_fallback_driver_completes_tool_task_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let block = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"fallback.txt\", \"content\": \"via text driver\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            block.to_string(),
+            "Done — wrote the file via the text driver.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task =
+            AgentTask::new_action_required(Ulid::new(), "write a file through the text driver");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "fallback-driven run should succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the fallback-driven task must complete: {}",
+            output.final_message
+        );
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("fallback.txt")),
+            "files_modified should include the fallback-written path"
+        );
+        let written = dir.path().join("fallback.txt");
+        assert!(written.exists(), "the file must be materialized on disk");
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert_eq!(content, "via text driver");
+        assert!(
+            !provider.saw_wire_tools.load(Ordering::SeqCst),
+            "fallback-driven requests must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: a malformed tool-call block is repaired by re-prompting —
+    /// the model sees its own defect plus the format instruction and the
+    /// next reply parses. The repair never executes the malformed turn.
+    #[tokio::test]
+    async fn text_fallback_driver_repairs_malformed_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = "<tool_calls>\nthis is not json\n</tool_calls>";
+        let valid = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"repaired.txt\", \"content\": \"repaired\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            malformed.to_string(),
+            valid.to_string(),
+            "All done.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the repaired file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "repaired run should succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("repaired.txt")),
+            "the repaired tool call must execute: {:?}",
+            output.files_modified
+        );
+        // Exactly one repair round-trip happened (malformed → repair → valid).
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            3,
+            "malformed turn + repair re-prompt + final answer"
+        );
+        assert!(
+            !provider.saw_wire_tools.load(Ordering::SeqCst),
+            "repair re-prompts must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: bound exhaustion fails the run loudly — a provider that
+    /// keeps emitting malformed blocks exhausts the repair budget and the
+    /// run returns a loud error naming the driver, provider, and model,
+    /// never a silent text-only completion.
+    #[tokio::test]
+    async fn text_fallback_driver_exhaustion_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = "<tool_calls>\nstill not json\n</tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![malformed.to_string()]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the impossible file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        let error = result.expect_err("bound exhaustion must fail the run loudly");
+        let message = error.to_string();
+        assert!(
+            message.contains("tool_driver"),
+            "the loud failure must name the driver: {message}"
+        );
+        assert!(message.contains("muse-v2"), "the loud failure must name the model: {message}");
+        assert!(
+            message.contains("exhausted"),
+            "the loud failure must name the exhaustion: {message}"
+        );
+        // 1 initial + MAX_REPAIR_ATTEMPTS repairs — no unbounded retries.
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            1 + crate::tool_driver::MAX_REPAIR_ATTEMPTS as usize,
+            "the repair budget must be bounded"
+        );
+    }
+
+    /// ADR-66 A5: fallback engagement and repair turns are labeled in the
+    /// audit log (`tool_driver` rows) — observable, never silent.
+    #[tokio::test]
+    async fn text_fallback_driver_writes_audit_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = CapturingAudit::new();
+        let malformed = "<tool_calls>\nbroken\n</tool_calls>";
+        let valid = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"audited.txt\", \"content\": \"x\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            malformed.to_string(),
+            valid.to_string(),
+            "Done.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        // Same construction as `make_loop_with_fs_tool`, but with a
+        // capturing audit log so the tool_driver rows can be asserted.
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(FilesystemTool::new(root.clone())));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(audit.clone())));
+        let executor = Arc::new(
+            ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(approval.clone()),
+        );
+        let mut loop_ = AgentLoop::with_project_root(
+            EventBus::new(256),
+            approval.clone(),
+            provider,
+            executor,
+            Arc::new(NoopMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new(dir.path()))),
+            EvalEngine::new(dir.path()),
+            PromptBuilder::new("test system prompt"),
+            10,
+            true,
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the audited file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "audited fallback run should succeed: {:?}", result.err());
+
+        let driver_rows: Vec<_> =
+            audit.entries().into_iter().filter(|entry| entry.tool_name == "tool_driver").collect();
+        assert!(
+            driver_rows.iter().any(|entry| entry.rule_matched.as_deref() == Some("engage")),
+            "engagement must be audited: {:?}",
+            driver_rows.iter().map(|e| e.rule_matched.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            driver_rows.iter().any(|entry| entry.rule_matched.as_deref() == Some("repair")),
+            "the repair turn must be audited"
+        );
+        assert!(
+            driver_rows.iter().any(|entry| entry.rule_matched.as_deref() == Some("turn")),
+            "the fallback tool-call turn must be audited"
+        );
+        assert!(
+            driver_rows.iter().all(|entry| entry.verdict == "fallback"),
+            "all driver rows must be labeled `tool_driver: fallback`"
+        );
+    }
+
+    /// ADR-66 §5 (A3): unknown models attempt native first — a capable
+    /// provider/model pair is never fallback-driven, so its native tool
+    /// calls reach the loop unchanged.
+    #[tokio::test]
+    async fn native_tool_support_never_engages_the_fallback_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "native.txt",
+                "content": "native path"
+            }),
+        };
+        // provider_name "scripted" resolves to the provider default (native
+        // tools), so no fallback engagement — even though the usage model
+        // alone is a Muse name.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![tc], vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the native file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "native run should succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("native.txt")),
+            "native tool calls must drive the task: {:?}",
+            output.files_modified
+        );
     }
 
     #[tokio::test]

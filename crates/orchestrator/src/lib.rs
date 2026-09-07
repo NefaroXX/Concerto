@@ -56,6 +56,7 @@ pub mod state;
 pub mod subscriptions;
 pub mod supervisor;
 pub mod timeline;
+pub mod tool_driver;
 mod tool_facts;
 mod tool_guard;
 mod working_memory;
