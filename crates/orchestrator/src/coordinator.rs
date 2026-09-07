@@ -782,6 +782,11 @@ pub struct CoordinatorAgent {
     /// `SkillsContext`; injected into every planner prompt for this run.
     /// Empty when skills are disabled.
     skills_section: String,
+    /// Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C),
+    /// threaded from the runtime's resolved shell settings. Injected into
+    /// every dispatch prompt and into the self-implement persona's prompts.
+    /// Empty when unset (manual/test constructions).
+    environment_card: String,
     /// ADR-55 Phase 2b: how far this run may go — full lifecycle (default)
     /// or planning-only (produce + render + persist the plan, nothing else).
     orchestration_depth: OrchestrationDepth,
@@ -1319,6 +1324,7 @@ impl CoordinatorAgent {
             default_provider_config_id: None,
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
             skills_section: String::new(),
+            environment_card: String::new(),
             max_total_iterations: None,
             model_dispatch_count: 0,
             plans: None,
@@ -1471,6 +1477,7 @@ impl CoordinatorAgent {
             sentinel_capabilities(persona, StageKind::Execution),
         )
         .with_skills_section(&self.skills_section)
+        .with_environment_card(&self.environment_card)
         // ADR-65 §3: evidence attribution for the coordinator's own tool
         // commands when it self-implements (no registration-time pool).
         .with_tool_facts(self.review_store.clone().map(|pool| {
@@ -1905,6 +1912,15 @@ impl CoordinatorAgent {
     /// into every planner prompt. Pass an empty string to omit them.
     pub fn with_skills_section(mut self, skills_section: String) -> Self {
         self.skills_section = skills_section;
+        self
+    }
+
+    /// Attach the pre-rendered OS/shell identity card (custom-ai-shell plan,
+    /// Phase C), injected into every dispatch prompt and into the
+    /// self-implement persona's prompts. Pass an empty string to omit it
+    /// (manual/test constructions without resolved shell settings).
+    pub fn with_environment_card(mut self, environment_card: String) -> Self {
+        self.environment_card = environment_card;
         self
     }
 
@@ -7347,6 +7363,14 @@ impl CoordinatorAgent {
         }
         if !self.skills_section.is_empty() {
             prompt.push_str(&self.skills_section);
+            prompt.push_str("\n\n");
+        }
+        // OS/shell identity card (custom-ai-shell plan, Phase C): the
+        // coordinator dispatches shell-capable specialists, so its decision
+        // prompt names the host OS and the selected agent shell. Only
+        // appended when the runtime supplied a card.
+        if !self.environment_card.is_empty() {
+            prompt.push_str(&self.environment_card);
             prompt.push_str("\n\n");
         }
         prompt.push_str(&format!("Objective: {}\n", task.description));

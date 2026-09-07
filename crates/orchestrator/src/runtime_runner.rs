@@ -1847,7 +1847,11 @@ async fn execute_agent_loop(
     let prompt_builder = PromptBuilder::with_skills(
         concerto_core::types::system_prompt_for(effective_outcome),
         Some(services.skills.clone()),
-    );
+    )
+    // OS/shell identity card (custom-ai-shell plan, Phase C): the resolved
+    // selected profile grounds every built prompt in the host OS and the
+    // selected agent shell's dialect; `None` falls back to OS facts only.
+    .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned());
 
     let retry_policy = RetryPolicy::new(services.config.retry.clone());
     let metrics_store = session_store.clone();
@@ -3994,6 +3998,13 @@ async fn run_multi_agent(
     // the roster and the seed set is NOT merged back in — deleted seeds stay
     // deleted at runtime (maintainer revision of ADR-58/59).
     let merge_seeds = !services.config.owns_agent_roster();
+    // OS/shell identity card (custom-ai-shell plan, Phase C): pre-rendered
+    // once from the resolved selected profile and threaded to the registry
+    // (every specialist) and the coordinator (dispatch prompts + the
+    // self-implement persona). `None` renders the OS-facts-only card.
+    let environment_card = crate::prompts::environment_card(
+        services.config.resolved_shell_settings().selected_profile(),
+    );
     let registry = Arc::new(AgentRegistry::build_with_roles_for_project_with_facade(
         role_providers,
         default_provider,
@@ -4003,6 +4014,7 @@ async fn run_multi_agent(
         &req.project_dir,
         &agent_configs,
         &skills_section,
+        &environment_card,
         facade.as_ref(),
         merge_seeds,
         // ADR-65 §3: the session-DB pool backs every registered specialist's
@@ -4062,6 +4074,9 @@ async fn run_multi_agent(
     )
     .with_agent_configs(agent_configs)
     .with_skills_section(skills_section)
+    // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
+    // above from the resolved shell settings; see the registry wiring.
+    .with_environment_card(environment_card)
     // ADR-58 P2+P3 (Batch 1): the resolved blueprint facade backs the
     // stage-kind resolutions (`role_in_kind_stage`, `execution_stage_tag`,
     // `kind_stage_tag`). ADR-58 amendment (2026-09-05): the facade never

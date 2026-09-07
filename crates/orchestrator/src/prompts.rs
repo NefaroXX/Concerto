@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use concerto_config::{ShellBackendType, ShellProfileConfig};
 use concerto_core::error::ProviderError;
 use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
@@ -29,13 +30,18 @@ pub struct PromptBuilder {
     /// the current skills section is appended to the system prompt on every
     /// build, so a live refresh takes effect without rebuilding the builder.
     skills: Option<Arc<SkillsContext>>,
+    /// The session's selected shell profile (ADR-28). Rendered into the
+    /// OS/shell identity card appended to every built system prompt.
+    /// `None` renders the card from OS facts plus the detected OS default
+    /// shell instead — the card is never omitted and never errors.
+    shell_profile: Option<ShellProfileConfig>,
 }
 
 impl PromptBuilder {
     /// Create a new builder with the given system prompt template and no
     /// skills context.
     pub fn new(system_template: impl Into<String>) -> Self {
-        Self { system_template: system_template.into(), skills: None }
+        Self { system_template: system_template.into(), skills: None, shell_profile: None }
     }
 
     /// Create a builder that appends the enabled skills section to the system
@@ -44,7 +50,15 @@ impl PromptBuilder {
         system_template: impl Into<String>,
         skills: Option<Arc<SkillsContext>>,
     ) -> Self {
-        Self { system_template: system_template.into(), skills }
+        Self { system_template: system_template.into(), skills, shell_profile: None }
+    }
+
+    /// Attach the session's selected shell profile for the identity card.
+    /// Pass `None` to fall back to the OS-only card (OS facts plus the
+    /// detected OS default shell).
+    pub fn with_shell_profile(mut self, profile: Option<ShellProfileConfig>) -> Self {
+        self.shell_profile = profile;
+        self
     }
 
     /// Build a `CompletionRequest` from the current context.
@@ -81,6 +95,15 @@ impl PromptBuilder {
             }
         }
 
+        // OS/shell identity card (custom-ai-shell plan, Phase C): grounds
+        // every prompt in the host facts and the selected agent shell's
+        // dialect gotchas. Always appended — with no configured profile it
+        // falls back to OS facts plus the detected OS default shell, so the
+        // card is never empty and never errors.
+        let card = environment_card(self.shell_profile.as_ref());
+        system.push_str("\n\n");
+        system.push_str(&card);
+
         let mut all_messages = Vec::with_capacity(messages.len() + 1);
 
         all_messages.push(Message {
@@ -105,6 +128,148 @@ impl PromptBuilder {
             stream: true,
         }
     }
+}
+
+/// The shell dialect family an identity card curates gotchas for.
+///
+/// Detection is deliberately cheap: the executable's file stem only. No
+/// process is spawned and no filesystem probe runs — `version_string()` is
+/// never called here because the card ships into every prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellDialect {
+    /// POSIX-style shells: bash, sh, zsh, dash, ash.
+    Posix,
+    /// PowerShell (pwsh / Windows PowerShell).
+    PowerShell,
+    /// Windows cmd.exe.
+    Cmd,
+    /// Unknown family — keep the guidance shell-agnostic.
+    Generic,
+}
+
+impl ShellDialect {
+    /// Classify a dialect from an executable path or bare name.
+    fn from_executable(executable: &str) -> Self {
+        match executable_stem(executable).as_str() {
+            "bash" | "sh" | "zsh" | "dash" | "ash" => Self::Posix,
+            "pwsh" | "powershell" => Self::PowerShell,
+            "cmd" => Self::Cmd,
+            _ => Self::Generic,
+        }
+    }
+
+    /// Short label used in the card's dialect-notes header.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::PowerShell => "powershell",
+            Self::Cmd => "cmd",
+            Self::Generic => "generic",
+        }
+    }
+
+    /// Curated gotchas for the detected family only — this text ships into
+    /// every prompt, so it stays short.
+    fn notes(self) -> &'static [&'static str] {
+        match self {
+            Self::Posix => &[
+                "Quote every `$VAR` expansion; unquoted expansions split on whitespace.",
+                "Prefer `printf` over `echo -e`/`echo -n` for escape sequences and exact output.",
+                "Each call is a fresh one-shot shell: no state carries over and `set -o pipefail` is per-invocation.",
+            ],
+            Self::PowerShell => &[
+                "There is no `&&`/`||`; separate commands with `;` or run one command per call.",
+                "`curl`/`ls` are aliases for cmdlets with different flags — prefer full cmdlet names (`Invoke-WebRequest`, `Get-ChildItem`) and prefix native executables with `&`.",
+                "Native executables set `$LASTEXITCODE`; cmdlets set `$?` — check the right one.",
+            ],
+            Self::Cmd => &[
+                "Variables expand as `%VAR%` (`!VAR!` only with delayed expansion).",
+                "No `ls`/`grep`/`curl` by default — use `dir`, `findstr`, and `curl.exe`.",
+                "Quote paths with spaces; `/C` parsing treats `^` as the escape character.",
+            ],
+            Self::Generic => &[
+                "Use the simplest single command; avoid chaining operators (`&&`, `;`, `|`) and shell-specific syntax.",
+            ],
+        }
+    }
+}
+
+/// File-name label for a configured executable (`/usr/bin/bash` → `bash`,
+/// `pwsh.exe` → `pwsh.exe`); `unspecified` when the field is blank. Splits on
+/// both separators so a Windows-style path still yields its file name.
+fn executable_label(executable: &str) -> String {
+    let trimmed = executable.trim();
+    if trimmed.is_empty() {
+        return "unspecified".to_string();
+    }
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).to_string()
+}
+
+/// Lowercase file stem used for dialect detection (`pwsh.exe` → `pwsh`).
+fn executable_stem(executable: &str) -> String {
+    let label = executable_label(executable);
+    match label.split_once('.') {
+        Some((stem, _)) => stem.to_ascii_lowercase(),
+        None => label.to_ascii_lowercase(),
+    }
+}
+
+/// Backend label for the card's shell line.
+fn backend_label(backend: ShellBackendType) -> &'static str {
+    match backend {
+        ShellBackendType::System => "system",
+        ShellBackendType::Managed => "managed",
+        ShellBackendType::Custom => "custom",
+        _ => "system",
+    }
+}
+
+/// Render the OS/shell identity card appended to agent system prompts
+/// (custom-ai-shell plan, Phase C).
+///
+/// The card is compact (< 20 lines) and deterministic: OS + arch, the
+/// canonical agent shell (profile id, executable file name, backend), and
+/// 2–3 dialect gotchas curated for the detected shell family only.
+///
+/// * `Some(profile)` — facts come from the selected ADR-28 shell profile.
+/// * `None` — falls back to OS facts plus `detect_os_default_shell()`; the
+///   dialect notes then reflect the detected default shell's family. The
+///   card is never empty and never errors, and it never probes shell
+///   versions in the hot path (no process is spawned).
+pub fn environment_card(profile: Option<&ShellProfileConfig>) -> String {
+    let (shell_line, dialect) = match profile {
+        Some(profile) => {
+            let label = executable_label(&profile.executable);
+            (
+                format!(
+                    "profile `{}` — {label} (backend: {})",
+                    profile.id,
+                    backend_label(profile.backend)
+                ),
+                ShellDialect::from_executable(&profile.executable),
+            )
+        }
+        None => {
+            let detected = concerto_tools::shell::detect_os_default_shell();
+            (
+                format!("OS default (`{}`)", executable_label(&detected)),
+                ShellDialect::from_executable(&detected),
+            )
+        }
+    };
+
+    let mut card = format!(
+        "## Environment\n- OS: {} ({})\n- Agent shell: {}\n- Shell dialect notes ({}):",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        shell_line,
+        dialect.label()
+    );
+    for note in dialect.notes() {
+        card.push_str("\n  - ");
+        card.push_str(note);
+    }
+    card
 }
 
 /// Parse the first valid JSON value from a model response.
@@ -450,7 +615,111 @@ mod tests {
         let builder =
             PromptBuilder::with_skills("System prompt".to_string(), Some(Arc::new(empty)));
         let request = builder.build("", &[], None, None);
-        assert_eq!(request.messages[0].content, "System prompt");
+        let system = &request.messages[0].content;
+        assert!(system.starts_with("System prompt"), "content: {system}");
+        assert!(!system.contains("## Skills"), "unexpected skills section: {system}");
+        // The identity card is always appended (OS fallback when no profile
+        // is set), so exact-equality assertions on the built system prompt
+        // are not possible anymore.
+        assert!(system.contains("## Environment"), "identity card missing: {system}");
+    }
+
+    // -------------------------------------------------------------------
+    // OS/shell identity card
+    // -------------------------------------------------------------------
+
+    fn fake_profile(executable: &str, backend: ShellBackendType) -> ShellProfileConfig {
+        ShellProfileConfig {
+            id: "test-profile".to_string(),
+            name: "Test Profile".to_string(),
+            backend,
+            executable: executable.to_string(),
+            ..ShellProfileConfig::default()
+        }
+    }
+
+    #[test]
+    fn environment_card_renders_bash_profile_with_posix_notes() {
+        let card = environment_card(Some(&fake_profile("/usr/bin/bash", ShellBackendType::System)));
+        assert!(card.contains("## Environment"), "card: {card}");
+        assert!(
+            card.contains(&format!("- OS: {} ({})", std::env::consts::OS, std::env::consts::ARCH)),
+            "OS/arch line missing: {card}"
+        );
+        assert!(
+            card.contains("profile `test-profile` — bash (backend: system)"),
+            "shell line missing: {card}"
+        );
+        assert!(card.contains("(posix)"), "posix notes header missing: {card}");
+        assert!(card.contains("Quote every `$VAR`"), "posix gotcha missing: {card}");
+        assert!(!card.contains("powershell"), "wrong dialect notes present: {card}");
+        assert!(!card.contains("$LASTEXITCODE"), "powershell gotcha present: {card}");
+    }
+
+    #[test]
+    fn environment_card_renders_powershell_profile_with_powershell_notes() {
+        let card = environment_card(Some(&fake_profile("pwsh.exe", ShellBackendType::Custom)));
+        assert!(card.contains("(powershell)"), "powershell notes header missing: {card}");
+        assert!(card.contains("no `&&`"), "powershell gotcha missing: {card}");
+        assert!(card.contains("$LASTEXITCODE"), "powershell gotcha missing: {card}");
+        assert!(!card.contains("(posix)"), "posix notes present: {card}");
+        assert!(!card.contains("`echo -e`"), "posix gotcha present: {card}");
+        assert!(card.contains("backend: custom"), "backend label missing: {card}");
+    }
+
+    #[test]
+    fn environment_card_unknown_executable_is_generic() {
+        let card =
+            environment_card(Some(&fake_profile("/opt/tools/fruitloop", ShellBackendType::System)));
+        assert!(card.contains("(generic)"), "generic notes header missing: {card}");
+        assert!(card.contains("Use the simplest single command"), "generic gotcha missing: {card}");
+        assert!(!card.contains("Quote every `$VAR`"), "posix notes present: {card}");
+        // The unknown executable is still reported verbatim in the shell line.
+        assert!(
+            card.contains("— fruitloop (backend: system)"),
+            "unknown executable label missing: {card}"
+        );
+    }
+
+    #[test]
+    fn environment_card_without_profile_falls_back_to_os_facts() {
+        let card = environment_card(None);
+        assert!(card.contains("## Environment"), "card: {card}");
+        assert!(
+            card.contains(&format!("- OS: {} ({})", std::env::consts::OS, std::env::consts::ARCH)),
+            "OS/arch line missing: {card}"
+        );
+        assert!(
+            card.contains("Agent shell: OS default (`"),
+            "OS-default shell line missing: {card}"
+        );
+        // Never empty, never panics, and always carries dialect notes.
+        assert!(card.contains("Shell dialect notes"), "dialect notes missing: {card}");
+    }
+
+    #[test]
+    fn build_appends_identity_card_when_profile_set() {
+        let profile = fake_profile("/bin/bash", ShellBackendType::System);
+        let builder =
+            PromptBuilder::new("System prompt".to_string()).with_shell_profile(Some(profile));
+        let request = builder.build("", &[], None, None);
+        let system = &request.messages[0].content;
+        assert!(system.starts_with("System prompt"), "content: {system}");
+        assert!(system.contains("profile `test-profile` — bash (backend: system)"), "{system}");
+        assert!(system.contains("(posix)"), "dialect notes missing: {system}");
+    }
+
+    #[test]
+    fn build_without_profile_appends_os_fallback_card() {
+        let builder = PromptBuilder::new("System prompt".to_string());
+        let request = builder.build("", &[], None, None);
+        let system = &request.messages[0].content;
+        assert!(system.starts_with("System prompt"), "content: {system}");
+        assert!(system.contains("## Environment"), "identity card missing: {system}");
+        assert!(
+            !system.contains("profile `"),
+            "no profile facts may appear without a profile: {system}"
+        );
     }
 
     #[test]

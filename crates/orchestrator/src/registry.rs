@@ -132,6 +132,9 @@ fn register_seeded_agents(
     retry_policy: &RetryPolicy,
     eval_root: &std::path::Path,
     skills_section: &str,
+    // Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C);
+    // empty on manual/test construction paths, which inject nothing.
+    environment_card: &str,
     facade: Option<&BlueprintFacade>,
     // ADR-65 §3: the session-DB pool backing every registered specialist's
     // tool-evidence writer; `None` (tests, pools unavailable) disables it.
@@ -185,6 +188,7 @@ fn register_seeded_agents(
             })
             .unwrap_or_else(|| stage.as_ref().is_some_and(AgentStage::is_validate));
         let skills = skills_section.to_string();
+        let environment_card = environment_card.to_string();
         let executor_owned = executor.clone();
         let bus_owned = bus.clone();
         let retry_policy_owned = retry_policy.clone();
@@ -228,6 +232,7 @@ fn register_seeded_agents(
                     .with_output_mode(output_mode)
                     .with_eval(eval)
                     .with_skills_section(&skills)
+                    .with_environment_card(&environment_card)
                     .with_tool_facts(fact_ctx),
                 );
             }
@@ -245,6 +250,7 @@ fn register_seeded_agents(
                 )
                 .with_output_mode(output_mode)
                 .with_skills_section(&skills)
+                .with_environment_card(&environment_card)
                 .with_tool_facts(fact_ctx),
             )
         };
@@ -401,6 +407,10 @@ impl AgentRegistry {
             &retry_policy,
             std::path::Path::new("."),
             skills_section,
+            // Manual/test construction path: no OS/shell identity card is
+            // injected (the production runtime threads one via
+            // `build_with_roles_for_project_with_facade`).
+            "",
             None,
             None, // Adr-65 §3: no fact-writer pool on the default construction path
         );
@@ -451,6 +461,8 @@ impl AgentRegistry {
             &merged,
             std::path::Path::new("."),
             skills_section,
+            // Manual/test construction path: no OS/shell identity card.
+            "",
             None,
             fact_pool,
         )
@@ -471,6 +483,7 @@ impl AgentRegistry {
         merged: &HashMap<AgentId, CustomAgentConfig>,
         eval_root: &std::path::Path,
         skills_section: &str,
+        environment_card: &str,
         facade: Option<&BlueprintFacade>,
         fact_pool: Option<sqlx::SqlitePool>,
     ) -> Self {
@@ -488,6 +501,7 @@ impl AgentRegistry {
             &retry_policy,
             eval_root,
             skills_section,
+            environment_card,
             facade,
             fact_pool,
         );
@@ -527,6 +541,8 @@ impl AgentRegistry {
             project_root,
             agent_configs,
             skills_section,
+            // Manual/test construction path: no OS/shell identity card.
+            "",
             None,
             merge_seeds,
             fact_pool,
@@ -557,6 +573,10 @@ impl AgentRegistry {
         project_root: &std::path::Path,
         agent_configs: &HashMap<AgentId, CustomAgentConfig>,
         skills_section: &str,
+        // Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase
+        // C) from the runtime's resolved shell settings; empty on manual or
+        // test construction paths, which inject nothing.
+        environment_card: &str,
         facade: Option<&BlueprintFacade>,
         merge_seeds: bool,
         fact_pool: Option<sqlx::SqlitePool>,
@@ -579,6 +599,7 @@ impl AgentRegistry {
             &merged,
             project_root,
             skills_section,
+            environment_card,
             facade,
             fact_pool,
         )
@@ -1148,6 +1169,7 @@ mod tests {
             dir.path(),
             &HashMap::new(),
             "",
+            "", // test construction: no OS/shell identity card
             Some(&facade),
             true,
             None, // no fact-writer pool in this test
