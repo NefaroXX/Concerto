@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OS/shell identity card (shell plan):** every agent prompt now carries a
+  compact environment card (OS + arch, canonical agent shell profile +
+  executable, 2–4 dialect gotchas for the detected bash/PowerShell/cmd
+  family) across single-agent, specialist, and coordinator prompts — models
+  no longer have to guess which dialect executes their commands.
+- **Bounded shell repair turns (shell plan Phase C subset):** failed shell
+  executions get up to 2 labeled corrective turns (command, exit code,
+  stderr/stdout tails, likely-cause category) without consuming continuation
+  rounds; policy denials are never repaired; exhaustion stays a recoverable
+  result with evidence preserved.
 - **Universal text-fallback tool driver (ADR-66):** harness-level
   prompt-based tool calling (schema injection, strict parser,
   repair-by-reprompt, bounded attempts) engages automatically for providers
