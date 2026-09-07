@@ -30,6 +30,7 @@ use concerto_tools::undo::UndoManager;
 use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
+use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
 use crate::tool_driver::{self, DriverTurn, TextToolDriver};
 use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
@@ -56,6 +57,13 @@ pub struct AgentLoop {
     /// corrective-retry coaching for weak models at
     /// [`tool_guard::MAX_TOOL_GUARD_REJECTS`] injections per tool.
     tool_guard_rejects: HashMap<String, u32>,
+    /// Repair turns spent per failed `shell` tool-call id within the current
+    /// run (cleared at run start). Bounds the execution-failure repair loop
+    /// at [`shell_repair::MAX_SHELL_REPAIR_ATTEMPTS`] corrective turns per
+    /// failed call id. Independent of `tool_guard_rejects`: that budget
+    /// repairs argument SHAPE before execution, this one coaches the model
+    /// after an execution failure.
+    shell_repair_attempts: HashMap<String, u32>,
     max_iterations: u32,
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
@@ -282,6 +290,7 @@ impl AgentLoop {
             prompt_builder,
             cycle_budget: CycleBudgetTracker::default(),
             tool_guard_rejects: HashMap::new(),
+            shell_repair_attempts: HashMap::new(),
             max_iterations,
             fast,
             state: AgentState::Idle,
@@ -364,6 +373,7 @@ impl AgentLoop {
         // Fresh run: clear any corrective-retry streaks carried over from a
         // previous run on this loop instance.
         self.tool_guard_rejects.clear();
+        self.shell_repair_attempts.clear();
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -2073,6 +2083,19 @@ impl AgentLoop {
                     )
                     .await;
                 }
+
+                // Bounded execution-failure repair (custom-ai-shell plan,
+                // Phase C subset): a `shell` command that RAN but exited
+                // non-zero earns a corrective user turn so the model can
+                // retry a fixed command without consuming a continuation
+                // round. Policy outcomes never reach this arm.
+                if let Some(failure) = shell_repair::repairable_failure(&tc.name, &output) {
+                    if let Some(repair) =
+                        self.shell_repair_turn(task.session_id, tc, &arguments, failure, &cancel)
+                    {
+                        messages.push(repair);
+                    }
+                }
             }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
@@ -2176,9 +2199,90 @@ impl AgentLoop {
                     &cancel,
                 )
                 .await;
+
+                // Bounded execution-failure repair (custom-ai-shell plan,
+                // Phase C subset): process-level shell failures (timeout,
+                // spawn failure) earn a corrective user turn the same way a
+                // non-zero exit does. `repairable_error_failure` refuses
+                // policy outcomes — denials, approval outcomes, containment
+                // blocks, and cancellation always surface unchanged.
+                if let Some(failure) = shell_repair::repairable_error_failure(&tc.name, &e) {
+                    if let Some(repair) =
+                        self.shell_repair_turn(task.session_id, tc, &arguments, failure, &cancel)
+                    {
+                        messages.push(repair);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Bounded shell-repair coaching (custom-ai-shell plan, Phase C subset).
+    ///
+    /// Consumes one unit of the per-call repair budget and returns the
+    /// corrective `User` turn to append to the conversation; the next
+    /// provider iteration sees it, so NO continuation round is consumed.
+    /// Returns `None` when the budget for this tool-call id is exhausted
+    /// ([`shell_repair::MAX_SHELL_REPAIR_ATTEMPTS`]) or the token is already
+    /// cancelled — a cancelled run must not spend a repair turn.
+    fn shell_repair_turn(
+        &mut self,
+        session_id: Ulid,
+        tc: &ToolCall,
+        arguments: &serde_json::Value,
+        failure: ShellFailure,
+        cancel: &CancellationToken,
+    ) -> Option<Message> {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let attempt = {
+            let spent = self.shell_repair_attempts.entry(tc.id.clone()).or_insert(0);
+            if *spent >= shell_repair::MAX_SHELL_REPAIR_ATTEMPTS {
+                tracing::debug!(
+                    tool_call = %tc.id,
+                    max = shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
+                    "shell repair budget exhausted; failure surfaces unchanged"
+                );
+                return None;
+            }
+            *spent += 1;
+            *spent
+        };
+        tracing::warn!(
+            tool_call = %tc.id,
+            attempt,
+            max = shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
+            diagnostic = shell_repair::diagnostic_code(&failure),
+            "shell execution failed; injecting bounded repair turn"
+        );
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::AgentThought {
+                agent_id: "single-agent".to_string(),
+                content: format!(
+                    "shell-repair: attempt {attempt}/{} injected ({})",
+                    shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
+                    shell_repair::diagnostic_code(&failure)
+                ),
+            },
+        );
+        let content = shell_repair::corrective_message_text(
+            attempt,
+            &shell_repair::command_from_arguments(arguments),
+            &failure,
+        );
+        Some(Message {
+            role: Role::User,
+            content,
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        })
     }
 
     /// ADR-65 §3: record a completed (or refused) tool command as evidence.
@@ -5583,6 +5687,449 @@ mod tests {
             tool_events[0].success,
             "the guard must let the text-repaired call through: {tool_events:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded shell-repair loop (custom-ai-shell plan, Phase C subset) —
+    // integration-level tests through `execute_single_tool_call`. The shell
+    // tool is mocked: no process is ever spawned.
+    // -----------------------------------------------------------------------
+
+    /// Scripted outcome a [`ScriptedShellTool`] returns for every call.
+    #[derive(Clone)]
+    enum ScriptedShellOutcome {
+        /// Ok output with the given exit code, stdout, and stderr.
+        Exit(i32, String, String),
+        /// Policy denial straight from the tool (as the real denylist does).
+        Deny(String),
+        /// Timeout error.
+        Timeout(u64),
+        /// Process-start / execution failure.
+        SpawnFailed(String),
+    }
+
+    /// A `shell`-named mock tool that returns its scripted outcome without
+    /// spawning any process.
+    struct ScriptedShellTool {
+        outcome: Arc<std::sync::Mutex<ScriptedShellOutcome>>,
+        calls: Arc<AtomicUsize>,
+        /// When set, cancelled during `execute` — before returning the
+        /// scripted outcome — so the loop sees a completed failure while the
+        /// run is already cancelled.
+        cancel_on_execute: Option<CancellationToken>,
+    }
+
+    impl ScriptedShellTool {
+        fn new(outcome: ScriptedShellOutcome) -> (Self, Arc<AtomicUsize>) {
+            Self::with_cancel_on_execute(outcome, None)
+        }
+
+        fn with_cancel_on_execute(
+            outcome: ScriptedShellOutcome,
+            cancel_on_execute: Option<CancellationToken>,
+        ) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    outcome: Arc::new(std::sync::Mutex::new(outcome)),
+                    calls: calls.clone(),
+                    cancel_on_execute,
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ScriptedShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "scripted shell mock"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancel) = &self.cancel_on_execute {
+                cancel.cancel();
+            }
+            let outcome = self.outcome.lock().unwrap_or_else(|error| error.into_inner()).clone();
+            match outcome {
+                ScriptedShellOutcome::Exit(code, stdout, stderr) => Ok(ToolOutput {
+                    summary: format!("Command `x` failed with exit code {code}."),
+                    data: serde_json::json!({
+                        "exit_code": code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }),
+                }),
+                ScriptedShellOutcome::Deny(rule) => Err(ToolError::PolicyDenied { rule }),
+                ScriptedShellOutcome::Timeout(timeout_secs) => {
+                    Err(ToolError::Timeout { timeout_secs })
+                }
+                ScriptedShellOutcome::SpawnFailed(message) => {
+                    Err(ToolError::ExecutionFailed { message })
+                }
+            }
+        }
+    }
+
+    /// Harness for one direct `execute_single_tool_call` against the scripted
+    /// shell mock.
+    fn shell_repair_harness(
+        outcome: ScriptedShellOutcome,
+    ) -> (AgentLoop, AgentTask, SessionContext, Arc<AtomicUsize>) {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (tool, calls) = ScriptedShellTool::new(outcome);
+        let loop_ = make_loop_with_extra_tools(provider, approval, 10, vec![Box::new(tool)]);
+        let task = AgentTask::new_action_required(Ulid::new(), "shell repair harness");
+        let session = SessionContext::new(task.session_id, std::path::PathBuf::from("/tmp"));
+        (loop_, task, session, calls)
+    }
+
+    /// Count the corrective repair turns (User messages) in `messages`.
+    fn repair_turns(messages: &[Message]) -> Vec<&Message> {
+        messages.iter().filter(|m| m.role == Role::User).collect()
+    }
+
+    #[tokio::test]
+    async fn shell_execution_failure_queues_bounded_repair_turns() {
+        let (mut loop_, task, session, calls) = shell_repair_harness(ScriptedShellOutcome::Exit(
+            2,
+            "some stdout".into(),
+            "boom".into(),
+        ));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_fail".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "false", "args": [] }),
+        };
+
+        // Three rounds against the SAME tool-call id: two repairs, then the
+        // budget is exhausted and the third failure surfaces unchanged.
+        for _ in 0..3 {
+            loop_
+                .execute_single_tool_call(
+                    &tc,
+                    &task,
+                    Ulid::new(),
+                    &session,
+                    CancellationToken::new(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "every round must execute");
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 2, "bounded at exactly MAX: {messages:?}");
+        assert!(
+            repairs[0].content.contains("[shell-repair attempt 1/2]"),
+            "marker missing: {}",
+            repairs[0].content
+        );
+        assert!(
+            repairs[1].content.contains("[shell-repair attempt 2/2]"),
+            "marker missing: {}",
+            repairs[1].content
+        );
+        for repair in &repairs {
+            assert!(repair.content.contains("diagnostic: shell.process.non-zero-exit"));
+            assert!(repair.content.contains("Failed command: false"));
+            assert!(repair.content.contains("Exit code: 2"));
+            assert!(repair.content.contains("inspect the captured output above and fix"));
+            assert!(repair.content.contains("exactly ONE corrected `shell` tool call"));
+        }
+        // Three tool results (one per round), each followed by at most one
+        // repair turn; the last round has no trailing repair.
+        let tool_results = messages.iter().filter(|m| m.role == Role::Tool).collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 3);
+        let last = messages.last().expect("non-empty history");
+        assert_eq!(last.role, Role::Tool, "exhaustion leaves only the tool result: {messages:?}");
+        assert!(!last.content.contains("shell-repair"));
+    }
+
+    #[tokio::test]
+    async fn shell_policy_denial_never_queues_repair_turn() {
+        let (mut loop_, task, session, calls) = shell_repair_harness(ScriptedShellOutcome::Deny(
+            "command matched deny pattern: rm -rf /".into(),
+        ));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_denied".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "rm -rf /", "args": [] }),
+        };
+
+        // Repeat: even across rounds a denial never earns a repair turn.
+        for _ in 0..3 {
+            loop_
+                .execute_single_tool_call(
+                    &tc,
+                    &task,
+                    Ulid::new(),
+                    &session,
+                    CancellationToken::new(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(
+            repair_turns(&messages).is_empty(),
+            "policy denials must never be repaired: {messages:?}"
+        );
+        assert!(
+            messages[0].content.contains("[POLICY DENIED]"),
+            "denial surfaces unchanged: {}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_successful_exit_never_queues_repair_turn() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::Exit(0, "all good".into(), String::new()));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_ok".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "true", "args": [] }),
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(messages.len(), 1, "only the tool result: {messages:?}");
+        assert_eq!(messages[0].role, Role::Tool);
+        assert!(repair_turns(&messages).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_cancellation_never_queues_repair_turn() {
+        // The mock cancels the token DURING execution, before returning the
+        // failure — so the loop handles a completed execution failure while
+        // the run is already cancelled. The repair helper must then refuse
+        // to spend a repair turn.
+        let cancel = CancellationToken::new();
+        let (tool, calls) = ScriptedShellTool::with_cancel_on_execute(
+            ScriptedShellOutcome::Exit(1, String::new(), "late".into()),
+            Some(cancel.clone()),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_extra_tools(provider, approval, 10, vec![Box::new(tool)]);
+        let task = AgentTask::new_action_required(Ulid::new(), "shell repair harness");
+        let session = SessionContext::new(task.session_id, std::path::PathBuf::from("/tmp"));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_cancelled".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "slow", "args": [] }),
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                cancel,
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            repair_turns(&messages).is_empty(),
+            "a cancelled run must not spend a repair turn: {messages:?}"
+        );
+        assert_eq!(messages.len(), 1, "only the tool result: {messages:?}");
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_queues_repair_turn_with_timeout_category() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::Timeout(30));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_timeout".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "long-build", "args": [] }),
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 1, "timeout earns one repair turn: {messages:?}");
+        assert!(repairs[0].content.contains("diagnostic: shell.process.timeout"));
+        assert!(repairs[0]
+            .content
+            .contains("split the work into smaller steps or raise the timeout"));
+        assert!(repairs[0].content.contains("Failed command: long-build"));
+    }
+
+    #[tokio::test]
+    async fn shell_spawn_failure_queues_repair_turn_with_not_found_category() {
+        let (mut loop_, task, session, _calls) =
+            shell_repair_harness(ScriptedShellOutcome::SpawnFailed(
+                "shell executable not found on PATH: fruitloop".into(),
+            ));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_spawn".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "fruitloop", "args": ["--help"] }),
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 1, "spawn failure earns one repair turn: {messages:?}");
+        assert!(repairs[0].content.contains("diagnostic: shell.execution.failed"));
+        assert!(repairs[0].content.contains("check the executable name for this shell"));
+        assert!(repairs[0].content.contains("Failed command: fruitloop --help"));
+    }
+
+    #[tokio::test]
+    async fn shell_repair_message_honors_truncation_caps() {
+        let (mut loop_, task, session, _calls) =
+            shell_repair_harness(ScriptedShellOutcome::Exit(1, "o".repeat(2000), "e".repeat(5000)));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let long_command = "c".repeat(900);
+        let tc = ToolCall {
+            id: "call_caps".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": long_command, "args": [] }),
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 1);
+        let content = &repairs[0].content;
+        // Command head-capped at 500 chars.
+        assert!(content.contains(&"c".repeat(500)), "command head missing");
+        assert!(!content.contains(&"c".repeat(501)), "command not head-capped");
+        // Stderr tail-capped at 1500 chars.
+        assert!(content.contains(&"e".repeat(1500)), "stderr tail missing");
+        assert!(!content.contains(&"e".repeat(1501)), "stderr not tail-capped");
+        assert!(!content.contains("o".repeat(501).as_str()), "stdout must be skipped");
     }
 
     // -----------------------------------------------------------------------

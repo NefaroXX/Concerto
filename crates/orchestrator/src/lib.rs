@@ -51,6 +51,7 @@ pub mod registry;
 pub mod resolver;
 pub mod resolver_integration;
 pub mod resume;
+mod shell_repair;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;
