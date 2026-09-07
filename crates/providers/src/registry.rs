@@ -83,7 +83,11 @@ impl ProviderRegistry {
                     cost_per_1k_tokens,
                     avg_latency_ms,
                     context_window: 8192,
-                    supports_tool_calling: true,
+                    // ADR-66 §3: per-model capability resolution, not a
+                    // hardcoded `true`.
+                    supports_tool_calling: crate::capability::resolve_tool_support(
+                        name, &rp.model, None, None,
+                    ),
                     base_url: None,
                     description: None,
                 }

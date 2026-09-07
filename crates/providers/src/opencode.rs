@@ -6,15 +6,18 @@
 //!   [`OpenAiProvider`] to `POST {base}/chat/completions`.
 //! - **Anthropic models** (`claude-*`): routed via the Anthropic Messages API
 //!   to `POST {base}/messages` with `x-api-key` + `anthropic-version` headers.
-//! - **Muse models** (e.g. `muse-spark-1.2-contributor-free`): routed via the
+//! - **Muse models** (genuine `muse-v*` family members): routed via the
 //!   OpenAI Responses API to `POST {base}/responses`. Muse moved to the
 //!   Responses API upstream and now 500s on both `/chat/completions` and
 //!   `/messages`.
 //!
-//! The dialect is chosen automatically based on the model name: models
-//! containing `"muse"` (case-insensitive) use the Responses API, models
-//! containing `"claude"` use the Anthropic dialect, and everything else uses
-//! OpenAI-compatible chat completions.
+//! The dialect is chosen automatically based on the model name, using whole
+//! family tokens only (ADR-66 §5): models whose `claude` family token
+//! matches use the Anthropic dialect, models matching the Muse family rule
+//! use the Responses API, and everything else uses OpenAI-compatible chat
+//! completions. Substring matches are forbidden — a name merely *containing*
+//! `muse` or `claude` (e.g. `muse-spark-*`, a non-Muse Zen catalog family,
+//! or `claudette-*`) must never route to that family's dialect.
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -33,22 +36,63 @@ use crate::sse::BufferedSseParser;
 /// Default OpenCode Zen API base URL.
 const OPENCODE_ZEN_API_BASE: &str = "https://opencode.ai/zen/v1";
 
+/// Stable capability name used by every ADR-66 capability refusal.
+pub(crate) const TOOL_CALLING_CAPABILITY: &str = "tool_calling";
+
 /// Detect whether a model name requires the Anthropic Messages API dialect.
 ///
 /// Claude models served by the Zen gateway expect the Anthropic wire format
 /// (`POST /messages`, `x-api-key` header, Anthropic SSE events). All other
 /// non-Muse models use the OpenAI-compatible dialect.
-fn needs_anthropic_dialect(model: &str) -> bool {
-    model.to_lowercase().contains("claude")
+///
+/// Family matching is token-based (ADR-66 §5): a hyphen-separated token must
+/// *be* `claude` — a name where `claude` is merely a substring of another
+/// token (`claudette-1`, `declaude`, `claudeify-v2`) never matches.
+pub(crate) fn needs_anthropic_dialect(model: &str) -> bool {
+    tokenize_model_name(model).iter().any(|token| token == "claude")
 }
-
 /// Detect whether a model name requires the OpenAI Responses API dialect.
 ///
 /// Muse models served by the Zen gateway only work via `POST /responses`
 /// (Responses SSE events); they 500 on both `/chat/completions` and
 /// `/messages`.
-fn needs_responses_api(model: &str) -> bool {
-    model.to_lowercase().contains("muse")
+///
+/// Family matching is token-based (ADR-66 §5) and deliberately strict:
+/// a `muse` token alone is NOT sufficient — the token immediately after it
+/// must be a known Muse family segment (a `v`-prefixed version token, e.g.
+/// `v2`, `v2.1`, `v3`). This keeps the non-Muse `muse-spark-*` Zen catalog
+/// family (and any other name merely containing "muse") on the
+/// OpenAI-compatible dialect. The segment rule is the extension point: when
+/// Zen introduces a non-versioned Muse family name, add it to
+/// [`is_muse_family_segment`].
+pub(crate) fn needs_responses_api(model: &str) -> bool {
+    let tokens = tokenize_model_name(model);
+    tokens
+        .iter()
+        .zip(tokens.iter().skip(1))
+        .any(|(token, next)| token == "muse" && is_muse_family_segment(next))
+}
+
+/// Split a model name into lowercase family tokens.
+///
+/// Model ids are hyphen-delimited (`muse-v2`, `claude-sonnet-4`); the
+/// hyphen is the only family separator honored. A token is the whole
+/// dash-delimited word, so substring collisions inside larger tokens are
+/// impossible. Tokens are owned — callers keep them as a standalone list.
+fn tokenize_model_name(model: &str) -> Vec<String> {
+    model.to_ascii_lowercase().split('-').map(str::to_owned).collect()
+}
+
+/// Decide whether the token following a `muse` token identifies a genuine
+/// Muse family member.
+///
+/// Known Muse family segments are version tokens: a leading `v` followed by
+/// at least one ASCII digit (`v2`, `v2.1`, `v3`, `v3-pro`). Everything else
+/// (`spark`, `pro`, `vapor`) is not a known Muse family segment, so
+/// `muse-spark-*` never routes to the Responses dialect.
+fn is_muse_family_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.first() == Some(&b'v') && bytes.get(1).is_some_and(u8::is_ascii_digit)
 }
 
 /// OpenCode Zen provider that automatically selects the correct wire dialect
@@ -184,6 +228,18 @@ impl OpenCodeZenProvider {
         cancel: CancellationToken,
     ) -> Result<CompletionStream, ProviderError> {
         let model = self.resolve_model(&request);
+        // ADR-66 §2(b) fail-loud seam: the Responses body builder carries no
+        // tool declarations at all, so a tool-carrying request routed here
+        // would be silently degraded to text-only. Refuse instead — the
+        // harness routes tool tasks to a capable path (native or the ADR-66
+        // §4 text-fallback driver) or fails before spend.
+        if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err(ProviderError::CapabilityRefused {
+                provider: "opencode".to_string(),
+                model,
+                capability: TOOL_CALLING_CAPABILITY.to_string(),
+            });
+        }
         let span = tracing::info_span!(
             "provider.stream_completion",
             provider = "opencode",
@@ -603,13 +659,51 @@ mod tests {
         assert!(!needs_anthropic_dialect("Muse-Spark-1.2"));
         assert!(!needs_anthropic_dialect("some-muse-model"));
         assert!(needs_responses_api("MUSE-v2"));
+        assert!(needs_responses_api("muse-v2"));
+        assert!(needs_responses_api("muse-v3"));
+        assert!(needs_responses_api("muse-v2.1"));
+        assert!(needs_responses_api("muse-v3-pro"));
     }
 
+    /// ADR-66 §5 regression: the Responses heuristic matches whole Muse
+    /// family tokens only. Every near-miss here was silently misrouted (or
+    /// could be) under the old `contains("muse")` substring match.
     #[test]
-    fn claude_models_need_anthropic_dialect() {
+    fn muse_near_misses_never_route_to_responses() {
+        // The live hazard from ADR-66: muse-spark-* is NOT a Muse family.
+        assert!(!needs_responses_api("muse-spark-1.3-contributor-free"));
+        assert!(!needs_responses_api("Muse-Spark-1.2"));
+        // `muse` inside another token.
+        assert!(!needs_responses_api("some-muse-model"));
+        assert!(!needs_responses_api("amuse-v2"));
+        assert!(!needs_responses_api("museum-2"));
+        assert!(!needs_responses_api("musex-v2"));
+        // `muse-` prefix without a known family segment after it.
+        assert!(!needs_responses_api("muse"));
+        assert!(!needs_responses_api("muse-pro"));
+        assert!(!needs_responses_api("muse-vapor"));
+        assert!(!needs_responses_api("muse-latest"));
+        // Empty / unrelated names stay on the OpenAI-compatible dialect.
+        assert!(!needs_responses_api(""));
+        assert!(!needs_responses_api("big-pickle"));
+        assert!(!needs_responses_api("deepseek-v4-flash-free"));
+    }
+
+    /// ADR-66 §5 regression: the Anthropic heuristic matches the whole
+    /// `claude` family token, never a bare substring.
+    #[test]
+    fn claude_near_misses_never_route_to_anthropic() {
         assert!(needs_anthropic_dialect("claude-3-5-sonnet"));
         assert!(needs_anthropic_dialect("Claude-3-opus"));
         assert!(needs_anthropic_dialect("claude-4"));
+        assert!(needs_anthropic_dialect("claude-sonnet-4"));
+
+        // Substring near-misses must stay on the OpenAI-compatible dialect.
+        assert!(!needs_anthropic_dialect("claudette-1"));
+        assert!(!needs_anthropic_dialect("declaude"));
+        assert!(!needs_anthropic_dialect("claudeify-v2"));
+        assert!(!needs_anthropic_dialect("sub-claudeify"));
+        assert!(!needs_anthropic_dialect(""));
     }
 
     #[test]
@@ -770,5 +864,71 @@ mod tests {
     fn openai_model_body_not_affected_by_anthropic_path() {
         // big-pickle should not trigger the Anthropic path
         assert!(!needs_anthropic_dialect("big-pickle"));
+    }
+
+    /// ADR-66 §2(b) fail-loud seam: a tool-carrying request routed to the
+    /// Responses dialect must error before any network I/O — never silently
+    /// drop the tool declarations.
+    #[tokio::test]
+    async fn responses_path_refuses_tool_declarations() {
+        let p = OpenCodeZenProvider::new("key".into(), "muse-v2".into(), 30);
+        let request = CompletionRequest {
+            model: "muse-v2".into(),
+            messages: vec![concerto_core::types::Message {
+                role: concerto_core::types::Role::User,
+                content: "list files".into(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            tools: Some(vec![concerto_core::types::ToolDefinition {
+                name: "filesystem".into(),
+                description: "File ops.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }]),
+            ..Default::default()
+        };
+        let result = p.stream_completion(request, concerto_core::CancellationToken::new()).await;
+        let Err(error) = result else {
+            panic!("tool-carrying Responses request must be refused");
+        };
+        match error {
+            ProviderError::CapabilityRefused { provider, model, capability } => {
+                assert_eq!(provider, "opencode");
+                assert_eq!(model, "muse-v2");
+                assert_eq!(capability, "tool_calling");
+            }
+            other => panic!("expected CapabilityRefused, got: {other:?}"),
+        }
+    }
+
+    /// A tool-free request to a Muse model does NOT hit the refusal seam
+    /// (the guard must not fire on absent or empty tool lists).
+    #[tokio::test]
+    async fn responses_path_accepts_tool_free_request_guard_only() {
+        let p = OpenCodeZenProvider::with_api_base(
+            "key".into(),
+            "muse-v2".into(),
+            30,
+            // Unroutable local port: the connection fails fast and locally,
+            // keeping this test network-free.
+            "http://127.0.0.1:1".into(),
+        );
+        let request = CompletionRequest {
+            model: "muse-v2".into(),
+            messages: Vec::new(),
+            tools: None,
+            ..Default::default()
+        };
+        let result = p.stream_completion(request, concerto_core::CancellationToken::new()).await;
+        let Err(error) = result else {
+            panic!("no server in tests — the request must fail");
+        };
+        assert!(
+            !matches!(error, ProviderError::CapabilityRefused { .. }),
+            "tool-less request must not be capability-refused: {error:?}"
+        );
     }
 }

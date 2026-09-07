@@ -1689,6 +1689,14 @@ pub struct ModelInfo {
     pub name: Option<String>,
     /// Entity that owns/publishes the model, if available.
     pub owned_by: Option<String>,
+    /// Tool-calling capability **as advertised by the provider's listing
+    /// API** (ADR-66 §3 precedence level 2), when the provider publishes
+    /// such metadata (e.g. Ollama's `capabilities` array containing
+    /// `"tools"`). `None` when the provider does not advertise capability
+    /// flags; resolution then falls through the built-in family table to
+    /// the provider default (see `concerto-providers::capability`).
+    #[serde(default)]
+    pub supports_tool_calling: Option<bool>,
 }
 
 // ---- Phase 8: SandboxProfile --------------------------------------------------

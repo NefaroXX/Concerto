@@ -94,10 +94,20 @@ impl LlmProvider for OllamaProvider {
                 arr.iter()
                     .filter_map(|v| {
                         let name = v["name"].as_str()?;
+                        // ADR-66 §3 level 2: Ollama advertises per-model
+                        // capability flags on `/api/tags` (`capabilities`:
+                        // ["completion", "tools", ...]). `None` when the
+                        // entry carries no capabilities array (older
+                        // servers) — resolution then falls through to the
+                        // family table / provider default.
+                        let supports_tool_calling = v["capabilities"].as_array().map(|caps| {
+                            caps.iter().filter_map(serde_json::Value::as_str).any(|c| c == "tools")
+                        });
                         Some(ModelInfo {
                             id: name.to_string(),
                             name: Some(name.to_string()),
                             owned_by: None,
+                            supports_tool_calling,
                         })
                     })
                     .collect::<Vec<_>>()

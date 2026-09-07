@@ -234,6 +234,26 @@ pub enum ProviderError {
         /// Error message from the final failed attempt.
         last_error: String,
     },
+
+    /// A tool-requiring task was resolved onto a provider/model that cannot
+    /// express tool calls (ADR-66).
+    ///
+    /// Raised at a fail-loud seam — selection (before any spend) or request
+    /// building — whenever a request carrying tool declarations reaches a
+    /// wire path that cannot express them (e.g. the OpenCode Zen Responses
+    /// dialect, plugin providers without tool ops). The refusal names the
+    /// provider, the model, and the missing capability so the failure is
+    /// actionable. Never treated as transient: retrying cannot add a
+    /// capability the wire path lacks.
+    #[error("provider '{provider}' model '{model}' does not support the '{capability}' capability required by this task")]
+    CapabilityRefused {
+        /// The refusing provider (e.g. "opencode", "plugin:my-llm").
+        provider: String,
+        /// The resolved model name.
+        model: String,
+        /// The missing capability (always `"tool_calling"` today).
+        capability: String,
+    },
 }
 
 impl ProviderError {
@@ -257,6 +277,9 @@ impl ProviderError {
             ProviderError::Serialization(_) => false,
             // RetryExhausted is already a terminal retry signal
             ProviderError::RetryExhausted { .. } => false,
+            // A capability refusal is a permanent wire-path fact — retrying
+            // cannot add a capability the path lacks (ADR-66).
+            ProviderError::CapabilityRefused { .. } => false,
             // Everything below here is configuration, auth, or cancellation
             ProviderError::NotConfigured
             | ProviderError::CredentialMissing { .. }
