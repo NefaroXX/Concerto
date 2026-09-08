@@ -20,9 +20,13 @@
 //!    unknown models attempt native first, never silent text).
 //!
 //! The resolution feeds `RoutingProfile::supports_tool_calling` in
-//! [`crate::factory::ProviderFactory::build_profiles`], which the routing
-//! engine's capability filter turns into a fail-fast refusal for
-//! tool-requiring roles — before any spend.
+//! [`crate::factory::ProviderFactory::build_profiles`]. Tool-requiring runs
+//! are gated at selection time — before any spend — but only refused when
+//! the gap cannot be covered by the ADR-66 §4 text-fallback driver
+//! ([`tool_fallback_available`]): a model whose ONLY gap is native tool
+//! declarations proceeds with the labeled fallback driver, while
+//! plugin-backed providers (no tool ops in the protocol, excluded from
+//! fallback) refuse loudly.
 //!
 //! # Not covered by the family table
 //!
@@ -110,6 +114,47 @@ pub fn require_tool_support(
     advertised: Option<bool>,
 ) -> Result<(), concerto_core::error::ProviderError> {
     if resolve_tool_support(provider, model, config_override, advertised) {
+        return Ok(());
+    }
+    Err(concerto_core::error::ProviderError::CapabilityRefused {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        capability: tool_calling_capability().to_string(),
+    })
+}
+
+/// Whether the ADR-66 §4 text-fallback driver can cover a missing native
+/// tool support on `provider`.
+///
+/// The driver is prompt-text-based, so it works over any text completion —
+/// including the Responses SSE path — and its requests carry no wire tool
+/// declarations. The only uncoverable gap is a wire protocol that cannot
+/// carry a text completion's tool instructions at all: plugin-backed
+/// providers (`plugin:<id>`) are excluded from the fallback (ADR-66
+/// decision (a)) and stay hard-gated to AnswerOnly tasks.
+pub fn tool_fallback_available(provider: &str) -> bool {
+    !is_plugin_backed(provider)
+}
+
+/// Refuse a tool-requiring resolution only when no tool path exists at all.
+///
+/// ADR-66 §2(a) with the §4 fallback carve-out (2026-09-08): a model whose
+/// ONLY gap is native tool declarations proceeds — the automatic
+/// text-fallback driver covers it and labels its turns — so a refusal at
+/// selection is reserved for providers the fallback cannot cover
+/// (plugin-backed, decision (a)). Everything else behaves exactly like
+/// [`require_tool_support`]: explicit override and advertised flags
+/// (precedence levels 1–2) still win, and a supported pair passes.
+pub fn require_tool_support_with_fallback(
+    provider: &str,
+    model: &str,
+    config_override: Option<bool>,
+    advertised: Option<bool>,
+) -> Result<(), concerto_core::error::ProviderError> {
+    if resolve_tool_support(provider, model, config_override, advertised) {
+        return Ok(());
+    }
+    if tool_fallback_available(provider) {
         return Ok(());
     }
     Err(concerto_core::error::ProviderError::CapabilityRefused {
@@ -218,5 +263,59 @@ mod tests {
         assert!(require_tool_support("openai", "gpt-4", None, None).is_ok());
         // Explicit override rescues a table-miss.
         assert!(require_tool_support("opencode", "muse-v2", Some(true), None).is_ok());
+    }
+
+    /// The §4 fallback availability: every provider except plugin-backed
+    /// ones is coverable (the driver is prompt-text-based and works over
+    /// any text completion, including the Responses SSE path).
+    #[test]
+    fn fallback_availability_excludes_only_plugins() {
+        assert!(tool_fallback_available("opencode"));
+        assert!(tool_fallback_available("openai"));
+        assert!(tool_fallback_available("ollama"));
+        assert!(tool_fallback_available(""));
+        assert!(!tool_fallback_available("plugin:my-llm"));
+    }
+
+    /// ADR-66 §2(a) + §4 carve-out: a tool-requiring run on a model whose
+    /// ONLY gap is native tool declarations proceeds (the labeled fallback
+    /// driver covers it — muse-spark-* on Zen is the live case), while a
+    /// plugin-backed gap refuses loudly (decision (a)) with the full
+    /// provider/model/capability naming. Precedence levels 1–2 are
+    /// untouched.
+    #[test]
+    fn gate_with_fallback_refuses_only_uncoverable_gaps() {
+        // Responses-dialect models on Zen proceed via the fallback driver.
+        assert!(require_tool_support_with_fallback("opencode", "muse-v2", None, None).is_ok());
+        assert!(require_tool_support_with_fallback(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            None,
+            None
+        )
+        .is_ok());
+        // Capable pairs pass as before.
+        assert!(require_tool_support_with_fallback("openai", "gpt-4", None, None).is_ok());
+        // Plugin-backed gap: refused, naming everything.
+        let error = require_tool_support_with_fallback("plugin:my-llm", "any", None, None)
+            .expect_err("plugin providers stay hard-gated (ADR-66 decision (a))");
+        match error {
+            concerto_core::error::ProviderError::CapabilityRefused {
+                provider,
+                model,
+                capability,
+            } => {
+                assert_eq!(provider, "plugin:my-llm");
+                assert_eq!(model, "any");
+                assert_eq!(capability, "tool_calling");
+            }
+            other => panic!("expected CapabilityRefused, got: {other:?}"),
+        }
+        // Precedence levels 1–2 unchanged: override and advertised flags win.
+        assert!(require_tool_support_with_fallback("opencode", "muse-v2", Some(true), None).is_ok());
+        assert!(require_tool_support_with_fallback("opencode", "muse-v2", None, Some(true)).is_ok());
+        assert!(
+            require_tool_support_with_fallback("plugin:my-llm", "any", Some(true), None).is_ok()
+        );
     }
 }
