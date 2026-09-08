@@ -3265,17 +3265,24 @@ pub async fn run_shared_agent(
     // mode picker.
     let action_required = task_action_required(effective_outcome, gate_read_only);
 
-    // ADR-66 §2(a) fail-fast selection gate: a tool-requiring run (Execute,
-    // or Plan — which runs the full coordinator at planning-only depth)
-    // resolved onto a provider/model without native tool support is a hard
-    // error BEFORE any agent spend. The refusal names provider, model, and
-    // the missing capability, and is audited (`capability_gate` / Refused)
-    // so it is observable — never a silent text-only run. The resolution
-    // follows the ADR-66 §3 precedence: explicit config override first,
-    // then the built-in family table, then the provider default.
+    // ADR-66 §2(a) selection gate with the §4 fallback carve-out (2026-09-08
+    // correction): a tool-requiring run (Execute, or Plan — which runs the
+    // full coordinator at planning-only depth) is refused BEFORE any agent
+    // spend only when no tool path exists at all. A model whose ONLY gap is
+    // native tool declarations proceeds — the automatic ADR-66 §4
+    // text-fallback driver covers it with labeled turns (events +
+    // `tool_driver` audit rows), and the driver's requests carry no wire
+    // tool declarations so the Responses-path request-build seam never
+    // fires on a fallback-driven turn. Refusal is reserved for providers the
+    // fallback cannot cover: plugin-backed providers (decision (a) — no tool
+    // ops in the protocol, excluded from the fallback), audited
+    // (`capability_gate` / Refused) and naming provider, model, and the
+    // missing capability. The resolution follows the ADR-66 §3 precedence:
+    // explicit config override first, then the built-in family table, then
+    // the provider default.
     if action_required || effective_outcome == RequestedOutcome::Plan {
         let override_flag = tool_support_override(&services.config, provider_config_id.as_deref());
-        if let Err(refusal) = concerto_providers::capability::require_tool_support(
+        if let Err(refusal) = concerto_providers::capability::require_tool_support_with_fallback(
             provider.provider_name(),
             &model,
             override_flag,
@@ -5083,35 +5090,56 @@ mod runtime_runner_tests {
         assert_eq!(router_row_correlation_id(Some(shared)), shared);
     }
 
-    /// ADR-66 §3: the selection-time tool-capability gate refuses a
-    /// tool-requiring run resolved onto a model without tool support (the
-    /// built-in family table: Zen-served genuine Muse models), passes for
-    /// near-misses and defaults, and honors the explicit-config override
-    /// (precedence level 1).
+    /// ADR-66 §2(a) + §4: the selection gate refuses a tool-requiring run
+    /// only when no tool path exists at all — plugin-backed providers
+    /// (decision (a)). Models whose ONLY gap is native tool declarations
+    /// (the Zen Responses dialect: genuine Muse models and `muse-spark-*`
+    /// via the explicit prefix entry) PROCEED via the labeled §4 fallback
+    /// driver instead of being refused. Precedence level 1 (the
+    /// explicit-config override) is unchanged.
     #[test]
-    fn selection_gate_refuses_tool_requiring_runs_without_tool_support() {
-        // Genuine Muse model on Zen → refused, naming everything.
-        let error =
-            concerto_providers::capability::require_tool_support("opencode", "muse-v2", None, None)
-                .expect_err("Muse models have no tool support");
-        match error {
-            ProviderError::CapabilityRefused { ref provider, ref model, ref capability } => {
-                assert_eq!(provider, "opencode");
-                assert_eq!(model, "muse-v2");
-                assert_eq!(capability, "tool_calling");
-            }
-            other => panic!("expected CapabilityRefused, got: {other:?}"),
-        }
-        // Near-miss keeps the provider default → allowed.
-        assert!(concerto_providers::capability::require_tool_support(
+    fn selection_gate_refuses_only_uncoverable_tool_gaps() {
+        // Responses-dialect models on Zen: no native tool declarations, but
+        // the fallback driver covers them → the gate proceeds (Execute runs
+        // on muse-spark-* must not be refused).
+        assert!(concerto_providers::capability::require_tool_support_with_fallback(
             "opencode",
             "muse-spark-1.3-contributor-free",
             None,
             None,
         )
         .is_ok());
+        assert!(concerto_providers::capability::require_tool_support_with_fallback(
+            "opencode", "muse-v2", None, None
+        )
+        .is_ok());
+        // Plugin-backed gap: refused, naming everything (decision (a)).
+        let error = concerto_providers::capability::require_tool_support_with_fallback(
+            "plugin:my-llm",
+            "any",
+            None,
+            None,
+        )
+        .expect_err("plugin providers stay hard-gated for tool tasks");
+        match &error {
+            ProviderError::CapabilityRefused { provider, model, capability } => {
+                assert_eq!(provider, "plugin:my-llm");
+                assert_eq!(model, "any");
+                assert_eq!(capability, "tool_calling");
+            }
+            other => panic!("expected CapabilityRefused, got: {other:?}"),
+        }
         // The refusal is permanent: retrying cannot add the capability.
         assert!(!error.is_transient());
+        // The pure §2(a) primitive (no fallback carve-out) still refuses
+        // the Responses-dialect models — the carve-out is the gate's choice.
+        assert!(concerto_providers::capability::require_tool_support(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            None,
+            None,
+        )
+        .is_err());
     }
 
     /// ADR-66 §3 precedence level 1: `tool_support_override` reads the

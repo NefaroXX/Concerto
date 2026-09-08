@@ -6,18 +6,25 @@
 //!   [`OpenAiProvider`] to `POST {base}/chat/completions`.
 //! - **Anthropic models** (`claude-*`): routed via the Anthropic Messages API
 //!   to `POST {base}/messages` with `x-api-key` + `anthropic-version` headers.
-//! - **Muse models** (genuine `muse-v*` family members): routed via the
-//!   OpenAI Responses API to `POST {base}/responses`. Muse moved to the
-//!   Responses API upstream and now 500s on both `/chat/completions` and
-//!   `/messages`.
+//! - **Responses-API models** (genuine `muse-v*` family members, plus
+//!   explicit entries like `muse-spark-*`): routed via the OpenAI Responses
+//!   API to `POST {base}/responses`. These models 500 on both
+//!   `/chat/completions` and `/messages` upstream.
 //!
-//! The dialect is chosen automatically based on the model name, using whole
-//! family tokens only (ADR-66 §5): models whose `claude` family token
-//! matches use the Anthropic dialect, models matching the Muse family rule
-//! use the Responses API, and everything else uses OpenAI-compatible chat
-//! completions. Substring matches are forbidden — a name merely *containing*
-//! `muse` or `claude` (e.g. `muse-spark-*`, a non-Muse Zen catalog family,
-//! or `claudette-*`) must never route to that family's dialect.
+//! The dialect is chosen per model id. The governing principle is
+//! **behavior over taxonomy** (ADR-66 §5 correction, 2026-09-08): the wire
+//! dialect follows what the endpoint *does*, not which family a model name
+//! resembles. Concretely, in precedence order:
+//!
+//! 1. **Explicit full-id prefix entries** ([`RESPONSES_API_MODEL_PREFIXES`])
+//!    — endpoint behavior observed live (0d511f1: `muse-spark-*` 500s on
+//!    `/chat/completions` and only works via `/responses`), even though the
+//!    name is not a Muse family member.
+//! 2. **Whole family tokens** (ADR-66 §5) — the `claude` token selects the
+//!    Anthropic dialect, the Muse rule (`muse` + version segment) selects
+//!    the Responses API. Substring matches are forbidden — a name merely
+//!    *containing* `muse` or `claude` (e.g. `claudette-*`, `some-muse-model`)
+//!    never routes to that family's dialect without an explicit entry.
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -53,25 +60,46 @@ pub(crate) fn needs_anthropic_dialect(model: &str) -> bool {
 }
 /// Detect whether a model name requires the OpenAI Responses API dialect.
 ///
-/// Muse models served by the Zen gateway only work via `POST /responses`
-/// (Responses SSE events); they 500 on both `/chat/completions` and
-/// `/messages`.
+/// The dialect follows **endpoint behavior, not family taxonomy** (ADR-66
+/// §5 correction): models in [`RESPONSES_API_MODEL_PREFIXES`] are served
+/// only via `POST /responses` — they 500 on both `/chat/completions` and
+/// `/messages` — regardless of what family their name suggests. Genuine
+/// Muse family members (`muse` followed by a `v`-prefixed version segment,
+/// e.g. `muse-v2`, `muse-v2.1`, `v3-pro`) hit the same upstream behavior
+/// and are matched by the token rule.
 ///
-/// Family matching is token-based (ADR-66 §5) and deliberately strict:
-/// a `muse` token alone is NOT sufficient — the token immediately after it
-/// must be a known Muse family segment (a `v`-prefixed version token, e.g.
-/// `v2`, `v2.1`, `v3`). This keeps the non-Muse `muse-spark-*` Zen catalog
-/// family (and any other name merely containing "muse") on the
-/// OpenAI-compatible dialect. The segment rule is the extension point: when
-/// Zen introduces a non-versioned Muse family name, add it to
-/// [`is_muse_family_segment`].
+/// The token rule stays deliberately strict (ADR-66 §5): a `muse` token
+/// alone is NOT sufficient — the token immediately after it must be a
+/// `v`-prefixed version token. Names that merely contain "muse"
+/// (`some-muse-model`, `amuse-v2`, `museum-2`) never match the token rule;
+/// they only take the Responses path via an explicit prefix entry, and only
+/// when endpoint behavior justifies it.
 pub(crate) fn needs_responses_api(model: &str) -> bool {
+    // Explicit full-id prefix entries override the token heuristic: they
+    // encode observed endpoint behavior (0d511f1), not name taxonomy.
+    let lowered = model.to_ascii_lowercase();
+    if RESPONSES_API_MODEL_PREFIXES.iter().any(|prefix| lowered.starts_with(prefix)) {
+        return true;
+    }
     let tokens = tokenize_model_name(model);
     tokens
         .iter()
         .zip(tokens.iter().skip(1))
         .any(|(token, next)| token == "muse" && is_muse_family_segment(next))
 }
+
+/// Explicit Responses-API dialect overrides, keyed by **full model-id
+/// prefix** (matched case-insensitively against the whole model id).
+///
+/// These entries exist because the wire dialect follows endpoint behavior,
+/// not family taxonomy (ADR-66 §5 correction, 2026-09-08): Zen's
+/// `muse-spark-*` catalog family is not Muse, but its models 500 on
+/// `/chat/completions` and only work via `POST /responses` (the original
+/// fix, 0d511f1). Entries are exact prefixes with a trailing `-` so they
+/// respect token boundaries (`muse-sparkless` must not match). Add an entry
+/// only for an observed upstream endpoint behavior, never for a name
+/// resemblance.
+pub(crate) const RESPONSES_API_MODEL_PREFIXES: &[&str] = &["muse-spark-"];
 
 /// Split a model name into lowercase family tokens.
 ///
@@ -88,8 +116,9 @@ fn tokenize_model_name(model: &str) -> Vec<String> {
 ///
 /// Known Muse family segments are version tokens: a leading `v` followed by
 /// at least one ASCII digit (`v2`, `v2.1`, `v3`, `v3-pro`). Everything else
-/// (`spark`, `pro`, `vapor`) is not a known Muse family segment, so
-/// `muse-spark-*` never routes to the Responses dialect.
+/// (`spark`, `pro`, `vapor`) is not a known Muse family segment, so such
+/// names only reach the Responses dialect through an explicit
+/// [`RESPONSES_API_MODEL_PREFIXES`] entry — never via name resemblance.
 fn is_muse_family_segment(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     bytes.first() == Some(&b'v') && bytes.get(1).is_some_and(u8::is_ascii_digit)
@@ -143,8 +172,9 @@ impl OpenCodeZenProvider {
     ///
     /// Applies to both wire paths: the Anthropic Messages path handled here
     /// and the OpenAI-compatible path delegated to the inner provider. The
-    /// Responses API path (Muse models) carries no tool declarations at all,
-    /// so there is nothing to adapt there.
+    /// Responses API path (Responses-dialect models, e.g. Muse and
+    /// `muse-spark-*`) carries no tool declarations at all, so there is
+    /// nothing to adapt there.
     ///
     /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
     /// tool-calling models (name heuristic) get loose schemas and the
@@ -172,7 +202,7 @@ impl OpenCodeZenProvider {
         dialect.render_chat_body(request, model, ReasoningEcho::IfPresent)
     }
 
-    /// Build the Responses API request body for Muse models.
+    /// Build the Responses API request body for Responses-dialect models.
     ///
     /// Uses the easy input format: an array of `{role, content}` items, with
     /// system messages carried as instructions.
@@ -219,9 +249,10 @@ impl OpenCodeZenProvider {
 
     /// Stream a completion using the OpenAI Responses API dialect.
     ///
-    /// This path handles Muse models, which the Zen gateway serves only via
-    /// `POST /responses` with Responses SSE events (`response.output_text.delta`,
-    /// `response.completed`, etc.).
+    /// This path handles Responses-dialect models (genuine Muse models and
+    /// explicit prefix entries like `muse-spark-*`), which the Zen gateway
+    /// serves only via `POST /responses` with Responses SSE events
+    /// (`response.output_text.delta`, `response.completed`, etc.).
     async fn stream_completion_responses(
         &self,
         request: CompletionRequest,
@@ -655,6 +686,8 @@ mod tests {
 
     #[test]
     fn muse_models_use_the_responses_dialect() {
+        // muse-spark-* routes via the explicit prefix entry (Responses), so
+        // it must not take the Anthropic dialect either.
         assert!(!needs_anthropic_dialect("muse-spark-1.2-contributor-free"));
         assert!(!needs_anthropic_dialect("Muse-Spark-1.2"));
         assert!(!needs_anthropic_dialect("some-muse-model"));
@@ -665,20 +698,39 @@ mod tests {
         assert!(needs_responses_api("muse-v3-pro"));
     }
 
-    /// ADR-66 §5 regression: the Responses heuristic matches whole Muse
-    /// family tokens only. Every near-miss here was silently misrouted (or
-    /// could be) under the old `contains("muse")` substring match.
+    /// ADR-66 §5 correction (2026-09-08): the wire dialect follows endpoint
+    /// behavior, not family taxonomy. `muse-spark-*` is not a Muse family
+    /// member, but the Zen gateway 500s on `/chat/completions` and only
+    /// serves it via `POST /responses` (the original fix, 0d511f1) — the
+    /// explicit full-id prefix entry overrides the token heuristic.
+    #[test]
+    fn responses_prefix_table_routes_muse_spark_by_endpoint_behavior() {
+        assert!(
+            needs_responses_api("muse-spark-1.3-contributor-free"),
+            "explicit prefix entry: muse-spark-* 500s on /chat/completions"
+        );
+        // Siblings and case-insensitivity of the full-id prefix match.
+        assert!(needs_responses_api("Muse-Spark-1.2"));
+        assert!(needs_responses_api("muse-spark-1.3"));
+        // The entry respects token boundaries: a longer name that merely
+        // starts with the prefix's characters (minus the trailing `-`)
+        // stays on the OpenAI-compatible dialect.
+        assert!(!needs_responses_api("muse-sparkless"));
+    }
+
+    /// ADR-66 §5 regression: the Responses token heuristic matches whole
+    /// Muse family tokens only. Every near-miss here stays on the
+    /// OpenAI-compatible dialect — no explicit prefix entry covers them, so
+    /// name resemblance alone must never select the Responses dialect.
     #[test]
     fn muse_near_misses_never_route_to_responses() {
-        // The live hazard from ADR-66: muse-spark-* is NOT a Muse family.
-        assert!(!needs_responses_api("muse-spark-1.3-contributor-free"));
-        assert!(!needs_responses_api("Muse-Spark-1.2"));
         // `muse` inside another token.
         assert!(!needs_responses_api("some-muse-model"));
         assert!(!needs_responses_api("amuse-v2"));
         assert!(!needs_responses_api("museum-2"));
         assert!(!needs_responses_api("musex-v2"));
-        // `muse-` prefix without a known family segment after it.
+        // `muse-` prefix without a known family segment after it and
+        // without an explicit prefix entry.
         assert!(!needs_responses_api("muse"));
         assert!(!needs_responses_api("muse-pro"));
         assert!(!needs_responses_api("muse-vapor"));

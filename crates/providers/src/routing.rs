@@ -296,7 +296,16 @@ impl RoutingEngine {
 
     fn profile_meets_requirements(&self, role: &AgentId, profile: &RoutingProfile) -> bool {
         match self.required_capability(role) {
-            Some("tool_calling") => profile.supports_tool_calling,
+            // ADR-66 §2(a) with the §4 carve-out (2026-09-08): a model whose
+            // ONLY gap is native tool declarations meets tool-calling
+            // requirements when the automatic text-fallback driver can cover
+            // the gap (non-plugin providers) — the driver engages with
+            // labeled turns, so dispatch proceeds instead of refusing.
+            // Plugin-backed providers stay hard-gated (decision (a)).
+            Some("tool_calling") => {
+                profile.supports_tool_calling
+                    || crate::capability::tool_fallback_available(&profile.provider)
+            }
             _ => true,
         }
     }
@@ -601,6 +610,9 @@ mod tests {
     fn pinned_model_missing_required_capability_errors() {
         let mut profile = mock_profile("text-only", 0.001);
         profile.supports_tool_calling = false;
+        // Plugin-backed providers are excluded from the §4 fallback
+        // (decision (a)), so their capability gap refuses loudly.
+        profile.provider = "plugin:tools-less".into();
         let spend_tracker = Arc::new(SpendTracker::default());
         let mut pins = HashMap::new();
         pins.insert(coder(), "text-only".to_string());
@@ -614,12 +626,43 @@ mod tests {
         assert!(matches!(result, Err(OrchestratorError::PinnedModelMissingCapability { .. })));
     }
 
+    /// ADR-66 §4 carve-out (2026-09-08): a pinned model whose ONLY gap is
+    /// native tool declarations meets tool-calling requirements on a
+    /// non-plugin provider — the labeled fallback driver covers it. This is
+    /// the muse-spark-on-Zen coordinator-dispatch case: the run pins the
+    /// model for every role, and dispatch must proceed via fallback rather
+    /// than refuse.
+    #[test]
+    fn pinned_fallback_covered_model_meets_tool_requirements() {
+        let mut profile = mock_profile("muse-spark-1.3-contributor-free", 0.001);
+        profile.supports_tool_calling = false;
+        profile.provider = "opencode".into();
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let mut pins = HashMap::new();
+        pins.insert(coder(), "muse-spark-1.3-contributor-free".to_string());
+        let engine = RoutingEngine::new(
+            vec![profile],
+            spend_tracker,
+            ModelPinConfig { pins, ..Default::default() },
+            EventBus::default(),
+        );
+        let result = engine.select(&coder(), None, TaskId::new());
+        assert!(
+            result.is_ok(),
+            "fallback-coverable gaps must not refuse dispatch: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().model, "muse-spark-1.3-contributor-free");
+    }
+
     #[test]
     fn custom_tool_calling_roles_are_enforced() {
-        // A single non-tool-calling profile exercises both the pinned and
+        // A single plugin-backed non-tool-calling profile (excluded from
+        // the §4 fallback, decision (a)) exercises both the pinned and
         // unassigned rejection paths, plus the legacy-set exemption.
         let mut text_only = mock_profile("text-only", 0.001);
         text_only.supports_tool_calling = false;
+        text_only.provider = "plugin:tools-less".into();
         let copilot = AgentId::new("copilot");
 
         let engine_with_roles = |profiles: Vec<RoutingProfile>| {
@@ -661,9 +704,11 @@ mod tests {
     #[test]
     fn legacy_tool_calling_roles_still_enforced_when_unset() {
         // Plain `new()` keeps the legacy defaults: "coder" requires
-        // tool_calling (pinned path), "architect" does not.
+        // tool_calling (pinned path), "architect" does not. The profile is
+        // plugin-backed, so the §4 fallback cannot cover its gap.
         let mut text_only = mock_profile("text-only", 0.001);
         text_only.supports_tool_calling = false;
+        text_only.provider = "plugin:tools-less".into();
 
         let mut pins = HashMap::new();
         pins.insert(coder(), "text-only".to_string());
@@ -772,18 +817,38 @@ mod tests {
 
     #[test]
     fn cheapest_respects_tool_calling() {
+        // A cheaper profile with an uncoverable capability gap (plugin
+        // providers are excluded from the §4 fallback, decision (a)) must
+        // not win a tool-calling role.
         let mut no_tools = mock_profile("no-tools", 0.0001);
         no_tools.supports_tool_calling = false;
+        no_tools.provider = "plugin:tools-less".into();
         let profiles = vec![no_tools, mock_profile("with-tools", 0.005)];
         let engine = mock_engine(profiles);
         let result = engine.select(&coder(), None, TaskId::new()).unwrap();
         assert_eq!(result.model, "with-tools");
     }
 
+    /// ADR-66 §4 carve-out: a cheaper non-plugin profile without native
+    /// tool support is eligible for tool-calling roles — the labeled
+    /// fallback driver covers the gap, so cost-based selection proceeds.
+    #[test]
+    fn cheapest_fallback_covered_profile_is_eligible_for_tool_roles() {
+        let mut no_tools = mock_profile("no-native-tools", 0.0001);
+        no_tools.supports_tool_calling = false;
+        let profiles = vec![no_tools, mock_profile("with-tools", 0.005)];
+        let engine = mock_engine(profiles);
+        let result = engine.select(&coder(), None, TaskId::new()).unwrap();
+        assert_eq!(result.model, "no-native-tools");
+    }
+
     #[test]
     fn cheapest_returns_none_when_no_compatible() {
+        // Plugin-backed gap: uncovered by the fallback → no compatible
+        // profile for a tool-calling role.
         let mut no_tools = mock_profile("no-tools", 0.001);
         no_tools.supports_tool_calling = false;
+        no_tools.provider = "plugin:tools-less".into();
         let engine = mock_engine(vec![no_tools]);
         let task_id = TaskId::new();
         let result = engine.select(&coder(), None, task_id);
@@ -842,11 +907,25 @@ mod tests {
 
     #[test]
     fn fallback_to_default_requires_capability() {
+        // The tier-1 default is plugin-backed: its capability gap is not
+        // fallback-coverable, so the ladder cannot resolve onto it.
         let mut text_only = mock_profile("text-only", 0.001);
         text_only.supports_tool_calling = false;
+        text_only.provider = "plugin:tools-less".into();
         let engine = mock_engine_with_default(vec![text_only], Some("text-only"), None);
         let result = engine.fallback_to_default(&coder());
         assert!(matches!(result, Err(OrchestratorError::PinnedModelNotFound { .. })));
+    }
+
+    /// ADR-66 §4 carve-out: a non-plugin default without native tool
+    /// support is ladder-eligible — the fallback driver covers the gap.
+    #[test]
+    fn fallback_to_default_allows_fallback_covered_models() {
+        let mut text_only = mock_profile("text-only", 0.001);
+        text_only.supports_tool_calling = false;
+        let engine = mock_engine_with_default(vec![text_only], Some("text-only"), None);
+        let result = engine.fallback_to_default(&coder()).unwrap();
+        assert_eq!(result.model, "text-only");
     }
 
     #[test]

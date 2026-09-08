@@ -3972,6 +3972,53 @@ mod tests {
         );
     }
 
+    /// ADR-66 §5 correction (2026-09-08): `muse-spark-*` rides the explicit
+    /// Responses dialect prefix entry, so it resolves to no NATIVE tool
+    /// support — but its tool-requiring run must PROCEED via the labeled §4
+    /// fallback driver (never refused at selection, never silently
+    /// text-only), exactly like the genuine Muse models. The driver is
+    /// prompt-text-based, so it works over the Responses SSE path.
+    #[tokio::test]
+    async fn responses_dialect_model_completes_tool_task_via_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let block = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"spark-fallback.txt\", \"content\": \"via spark fallback\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            block.to_string(),
+            "Done — wrote the file via the text driver.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-spark-1.3-contributor-free".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write a file on muse-spark");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(
+            result.is_ok(),
+            "a Responses-path model's tool task must proceed via fallback: {:?}",
+            result.err()
+        );
+        let output = result.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the fallback-driven task must complete: {}",
+            output.final_message
+        );
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("spark-fallback.txt")),
+            "files_modified should include the fallback-written path"
+        );
+        let written = dir.path().join("spark-fallback.txt");
+        assert!(written.exists(), "the file must be materialized on disk");
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "via spark fallback");
+        assert!(
+            !provider.saw_wire_tools.load(Ordering::SeqCst),
+            "Responses-path fallback turns must never carry wire tool declarations"
+        );
+    }
+
     /// ADR-66 A5: a malformed tool-call block is repaired by re-prompting —
     /// the model sees its own defect plus the format instruction and the
     /// next reply parses. The repair never executes the malformed turn.
