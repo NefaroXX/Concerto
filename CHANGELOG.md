@@ -26,8 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
-- **Negation veto false-positive (`concerto-core`):** the read-only
-
 - **Evidence spine (ADR-65):** multi-agent runs are grounded in a single
   append-only whiteboard evidence chain — runtime-written tool facts with agent
   attribution, a deterministic workspace-snapshot readiness barrier, safe read
@@ -134,7 +132,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Daily-total spend output stubbed (field present, always `None`) until daily
   tracking is enabled
 
-### Fixed
+- **muse-spark Zen 500 regression:** `muse-spark-*` is routed to the Responses
+  API again via an explicit full-id prefix table (wire dialect follows
+  endpoint behavior, not family taxonomy — ADR-66 §5/A2 corrected in place);
+  tool-requiring runs on fallback-coverable models proceed via the labeled
+  fallback driver instead of being refused, while the plugin hard gate is
+  unchanged.
 - **Silent tool-call degradation removed (ADR-66):** tool-requiring runs
   either drive tools or fail loud naming provider/model/capability — never
   silent text. Per-model capability resolution (config override > advertised
