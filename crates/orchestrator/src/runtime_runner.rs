@@ -5085,9 +5085,10 @@ mod runtime_runner_tests {
 
     /// ADR-66 §3: the selection-time tool-capability gate refuses a
     /// tool-requiring run resolved onto a model without tool support (the
-    /// built-in family table: Zen-served genuine Muse models), passes for
-    /// near-misses and defaults, and honors the explicit-config override
-    /// (precedence level 1).
+    /// built-in family table: Zen-served Responses-dialect models —
+    /// genuine Muse models and `muse-spark-*` via the explicit dialect
+    /// prefix entry), passes for name-only near-misses and defaults, and
+    /// honors the explicit-config override (precedence level 1).
     #[test]
     fn selection_gate_refuses_tool_requiring_runs_without_tool_support() {
         // Genuine Muse model on Zen → refused, naming everything.
@@ -5102,14 +5103,17 @@ mod runtime_runner_tests {
             }
             other => panic!("expected CapabilityRefused, got: {other:?}"),
         }
-        // Near-miss keeps the provider default → allowed.
+        // muse-spark-* rides the explicit Responses dialect entry (ADR-66 §5
+        // correction): no native tool support → the pure §2(a) check refuses
+        // it too. The §4 fallback carve-out for such models lands with the
+        // gate predicate change.
         assert!(concerto_providers::capability::require_tool_support(
             "opencode",
             "muse-spark-1.3-contributor-free",
             None,
             None,
         )
-        .is_ok());
+        .is_err());
         // The refusal is permanent: retrying cannot add the capability.
         assert!(!error.is_transient());
     }

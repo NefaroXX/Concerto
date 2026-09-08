@@ -839,9 +839,10 @@ mod tests {
 
     /// ADR-66 §3: `build_profiles` resolves `supports_tool_calling` per
     /// model — a Zen-served genuine Muse model (Responses dialect, no tool
-    /// declarations) resolves to `false`, while the `muse-spark-*`
-    /// near-miss keeps the provider default (`true`, OpenAI-compatible
-    /// dialect with native tools).
+    /// declarations) resolves to `false`, and so does the `muse-spark-*`
+    /// family via the explicit Responses dialect prefix entry (ADR-66 §5
+    /// correction: endpoint behavior, not taxonomy). Other providers keep
+    /// the provider default.
     #[test]
     fn build_profiles_resolves_tool_support_per_model() {
         let settings = ModelSettings {
@@ -876,8 +877,8 @@ mod tests {
         };
         assert!(!by_id("zen-muse").supports_tool_calling, "genuine Muse has no tool support");
         assert!(
-            by_id("zen-spark").supports_tool_calling,
-            "muse-spark near-miss keeps the OpenAI-compatible default"
+            !by_id("zen-spark").supports_tool_calling,
+            "muse-spark-* rides the explicit Responses dialect entry: no NATIVE tool declarations"
         );
         assert!(by_id("openai-main").supports_tool_calling);
     }

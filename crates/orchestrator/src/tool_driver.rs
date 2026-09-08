@@ -1,7 +1,8 @@
 //! Universal text-fallback tool driver (ADR-66 §4).
 //!
 //! Providers whose wire path cannot express tool declarations (e.g.
-//! Zen-served genuine `muse-v*` models on the Responses dialect) must never
+//! Zen-served Responses-dialect models — genuine `muse-v*` models and
+//! `muse-spark-*` via the explicit dialect prefix entry) must never
 //! silently degrade a tool-requiring task to text-only output. This module
 //! implements the harness-level prompt-based driver that engages
 //! **automatically** for such providers: tool schemas are injected into the
@@ -242,6 +243,12 @@ struct ParsedCall {
 /// AnswerOnly tasks with an explicit error (decision (a)), so the fallback
 /// must not bypass that gate. Unknown models attempt native first and are
 /// never fallback-driven from selection time.
+///
+/// Responses-dialect models (genuine `muse-v*` and `muse-spark-*` via the
+/// explicit dialect prefix entry, ADR-66 §5 correction) resolve to no
+/// native tool support, so the driver engages for them: it is
+/// prompt-text-based and works over any text completion, including the
+/// Responses SSE path.
 pub fn fallback_engaged(provider: &str, model: &str) -> bool {
     if concerto_providers::capability::is_plugin_backed(provider) {
         return false;
@@ -470,15 +477,18 @@ mod tests {
     }
 
     /// ADR-66 §4 engagement: engages for known tool-less families
-    /// (Zen-served Muse models), never for plugin providers (hard gate,
-    /// decision (a)), never for capable models, and never for near-misses.
+    /// (Zen-served Responses-dialect models — genuine Muse models and
+    /// `muse-spark-*` via the explicit prefix entry), never for plugin
+    /// providers (hard gate, decision (a)), never for capable models, and
+    /// never for near-misses without an explicit entry.
     #[test]
     fn fallback_engagement_follows_capability_resolution() {
         assert!(fallback_engaged("opencode", "muse-v2"));
         assert!(fallback_engaged("opencode", "muse-v3"));
         assert!(
-            !fallback_engaged("opencode", "muse-spark-1.3-contributor-free"),
-            "the ADR-66 near-miss keeps native (OpenAI-compatible) tools"
+            fallback_engaged("opencode", "muse-spark-1.3-contributor-free"),
+            "muse-spark-* rides the explicit Responses dialect entry: no native \
+             tool declarations, so the labeled fallback driver covers it"
         );
         assert!(!fallback_engaged("openai", "gpt-4o"));
         assert!(!fallback_engaged("anthropic", "claude-sonnet-4"));
@@ -488,5 +498,8 @@ mod tests {
         );
         // Unknown models attempt native first (provider default).
         assert!(!fallback_engaged("opencode", "big-pickle"));
+        // Name-only near-misses without an explicit dialect entry keep
+        // native tools (provider default).
+        assert!(!fallback_engaged("opencode", "some-muse-model"));
     }
 }

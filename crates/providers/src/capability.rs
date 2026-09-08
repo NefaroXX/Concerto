@@ -12,8 +12,10 @@
 //!    per-model capability metadata (e.g. Ollama's `capabilities` array),
 //!    the advertised value wins over every heuristic below;
 //! 3. **built-in family table** — known model families with known
-//!    capability gaps (today: Zen-served genuine `muse-v*` models, whose
-//!    Responses dialect carries no tool declarations);
+//!    capability gaps (today: Zen-served Responses-dialect models —
+//!    genuine `muse-v*` models plus `muse-spark-*` via the explicit
+//!    dialect prefix entry — whose Responses path carries no tool
+//!    declarations);
 //! 4. **provider default** — attempt native tool calling (ADR-66 §3:
 //!    unknown models attempt native first, never silent text).
 //!
@@ -51,9 +53,11 @@ pub fn is_plugin_backed(provider: &str) -> bool {
 ///
 /// Returns `Some(supports)` when the family is known, `None` when the model
 /// is not in the table (the caller falls through to the provider default).
-/// ADR-66 §5: family membership is decided by whole family tokens — the
-/// Muse rule reuses the dialect heuristic, which never matches
-/// `muse-spark-*` near-misses.
+/// ADR-66 §5 (corrected 2026-09-08): the Zen Muse rule reuses the dialect
+/// heuristic, so it covers every Responses-dialect model — the genuine
+/// `muse-v*` token rule plus `muse-spark-*` via the explicit full-id prefix
+/// entry — while name-only near-misses (`some-muse-model`, `amuse-v2`, …)
+/// stay outside the table.
 pub fn family_table_supports_tools(provider: &str, model: &str) -> Option<bool> {
     match provider {
         // Zen-served genuine Muse models use the Responses API dialect,
@@ -141,20 +145,27 @@ mod tests {
         assert!(!provider_default_supports_tools("plugin:my-llm"));
     }
 
-    /// Family table: genuine Zen-served Muse models have no tool support
-    /// (Responses dialect carries no tool declarations); near-misses are
-    /// not in the family and keep the provider default.
+    /// Family table: Zen-served Responses-dialect models have no native
+    /// tool support (the Responses path carries no tool declarations);
+    /// name-only near-misses are not in the family and keep the provider
+    /// default.
     #[test]
     fn family_table_covers_muse_and_not_its_near_misses() {
         assert_eq!(family_table_supports_tools("opencode", "muse-v2"), Some(false));
         assert_eq!(family_table_supports_tools("opencode", "muse-v3.1"), Some(false));
-        // The live hazard from ADR-66 must NOT classify as Muse.
+        // muse-spark-* rides the explicit Responses dialect prefix entry
+        // (ADR-66 §5 correction: endpoint behavior, not taxonomy), so it
+        // resolves to no NATIVE tool support like the genuine Muse models.
         assert_eq!(
             family_table_supports_tools("opencode", "muse-spark-1.3-contributor-free"),
-            None
+            Some(false)
         );
         assert_eq!(family_table_supports_tools("opencode", "big-pickle"), None);
         assert_eq!(family_table_supports_tools("openai", "muse-v2"), None);
+        // Name-only near-misses without an explicit dialect entry keep the
+        // provider default.
+        assert_eq!(family_table_supports_tools("opencode", "some-muse-model"), None);
+        assert_eq!(family_table_supports_tools("opencode", "amuse-v2"), None);
     }
 
     /// ADR-66 A3: the full precedence — override > advertised flags >
