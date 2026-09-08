@@ -78,6 +78,24 @@ substrings: `muse-spark-*` must never classify as Muse. Heuristics sit last
 in the §3 precedence and every heuristic ships with regression tests pairing
 it against its known near-misses.
 
+> **Correction (2026-09-08, amending §5 and A2 in place):** the token rule
+> encoded a taxonomy fallacy. The wire dialect follows **endpoint behavior**,
+> not family taxonomy: Zen's `muse-spark-*` family is not Muse, but it 500s
+> on `/chat/completions` and only works via `POST /responses` — the original
+> fix (0d511f1, 2026-08-31) routed it to the Responses API for exactly that
+> reason. PR #44's `muse` + version-segment rule re-routed `muse-spark-*`
+> back to `/chat/completions`, resurfacing the 500s on every call. Resolution:
+> an explicit dialect-override table keyed by **full model-id prefix**
+> (`muse-spark-` → Responses API) is consulted before the token heuristic,
+> which keeps matching only genuine `muse-v*` models. Because such models
+> carry no native tool declarations on the Responses path, they resolve to
+> no native tool support, and their tool-requiring runs **proceed via the
+> §4 fallback driver** (labeled) — the §2(a) selection gate and the routing
+> capability filter refuse only when the fallback cannot cover the gap
+> (plugin-backed providers, decision (a)). A2's regression tests now pin the
+> explicit prefix entry instead of asserting `muse-spark-*` stays on
+> `/chat/completions`.
+
 ## Consequences
 
 - Plugin providers: implement tool ops in the plugin protocol + host, or the
@@ -98,6 +116,10 @@ it against its known near-misses.
   Zen-Muse tool tasks either work or error before spend — never silent text.
 - **A2** — `muse-spark-*` (and documented near-misses) never route to the
   Muse/Responses path; regression tests pin each heuristic.
+  *(Amended 2026-09-08 — see the §5 correction: `muse-spark-*` routes to the
+  Responses path via the explicit full-id prefix entry; the near-miss
+  regressions that stay pinned are the ones with no endpoint-behavior
+  justification, e.g. `some-muse-model`, `amuse-v2`, `museum-2`, `musex-v2`.)*
 - **A3** — capability-resolution precedence tested (override > flags >
   table > default); unknown model → native attempt + automatic fallback.
 - **A4** — the Execute smoke test produces files identically on OpenAI-compat,
