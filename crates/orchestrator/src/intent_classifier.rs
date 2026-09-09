@@ -1,15 +1,24 @@
-//! ADR-55 Phase 2c / ADR-56: LLM intent classifier — the primary intent
-//! decider when enabled.
+//! ADR-55 Phase 2c / ADR-56: LLM intent classifier.
 //!
-//! When `[intent] classifier_enabled` is true (the **default**, ADR-56 §2),
-//! the LLM classifier is the intent authority for every non-fast-path
-//! message: the deterministic router ([`concerto_core::intent::route`]) result
-//! — a rule hit, a question-detection result, or `AskUser` ambiguity — is
-//! re-classified once by the LLM before the intent gate runs. A
-//! classification at or above the configured confidence threshold re-routes
-//! the run to the suggested outcome; anything below threshold, a malformed
-//! reply, a provider failure, or a cancellation fails soft back to the
-//! unchanged deterministic result (ADR-56 §3/§4).
+//! **OFF THE RUN HOT PATH (ADR-55 Phase 2e §4, 2026-09-09).** The classifier
+//! is retired from dispatch: `run_shared_agent` never consults
+//! `[intent].classifier_enabled` anymore, so no run pays the classifier call
+//! or its latency. Deterministic safety rules + the flavor-hint scan remain.
+//! The module and its tests stay as the historical record of the seam (and
+//! for any future, explicitly re-mounted opt-in); nothing in the crate calls
+//! it from the run path.
+//!
+//! Historical contract (while it was mounted, ADR-55 Phase 2c §1–§6; ADR-56
+//! §1/§3/§4/§5): when `[intent] classifier_enabled` was true (the then
+//! default), the LLM classifier was the intent authority for every
+//! non-fast-path message: the deterministic router
+//! ([`concerto_core::intent::route`]) result — a rule hit, a
+//! question-detection result, or `AskUser` ambiguity — was re-classified
+//! once by the LLM before the intent gate ran. A classification at or above
+//! the configured confidence threshold re-routed the run to the suggested
+//! outcome; anything below threshold, a malformed reply, a provider failure,
+//! or a cancellation failed soft back to the unchanged deterministic result
+//! (ADR-56 §3/§4).
 //!
 //! Contract (ADR-55 Phase 2c §1–§6; ADR-56 §1/§3/§4/§5):
 //!

@@ -27,15 +27,21 @@ The detailed internal dependency edges are maintained in
 
 ## Interaction modes
 
-`AgentMode` is part of task intent:
+Intent routing decides only the run's permission envelope (ADR-55 Phase 2e):
 
-- **Chat** returns conversational text and does not grant project tools.
-- **Plan** produces a plan and does not grant project tools.
-- **Build** enables the action-required path and registered tools.
+- **ReadOnly** — task-level prohibitions (`negation_override`), unresolved
+  `AskUser` ambiguity, and gate denials. No grants; the policy engine denies
+  writes.
+- **Acting** — everything else. Grants hold exactly as confirmed; writes stay
+  governed by the policy engine, never by a branch.
 
-With multi-agent disabled, `AgentLoop` owns the run. With it enabled, Chat and
-Plan remain Coordinator-only; Build uses `CoordinatorAgent` and the specialist
-registry.
+Every non-empty run enters the unified agent loop. Chat is what the loop does
+when the model uses no tools (≈ one text-only call in cost, zero forks); the
+routed outcome is a non-binding flavor hint appended to the system prompt and
+logged, never a code-path branch. With multi-agent disabled, `AgentLoop` owns
+the run. With it enabled, only action-required (Execute) and Plan runs use
+`CoordinatorAgent` and the specialist registry — Plan capped at planning-only
+depth; every other run shape enters the loop.
 
 ## Single-agent execution
 

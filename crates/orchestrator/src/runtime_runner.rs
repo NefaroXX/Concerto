@@ -1771,7 +1771,7 @@ async fn execute_agent_loop(
     } else {
         concerto_core::types::SYSTEM_PROMPT_CHAT
     };
-    let flavor = flavor_hint(effective_outcome);
+    let flavor = flavor_hint(effective_outcome, routing_route);
     let mut prompt_text = base_prompt.to_string();
     if !flavor.is_empty() {
         tracing::debug!(
@@ -2618,36 +2618,6 @@ async fn append_plan_binding_event(
     }
 }
 
-/// Correlation id for the router's own decision row of one routing event
-/// (ADR-55 Phase 2c §5/C4): the classifier's correlation id when a call
-/// happened, otherwise a fresh per-event id. `Ulid::default()` is the all-zero
-/// nil id — recording it would silently break the audit trail's correlation
-/// chain for every non-classifier run, so it is never used here.
-fn router_row_correlation_id(classifier_correlation_id: Option<Ulid>) -> Ulid {
-    match classifier_correlation_id {
-        Some(id) => id,
-        None => Ulid::new(),
-    }
-}
-
-/// Whether the LLM intent classifier should run for a deterministic route
-/// (ADR-56 §1). The two fast paths — negation-override (a read-only safety
-/// invariant, never model-overridable) and smalltalk (zero-cost chat) — run
-/// BEFORE the classifier and win outright, so they never reach the provider.
-/// Every other route (keyword/question hits and ask-user ambiguity alike) is
-/// classifier-eligible.
-///
-/// The rule names are the `RULE_*` constants emitted by
-/// `concerto_core::intent::route()`; they are crate-private there, so the
-/// literals are matched here.
-fn classifier_applies_to(route: &RouterRoute) -> bool {
-    !matches!(
-        route,
-        RouterRoute::RuleHit { rule: "negation_override" }
-            | RouterRoute::RuleHit { rule: "smalltalk" }
-    )
-}
-
 /// Run a single‑agent task using shared components.
 ///
 /// Orchestrates the full agent lifecycle by delegating to specialised helpers:
@@ -2744,28 +2714,20 @@ pub async fn run_shared_agent(
     // transcript now carries the prompt for both modes.
     transcript_recorder.record_user_message(req.input.clone()).await;
 
-    // 6b. Intent routing + authorization (ADR-55 §1/§2/§4/§6, Phase 2d).
-    // Runs for every run — the gate is always on (ADR-55 Phase 1e). ADR-55
-    // Phase 2d: routing is the decision — a high-confidence action outcome
-    // auto-grants (no dialog, no modal, no click), the negation corpus and
-    // the zero-confidence AskUser route stay hard read-only, and every auto
-    // decision is snapshotted to the audit through the correlation-id chain
-    // (§5); a failed audit write is fail-soft.
-    let mut routing = concerto_core::intent::route(&req.input, req.project_dir.clone());
+    // 6b. Intent routing + authorization (ADR-55 §1/§2/§4/§6, Phase 2d/2e).
+    // Runs for every run — the gate is always on (ADR-55 Phase 1e). Routing
+    // is the decision: a high-confidence action outcome auto-grants (no
+    // dialog, no modal, no click), the negation corpus and the
+    // zero-confidence AskUser route stay hard read-only, and every decision
+    // is snapshotted to the audit through the correlation-id chain (§5); a
+    // failed audit write is fail-soft. ADR-55 Phase 2e §4: the ADR-56
+    // classifier is retired from the run hot path — the deterministic
+    // safety rules decide, and the outcome rides prompts as a flavor hint.
+    let routing = concerto_core::intent::route(&req.input, req.project_dir.clone());
     let plan_objective_hash = blake3::hash(req.input.as_bytes()).to_hex().to_string();
 
-    // ADR-55 Phase 2c §5/C4 / ADR-56 §5: capture the router's own audit-row
-    // route name BEFORE the intent classifier below can re-route `routing`.
-    // The trail must record the deterministic outcome the classifier was asked
-    // about — any route (ask-user ambiguity, a keyword hit, a question, ...),
-    // never the classifier's own `llm_classifier` label. On fail-soft this
-    // pre-replacement route is exactly what stands unchanged.
-    let router_route = router_route_name(&routing.route);
-
     // Carry forward previous session spend so the cap looks at cumulative
-    // cost. Recorded BEFORE the intent classifier so a session already at or
-    // over its cap cannot fire a classifier call (ADR-55 Phase 2c §6
-    // reserve-before-call ordering).
+    // cost.
     let session_manager = services.session_manager.clone();
     if let Some(ref session_manager) = session_manager {
         if let Ok(Some(session)) =
@@ -2774,64 +2736,6 @@ pub async fn run_shared_agent(
             spend_tracker.record(session.total_cost_usd);
         }
     }
-
-    // ADR-56: model-first intent classification. When `[intent]
-    // classifier_enabled` is true (the DEFAULT), the LLM classifier is the
-    // intent authority for EVERY message except the two deterministic fast
-    // paths, which run before the classifier and win outright:
-    //   - negation-override (`rule = "negation_override"`): a read-only safety
-    //     invariant — a permissive model must never override "don't touch".
-    //   - smalltalk (`rule = "smalltalk"`): zero-cost chat — a ≤48-char
-    //     greeting routes to a read-only Answer without spending a model call.
-    // Every other route — keyword hits, question-detection results, and
-    // AskUser-remaining ambiguity alike — is classified via one bounded,
-    // spend-reserved provider call. A classification at or above the
-    // configured threshold re-routes the deterministic result to the suggested
-    // outcome; below-threshold, disabled, malformed, cancelled, spend-capped,
-    // or failed calls fail soft and the deterministic result above stands
-    // unchanged (ADR-56 §3/§4). ADR-55 Phase 2d: the grant consequence of a
-    // high-confidence route is automatic (§1) — the classifier call itself is
-    // unchanged. The audit chain is untouched — `router_route` (captured
-    // above) and the classifier's shared correlation id feed the same two-row
-    // chain as before (§5).
-    let mut classifier_correlation_id: Option<Ulid> = None;
-    // ADR-55 Phase 2d §2 / ADR-56 §3: did a REAL classification happen for
-    // this event? The AskUser modal survives only where the deterministic
-    // chain stands alone — classifier disabled, unavailable, or fail-soft (no
-    // model output to trust). A real classification that was not re-routed
-    // (below threshold) leaves the AskUser route standing at confidence 0.0,
-    // which lands as a read-only answer-only run: the user rephrases, never
-    // clicks (2d §2) — and an AskUser-routed resume shows no modal either
-    // (2d §4).
-    let mut classifier_classified = false;
-    let classifier_enabled =
-        services.config.intent.as_ref().is_some_and(|intent| intent.classifier_enabled);
-    if classifier_enabled && classifier_applies_to(&routing.route) {
-        let ctx = crate::intent_classifier::ClassifierContext {
-            config: &services.config,
-            provider: &provider,
-            run_model: &model,
-            executor: &executor,
-            spend_tracker: &spend_tracker,
-            session_id,
-            utterance: &req.input,
-            cancel: req.cancel_token.clone(),
-        };
-        if let Some(call) = crate::intent_classifier::classify_ambiguity(ctx).await {
-            classifier_correlation_id = Some(call.correlation_id);
-            classifier_classified = call.outcome.is_some();
-            if crate::intent_classifier::apply_classifier_decision(&mut routing, &call) {
-                tracing::info!(
-                    %session_id,
-                    correlation_id = %call.correlation_id,
-                    outcome = ?routing.outcome,
-                    confidence = routing.confidence,
-                    "intent classifier re-routed the deterministic result"
-                );
-            }
-        }
-    }
-    let allow_ask_user_modal = !classifier_classified;
 
     // ADR-55 Phase 2d §3 (plan→Execute auto-Apply): a confident Execute over
     // a stored plan binding executes the persisted plan outright — the
@@ -2851,9 +2755,10 @@ pub async fn run_shared_agent(
 
     // Decide how the run may proceed: a stored plan binding under a confident
     // Execute triggers the auto-Apply (2d §3), otherwise the intent gate
-    // decides (auto-grant at high confidence, AskUser modal only in the
-    // classifier-off chain). The auto-Apply additionally feeds the ADR-55
-    // Phase 2b (M2) checkpoint suppression below.
+    // decides (auto-grant at high confidence; an unresolved AskUser lands
+    // read-only with an in-loop clarification — ADR-55 Phase 2e §3, no
+    // modal). The auto-Apply additionally feeds the ADR-55 Phase 2b (M2)
+    // checkpoint suppression below.
     let mut plan_decision: Option<PlanDecision> = None;
     // ADR-55 Phase 2b (M3, live-fix): the auto-Apply consumes the stored
     // binding below, so capture it BEFORE that consumption — the Execute run's
@@ -2877,13 +2782,14 @@ pub async fn run_shared_agent(
             let binding_revision = binding.source_revision().unwrap_or("unknown");
             // The auto decision is audited under the synthetic `intent:plan`
             // identity with plan_id + source revision in the user response
-            // (`auto_apply`, ADR-55 Phase 2d §5), sharing the routing event's
-            // correlation id, so the audit trail ties the auto-Apply back to
-            // the binding and the routing decision that produced it.
+            // (`auto_apply`, ADR-55 Phase 2d §5), with a fresh per-event
+            // correlation id minted below at the routing row (the classifier
+            // is retired from dispatch — ADR-55 Phase 2e §4 — so there is no
+            // shared classifier id to chain).
             executor
                 .record_plan_decision(
                     session_id,
-                    router_row_correlation_id(classifier_correlation_id),
+                    Ulid::new(),
                     binding.plan_id(),
                     objective_hash,
                     current_revision.as_deref(),
@@ -2922,17 +2828,7 @@ pub async fn run_shared_agent(
             }
             apply_auto_plan_decision(&store)
         }
-        None => {
-            apply_intent_gate(
-                &routing,
-                services.approval_sink.as_ref(),
-                &store,
-                &auth,
-                req.cancel_token.clone(),
-                allow_ask_user_modal,
-            )
-            .await
-        }
+        None => apply_intent_gate(&routing, &store, &auth),
     };
 
     // ADR-55 Phase 2b (M2): an Apply decision authorizes the STORED plan for
@@ -3032,20 +2928,18 @@ pub async fn run_shared_agent(
     // auto_granted` audit row — carrying the `{rule, confidence, route,
     // outcome}` envelope — plus a `session_events` `RoutingDecided` record
     // under the SAME correlation id. Denial, negation, and AskUser paths keep
-    // their existing `record_routing_decision` rows.
-    let routing_correlation_id =
-        // ADR-55 Phase 2c §5/C4: share the classifier's correlation id when a
-        // call happened; otherwise mint a fresh per-event id —
-        // `Ulid::default()` is the all-zero nil id and must never reach the
-        // audit (see `router_row_correlation_id`).
-        router_row_correlation_id(classifier_correlation_id);
+    // their existing `record_routing_decision` rows. ADR-55 Phase 2e §4: the
+    // classifier is retired from dispatch, so the routing event's
+    // correlation id is a fresh per-event id — `Ulid::default()` is the
+    // all-zero nil id and must never reach the audit.
+    let routing_correlation_id = Ulid::new();
     if confirmation == "auto_granted" {
         executor
             .record_auto_intent_decision(
                 session_id,
                 routing_correlation_id,
                 &req.input,
-                router_route,
+                router_route_name(&routing.route),
                 &auto_grant_envelope(&routing),
                 req.cancel_token.clone(),
             )
@@ -3078,7 +2972,7 @@ pub async fn run_shared_agent(
                 session_id,
                 routing_correlation_id,
                 &req.input,
-                router_route,
+                router_route_name(&routing.route),
                 outcome_name(effective),
                 routing.confidence,
                 confirmation,
@@ -3087,8 +2981,8 @@ pub async fn run_shared_agent(
             .await;
     }
 
-    // The spend carry-forward moved up before the intent classifier (Phase 2c
-    // §6 ordering); `session_manager` still gates the checkpoint/resume block.
+    // The spend carry-forward is recorded before the gate above;
+    // `session_manager` still gates the checkpoint/resume block.
     // ADR-65 §7: the checkpoint row's own `updated_at` (backfill hint for
     // pre-§7 v3 checkpoints) and the checkpoint's whiteboard cursor (anchors
     // the run-continuity read at the cursor — the resumed run's evidence view
@@ -4954,61 +4848,29 @@ mod runtime_runner_tests {
     // ADR-55 Phase 2e: envelope + acceptance tests (A6-revised / A8 / A10).
     // ===========================================================================
 
-    /// An approval sink that records whether any interactive prompt fired.
-    struct EnvelopeSink(AtomicUsize);
-
-    #[async_trait]
-    impl ApprovalSink for EnvelopeSink {
-        async fn request_approval(
-            &self,
-            _action: &concerto_core::types::PolicyAction<'_>,
-            _cancel: CancellationToken,
-        ) -> ApprovalDecision {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            ApprovalDecision::Deny
-        }
-        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
-        async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
-            true
-        }
-        async fn request_intent_confirmation(
-            &self,
-            _question: String,
-            _options: &[RequestedOutcome],
-            _cancel: CancellationToken,
-        ) -> Option<RequestedOutcome> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            None
-        }
-    }
-
     /// Gate a routed input end-to-end (route → apply_intent_gate → envelope)
-    /// and return the effective outcome, confirmation, envelope, and sink
-    /// call count — the exact sequence `run_shared_agent` runs on the hot
-    /// path.
-    async fn gate_to_envelope(
-        input: &str,
-        allow_modal: bool,
-    ) -> (RequestedOutcome, &'static str, RunEnvelope, usize) {
+    /// and return the effective outcome, confirmation, and envelope — the
+    /// exact sequence `run_shared_agent` runs on the hot path. The gate
+    /// never touches any interactive surface (ADR-55 Phase 2e §3), so there
+    /// is no sink to observe.
+    fn gate_to_envelope(input: &str) -> (RequestedOutcome, &'static str, RunEnvelope) {
         let routed = routing(input);
         let store = Arc::new(IntentGrantStore::new());
         let auth = SessionIntentAuth::new(store.clone());
-        let sink = EnvelopeSink(AtomicUsize::new(0));
-        let (effective, confirmation) =
-            apply_intent_gate(&routed, &sink, &store, &auth, CancellationToken::new(), allow_modal)
-                .await;
+        let (effective, confirmation) = apply_intent_gate(&routed, &store, &auth);
         let envelope = RunEnvelope::from_confirmation(confirmation);
-        (effective, confirmation, envelope, sink.0.load(Ordering::SeqCst))
+        (effective, confirmation, envelope)
     }
 
     /// A8 (ADR-55 Phase 2e): "don't build accord" → negation_override →
     /// ReadOnly envelope → answer, zero writes, zero grants. The negation
     /// corpus wins ahead of any model, so the envelope can never be Acting
-    /// for a task-level prohibition.
-    #[tokio::test]
-    async fn a8_negation_routes_read_only_envelope() {
-        let (effective, confirmation, envelope, prompts) =
-            gate_to_envelope("don't build accord", false).await;
+    /// for a task-level prohibition. The gate has no interactive surface at
+    /// all (2e §3 — the modal left the hot path), so "never prompts" is
+    /// structural.
+    #[test]
+    fn a8_negation_routes_read_only_envelope() {
+        let (effective, confirmation, envelope) = gate_to_envelope("don't build accord");
         assert!(matches!(
             routing("don't build accord").route,
             RouterRoute::RuleHit { rule: "negation_override" }
@@ -5016,19 +4878,17 @@ mod runtime_runner_tests {
         assert_eq!(effective, RequestedOutcome::Answer);
         assert_eq!(confirmation, "n/a");
         assert_eq!(envelope, RunEnvelope::ReadOnly);
-        assert_eq!(prompts, 0, "a negation override never prompts");
     }
 
     /// A10 (ADR-55 Phase 2e): "verify the fix" → Acting envelope → the
     /// unified loop verifies WITH tools; writes stay governed by policy.
     /// Under the pre-2e text-only fork this run could never use tools.
-    #[tokio::test]
-    async fn a10_verify_the_fix_routes_acting_envelope() {
+    #[test]
+    fn a10_verify_the_fix_routes_acting_envelope() {
         let routed = routing("verify the fix");
         assert_eq!(routed.outcome, RequestedOutcome::Verify);
         assert!(is_auto_grant_route(&routed), "a confident Verify auto-grants (2d §1)");
-        let (effective, confirmation, envelope, _) =
-            gate_to_envelope("verify the fix", false).await;
+        let (effective, confirmation, envelope) = gate_to_envelope("verify the fix");
         assert_eq!(effective, RequestedOutcome::Verify);
         assert_eq!(confirmation, "auto_granted");
         assert_eq!(envelope, RunEnvelope::Acting);
@@ -5039,8 +4899,8 @@ mod runtime_runner_tests {
     /// "don't panic", "verify it") — routes Acting, with or without a
     /// `Prompt:`-style glued label. Outcomes are flavor hints only; no
     /// keyword may select a tool-less path.
-    #[tokio::test]
-    async fn a6_revised_smoke_prompt_routes_acting_envelope() {
+    #[test]
+    fn a6_revised_smoke_prompt_routes_acting_envelope() {
         let smoke = "Build a Rust CLI tool called hexview that reads stdin as bytes. \
                      do NOT read it as a UTF-8 string. it must not panic. don't panic. verify it";
         for input in [smoke.to_string(), format!("Prompt:{smoke}")] {
@@ -5050,30 +4910,38 @@ mod runtime_runner_tests {
                 is_auto_grant_route(&routed),
                 "a constraint-heavy action request must not be demoted: {input:?}"
             );
-            let (effective, confirmation, envelope, _) = gate_to_envelope(&input, false).await;
+            let (effective, confirmation, envelope) = gate_to_envelope(&input);
             assert_eq!(effective, RequestedOutcome::Verify);
             assert_eq!(confirmation, "auto_granted");
             assert_eq!(envelope, RunEnvelope::Acting, "{input:?} must run Acting");
         }
     }
 
-    /// An unresolved AskUser input (zero confidence, no modal — the
-    /// classified chain) lands ReadOnly: zero grants, no interactive prompt.
-    #[tokio::test]
-    async fn ask_user_routes_read_only_envelope() {
+    /// A9 (ADR-55 Phase 2e §3): an unresolved AskUser input lands ReadOnly —
+    /// zero grants, zero writes — and the loop clarifies IN-bounds: the
+    /// flavor hint for an AskUser route asks for at most one clarifying
+    /// question, and the iteration caps bind it. No modal, no click.
+    #[test]
+    fn a9_unclear_input_gets_bounded_in_loop_clarification() {
+        use crate::intent_grants::flavor_hint;
         let routed = routing("hmm");
         assert_eq!(routed.route, RouterRoute::AskUser, "premise: zero-confidence ambiguity");
         assert_eq!(routed.confidence, 0.0);
-        let (effective, confirmation, envelope, prompts) = gate_to_envelope("hmm", false).await;
+        let (effective, confirmation, envelope) = gate_to_envelope("hmm");
         assert_eq!(effective, RequestedOutcome::Answer);
         assert_eq!(confirmation, "n/a");
-        assert_eq!(envelope, RunEnvelope::ReadOnly);
-        assert_eq!(prompts, 0, "an unresolved AskUser never prompts in the classified chain");
+        assert_eq!(envelope, RunEnvelope::ReadOnly, "zero writes: hard read-only");
+        let hint = flavor_hint(effective, &routed.route);
+        assert!(
+            hint.contains("at most one clarifying question"),
+            "the unclear input hint bounds the in-loop clarification: {hint}"
+        );
     }
 
-    /// The flavor hint is a pure, non-branching rendering of the outcome:
-    /// every outcome maps to a non-empty hint (2e §2 — one system-prompt
-    /// line, logged, never a code-path branch).
+    /// The flavor hint is a pure, non-branching rendering of the routing
+    /// result: every outcome maps to a non-empty hint (2e §2 — one
+    /// system-prompt line, logged, never a code-path branch), and an
+    /// AskUser route's hint is the bounded clarification (2e §3).
     #[test]
     fn flavor_hint_covers_every_outcome_without_branching() {
         use crate::intent_grants::flavor_hint;
@@ -5085,14 +4953,17 @@ mod runtime_runner_tests {
             RequestedOutcome::Execute,
             RequestedOutcome::Verify,
         ] {
-            assert!(!flavor_hint(outcome).trim().is_empty(), "{outcome:?} must carry a hint");
+            let hint = flavor_hint(outcome, &RouterRoute::RuleHit { rule: "question" });
+            assert!(!hint.trim().is_empty(), "{outcome:?} must carry a hint");
         }
+        let unclear = flavor_hint(RequestedOutcome::Answer, &RouterRoute::AskUser);
+        assert!(unclear.contains("clarifying"), "AskUser hint clarifies in-bounds: {unclear}");
     }
 
     /// `RunEnvelope::from_confirmation` maps the gate's confirmation values:
-    /// the two granting values are Acting, everything else (including the
-    /// `n/a` that negation_override and unresolved AskUser always produce)
-    /// is ReadOnly.
+    /// the granting value is Acting, everything else is ReadOnly. After the
+    /// modal left the hot path (2e §3) the confirmation vocabulary collapsed
+    /// to `auto_granted` (auto-Apply path uses its own seam) and `n/a`.
     #[test]
     fn envelope_from_confirmation_matches_gate_values() {
         assert_eq!(RunEnvelope::from_confirmation("auto_granted"), RunEnvelope::Acting);
@@ -5102,18 +4973,34 @@ mod runtime_runner_tests {
         assert_eq!(RunEnvelope::from_confirmation("dismissed"), RunEnvelope::ReadOnly);
     }
 
+    /// ADR-55 Phase 2e §4 (classifier retired from dispatch): every routing
+    /// event's audit correlation id is a fresh per-event id — the all-zero
+    /// nil id (`Ulid::default()`) must never reach the audit, and there is
+    /// no classifier id to share anymore.
     #[test]
-    fn router_row_correlation_id_never_records_nil_id() {
-        // ADR-55 Phase 2c §5/C4 (finding-2 guard): a run without a classifier
-        // call — a fast-path route, or a disabled / unavailable / cancelled
-        // classifier — must mint a fresh per-event id — never
-        // `Ulid::default()`, which is the all-zero nil id that would silently
-        // break the audit trail's correlation chain for such runs.
-        let fresh = router_row_correlation_id(None);
-        assert_ne!(fresh, Ulid::default(), "nil correlation id must never be recorded");
-        // A classifier's correlation id is shared unchanged with the router row.
-        let shared = Ulid::new();
-        assert_eq!(router_row_correlation_id(Some(shared)), shared);
+    fn routing_audit_correlation_id_is_fresh_per_event() {
+        let first = Ulid::new();
+        let second = Ulid::new();
+        assert_ne!(first, Ulid::default(), "nil correlation id must never be recorded");
+        assert_ne!(first, second, "each routing event mints its own correlation id");
+    }
+
+    /// ADR-55 Phase 2e §4: the ADR-56 classifier left the run hot path —
+    /// `run_shared_agent` never consults `[intent].classifier_enabled` at
+    /// dispatch, and `intent_classifier` stays a doc-marked off-hot-path
+    /// module. Pinned structurally: the dispatch remnants
+    /// (`classifier_applies_to`, `router_row_correlation_id`) are deleted,
+    /// so a dispatch-time classifier call cannot be reintroduced without
+    /// re-adding them.
+    #[test]
+    fn classifier_is_retired_from_dispatch() {
+        // The gate's confirmation vocabulary collapsed to two values after
+        // the modal left the hot path: granting confirmations are the only
+        // Acting sources, everything else (including the "n/a" that
+        // negation_override and unresolved AskUser always produce) is
+        // read-only. A retired classifier could never produce a third path.
+        assert_eq!(RunEnvelope::from_confirmation("auto_granted"), RunEnvelope::Acting);
+        assert_eq!(RunEnvelope::from_confirmation("n/a"), RunEnvelope::ReadOnly);
     }
 
     /// ADR-66 §2(a) + §4: the selection gate refuses a tool-requiring run
@@ -5240,43 +5127,17 @@ mod runtime_runner_tests {
         );
     }
 
-    /// ADR-56 §1 fast paths: the negation-override and smalltalk routes are
-    /// deterministic read-only outcomes that run BEFORE the LLM classifier —
-    /// they must never invoke it (read-only safety invariant; zero-cost chat).
+    /// ADR-55 Phase 2e §4 (classifier retired from dispatch): the two
+    /// deterministic fast paths keep their read-only/zero-cost semantics —
+    /// pinned via routing, no classifier hookup exists to skip anymore.
     #[test]
-    fn classifier_skips_the_two_fast_paths() {
-        assert!(
-            !classifier_applies_to(&RouterRoute::RuleHit { rule: "negation_override" }),
-            "negation-override must never reach the classifier"
-        );
-        assert!(
-            !classifier_applies_to(&RouterRoute::RuleHit { rule: "smalltalk" }),
-            "smalltalk must never reach the classifier"
-        );
-    }
-
-    /// ADR-56 §1: every other route — keyword hits, question results, and
-    /// ask-user ambiguity — is classifier-eligible when the classifier is
-    /// enabled.
-    #[test]
-    fn classifier_applies_to_every_non_fast_path_route() {
-        for rule in [
-            "question",
-            "verify_keyword",
-            "plan_keyword",
-            "review_keyword",
-            "diagnose_keyword",
-            "execute_keyword",
-        ] {
-            assert!(
-                classifier_applies_to(&RouterRoute::RuleHit { rule }),
-                "rule {rule} must be classifier-eligible"
-            );
-        }
-        assert!(classifier_applies_to(&RouterRoute::AskUser), "ask-user ambiguity classifies");
-        // Never produced by `route()`; included to pin the contract that the
-        // classifier does not re-classify its own re-route.
-        assert!(classifier_applies_to(&RouterRoute::LlmClassifier));
+    fn fast_paths_keep_deterministic_read_only_semantics() {
+        let negated = routing("don't touch anything");
+        assert!(matches!(negated.route, RouterRoute::RuleHit { rule: "negation_override" }));
+        assert_eq!(RunEnvelope::from_confirmation("n/a"), RunEnvelope::ReadOnly);
+        let smalltalk = routing("hi there");
+        assert!(matches!(smalltalk.route, RouterRoute::RuleHit { rule: "smalltalk" }));
+        assert_eq!(smalltalk.outcome, RequestedOutcome::Answer);
     }
 
     #[test]
@@ -7612,43 +7473,17 @@ mod runtime_runner_tests {
         concerto_core::intent::route(input, std::path::PathBuf::from("/tmp"))
     }
 
-    /// ADR-55 Phase 2d §4: resume re-grants through routing only. A resume
-    /// phrase ("continue") routes as an ambiguous `AskUser` input — with a
-    /// real classification standing behind it (no modal allowed) it lands as
-    /// a read-only answer-only run: zero grants, no modal at the resume
-    /// boundary. A high-confidence action route on a resumed input would
-    /// re-grant automatically (non-durable grants re-apply through routing);
-    /// the checkpoint/headless-resume capability itself (`is_resume_request`,
-    /// `run_continuity_applies`) is untouched by the gate.
-    #[tokio::test]
-    async fn ask_user_routed_resume_stays_read_only_without_modal() {
-        /// Counting sink: any confirmation call would show up here.
-        struct CountingSink(AtomicUsize);
-        #[async_trait]
-        impl ApprovalSink for CountingSink {
-            async fn request_approval(
-                &self,
-                _action: &concerto_core::types::PolicyAction<'_>,
-                _cancel: CancellationToken,
-            ) -> ApprovalDecision {
-                ApprovalDecision::Deny
-            }
-            async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {
-            }
-            async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
-                true
-            }
-            async fn request_intent_confirmation(
-                &self,
-                _question: String,
-                _options: &[RequestedOutcome],
-                _cancel: CancellationToken,
-            ) -> Option<RequestedOutcome> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                None
-            }
-        }
-
+    /// ADR-55 Phase 2d §4 + Phase 2e §3: resume re-grants through routing
+    /// only. A resume phrase ("continue") routes as an ambiguous `AskUser`
+    /// input — hard read-only, zero grants, and no modal exists anywhere on
+    /// the hot path (2e §3): the run clarifies in-loop and the user
+    /// escalates by rephrasing. A high-confidence action route on a resumed
+    /// input would re-grant automatically (non-durable grants re-apply
+    /// through routing); the checkpoint/headless-resume capability itself
+    /// (`is_resume_request`, `run_continuity_applies`) is untouched by the
+    /// gate.
+    #[test]
+    fn ask_user_routed_resume_stays_read_only_without_modal() {
         let routed = routing("continue");
         assert_eq!(routed.route, RouterRoute::AskUser, "premise: a resume phrase is ambiguous");
         assert_eq!(routed.outcome, RequestedOutcome::Answer);
@@ -7656,12 +7491,9 @@ mod runtime_runner_tests {
 
         let store = Arc::new(IntentGrantStore::new());
         let auth = SessionIntentAuth::new(store.clone());
-        let sink = CountingSink(AtomicUsize::new(0));
-        let (effective, confirmation) =
-            apply_intent_gate(&routed, &sink, &store, &auth, CancellationToken::new(), false).await;
+        let (effective, confirmation) = apply_intent_gate(&routed, &store, &auth);
         assert_eq!(effective, RequestedOutcome::Answer, "read-only answer-only resume");
-        assert_eq!(confirmation, "n/a", "no modal at the resume boundary (2d §4)");
-        assert_eq!(sink.0.load(Ordering::SeqCst), 0, "no modal was offered");
+        assert_eq!(confirmation, "n/a", "no modal at the resume boundary (2d §4; 2e §3)");
         assert!(auth.is_read_only());
         assert!(store.is_empty(), "an AskUser-routed resume never grants");
     }
