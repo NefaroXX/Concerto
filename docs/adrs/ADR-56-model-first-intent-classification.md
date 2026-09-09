@@ -263,3 +263,15 @@ exists, not as a click tax on confident routes); §4 threshold validation
 (`classifier_confidence_threshold >= LOW_CONFIDENCE_THRESHOLD` at config
 load; no `[threshold, 0.7)` band); §5 audit chain; §6 utterance-only prompt;
 §7 cost semantics.
+
+## Amendment (2026-09-09) — classifier retired from run dispatch (unification, ADR-55 Phase 2e)
+
+The classifier leaves the run hot path: §1 "primary decider" and §4
+"reroute at threshold" no longer operate on run dispatch (saves one bounded
+LLM call + latency per run). What remains: deterministic safety rules +
+flavor scan in `route()`; the `intent_classifier` module itself, retained
+for future eval/classification UX and marked off-hot-path (no dispatch
+hookups). §8 (classifies, never authorizes) holds wherever the module is
+used. The 2026-09-06 auto-grant amendment is moot on the hot path — grants
+derive from the deterministic envelope (ADR-55 Phase 2e §§2–3), not from
+classifier output.

@@ -19,6 +19,11 @@ default to preserve deterministic execution.
 
 ## Decision
 
+> **Amendment (2026-09-09):** model choice is never automatic. Concerto
+> performs no cost- or capability-based search-and-select: assignment is
+> explicit only, and an unassigned role resolves to the first
+> capability-compatible configured profile in stable configuration order.
+
 - User-facing execution selectors display models only.
 - Provider configurations remain in Settings solely to manage credentials,
   endpoints, discovery, and protocol records.

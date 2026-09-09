@@ -25,6 +25,11 @@ pub enum RetryClass {
     ServiceUnavailable,
     GatewayFailure,
     Network,
+    /// A transport fault while a completion stream was already in flight
+    /// (ADR-55 Phase 2e stream-retry): the connection broke mid-stream.
+    /// Retryable — tools execute only post-assembly, so re-issuing the
+    /// request is side-effect-free within the bounded attempt budget.
+    StreamTransport,
     ConnectionReset,
     RequestTimeout,
     StreamIdleTimeout,
@@ -46,7 +51,17 @@ pub struct RetryDecision {
 /// context overflow, malformed/invalid responses, cancellation, spend/policy
 /// rejection, and mid-stream idle timeouts after output has begun) return
 /// `retryable: false`. Transient conditions (rate limits, 5xx, timeouts before
-/// any output, network blips) return `retryable: true`.
+/// any output, network blips, and mid-stream TRANSPORT faults — ADR-55 Phase
+/// 2e stream-retry) return `retryable: true`.
+///
+/// The mid-stream distinction (ADR-55 Phase 2e): a transport fault while a
+/// stream was in flight ([`ProviderError::StreamTransport`]) IS retried —
+/// tools execute only after the stream is fully assembled, so re-issuing the
+/// request is side-effect-free within the bounded attempt budget. The
+/// collector-side idle timeout stays fatal (the conservative
+/// duplicate-partial-output posture for a hung-but-healthy connection), and
+/// framing/parse failures inside a healthy stream stay fatal (retrying
+/// cannot fix a broken wire format).
 pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
     match error {
         ProviderError::RateLimit { retry_after } => RetryDecision {
@@ -78,6 +93,19 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             class: Some(RetryClass::Network),
             provider_delay: None,
             reason: "temporary network failure".into(),
+        },
+
+        // ADR-55 Phase 2e stream-retry: the collector wraps a dropped
+        // mid-stream connection as `StreamTransport` (framing/parse failures
+        // stay `Serialization`/`InvalidResponse` and fatal). Retrying is
+        // side-effect-free: tools execute only after the stream is fully
+        // assembled, so the re-issue happens within the same bounded attempt
+        // budget as any other transient failure.
+        ProviderError::StreamTransport(message) => RetryDecision {
+            retryable: true,
+            class: Some(RetryClass::StreamTransport),
+            provider_delay: None,
+            reason: format!("connection dropped mid-stream: {message}"),
         },
 
         // A `stream-idle` timeout fires only after the first chunk has arrived:
@@ -698,6 +726,58 @@ mod tests {
         let d = classify_provider_error(&ProviderError::Network("conn reset".into()));
         assert!(d.retryable);
         assert_eq!(d.class, Some(RetryClass::Network));
+    }
+
+    /// ADR-55 Phase 2e stream-retry: a transport fault while a completion
+    /// stream was already in flight is RETRYABLE. Deliberately reversing the
+    /// previous conservative stance (`Other` → fatal) with this rationale:
+    /// tools execute only after the stream is fully assembled, so re-issuing
+    /// the request is side-effect-free — the retry runs inside the same
+    /// bounded attempt budget as every other transient failure
+    /// (`max_attempts` / elapsed fuse). Framing/parse failures inside a
+    /// healthy stream stay fatal (`Serialization`/`InvalidResponse`), and
+    /// the collector-side `stream-idle` timeout stays fatal (see
+    /// `classify_stream_idle_timeout_not_retryable`).
+    #[test]
+    fn classify_stream_transport_retryable() {
+        let d = classify_provider_error(&ProviderError::StreamTransport(
+            "connection reset mid-stream".into(),
+        ));
+        assert!(d.retryable, "a mid-stream transport fault must be retried (ADR-55 Phase 2e)");
+        assert_eq!(d.class, Some(RetryClass::StreamTransport));
+        assert!(d.reason.contains("mid-stream"));
+    }
+
+    #[test]
+    fn stream_transport_policy_retries() {
+        let policy = RetryPolicy::new(RetryConfig { jitter: false, ..RetryConfig::default() });
+        let state = RetryState { attempt: 1, started_at: Instant::now() };
+        let decision = classify_provider_error(&ProviderError::StreamTransport(
+            "connection reset mid-stream".into(),
+        ));
+        assert!(decision.retryable);
+        match policy.evaluate(&state, &decision) {
+            RetryOutcome::RetryAfter { .. } => {}
+            other => panic!("expected retry, got {other:?}"),
+        }
+    }
+
+    /// The bounded-attempt budget still applies: repeated mid-stream
+    /// transport faults exhaust into `RetryExhausted` rather than looping.
+    #[test]
+    fn stream_transport_respects_attempt_budget() {
+        let policy = RetryPolicy::new(RetryConfig {
+            max_attempts: 2,
+            jitter: false,
+            ..RetryConfig::default()
+        });
+        let decision = classify_provider_error(&ProviderError::StreamTransport("reset".into()));
+        assert!(decision.retryable);
+        let state = RetryState { attempt: 2, started_at: Instant::now() };
+        match policy.evaluate(&state, &decision) {
+            RetryOutcome::Exhausted { .. } => {}
+            other => panic!("expected exhausted, got {other:?}"),
+        }
     }
 
     #[test]

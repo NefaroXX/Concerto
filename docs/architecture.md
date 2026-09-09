@@ -27,15 +27,21 @@ The detailed internal dependency edges are maintained in
 
 ## Interaction modes
 
-`AgentMode` is part of task intent:
+Intent routing decides only the run's permission envelope (ADR-55 Phase 2e):
 
-- **Chat** returns conversational text and does not grant project tools.
-- **Plan** produces a plan and does not grant project tools.
-- **Build** enables the action-required path and registered tools.
+- **ReadOnly** — task-level prohibitions (`negation_override`), unresolved
+  `AskUser` ambiguity, and gate denials. No grants; the policy engine denies
+  writes.
+- **Acting** — everything else. Grants hold exactly as confirmed; writes stay
+  governed by the policy engine, never by a branch.
 
-With multi-agent disabled, `AgentLoop` owns the run. With it enabled, Chat and
-Plan remain Coordinator-only; Build uses `CoordinatorAgent` and the specialist
-registry.
+Every non-empty run enters the unified agent loop. Chat is what the loop does
+when the model uses no tools (≈ one text-only call in cost, zero forks); the
+routed outcome is a non-binding flavor hint appended to the system prompt and
+logged, never a code-path branch. With multi-agent disabled, `AgentLoop` owns
+the run. With it enabled, only action-required (Execute) and Plan runs use
+`CoordinatorAgent` and the specialist registry — Plan capped at planning-only
+depth; every other run shape enters the loop.
 
 ## Single-agent execution
 
@@ -66,8 +72,10 @@ configured through `MultiAgentConfig.relationships` and validated by
 
 Provider/model assignments are per role. Concerto uses objective compatibility
 metadata—most importantly tool-call support for Researcher, Coder, and
-Validator—not subjective capability tiers. All roles share the session spend
-tracker.
+Validator—not subjective capability tiers. Assignments are explicit only: the
+runtime never searches or selects models by cost, and an unassigned role takes
+the first capability-compatible configured profile in configuration order. All
+roles share the session spend tracker.
 
 The runtime topology is configuration-driven (ADR-35 phase 4): the Coordinator
 plus every non-disabled built-in specialist and custom agent
@@ -122,9 +130,12 @@ Google, OpenRouter, Ollama, NVIDIA NIM, and OpenCode-compatible behavior. It als
 owns OpenAI-compatible protocol normalization, token metering, retry wrapping,
 provider construction, model profiles, and routing.
 
-The selected provider and model form a pair. Explicit session/role selection is
-authoritative unless invalid or unaffordable; fallback routing operates only
-where no authoritative pair can be used. See [models.md](models.md).
+The selected provider and model form a pair. Explicit session/role selection
+is authoritative; there is no automatic cost- or capability-based model
+selection (assignment is explicit only), and fallback routing operates only
+where no authoritative pair can be used. An unassigned role resolves to the
+first capability-compatible configured profile in configuration order. See
+[models.md](models.md).
 
 ## Tool, policy, and filesystem layers
 

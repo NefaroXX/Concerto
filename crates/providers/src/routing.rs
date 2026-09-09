@@ -1,7 +1,11 @@
-//! Explicit, budget-aware model routing per agent.
+//! Explicit model routing per agent (assignment is explicit only).
 //!
 //! Explicit role assignments are authoritative. When a role has no assignment,
-//! the runtime supplies the session's selected provider/model as its pin.
+//! the runtime supplies the session's selected provider/model as its pin; an
+//! unassigned role with no pin resolves to the FIRST capability-compatible
+//! profile in configuration order. The engine never searches or selects models
+//! by cost — model choice is never automatic (2026-09-09: cost-based
+//! selection, budget-driven downgrade, and `retry_or_downgrade` were deleted).
 
 use concerto_config::ModelPinConfig;
 use concerto_core::error::OrchestratorError;
@@ -13,8 +17,10 @@ use std::sync::Arc;
 
 /// Rough cost estimator for agent runs.
 ///
-/// Uses tunable constants per agent. These are conservative estimates of
-/// typical token usage for a single agent run of that agent.
+/// Used ONLY to validate explicitly pinned models against the remaining
+/// budget (a pinned pick is refused when its estimate exceeds the budget) and
+/// to reserve estimated spend before a dispatch. It never ranks or selects
+/// models — cost metadata is display/diagnostics only.
 pub struct CostEstimator;
 
 impl CostEstimator {
@@ -47,12 +53,16 @@ fn normalize_cost(cost: f64) -> f64 {
     }
 }
 
-/// Explicit, budget-aware model routing engine.
+/// Explicit model routing engine (assignment is explicit only).
 ///
-/// Selects the best `RoutingProfile` for a given `AgentId` based on:
-/// 1. Explicit provider/model assignments (highest priority)
-/// 2. Objective compatibility requirements
-/// 3. Budget constraints for unassigned fallback selection
+/// Selects the `RoutingProfile` for a given `AgentId` based on:
+/// 1. Explicit provider/model assignments (highest priority; refusal errors
+///    when the pin is missing, incapable, or over budget)
+/// 2. Objective compatibility requirements — the filter, never a ranking
+///
+/// There is no cost-based selection: an unassigned role resolves to the
+/// first capability-compatible profile in configuration order, and model
+/// choice is never automatic.
 pub struct RoutingEngine {
     profiles: Vec<RoutingProfile>,
     spend_tracker: Arc<SpendTracker>,
@@ -99,15 +109,18 @@ impl RoutingEngine {
         self
     }
 
-    /// Select the best routing profile for the given agent.
+    /// Select the routing profile for the given agent.
     ///
     /// # Arguments
     /// * `role` - The agent to select a model for
-    /// * `budget_remaining` - Optional remaining budget in USD
+    /// * `budget_remaining` - Optional remaining budget in USD (validates the
+    ///   EXPLICIT pin only; the unassigned path never selects by budget)
     /// * `task_id` - Task ID for event emission
     ///
     /// # Returns
-    /// The selected `RoutingProfile` or an error if no affordable model exists.
+    /// The selected `RoutingProfile`, or an error when the explicit pin is
+    /// missing/incapable/over budget, or no capability-compatible profile
+    /// exists for an unassigned role.
     pub fn select(
         &self,
         role: &AgentId,
@@ -171,16 +184,18 @@ impl RoutingEngine {
             });
         }
 
-        let compatible = self.compatible_candidates(role);
-        if compatible.is_empty() {
-            return Err(OrchestratorError::NoCapableModel {
+        // No explicit assignment: model choice is never automatic (no cost
+        // search, no budget selection). The first capability-compatible
+        // profile in configuration order serves the role; an empty set is a
+        // loud `NoCapableModel`.
+        let selected = self.compatible_candidates(role).into_iter().next().ok_or_else(|| {
+            OrchestratorError::NoCapableModel {
                 role: role.clone(),
                 capability: self.required_capability(role).unwrap_or("a configured model").into(),
-            });
-        }
-        let selected = self.select_affordable(&compatible, role, effective_budget)?;
+            }
+        })?;
 
-        // 5. Emit routing event
+        // Emit routing event
         self.publish_routing_decision(
             session_id,
             task_id,
@@ -189,7 +204,7 @@ impl RoutingEngine {
                 role: role.clone(),
                 provider: selected.provider.clone(),
                 model: selected.model.clone(),
-                reason: format!("lowest-cost compatible unassigned model for {role}"),
+                reason: format!("first capability-compatible unassigned model for {role}"),
                 // Model-routing row: no intent payload (ADR-55 2d §5).
                 intent: None,
             },
@@ -209,41 +224,6 @@ impl RoutingEngine {
         } else {
             let _ = self.event_bus.publish_raw(event);
         }
-    }
-
-    /// Handle provider failure by retrying with the next cheaper profile.
-    ///
-    /// # Arguments
-    /// * `role` - The agent
-    /// * `current_profile` - The profile that just failed
-    /// * `profiles` - All available profiles to choose from
-    ///
-    /// # Returns
-    /// The next cheaper `RoutingProfile` or an error if none exists.
-    pub fn retry_or_downgrade(
-        &self,
-        role: &AgentId,
-        current_profile: &RoutingProfile,
-        profiles: &[RoutingProfile],
-    ) -> Result<RoutingProfile, OrchestratorError> {
-        // Find compatible profiles that are cheaper than the current model.
-        let mut candidates: Vec<&RoutingProfile> = profiles
-            .iter()
-            .filter(|profile| self.profile_meets_requirements(role, profile))
-            .filter(|p| p.cost_per_1k_tokens < current_profile.cost_per_1k_tokens)
-            .collect();
-
-        // Sort by cost (cheapest first)
-        candidates.sort_by(|a, b| {
-            a.cost_per_1k_tokens
-                .partial_cmp(&b.cost_per_1k_tokens)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        candidates
-            .first()
-            .map(|&p| p.clone())
-            .ok_or(OrchestratorError::NoAffordableModel { role: role.clone() })
     }
 
     /// Resolve the configured global default model for a role.
@@ -321,46 +301,13 @@ impl RoutingEngine {
     }
 
     fn compatible_candidates(&self, role: &AgentId) -> Vec<&RoutingProfile> {
-        let mut candidates: Vec<&RoutingProfile> = self
-            .profiles
+        // Capability FILTER only — configuration order is preserved and no
+        // cost sort is applied. Model choice is never automatic: the first
+        // compatible profile in config order serves an unassigned role.
+        self.profiles
             .iter()
             .filter(|profile| self.profile_meets_requirements(role, profile))
-            .collect();
-
-        candidates.sort_by(|a, b| {
-            a.cost_per_1k_tokens
-                .partial_cmp(&b.cost_per_1k_tokens)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        candidates
-    }
-
-    /// Select the most affordable profile, downgrading if necessary.
-    fn select_affordable<'a>(
-        &self,
-        candidates: &'a [&'a RoutingProfile],
-        role: &AgentId,
-        budget_remaining: Option<f64>,
-    ) -> Result<&'a RoutingProfile, OrchestratorError> {
-        if let Some(budget) = budget_remaining {
-            // Find the best profile within budget
-            for &profile in candidates {
-                let estimated_cost = CostEstimator::estimate(role, profile);
-                if estimated_cost <= budget {
-                    return Ok(profile);
-                }
-            }
-
-            // All candidates exceed budget — report NoAffordableModel
-            return Err(OrchestratorError::NoAffordableModel { role: role.clone() });
-        }
-
-        // No budget constraint — return the first (best) candidate
-        candidates
-            .first()
-            .copied()
-            .ok_or(OrchestratorError::NoAffordableModel { role: role.clone() })
+            .collect()
     }
 
     /// Compute the effective remaining budget from the caller param
@@ -440,22 +387,39 @@ mod tests {
         AgentId::new("coder")
     }
 
-    fn reviewer() -> AgentId {
-        AgentId::new("reviewer")
-    }
-
-    fn validator() -> AgentId {
-        AgentId::new("validator")
-    }
-
     #[test]
-    fn unassigned_architect_uses_lowest_cost_compatible_model() {
+    fn unassigned_selects_first_compatible_profile_in_config_order() {
+        // Model choice is never automatic: no cost sort, no budget selection.
+        // The first capability-compatible profile in CONFIGURATION order wins.
         let profiles = mock_profiles();
         let engine = mock_engine(profiles.clone());
         let task_id = TaskId::new();
 
         let result = engine.select(&architect(), None, task_id).unwrap();
         assert_eq!(result.model, "cheap");
+    }
+
+    #[test]
+    fn unassigned_path_ignores_cost_ranking() {
+        // The deletion of cost-based selection is deliberate: a more expensive
+        // profile listed FIRST in configuration order is selected over a
+        // cheaper one listed later — config order, never a cost sort.
+        let profiles = vec![mock_profile("pricier-first", 0.01), mock_profile("cheap", 0.001)];
+        let engine = mock_engine(profiles);
+        let result = engine.select(&architect(), None, TaskId::new()).unwrap();
+        assert_eq!(result.model, "pricier-first");
+    }
+
+    #[test]
+    fn unassigned_path_ignores_budget() {
+        // Budget no longer gates or ranks the unassigned path (2026-09-09:
+        // automatic cost-based selection removed; assignment is explicit
+        // only). Spend caps are enforced by the SpendTracker at dispatch,
+        // not by model selection.
+        let profiles = vec![mock_profile("only-model", 10.0)];
+        let engine = mock_engine(profiles);
+        let result = engine.select(&architect(), Some(0.0001), TaskId::new()).unwrap();
+        assert_eq!(result.model, "only-model");
     }
 
     #[tokio::test]
@@ -482,46 +446,6 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_researcher_uses_lowest_cost_compatible_model() {
-        let profiles = mock_profiles();
-        let engine = mock_engine(profiles.clone());
-        let task_id = TaskId::new();
-
-        let result = engine.select(&researcher(), None, task_id).unwrap();
-        assert_eq!(result.model, "cheap");
-    }
-
-    #[test]
-    fn unassigned_coder_uses_lowest_cost_compatible_model() {
-        let profiles = mock_profiles();
-        let engine = mock_engine(profiles.clone());
-        let task_id = TaskId::new();
-
-        let result = engine.select(&coder(), None, task_id).unwrap();
-        assert_eq!(result.model, "cheap");
-    }
-
-    #[test]
-    fn unassigned_reviewer_uses_lowest_cost_compatible_model() {
-        let profiles = mock_profiles();
-        let engine = mock_engine(profiles.clone());
-        let task_id = TaskId::new();
-
-        let result = engine.select(&reviewer(), None, task_id).unwrap();
-        assert_eq!(result.model, "cheap");
-    }
-
-    #[test]
-    fn select_validator_gets_cheapest() {
-        let profiles = mock_profiles();
-        let engine = mock_engine(profiles.clone());
-        let task_id = TaskId::new();
-
-        let result = engine.select(&validator(), None, task_id).unwrap();
-        assert_eq!(result.model, "cheap");
-    }
-
-    #[test]
     fn pinned_model_override() {
         let profiles = mock_profiles();
         let spend_tracker = Arc::new(SpendTracker::default());
@@ -535,52 +459,6 @@ mod tests {
 
         let result = engine.select(&architect(), None, task_id).unwrap();
         assert_eq!(result.model, "expensive");
-    }
-
-    #[test]
-    fn budget_downgrade() {
-        // Budget 0.035 makes this affordable.
-        let profile = mock_profile("arch-capable", 0.008);
-        let profiles = vec![profile];
-        let engine = mock_engine(profiles);
-        let task_id = TaskId::new();
-
-        let result = engine.select(&architect(), Some(0.035), task_id).unwrap();
-        assert_eq!(result.model, "arch-capable");
-    }
-
-    #[test]
-    fn no_affordable_model_returns_err() {
-        let profiles = vec![mock_profile("expensive", 10.0)];
-        let engine = mock_engine(profiles);
-        let task_id = TaskId::new();
-
-        // Architect estimate for expensive (4k × 10.0/1k) = 40.0 >> 0.0001
-        let result = engine.select(&architect(), Some(0.0001), task_id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn retry_or_downgrade_finds_cheaper() {
-        let profiles = mock_profiles();
-        let engine = mock_engine(profiles.clone());
-
-        let current = mock_profile("mid", 0.005);
-        let result = engine.retry_or_downgrade(&researcher(), &current, &profiles).unwrap();
-
-        assert!(result.cost_per_1k_tokens < current.cost_per_1k_tokens);
-        assert_eq!(result.model, "cheap");
-    }
-
-    #[test]
-    fn retry_or_downgrade_fails_when_no_cheaper() {
-        let profiles = vec![mock_profile("cheap", 0.001)];
-        let engine = mock_engine(profiles.clone());
-
-        let current = mock_profile("cheap", 0.001);
-        let result = engine.retry_or_downgrade(&researcher(), &current, &profiles);
-
-        assert!(result.is_err());
     }
 
     #[test]
@@ -600,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_routing_uses_available_compatible_model() {
+    fn unassigned_resolves_single_available_model() {
         let engine = mock_engine(vec![mock_profile("available", 0.001)]);
         let result = engine.select(&architect(), None, TaskId::new()).unwrap();
         assert_eq!(result.model, "available");
@@ -808,18 +686,11 @@ mod tests {
     }
 
     #[test]
-    fn cheapest_profile_is_selected_when_no_budget() {
-        let profiles = mock_profiles();
-        let engine = mock_engine(profiles.clone());
-        let result = engine.select(&coder(), None, TaskId::new()).unwrap();
-        assert_eq!(result.model, "cheap");
-    }
-
-    #[test]
-    fn cheapest_respects_tool_calling() {
-        // A cheaper profile with an uncoverable capability gap (plugin
-        // providers are excluded from the §4 fallback, decision (a)) must
-        // not win a tool-calling role.
+    fn unassigned_capability_filter_skips_incompatible_profiles() {
+        // The capability FILTER survives the cost-routing deletion: a profile
+        // with an uncoverable capability gap (plugin providers are excluded
+        // from the §4 fallback, decision (a)) never serves a tool-calling
+        // role, even when it is first in configuration order.
         let mut no_tools = mock_profile("no-tools", 0.0001);
         no_tools.supports_tool_calling = false;
         no_tools.provider = "plugin:tools-less".into();
@@ -829,11 +700,11 @@ mod tests {
         assert_eq!(result.model, "with-tools");
     }
 
-    /// ADR-66 §4 carve-out: a cheaper non-plugin profile without native
-    /// tool support is eligible for tool-calling roles — the labeled
-    /// fallback driver covers the gap, so cost-based selection proceeds.
+    /// ADR-66 §4 carve-out: a non-plugin profile without native tool support
+    /// is eligible for tool-calling roles — the labeled fallback driver
+    /// covers the gap, so the first-in-config-order profile is selected.
     #[test]
-    fn cheapest_fallback_covered_profile_is_eligible_for_tool_roles() {
+    fn unassigned_fallback_covered_profile_is_eligible_for_tool_roles() {
         let mut no_tools = mock_profile("no-native-tools", 0.0001);
         no_tools.supports_tool_calling = false;
         let profiles = vec![no_tools, mock_profile("with-tools", 0.005)];
@@ -843,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn cheapest_returns_none_when_no_compatible() {
+    fn unassigned_no_compatible_profile_returns_no_capable_model() {
         // Plugin-backed gap: uncovered by the fallback → no compatible
         // profile for a tool-calling role.
         let mut no_tools = mock_profile("no-tools", 0.001);
@@ -852,17 +723,7 @@ mod tests {
         let engine = mock_engine(vec![no_tools]);
         let task_id = TaskId::new();
         let result = engine.select(&coder(), None, task_id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn budget_enough_for_expensive_model() {
-        let profiles = vec![mock_profile("cheap", 0.001), mock_profile("expensive", 0.01)];
-        let engine = mock_engine(profiles);
-        let task_id = TaskId::new();
-        let result = engine.select(&coder(), Some(1.0), task_id).unwrap();
-        // With a generous budget, should still pick cheapest
-        assert_eq!(result.model, "cheap");
+        assert!(matches!(result, Err(OrchestratorError::NoCapableModel { .. })));
     }
 
     #[test]
@@ -871,15 +732,6 @@ mod tests {
         let p2 = p.clone();
         assert_eq!(p.model, p2.model);
         assert_eq!(p.cost_per_1k_tokens, p2.cost_per_1k_tokens);
-    }
-
-    #[test]
-    fn retry_or_downgrade_same_cost_returns_err() {
-        let profiles = vec![mock_profile("same1", 0.005), mock_profile("same2", 0.005)];
-        let engine = mock_engine(profiles.clone());
-        let current = mock_profile("same1", 0.005);
-        let result = engine.retry_or_downgrade(&researcher(), &current, &profiles);
-        assert!(result.is_err());
     }
 
     #[test]

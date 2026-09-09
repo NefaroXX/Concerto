@@ -314,7 +314,15 @@ impl LlmProvider for GoogleProvider {
                         }
                         items
                     }
-                    Err(e) => vec![Err(ProviderError::Other(format!("stream error: {}", describe_error_chain(&e))))],
+                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // mid-stream is retriable (tools execute only
+                    // post-assembly — re-issue is side-effect-free within
+                    // the bounded attempt budget); framing/parse failures
+                    // inside a healthy stream stay fatal.
+                    Err(e) => vec![Err(ProviderError::StreamTransport(format!(
+                        "connection dropped mid-stream: {}",
+                        describe_error_chain(&e)
+                    )))]
                 };
                 for item in items {
                     yield item;

@@ -194,6 +194,20 @@ pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
 
+    /// Transport failure while a completion stream was already in flight.
+    ///
+    /// The HTTP request succeeded and the response stream had opened, then
+    /// the connection broke mid-stream (reset, dropped socket, body read
+    /// error). Kept distinct from a pre-request [`ProviderError::Network`]
+    /// failure so the retry layer can retry it deliberately (ADR-55 Phase
+    /// 2e stream-retry): tools execute only after a stream is fully
+    /// assembled, so re-issuing the request is side-effect-free within the
+    /// bounded attempt budget. Framing and parse failures inside a healthy
+    /// stream stay fatal (`Serialization`/`InvalidResponse`) — retrying
+    /// cannot fix a broken wire format.
+    #[error("stream transport error: {0}")]
+    StreamTransport(String),
+
     /// A provider request stopped making progress at a specific phase.
     #[error("provider {phase} timed out after {timeout:?}")]
     Timeout { phase: &'static str, timeout: Duration },
@@ -269,6 +283,10 @@ impl ProviderError {
             ProviderError::RateLimit { .. } => true,
             ProviderError::HttpStatus { status, .. } => *status >= 500 || *status == 429,
             ProviderError::Network(_) => true,
+            // A mid-stream transport fault is as transient as a
+            // pre-request one — see the variant's docs (ADR-55 Phase 2e
+            // stream-retry).
+            ProviderError::StreamTransport(_) => true,
             ProviderError::Timeout { .. } => true,
             ProviderError::InvalidResponse(_) => true,
             // Generic catch-all — assume transient to avoid false fatal

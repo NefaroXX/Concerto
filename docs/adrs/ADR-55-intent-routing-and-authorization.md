@@ -991,11 +991,85 @@ AskUser paths keep their existing audit rows.
 - **A4** — `hmm` (`AskUser` `0.0`) → zero writes, zero grants.
 - **A5** — `plan: X` then `execute` (no `approve` click) → auto-`Apply` from
   the persisted `DesignDoc`, hash-verified.
-- **A6** — "Build a Rust CLI tool called hexview … do NOT read it as a UTF-8
-  string … must not panic … don't panic" → routes to a grantable outcome
-  (`Verify`/`Execute`, ≥ 0.7, non-negation), **not** `negation_override`; the
-  coordinator runs and writes files.
+- **A6 (revised by Phase 2e below)** — "Build a Rust CLI tool called hexview
+  … do NOT read it as a UTF-8 string … must not panic … don't panic …
+  verify it" (with or without a `Prompt:`-style glued label) → Acting
+  envelope → the unified loop builds and verifies with tools → files
+  written. Outcomes are flavor hints only; no keyword may select a
+  tool-less path.
 - **A7** — A3 plus "don't do it", "just answer", "no changes" → `NegationOverride`
   read-only, zero writes, zero grants. Standalone "stop" (deliberately not a
   corpus member; "stop the service" is an action request) → `AskUser` 0.0,
   also hard read-only (§2), zero writes, zero grants.
+
+## Addendum (Phase 2e) — Unified agent loop: the router grants envelopes, the model shapes the run (2026-09-09)
+
+Supersedes Phase 2d §§1/3–4 *as dispatch logic* (auto-grant-then-branch).
+Three consecutive smoke failures share one mechanism, not three causes:
+deterministic keyword routing choosing the run's code path before any model
+is consulted (a `verify` subordinate clause hijacks builds into tool-less
+chat; `don't` inside constraints hijacks into the read-only sink; a
+`Prompt:` label glued to the leading verb blinds whole-token matching).
+Narrowing instances (#43, #44, #46) cannot close a mechanism that generates
+them. Grounding: Anthropic "Building Effective Agents" (augmented LLM —
+the model selects tools; agents are LLMs using tools on environmental
+feedback in a loop) and OpenCode (one loop, `permission` rules keyed by
+tool at action time, no request classification).
+
+**Unchanged and load-bearing:** Decision §2 tiers (the *only* gate); §5
+audit chain; §2a prohibition trigger as narrowed by #43 (now an *envelope*
+trigger, not a path selector); ADR-60/65; ADR-66.
+
+### 1. One loop
+
+Every non-empty run enters the unified agent loop (single-agent vs
+coordinator selection unchanged — out of scope). The `run_text_only`
+branch is deleted. Chat is what the loop does when the model uses no tools
+(≈ one text-only call in cost, zero forks).
+
+### 2. Router keeps the safety job only
+
+`route()` still runs (cheap, auditable) and decides only the permission
+envelope: `ReadOnly` (task-level prohibition; empty/zero-confidence) or
+`Acting` (everything else, grant scopes exactly as today). Outcomes become
+non-binding flavor hints — one system-prompt line (e.g. "the user seems to
+want verification; prefer checking over changing"), logged with the routing
+row, never branching.
+
+### 3. Enforcement at grants; modal leaves the hot path
+
+`ReadOnly` = `IntentAuthorized` never set; the policy engine denies writes
+as today. Prohibition inputs get read-capable answers (better UX, identical
+safety). Unclear input gets bounded in-loop clarification (iteration caps
+bind it).
+
+### 4. Classifier retired from dispatch
+
+The ADR-56 classifier leaves the run hot path (saves a call + latency per
+run); deterministic safety rules + flavor scan remain (see ADR-56 amendment
+2026-09-09).
+
+### 5. Guards that stay
+
+Zero-work guard, cycle detection, continuation caps, spend fuses, and the
+empty-completion honesty rule (Phase 2d Fix B — a loop run ending with
+empty final text still synthesizes the explanatory completion).
+Identical-tool-call repetition coverage is verified in `cycle_manager`,
+with a minimal same-call guard added only if absent.
+
+### 6. Narrow normalization (glue-strip)
+
+Routing normalization detaches a leading glued `Label:` iff alphabetic
+length > 1 (excludes `C:` drives) and the remainder begins with an explicit
+action keyword as a whole token (excludes `https://…`). Near-miss
+regression tests pin the exclusions.
+
+### 7. Acceptance (Phase 2e)
+
+- **A8** — `don't build accord` → ReadOnly envelope → answer, zero writes,
+  zero grants.
+- **A9** — `hmm` → bounded in-loop clarification (≤1 turn), zero writes.
+- **A10** — `verify the fix` → Acting envelope → loop verifies *with
+  tools*; writes governed by policy, not by branch.
+- **A11** — full workspace green; `run_text_only` deleted; no text-only
+  branch; no dispatch-time classifier call; routing docs updated.
