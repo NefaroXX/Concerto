@@ -216,6 +216,15 @@ impl From<OrchestratorError> for ClassifiedFailure {
                         "The model provider could not be reached: {message}. The task can be resumed when connectivity returns."
                     );
                 }
+                ProviderError::StreamTransport(message) => {
+                    audience = FailureAudience::User;
+                    code = "PROVIDER_STREAM_TRANSPORT".to_string();
+                    user_message = format!(
+                        "The connection to the model provider dropped mid-stream: {message}. \
+                         The request is retried automatically within its attempt budget; \
+                         if the run still fails, it can be resumed."
+                    );
+                }
                 ProviderError::Timeout { phase, timeout } => {
                     audience = FailureAudience::User;
                     code = "PROVIDER_TIMEOUT".to_string();
@@ -563,6 +572,7 @@ mod tests {
             ProviderError::AuthFailure,
             ProviderError::Cancelled,
             ProviderError::Network("dns failed".into()),
+            ProviderError::StreamTransport("connection reset mid-stream".into()),
             ProviderError::Timeout { phase: "connect", timeout: std::time::Duration::from_secs(1) },
             ProviderError::Serialization("bad json".into()),
             ProviderError::InvalidResponse("malformed".into()),
