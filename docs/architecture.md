@@ -66,8 +66,10 @@ configured through `MultiAgentConfig.relationships` and validated by
 
 Provider/model assignments are per role. Concerto uses objective compatibility
 metadata—most importantly tool-call support for Researcher, Coder, and
-Validator—not subjective capability tiers. All roles share the session spend
-tracker.
+Validator—not subjective capability tiers. Assignments are explicit only: the
+runtime never searches or selects models by cost, and an unassigned role takes
+the first capability-compatible configured profile in configuration order. All
+roles share the session spend tracker.
 
 The runtime topology is configuration-driven (ADR-35 phase 4): the Coordinator
 plus every non-disabled built-in specialist and custom agent
@@ -122,9 +124,12 @@ Google, OpenRouter, Ollama, NVIDIA NIM, and OpenCode-compatible behavior. It als
 owns OpenAI-compatible protocol normalization, token metering, retry wrapping,
 provider construction, model profiles, and routing.
 
-The selected provider and model form a pair. Explicit session/role selection is
-authoritative unless invalid or unaffordable; fallback routing operates only
-where no authoritative pair can be used. See [models.md](models.md).
+The selected provider and model form a pair. Explicit session/role selection
+is authoritative; there is no automatic cost- or capability-based model
+selection (assignment is explicit only), and fallback routing operates only
+where no authoritative pair can be used. An unassigned role resolves to the
+first capability-compatible configured profile in configuration order. See
+[models.md](models.md).
 
 ## Tool, policy, and filesystem layers
 

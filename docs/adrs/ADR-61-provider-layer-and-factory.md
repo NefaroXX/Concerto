@@ -63,6 +63,14 @@ than being copied per vendor.
 
 ### 3. Factory construction is the only production path
 
+> **Amendment (2026-09-09):** no automatic model selection by cost or
+> capability — assignment is explicit only (per-agent Studio pins, the
+> coordinator model in settings, or the agent fallback → global default
+> chain). An unassigned role resolves to the first capability-compatible
+> configured profile in configuration order; cost metadata is
+> display/diagnostics only, and the `CostEstimator` validates explicit pins
+> against the remaining budget without ever ranking candidates.
+
 `ProviderFactory` (`crates/providers/src/factory.rs`) turns a
 `ProviderConfig` plus a `CredentialStore` into a ready provider instance:
 

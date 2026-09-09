@@ -26,6 +26,14 @@ The 24-crate workspace has completed the audit-remediation programme
 (Phases 0–6, PR #77) and the ADR-34 through ADR-40 run of durability and
 lifecycle decisions. What is true on `dev` today:
 
+- **Automatic cost-based model selection removed (2026-09-09):** assignment is
+  explicit only — per-agent Studio pins, the coordinator model in settings, or
+  the fallback chain. The routing engine never searches or ranks models by
+  cost or budget; an unassigned role resolves to the first
+  capability-compatible configured profile in configuration order, and
+  spend tracking + budget caps remain enforced at dispatch (ADR-31/61
+  amendments).
+
 - **Durable orchestration runtime (ADR-34):** one provider retry boundary
   (time-to-first-byte and idle timeouts, never replaying a specialist run),
   orchestration checkpoints persisted to the session database with fallible
