@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Unified agent loop (ADR-55 Phase 2e):** the router now grants permission
+  envelopes (ReadOnly/Acting) instead of choosing code paths — every
+  non-empty run enters the loop and the model shapes it; outcomes are
+  non-binding flavor hints; the text-only branch is deleted; the classifier
+  left the hot path. No keyword can convert a build into chat anymore.
+- **Cost-routing deletion:** the harness never selects models — automatic
+  cheapest-compatible selection, cost sorting, and downgrade-on-failure are
+  removed. Assignment is explicit only (Studio pins, coordinator setting,
+  agent-fallback → global-default chain); spend tracking + budget caps and
+  loud capability refusal on pinned models are unchanged.
+- **Mid-stream retry:** transport-caused stream failures are bounded-retryable
+  (`StreamTransport`); framing/parse errors stay fatal.
 - **OS/shell identity card (shell plan):** every agent prompt now carries a
   compact environment card (OS + arch, canonical agent shell profile +
   executable, 2–4 dialect gotchas for the detected bash/PowerShell/cmd
