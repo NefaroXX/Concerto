@@ -2122,6 +2122,27 @@ pub fn task_action_required(effective: RequestedOutcome, gate_read_only: bool) -
     matches!(effective, RequestedOutcome::Execute) && !gate_read_only
 }
 
+/// The authoritative acting-run vehicle (ADR-55 Phase 2e fix, 2026-09-09).
+///
+/// The single/multi switch (the desktop toggle wired through
+/// `RequestBuilder::with_single_agent` into [`AgentRunRequest::
+/// force_single_agent`], or the `force_single_agent` config lever) is the
+/// dispatch decision for ACTING runs — no outcome-based exceptions:
+///
+/// - Multi mode (`force_single_agent == false`) + [`RunEnvelope::Acting`] →
+///   the coordinator (`run_multi_agent`) for every acting outcome (Execute,
+///   Plan, Verify, Diagnose, Review, Answer) — the envelope is the only
+///   branch, exactly as ADR-55 Phase 2e §2 demands the router decide only
+///   the permission envelope.
+/// - Single mode, `force_single_agent`, or a [`RunEnvelope::ReadOnly`]
+///   envelope → the single-agent loop.
+///
+/// Published so tests can pin all four dispatch permutations without a full
+/// run.
+pub fn dispatches_to_coordinator(force_single_agent: bool, envelope: RunEnvelope) -> bool {
+    !force_single_agent && envelope.is_acting()
+}
+
 /// ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
 /// not the approval phrase ("i approve"). The stored, capped plan text is
 /// what the user approved; the original ask rides in the transcript.
@@ -3223,10 +3244,12 @@ pub async fn run_shared_agent(
     // 7. Multi-agent dispatch. ADR-55 Phase 2e §1: the text-only fork is
     // deleted — every non-empty run enters the unified agent loop, and Chat
     // is what the loop does when the model uses no tools (≈ one text-only
-    // call in cost, zero forks). Single-vs-coordinator selection is
-    // untouched: only action-required (Execute) and Plan runs still dispatch
-    // to the coordinator when the multi-agent flag selects it.
-    if !req.force_single_agent && (action_required || effective_outcome == RequestedOutcome::Plan) {
+    // call in cost, zero forks). Single-vs-coordinator selection is the
+    // authoritative acting-run switch (2026-09-09 fix): the multi switch
+    // (`!force_single_agent`) routes EVERY Acting-envelope run to the
+    // coordinator — all acting outcomes, no flavor-hint exceptions; single
+    // mode, `force_single_agent`, and ReadOnly envelopes run the loop.
+    if dispatches_to_coordinator(req.force_single_agent, envelope) {
         return run_multi_agent(
             &req,
             &services,
@@ -3377,9 +3400,12 @@ pub async fn run_shared_agent(
 /// Run the multi-agent (coordinator) path: resolve role-specific providers,
 /// or launch a full multi-agent `CoordinatorAgent` with collaboration rules.
 ///
-/// ADR-55 Phase 2e §1: this path only receives action-required (Execute) and
-/// Plan runs — the text-only fork was deleted with the unified agent loop,
-/// and Chat/Verify/Review/Diagnose/Answer runs enter the loop instead.
+/// ADR-55 Phase 2e §1: this path receives the run whenever the acting-run
+/// switch selects the coordinator — an Acting envelope in multi mode, any
+/// acting outcome (the text-only fork was deleted with the unified agent
+/// loop). `action_required` is `false` for the non-Execute acting outcomes;
+/// they reach the same coordinator as topologically text-only/coordinator-only
+/// orchestration depths (1e §2).
 ///
 /// `action_required` / `effective_outcome` / `plan_objective_hash` come from
 /// the always-on intent gate (ADR-55 Phase 1e): they shape the topology and
@@ -6426,6 +6452,47 @@ mod runtime_runner_tests {
                 "{outcome:?} stays answer-only when read-only"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // dispatches_to_coordinator (ADR-55 Phase 2e acting-run vehicle fix):
+    // the single/multi switch routes Acting runs, with no outcome-based
+    // exceptions — four pinning permutations.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn multi_mode_acting_envelope_dispatches_coordinator_for_every_acting_outcome() {
+        // The envelope is the only branch: Verify (and every other acting
+        // outcome) dispatches the coordinator in multi mode, not just
+        // Execute/Plan.
+        assert!(dispatches_to_coordinator(false, RunEnvelope::Acting));
+        // Execute still dispatches (sanity for the previous behavior).
+        assert!(dispatches_to_coordinator(false, RunEnvelope::from_confirmation("auto_granted")));
+    }
+
+    #[test]
+    fn single_mode_acting_execute_stays_single_loop() {
+        assert!(
+            !dispatches_to_coordinator(true, RunEnvelope::Acting),
+            "single mode keeps even an acting Execute on the single-agent loop"
+        );
+    }
+
+    #[test]
+    fn forced_single_agent_overrides_multi_mode() {
+        // `with_single_agent(false)` is the multi-mode signal; a forced
+        // single-agent request never routes to the coordinator.
+        assert!(!dispatches_to_coordinator(true, RunEnvelope::Acting));
+        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly));
+    }
+
+    #[test]
+    fn read_only_envelope_stays_single_loop() {
+        // A ReadOnly envelope (negation veto, unresolved AskUser, gate
+        // denial) runs the single-agent loop even in multi mode: the
+        // coordinator path exists only for acting runs.
+        assert!(!dispatches_to_coordinator(false, RunEnvelope::ReadOnly));
+        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly));
     }
 
     // ------------------------------------------------------------------
