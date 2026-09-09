@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use concerto_core::error::ProviderError;
-use concerto_core::event::{EventBus, EventKind};
+use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
@@ -172,6 +172,7 @@ impl AgentRunner {
                     profile.profile.provider,
                     model_name
                 ),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -221,6 +222,7 @@ impl AgentRunner {
                     model_name,
                     start.elapsed().as_millis()
                 ),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -261,6 +263,7 @@ impl AgentRunner {
                         } else {
                             format!("Subtask failed: {error}")
                         },
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 let lifecycle_event = if cancelled {
@@ -306,6 +309,7 @@ impl AgentRunner {
                     EventKind::AgentThought {
                         agent_id: role_name.to_string(),
                         content: format!("Completed subtask: {summary}"),
+                        kind: ThinkingKind::Headline,
                     },
                 );
                 let _ = self.bus.publish_for_session(
@@ -321,6 +325,7 @@ impl AgentRunner {
                     EventKind::AgentThought {
                         agent_id: role_name.to_string(),
                         content: format!("Subtask needs revision: {reason}"),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 let _ = self.bus.publish_for_session(
@@ -336,6 +341,7 @@ impl AgentRunner {
                     EventKind::AgentThought {
                         agent_id: role_name.to_string(),
                         content: format!("Subtask blocked on {on:?}"),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 let _ = self.bus.publish_for_session(
@@ -351,6 +357,7 @@ impl AgentRunner {
                     EventKind::AgentThought {
                         agent_id: role_name.to_string(),
                         content: format!("Subtask failed: {error}"),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 let _ = self.bus.publish_for_session(

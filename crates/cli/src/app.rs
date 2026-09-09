@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use crate::approval::{
     ApprovalPrompt, CliApprovalSink, CliApprovalState, IntentPrompt, PlanPrompt,
@@ -15,7 +15,7 @@ use concerto_config::{
     AgentModelAssignment, AppConfig, ConditionDef, ModelSettings, MultiAgentConfig, PolicyConfig,
     PolicyRuleDef,
 };
-use concerto_core::event::{EventBus, EventKind};
+use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{PlanDecision, RequestedOutcome, RunStage};
 use concerto_core::traits::approval::ApprovalDecision;
@@ -154,6 +154,9 @@ pub(crate) enum UiLine {
     Text(String),
     /// The assistant's final message, animated into view by the reveal.
     Assistant(String),
+    /// An agent thought, tiered for the score accordion (V2). `LowLevel`
+    /// thoughts never become `UiLine`s (dropped at the bus adapter).
+    Thought { agent: String, kind: ThinkingKind, content: String },
 }
 
 /// In-progress typewriter reveal of the assistant's final message. The last
@@ -162,6 +165,16 @@ pub(crate) enum UiLine {
 struct RevealState {
     full: String,
     shown: usize,
+}
+
+/// One tiered thought in the current movement's log (V2 score accordion).
+/// `shown` records whether the line rendered at ingest time so `/thinking`
+/// expand-all replays exactly the suppressed lines — never duplicates.
+pub(crate) struct ThoughtRecord {
+    agent: String,
+    kind: ThinkingKind,
+    content: String,
+    shown: bool,
 }
 
 /// Characters the typewriter reveal adds per tick. Together with
@@ -237,6 +250,19 @@ pub struct App {
     tool_event_rx: Option<std::sync::mpsc::Receiver<EventKind>>,
     stage_rx: Option<std::sync::mpsc::Receiver<RunStage>>,
     pub memory_chunks: usize,
+    /// Tracks the most recently seen agent id for the thinking accordion
+    /// header insertion. When the agent changes, a bold header line is
+    /// injected before the first thought from the new agent.
+    current_agent: Option<String>,
+    /// Full thought log for the current movement (V2 score accordion).
+    /// Every `Headline`/`Detail` thought is recorded with its visibility so
+    /// `/thinking` expand-all can replay suppressed lines and collapse-all
+    /// can print a per-agent digest. `LowLevel` thoughts never enter here.
+    pub(crate) thought_log: Vec<ThoughtRecord>,
+    /// Whether `Detail` thoughts render inline (V2). `true` preserves the
+    /// historical show-everything behavior; `/thinking` toggles it per
+    /// movement. `Headline` thoughts always render.
+    pub(crate) thinking_expanded: bool,
 }
 
 impl Default for App {
@@ -291,6 +317,9 @@ impl App {
             tool_event_rx: None,
             stage_rx: None,
             memory_chunks: 0,
+            current_agent: None,
+            thought_log: Vec::new(),
+            thinking_expanded: true,
         }
     }
 
@@ -571,9 +600,19 @@ impl App {
                         | EventKind::ToolTimeout { .. }
                         | EventKind::IndexingCompleted { .. }
                 );
+                // Tiered thoughts (score accordion V2): LowLevel never
+                // reaches a chat surface; the App applies collapse filtering
+                // and header injection at ingest time.
+                if let EventKind::AgentThought { agent_id, content, kind } = &event.kind {
+                    if *kind != ThinkingKind::LowLevel {
+                        let _ = event_tx.send(UiLine::Thought {
+                            agent: agent_id.clone(),
+                            kind: *kind,
+                            content: content.clone(),
+                        });
+                    }
+                }
                 if let Some(line) = event_line(&event.kind) {
-                    // Assistant final messages reveal typewriter-style; every
-                    // other line renders instantly (Issue #147 Part 2).
                     let tagged = if matches!(&event.kind, EventKind::AssistantMessage { .. }) {
                         UiLine::Assistant(line)
                     } else {
@@ -732,6 +771,12 @@ impl App {
         if self.running || input.trim().is_empty() {
             return;
         }
+        // `/thinking` is a local accordion toggle for the current movement
+        // (collapse-all / expand-all) — never dispatched as a run.
+        if input.trim() == "/thinking" {
+            self.toggle_thinking();
+            return;
+        }
         // External config edits take effect on this dispatch (ADR-57 D5).
         self.reload_config_for_run();
         let (Some(config), Some(session_manager)) =
@@ -784,6 +829,11 @@ impl App {
         // Fresh run boundary: no stale stage from a previous run may show in
         // the status bar (the chip re-appears once a stage event lands).
         self.run_stage = None;
+        self.current_agent = None;
+        // Fresh movement boundary: the thought log belongs to the previous
+        // movement, and collapse mode resets to show-everything.
+        self.thought_log.clear();
+        self.thinking_expanded = true;
         self.cancel_token = CancellationToken::new();
 
         let request =
@@ -852,6 +902,9 @@ impl App {
     fn ingest_ui_line(&mut self, line: UiLine) {
         match line {
             UiLine::Text(text) => self.push_line(Line::from(text)),
+            UiLine::Thought { agent, kind, content } => {
+                self.ingest_thought(agent, kind, content);
+            }
             UiLine::Assistant(full) => {
                 // Cancel any active reveal first (same semantics as
                 // `push_line`) so its slot is materialized before we push the
@@ -860,6 +913,68 @@ impl App {
                 self.messages.push(Line::from(prefix(&full, 0)));
                 self.reveal = Some(RevealState { full, shown: 0 });
             }
+        }
+    }
+
+    /// Route one tiered thought into the chat view (V2 score accordion).
+    /// The full movement is always logged; rendering follows the collapse
+    /// mode — `Headline` thoughts always show, `Detail` only when expanded.
+    /// A bold per-agent header is injected on agent change.
+    fn ingest_thought(&mut self, agent: String, kind: ThinkingKind, content: String) {
+        let shown = self.thinking_expanded || kind == ThinkingKind::Headline;
+        self.thought_log.push(ThoughtRecord {
+            agent: agent.clone(),
+            kind,
+            content: content.clone(),
+            shown,
+        });
+        if self.current_agent.as_deref() != Some(agent.as_str()) {
+            self.push_line(thinking_header(&agent));
+            self.current_agent = Some(agent.clone());
+        }
+        if shown {
+            self.push_line(Line::from(format!("· [{agent}] {content}")));
+        }
+    }
+
+    /// `/thinking` toggle for the current movement: collapse-all prints a
+    /// per-agent digest (latest headline each) and suppresses future
+    /// `Detail` lines; expand-all replays exactly the suppressed lines.
+    fn toggle_thinking(&mut self) {
+        self.thinking_expanded = !self.thinking_expanded;
+        if self.thinking_expanded {
+            let replay: Vec<(String, String)> = self
+                .thought_log
+                .iter_mut()
+                .filter(|record| !record.shown && record.kind == ThinkingKind::Detail)
+                .map(|record| {
+                    record.shown = true;
+                    (record.agent.clone(), record.content.clone())
+                })
+                .collect();
+            for (agent, content) in replay {
+                self.push_line(Line::from(format!("· [{agent}] {content}")));
+            }
+            self.push_line(Line::from("‖ thinking expanded"));
+        } else {
+            let mut order: Vec<String> = Vec::new();
+            let mut latest: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for record in &self.thought_log {
+                if record.kind == ThinkingKind::Headline {
+                    if !latest.contains_key(&record.agent) {
+                        order.push(record.agent.clone());
+                    }
+                    latest.insert(record.agent.clone(), record.content.clone());
+                }
+            }
+            for agent in &order {
+                if let Some(headline) = latest.get(agent) {
+                    let first = headline.lines().next().unwrap_or("").trim();
+                    self.push_line(Line::from(format!("‖ [{agent}] {first}")));
+                }
+            }
+            self.push_line(Line::from("‖ thinking collapsed — /thinking to expand"));
         }
     }
 
@@ -1527,6 +1642,38 @@ fn prefix(full: &str, shown: usize) -> String {
     full.chars().take(shown).collect()
 }
 
+/// ANSI counterpart of the desktop `agent_roles` palette map: one stable
+/// color per specialist role so CLI headers match desktop buckets.
+fn agent_ansi_color(role: &str) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    match role.to_lowercase().as_str() {
+        "architect" => Color::Magenta,
+        "researcher" => Color::Blue,
+        "coder" => Color::Green,
+        "reviewer" => Color::Yellow,
+        "validator" => Color::Cyan,
+        "coordinator" => Color::White,
+        _ => Color::DarkGray,
+    }
+}
+
+/// Per-agent thinking header (V2 score accordion). Colorized `[‖ agent]`
+/// on a color TTY; plain `[+ agent]` under `NO_COLOR` or off-TTY so no ANSI
+/// escapes leak into pipes.
+pub(crate) fn thinking_header(agent: &str) -> Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    use std::io::IsTerminal as _;
+    let use_color = std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
+    if use_color {
+        Line::from(Span::styled(
+            format!("[‖ {agent}]"),
+            Style::default().fg(agent_ansi_color(agent)).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(format!("[+ {agent}]"))
+    }
+}
+
 fn event_line(kind: &EventKind) -> Option<String> {
     match kind {
         EventKind::AssistantMessage { content, .. } => Some(content.clone()),
@@ -1542,8 +1689,14 @@ fn event_line(kind: &EventKind) -> Option<String> {
         EventKind::ToolTimeout { tool_name, timeout_secs } => {
             Some(format!("· {tool_name} timed out after {timeout_secs}s"))
         }
-        // -- agent activity --
-        EventKind::AgentThought { agent_id, content } => Some(format!("· [{agent_id}] {content}")),
+        // -- agent activity (LowLevel thoughts never reach chat surfaces) --
+        EventKind::AgentThought { agent_id, content, kind } => {
+            if *kind == ThinkingKind::LowLevel {
+                None
+            } else {
+                Some(format!("· [{agent_id}] {content}"))
+            }
+        }
         EventKind::SubTaskCreated { role, description, .. } => {
             Some(format!("· [{role:?}] starting: {description}"))
         }
@@ -1739,6 +1892,81 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         })
+    }
+
+    #[test]
+    fn thought_ingest_logs_headline_and_detail_while_expanded() {
+        let mut app = App::new();
+        let base = app.messages.len();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Headline,
+            content: "starting".into(),
+        });
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Detail,
+            content: "tool reasoning".into(),
+        });
+        assert_eq!(app.thought_log.len(), 2);
+        // Header + 2 thought lines.
+        assert_eq!(app.messages.len(), base + 3);
+        assert_eq!(app.current_agent.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn thinking_toggle_suppresses_detail_and_replays_on_expand() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Headline,
+            content: "starting".into(),
+        });
+        // Collapse: digest only, future Detail suppressed.
+        app.toggle_thinking();
+        assert!(!app.thinking_expanded);
+        let collapsed_len = app.messages.len();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Detail,
+            content: "hidden detail".into(),
+        });
+        assert_eq!(app.messages.len(), collapsed_len, "collapsed Detail stays hidden");
+        // Expand: exactly the suppressed line replays, no duplicates.
+        app.toggle_thinking();
+        assert!(app.thinking_expanded);
+        assert!(
+            app.messages
+                .iter()
+                .filter(|line| format!("{line:?}").contains("hidden detail"))
+                .count()
+                == 1
+        );
+    }
+
+    #[test]
+    fn low_level_thoughts_have_no_chat_line() {
+        let kind = EventKind::AgentThought {
+            agent_id: "coder".into(),
+            content: "[system_instructions]".into(),
+            kind: ThinkingKind::LowLevel,
+        };
+        assert_eq!(event_line(&kind), None);
+        let detail = EventKind::AgentThought {
+            agent_id: "coder".into(),
+            content: "reasoning".into(),
+            kind: ThinkingKind::Detail,
+        };
+        assert!(event_line(&detail).is_some());
+    }
+
+    #[test]
+    fn thinking_header_is_plain_off_tty() {
+        // Test harnesses run off-TTY, so headers must be the plain `[+]`
+        // form with no ANSI styling.
+        let header = thinking_header("coder");
+        let rendered: String = header.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(rendered, "[+ coder]");
     }
 
     #[test]

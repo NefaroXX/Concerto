@@ -156,7 +156,7 @@ pub fn transcript_entry_from_event_with_labels(
         }),
 
         // ---- Agent output ----
-        EventKind::AgentThought { agent_id, content } => {
+        EventKind::AgentThought { agent_id, content, .. } => {
             Some(TranscriptEntry::Thinking { agent: agent_id.clone(), content: content.clone() })
         }
         EventKind::AssistantMessage { content, .. } => {
@@ -582,6 +582,7 @@ mod tests {
         let thinking = transcript_entry_from_event(&EventKind::AgentThought {
             agent_id: "coder".into(),
             content: "step one".into(),
+            kind: crate::event::ThinkingKind::Detail,
         });
         assert_eq!(
             thinking,

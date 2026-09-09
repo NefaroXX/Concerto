@@ -5955,7 +5955,11 @@ mod runtime_runner_tests {
         publish(
             &bus,
             session_id,
-            EventKind::AgentThought { agent_id: "coder".into(), content: "plan".into() },
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "plan".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         );
         publish(
             &bus,
@@ -5972,6 +5976,7 @@ mod runtime_runner_tests {
             EventKind::AgentThought {
                 agent_id: "coder".into(),
                 content: "observing result".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
             },
         );
         publish(
@@ -6086,7 +6091,11 @@ mod runtime_runner_tests {
             publish(
                 &bus,
                 session_id,
-                EventKind::AgentThought { agent_id: "coder".into(), content: format!("step {i}") },
+                EventKind::AgentThought {
+                    agent_id: "coder".into(),
+                    content: format!("step {i}"),
+                    kind: concerto_core::event::ThinkingKind::Detail,
+                },
             );
         }
         recorder.stop().await;
@@ -6112,12 +6121,20 @@ mod runtime_runner_tests {
         publish(
             &bus,
             session_a,
-            EventKind::AgentThought { agent_id: "coder".into(), content: "step one".into() },
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "step one".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         );
         publish(
             &bus,
             session_b,
-            EventKind::AgentThought { agent_id: "coder".into(), content: "other session".into() },
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "other session".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         );
 
         recorder.stop().await;

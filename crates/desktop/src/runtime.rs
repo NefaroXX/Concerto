@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use concerto_config::AppConfig;
-use concerto_core::event::{Event as BackendEvent, EventBus, EventKind};
+use concerto_core::event::{Event as BackendEvent, EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::traits::policy::PolicyEngine;
@@ -40,6 +40,7 @@ pub enum DesktopEvent {
     AgentThought {
         agent_id: String,
         content: String,
+        kind: ThinkingKind,
     },
     /// A tool was called (for chat annotation + tool log row).
     ToolCalled {
@@ -223,7 +224,11 @@ impl DesktopServices {
 // ---------------------------------------------------------------------------
 
 fn activity(agent_id: impl Into<String>, content: impl Into<String>) -> Option<DesktopEvent> {
-    Some(DesktopEvent::AgentThought { agent_id: agent_id.into(), content: content.into() })
+    Some(DesktopEvent::AgentThought {
+        agent_id: agent_id.into(),
+        content: content.into(),
+        kind: ThinkingKind::Detail,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -473,9 +478,11 @@ fn translate_provider_retry_event(event: &BackendEvent) -> Option<DesktopEvent> 
 /// Translate miscellaneous events that don't fit a domain group.
 fn translate_misc_event(event: &BackendEvent) -> Option<DesktopEvent> {
     match &event.kind {
-        EventKind::AgentThought { agent_id, content } => {
-            activity(agent_id.clone(), content.clone())
-        }
+        EventKind::AgentThought { agent_id, content, kind } => Some(DesktopEvent::AgentThought {
+            agent_id: agent_id.clone(),
+            content: content.clone(),
+            kind: *kind,
+        }),
         EventKind::SessionSaved => Some(DesktopEvent::SessionSaved),
         EventKind::AssistantMessage { content, .. } => {
             Some(DesktopEvent::AssistantMessage { content: content.clone() })
@@ -550,9 +557,14 @@ pub fn route_event(
     memory_state: &mut memory::State,
 ) {
     match event {
-        DesktopEvent::AgentThought { agent_id, content } => {
+        DesktopEvent::AgentThought { agent_id, content, kind } => {
+            // LowLevel thoughts never reach chat: they fold into the
+            // AgentGraph logs only. Everything else lands in the agent's
+            // chat bucket (Headline = digest, Detail = behind expand).
             agent_graph_state.on_agent_thought(agent_id, content);
-            chat_state.add_thinking(format!("[{agent_id}] {content}"));
+            if *kind != ThinkingKind::LowLevel {
+                chat_state.add_thinking(agent_id, content.clone(), *kind);
+            }
         }
         DesktopEvent::ToolCalled { tool_name, input_hash, detail } => {
             chat_state.add_tool_call(tool_name.clone(), detail.clone());
@@ -601,7 +613,11 @@ pub fn route_event(
                 description: description.clone(),
                 role: role.clone(),
             });
-            chat_state.add_thinking(format!("[Coordinator → {role:?}] {description}"));
+            chat_state.add_thinking(
+                "Coordinator",
+                format!("→ {role:?}: {description}"),
+                ThinkingKind::Detail,
+            );
         }
         DesktopEvent::SubTaskCompleted { task_id, outcome, role } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::Completed {
@@ -609,7 +625,7 @@ pub fn route_event(
                 outcome: outcome.clone(),
                 role: role.clone(),
             });
-            chat_state.add_thinking(format!("[{role}] Completed: {outcome}"));
+            chat_state.add_thinking(role, format!("Completed: {outcome}"), ThinkingKind::Detail);
         }
         DesktopEvent::SubTaskNeedsRevision { task_id, reason, role } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::NeedsRevision {
@@ -617,7 +633,11 @@ pub fn route_event(
                 reason: reason.clone(),
                 role: role.clone(),
             });
-            chat_state.add_thinking(format!("[{role}] Needs revision: {reason}"));
+            chat_state.add_thinking(
+                role,
+                format!("Needs revision: {reason}"),
+                ThinkingKind::Detail,
+            );
         }
         DesktopEvent::SubTaskBlocked { task_id, role, on } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::Blocked {
@@ -625,7 +645,7 @@ pub fn route_event(
                 role: role.clone(),
                 on: on.clone(),
             });
-            chat_state.add_thinking(format!("[{role}] Blocked on {on:?}"));
+            chat_state.add_thinking(role, format!("Blocked on {on:?}"), ThinkingKind::Detail);
         }
         DesktopEvent::SubTaskCancelled { task_id, role, reason } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::Cancelled {
@@ -633,7 +653,7 @@ pub fn route_event(
                 role: role.clone(),
                 reason: reason.clone(),
             });
-            chat_state.add_thinking(format!("[{role}] Cancelled: {reason}"));
+            chat_state.add_thinking(role, format!("Cancelled: {reason}"), ThinkingKind::Detail);
         }
         DesktopEvent::SubTaskFailed { task_id, error, role } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::Failed {
@@ -641,7 +661,7 @@ pub fn route_event(
                 error: error.clone(),
                 role: role.clone(),
             });
-            chat_state.add_thinking(format!("[{role}] Failed: {error}"));
+            chat_state.add_thinking(role, format!("Failed: {error}"), ThinkingKind::Detail);
         }
         DesktopEvent::IndexingProgress { files_processed, files_total } => {
             memory_state.on_indexing_progress(*files_processed, *files_total);
@@ -669,7 +689,7 @@ pub fn route_event(
         DesktopEvent::ProviderRetryScheduled { attempt, delay_ms, reason, source, .. } => {
             let msg =
                 format!("Provider retry #{attempt} in {}s ({source}): {reason}", delay_ms / 1000);
-            chat_state.add_thinking(msg);
+            chat_state.add_thinking("provider", msg, ThinkingKind::Detail);
             tool_log_state.add_or_update(&tool_log::ToolLogUpdate::Failed {
                 tool_name: "provider".into(),
                 error: format!("Retry #{attempt} scheduled (delay={delay_ms}ms, {reason})"),
@@ -677,7 +697,7 @@ pub fn route_event(
         }
         DesktopEvent::ProviderRetryRecovered { attempts, elapsed_ms, .. } => {
             let msg = format!("Provider recovered after {attempts} attempt(s) in {elapsed_ms}ms");
-            chat_state.add_thinking(msg);
+            chat_state.add_thinking("provider", msg, ThinkingKind::Detail);
             tool_log_state.add_or_update(&tool_log::ToolLogUpdate::Completed {
                 tool_name: "provider".into(),
                 duration_ms: *elapsed_ms,
@@ -813,6 +833,55 @@ mod tests {
             Some(DesktopEvent::RunStageChanged { stage })
                 if stage == concerto_core::intent::RunStage::Execute
         ));
+    }
+
+    /// Thinking tiers survive translation, and `LowLevel` thoughts fold
+    /// into the AgentGraph logs without touching chat entries.
+    #[test]
+    fn low_level_thought_skips_chat_but_reaches_graph() {
+        use crate::views::{agent_graph, chat, memory, tool_log};
+
+        let event = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "[system_instructions]".into(),
+                kind: ThinkingKind::LowLevel,
+            },
+        );
+        let desktop = translate_event(&event).expect("thought must translate");
+        let mut chat_state = chat::State::new();
+        let mut tool_log_state = tool_log::State::new();
+        let mut graph_state = agent_graph::State::new();
+        let mut memory_state = memory::State::new();
+        route_event(
+            &desktop,
+            &mut chat_state,
+            &mut tool_log_state,
+            &mut graph_state,
+            &mut memory_state,
+        );
+        assert!(chat_state.entries().is_empty(), "LowLevel thoughts never reach chat buckets");
+
+        let headline = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "Starting work".into(),
+                kind: ThinkingKind::Headline,
+            },
+        );
+        let desktop = translate_event(&headline).expect("thought must translate");
+        route_event(
+            &desktop,
+            &mut chat_state,
+            &mut tool_log_state,
+            &mut graph_state,
+            &mut memory_state,
+        );
+        assert_eq!(chat_state.entries().len(), 1, "Headline lands in the chat bucket");
     }
 
     /// Unknown event kinds are silently ignored by translate_event.

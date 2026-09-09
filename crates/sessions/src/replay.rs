@@ -149,7 +149,11 @@ mod tests {
     fn stored_event_different_event_kinds() {
         let kinds: Vec<EventKind> = vec![
             EventKind::SessionSaved,
-            EventKind::AgentThought { agent_id: "a1".into(), content: "thinking".into() },
+            EventKind::AgentThought {
+                agent_id: "a1".into(),
+                content: "thinking".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
             EventKind::ToolExecutionFinished {
                 tool_name: "fs".into(),
                 duration_ms: 100,

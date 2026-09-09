@@ -3,7 +3,7 @@ use iced::widget::{
 };
 use iced::{border::Radius, Alignment, Background, Border, Color, Element, Length};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::theme::AppTheme;
@@ -13,6 +13,7 @@ use crate::views::spend::{
 };
 use crate::widgets::agent_graph::NodeState;
 use crate::widgets::markdown;
+use concerto_core::event::ThinkingKind;
 use concerto_core::types::AgentId;
 use concerto_sessions::spend::SpendRecord;
 
@@ -57,6 +58,13 @@ pub enum Message {
     /// Resume a project session from the sidebar project tree.
     SelectSession(String),
     ToggleEntry(EntryId),
+    /// Mute/unmute one agent's thinking bucket (filter bar). View-only: the
+    /// WAL and transcript still record everything.
+    ToggleMuteAgent(String),
+    /// Collapse every thinking bucket (`/thinking` toggle → collapsed side).
+    CollapseAllThinking,
+    /// Expand every thinking bucket (`/thinking` toggle → expanded side).
+    ExpandAllThinking,
     CopyCode(String),
     ToggleMultiAgent,
     ToggleFastMode,
@@ -115,7 +123,15 @@ pub enum ChatEntry {
     },
     Thinking {
         id: EntryId,
+        /// Agent that produced this thought — the V2 bucket key. Legacy
+        /// entries (and `Message::AddThinking`) leave this empty; the render
+        /// path falls back to parsing the `[agent]` content prefix.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        agent: String,
         content: String,
+        /// Verbosity tier (V2). Legacy entries default to `Detail`.
+        #[serde(default, skip_serializing_if = "ThinkingKind::is_detail")]
+        kind: ThinkingKind,
         collapsed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_at: Option<String>,
@@ -244,6 +260,16 @@ pub struct State {
     next_id: EntryId,
     /// Active sub-view overlay shown on top of the chat canvas.
     pub sub_view: SubView,
+    /// The first id of the currently expanded thinking group, or `None` when
+    /// all groups are collapsed. Drives the accordion toggle.
+    expanded_thinking_id: Option<EntryId>,
+    /// `/thinking` expand-all override: when true every bucket renders
+    /// expanded regardless of `expanded_thinking_id`.
+    thinking_expand_all: bool,
+    /// Per-agent mute set for the thinking filter bar. Muted buckets are
+    /// hidden from chat only — the WAL, transcript, and AgentGraph logs
+    /// still record everything.
+    muted_agents: HashSet<String>,
     /// Whether the blinking cursor is currently shown on the live streaming
     /// assistant entry. Toggled by `Message::StreamingTick`; only meaningful
     /// (and only ever read) while at least one entry is still streaming.
@@ -262,6 +288,17 @@ pub struct State {
     /// `update_last_assistant`) keep their window at the content length
     /// instead, matching the pre-autofinish behavior.
     reveal_autofinish: bool,
+    /// First-token emphasis ticks for assistant entries: `id -> elapsed
+    /// ticks` since the turn started. While present, the first token (up to
+    /// first whitespace) of the revealed text renders bold for ~200 ms
+    /// (12 ticks × 16 ms), then settles. Transient view state — never
+    /// serialized.
+    first_token_ticks: HashMap<EntryId, u8>,
+    /// Reduced-motion override: when true, first-token emphasis is skipped
+    /// (entries render at normal weight immediately). Iced exposes no system
+    /// a11y API (see the scanline_overlay call site in `app.rs`), so this
+    /// defaults to false until wired to a user setting.
+    reduced_motion: bool,
     /// Per-entry cached parses of assistant markdown, so the 16 ms reveal tick
     /// re-renders an already-parsed event stream (`render_upto`) instead of
     /// re-running pulldown_cmark on the raw text every frame. Transient view
@@ -300,9 +337,31 @@ const REVEAL_CHARS_PER_TICK: usize = 8;
 const THINKING_REVEAL_CHARS_PER_TICK: usize = 64;
 /// Number of `TypingTick`s an entrance fade runs for (~128 ms at 16 ms/tick).
 const ENTRANCE_TICKS: u8 = 8;
+/// Number of `TypingTick`s the first-token emphasis holds (~200 ms at 16 ms/tick).
+/// The first word of each assistant turn renders slightly bolder/larger for this
+/// duration, then settles to normal weight — the Score signature text (prototype #6).
+const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 12;
 /// Period (in ticks) of the subtle thinking shimmer pulse: the color
 /// interpolates from muted to text over `SHIMMER_PERIOD` ticks and back.
 const SHIMMER_PERIOD: u32 = 8;
+
+/// One agent's thinking bucket: every `Thinking` entry from that agent in
+/// the current run, regardless of consecutiveness. The bucket's `expanded`
+/// state is keyed to the first entry id so `ToggleEntry` toggles the whole
+/// bucket (or `thinking_expand_all` opens all of them via `/thinking`).
+#[derive(Debug, Clone)]
+struct ThinkingGroup {
+    agent_id: String,
+    /// Indices into the parent `entries` slice.
+    indices: Vec<usize>,
+    /// The first entry id in the group — `ToggleEntry` target.
+    first_id: EntryId,
+    /// Whether this group is expanded (one at a time).
+    expanded: bool,
+    /// Latest headline: first line of the latest entry's content, heuristically
+    /// shortened to a movement verb phrase.
+    headline: String,
+}
 
 impl Default for State {
     fn default() -> Self {
@@ -317,9 +376,14 @@ impl State {
             input: String::new(),
             next_id: 1,
             sub_view: SubView::Main,
+            expanded_thinking_id: None,
+            thinking_expand_all: false,
+            muted_agents: HashSet::new(),
             streaming_cursor_visible: false,
             revealed_chars: None,
             reveal_autofinish: false,
+            first_token_ticks: HashMap::new(),
+            reduced_motion: false,
             md_docs: HashMap::new(),
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
@@ -360,9 +424,14 @@ impl State {
             input: String::new(),
             next_id,
             sub_view: SubView::Main,
+            expanded_thinking_id: None,
+            thinking_expand_all: false,
+            muted_agents: HashSet::new(),
             streaming_cursor_visible: false,
             revealed_chars: None,
             reveal_autofinish: false,
+            first_token_ticks: HashMap::new(),
+            reduced_motion: false,
             md_docs,
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
@@ -453,6 +522,7 @@ impl State {
             self.md_docs.clear();
             self.thinking_reveals.clear();
             self.entrance_ticks.clear();
+            self.first_token_ticks.clear();
         }
     }
 
@@ -531,32 +601,45 @@ impl State {
         self.trim_entries();
     }
 
-    /// Add a thinking entry (deduplicates consecutive thinking).
-    pub fn add_thinking(&mut self, content: String) {
+    /// Add a thinking entry, bucketed per agent (V2). Consecutive open
+    /// entries from the same agent at the same tier merge into one; anything
+    /// else appends. Never touches the expand/mute view state, so new input
+    /// never auto-expands a bucket.
+    pub fn add_thinking(&mut self, agent_id: &str, content: String, kind: ThinkingKind) {
         if let Some(ChatEntry::Thinking {
-            content: ref mut existing, collapsed: false, id, ..
+            agent,
+            kind: existing_kind,
+            content: ref mut existing,
+            collapsed: false,
+            finished_at: None,
+            id,
+            ..
         }) = self.entries.last_mut()
         {
-            existing.push('\n');
-            existing.push_str(&content);
-            *existing = tail_chars(existing, MAX_THINKING_CHARS);
-            // Content grew: keep any in-flight reveal, clamping it to the new
-            // length (and finishing it if the tail was truncated into range).
-            if let Some(revealed) = self.thinking_reveals.get_mut(id) {
-                let len = existing.chars().count();
-                *revealed = (*revealed).min(len);
-                if *revealed >= len {
-                    self.thinking_reveals.remove(id);
+            if agent == agent_id && *existing_kind == kind {
+                existing.push('\n');
+                existing.push_str(&content);
+                *existing = tail_chars(existing, MAX_THINKING_CHARS);
+                // Content grew: keep any in-flight reveal, clamping it to the new
+                // length (and finishing it if the tail was truncated into range).
+                if let Some(revealed) = self.thinking_reveals.get_mut(id) {
+                    let len = existing.chars().count();
+                    *revealed = (*revealed).min(len);
+                    if *revealed >= len {
+                        self.thinking_reveals.remove(id);
+                    }
                 }
+                return;
             }
-            return;
         }
         let id = self.next_id;
         self.next_id += 1;
         let collapsed = content.len() > 500;
         self.entries.push(ChatEntry::Thinking {
             id,
+            agent: agent_id.to_string(),
             content,
+            kind,
             collapsed,
             created_at: Some(now_rfc3339()),
             finished_at: None,
@@ -690,8 +773,12 @@ impl State {
         if assistant_revealing {
             return true;
         }
-        // Thinking-preview reveal or an entrance fade still animating.
-        if !self.thinking_reveals.is_empty() || !self.entrance_ticks.is_empty() {
+        // Thinking-preview reveal, entrance fade, or first-token emphasis
+        // still animating.
+        if !self.thinking_reveals.is_empty()
+            || !self.entrance_ticks.is_empty()
+            || !self.first_token_ticks.is_empty()
+        {
             return true;
         }
         // An open thinking entry keeps the shimmer driver (and its 16 ms tick)
@@ -775,6 +862,27 @@ impl State {
         });
     }
 
+    /// Advance first-token emphasis ticks: count each entry's elapsed ticks
+    /// up, removing entries whose emphasis has expired. Each tick is ~16 ms,
+    /// so `FIRST_TOKEN_EMPHASIS_TICKS` ticks ≈ 200 ms of emphasis.
+    fn advance_first_token_ticks(&mut self) {
+        self.first_token_ticks.retain(|_, ticks| {
+            *ticks = ticks.saturating_add(1);
+            *ticks < FIRST_TOKEN_EMPHASIS_TICKS
+        });
+    }
+
+    /// Whether the assistant entry's first token still renders emphasized:
+    /// its emphasis window is open and reduced-motion is off.
+    fn first_token_emphasis(&self, id: EntryId) -> bool {
+        !self.reduced_motion && self.first_token_ticks.contains_key(&id)
+    }
+
+    /// Set the reduced-motion override (skips first-token emphasis).
+    pub fn set_reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
+    }
+
     /// Update the latest assistant entry with streaming content.
     pub fn update_last_assistant(&mut self, new_content: String) {
         self.finish_open_thinking();
@@ -809,6 +917,10 @@ impl State {
             // than auto-finalizing (`reveal_autofinish` stays false).
             self.revealed_chars = Some((id, 0));
             self.reveal_autofinish = false;
+            // Seed first-token emphasis for the new turn (prototype #6):
+            // elapsed-tick counter starts at 0 and expires after
+            // `FIRST_TOKEN_EMPHASIS_TICKS` TypingTicks (~200 ms).
+            self.first_token_ticks.insert(id, 0);
             self.md_docs.insert(id, doc);
             self.trim_entries();
         }
@@ -825,9 +937,11 @@ impl State {
             *streaming = false;
         }
         // The reveal window is transient; once the entry is finalized the
-        // full text renders and there is nothing left to drive.
+        // full text renders and there is nothing left to drive. The
+        // first-token emphasis settles immediately at this boundary too.
         self.revealed_chars = None;
         self.reveal_autofinish = false;
+        self.first_token_ticks.clear();
     }
 
     /// Finalize a run: mark the last assistant entry as non-streaming (same
@@ -840,9 +954,11 @@ impl State {
         if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
             *streaming = false;
         }
-        // Full text is final after a run boundary — stop any reveal window.
+        // Full text is final after a run boundary — stop any reveal window
+        // and settle first-token emphasis immediately.
         self.revealed_chars = None;
         self.reveal_autofinish = false;
+        self.first_token_ticks.clear();
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -887,6 +1003,9 @@ impl State {
                     // the entry auto-finalizes itself.
                     self.revealed_chars = Some((id, 0));
                     self.reveal_autofinish = true;
+                    // Seed first-token emphasis for the new turn (prototype #6):
+                    // elapsed-tick counter starts at 0 (≈200 ms of emphasis).
+                    self.first_token_ticks.insert(id, 0);
                 }
                 // An empty final message must never linger as a `streaming`
                 // entry: without a reveal window it would blink a cursor and
@@ -901,7 +1020,8 @@ impl State {
                 self.md_docs.insert(id, doc);
             }
             Message::AddThinking(s) => {
-                self.add_thinking(s);
+                // Legacy untyped path (tests, quick seeds): unattributed Detail.
+                self.add_thinking("", s, ThinkingKind::Detail);
             }
             Message::AddToolCall(s) => {
                 self.add_tool_call(s, String::new());
@@ -913,6 +1033,7 @@ impl State {
                 self.advance_reveal();
                 self.advance_thinking_reveals();
                 self.advance_entrance_ticks();
+                self.advance_first_token_ticks();
                 self.shimmer_phase = self.shimmer_phase.wrapping_add(1);
             }
             Message::UsePrompt(prompt) => {
@@ -922,14 +1043,31 @@ impl State {
                 // Handled by App because session loading requires shared services.
             }
             Message::ToggleEntry(id) => {
-                if let Some(ChatEntry::Thinking { ref mut collapsed, .. }) =
-                    self.entries.iter_mut().find(|e| match e {
-                        ChatEntry::Thinking { id: eid, .. } => *eid == id,
-                        _ => false,
-                    })
+                // Toggle the thinking bucket accordion: the id is the first
+                // entry's id of the bucket. Clicking the same bucket collapses
+                // it; clicking a different bucket switches expansion. A manual
+                // toggle always leaves expand-all mode first.
+                if let Some(ChatEntry::Thinking { .. }) = self
+                    .entries
+                    .iter()
+                    .find(|e| matches!(e, ChatEntry::Thinking { id: eid, .. } if *eid == id))
                 {
-                    *collapsed = !*collapsed;
+                    self.thinking_expand_all = false;
+                    self.expanded_thinking_id =
+                        if self.expanded_thinking_id == Some(id) { None } else { Some(id) };
                 }
+            }
+            Message::ToggleMuteAgent(agent) => {
+                if !self.muted_agents.remove(&agent) {
+                    self.muted_agents.insert(agent);
+                }
+            }
+            Message::CollapseAllThinking => {
+                self.thinking_expand_all = false;
+                self.expanded_thinking_id = None;
+            }
+            Message::ExpandAllThinking => {
+                self.thinking_expand_all = true;
             }
             Message::CopyCode(_) => {
                 // Handled via clipboard integration in the code_block widget
@@ -1001,6 +1139,13 @@ impl State {
                 // document's visible-text units so every tick re-drives an
                 // already-parsed event stream instead of re-parsing markdown.
                 // The raw `markdown::render` fallback is purely defensive.
+                // First-token emphasis (Score prototype #6): while the entry's
+                // ~200 ms window is open (and reduced-motion is off), its
+                // first token renders bold, then settles to normal weight.
+                // The uncached `markdown::render` fallback is purely defensive
+                // (the cache is always populated for assistant entries) and
+                // renders without emphasis.
+                let emphasis = self.first_token_emphasis(*id);
                 let md: Element<'_, Message> = match self.md_docs.get(id) {
                     Some(doc) => {
                         let budget = reveal_window.map(|n| n.min(doc.total_units));
@@ -1010,6 +1155,7 @@ impl State {
                             palette.surface_variant,
                             palette.text_muted,
                             palette.primary,
+                            emphasis,
                         )
                     }
                     None => markdown::render(
@@ -1153,6 +1299,53 @@ impl State {
                     .into()
             }
         }
+    }
+
+    /// `/thinking` toggle for the current movement: collapse everything when
+    /// any bucket is open, otherwise expand all buckets.
+    pub fn toggle_thinking_all(&mut self) {
+        if self.thinking_expand_all || self.expanded_thinking_id.is_some() {
+            self.thinking_expand_all = false;
+            self.expanded_thinking_id = None;
+        } else {
+            self.thinking_expand_all = true;
+        }
+    }
+
+    /// Per-agent mute filter bar (V2): one toggle chip per thinking bucket.
+    /// Muted agents show dimmed with a `+` marker; hiding is chat-only.
+    fn thinking_filter_bar<'a>(
+        &'a self,
+        palette: &'a crate::theme::Palette,
+        order: &[String],
+        buckets: &HashMap<String, Vec<usize>>,
+    ) -> Element<'a, Message> {
+        let mut bar = row![
+            text("‖ thinking").size(11).color(palette.text_muted),
+            text("/thinking toggles all").size(11).color(palette.text_muted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        for agent in order {
+            let count = buckets.get(agent).map(Vec::len).unwrap_or(0);
+            let muted = self.muted_agents.contains(agent);
+            let label = if muted {
+                format!("[+ {agent}] muted ×{count}")
+            } else {
+                format!("[‖ {agent}] ×{count}")
+            };
+            let color = if muted {
+                palette.text_muted
+            } else {
+                crate::theme::agent_color_from_id(agent, palette).unwrap_or(palette.text_muted)
+            };
+            bar = bar.push(
+                button(text(label).size(11).color(color))
+                    .style(crate::ui::button::secondary)
+                    .on_press(Message::ToggleMuteAgent(agent.clone())),
+            );
+        }
+        container(bar).padding([4, 8]).into()
     }
 
     fn empty_session_view<'a>(
@@ -1453,7 +1646,7 @@ impl State {
             .into();
         }
 
-        // Message list
+        // Message list — render with the per-agent thinking accordion (V2).
         let mut col = column![].spacing(6).padding(8);
         let has_timeline =
             agent_graph.has_multi_agent_activity && !agent_graph.model.nodes.is_empty();
@@ -1462,14 +1655,65 @@ impl State {
         if has_timeline && latest_user_index.is_none() {
             col = col.push(self.orchestration_timeline(agent_graph, palette, &self.entries));
         }
-        for (index, entry) in self.entries.iter().enumerate() {
-            col = col.push(self.render_entry(entry, palette));
-            if has_timeline && latest_user_index == Some(index) {
-                col = col.push(self.orchestration_timeline(
-                    agent_graph,
-                    palette,
-                    &self.entries[index + 1..],
-                ));
+        // Full per-agent buckets over ALL thinking entries (not just
+        // consecutive runs): one panel per agent in first-appearance order,
+        // emitted at the agent's first entry. Muted agents are skipped here
+        // (view-only; the WAL/transcript still hold everything).
+        let (bucket_order, buckets) = thinking_buckets(&self.entries);
+        if !bucket_order.is_empty() {
+            col = col.push(self.thinking_filter_bar(palette, &bucket_order, &buckets));
+        }
+        let mut emitted_buckets = HashSet::new();
+        let mut idx = 0;
+        while idx < self.entries.len() {
+            let bucket_key = match &self.entries[idx] {
+                ChatEntry::Thinking { agent, content, .. } => {
+                    Some(thinking_agent_key(agent, content))
+                }
+                _ => None,
+            };
+            if let Some(agent) = bucket_key {
+                if self.muted_agents.contains(&agent) {
+                    idx += 1;
+                    continue;
+                }
+                if emitted_buckets.insert(agent.clone()) {
+                    let indices = buckets.get(&agent).cloned().unwrap_or_default();
+                    let first_id = indices
+                        .first()
+                        .and_then(|&i| match &self.entries[i] {
+                            ChatEntry::Thinking { id, .. } => Some(*id),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let headline = thinking_headline_from_entries(&self.entries, &indices);
+                    let group = ThinkingGroup {
+                        agent_id: agent,
+                        indices,
+                        first_id,
+                        expanded: self.thinking_expand_all
+                            || self.expanded_thinking_id == Some(first_id),
+                        headline,
+                    };
+                    col = col.push(render_thinking_group(
+                        &group,
+                        &self.entries,
+                        palette,
+                        &self.thinking_reveals,
+                        self.shimmer_phase,
+                    ));
+                }
+                idx += 1;
+            } else {
+                col = col.push(self.render_entry(&self.entries[idx], palette));
+                if has_timeline && latest_user_index == Some(idx) {
+                    col = col.push(self.orchestration_timeline(
+                        agent_graph,
+                        palette,
+                        &self.entries[idx + 1..],
+                    ));
+                }
+                idx += 1;
             }
         }
         let messages = scrollable(col).anchor_bottom().height(Length::Fill).width(Length::Fill);
@@ -1490,6 +1734,172 @@ impl State {
             )
         ]
         .into()
+    }
+}
+
+/// Bucket key for a thinking entry: the stored agent id, falling back to
+/// the legacy `[agent]` content prefix for pre-V2 entries.
+fn thinking_agent_key(agent: &str, content: &str) -> String {
+    if !agent.is_empty() {
+        return agent.to_string();
+    }
+    content
+        .split_once("] ")
+        .map(|(p, _)| p.strip_prefix('[').unwrap_or(p).to_string())
+        .unwrap_or_default()
+}
+
+/// Full per-agent bucketing over every `Thinking` entry: returns agents in
+/// first-appearance order plus `agent -> entry indices`.
+fn thinking_buckets(entries: &[ChatEntry]) -> (Vec<String>, HashMap<String, Vec<usize>>) {
+    let mut order = Vec::new();
+    let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if let ChatEntry::Thinking { agent, content, .. } = entry {
+            let key = thinking_agent_key(agent, content);
+            if !buckets.contains_key(&key) {
+                order.push(key.clone());
+            }
+            buckets.entry(key).or_default().push(idx);
+        }
+    }
+    (order, buckets)
+}
+
+/// Strip a legacy `[agent]` prefix from content for headline display.
+fn strip_agent_prefix(content: &str) -> &str {
+    content.split_once("] ").map(|(_, rest)| rest).unwrap_or(content)
+}
+
+/// Digest for a thinking bucket: the first line of the latest `Headline`
+/// entry when one exists, else the legacy movement-verb heuristic over the
+/// latest entry.
+fn thinking_headline_from_entries(entries: &[ChatEntry], indices: &[usize]) -> String {
+    let headline_content = indices
+        .iter()
+        .rev()
+        .filter_map(|&idx| match &entries[idx] {
+            ChatEntry::Thinking { content, kind: ThinkingKind::Headline, .. } => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .next();
+    let last_content = headline_content
+        .or_else(|| {
+            indices
+                .iter()
+                .rev()
+                .filter_map(|&idx| match &entries[idx] {
+                    ChatEntry::Thinking { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .next()
+        })
+        .unwrap_or("");
+    let first_line = strip_agent_prefix(last_content).lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return "Thinking…".to_string();
+    }
+    for verb in &["Tuning", "Scoring", "Rehearsing", "Coda", "Starting"] {
+        if let Some(rest) = first_line.strip_prefix(verb) {
+            let tail = rest.trim_start();
+            if tail.is_empty() {
+                return verb.to_string();
+            }
+            let token = tail.split_whitespace().next().unwrap_or("");
+            return format!("{verb} {token}");
+        }
+    }
+    let truncated: String = first_line.chars().take(48).collect();
+    if truncated.len() < first_line.len() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// Render a thinking bucket as a collapsible accordion panel. Collapsed
+/// shows the agent badge + digest headline + count; expanded shows each
+/// `Headline`/`Detail` entry (`LowLevel` never reaches chat — it is routed
+/// to the AgentGraph logs in `runtime.rs`, and is skipped here defensively).
+/// Reuses existing thinking_reveals, shimmer, and stub logic.
+fn render_thinking_group<'a>(
+    group: &ThinkingGroup,
+    entries: &'a [ChatEntry],
+    palette: &'a crate::theme::Palette,
+    reveals: &'a std::collections::HashMap<EntryId, usize>,
+    shimmer_phase: u32,
+) -> Element<'a, Message> {
+    let count = group.indices.len();
+    let any_open = group
+        .indices
+        .iter()
+        .any(|&idx| matches!(&entries[idx], ChatEntry::Thinking { finished_at: None, .. }));
+
+    let preview_color = if any_open {
+        let phase = shimmer_phase % (2 * SHIMMER_PERIOD);
+        let wave = if phase < SHIMMER_PERIOD {
+            phase as f32 / SHIMMER_PERIOD as f32
+        } else {
+            (2 * SHIMMER_PERIOD - phase) as f32 / SHIMMER_PERIOD as f32
+        };
+        lerp_color(palette.text_muted, palette.text, 0.5 + 0.5 * wave)
+    } else {
+        palette.text_muted
+    };
+
+    let agent_color =
+        crate::theme::agent_color_from_id(&group.agent_id, palette).unwrap_or(palette.text_muted);
+
+    if !group.expanded {
+        // Collapsed: single header row with agent badge + headline + count.
+        let label =
+            format!("[{}] ‖ {headline} ×{count}", group.agent_id, headline = group.headline);
+        let toggle_btn = button(text("▶").size(11))
+            .style(crate::ui::button::secondary)
+            .on_press(Message::ToggleEntry(group.first_id));
+        container(row![toggle_btn, text(label).size(12).color(agent_color)].spacing(4))
+            .padding([6, 8])
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(palette.surface_variant)),
+                border: Border { radius: Radius::from(8.0), ..Default::default() },
+                ..container::Style::default()
+            })
+            .into()
+    } else {
+        // Expanded: show each entry's content with per-entry reveal.
+        let mut col = column![].spacing(2);
+        let header = row![
+            button(text("▼").size(11))
+                .style(crate::ui::button::secondary)
+                .on_press(Message::ToggleEntry(group.first_id)),
+            text(format!("[{}] ‖ {headline} ×{count}", group.agent_id, headline = group.headline))
+                .size(12)
+                .color(agent_color),
+        ]
+        .spacing(4);
+        col = col.push(header);
+        for &idx in &group.indices {
+            if let ChatEntry::Thinking { id, content, kind, .. } = &entries[idx] {
+                if *kind == ThinkingKind::LowLevel {
+                    continue;
+                }
+                let revealed = reveals.get(id).copied().unwrap_or(content.chars().count());
+                let preview = content.chars().take(revealed).collect::<String>();
+                col = col
+                    .push(container(text(preview).size(13).color(preview_color)).padding([4, 8]));
+            }
+        }
+        container(col)
+            .padding([6, 8])
+            .width(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(palette.surface_variant)),
+                border: Border { radius: Radius::from(8.0), ..Default::default() },
+                ..container::Style::default()
+            })
+            .into()
     }
 }
 
@@ -1787,8 +2197,8 @@ mod tests {
     #[test]
     fn add_thinking_appends_to_existing_thinking() {
         let mut state = State::new();
-        state.add_thinking("First".to_string());
-        state.add_thinking("Second".to_string());
+        state.add_thinking("coder", "First".to_string(), ThinkingKind::Detail);
+        state.add_thinking("coder", "Second".to_string(), ThinkingKind::Detail);
         assert_eq!(state.entries.len(), 1);
         match &state.entries[0] {
             ChatEntry::Thinking { content, .. } => {
@@ -1951,7 +2361,7 @@ mod tests {
     #[test]
     fn add_thinking_creates_thinking_entry() {
         let mut state = State::new();
-        state.add_thinking("thinking...".to_string());
+        state.add_thinking("coder", "thinking...".to_string(), ThinkingKind::Detail);
         assert_eq!(state.entries().len(), 1);
         assert!(matches!(state.entries()[0], ChatEntry::Thinking { .. }));
     }
@@ -2003,7 +2413,7 @@ mod tests {
     #[test]
     fn thinking_finishes_when_assistant_follows() {
         let mut state = State::new();
-        state.add_thinking("planning...".to_string());
+        state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
         state.update_last_assistant("answer".to_string());
 
         match &state.entries()[0] {
@@ -2021,8 +2431,8 @@ mod tests {
     #[test]
     fn consecutive_thinking_shares_one_open_entry() {
         let mut state = State::new();
-        state.add_thinking("a".to_string());
-        state.add_thinking("b".to_string());
+        state.add_thinking("coder", "a".to_string(), ThinkingKind::Detail);
+        state.add_thinking("coder", "b".to_string(), ThinkingKind::Detail);
 
         assert_eq!(state.entries().len(), 1);
         match &state.entries()[0] {
@@ -2037,24 +2447,24 @@ mod tests {
     #[test]
     fn finalize_run_closes_all_open_thinking() {
         let mut state = State::new();
-        state.add_thinking("planning a".to_string());
-        // Collapse the open thinking entry; the next thought then starts a
-        // new entry instead of appending (add_thinking dedupes only when the
-        // trailing entry is not collapsed).
+        state.add_thinking("coder", "planning a".to_string(), ThinkingKind::Detail);
+        // A second agent's thought lands in its own bucket entry; toggling
+        // the accordion never splits entries, so both stay open.
+        state.add_thinking("reviewer", "planning b".to_string(), ThinkingKind::Detail);
         let first_id = match &state.entries()[0] {
             ChatEntry::Thinking { id, .. } => *id,
             _ => panic!("Expected a Thinking entry"),
         };
         let _ = state.update(Message::ToggleEntry(first_id));
-        state.add_thinking("planning b".to_string());
+        assert_eq!(state.entries().len(), 2);
         // The assistant chunk closes only the *trailing* thinking entry; the
-        // earlier collapsed one is out of reach of the trailing-only helper.
+        // earlier bucket entry is out of reach of the trailing-only helper.
         state.update_last_assistant("partial answer".to_string());
         match &state.entries()[0] {
             ChatEntry::Thinking { finished_at, .. } => {
                 assert!(
                     finished_at.is_none(),
-                    "earlier collapsed thinking must stay open until finalize_run"
+                    "earlier bucket thinking must stay open until finalize_run"
                 );
             }
             _ => panic!("Expected a Thinking entry"),
@@ -2086,7 +2496,7 @@ mod tests {
     #[test]
     fn finalize_streaming_does_not_close_thinking() {
         let mut state = State::new();
-        state.add_thinking("planning...".to_string());
+        state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
         state.finalize_streaming();
 
         match &state.entries()[0] {
@@ -2131,8 +2541,17 @@ mod tests {
         }
 
         // Clamped at the content length; although the entry is still
-        // streaming, nothing is left to reveal.
+        // streaming, nothing is left to reveal. First-token emphasis keeps
+        // the tick alive until its ~200 ms window expires.
         assert_eq!(state.revealed_chars, Some((id, 20)));
+        assert!(state.first_token_emphasis(id), "a fresh turn emphasizes its first token");
+        assert!(state.is_revealing());
+        // Drive past the 12-tick emphasis window: emphasis settles and, with
+        // the reveal already complete, the tick stops.
+        for _ in 3..FIRST_TOKEN_EMPHASIS_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(!state.first_token_emphasis(id), "emphasis settles ~200 ms after the turn started");
         assert!(!state.is_revealing());
     }
 
@@ -2150,6 +2569,45 @@ mod tests {
         // A new streaming entry restarts its own typewriter reveal from zero.
         assert_eq!(state.revealed_chars, Some((id, 0)));
         assert!(state.is_revealing());
+    }
+
+    #[test]
+    fn first_token_emphasis_survives_same_turn_chunks_without_reseed() {
+        let mut state = State::new();
+        state.update_last_assistant("hello world".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("Expected an assistant entry"),
+        };
+        for _ in 0..5 {
+            let _ = state.update(Message::TypingTick);
+        }
+        // A streaming continuation on the same entry must not restart the
+        // ~200 ms window: the clock runs from the turn start.
+        state.update_last_assistant("hello world, more".to_string());
+        assert!(state.first_token_emphasis(id));
+        for _ in 0..7 {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(
+            !state.first_token_emphasis(id),
+            "window settles 12 ticks after the turn started, not after the last chunk"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_skips_first_token_emphasis() {
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        state.update_last_assistant("hello world".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("Expected an assistant entry"),
+        };
+        assert!(
+            !state.first_token_emphasis(id),
+            "reduced-motion renders every turn at normal weight immediately"
+        );
     }
 
     #[test]
@@ -2296,7 +2754,7 @@ mod tests {
     #[test]
     fn thinking_reveal_advances_per_tick_and_clamps() {
         let mut state = State::new();
-        state.add_thinking("0123456789".to_string()); // 10 chars
+        state.add_thinking("coder", "0123456789".to_string(), ThinkingKind::Detail); // 10 chars
         let id = match state.entries().last() {
             Some(ChatEntry::Thinking { id, .. }) => *id,
             _ => panic!("Expected a thinking entry"),
@@ -2316,7 +2774,7 @@ mod tests {
     #[test]
     fn thinking_reveal_clamps_when_content_grows() {
         let mut state = State::new();
-        state.add_thinking("short".to_string());
+        state.add_thinking("coder", "short".to_string(), ThinkingKind::Detail);
         let id = match state.entries().last() {
             Some(ChatEntry::Thinking { id, .. }) => *id,
             _ => panic!("Expected a thinking entry"),
@@ -2326,7 +2784,7 @@ mod tests {
         assert!(!state.thinking_reveals.contains_key(&id));
         // Content grows; the completed reveal must NOT restart for appended
         // content (per design: only an in-flight reveal is clamped).
-        state.add_thinking(" longer tail".to_string());
+        state.add_thinking("coder", " longer tail".to_string(), ThinkingKind::Detail);
         assert!(
             !state.thinking_reveals.contains_key(&id),
             "appended content must not resurrect a completed reveal"
@@ -2356,7 +2814,7 @@ mod tests {
     #[test]
     fn open_thinking_keeps_is_revealing_for_shimmer() {
         let mut state = State::new();
-        state.add_thinking("planning...".to_string());
+        state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
         let id = match state.entries().last() {
             Some(ChatEntry::Thinking { id, .. }) => *id,
             _ => panic!("Expected a thinking entry"),
@@ -2386,5 +2844,77 @@ mod tests {
             "restored assistant content must be eagerly cached"
         );
         assert!(!restored.md_docs.contains_key(&2), "non-assistant entries never cache");
+    }
+
+    #[test]
+    fn buckets_group_non_consecutive_same_agent_thoughts() {
+        let mut state = State::new();
+        state.add_thinking("coder", "first".to_string(), ThinkingKind::Detail);
+        let _ = state.update(Message::AddAssistant("mid".to_string()));
+        state.add_thinking("coder", "second".to_string(), ThinkingKind::Detail);
+        state.add_thinking("reviewer", "review note".to_string(), ThinkingKind::Detail);
+        let (order, buckets) = thinking_buckets(state.entries());
+        assert_eq!(order, vec!["coder".to_string(), "reviewer".to_string()]);
+        assert_eq!(buckets["coder"].len(), 2, "non-consecutive thoughts share one bucket");
+        assert_eq!(buckets["reviewer"].len(), 1);
+    }
+
+    #[test]
+    fn headline_digest_prefers_latest_headline_entry() {
+        let entries = vec![
+            ChatEntry::Thinking {
+                id: 1,
+                agent: "coder".into(),
+                content: "old detail".into(),
+                kind: ThinkingKind::Detail,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+            ChatEntry::Thinking {
+                id: 2,
+                agent: "coder".into(),
+                content: "Starting work".into(),
+                kind: ThinkingKind::Headline,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+            ChatEntry::Thinking {
+                id: 3,
+                agent: "coder".into(),
+                content: "newer detail".into(),
+                kind: ThinkingKind::Detail,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+        ];
+        assert_eq!(thinking_headline_from_entries(&entries, &[0, 1, 2]), "Starting work");
+    }
+
+    #[test]
+    fn toggle_thinking_all_collapses_then_expands() {
+        let mut state = State::new();
+        state.add_thinking("coder", "x".to_string(), ThinkingKind::Detail);
+        // Nothing open: first toggle expands all.
+        state.toggle_thinking_all();
+        assert!(state.thinking_expand_all);
+        // Anything open: next toggle collapses all.
+        state.toggle_thinking_all();
+        assert!(!state.thinking_expand_all);
+        assert_eq!(state.expanded_thinking_id, None);
+    }
+
+    #[test]
+    fn mute_toggle_hides_bucket_without_dropping_entries() {
+        let mut state = State::new();
+        state.add_thinking("coder", "x".to_string(), ThinkingKind::Detail);
+        let before = state.entries().len();
+        let _ = state.update(Message::ToggleMuteAgent("coder".to_string()));
+        assert!(state.muted_agents.contains("coder"));
+        assert_eq!(state.entries().len(), before, "mute is view-only; entries stay");
+        let _ = state.update(Message::ToggleMuteAgent("coder".to_string()));
+        assert!(!state.muted_agents.contains("coder"));
     }
 }

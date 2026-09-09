@@ -50,6 +50,11 @@ impl MarkdownDoc {
     /// (identical to [`render`]); `Some(n)` renders only the first `n` visible
     /// characters, cutting the output off at a container boundary — usable as
     /// the per-frame cheap render behind the typewriter reveal.
+    ///
+    /// When `emphasis_first_token` is `true`, the first word (up to the first
+    /// whitespace) of the first `Text` event in each paragraph renders with
+    /// bold font weight. This is the Score first-token emphasis (prototype #6):
+    /// it persists for ~200 ms (12 ticks × 16 ms) then settles to normal.
     pub fn render_upto<M: Clone + 'static>(
         &self,
         budget: Option<usize>,
@@ -57,9 +62,11 @@ impl MarkdownDoc {
         surface_variant: Color,
         text_muted: Color,
         primary: Color,
+        emphasis_first_token: bool,
     ) -> Element<'static, M> {
         let mut renderer: MarkdownRenderer<'static, M> =
             MarkdownRenderer::new(on_copy, surface_variant, text_muted, primary);
+        renderer.emphasis_first_token = emphasis_first_token;
 
         let Some(budget) = budget else {
             for event in &self.events {
@@ -149,6 +156,12 @@ struct MarkdownRenderer<'a, M: Clone> {
     surface_variant: Color,
     text_muted: Color,
     primary: Color,
+
+    // First-token emphasis (prototype #6): when true, the first word of the
+    // first Text event in each paragraph renders with bold font weight.
+    emphasis_first_token: bool,
+    /// Whether emphasis has already been applied in the current paragraph.
+    first_token_emphasized: bool,
 }
 
 impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
@@ -179,6 +192,8 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
             surface_variant,
             text_muted,
             primary,
+            emphasis_first_token: false,
+            first_token_emphasized: false,
         }
     }
 
@@ -204,6 +219,7 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
             }
             Tag::Paragraph => {
                 self.spans.clear();
+                self.first_token_emphasized = false;
             }
             Tag::CodeBlock(kind) => {
                 self.flush_para();
@@ -221,6 +237,7 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
             }
             Tag::Item => {
                 self.spans.clear();
+                self.first_token_emphasized = false;
             }
             Tag::Emphasis => {
                 self.fmt_stack.push(Fmt::Italic);
@@ -344,6 +361,23 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
             self.code_buf.push_str(text);
         } else if self.in_table {
             self.current_cell_spans.push(self.span_for(text.to_string()));
+        } else if self.emphasis_first_token && !self.first_token_emphasized {
+            // First-token emphasis (prototype #6): split the first text
+            // event at the first whitespace boundary. The leading word
+            // renders as `Span::Bold` (slightly larger + bold weight);
+            // the remainder continues as normal inline text.
+            self.first_token_emphasized = true;
+            if let Some(space_idx) = text.find(char::is_whitespace) {
+                let word = &text[..space_idx];
+                let rest = &text[space_idx..];
+                self.spans.push(Span::Bold(word.to_string()));
+                if !rest.is_empty() {
+                    self.spans.push(self.span_for(rest.to_string()));
+                }
+            } else {
+                // No whitespace — the entire text is one token; bold it all.
+                self.spans.push(Span::Bold(text.to_string()));
+            }
         } else {
             self.spans.push(self.span_for(text.to_string()));
         }
@@ -364,13 +398,26 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
     }
 
     /// Emit only the first `chars` characters of an oversized text event, then
-    /// let `finalize_truncated` close the current container.
+    /// let `finalize_truncated` close the current container. Mirrors `on_text`
+    /// so a reveal budget that lands inside the first token still emphasizes
+    /// the visible prefix deterministically.
     fn on_text_prefix(&mut self, text: &str, chars: usize) {
         let prefix: String = text.chars().take(chars).collect();
         if self.in_code_block {
             self.code_buf.push_str(&prefix);
         } else if self.in_table {
             self.current_cell_spans.push(self.span_for(prefix));
+        } else if self.emphasis_first_token && !self.first_token_emphasized {
+            self.first_token_emphasized = true;
+            if let Some(space_idx) = prefix.find(char::is_whitespace) {
+                let rest = &prefix[space_idx..];
+                self.spans.push(Span::Bold(prefix[..space_idx].to_string()));
+                if !rest.is_empty() {
+                    self.spans.push(self.span_for(rest.to_string()));
+                }
+            } else {
+                self.spans.push(Span::Bold(prefix));
+            }
         } else {
             self.spans.push(self.span_for(prefix));
         }
@@ -499,7 +546,9 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
                     children.push(t.into());
                 }
                 Span::Bold(t) => {
-                    let mut t = text(t).size(size + 1.0);
+                    let mut t = text(t)
+                        .size(size + 1.0)
+                        .font(Font { weight: iced::font::Weight::Bold, ..Font::default() });
                     if let Some(c) = color {
                         t = t.color(c);
                     }
@@ -637,7 +686,14 @@ pub fn render<'a, M: Clone + 'static>(
     // Parse once and render with no budget. Callers that hold a `MarkdownDoc`
     // use `render_upto` instead (and never re-parse); this entry point exists
     // for one-off renders such as tests and unsaved fallback paths.
-    MarkdownDoc::parse(markdown).render_upto(None, on_copy, surface_variant, text_muted, primary)
+    MarkdownDoc::parse(markdown).render_upto(
+        None,
+        on_copy,
+        surface_variant,
+        text_muted,
+        primary,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -683,7 +739,8 @@ mod tests {
         let md = "# Heading\n\nSome **bold** and `inline` code.\n\n- one\n- two";
         let doc = MarkdownDoc::parse(md);
         assert!(doc.total_units > 0, "total_units must count visible text");
-        let elem = doc.render_upto(None, dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE);
+        let elem =
+            doc.render_upto(None, dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 
@@ -692,7 +749,8 @@ mod tests {
         let doc = MarkdownDoc::parse("# Heading\n\nsome body *text*");
         // A zero budget stops before any text renders; it must still produce a
         // valid (empty) element rather than panicking.
-        let elem = doc.render_upto(Some(0), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE);
+        let elem =
+            doc.render_upto(Some(0), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 
@@ -702,7 +760,8 @@ mod tests {
         let doc = MarkdownDoc::parse(md);
         // Budget 5 lands mid-code-block: a partial code block must emit with
         // its language intact and never panic.
-        let elem = doc.render_upto(Some(5), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE);
+        let elem =
+            doc.render_upto(Some(5), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 
@@ -710,7 +769,8 @@ mod tests {
     fn render_upto_truncated_list_does_not_panic() {
         let md = "- item one\n- item two\n- item three";
         let doc = MarkdownDoc::parse(md);
-        let elem = doc.render_upto(Some(6), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE);
+        let elem =
+            doc.render_upto(Some(6), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 
@@ -720,7 +780,8 @@ mod tests {
         let doc = MarkdownDoc::parse(md);
         // Budget 5 cuts mid-way through the table body: completed rows render,
         // the partial row is dropped.
-        let elem = doc.render_upto(Some(5), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE);
+        let elem =
+            doc.render_upto(Some(5), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 
@@ -728,7 +789,8 @@ mod tests {
     fn render_upto_truncated_blockquote_does_not_panic() {
         let md = "> This is a quote\n>\n> with several lines";
         let doc = MarkdownDoc::parse(md);
-        let elem = doc.render_upto(Some(7), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE);
+        let elem =
+            doc.render_upto(Some(7), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 }

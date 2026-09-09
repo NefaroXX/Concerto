@@ -13,6 +13,35 @@ use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 
+/// Verbosity tier of an `AgentThought` (score-accordion V2).
+///
+/// - `Headline`: agent intent — run starts, completions. Shown as the bucket
+///   digest and always visible unless the agent is muted.
+/// - `Detail`: tool reasoning, failures, summaries. Shown behind expand (or
+///   in CLI expanded mode). This is the default so every pre-tier event
+///   keeps its historical visibility.
+/// - `LowLevel`: IPC noise (prompt dumps, raw payloads). Routed to the
+///   AgentGraph logs only, never to chat surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThinkingKind {
+    /// Agent intent: run starts and completions. Bucket digest source.
+    Headline,
+    /// Tool reasoning and summaries. Visible on expand. Default for
+    /// backward compatibility with pre-tier events.
+    #[default]
+    Detail,
+    /// IPC noise. AgentGraph logs only, never chat.
+    LowLevel,
+}
+
+impl ThinkingKind {
+    /// `skip_serializing_if` target so `Detail` (the legacy-compatible
+    /// default) stays out of persisted payloads.
+    pub fn is_detail(&self) -> bool {
+        matches!(self, Self::Detail)
+    }
+}
+
 /// The payload of an event. Variants map directly to the list in the
 /// roadmap's "Event system" section. Add new variants here as new phases
 /// need them — do not let other crates define their own ad-hoc event types.
@@ -44,6 +73,10 @@ pub enum EventKind {
     AgentThought {
         agent_id: String,
         content: String,
+        /// Verbosity tier. `#[serde(default)]` keeps pre-tier persisted
+        /// events (bus replay, WAL rows) deserializing as `Detail`.
+        #[serde(default)]
+        kind: ThinkingKind,
     },
     ErrorOccurred {
         message: String,
@@ -571,9 +604,10 @@ impl EventKind {
     /// than post-hoc.
     pub fn sanitized(self, sanitizer: &SecretSanitizer) -> Self {
         match self {
-            EventKind::AgentThought { agent_id, content } => EventKind::AgentThought {
+            EventKind::AgentThought { agent_id, content, kind } => EventKind::AgentThought {
                 agent_id: sanitizer.sanitize(&agent_id),
                 content: sanitizer.sanitize(&content),
+                kind,
             },
             EventKind::ErrorOccurred { message } => {
                 EventKind::ErrorOccurred { message: sanitizer.sanitize(&message) }
@@ -1069,6 +1103,7 @@ mod tests {
                 EventKind::AgentThought {
                     agent_id: "demo".into(),
                     content: format!("thought #{i}"),
+                    kind: ThinkingKind::Detail,
                 },
             );
             bus.publish(event).expect("at least one subscriber exists");
@@ -1094,7 +1129,11 @@ mod tests {
             bus.publish_for_session(
                 session_id,
                 correlation_id,
-                EventKind::AgentThought { agent_id: "burst".into(), content: i.to_string() },
+                EventKind::AgentThought {
+                    agent_id: "burst".into(),
+                    content: i.to_string(),
+                    kind: ThinkingKind::Detail,
+                },
             )
             .unwrap();
         }
@@ -1122,7 +1161,11 @@ mod tests {
             bus.publish_for_session(
                 session_id,
                 correlation_id,
-                EventKind::AgentThought { agent_id: "lossless".into(), content: i.to_string() },
+                EventKind::AgentThought {
+                    agent_id: "lossless".into(),
+                    content: i.to_string(),
+                    kind: ThinkingKind::Detail,
+                },
             )
             .unwrap();
         }
@@ -1153,7 +1196,11 @@ mod tests {
             bus.publish_for_session(
                 session_id,
                 correlation_id,
-                EventKind::AgentThought { agent_id: "track".into(), content: i.to_string() },
+                EventKind::AgentThought {
+                    agent_id: "track".into(),
+                    content: i.to_string(),
+                    kind: ThinkingKind::Detail,
+                },
             )
             .unwrap();
         }
@@ -1203,7 +1250,11 @@ mod tests {
             bus.publish_for_session(
                 session_id,
                 correlation_id,
-                EventKind::AgentThought { agent_id: "lag".into(), content: i.to_string() },
+                EventKind::AgentThought {
+                    agent_id: "lag".into(),
+                    content: i.to_string(),
+                    kind: ThinkingKind::Detail,
+                },
             )
             .unwrap();
         }
@@ -1225,6 +1276,7 @@ mod tests {
             EventKind::AgentThought {
                 agent_id: "test".into(),
                 content: "Using OpenAI key sk-1234567890abcdef1234567890abcdef".into(),
+                kind: ThinkingKind::Detail,
             },
         );
         bus.publish(event).unwrap();
@@ -1296,7 +1348,11 @@ mod tests {
         let event = Event::new(
             new_id(),
             new_id(),
-            EventKind::AgentThought { agent_id: "test".into(), content: original_content.into() },
+            EventKind::AgentThought {
+                agent_id: "test".into(),
+                content: original_content.into(),
+                kind: ThinkingKind::Detail,
+            },
         );
         bus.publish(event).unwrap();
 
@@ -1344,7 +1400,11 @@ mod tests {
             EventKind::TokenUsed { tokens_in: 100, tokens_out: 50 },
             EventKind::CostIncurred { cost_usd: 0.01 },
             EventKind::SessionSaved,
-            EventKind::AgentThought { agent_id: "a1".into(), content: "thinking".into() },
+            EventKind::AgentThought {
+                agent_id: "a1".into(),
+                content: "thinking".into(),
+                kind: ThinkingKind::Detail,
+            },
             EventKind::ErrorOccurred { message: "error".into() },
         ];
         assert_eq!(kinds.len(), 8);
@@ -1457,7 +1517,11 @@ mod tests {
                 chunk_count: 3,
                 retrieval_ms: 50,
             },
-            EventKind::AgentThought { agent_id: "agent".into(), content: "think".into() },
+            EventKind::AgentThought {
+                agent_id: "agent".into(),
+                content: "think".into(),
+                kind: ThinkingKind::Detail,
+            },
         ];
         for v in &variants {
             let debug = format!("{v:?}");
@@ -1489,5 +1553,24 @@ mod tests {
         let state_back: crate::types::McpServerState =
             serde_json::from_str(&state_json).expect("must deserialize");
         assert_eq!(state_back, crate::types::McpServerState::Connected);
+    }
+
+    /// Pre-tier `AgentThought` JSON (no `kind` field) deserializes as
+    /// `Detail`, and an explicit tier survives the round trip.
+    #[test]
+    fn agent_thought_kind_defaults_to_detail() {
+        let legacy = serde_json::json!({
+            "AgentThought": { "agent_id": "coder", "content": "old thought" }
+        });
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(back, EventKind::AgentThought { kind: ThinkingKind::Detail, .. }));
+        let kind = EventKind::AgentThought {
+            agent_id: "coder".into(),
+            content: "starting".into(),
+            kind: ThinkingKind::Headline,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::AgentThought { kind: ThinkingKind::Headline, .. }));
     }
 }

@@ -273,9 +273,18 @@ fn status_line(app: &App) -> String {
         (true, Some(stage)) => format!(" | stage: {}", run_stage_label(stage)),
         _ => String::new(),
     };
+    // Thinking-accordion state (V2): only shown once the movement logged a
+    // thought, so idle status lines stay unchanged.
+    let thinking = if app.thought_log.is_empty() {
+        String::new()
+    } else if app.thinking_expanded {
+        " | thinking: expanded".to_string()
+    } else {
+        " | thinking: collapsed".to_string()
+    };
 
     format!(
-        " {} | {} | mode={}{}{}{}{} | {} ",
+        " {} | {} | mode={}{}{}{}{}{} | {} ",
         provider,
         model,
         mode,
@@ -283,6 +292,7 @@ fn status_line(app: &App) -> String {
         memory,
         run,
         stage,
+        thinking,
         app.project_dir.display()
     )
 }
