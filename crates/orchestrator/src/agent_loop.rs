@@ -114,6 +114,10 @@ const MAX_CONTINUATION_ROUNDS: u32 = 8;
 /// non-convergence and escalating to the user.
 const MAX_STALE_ROUNDS: u32 = 3;
 
+/// Character cap for the loop's persisted end-reason note (completion fix:
+/// the terminal reason/surfaces bounded into the session event log).
+const END_REASON_CHARS: usize = 2000;
+
 /// Snapshot of progress used to detect non-convergence across continuation
 /// rounds (two identical fingerprints in a row ⇒ no real forward motion).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -165,6 +169,53 @@ fn merge_run_progress(accumulated: &mut AgentOutput, latest: &AgentOutput) {
     if latest.project_root.is_some() {
         accumulated.project_root = latest.project_root.clone();
     }
+}
+
+/// Number of successful, audited file-changing tool calls recorded in
+/// `output.tool_events` (completion-fix counter reconciliation, 2026-09-09).
+///
+/// The ActionRequired completion check consults the in-loop counter
+/// (`file_changing_tool_count`), which is SCOPED to one continuation round
+/// and keys off the raw arguments' tool name / `operation` field — while the
+/// audited write path (tool summaries, tool-fact rows) accumulates across
+/// rounds and records what the tool normalized. A run that wrote a file in
+/// an earlier round then ended Blocked on "no file-changing tool call
+/// succeeded" reported a disagreement between the two views (live smoke
+/// evidence). This reconciles the check with the audited write path: the
+/// cross-round audit counts as file-changing evidence too.
+fn audited_file_changes(output: &AgentOutput) -> u32 {
+    output
+        .tool_events
+        .iter()
+        .filter(|event| event.success && is_audited_mutation_event(event))
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// True when a tool-execution summary names a mutating tool or operation —
+/// the same grammar [`crate::tool_facts::is_file_affecting_tool`] uses on the
+/// RAW arguments, applied to the summary the executor produced, with the
+/// filesystem tool's own write/delete success marker ("Wrote …"/"Deleted …")
+/// as the fallback for normalized (alias/inferred) calls whose raw
+/// `operation` field was absent.
+fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
+    if event
+        .operation
+        .as_deref()
+        .is_some_and(|op| matches!(op, "write" | "delete" | "move" | "copy"))
+    {
+        return true;
+    }
+    if matches!(
+        event.tool_name.as_str(),
+        "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
+    ) {
+        return true;
+    }
+    // Normalized writes whose raw arguments carried no `operation` field:
+    // classify from the tool's own success summary vocabulary.
+    ["Wrote ", "Deleted "].iter().any(|marker| event.summary.starts_with(marker))
 }
 
 /// Hard completion condition: verification must actually pass when the task
@@ -382,6 +433,12 @@ impl AgentLoop {
         let mut last_partial: Option<AgentOutput> = None;
         let mut cumulative_progress: Option<AgentOutput> = None;
 
+        let mut carried_file_changes: u32 = 0;
+        // Cross-round file-changing carry (completion-fix reconciliation):
+        // the ActionRequired completion check runs INSIDE `run_once` with a
+        // round-scoped counter; the audited write path accumulates across
+        // continuation rounds. The carry tracks the audited file-changing
+        // total so a later round's check sees the earlier rounds' writes.
         for round in 0..MAX_CONTINUATION_ROUNDS {
             // Seed this round's conversation. The first round includes the
             // original task prompt; continuation rounds reuse the full prior
@@ -399,7 +456,8 @@ impl AgentLoop {
                 });
             }
 
-            let exit = self.run_once(task.clone(), seed, cancel.clone()).await?;
+            let exit =
+                self.run_once(task.clone(), seed, cancel.clone(), carried_file_changes).await?;
 
             match exit {
                 AgentRunExit::Done(mut output) => {
@@ -407,8 +465,11 @@ impl AgentLoop {
                         merge_run_progress(accumulated, &output);
                         output = accumulated.clone();
                     }
-                    output.completion_status =
-                        concerto_core::types::AgentCompletionStatus::Completed;
+                    // Truthful completion (ADR-55 Phase 2e, completion fix):
+                    // `AgentOutput.completion_status` is the single source
+                    // of truth. `finalize_completion` set it from the agent's
+                    // own landing state (an eval failure stays `Partial`);
+                    // no transport-level success ever overrides it here.
                     self.persist_run_success(session_id, &output, cancel.clone()).await;
                     return Ok(output);
                 }
@@ -419,6 +480,15 @@ impl AgentLoop {
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
+                    // End-reason persistence (completion-fix): surface the
+                    // loop-end reason into the session event log so the next
+                    // diagnosis reads it from the log, not code archaeology.
+                    self.publish_end_reason(
+                        session_id,
+                        "user input required",
+                        &reason,
+                        cancel.clone(),
+                    );
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
                     return Ok(output);
                 }
@@ -429,6 +499,7 @@ impl AgentLoop {
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
+                    self.publish_end_reason(session_id, "blocked", &reason, cancel.clone());
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
                     return Ok(output);
                 }
@@ -439,6 +510,9 @@ impl AgentLoop {
                         cumulative_progress = Some(partial.clone());
                     }
                     let cumulative = cumulative_progress.as_ref().unwrap_or(&partial);
+                    // Reconcile the cross-round file-changing carry with the
+                    // audited write path (completion-fix).
+                    carried_file_changes = audited_file_changes(cumulative);
                     let fp = ProgressFingerprint::from_output(cumulative);
                     if Some(&fp) == last_fp.as_ref() {
                         stale_rounds += 1;
@@ -453,6 +527,12 @@ impl AgentLoop {
                         );
                         partial_out.completion_status =
                             concerto_core::types::AgentCompletionStatus::Partial;
+                        self.publish_end_reason(
+                            session_id,
+                            "no convergence",
+                            &reason,
+                            cancel.clone(),
+                        );
                         self.persist_run_partial(session_id, &partial_out, cancel.clone()).await;
                         return Ok(partial_out);
                     }
@@ -503,8 +583,48 @@ impl AgentLoop {
         partial.final_message =
             format!("Blocked: reached maximum continuation rounds ({MAX_CONTINUATION_ROUNDS}).");
         partial.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+        self.publish_end_reason(
+            session_id,
+            "maximum continuation rounds reached",
+            &partial.final_message,
+            cancel.clone(),
+        );
         self.persist_run_partial(session_id, &partial, cancel.clone()).await;
         Ok(partial)
+    }
+
+    /// End-reason persistence (completion-fix): the loop's terminal reason
+    /// surfaces as a session event (`AgentThought` diagnostic channel — an
+    /// existing payload field, no schema change) so the session event log
+    /// carries WHY the run ended; the same reason lands in the message log
+    /// through `persist_run_partial`'s assistant summary. Content is
+    /// truncated ([`END_REASON_CHARS`]) and fail-soft (a publish failure
+    /// never changes the run's outcome).
+    fn publish_end_reason(
+        &self,
+        session_id: Ulid,
+        kind: &str,
+        reason: &str,
+        cancel: CancellationToken,
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let mut reason = reason.trim();
+        if reason.is_empty() {
+            reason = "(no recorded reason)";
+        }
+        let content = if reason.chars().count() > END_REASON_CHARS {
+            let truncated: String = reason.chars().take(END_REASON_CHARS).collect();
+            format!("run ended ({kind}): {truncated}… [truncated]")
+        } else {
+            format!("run ended ({kind}): {reason}")
+        };
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::AgentThought { agent_id: "single-agent".to_owned(), content },
+        );
     }
 
     async fn run_once(
@@ -512,6 +632,11 @@ impl AgentLoop {
         task: AgentTask,
         seed_messages: Vec<Message>,
         cancel: CancellationToken,
+        // Cross-round audited file-changing carry (completion-fix): the
+        // ActionRequired completion check inside `decide_exit` sees the
+        // earlier continuation rounds' audited writes, not just this round's
+        // round-scoped counter.
+        prior_file_changes: u32,
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Planning;
         let correlation_id = Ulid::new();
@@ -777,6 +902,7 @@ impl AgentLoop {
             &output,
             tool_call_count,
             file_changing_tool_count,
+            prior_file_changes,
             &eval_result,
             completed,
             messages,
@@ -1331,6 +1457,11 @@ impl AgentLoop {
         output: &AgentOutput,
         tool_call_count: u32,
         file_changing_tool_count: u32,
+        // Cross-round audited file-changing carry (completion-fix, see
+        // `run_once`): the check reconciles with the audited write path, so
+        // a write that succeeded in an earlier continuation round is not
+        // treated as "no file-changing tool call succeeded".
+        prior_file_changes: u32,
         eval_result: &Option<concerto_core::types::EvalResult>,
         completed: bool,
         messages: Vec<Message>,
@@ -1348,9 +1479,17 @@ impl AgentLoop {
                 return Err(OrchestratorError::ExecutionRequiredButNoTools);
             }
 
-            if file_changing_tool_count == 0 {
+            // Counter reconciliation (completion-fix): the round-scoped
+            // in-loop counter is authoritative for THIS round, but the
+            // audited write path accumulates across rounds (both the
+            // cross-round carry and this round's own audited tool counts).
+            // The Blocked verdict fires only when BOTH views report zero.
+            if file_changing_tool_count == 0
+                && prior_file_changes == 0
+                && audited_file_changes(output) == 0
+            {
                 return Ok(Some(AgentRunExit::Blocked {
-                    reason: "Action-required task failed: no file-changing tool call succeeded. Text-only provider claims are ignored. Expected filesystem operation \"write\" or \"delete\", or an equivalent file mutation tool.".to_string(),
+                    reason: "Action-required task failed: no file-changing tool call succeeded. Text-only provider claims are ignored. Expected filesystem operation \"write\" or \"delete\", or an equivalent file mutation tool. File-changing counting reconciles with the audited write path (round-local and cross-round).".to_string(),
                     partial: output.clone(),
                 }));
             }
@@ -1382,7 +1521,7 @@ impl AgentLoop {
         &mut self,
         task: &AgentTask,
         session: &SessionContext,
-        output: AgentOutput,
+        mut output: AgentOutput,
         eval_result: &Option<concerto_core::types::EvalResult>,
         tool_call_count: u32,
         files_modified: &[Utf8PathBuf],
@@ -1391,13 +1530,26 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Completed;
+
+        // Truthful completion: `AgentOutput.completion_status` is the single
+        // source of truth, decided HERE from the agent's own landing state —
+        // an eval failure stays `Partial`, everything else lands `Completed`
+        // (a run with no evaluation result is a normal done run, exactly once
+        // the task genuinely reached finalize). Nothing transport-derived
+        // (a successful provider call, a successful tool transfer) can
+        // override this afterwards; `persist_run_success` and the run-level
+        // Completion card mirror this status.
+        output.completion_status = if eval_result.as_ref().is_some_and(|result| !result.passed) {
+            concerto_core::types::AgentCompletionStatus::Partial
+        } else {
+            concerto_core::types::AgentCompletionStatus::Completed
+        };
+        let success =
+            output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
         let _ = self.bus.publish_for_session(
             task.session_id,
             correlation_id,
-            EventKind::TaskCompleted {
-                task_id: task.id,
-                success: eval_result.as_ref().is_none_or(|r| r.passed),
-            },
+            EventKind::TaskCompleted { task_id: task.id, success },
         );
 
         self.store_task_summary(
@@ -1410,12 +1562,6 @@ impl AgentLoop {
         )
         .await;
 
-        let mut output = output;
-        output.completion_status = if eval_result.as_ref().is_none_or(|result| result.passed) {
-            concerto_core::types::AgentCompletionStatus::Completed
-        } else {
-            concerto_core::types::AgentCompletionStatus::Partial
-        };
         Ok(AgentRunExit::Done(output))
     }
 
@@ -1516,7 +1662,20 @@ impl AgentLoop {
         if cancel.is_cancelled() {
             return;
         }
-        if let Err(e) = store.update_task_status(output.task_id, "completed", cancel.clone()).await
+        // Truthful completion (completion-status fix): the TaskCompleted
+        // event and the task row mirror `AgentOutput.completion_status` —
+        // never an unconditional transport-level `success: true`. A partial
+        // landing (eval failure) persists `success: false` with a `partial`
+        // task row, exactly like `persist_run_partial`.
+        let success =
+            output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
+        if let Err(e) = store
+            .update_task_status(
+                output.task_id,
+                if success { "completed" } else { "partial" },
+                cancel.clone(),
+            )
+            .await
         {
             tracing::warn!(error = %e, "failed to update task status");
         }
@@ -1524,7 +1683,7 @@ impl AgentLoop {
         let event = Event::new(
             Ulid::new(),
             session_id,
-            EventKind::TaskCompleted { task_id: output.task_id, success: true },
+            EventKind::TaskCompleted { task_id: output.task_id, success },
         );
         if cancel.is_cancelled() {
             return;
@@ -1985,9 +2144,21 @@ impl AgentLoop {
             Ok(output) => {
                 *tool_call_count += 1;
 
-                // Track file-changing tools separately (classified just before
-                // execution above for the evidence writer).
-                if file_affecting {
+                // Track file-changing tools separately. Reconciled with the
+                // audited write path (completion fix, 2026-09-09 smoke): the
+                // pre-execution classification reads the RAW arguments' tool
+                // name / `operation` field, but the write path records what
+                // the TOOL actually normalized and executed — alias keys
+                // (`op`), content-inferred writes, and guard text-extracted
+                // fills can all execute a real, audited mutation that the
+                // raw-args classifier misses. A successful tool result that
+                // itself records a materialized mutation (`materialized:
+                // true`, the filesystem tool's write/delete success marker)
+                // therefore counts exactly like a pre-classified one.
+                let audited_mutation = file_affecting
+                    || output.data.get("materialized").and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                if audited_mutation {
                     *file_changing_tool_count += 1;
 
                     if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
@@ -2063,7 +2234,7 @@ impl AgentLoop {
                     true,
                     None,
                     crate::tool_facts::extract_affected_paths(&arguments, Some(&output.data)),
-                    file_affecting,
+                    audited_mutation,
                     pre_image_hashes.clone(),
                     &cancel,
                 )
@@ -6319,5 +6490,246 @@ mod tests {
         assert!(matches!(action, ProviderResponseAction::Proceed));
         assert_eq!(final_message, "", "must NOT set final_message when action_required=true");
         assert!(!completed);
+    }
+
+    // -------------------------------------------------------------------
+    // Truthful completion + counter reconciliation (completion fix)
+    // -------------------------------------------------------------------
+
+    /// A minimal write-shaped tool whose schema does NOT require `operation`
+    /// (the shape custom/plugin tools present): the guard passes the raw
+    /// arguments untouched, the pre-execution classifier finds no
+    /// `operation` field — and the tool's own success output records the
+    /// audited materialized mutation.
+    struct NormalizedWriteTool;
+    #[async_trait]
+    impl Tool for NormalizedWriteTool {
+        fn name(&self) -> &str {
+            "fs_write"
+        }
+        fn description(&self) -> &str {
+            "custom tool that normalizes raw args into a write"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            // Records the audited success exactly like the real filesystem
+            // tool's write result (content-normalized write, no `operation`
+            // in the executed call).
+            Ok(ToolOutput {
+                summary: "Wrote 5 bytes to Cargo.toml".to_owned(),
+                data: serde_json::json!({
+                    "path": input.get("path").cloned().unwrap_or_default(),
+                    "materialized": true
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn audited_mutation_success_counts_across_the_normalization_gap() {
+        // The counter disagreement (live smoke): the counter keys off the
+        // RAW arguments' operation field while the audited write path
+        // records what the TOOL actually executed. A successful tool result
+        // carrying `materialized: true` must count as file-changing even
+        // when the raw argument classification missed it.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(NormalizedWriteTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy));
+        let mut loop_ = AgentLoop::with_project_root(
+            EventBus::new(64),
+            approval.clone(),
+            provider,
+            executor,
+            Arc::new(NoopMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new("/tmp"))),
+            EvalEngine::new(dir.path().to_str().unwrap_or("/tmp")),
+            PromptBuilder::new("test system prompt"),
+            10,
+            true,
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
+
+        let task = AgentTask::new_action_required(Ulid::new(), "write Cargo.toml");
+        let session = SessionContext::new(task.session_id, dir.path().to_path_buf());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        // Raw arguments WITHOUT an `operation` field: the pre-execution
+        // classifier answers false, the executed tool result records the
+        // audited materialized mutation.
+        let tc = ToolCall {
+            id: "call_norm".into(),
+            name: "fs_write".into(),
+            arguments: serde_json::json!({ "path": "Cargo.toml", "content": "hi" }),
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_changing_tool_count, 1,
+            "an audited materialized write counts as file-changing even when \
+             the raw arguments carried no `operation` field"
+        );
+        assert!(files_modified.iter().any(|p| p.as_str() == "Cargo.toml"));
+        assert!(tool_events.iter().any(|event| event.success));
+    }
+
+    /// The ActionRequired Blocked verdict reconciles with the AUDITED write
+    /// path: a run whose round-scoped counter is 0 but whose audited tool
+    /// landing records a successful write is NOT blocked — the audited write
+    /// path discharges the requirement.
+    #[tokio::test]
+    async fn blocked_check_reconciles_with_audited_writes() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output = AgentOutput {
+            tool_call_count: 1,
+            final_message: "done".to_owned(),
+            files_modified: vec!["Cargo.toml".into()],
+            tool_events: vec![ToolExecutionSummary {
+                tool_name: "filesystem".to_owned(),
+                operation: Some("write".to_owned()),
+                path: Some("Cargo.toml".into()),
+                success: true,
+                summary: "Wrote 9 bytes to Cargo.toml".to_owned(),
+            }],
+            ..agent_output_base()
+        };
+
+        // Round counter 0, prior carry 0 — the round's own AUDITED
+        // successful write satisfies the file-changing requirement.
+        let decision = loop_
+            .decide_exit(
+                &task,
+                &output,
+                1, // tool_call_count >= min_tool_calls
+                0, // round file-changing counter: zero (the defect scenario)
+                0, // prior rounds carry: zero
+                &None,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(
+            decision.is_none(),
+            "an audited successful write discharges the file-changing requirement and must not block"
+        );
+
+        // Without any audited mutation the verdict stays Blocked.
+        let mut no_writes = output.clone();
+        no_writes.tool_events = vec![ToolExecutionSummary {
+            tool_name: "filesystem".to_owned(),
+            operation: Some("read".to_owned()),
+            path: None,
+            success: true,
+            summary: "Read 3 bytes".to_owned(),
+        }];
+        let blocked =
+            loop_.decide_exit(&task, &no_writes, 1, 0, 0, &None, true, Vec::new()).unwrap();
+        assert!(
+            matches!(blocked, Some(AgentRunExit::Blocked { .. })),
+            "with no audited mutation the ActionRequired verdict is still Blocked"
+        );
+    }
+
+    /// The loop-end reason persists into the session event log (the
+    /// diagnostic `AgentThought` channel) so a diagnosis reads from the log.
+    #[tokio::test]
+    async fn blocked_run_surfaces_the_end_reason_in_the_event_log() {
+        let bus = EventBus::new(256);
+        let rx = bus.subscribe();
+        let tc = make_tool_call("echo", "read some data");
+        let calls = vec![vec![tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_bus(bus, provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "write a file");
+        let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "premise: the run ends partial"
+        );
+
+        let mut inner = rx.into_inner();
+        let mut end_reason = false;
+        while let Ok(event) = inner.try_recv() {
+            if let EventKind::AgentThought { content, .. } = &event.kind {
+                if content.contains("run ended (blocked)")
+                    && content.contains("no file-changing tool call succeeded")
+                {
+                    end_reason = true;
+                }
+            }
+        }
+        assert!(end_reason, "the loop-end reason must surface in the session event log");
+    }
+
+    /// The Done path with no evaluation result is a normal `Completed` run:
+    /// the output stays Completed, and the bus `TaskCompleted` mirrors
+    /// `success: true` — mirrored from the output's status, never a
+    /// transport-level default.
+    #[tokio::test]
+    async fn no_eval_normal_done_is_completed_with_success_true() {
+        let bus = EventBus::new(64);
+        let rx = bus.subscribe();
+        // Answer-only task with no tool calls: text response ends the loop.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_bus(bus, provider, approval, 4);
+        let task = AgentTask::new(Ulid::new(), "say something");
+        let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "no-eval normal done is Completed"
+        );
+
+        let mut inner = rx.into_inner();
+        let mut task_completed = false;
+        while let Ok(event) = inner.try_recv() {
+            if let EventKind::TaskCompleted { success, .. } = &event.kind {
+                task_completed = true;
+                assert!(success, "the Completed status publishes success:true");
+            }
+        }
+        assert!(task_completed, "the Done path publishes exactly one TaskCompleted");
     }
 }
