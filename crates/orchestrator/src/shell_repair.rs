@@ -105,11 +105,17 @@ pub(crate) fn repairable_failure(tool_name: &str, output: &ToolOutput) -> Option
 /// Classify a failed `shell` tool execution into a repairable execution
 /// failure, if any.
 ///
-/// Policy outcomes (`PolicyDenied` — executor verdicts and the tool's own
-/// denylist), approval outcomes (`ExecutionFailed` carrying the executor's
-/// literal "approval timed out" message), cancellation, and containment
-/// blocks (`VirtualFsConflict`) surface unchanged: repairing any of them
-/// would coach a model around a gate.
+/// Policy outcomes surface unchanged and are never repaired: repairing any
+/// of them would coach a model around a gate. `PolicyDenied` (executor
+/// verdicts and the tool's own denylist), approval outcomes
+/// ([`PolicyError::ApprovalTimeout`] arrives both as the literal
+/// "approval timed out" message and as the write-gate rejection envelope
+/// `gate rejected the write (…): …` — e.g.
+/// `"gate rejected the write (GateDenied): RequireApproval { timeout: 30s }"`
+/// — where the gate denial shows up as an `ExecutionFailed`),
+/// cancellation, and containment blocks (`VirtualFsConflict`) all surface
+/// unchanged. Only genuine process faults (non-zero exit handled by
+/// [`repairable_failure`], `Timeout`, spawn/I/O errors) are repairable.
 pub(crate) fn repairable_error_failure(tool_name: &str, error: &ToolError) -> Option<ShellFailure> {
     if tool_name != SHELL_TOOL_NAME {
         return None;
@@ -118,13 +124,17 @@ pub(crate) fn repairable_error_failure(tool_name: &str, error: &ToolError) -> Op
         ToolError::Timeout { timeout_secs } => {
             Some(ShellFailure::Timeout { timeout_secs: *timeout_secs })
         }
-        ToolError::ExecutionFailed { message } if message.trim() != "approval timed out" => {
-            Some(ShellFailure::ProcessError {
-                message: message.clone(),
-                not_found: message_looks_not_found(message),
-                diagnostic: DIAG_EXECUTION_FAILED,
-            })
+        ToolError::ExecutionFailed { message } if is_policy_denial_message(message) => {
+            // A wrapped gate/policy denial: surface unchanged, never repaired
+            // (the module's hard boundary holds by capability, not by the
+            // denial text matching one literal).
+            None
         }
+        ToolError::ExecutionFailed { message } => Some(ShellFailure::ProcessError {
+            message: message.clone(),
+            not_found: message_looks_not_found(message),
+            diagnostic: DIAG_EXECUTION_FAILED,
+        }),
         ToolError::Io(error) => Some(ShellFailure::ProcessError {
             message: error.to_string(),
             not_found: error.kind() == std::io::ErrorKind::NotFound,
@@ -134,6 +144,26 @@ pub(crate) fn repairable_error_failure(tool_name: &str, error: &ToolError) -> Op
         // every other category: surface unchanged, never repaired.
         _ => None,
     }
+}
+
+/// Semantic classification of the embedded-denial shapes an
+/// `ExecutionFailed` carries (the write-gate rejection envelope and the
+/// executor's wrapped verdict strings). Anything matching is a policy or
+/// approval outcome — never an execution failure a repair turn may coach.
+fn is_policy_denial_message(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.eq_ignore_ascii_case("approval timed out") {
+        return true;
+    }
+    // The write-gate rejection envelope produced by gate_proxy.rs /
+    // ipc.rs: nothing repairable ever rides it, whatever the inner verdict.
+    if message.starts_with("gate rejected the write") {
+        return true;
+    }
+    const DENIAL_MARKERS: &[&str] =
+        &["gatedenied", "requireapproval", "policydenied", "blocked", "denied", "cancelled"];
+    let lowered = trimmed.to_ascii_lowercase();
+    DENIAL_MARKERS.iter().any(|marker| lowered.contains(marker))
 }
 
 /// Heuristic for the not-found cause category: the message reports a missing
@@ -322,6 +352,84 @@ mod tests {
             &ToolError::ExecutionFailed { message: "approval timed out".into() }
         )
         .is_none());
+    }
+
+    #[test]
+    fn wrapped_gate_denials_are_never_repairable() {
+        // The exact string observed live (2026-09 smoke): the unattended shell
+        // write hit the 30s approval timeout and the gate surfaced the denial
+        // wrapped as `ExecutionFailed`. The literal-string check used to
+        // classify it as repairable, coaching a model around the gate.
+        let live = "tool execution failed: gate rejected the write (GateDenied): \
+                    RequireApproval { timeout: 30s }";
+        assert!(repairable_error_failure(
+            SHELL_TOOL_NAME,
+            &ToolError::ExecutionFailed { message: live.into() }
+        )
+        .is_none());
+
+        // Every gate-rejection shape this path can produce is non-repairable:
+        // any code (GateDenied/GateError/Conflict/...) and any embedded reason
+        // (any RequireApproval shape, Blocked, Denied).
+        for message in [
+            "gate rejected the write (GateDenied): RequireApproval { timeout: 30s }",
+            "gate rejected the write (GateDenied): un_granted",
+            "gate rejected the write (GateError): policy evaluation failed",
+            "gate rejected the write (Conflict): base_version mismatch",
+            "supervisor gate said: gate rejected the write (GateDenied): Blocked: containment",
+        ] {
+            let wrapped = ToolError::ExecutionFailed { message: message.into() };
+            assert!(
+                repairable_error_failure(SHELL_TOOL_NAME, &wrapped).is_none(),
+                "a wrapped gate rejection is never a repairable execution failure: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_denial_variants_are_never_repairable() {
+        // Variant/semantic classification: the denial vocabulary — whatever
+        // shape or timeout the verdict carries — is never a repairable
+        // execution failure.
+        let denials = [
+            "RequireApproval { timeout: 30s }",
+            "RequireApprovalWithTimeout { timeout: 5s }",
+            "RequireApproval(Condition)",
+            "GateDenied",
+            "PolicyDenied: shell_danger",
+            "Blocked: containment rejected the target",
+            "denied: outside project root",
+            "The operation was cancelled",
+        ];
+        for message in denials {
+            let error = ToolError::ExecutionFailed { message: message.into() };
+            assert!(
+                repairable_error_failure(SHELL_TOOL_NAME, &error).is_none(),
+                "denial must never be repaired: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_process_failures_still_repair() {
+        // Non-denial execution failures keep the bounded (2-attempt) repair
+        // behavior: spawn leniacy, oversized input, io faults, timeouts.
+        for message in [
+            "failed to spawn process: No such file or directory (os error 2)",
+            "shell executable not found on PATH: fruitloop",
+            "command exceeds maximum length",
+        ] {
+            assert!(
+                matches!(
+                    repairable_error_failure(
+                        SHELL_TOOL_NAME,
+                        &ToolError::ExecutionFailed { message: message.into() }
+                    ),
+                    Some(ShellFailure::ProcessError { .. })
+                ),
+                "genuine execution failure stays repairable: {message}"
+            );
+        }
     }
 
     #[test]
