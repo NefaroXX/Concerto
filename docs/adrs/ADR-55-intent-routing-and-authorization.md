@@ -918,6 +918,14 @@ For outcomes `Execute | Plan | Verify | Review | Diagnose` with
 `RouterRoute::RuleHit` **or** `RouterRoute::LlmClassifier`, the run loop
 auto-grants in `IntentGrantStore` with the same `filesystem`/`git` scopes a
 confirmed `Apply` holds today. No `ApprovalSink` call, no dialog, no modal.
+**Scope amendment (2026-09-09):** the auto-grant's scopes are now
+`filesystem` + `git` + **project-bounded `shell`** — a shell command is
+covered by the acting grant only while structured command facts prove its
+working directory and every path-like token resolve inside the session
+project root and no denylist/Consequential/network rule already matched
+(`is_project_bounded_shell`; everything outside that scope keeps the
+existing `shell_requires_approval` approval path). The shell scope hole in
+§Decision 2 remains for anything outside these bounds.
 The classifier wrapper remains mounted after the two fast paths (ADR-56 §1)
 and its threshold validation (>= 0.7, no band creation, ADR-56 §4) is
 unchanged — the invariant shift is only *what happens after a high-confidence

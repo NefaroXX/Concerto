@@ -144,10 +144,24 @@ pub trait IntentAuthorization: Send + Sync {
     ///   (filesystem write/edit tools and git local-mutate tools) →
     ///   [`IntentVerdict::Allow`] (`rule = "intent_authorized"`); a grantable
     ///   class without a grant → [`IntentVerdict::RequireApproval`]
-    ///   (`rule = "un_granted"`); and shell mutations (never grantable,
-    ///   ADR-55 §2 shell scope hole) → [`IntentVerdict::RequireApproval`]
+    ///   (`rule = "un_granted"`); and shell mutations (never blanket-granted,
+    ///   ADR-55 §2 shell scope hole — project-bounded shell commands are the
+    ///   scoped upgrade exception, ADR-55 shell scope amendment) →
+    ///   [`IntentVerdict::RequireApproval`]
     ///   (`rule = "shell_requires_approval"`).
     fn verdict(&self, action: &PolicyAction<'_>) -> IntentVerdict {
+        self.default_gate_verdict(action)
+    }
+
+    /// The tier → verdict arms [`Self::verdict`] derives by default, exposed
+    /// so composite providers can layer a scoped upgrade on top WITHOUT
+    /// duplicating the arms (a scoped shell auto-approval composes over
+    /// exactly this function, never replaces it). Callers that layer an
+    /// upgrade MUST keep the upgrade below the hard invariants: it may only
+    /// run after the Consequential/Observe tiers have their say, may only
+    /// fire in a non-read-only run, and may only produce
+    /// [`IntentVerdict::Allow`] — never touch a `Deny`.
+    fn default_gate_verdict(&self, action: &PolicyAction<'_>) -> IntentVerdict {
         let tier = classify_tier(action);
         match tier {
             IntentTier::Observe => IntentVerdict::Allow { rule: RULE_OBSERVE },
@@ -165,8 +179,11 @@ pub trait IntentAuthorization: Send + Sync {
                     // is a top-level flow (a new run), not a mid-run prompt.
                     IntentVerdict::Deny { rule: RULE_INTENT_READONLY_DENY }
                 } else if action.tool_name == "shell" {
-                    // Shell MutateLocal is never grantable (ADR-55 §2 shell
-                    // scope hole): the command stays under approval.
+                    // Shell MutateLocal has no blanket grant (ADR-55 §2 shell
+                    // scope hole): the command stays under approval. The
+                    // scoped project-bounded upgrade is layered by providers
+                    // (see [`is_project_bounded_shell`]) on top of this
+                    // default — never inside it.
                     IntentVerdict::RequireApproval { rule: RULE_SHELL_REQUIRES_APPROVAL }
                 } else if is_grantable_class(action) {
                     if self.grant_covers(action) {
@@ -502,13 +519,85 @@ fn is_escaping_path(target: &str) -> bool {
         || target.starts_with("../")
 }
 
-/// Whether `action` belongs to a grantable mutation class: filesystem
+/// True when `action` belongs to a grantable mutation class: filesystem
 /// write/edit tools and git local-mutate tools. Shell MutateLocal is NEVER
-/// grantable (ADR-55 §2 shell scope hole); other tools are not grantable
-/// either. Only meaningful within the MutateLocal tier arm, where the tier is
-/// already established.
+/// blanket-grantable (ADR-55 §2 shell scope hole); other tools are not
+/// grantable either. Only meaningful within the MutateLocal tier arm, where
+/// the tier is already established.
 fn is_grantable_class(action: &PolicyAction<'_>) -> bool {
     matches!(action.tool_name, "filesystem" | "git")
+}
+
+/// ADR-55 shell scope amendment (2026-09-09): is `action` a project-bounded
+/// `shell` command whose policy verdict may be auto-approved under an
+/// Acting grant, exactly like in-scope filesystem writes?
+///
+/// Conservative and pure — the upgrade predicate, not a bypass: every check
+/// below must hold, and any doubt answers `false` (the command keeps its
+/// existing approval path), because an upgrade may only ever flip
+/// `RequireApproval` → `Allow`, never a `Deny` (§Decision 2). The EXISTING
+/// denylist/Consequential/network/writer rules still run first in the
+/// engine; this predicate only gates the shell arm otherwise headed to
+/// [`RULE_SHELL_REQUIRES_APPROVAL`].
+///
+/// Required:
+/// - the tool is `shell` **and** structured `CommandPolicyFacts` came from
+///   the producing tool (facts are executor-produced at the policy-action
+///   boundary, never model text — a raw command string without facts cannot
+///   prove its scope, so without facts this answers `false`);
+/// - the facts' `FilesystemScope` is `FilesystemScope::ProjectOnly`: the
+///   shell runtime resolved the working directory against the session
+///   project root at facts time (cwd containment);
+/// - the facts did not request network egress (belt with the Consequential
+///   network classification, which already precedes this predicate);
+/// - the command text carries no escape: no absolute path, `~`-pivot or
+///   `..` climb, no workspace-escaping `cd`/`pushd`, and no workspace-
+///   escaping write-redirect target. Relative in-root tokens resolve
+///   against the in-root working directory, so they stay in project.
+pub fn is_project_bounded_shell(action: &PolicyAction<'_>) -> bool {
+    if action.tool_name != "shell" {
+        return false;
+    }
+    let Some(facts) = action.command_facts.as_ref() else {
+        return false;
+    };
+    if facts.filesystem_scope != crate::types::FilesystemScope::ProjectOnly {
+        return false;
+    }
+    if facts.network_requested {
+        return false;
+    }
+    let Some(text) = shell_command_text(action) else {
+        return false;
+    };
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.iter().any(|token| is_escaping_shell_token(token)) {
+        // A path-like token that resolves outside the project root (or could
+        // not be proven to stay inside): keep the existing approval path.
+        return false;
+    }
+    if has_escaping_redirect(&tokens) || has_escaping_cd(&tokens) {
+        // The bounded redirect/`cd` scans already classify workspace escapes
+        // as Consequential (the tier check precedes this call); re-checked
+        // here so the predicate stays standalone-true only for in-project
+        // commands.
+        return false;
+    }
+    true
+}
+
+/// True when `token` could name a target outside the project root: an
+/// absolute path, a home pivot, or ANY `..`-containing token (`..`, `../x`,
+/// `x/../y`, backslash variants, glued forms). Deliberately coarser than the
+/// execution-time containment canon — a false *positive* here only costs an
+/// approval prompt; a false negative would upgrade an escape.
+fn is_escaping_shell_token(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with('\\')
+        || token.starts_with('~')
+        || token.contains("..")
+        || token.contains('\\')
+        || token.contains(':')
 }
 
 /// Read the tool input's `operation` field, if any.
@@ -1150,5 +1239,126 @@ mod tests {
             auth.verdict(&action),
             IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL }
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-55 shell scope amendment: is_project_bounded_shell
+    // ------------------------------------------------------------------
+
+    /// Shell facts as the tool itself derives them: the working directory
+    /// resolved against the session project root, egress flag per argument.
+    fn facts(in_root: bool, network: bool) -> CommandPolicyFacts {
+        crate::types::CommandPolicyFacts {
+            shell_profile_id: None,
+            resolved_executable: Some(PathBuf::from("/usr/bin/bash")),
+            argv: vec!["/bin/bash".to_owned(), "-c".to_owned(), "resolved".to_owned()],
+            working_directory: Some(PathBuf::from(if in_root {
+                "/proj/sub"
+            } else {
+                "/home/other"
+            })),
+            network_requested: network,
+            filesystem_scope: if in_root {
+                FilesystemScope::ProjectOnly
+            } else {
+                FilesystemScope::Anywhere
+            },
+            destructive_classification: DestructiveClass::NonDestructive,
+        }
+    }
+
+    /// An action carrying shell facts; the input lives as long as the test
+    /// local that builds it (`shell_action_with(&value, facts)`).
+    fn shell_action_with<'a>(
+        input: &'a serde_json::Value,
+        facts: CommandPolicyFacts,
+    ) -> PolicyAction<'a> {
+        PolicyAction {
+            tool_name: "shell",
+            input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: Some(facts),
+        }
+    }
+
+    fn shell_command(command: &str) -> serde_json::Value {
+        let mut parts = command.split_whitespace();
+        let head = parts.next().unwrap_or_default().to_owned();
+        let args: Vec<&str> = parts.collect();
+        serde_json::json!({ "command": head, "args": args })
+    }
+
+    /// In-project `cargo build`-class commands with in-root facts classify
+    /// project-bounded.
+    #[test]
+    fn in_root_commands_with_in_root_facts_are_project_bounded() {
+        for command in ["cargo build", "cargo test", "cargo test --lib", "sh -c 'cd src'"] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                is_project_bounded_shell(&act),
+                "in-project command must be project-bounded: {command}"
+            );
+            // MutateLocal tier as classified before the predicate ever runs.
+            assert_eq!(classify_tier(&act), IntentTier::MutateLocal);
+        }
+    }
+
+    /// Any doubt keeps the existing approval path: no facts, an outside-root
+    /// working scope, or network egress is never project-bounded.
+    #[test]
+    fn doubtful_commands_are_never_project_bounded() {
+        let command = "cargo build";
+        let without_facts = serde_json::json!({ "command": "cargo", "args": ["build"] });
+        let no_facts = PolicyAction {
+            tool_name: "shell",
+            input: &without_facts,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        assert!(
+            !is_project_bounded_shell(&no_facts),
+            "no facts: the raw text cannot prove its scope"
+        );
+
+        let input_cargo = shell_command(command);
+        let outside_root = shell_action_with(&input_cargo, facts(false, false));
+        assert!(
+            !is_project_bounded_shell(&outside_root),
+            "outside-root working directory is never project-bounded"
+        );
+
+        let networked = shell_action_with(&input_cargo, facts(true, true));
+        assert!(!is_project_bounded_shell(&networked), "network egress never auto-upgrades");
+    }
+
+    /// Escapes in the command text, `cd` targets, and redirect targets keep
+    /// the command under its existing approval path (`../` climb, absolute
+    /// outside-root target).
+    #[test]
+    fn escapes_keep_the_existing_approval_path() {
+        for command in [
+            "cargo build ../other",
+            "cat /etc/os-release", // absolute outside-root token
+            "echo x > ../out",
+            "cd .. && cargo build",
+            "bash -c \"cd /var && pwd\"",
+            "cat ~/notes",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "escape must keep the approval path: {command}"
+            );
+        }
     }
 }
