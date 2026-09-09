@@ -211,7 +211,9 @@ impl fmt::Display for RunStage {
 /// Route `input` to a requested outcome with a deterministic, pure,
 /// negation-aware rule set.
 ///
-/// Order of evaluation (first match wins):
+/// The input is lowercased, then a leading glued `Label:` ahead of an
+/// explicit action keyword is detached (ADR-55 Phase 2e §6 — see
+/// [`strip_glued_label`]). Order of evaluation (first match wins):
 /// 1. **Negation corpus** — read-only directives (`don't`, `never`,
 ///    `without <verb>`, `just <answer|review|...>`, ...) override everything,
 ///    including execution keywords.
@@ -242,7 +244,11 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
         hinted_paths: extract_hinted_paths(input, &root),
     };
     let normalized = normalize_input(input);
-    let tokens = tokens_of(&normalized);
+    // ADR-55 Phase 2e §6: a leading glued `Label:` ahead of an explicit
+    // action keyword is detached before classification (see
+    // [`strip_glued_label`]).
+    let normalized = strip_glued_label(&normalized).unwrap_or(&normalized);
+    let tokens = tokens_of(normalized);
 
     // Empty/whitespace-only input: nothing to route.
     if normalized.is_empty() {
@@ -258,9 +264,9 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
     //     a task-level prohibition (ADR-55 Phase 2d §2a): a requirement clause
     //     that follows an explicit action request constrains the artifact, not
     //     the action, and falls through to the keyword rules below.
-    if negation_veto_fires(&normalized, &tokens) {
+    if negation_veto_fires(normalized, &tokens) {
         return RouterOutput {
-            outcome: read_only_outcome(&normalized, &tokens),
+            outcome: read_only_outcome(normalized, &tokens),
             scope,
             confidence: 0.9,
             route: RouterRoute::RuleHit { rule: RULE_NEGATION_OVERRIDE },
@@ -268,8 +274,8 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
     }
 
     // (b) Question detection.
-    if is_question(&normalized) {
-        let outcome = if contains_any(&normalized, DIAGNOSE_WORDS) {
+    if is_question(normalized) {
+        let outcome = if contains_any(normalized, DIAGNOSE_WORDS) {
             RequestedOutcome::Diagnose
         } else {
             RequestedOutcome::Answer
@@ -298,7 +304,7 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
     //     start with a greeting (and may hide a real intent) still falls
     //     through to the AskUser sink below.
     if normalized.chars().count() <= SMALLTALK_MAX_INPUT_LEN
-        && SMALLTALK_PHRASES.iter().any(|phrase| contains_standalone(&normalized, phrase))
+        && SMALLTALK_PHRASES.iter().any(|phrase| contains_standalone(normalized, phrase))
     {
         return RouterOutput {
             outcome: RequestedOutcome::Answer,
@@ -324,6 +330,44 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
 /// apostrophes normalized to ASCII so `don’t` matches the `don't` corpus.
 fn normalize_input(input: &str) -> String {
     input.trim().to_lowercase().replace(['\u{2018}', '\u{2019}'], "'")
+}
+
+/// ADR-55 Phase 2e §6 (glue-strip): detach a leading glued `Label:` from the
+/// normalized input when ALL conditions hold:
+///
+/// 1. the label is purely alphabetic with more than one alphabetic
+///    character — excludes `C:` drive letters (alphabetic length 1);
+/// 2. the label is NOT itself an explicit outcome keyword — `plan:` and
+///    `verify:` are the documented intent idioms (ADR-55 Phase 2b §9/T11),
+///    so a keyword label is semantic, never glue to strip;
+/// 3. the remainder BEGINS with an explicit outcome keyword as whole
+///    token(s) — excludes `https://…` URLs, whose post-colon text never
+///    starts with a keyword.
+///
+/// A `Prompt:`-style label glued to the leading verb otherwise blinds the
+/// whole-token keyword matcher (`prompt:build` is one token, so `build`
+/// never matches) and drags an explicit action request into the AskUser
+/// sink. Returns the remainder to classify, or `None` to keep the input
+/// unchanged. Classification only — hinted-path extraction still runs on
+/// the original input.
+fn strip_glued_label(normalized: &str) -> Option<&str> {
+    let (label, remainder) = normalized.split_once(':')?;
+    if !label.chars().all(|c| c.is_alphabetic())
+        || label.chars().filter(|c| c.is_alphabetic()).count() <= 1
+    {
+        return None;
+    }
+    // A label that is itself an outcome keyword (`plan:`, `verify:`, ...)
+    // carries the intent — never treat it as glue (T11: `plan: build …`
+    // stays Plan).
+    let label_tokens = [label.to_owned()];
+    if explicit_outcome_keyword(&label_tokens).is_some() {
+        return None;
+    }
+    let remainder = remainder.trim_start();
+    // The earliest whole-token keyword match must sit at offset 0: the
+    // remainder has to START with the action keyword.
+    (earliest_action_keyword_start(remainder) == Some(0)).then_some(remainder)
 }
 
 /// Read-only negation/limiting corpus (routing step a). Matched FIRST and with
@@ -1021,6 +1065,104 @@ mod tests {
 
     fn hinted(out: &RouterOutput) -> &[PathBuf] {
         &out.scope.hinted_paths
+    }
+
+    // ---- ADR-55 Phase 2e §6: glue-strip normalization (near-miss pins) ----
+
+    #[test]
+    fn glued_label_with_action_keyword_is_stripped() {
+        // "Prompt:Build …" glued the label onto the leading verb, so the
+        // whole-token matcher saw one token ("prompt:build") and the explicit
+        // action request fell into the AskUser sink. The strip detaches the
+        // label and the remainder routes exactly like "Build …".
+        let glued = route("Prompt:Build a rust cli tool called hexview", project());
+        let bare = route("Build a rust cli tool called hexview", project());
+        assert_eq!(
+            glued.outcome,
+            RequestedOutcome::Execute,
+            "the glued label must not blind the keyword match"
+        );
+        assert_eq!(
+            glued.outcome, bare.outcome,
+            "the glued form routes identically to the bare form"
+        );
+        assert_eq!(glued.confidence, bare.confidence);
+        assert!(matches!(glued.route, RouterRoute::RuleHit { rule: "execute_keyword" }));
+    }
+
+    #[test]
+    fn glued_label_survives_to_negation_when_remainder_is_a_prohibition() {
+        // The strip requires the remainder to BEGIN with an action keyword:
+        // a prohibition never detaches, so the veto sees the full text and
+        // the hard read-only invariant is untouched (A8).
+        let out = route("Prompt:don't build accord", project());
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+        assert_eq!(out.outcome, RequestedOutcome::Answer);
+    }
+
+    #[test]
+    fn url_is_never_glue_stripped() {
+        // The post-colon text of a URL never begins with an action keyword
+        // as a whole token (`//example.com/…`), so `https://…` is never
+        // treated as `Label:` + action keyword — pinned directly on the
+        // strip predicate, since an outcome-level assertion cannot
+        // discriminate (an URL body may contain a keyword further in, which
+        // routes the same with or without the strip).
+        assert_eq!(strip_glued_label("https://example.com/build it"), None);
+        assert_eq!(strip_glued_label("https://example.com/verify the fix"), None);
+        assert_eq!(strip_glued_label("http://run.the.tests/now"), None);
+    }
+
+    #[test]
+    fn drive_letter_and_single_char_labels_are_never_stripped() {
+        assert_eq!(strip_glued_label("c:\\tools\\build"), None);
+        assert_eq!(strip_glued_label("x:build it now"), None);
+    }
+
+    #[test]
+    fn keyword_labels_are_semantic_not_glue() {
+        // `plan:` / `verify:` are the documented intent idioms (T11): a
+        // label that is itself an outcome keyword carries the intent and is
+        // never stripped, even when the remainder starts with an action
+        // keyword too.
+        assert_eq!(strip_glued_label("plan: build a minimal cli tool"), None);
+        assert_eq!(strip_glued_label("verify: build passes"), None);
+    }
+
+    #[test]
+    fn glue_strip_accepts_and_rejects() {
+        // NOTE: `strip_glued_label` operates on the NORMALIZED (lowercased)
+        // text `route()` produces — tests must feed normalized strings.
+        assert_eq!(strip_glued_label("prompt:build accord"), Some("build accord"));
+        assert_eq!(strip_glued_label("prompt: build accord"), Some("build accord"));
+        // No keyword at offset 0 of the remainder → no strip.
+        assert_eq!(strip_glued_label("note:please build accord"), None);
+        // A prohibition remainder never strips.
+        assert_eq!(strip_glued_label("note:don't build accord"), None);
+        // Non-alphabetic labels never strip.
+        assert_eq!(strip_glued_label("2024:build it"), None);
+        assert_eq!(strip_glued_label("don't:build it"), None);
+        assert_eq!(strip_glued_label("no colon here"), None);
+    }
+
+    #[test]
+    fn constraint_heavy_build_prompt_with_glued_label_stays_actionable() {
+        // Revised A6 shape (ADR-55 Phase 2e): constraint clauses after the
+        // explicit action request ("do NOT read it as UTF-8", "don't panic")
+        // must not demote the run, with or without a glued `Prompt:` label.
+        let smoke = "Build a Rust CLI tool called hexview that reads stdin as bytes. \
+                     do NOT read it as a UTF-8 string. it must not panic. don't panic. verify it";
+        let with_label = format!("Prompt:{smoke}");
+        for input in [smoke.to_string(), with_label] {
+            let out = route(&input, project());
+            assert!(
+                !matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }),
+                "constraint clauses must not fire the task-level veto: {out:?}"
+            );
+            assert_eq!(out.outcome, RequestedOutcome::Verify);
+            assert_eq!(out.confidence, 0.8);
+            assert!(matches!(out.route, RouterRoute::RuleHit { rule: "verify_keyword" }));
+        }
     }
 
     #[test]

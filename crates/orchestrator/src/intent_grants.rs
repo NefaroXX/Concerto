@@ -247,6 +247,71 @@ pub fn auto_grant_envelope(routing: &RouterOutput) -> String {
     .to_string()
 }
 
+/// ADR-55 Phase 2e §2: the permission envelope a routed run executes under.
+///
+/// The router keeps only the safety job: it decides whether the run may act,
+/// never which code path runs. Every non-empty run enters the unified agent
+/// loop; the envelope is what the loop's prompt and the policy engine key
+/// off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnvelope {
+    /// Hard read-only: no grants exist, the policy engine denies every
+    /// mutation, and the loop's prompt does not ask the model to act.
+    /// Reached by a task-level prohibition (`negation_override`), an
+    /// unresolved `AskUser` ambiguity, or a gate denial
+    /// (`declined`/`dismissed`).
+    ReadOnly,
+    /// Acting: the confirmed grants hold exactly as the gate granted them
+    /// (`auto_granted`, or a user-granted Execute). Writes stay governed by
+    /// the policy engine, never by a branch.
+    Acting,
+}
+
+impl RunEnvelope {
+    /// Derive the envelope from the intent gate's confirmation value
+    /// (`auto_granted` | `granted` | `declined` | `dismissed` | `n/a`).
+    ///
+    /// A `negation_override` route and an unresolved `AskUser` route never
+    /// produce a granting confirmation ([`apply_intent_gate`] audits them
+    /// `"n/a"`), so they land [`RunEnvelope::ReadOnly`] here by construction
+    /// — the hard read-only invariant (2e §2) does not need its own clause.
+    pub fn from_confirmation(confirmation: &str) -> Self {
+        if matches!(confirmation, "granted" | "auto_granted") {
+            Self::Acting
+        } else {
+            Self::ReadOnly
+        }
+    }
+
+    /// True when the run may act within its grants.
+    pub fn is_acting(self) -> bool {
+        self == Self::Acting
+    }
+}
+
+/// ADR-55 Phase 2e §2: the non-binding flavor hint for a routed outcome.
+///
+/// One system-prompt line rendered from the outcome the router settled on.
+/// Pure: the helper maps an outcome to text and nothing else. Prompt-building
+/// callers append it, log it alongside the routing row, and NEVER branch on
+/// it — no keyword may select a tool-less path, and the unified loop decides
+/// tool use from the model's own output.
+pub fn flavor_hint(outcome: RequestedOutcome) -> &'static str {
+    match outcome {
+        RequestedOutcome::Execute => "the user asked for a change; implement it",
+        RequestedOutcome::Plan => "the user seems to want a plan; design before changing",
+        RequestedOutcome::Verify => {
+            "the user seems to want verification; prefer checking over changing"
+        }
+        RequestedOutcome::Review => "the user seems to want a review; critique rather than modify",
+        RequestedOutcome::Diagnose => {
+            "the user seems to want a diagnosis; investigate and explain before changing"
+        }
+        RequestedOutcome::Answer => "the user seems to want an answer",
+        _ => "",
+    }
+}
+
 /// Apply the ADR-55 gate (Phase 2d) to a routed request and return the run's
 /// EFFECTIVE outcome plus the audit confirmation value (`auto_granted` |
 /// `granted` | `declined` | `dismissed` | `n/a`).
