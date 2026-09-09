@@ -78,6 +78,14 @@ pub const RULE_OBSERVE: &str = "observe";
 /// `RequireApproval` → `Allow` for an in-scope grantable mutation (ADR-55 §2).
 pub const RULE_INTENT_AUTHORIZED: &str = "intent_authorized";
 
+/// Audit `rule_matched` value when the intent gate upgrades
+/// `RequireApproval` → `Allow` for a project-bounded `shell` command under
+/// an Acting grant (ADR-55 shell scope amendment; F4 — security review 2026-
+/// 09-09). Deliberately DISTINCT from [`RULE_INTENT_AUTHORIZED`]: a shell
+/// auto-approval must be individually auditable, and filesystem upgrades
+/// keep the original shared rule.
+pub const RULE_INTENT_AUTHORIZED_SHELL: &str = "intent_authorized_shell";
+
 /// Audit `rule_matched` value when the intent gate keeps a Consequential-tier
 /// action under `RequireApproval` — blanket grants never cover it.
 pub const RULE_CONSEQUENTIAL: &str = "consequential";
@@ -258,6 +266,33 @@ const INPLACE_WRITE_FLAGS: &[(&str, &[&str])] =
 const SHELL_DESTRUCTIVE_VERBS: &[&str] =
     &["rm", "rmdir", "shred", "dd", "mkfs", "truncate", "unlink"];
 
+// Security-review hardening of the project-bounded shell upgrade (2026-09-09,
+// F1/F2/F3). These tables feed BOTH the Consequential classifier and the
+// [`is_project_bounded_shell`] upgrade predicate: a token here keeps the
+// command under its existing approval path, wherever it appears in the
+// command text — not just as the first verb.
+
+/// Env-indirection metacharacters (F1). ANY token carrying one means the
+/// command text the classifier sees is NOT the text the shell will run:
+/// `$HOME`, `${HOME}`, `$(…)` run outside the scanner's sight, `%USERPROFILE%`
+/// is a second expansion dialect, and quotes hide argument content from the
+/// whitespace split. Never eligible for auto-approval.
+const SHELL_INTERPOLATION_CHARS: &[char] = &['$', '`', '%', '\'', '"'];
+
+/// Interpreter verbs (F3): with a code flag (`-c`, `-e`, `-m`, `-r`) they run
+/// attacker-chosen code no token scan can see into (network calls, escapes
+/// assembled at runtime). Such invocations are Consequential everywhere and
+/// never take the project-bounded upgrade.
+const SHELL_INTERPRETERS: &[&str] = &["python", "python3", "node", "perl", "ruby"];
+
+/// Interpreter code flags: any argument starting with one of these prefixes
+/// counts (exact forms and glued forms like `-e'print(1)'` alike).
+const INTERPRETER_CODE_FLAGS: &[&str] = &["-c", "-e", "-m", "-r"];
+
+/// Destructive single flags that make a scan-innocent verb destructive
+/// (`find . -delete` deletes; the `find` verb alone is read-only).
+const DESTRUCTIVE_FLAGS: &[&str] = &["-delete"];
+
 /// Shell verbs that are themselves network-egress clients (v1 set).
 const SHELL_NETWORK_VERBS: &[&str] =
     &["curl", "wget", "ssh", "scp", "rsync", "ftp", "sftp", "telnet", "nc", "ncat", "socat"];
@@ -397,6 +432,13 @@ fn shell_is_consequential(action: &PolicyAction<'_>) -> bool {
     if SHELL_NETWORK_VERBS.contains(&verb) {
         return true;
     }
+    // Interpreter invocations carrying a code flag (`python -c …`, `node -e …`,
+    // `python -m http.server`) run attacker-chosen code no token scan can see
+    // into — always Consequential so they can never take any auto-approval
+    // (F3).
+    if is_interpreter_code_invocation(&tokens) {
+        return true;
+    }
     // Package publish/install/add.
     if SHELL_PACKAGE_MANAGERS.contains(&verb)
         && tokens.iter().any(|t| matches!(*t, "publish" | "install" | "add"))
@@ -509,14 +551,16 @@ fn has_escaping_cd(tokens: &[&str]) -> bool {
 }
 
 /// True when `target` resolves outside the session project root: absolute,
-/// home-relative, or a parent climb. Mirrors the containment module's boundary
-/// without needing the root value — any such target is outside by construction
-/// for a scoped run.
+/// home-relative, ANY `..`-containing climb, or an interpolation metachar
+/// (`$`/`%` env expansion is resolved by the SHELL against outside roots —
+/// a target carrying `$HOME`/`${HOME}`/`%USERPROFILE%` escapes by
+/// construction). Mirrors the containment module's boundary without needing
+/// the root value — any such target is outside for a scoped run.
 fn is_escaping_path(target: &str) -> bool {
     target.starts_with('/')
         || target.starts_with('~')
-        || target == ".."
-        || target.starts_with("../")
+        || target.contains("..")
+        || target.chars().any(|c| SHELL_INTERPOLATION_CHARS.contains(&c))
 }
 
 /// True when `action` belongs to a grantable mutation class: filesystem
@@ -554,6 +598,18 @@ fn is_grantable_class(action: &PolicyAction<'_>) -> bool {
 ///   `..` climb, no workspace-escaping `cd`/`pushd`, and no workspace-
 ///   escaping write-redirect target. Relative in-root tokens resolve
 ///   against the in-root working directory, so they stay in project.
+/// - the command text carries no env indirection (F1): no `$`, backtick,
+///   `%`, or quote character in ANY token — expansion and quoted content
+///   mean the scanned text is not the executed text, so such commands keep
+///   their approval path;
+/// - no unbounded `cd`/`pushd`: bare `cd`, `cd -`, and any target that
+///   cannot be proven to resolve inside the project are rejected (F1);
+/// - NO token or separator segment names a destructive/network verb or a
+///   destructive find-style flag, and no interpreter invocation carries a
+///   code flag (F2/F3) — verb hiding past the first verb is scanned out;
+/// - the audit row the upgrade produces is `intent_authorized_shell`
+///   ([`RULE_INTENT_AUTHORIZED_SHELL`], F4), distinct from the filesystem
+///   row, so shell auto-approvals are individually auditable.
 pub fn is_project_bounded_shell(action: &PolicyAction<'_>) -> bool {
     if action.tool_name != "shell" {
         return false;
@@ -570,7 +626,32 @@ pub fn is_project_bounded_shell(action: &PolicyAction<'_>) -> bool {
     let Some(text) = shell_command_text(action) else {
         return false;
     };
-    let tokens: Vec<&str> = text.split_whitespace().collect();
+    // The scan tables are lowercase; lowercasing once is safe for every
+    // check below (escape/redirect/`cd` scans are defined over symbolic
+    // characters that lowercase does not change).
+    let lower = text.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    // F1 (env indirection): `$`, backticks, `%`, and quotes in ANY token
+    // mean the text the scanner sees is NOT the text the shell runs — env
+    // expansion (`$HOME`, `${HOME}`, `$(…)`, `%USERPROFILE%`) and quoted
+    // argument content escape the token scan. Never auto-approved.
+    if tokens.iter().any(|token| token.chars().any(|c| SHELL_INTERPOLATION_CHARS.contains(&c))) {
+        return false;
+    }
+    // F1 (`cd` bounds): a bare `cd` (~$HOME in bash), `cd -`, or any `cd`/
+    // `pushd` target that cannot be proven to resolve inside the project —
+    // containment today only rejects explicit escapes, but the upgrade must
+    // not allow an unproven `cd` target through.
+    if has_unbounded_cd(&tokens) {
+        return false;
+    }
+    // F2/F3 (verb hiding): every token and separator segment is scanned
+    // against the destructive/network/interpreter tables — not just the
+    // first verb (`cargo build && rm -rf src`, `sudo rm f`, `xargs rm`,
+    // `find . -delete`, `timeout 5 rm f`, `python -m http.server`).
+    if command_carries_restricted_verb(&tokens) {
+        return false;
+    }
     if tokens.iter().any(|token| is_escaping_shell_token(token)) {
         // A path-like token that resolves outside the project root (or could
         // not be proven to stay inside): keep the existing approval path.
@@ -598,6 +679,59 @@ fn is_escaping_shell_token(token: &str) -> bool {
         || token.contains("..")
         || token.contains('\\')
         || token.contains(':')
+}
+
+/// F1: true when `tokens` contains a `cd`/`pushd` whose target cannot be
+/// proven to resolve inside the session project root:
+///
+/// - a bare `cd` sends the shell to `$HOME` in bash — outside by
+///   construction for a project-scoped run;
+/// - `cd -` re-enters the previous directory the run cannot know;
+/// - an absolute / home / `..` target fails [`is_escaping_shell_token`].
+///
+/// The only target this accepts is a relative, interpolation-free,
+/// `..`-free token, which lexically resolves against the in-project working
+/// directory and therefore provably stays inside it (`cd src`). A false
+/// positive here only costs an approval prompt; a false negative would
+/// auto-approve a working-directory pivot outside the root.
+fn has_unbounded_cd(tokens: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(i, token)| {
+        matches!(*token, "cd" | "pushd")
+            && match tokens.get(i + 1) {
+                None => true,
+                Some(target) => *target == "-" || is_escaping_shell_token(target),
+            }
+    })
+}
+
+/// F3: true when `tokens` contains an interpreter verb AND a code flag
+/// (`-c`, `-e`, `-m`, `-r`, exact or glued). Position-independent: a
+/// wrapper verb (`sudo python -c …`, `env python -m …`) is still an
+/// interpreter invocation.
+fn is_interpreter_code_invocation(tokens: &[&str]) -> bool {
+    tokens.iter().copied().map(verb_basename).any(|verb| SHELL_INTERPRETERS.contains(&verb))
+        && tokens
+            .iter()
+            .any(|token| INTERPRETER_CODE_FLAGS.iter().any(|flag| token.starts_with(flag)))
+}
+
+/// F2/F3: true when ANY token in `tokens` — not just the first verb, and
+/// across every `;`/`&&`/`||`/`|`-separated segment — names a destructive
+/// file verb, a network transport client, a destructive find-style flag, or
+/// is an interpreter invocation carrying a code flag. Verb hiding
+/// (`cargo build && rm -rf src`, `sudo rm f`, `timeout 5 rm f`, `xargs rm`,
+/// `env rm`, `find . -delete`) can no longer clear the upgrade predicate.
+/// Chosen over a positive build-verb allowlist because it reuses the
+/// tables this module already maintains, keeps the existing smoke verbs
+/// (`touch`, `mkdir`, `mv`, …) upgradable without enumerating them, and a
+/// false positive only costs the existing approval prompt.
+fn command_carries_restricted_verb(tokens: &[&str]) -> bool {
+    tokens.iter().copied().any(|token| {
+        let verb = verb_basename(token);
+        SHELL_DESTRUCTIVE_VERBS.contains(&verb)
+            || SHELL_NETWORK_VERBS.contains(&verb)
+            || DESTRUCTIVE_FLAGS.contains(&verb)
+    }) || is_interpreter_code_invocation(tokens)
 }
 
 /// Read the tool input's `operation` field, if any.
@@ -1293,10 +1427,14 @@ mod tests {
     }
 
     /// In-project `cargo build`-class commands with in-root facts classify
-    /// project-bounded.
+    /// project-bounded. Quoted text is NOT (F1) — `sh -c 'cd src'` carries a
+    /// quote, so the smoke allowlist sticks to metachar-free commands and an
+    /// in-project `cd src` target (its only provably in-`cd`-able shape).
     #[test]
     fn in_root_commands_with_in_root_facts_are_project_bounded() {
-        for command in ["cargo build", "cargo test", "cargo test --lib", "sh -c 'cd src'"] {
+        for command in
+            ["cargo build", "cargo test", "cargo test --lib", "cd src && cargo test", "mkdir src"]
+        {
             let input = shell_command(command);
             let act = shell_action_with(&input, facts(true, false));
             assert!(
@@ -1306,6 +1444,102 @@ mod tests {
             // MutateLocal tier as classified before the predicate ever runs.
             assert_eq!(classify_tier(&act), IntentTier::MutateLocal);
         }
+    }
+
+    /// F1 (env indirection): interpolation metacharacters (`$`, backtick,
+    /// `%`, quotes) in ANY token keep the command on its approval path, as do
+    /// bare `cd`, `cd -`, and quoted targets the word split cannot see into.
+    #[test]
+    fn interpolated_and_quoted_commands_are_never_project_bounded() {
+        for command in [
+            "cd $HOME && rm -rf Documents",
+            "echo pwned > $HOME/.bashrc",
+            "touch $(echo $HOME)/pwned",
+            "cd %USERPROFILE%",
+            "cd -",
+            "cd",
+            "sh -c 'cd src'", // quote hides the cd target from the scan
+            "echo hi && printf '%s' x",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "interpolation/quote/bare-cd must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// F2 (verb hiding): a destructive or network verb in ANY position or
+    /// segment — not just the first verb — keeps the existing approval path.
+    #[test]
+    fn hidden_destructive_and_network_verbs_are_never_project_bounded() {
+        for command in [
+            "cargo build && rm -rf src",
+            "sudo rm f",
+            "timeout 5 rm f",
+            "env rm",
+            "xargs rm",
+            "find . -delete",
+            "find . -name '*.rs' -delete",
+            "cat a | xargs rm",
+            "cargo build && curl https://example.com",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "hidden verb must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// F3: network facts word list aligned with `SHELL_NETWORK_VERBS` — the
+    /// missing `ncat`/`socat`/`sftp` transport clients are Consequential at
+    /// the tier level too, so they can never take the upgrade.
+    #[test]
+    fn aligned_network_clients_are_consequential() {
+        for (command, args) in [
+            ("ncat", vec!["evil.example", "9000"]),
+            ("socat", vec!["TCP-LISTEN:9000", "EXEC:sh"]),
+            ("sftp", vec!["host:file"]),
+        ] {
+            assert_eq!(
+                tier("shell", serde_json::json!({"command": command, "args": args})),
+                IntentTier::Consequential,
+                "{command} should be Consequential"
+            );
+        }
+    }
+
+    /// F3: interpreter invocations carrying a code flag (`-c`, `-e`, `-m`,
+    /// `-r`) classify Consequential wherever they sit (`sudo`, `env`
+    /// wrappers included), so they can never take the upgrade; an
+    /// interpreter without a code flag stays MutateLocal.
+    #[test]
+    fn interpreter_code_invocations_are_consequential() {
+        for command in [
+            ("python", vec!["-m", "http.server"]),
+            ("python3", vec!["-c", "import os"]),
+            ("node", vec!["-e", "fetch('https://x')"]),
+            ("perl", vec!["-e", "print 1"]),
+            ("ruby", vec!["-e", "puts 1"]),
+            ("env", vec!["python", "-r"]),
+            ("sudo", vec!["node", "-c", "1"]),
+        ] {
+            let input = serde_json::json!({"command": command.0, "args": command.1});
+            assert_eq!(
+                tier("shell", input),
+                IntentTier::Consequential,
+                "{command:?} with a code flag should be Consequential"
+            );
+        }
+        // No code flag: stays MutateLocal — the interpreter verbs are only
+        // consequential when attacker-chosen code rides a flag.
+        assert_eq!(
+            tier("shell", serde_json::json!({"command": "node", "args": ["script.js"]})),
+            IntentTier::MutateLocal
+        );
     }
 
     /// Any doubt keeps the existing approval path: no facts, an outside-root

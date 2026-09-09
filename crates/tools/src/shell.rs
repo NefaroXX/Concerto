@@ -764,9 +764,13 @@ fn resolve_program_in_path(program: &str) -> Option<PathBuf> {
     })
 }
 
-/// Heuristic detection of network-reaching commands (ADR-28 §6), mirroring the
-/// policy engine's `cmd_is_network_op` so the structured `network_requested`
-/// fact agrees with the legacy string scan.
+/// Heuristic detection of network-reaching commands (ADR-28 §6), mirroring
+/// the policy engine's `cmd_is_network_op` (and the intent classifier's
+/// `SHELL_NETWORK_VERBS`) so the structured `network_requested` fact agrees
+/// with the legacy string scan. Word table kept in sync with
+/// `crates/core/src/authorization.rs` — `ncat`, `socat`, and `sftp` added so
+/// e.g. `ncat evil.com 9000` sets the egress fact (F3, security review
+/// 2026-09-09).
 fn command_looks_networked(command: &str, args: &[String]) -> bool {
     let joined =
         if args.is_empty() { command.to_string() } else { format!("{command} {}", args.join(" ")) };
@@ -783,9 +787,22 @@ fn command_looks_networked(command: &str, args: &[String]) -> bool {
     if lower.contains("http://") || lower.contains("https://") || lower.contains("github.com") {
         return true;
     }
-    lower
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| matches!(w, "curl" | "wget" | "ssh" | "scp" | "rsync" | "ftp" | "telnet" | "nc"))
+    lower.split(|c: char| !c.is_alphanumeric()).any(|w| {
+        matches!(
+            w,
+            "curl"
+                | "wget"
+                | "ssh"
+                | "scp"
+                | "rsync"
+                | "ftp"
+                | "sftp"
+                | "telnet"
+                | "nc"
+                | "ncat"
+                | "socat"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1261,6 +1278,18 @@ mod tests {
     fn command_looks_networked_rejects_benign_commands() {
         assert!(!command_looks_networked("echo", &["hello".into()]));
         assert!(!command_looks_networked("ls", &["-la".into()]));
+    }
+
+    // F3 (security review 2026-09-09): the facts word list is aligned with
+    // the policy engine's `SHELL_NETWORK_VERBS` — the previously missing
+    // `ncat`/`socat`/`sftp` transport clients now set the egress fact.
+    #[test]
+    fn command_looks_networked_matches_aligned_transport_clients() {
+        assert!(command_looks_networked("ncat", &["evil.example".into(), "9000".into()]));
+        assert!(command_looks_networked("socat", &["TCP-LISTEN:9000".into()]));
+        assert!(command_looks_networked("sftp", &["host".into()]));
+        // The table was already aligned on `nc`; word-scan, no substring.
+        assert!(command_looks_networked("nc", &["host".into(), "9000".into()]));
     }
 
     #[test]

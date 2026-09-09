@@ -150,6 +150,14 @@ pub(crate) fn repairable_error_failure(tool_name: &str, error: &ToolError) -> Op
 /// `ExecutionFailed` carries (the write-gate rejection envelope and the
 /// executor's wrapped verdict strings). Anything matching is a policy or
 /// approval outcome — never an execution failure a repair turn may coach.
+///
+/// Envelope checks (F8, security review 2026-09-09) run on the TRIMMED
+/// message so a denial wrapped with leading/trailing whitespace cannot
+/// pretend to be an ordinary execution fault. Genuine spawn-permission
+/// faults (EACCES — `permission denied (os error 13)`) are exempted BEFORE
+/// the deny-marker scan: their text contains "denied", but they are real
+/// process faults (F9) and keep their bounded repair turn — without the
+/// exemption the deny scan swallowed them and dropped the repair turn.
 fn is_policy_denial_message(message: &str) -> bool {
     let trimmed = message.trim();
     if trimmed.eq_ignore_ascii_case("approval timed out") {
@@ -157,12 +165,20 @@ fn is_policy_denial_message(message: &str) -> bool {
     }
     // The write-gate rejection envelope produced by gate_proxy.rs /
     // ipc.rs: nothing repairable ever rides it, whatever the inner verdict.
-    if message.starts_with("gate rejected the write") {
+    // Checked on the trimmed text (F8) so a padded envelope is classified
+    // the same as the exact one.
+    if trimmed.starts_with("gate rejected the write") {
         return true;
+    }
+    // Genuine EACCES spawn faults are execution failures, not policy
+    // denials, despite the "denied" substring (F9 exemption). Compared on
+    // the lowercased text.
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.contains("permission denied (os error") {
+        return false;
     }
     const DENIAL_MARKERS: &[&str] =
         &["gatedenied", "requireapproval", "policydenied", "blocked", "denied", "cancelled"];
-    let lowered = trimmed.to_ascii_lowercase();
     DENIAL_MARKERS.iter().any(|marker| lowered.contains(marker))
 }
 
@@ -406,6 +422,48 @@ mod tests {
             assert!(
                 repairable_error_failure(SHELL_TOOL_NAME, &error).is_none(),
                 "denial must never be repaired: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn untrimmed_gate_envelope_is_never_repairable() {
+        // F8 (security review 2026-09-09): the envelope check runs on the
+        // TRIMMED message — a denial padded (either side or both) with
+        // whitespace used to slip past the exact-prefix check and be turned
+        // into a repairable process error, coaching a model around the
+        // gate.
+        for message in [
+            " gate rejected the write (GateDenied): Blocked",
+            "gate rejected the write (GateDenied): Blocked ",
+            "  gate rejected the write (GateDenied): RequireApproval { timeout: 30s }  ",
+            "\n gate rejected the write (GateError): policy evaluation failed",
+        ] {
+            let error = ToolError::ExecutionFailed { message: message.into() };
+            assert!(
+                repairable_error_failure(SHELL_TOOL_NAME, &error).is_none(),
+                "padded gate envelope is never repairable: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eacces_spawn_faults_keep_the_repair_turn() {
+        // F9 exemption (security review 2026-09-09): a genuine EACCES spawn
+        // fault is an execution failure, not a policy denial — the "denied"
+        // substring used to swallow it and drop the repair turn.
+        for message in [
+            "failed to spawn process: Permission denied (os error 13)",
+            "Permission denied (os error 13)",
+            "  Permission denied (os error 13)  ",
+        ] {
+            let error = ToolError::ExecutionFailed { message: message.into() };
+            assert!(
+                matches!(
+                    repairable_error_failure(SHELL_TOOL_NAME, &error),
+                    Some(ShellFailure::ProcessError { .. })
+                ),
+                "EACCES spawn fault stays repairable: {message}"
             );
         }
     }
