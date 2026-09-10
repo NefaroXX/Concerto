@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Smoke runtime recovery:** the single/multi switch now routes (multi +
+  acting → coordinator for every acting outcome); project-bounded shell
+  auto-approves under acting grants via a positive 9-verb allowlist with
+  segment-aware scanning and interpreter exclusion (tiers/denylist/network/
+  plugin gate untouched; `intent_authorized_shell` audit row); repair turns
+  never fire on policy denials (verdict-based, not substring); completion
+  cards and task signals mirror `completion_status` (no default-true);
+  file-change counting reconciled with audited writes; bounded end-reasons
+  persisted for diagnosability.
 - **Evidence spine (ADR-65):** multi-agent runs are grounded in a single
   append-only whiteboard evidence chain — runtime-written tool facts with agent
   attribution, a deterministic workspace-snapshot readiness barrier, safe read
