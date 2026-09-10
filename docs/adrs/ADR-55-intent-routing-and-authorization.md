@@ -926,6 +926,13 @@ project root and no denylist/Consequential/network rule already matched
 (`is_project_bounded_shell`; everything outside that scope keeps the
 existing `shell_requires_approval` approval path). The shell scope hole in
 §Decision 2 remains for anything outside these bounds.
+**Scope amendment (2026-09-10, delegation under Acting grants):** the same Acting grant also covers the
+Coordinator's orchestration/delegation surface — `call_specialist`, the only dispatch tool the
+coordinator's decision loop policy-evaluates — so the run-scoped authorization upgrades its
+otherwise-`un_granted` `RequireApproval` to `Allow` under the distinct, individually auditable
+`intent_authorized_delegation` row. Cause-only-no-effect: this authorizes the dispatch, never the
+specialist's own work — every specialist tool call stays policy+grant-gated, spend/task caps
+still bound the fan-out, and a read-only run denies delegation outright.
 The classifier wrapper remains mounted after the two fast paths (ADR-56 §1)
 and its threshold validation (>= 0.7, no band creation, ADR-56 §4) is
 unchanged — the invariant shift is only *what happens after a high-confidence

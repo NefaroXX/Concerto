@@ -86,6 +86,19 @@ pub const RULE_INTENT_AUTHORIZED: &str = "intent_authorized";
 /// keep the original shared rule.
 pub const RULE_INTENT_AUTHORIZED_SHELL: &str = "intent_authorized_shell";
 
+/// Audit `rule_matched` value when the intent gate upgrades
+/// `RequireApproval` → `Allow` for an ORCHESTRATION/delegation tool call
+/// (`call_specialist`) under an Acting grant (ADR-55 scope amendment,
+/// delegation coverage). Deliberately DISTINCT from [`RULE_INTENT_AUTHORIZED`]
+/// (files/git) and [`RULE_INTENT_AUTHORIZED_SHELL`]: a delegation
+/// auto-approval is its own forensic row — the audit must be able to
+/// reconstruct *which* coordinator dispatched *which* specialist without
+/// conflating it with a filesystem write or a shell command approval. The
+/// upgrade carries no side effect: the dispatched specialist's own tool calls
+/// are still individually policy+grant-gated, and the run's spend/task caps
+/// still bound the fan-out.
+pub const RULE_INTENT_AUTHORIZED_DELEGATION: &str = "intent_authorized_delegation";
+
 /// Audit `rule_matched` value when the intent gate keeps a Consequential-tier
 /// action under `RequireApproval` — blanket grants never cover it.
 pub const RULE_CONSEQUENTIAL: &str = "consequential";
