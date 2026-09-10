@@ -20,7 +20,7 @@ use concerto_core::intent::{RequestedOutcome, RouterOutput, RouterRoute};
 use concerto_core::types::PolicyAction;
 use concerto_core::{
     classify_tier, is_project_bounded_shell, IntentAuthorization, IntentTier, IntentVerdict,
-    LOW_CONFIDENCE_THRESHOLD, RULE_INTENT_AUTHORIZED_SHELL,
+    LOW_CONFIDENCE_THRESHOLD, RULE_INTENT_AUTHORIZED_DELEGATION, RULE_INTENT_AUTHORIZED_SHELL,
 };
 
 /// One granted tool-class scope, bound to the confirmed requested outcome.
@@ -140,7 +140,26 @@ impl IntentAuthorization for SessionIntentAuth {
     /// else keeps the default verdict — the `RequireApproval`
     /// (`shell_requires_approval`) approval path, the hard read-only `Deny`,
     /// and every Consequential/denylist classification are untouched.
+    ///
+    /// ADR-55 delegation scope amendment (2026-09-10): under the same Acting
+    /// grant, the Coordinator's `call_specialist` dispatch is likewise
+    /// upgraded to [`IntentVerdict::Allow`] (`rule =
+    /// "intent_authorized_delegation"` — its own DISTINCT audited row,
+    /// separate from files/git and shell) so the decision loop can delegate
+    /// without an approval the coordinator loop cannot answer. The upgrade
+    /// is deliberate cause-only-no-effect: it authorizes the DISPATCH, never
+    /// the specialist's own work — every specialist tool call is still
+    /// individually policy+grant-gated, spend/task caps still bound the
+    /// fan-out, and the zero-work guard still catches no-op dispatches.
+    /// A read-only run denies dispatch (hard read-only `Deny`), and a run
+    /// without the acting `filesystem` grant keeps `un_granted`.
     fn verdict(&self, action: &PolicyAction<'_>) -> IntentVerdict {
+        if is_orchestration_tool(action.tool_name)
+            && !self.is_read_only()
+            && self.store.covers("filesystem")
+        {
+            return IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED_DELEGATION };
+        }
         if action.tool_name == "shell"
             && !self.is_read_only()
             && self.store.covers("filesystem")
@@ -151,6 +170,23 @@ impl IntentAuthorization for SessionIntentAuth {
         }
         self.default_gate_verdict(action)
     }
+}
+
+/// True when `tool_name` is one of the Coordinator's policy-evaluated
+/// orchestration/delegation tools (ADR-55 delegation scope amendment, 2026-09-10).
+///
+/// Audit (2026-09-10, branch `fix/coordinator-delegation-grant`): the
+/// Coordinator's decision loop offers exactly three tool families —
+/// [`crate::coordinator::CALL_SPECIALIST_TOOL`] (the ONLY one it
+/// policy-evaluates itself, in `handle_call_specialist`), the advisory
+/// `draft_plan` (handled internally by the planner; it never builds a
+/// `PolicyAction` so no gate is ever consulted), and the shared executor's own
+/// tools (fs/git/shell — already covered by the `filesystem`/`git` grants and
+/// the project-bounded `shell` upgrade through the executor's full policy
+/// path). So delegation of specialist dispatch is the only orchestration
+/// surface in the grant gap today.
+fn is_orchestration_tool(tool_name: &str) -> bool {
+    tool_name == crate::coordinator::CALL_SPECIALIST_TOOL
 }
 
 /// The audit `rule_matched` value for a routing path (ADR-55 §5.2).
@@ -1061,5 +1097,122 @@ mod tests {
                 "egress/interpreter command stays Consequential: {command}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-55 delegation scope amendment (2026-09-10): call_specialist
+    // under Acting grants
+    // ------------------------------------------------------------------
+
+    /// A `call_specialist` tool-call input of the shape the coordinator's
+    /// decision loop parses (`CallSpecialistArgs`).
+    fn dispatch_input() -> serde_json::Value {
+        serde_json::json!({"agent_id": "coder", "task": "implement the parser fix"})
+    }
+
+    /// Delegation coverage: an Acting auto-granted run (the exact state the
+    /// live smoke session audited — fs+git granted, read-only intent absent)
+    /// upgrades the coordinator's `call_specialist` dispatch to
+    /// `Allow {..., intent_authorized_delegation}` — its own DISTINCT audited
+    /// row, so the decision loop can delegate without an approval prompt the
+    /// coordinator loop cannot answer (the 30s un_granted timeout fix).
+    #[test]
+    fn acting_grant_allows_call_specialist_delegation() {
+        let (_store, auth) = acting_auth();
+        let input = dispatch_input();
+        let dispatch = action("call_specialist", &input);
+        assert_eq!(
+            auth.verdict(&dispatch),
+            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED_DELEGATION },
+            "an Acting grant covers the coordinator's specialist dispatch"
+        );
+    }
+
+    /// The auto-grant path end-to-end: a confident Execute route auto-grants
+    /// through `apply_intent_gate` (no store/auth manipulation) and the very
+    /// same authorization then allows the dispatch — reproducing the live
+    /// multi-agent failure through the real routing decision.
+    #[test]
+    fn a2_auto_granted_run_can_delegate_to_a_specialist() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+
+        let routing = concerto_core::intent::route("implement the login feature", project_dir());
+        let (effective, confirmation) = apply_intent_gate(&routing, &store, &auth);
+        assert_eq!(effective, RequestedOutcome::Execute);
+        assert_eq!(confirmation, "auto_granted", "premise: the route auto-granted");
+        assert!(!auth.is_read_only());
+
+        let input = dispatch_input();
+        let dispatch = action("call_specialist", &input);
+        assert_eq!(
+            auth.verdict(&dispatch),
+            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED_DELEGATION },
+            "the auto-granted Acting run delegates without prompting"
+        );
+    }
+
+    /// Hard read-only invariant (2d §2, B-1): a ReadOnly-envelope run denies
+    /// delegation outright — never surfaced to the approval sink, so even
+    /// session auto-approve cannot dispatch a specialist.
+    #[test]
+    fn read_only_intent_denies_call_specialist() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+        assert!(auth.is_read_only(), "premise: an ungranted run starts read-only");
+
+        let input = dispatch_input();
+        let dispatch = action("call_specialist", &input);
+        assert_eq!(
+            auth.verdict(&dispatch),
+            IntentVerdict::Deny { rule: RULE_INTENT_READONLY_DENY },
+            "a read-only run never dispatches a specialist"
+        );
+    }
+
+    /// Ungranted Acting shape keeps today's `un_granted` semantics: a
+    /// mutation-capable run WITHOUT the acting `filesystem` grant (no grants
+    /// in the store) does not blanket-allow delegation — the dispatch keeps
+    /// `RequireApproval { un_granted }`, exactly the pre-amendment verdict.
+    #[test]
+    fn acting_without_grants_keeps_call_specialist_un_granted() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = SessionIntentAuth::new(store.clone());
+        auth.set_read_only(false); // acting shape, but zero grants
+        assert!(store.is_empty(), "premise: ungranted");
+
+        let input = dispatch_input();
+        let dispatch = action("call_specialist", &input);
+        assert_eq!(
+            auth.verdict(&dispatch),
+            IntentVerdict::RequireApproval { rule: RULE_UN_GRANTED },
+            "delegation coverage rides the acting GRANT, not just the acting flag"
+        );
+    }
+
+    /// The upgrade is scoped to the orchestration tool: an un-granted,
+    /// non-orchestration MutateLocal tool (e.g. an `mcp:*` namespaced call)
+    /// in the same Acting run keeps `RequireApproval { un_granted }` — the
+    /// delegation amendment NEVER blanket-allows unknown tools.
+    #[test]
+    fn non_orchestration_ungranted_tools_keep_un_granted_under_acting() {
+        let (_store, auth) = acting_auth();
+        let mcp_input = serde_json::json!({});
+        let mcp_tool = action("mcp:server:tool", &mcp_input);
+        assert_eq!(
+            auth.verdict(&mcp_tool),
+            IntentVerdict::RequireApproval { rule: RULE_UN_GRANTED },
+            "an mcp:* call stays under approval — no delegation-class blanket"
+        );
+    }
+
+    /// Delegation is never classified Observe/Consequential: the dispatched
+    /// specialist runs to completion under the coordinator's engine, and the
+    /// upgrade never touches the read-only flag or the tiers.
+    #[test]
+    fn call_specialist_rides_mutate_local_tier() {
+        let input = dispatch_input();
+        let dispatch = action("call_specialist", &input);
+        assert_eq!(classify_tier(&dispatch), IntentTier::MutateLocal);
     }
 }

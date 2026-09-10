@@ -57,8 +57,9 @@ pub use intent::{
 // `Condition::IntentAuthorized`, and the audit rule-name vocabulary.
 pub use authorization::{
     classify_tier, is_project_bounded_shell, IntentAuthorization, IntentTier, IntentVerdict,
-    RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_AUTHORIZED_SHELL,
-    RULE_INTENT_READONLY_DENY, RULE_OBSERVE, RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
+    RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_AUTHORIZED_DELEGATION,
+    RULE_INTENT_AUTHORIZED_SHELL, RULE_INTENT_READONLY_DENY, RULE_OBSERVE,
+    RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
 };
 
 // Re-export Phase 4 memory types from the dedicated module.
