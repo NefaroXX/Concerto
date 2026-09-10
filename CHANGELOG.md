@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Coordinator delegation grant:** `call_specialist` is covered under Acting
+  grants (`intent_authorized_delegation` audit row) — the coordinator can
+  delegate unattended; ReadOnly still denies, ungranted still prompts, and
+  specialists remain individually gated with caps and zero-work guard intact.
 - **Smoke runtime recovery:** the single/multi switch now routes (multi +
   acting → coordinator for every acting outcome); project-bounded shell
   auto-approves under acting grants via a positive 9-verb allowlist with
