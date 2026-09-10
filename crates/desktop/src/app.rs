@@ -898,12 +898,13 @@ impl App {
                     }
                 }
                 if page == Page::OrchestrationStudio {
-                    // ADR-58/59 (rewritten) Slice 2 (first-run bootstrap): auto-seed the
-                    // orchestration roster into the PROJECT config before the
-                    // Studio first renders, so the blueprint surface is active
-                    // from the very first open — no splash, no manual init.
-                    // Idempotent: a config that already owns its roster is
-                    // never touched.
+                    // ADR-58/59 (rewritten) Slice 2 (first-run bootstrap), AMENDED
+                    // (global-only orchestration): auto-seed the orchestration
+                    // roster into the GLOBAL config before the Studio first
+                    // renders, so the blueprint surface is active from the very
+                    // first open — no splash, no manual init. Idempotent: a
+                    // config that already owns its roster is never touched, and
+                    // no project `.concerto.toml` is ever created here.
                     self.ensure_orchestration_seeded();
                     // Do not replace an in-progress Studio draft when the user
                     // briefly visits another page. Saved state may be reloaded
@@ -1423,15 +1424,18 @@ impl App {
                 self.terminal.update(msg, &self.current_theme).map(Message::Terminal)
             }
             Message::OrchestrationStudio(msg) => {
-                // ADR-58/59 (rewritten) Slice 2 (single-arm Save): `SaveOrchestration`
-                // persists the Studio's editable blueprint via
-                // `persist_orchestration`, which routes by the loaded
-                // selection's source (inline → rewrite in the config, include
-                // → guarded include write, name → materialize inline into the
-                // project config), validates, writes, and reloads — never
-                // navigating, never switching the surface, and never touching
-                // the global config. There is no init path anymore: the roster
-                // auto-seeds on Studio open.
+                // ADR-58/59 (rewritten) Slice 2 (single-arm Save), AMENDED
+                // (global-only orchestration): `SaveOrchestration` persists
+                // the Studio's editable blueprint via `persist_orchestration`,
+                // which writes to the GLOBAL config (include → guarded include
+                // write, name/inline → materialize inline into the global
+                // config) + the roster to the global config, validates,
+                // writes, and reloads — never navigating, never switching the
+                // surface, and never creating a project `.concerto.toml`
+                // (existing project orchestration keeps loading as-is, but a
+                // Save is refused while a project file still declares
+                // `[orchestration]`). There is no init path anymore: the
+                // roster auto-seeds globally on Studio open.
                 let persist =
                     matches!(msg, views::orchestration_studio::StudioMessage::SaveOrchestration);
                 let task = self.orchestration_studio.update(msg);
@@ -2400,56 +2404,68 @@ impl App {
         )
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (first-run bootstrap + orphan self-heal):
-    /// ensure the PROJECT config materializes the orchestration roster before
-    /// the Studio first renders, so the blueprint surface — and the searchable
-    /// agent library — is active from the very first open. No splash, no
-    /// manual init.
+    /// ADR-58/59 (rewritten) Slice 2, AMENDED (global-only orchestration,
+    /// smoke follow-up round 2 2026-09): orchestration is persisted to the
+    /// GLOBAL config only, and the auto-seed never creates a project config
+    /// file — creating a file is an explicit user save, never a side effect
+    /// of opening the Studio. Back-compat: existing project `.concerto.toml`
+    /// files keep loading/overriding exactly as before (the load path is
+    /// untouched), and a project that already owns its roster (the raw
+    /// `[multi_agent.custom_agents]` key is present there) skips the seed
+    /// entirely instead of duplicating it into the global layer.
     ///
-    /// Seeding runs ONLY when the roster was never materialized: the raw-Toml
-    /// signal is the `[multi_agent.custom_agents]` key being present in the
-    /// file, even as `[]` (= all agents deleted) — "key present" means owned
-    /// and deletions stick, so nothing is ever written back over it. Three
-    /// shapes:
+    /// Seeding runs ONLY against the global config file and ONLY when its
+    /// roster was never materialized. Three global-file shapes:
     ///
-    /// 1. **Key present** (`roster_materialized`) → strict no-op: whether the
-    ///    array is empty (all agents deleted) or populated, the config owns
-    ///    its roster and the seed is skipped.
-    /// 2. **Orphan shape** — `[orchestration]` present (the Studio's stage
-    ///    cards staff from the blueprint) but the roster key never
-    ///    materialized: `seed_agent_roster_only` writes ONLY
-    ///    `[multi_agent.custom_agents]`, preserving the existing — possibly
-    ///    user-edited — `[orchestration]` table byte-for-byte, so the Studio's
-    ///    searchable library matches the blueprint's staffing without
-    ///    clobbering the blueprint.
-    /// 3. **Fresh project** — no config at all (or none loaded): the full
-    ///    `seed_orchestration_roster` writes `[orchestration]` standard-inline
-    ///    + the five agents, unchanged first-run bootstrap.
+    /// 1. **Key present** (`roster_materialized` on the global file) →
+    ///    strict no-op: whether the array is empty (all agents deleted) or
+    ///    populated, the global config owns its roster and the seed is
+    ///    skipped.
+    /// 2. Orphan shape — `[orchestration]` present in the global file but
+    ///    the roster key never materialized: `seed_agent_roster_only`
+    ///    writes ONLY `[multi_agent.custom_agents]` into the global file,
+    ///    preserving the existing — possibly user-edited — `[orchestration]`
+    ///    table byte-for-byte.
+    /// 3. Fresh — no global orchestration at all: the full
+    ///    `seed_orchestration_roster` writes `[orchestration]`
+    ///    standard-inline + the five agents, unchanged first-run bootstrap.
     ///
-    /// A `None` config (fresh project with no file) is still handed to the
-    /// seed: the writers create the file when missing, and a genuinely broken
-    /// file makes `roster_materialized` report owned so the seed is never
-    /// attempted over it (`config_broken` already surfaces dirty config
-    /// elsewhere). After seeding, state re-derives from disk so the first
-    /// render already resolves the seeded blueprint.
+    /// A broken global file makes `roster_materialized` report owned so the
+    /// seed is never attempted over it (`config_broken` already surfaces
+    /// dirty config elsewhere). After seeding, state re-derives from disk so
+    /// the first render already resolves the seeded blueprint.
     fn ensure_orchestration_seeded(&mut self) {
-        let config_path = self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        // Raw-file ownership test: the `custom_agents` key exists in the TOML
-        // (even `[]` = every agent deleted). "Key present" means owned —
-        // deletions stick and nothing is ever written.
+        // A project config that owns the roster is authoritative for this
+        // project (and keeps loading as today) — never write the global seed
+        // on top of it.
+        let project_config =
+            self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        if concerto_config::roster_materialized(&project_config) {
+            return;
+        }
+        let Some(config_path) = concerto_config::default_config_path() else {
+            return;
+        };
+        // Raw-file ownership test on the global layer: the `custom_agents`
+        // key exists in the TOML (even `[]` = every agent deleted). "Key
+        // present" means owned — deletions stick and nothing is ever written.
         if concerto_config::roster_materialized(&config_path) {
             return;
         }
-        // Orphan shape: `[orchestration]` present but the roster was never
-        // materialized. Seed ONLY the agents so the searchable library matches
-        // the blueprint's staffing; the existing (possibly user-edited)
-        // `[orchestration]` table is preserved byte-for-byte. A failed seed
+        // Orphan shape (global `[orchestration]` present, roster never
+        // materialized) seeds ONLY the agents so the searchable library
+        // matches the blueprint's staffing; the existing (possibly
+        // user-edited) `[orchestration]` table is preserved byte-for-byte.
+        // The raw presence signal avoids re-parsing the merged config — the
+        // orphan decision must key on the GLOBAL file only. A failed seed
         // leaves the previous file at the target intact.
-        if self.config.as_ref().is_some_and(|config| config.orchestration.is_some()) {
-            if concerto_config::seed_agent_roster_only(&config_path).is_err() {
-                return;
-            }
-        } else if concerto_config::seed_orchestration_roster(&config_path).is_err() {
+        let global_has_orchestration = concerto_config::orchestration_declared(&config_path);
+        let seeded = if global_has_orchestration {
+            concerto_config::seed_agent_roster_only(&config_path)
+        } else {
+            concerto_config::seed_orchestration_roster(&config_path)
+        };
+        if seeded.is_err() {
             // A failed seed leaves the previous file at the target intact;
             // nothing to reconcile then. Broken config is surfaced elsewhere.
             return;
@@ -2457,10 +2473,22 @@ impl App {
         self.reconcile_config_from_reload();
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save): persist the Studio's editable
-    /// [`Blueprint`] by the active selection's source, then reload so App
-    /// state re-derives from the fresh file (the watcher equality
-    /// short-circuit makes the reload a no-op rebuild when nothing moved).
+    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save), AMENDED (global-only
+    /// orchestration, smoke follow-up round 2 2026-09): the Studio persists
+    /// the blueprint and the agent roster to the GLOBAL config file
+    /// (`default_config_path()`), never `<project>/.concerto.toml`. Creating
+    /// that file is an explicit user save, and orchestration is global-only
+    /// going forward; the load path is untouched (existing project
+    /// `.concerto.toml` files with orchestration sections keep
+    /// loading/overriding exactly as today).
+    ///
+    /// While a project config still DECLARES `[orchestration]`, the inline
+    /// save is refused with the draft kept: writing the fresher selection to
+    /// the global file would leave the stale project-layer selection
+    /// merged on top of it (figment layers project over global) and the
+    /// exactly-one load seam would reject the mixed selection. The include
+    /// path is unaffected — it writes the include file the selection already
+    /// loads from, so no project-layer conflict can arise.
     ///
     /// The generic guards run before routing — the draft is kept and nothing
     /// is written when either fails:
@@ -2468,23 +2496,23 @@ impl App {
     /// 1. **Validation** — the UI already disables Save while the draft is
     ///    invalid; this belt-and-braces check guards stale queued messages.
     /// 2. **No editable blueprint** — nothing to write (defensive).
+    /// 3. **Project-layer conflict** — a project `.concerto.toml` carrying
+    ///    `[orchestration]` blocks the inline save (see above).
     ///
     /// Then, by selection source (exactly one of name/include/inline is
     /// guaranteed by `BlueprintSelection`):
     ///
-    /// - **inline** → rewrite the blueprint back into the project config's
-    ///   `[orchestration].blueprint.inline` (`save_inline_blueprint`,
-    ///   merge-aware, atomic).
     /// - **include** → the guarded include write (`persist_include_blueprint`,
     ///   target-shadow + unparseable guards), the only path that touches a
     ///   blueprint file.
-    /// - **name** → materialize the edited blueprint inline into the project
-    ///   config. The catalog is seed-only: once the user edits, the config
-    ///   owns the blueprint (the dangling `name` selector is removed so the
-    ///   selection stays exactly-one). Covers a defensively-absent
-    ///   `[orchestration]` too.
+    /// - **name** (materialize), **inline**, or a defensively-absent
+    ///   `[orchestration]` → write the blueprint inline into the global
+    ///   config's `[orchestration].blueprint.inline` (`save_inline_blueprint`,
+    ///   merge-aware, atomic).
     ///
-    /// Never navigates and never switches the surface (Slice 2).
+    /// The agent roster always goes to the global config (`save_agent_roster`
+    /// after the blueprint write succeeds). Never navigates and never
+    /// switches the surface (Slice 2).
     fn persist_orchestration(&mut self) -> Result<(), String> {
         let Some(blueprint) = self.orchestration_studio.blueprint() else {
             return Err("no editable blueprint loaded; nothing was written".to_string());
@@ -2501,7 +2529,23 @@ impl App {
             .and_then(|config| config.orchestration.as_ref())
             .map(|orchestration| &orchestration.blueprint);
 
-        let config_path = self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        // Conflict guard: a project config that still declares
+        // `[orchestration]` owns its selection until the user moves or
+        // removes it — we never silently delete project data on save.
+        let project_config =
+            self.project_dir.clone().join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        if !matches!(selection, Some(selection) if selection.include.is_some())
+            && concerto_config::orchestration_declared(&project_config)
+        {
+            return Err(format!(
+                "the project config '{}' still declares an [orchestration] selection; \
+                 orchestration is saved to the global config only — move that section \
+                 into the global config or remove it from the project file first",
+                project_config.display()
+            ));
+        }
+        let config_path = concerto_config::default_config_path()
+            .ok_or_else(|| "no global config path available; nothing was written".to_string())?;
         match selection {
             // The blueprint lives in the include file the selection
             // references: the guarded include write, then reload.
@@ -4309,22 +4353,19 @@ mod tests {
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        // Global config: schema only — must stay untouched. Project dir is
+        // Global config: schema only — the seed lands here. Project dir is
         // empty: no config file, no include file (a brand-new project).
         let global_dir = dir.path().join("concerto");
         std::fs::create_dir_all(&global_dir).expect("create global config dir");
         let global_config_path = global_dir.join("config.toml");
         std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
-        let global_before = std::fs::read_to_string(&global_config_path).expect("read global");
         let project_dir = dir.path().join("project");
         std::fs::create_dir_all(&project_dir).expect("create project dir");
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
-        // The persisted project registry (data dir) may already point at a
-        // seeded project on this machine; force the fresh-project shape so
-        // `ensure_orchestration_seeded` must really write (the doc contract:
-        // a `None` config is still handed to the seed).
+        // Force the no-roster shape (global has no materialized roster) so
+        // `ensure_orchestration_seeded` must really write.
         app.config = None;
         // The first Studio open is exactly what triggers the auto-seed.
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
@@ -4335,9 +4376,9 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
-        // The seed landed in the PROJECT config layer.
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        let raw = std::fs::read_to_string(&project_config).expect("project config read back");
+        // The seed landed in the GLOBAL config layer (global-only
+        // orchestration — never a project file).
+        let raw = std::fs::read_to_string(&global_config_path).expect("global config read back");
         assert!(raw.contains("[orchestration]"), "roster section written\n{raw}");
         assert!(
             raw.contains("blueprint = { inline = {") && raw.contains("name = \"standard\""),
@@ -4348,9 +4389,12 @@ mod tests {
             5,
             "five seeded agents expected\n{raw}"
         );
-        // The global config is never rewritten by the seed.
-        let global_after = std::fs::read_to_string(&global_config_path).expect("global read back");
-        assert_eq!(global_before, global_after, "the global config must stay untouched");
+        // No project config file may be created by the seed — creating a
+        // file is an explicit user save only.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the seed must never create a project .concerto.toml"
+        );
         // No include file is created — the seed is inline, not include-based.
         assert!(
             !project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE).exists(),
@@ -4406,9 +4450,10 @@ mod tests {
         assert!(app.config_broken, "startup config fallback must surface via config_broken");
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (orphan contract): when the raw file
-    /// carries the `custom_agents` key — even as `[]`, meaning every agent was
-    /// deleted — the auto-seed is a strict no-op: nothing is written and the
+    /// ADR-58/59 (rewritten) Slice 2 (orphan contract), AMENDED (global-only):
+    /// when the GLOBAL config owns its roster — the raw file carries the
+    /// `custom_agents` key, even as `[]` meaning every agent was deleted —
+    /// the auto-seed is a strict no-op: nothing is written and the global
     /// file stays byte-identical ("key present" = owned; deletions stick).
     #[test]
     fn ensure_orchestration_seeded_is_a_noop_when_key_present_even_empty() {
@@ -4445,16 +4490,24 @@ custom_agents = []
         );
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (orphan self-heal): a config carrying
-    /// `[orchestration]` (a custom blueprint) but NO materialized `custom_agents`
-    /// key is the orphan shape — the auto-seed writes ONLY the five seed
-    /// agents under `[multi_agent.custom_agents]` and preserves the existing
-    /// orchestration blueprint text unchanged, so the Studio's searchable
-    /// library matches the blueprint's staffing.
+    /// ADR-58/59 (rewritten) Slice 2 (orphan self-heal), AMENDED (global-only
+    /// orchestration): a GLOBAL config carrying `[orchestration]` (a custom
+    /// blueprint) but NO materialized `custom_agents` key is the orphan
+    /// shape — the auto-seed writes ONLY the five seed agents under
+    /// `[multi_agent.custom_agents]` of the global config and preserves the
+    /// existing orchestration blueprint text unchanged, so the Studio's
+    /// searchable library matches the blueprint's staffing. The project
+    /// directory stays untouched (no project file is created).
     #[test]
     fn ensure_orchestration_seeded_self_heals_the_orphan_shape() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let config_path = global_dir.join("config.toml");
         let content = r#"schema_version = 7
 
 [orchestration]
@@ -4465,15 +4518,20 @@ name = "custom-blueprint"
 description = "keep me"
 "#;
         std::fs::write(&config_path, content).expect("seed orphan-shape config");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
 
         let (mut app, _) = App::new();
-        app.project_dir = dir.path().to_path_buf();
-        app.config = Some(AppConfig {
-            orchestration: Some(concerto_config::OrchestrationConfig::default()),
-            ..AppConfig::default()
-        });
+        app.project_dir = project_dir.clone();
+        app.reconcile_config_from_reload();
 
         app.ensure_orchestration_seeded();
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
 
         let after = std::fs::read_to_string(&config_path).expect("read back");
         // The agents-only seed preserves the existing orchestration blueprint.
@@ -4490,17 +4548,62 @@ description = "keep me"
         for id in ["architect", "researcher", "coder", "reviewer", "validator"] {
             assert!(after.contains(&format!("id = \"{id}\"")), "seed agent {id} missing\n{after}");
         }
+        // The seed never creates a project config file.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the seed must never create a project .concerto.toml\n"
+        );
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, name source): a config whose
-    /// selection is a bare catalog `name` (the code-catalog is seed-only) is
-    /// materialized — Save writes the edited blueprint inline into the
-    /// PROJECT config, the dangling `name` selector is removed (exactly-one
-    /// selection), the global `config.toml` stays untouched, and a full
-    /// reload consumes the EDITS (the B1 property: the runtime reads what
-    /// Save wrote, not the catalog).
+    /// Back-compat seed no-op: when a PROJECT config owns its roster (the
+    /// raw `custom_agents` key is present there), the auto-seed is skipped
+    /// entirely — the project keeps being authoritative for itself (its
+    /// orchestration keeps loading as today) and neither the project file
+    /// nor the global config is written.
     #[test]
-    fn save_materializes_a_name_selection_inline_into_the_project_config() {
+    fn seed_is_skipped_and_global_untouched_when_the_project_owns_the_roster() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_config = dir.path().join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        let content = r#"# sentinel comment
+schema_version = 7
+
+[orchestration]
+schema_version = 1
+
+[multi_agent]
+custom_agents = []
+"#;
+        std::fs::write(&project_config, content).expect("seed owned-roster config");
+        let before = std::fs::read_to_string(&project_config).expect("read before");
+
+        let (mut app, _) = App::new();
+        app.project_dir = dir.path().to_path_buf();
+        app.config = Some(AppConfig {
+            orchestration: Some(concerto_config::OrchestrationConfig::default()),
+            ..AppConfig::default()
+        });
+        let owned = app.config.as_ref().and_then(|config| config.orchestration.as_ref()).cloned();
+
+        app.ensure_orchestration_seeded();
+
+        let after = std::fs::read_to_string(&project_config).expect("read back");
+        assert_eq!(after, before, "an owned roster (even empty) must never trigger a write");
+        assert_eq!(
+            app.config.as_ref().and_then(|config| config.orchestration.as_ref()),
+            owned.as_ref(),
+            "the owned orchestration selection is left untouched"
+        );
+    }
+
+    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, name source), AMENDED
+    /// (global-only orchestration): a selection that is a bare catalog
+    /// `name` (the code-catalog is seed-only) is materialized — Save writes
+    /// the edited blueprint inline into the GLOBAL config, the dangling
+    /// `name` selector is removed (exactly-one selection), the project
+    /// directory stays file-free, and a full reload consumes the EDITS
+    /// (the B1 property: the runtime reads what Save wrote, not the catalog).
+    #[test]
+    fn save_materializes_a_name_selection_inline_into_the_global_config() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let previous = std::env::var_os("XDG_CONFIG_HOME");
@@ -4509,14 +4612,9 @@ description = "keep me"
         std::fs::create_dir_all(dir.path().join("concerto")).expect("create global config dir");
         let global_config_path = dir.path().join("concerto").join("config.toml");
         std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
-        let global_before = std::fs::read_to_string(&global_config_path).expect("read global");
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).expect("create project dir");
-        // A bare name-based selection in the project layer (catalog shape).
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
+        // A bare name-based selection in the global layer (catalog shape).
         concerto_config::save_blueprint_selection(
-            &project_config,
+            &global_config_path,
             &concerto_config::BlueprintSelection {
                 name: Some("standard".to_string()),
                 include: None,
@@ -4524,6 +4622,8 @@ description = "keep me"
             },
         )
         .expect("seed name selection");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
@@ -4547,6 +4647,13 @@ description = "keep me"
             crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
         ));
 
+        // All app operations stay under the XDG redirect — whole-config
+        // persistence paths serialize the app's in-memory global config, and
+        // running them against the real machine config would leak test state
+        // there. The env is restored only after every app call below.
+        app.reconcile_config_from_reload();
+        let reloaded = app.config.clone().expect("config after reload");
+
         // Env restored before assertions so a panic cannot leak the redirect.
         match previous {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
@@ -4554,16 +4661,17 @@ description = "keep me"
         }
 
         assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
-        let after = std::fs::read_to_string(&project_config).expect("project config read back");
+        let after = std::fs::read_to_string(&global_config_path).expect("global config read back");
         assert!(after.contains("inline = {"), "save must write the blueprint inline\n{after}");
-        let global_after = std::fs::read_to_string(&global_config_path).expect("global read back");
-        assert_eq!(global_before, global_after, "the global config must stay untouched");
+        // Save is global-only: no project config file may appear.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "creating a project file is an explicit user save, not a Save side effect"
+        );
 
         // The materialized selection is exactly-one (inline) — the load seam
         // rejects any dangling sibling selector, so a successful reload is
         // itself the proof the `name` selector was removed.
-        app.reconcile_config_from_reload();
-        let reloaded = app.config.clone().expect("config after reload");
         let selection = reloaded.orchestration.as_ref().expect("[orchestration] present");
         assert!(selection.blueprint.name.is_none(), "the name selector must be removed");
         assert!(selection.blueprint.include.is_none(), "no include selector may appear");
@@ -4579,9 +4687,78 @@ description = "keep me"
         );
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, guard): a validation-invalid draft is
-    /// rejected on the inline path too — nothing is written, the draft is
-    /// kept, and the failure is surfaced (studio error + error toast).
+    /// Global-only Save conflict guard: while a project `.concerto.toml`
+    /// still declares `[orchestration]`, the inline save is refused (draft
+    /// kept, NOTHING written) — writing the fresher selection to the global
+    /// file would leave the stale project selection merged on top and the
+    /// exactly-one load seam would reject the mixed selection. Project
+    /// orchestration data is never silently deleted by a save.
+    #[test]
+    fn save_is_refused_when_the_project_config_still_declares_orchestration() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        std::fs::create_dir_all(dir.path().join("concerto")).expect("create global config dir");
+        let global_config_path = dir.path().join("concerto").join("config.toml");
+        std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
+        let global_before = std::fs::read_to_string(&global_config_path).expect("read global");
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
+        concerto_config::save_blueprint_selection(
+            &project_config,
+            &concerto_config::BlueprintSelection {
+                name: Some("standard".to_string()),
+                include: None,
+                inline: None,
+            },
+        )
+        .expect("seed project name selection");
+        let project_before = std::fs::read_to_string(&project_config).expect("read project");
+
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        app.reconcile_config_from_reload();
+        let config = app.config.clone().expect("config loaded after reconcile");
+        app.orchestration_studio.load_from_config(&config);
+        let _ = app.orchestration_studio.update(
+            crate::views::orchestration_studio::StudioMessage::StageLabelEdited(
+                0,
+                "planning".into(),
+            ),
+        );
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
+        ));
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        // The save is refused with the failure surfaced, nothing written.
+        assert!(
+            app.orchestration_studio.save_error.is_some(),
+            "the save conflict must surface on the studio"
+        );
+        assert!(app.toasts.has_toasts(), "the save conflict must surface as a toast");
+        let global_after = std::fs::read_to_string(&global_config_path).expect("read global");
+        assert_eq!(global_before, global_after, "the global config must stay untouched");
+        let project_after = std::fs::read_to_string(&project_config).expect("read project");
+        assert_eq!(project_before, project_after, "the project config must stay untouched");
+    }
+
+    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, guard), AMENDED
+    /// (global-only): a validation-invalid draft is rejected on the inline
+    /// path too — nothing is written, the draft is kept, and the failure is
+    /// surfaced (studio error + error toast). The auto-seed that ran on the
+    /// Studio open wrote the GLOBAL config; the project directory must stay
+    /// file-free after the failed save.
     #[test]
     fn save_rejects_an_invalid_draft_on_the_inline_path() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -4597,14 +4774,15 @@ description = "keep me"
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
-        // Same fresh-project shape as the seed matrix (see the first-open
-        // test): the machine's persisted registry must not pre-own a roster,
-        // or the seed short-circuits and no project file is written.
+        // Same shape as the seed matrix (see the first-open test): the
+        // machine's persisted registry must not pre-own a roster, or the
+        // seed short-circuits.
         app.config = None;
-        // First Studio open auto-seeds the inline roster.
+        // First Studio open auto-seeds the inline roster — globally now.
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        let before = std::fs::read_to_string(&project_config).expect("read project config before");
+        let global_config_path = dir.path().join("concerto").join("config.toml");
+        let before =
+            std::fs::read_to_string(&global_config_path).expect("read global config before");
 
         // Force a rulebook violation the UI would flag: an empty stage tag
         // (rule (g), "stage tag must be non-empty").
@@ -4625,8 +4803,12 @@ description = "keep me"
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
-        let after = std::fs::read_to_string(&project_config).expect("read project config after");
+        let after = std::fs::read_to_string(&global_config_path).expect("read global config after");
         assert_eq!(before, after, "an invalid draft must never reach the config");
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the seed and a failed save must never create a project config"
+        );
         assert!(
             app.orchestration_studio.save_error.is_some(),
             "the save failure must surface on the studio"
@@ -4634,12 +4816,14 @@ description = "keep me"
         assert!(app.toasts.has_toasts(), "the save failure must surface as a toast");
     }
 
-    /// ADR-58/59 (rewritten) Slice 3: a valid Save writes the agent roster —
-    /// the Studio's authoritative agent list (mirrors of the seeds plus user
-    /// agents) — into `[multi_agent.custom_agents]` of the PROJECT config,
-    /// atomically and merge-aware. The roster has no rulebook of its own, so
-    /// it is gated on the same blueprint validation that gates the blueprint
-    /// write (an invalid draft never reaches the config at all — covered by
+    /// ADR-58/59 (rewritten) Slice 3, AMENDED (global-only): a valid Save
+    /// writes the agent roster — the Studio's authoritative agent list
+    /// (mirrors of the seeds plus user agents) — into
+    /// `[multi_agent.custom_agents]` of the GLOBAL config, atomically and
+    /// merge-aware, while the project directory stays file-free. The roster
+    /// has no rulebook of its own, so it is gated on the same blueprint
+    /// validation that gates the blueprint write (an invalid draft never
+    /// reaches the config at all — covered by
     /// `save_rejects_an_invalid_draft_on_the_inline_path`).
     #[test]
     fn save_writes_the_agent_roster_alongside_the_blueprint() {
@@ -4656,11 +4840,11 @@ description = "keep me"
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
-        // Same fresh-project shape as the seed matrix: the machine's persisted
-        // registry must not pre-own a roster, or the seed short-circuits.
+        // Same shape as the seed matrix: the machine's persisted registry
+        // must not pre-own a roster, or the seed short-circuits.
         app.config = None;
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        let global_config_path = dir.path().join("concerto").join("config.toml");
 
         // Add a user agent to the roster (mirrors Add/Rename in the library).
         let _ = app.orchestration_studio.update(
@@ -4675,17 +4859,11 @@ description = "keep me"
             crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
         ));
 
-        // Env restored before assertions so a panic cannot leak the redirect.
-        match previous {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-
         assert!(
             !app.orchestration_studio.unsaved,
             "a successful save marks the studio clean (blueprint + roster)"
         );
-        let after = std::fs::read_to_string(&project_config).expect("project config read back");
+        let after = std::fs::read_to_string(&global_config_path).expect("global config read back");
         assert!(
             after.contains("[[multi_agent.custom_agents]]"),
             "the roster table must be written\n{after}"
@@ -4694,10 +4872,22 @@ description = "keep me"
             after.contains("Planner"),
             "the added roster agent must appear in [[multi_agent.custom_agents]]\n{after}"
         );
-        // The roster owns the config (owns_agent_roster): a reload keeps it.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the save must never create a project .concerto.toml"
+        );
+        // The roster owns the config (owns_agent_roster): a reload keeps it —
+        // performed under the redirect (see the round-trip test note) so the
+        // reconcile consumes the redirected global file.
         app.reconcile_config_from_reload();
         let reloaded = app.config.clone().expect("config after reload");
-        assert!(reloaded.owns_agent_roster(), "the project config must own the agent roster");
+
+        // Env restored after every app operation, before the final assertions.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(reloaded.owns_agent_roster(), "the global config must own the agent roster");
     }
 
     /// Slice 4a (spec §7): the Settings Relationships-hide flag is a pure
@@ -5636,8 +5826,19 @@ description = "keep me"
     /// Navigation to Studio page works.
     #[test]
     fn navigate_to_studio_changes_page() {
+        // Redirect XDG before App::new: navigating to the Studio auto-seeds
+        // the GLOBAL orchestration config now (global-only seeding), so this
+        // test must never touch the machine's real config file.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
         let (mut app, _) = App::new();
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         assert_eq!(app.page, Page::OrchestrationStudio);
     }
 
@@ -6611,8 +6812,9 @@ description = "keep me"
     // config on success.
 
     /// Save on the include source writes the edited blueprint to the project
-    /// include file — and only there: the global `config.toml` is never
-    /// rewritten (the legacy wholesale persist is gone).
+    /// include file — and only there — plus (global-only roster, AMENDED
+    /// smoke follow-up round 2) the agent roster into the global config: the
+    /// inline `[orchestration]` blueprint NEVER reaches the global file.
     #[test]
     fn save_on_blueprint_path_writes_the_edited_blueprint_to_the_project_include() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -6620,13 +6822,12 @@ description = "keep me"
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        // Global config file: schema only — must stay byte-identical.
+        // Global config file: schema only — the roster save lands here, but
+        // the inline blueprint must never.
         let global_dir = dir.path().join("concerto");
         std::fs::create_dir_all(&global_dir).expect("create global config dir");
         let global_config_path = global_dir.join("config.toml");
         std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
-        let global_before =
-            std::fs::read_to_string(&global_config_path).expect("read global config");
 
         // Project include + project-layer selection pointing at it.
         let project_dir = dir.path().join("project");
@@ -6653,13 +6854,21 @@ description = "keep me"
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
 
-        // The Studio draft: edit the first stage's label, then Save.
+        // The Studio draft: edit the first stage's label, add a roster agent
+        // (a roster edit alongside the blueprint — exactly one agent list is
+        // persisted), then Save.
         let _ = app.orchestration_studio.update(
             crate::views::orchestration_studio::StudioMessage::StageLabelEdited(
                 0,
                 "planning".into(),
             ),
         );
+        let _ = app.orchestration_studio.update(
+            crate::views::orchestration_studio::StudioMessage::NewAgentName("Planner".into()),
+        );
+        let _ = app
+            .orchestration_studio
+            .update(crate::views::orchestration_studio::StudioMessage::AddAgent);
         let _ = app.update(Message::OrchestrationStudio(
             crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
         ));
@@ -6683,9 +6892,14 @@ description = "keep me"
         assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
         let global_after =
             std::fs::read_to_string(&global_config_path).expect("global config read back");
-        assert_eq!(
-            global_before, global_after,
-            "the global config must stay untouched — no [orchestration] persist\n{global_after}"
+        assert!(
+            !global_after.contains("[orchestration]"),
+            "the inline blueprint must never reach the global file (global-only roster \
+             aside)\n{global_after}"
+        );
+        assert!(
+            global_after.contains("[[multi_agent.custom_agents]]"),
+            "the agent roster is written to the global config (global-only)\n{global_after}"
         );
     }
 
@@ -6884,7 +7098,7 @@ description = "keep me"
     fn default_auto_seed_then_save_then_reload_round_trips_the_edited_blueprint() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let mut previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
         let global_dir = dir.path().join("concerto");
@@ -6900,13 +7114,11 @@ description = "keep me"
         // must really write for this round-trip to prove anything.
         app.config = None;
         // First-run bootstrap: opening the Studio seeds the roster inline.
+        // All app operations stay under the XDG redirect — whole-config
+        // persistence paths serialize the app's in-memory global config, so
+        // any app call against the real machine config would leak test state
+        // there. The env is restored only before the final assertions.
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-
-        // Env restored before assertions so a panic cannot leak the redirect.
-        match previous {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
 
         // The auto-seed activates the blueprint path through an INLINE
         // selection (the Slice-2 default shape).
@@ -6938,21 +7150,37 @@ description = "keep me"
         ));
         assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
 
-        // Save rewrote the inline in the PROJECT config — not an include file.
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        let raw_project = std::fs::read_to_string(&project_config).expect("project config read");
+        // Save rewrote the inline in the GLOBAL config (global-only
+        // orchestration); the project directory stays file-free — not an
+        // include file either. Reload the fresh file while the redirect is
+        // still active — whole-config persistence paths serialize the app's
+        // in-memory global config, and running them against the real machine
+        // config would leak test state there.
         assert!(
-            raw_project.contains("inline = {"),
-            "save must write the edited blueprint inline\n{raw_project}"
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the save must never create a project .concerto.toml"
         );
         assert!(
             !project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE).exists(),
             "no include file is created on the default inline path"
         );
+        let global_config_path = dir.path().join("concerto").join("config.toml");
+        let raw_global = std::fs::read_to_string(&global_config_path).expect("global config read");
+        assert!(
+            raw_global.contains("inline = {"),
+            "save must write the edited blueprint inline into the global file\n{raw_global}"
+        );
 
         // A full reload from disk must now load the EDITS — the B1 property:
         // the runtime consumes the inline Save wrote, not an unedited default.
         app.reconcile_config_from_reload();
+
+        // Env restored after every app operation, before the final assertions.
+        let previous = previous.take();
+        match &previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         let reloaded = app.config.clone().expect("config after reload");
         assert!(
             reloaded.orchestration.as_ref().is_some(),

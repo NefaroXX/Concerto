@@ -38,8 +38,8 @@ pub use managed::{
 };
 pub use projects::ProjectRegistry;
 pub use saving::{
-    roster_materialized, save_agent_roster, save_blueprint, save_inline_blueprint,
-    seed_agent_roster_only, seed_orchestration_roster,
+    orchestration_declared, roster_materialized, save_agent_roster, save_blueprint,
+    save_inline_blueprint, seed_agent_roster_only, seed_orchestration_roster,
 };
 pub use schema::{
     builtin_agent_seeds, parse_tool_schema_mode, AgentCapabilities, AgentModelAssignment,
