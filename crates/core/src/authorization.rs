@@ -267,10 +267,12 @@ const SHELL_DESTRUCTIVE_VERBS: &[&str] =
     &["rm", "rmdir", "shred", "dd", "mkfs", "truncate", "unlink"];
 
 // Security-review hardening of the project-bounded shell upgrade (2026-09-09,
-// F1/F2/F3). These tables feed BOTH the Consequential classifier and the
-// [`is_project_bounded_shell`] upgrade predicate: a token here keeps the
-// command under its existing approval path, wherever it appears in the
-// command text — not just as the first verb.
+// F1/F2/F3; recast 2026-09-10). These tables feed BOTH the Consequential
+// classifier and (via the recast's positive allowlist, see
+// [`SHELL_UPGRADE_ALLOWLIST`]) the [`is_project_bounded_shell`] upgrade
+// predicate: a token at the tier level keeps the command under its existing
+// approval path wherever it appears in the command text — not just as the
+// first verb.
 
 /// Env-indirection metacharacters (F1). ANY token carrying one means the
 /// command text the classifier sees is NOT the text the shell will run:
@@ -279,19 +281,27 @@ const SHELL_DESTRUCTIVE_VERBS: &[&str] =
 /// whitespace split. Never eligible for auto-approval.
 const SHELL_INTERPOLATION_CHARS: &[char] = &['$', '`', '%', '\'', '"'];
 
-/// Interpreter verbs (F3): with a code flag (`-c`, `-e`, `-m`, `-r`) they run
-/// attacker-chosen code no token scan can see into (network calls, escapes
-/// assembled at runtime). Such invocations are Consequential everywhere and
-/// never take the project-bounded upgrade.
-const SHELL_INTERPRETERS: &[&str] = &["python", "python3", "node", "perl", "ruby"];
+/// Interpreter verbs (F3, extended by the 2026-09-10 security recast): with
+/// a code flag (`-c`, `-e`, `-m`, `-r`) they run attacker-chosen code no
+/// token scan can see into (network calls, escapes assembled at runtime).
+/// Such invocations are Consequential everywhere and never take the
+/// project-bounded upgrade. Under the recast the upgrade predicate goes
+/// further: these verbs NEVER upgrade in ANY form — including the plain
+/// script-file form (`python pwn.py` executes model-authored code whose
+/// network/write effects are invisible to every text scan). No exception.
+const SHELL_INTERPRETERS: &[&str] =
+    &["python", "python3", "node", "perl", "ruby", "php", "lua", "rscript", "powershell", "pwsh"];
+
+/// Interpreter shells (upgrade predicate only, 2026-09-10): shell-family
+/// interpreters (`sh pwn.sh`, `bash pwn.sh`). Kept OUT of
+/// [`SHELL_INTERPRETERS`] so the tier classifier's code-flag rule stays
+/// exactly as shipped (`bash -c "cd src && cargo build"` remains
+/// MutateLocal); here they simply never upgrade.
+const SHELL_INTERPRETER_INVOKERS: &[&str] = &["sh", "bash", "zsh", "dash", "ash", "fish"];
 
 /// Interpreter code flags: any argument starting with one of these prefixes
 /// counts (exact forms and glued forms like `-e'print(1)'` alike).
 const INTERPRETER_CODE_FLAGS: &[&str] = &["-c", "-e", "-m", "-r"];
-
-/// Destructive single flags that make a scan-innocent verb destructive
-/// (`find . -delete` deletes; the `find` verb alone is read-only).
-const DESTRUCTIVE_FLAGS: &[&str] = &["-delete"];
 
 /// Shell verbs that are themselves network-egress clients (v1 set).
 const SHELL_NETWORK_VERBS: &[&str] =
@@ -572,17 +582,18 @@ fn is_grantable_class(action: &PolicyAction<'_>) -> bool {
     matches!(action.tool_name, "filesystem" | "git")
 }
 
-/// ADR-55 shell scope amendment (2026-09-09): is `action` a project-bounded
-/// `shell` command whose policy verdict may be auto-approved under an
-/// Acting grant, exactly like in-scope filesystem writes?
+/// ADR-55 shell scope amendment (2026-09-10 security recast): is `action`
+/// a project-bounded `shell` command whose policy verdict may be
+/// auto-approved under an Acting grant, exactly like in-scope filesystem
+/// writes?
 ///
-/// Conservative and pure — the upgrade predicate, not a bypass: every check
-/// below must hold, and any doubt answers `false` (the command keeps its
-/// existing approval path), because an upgrade may only ever flip
-/// `RequireApproval` → `Allow`, never a `Deny` (§Decision 2). The EXISTING
-/// denylist/Consequential/network/writer rules still run first in the
-/// engine; this predicate only gates the shell arm otherwise headed to
-/// [`RULE_SHELL_REQUIRES_APPROVAL`].
+/// Conservative and pure — the upgrade predicate, NOT a bypass: it may only
+/// ever explain why a command should upgrade, never why to widen one. Any
+/// doubt answers `false` (the command keeps its existing approval path),
+/// because an upgrade may only ever flip `RequireApproval` → `Allow`, never
+/// a `Deny` (§Decision 2). The EXISTING denylist/Consequential/network/
+/// writer rules still run first in the engine; this predicate only gates the
+/// shell arm otherwise headed to [`RULE_SHELL_REQUIRES_APPROVAL`].
 ///
 /// Required:
 /// - the tool is `shell` **and** structured `CommandPolicyFacts` came from
@@ -594,19 +605,36 @@ fn is_grantable_class(action: &PolicyAction<'_>) -> bool {
 ///   project root at facts time (cwd containment);
 /// - the facts did not request network egress (belt with the Consequential
 ///   network classification, which already precedes this predicate);
-/// - the command text carries no escape: no absolute path, `~`-pivot or
-///   `..` climb, no workspace-escaping `cd`/`pushd`, and no workspace-
-///   escaping write-redirect target. Relative in-root tokens resolve
-///   against the in-root working directory, so they stay in project.
-/// - the command text carries no env indirection (F1): no `$`, backtick,
-///   `%`, or quote character in ANY token — expansion and quoted content
-///   mean the scanned text is not the executed text, so such commands keep
-///   their approval path;
-/// - no unbounded `cd`/`pushd`: bare `cd`, `cd -`, and any target that
-///   cannot be proven to resolve inside the project are rejected (F1);
-/// - NO token or separator segment names a destructive/network verb or a
-///   destructive find-style flag, and no interpreter invocation carries a
-///   code flag (F2/F3) — verb hiding past the first verb is scanned out;
+/// - **segment independence**: the command text is first split into
+///   shell-list segments on `&&`, `||`, `;`, unspaced and spaced `|`, `&`
+///   (background), and newlines — both between spaced tokens and glued
+///   inside one (`cargo build&&rm -rf src` splits into `cargo build` and
+///   `rm -rf src`). EVERY segment is then evaluated independently, and the
+///   command upgrades only if **every** segment proves it:
+///   - a bare `cd`/`pushd` at a segment boundary or end-of-segment is
+///     UNBOUNDED (`cd && touch pwned` pivots to `$HOME`) — dead by
+///     construction;
+///   - the segment's leading verb must be on the positive allowlist
+///     ([`SHELL_UPGRADE_ALLOWLIST`], `cd`/`pushd` with their own bounded
+///     shape) — the prior negative destructive/network scan is replaced
+///     wholesale: anything not allowlisted (`sudo`, `rm`, `find`, `xargs`,
+///     `env`, `make`, `cmake`, `npm`, `tee`, interpreters, package
+///     managers) keeps the approval path;
+///   - interpreter verbs ([`SHELL_INTERPRETERS`] +
+///     [`SHELL_INTERPRETER_INVOKERS`], plus any `python*` spelling) never
+///     upgrade — code-flag (`php -r '…'`) and script-file (`python pwn.py`)
+///     forms alike execute model-authored code whose effects are invisible
+///     to text scanning;
+///   - [F1] no token in the segment carries an interpolation metachar
+///     (`$`, backtick, `%`, quotes) — expansion and quoted content mean the
+///     scanned text is not the executed text;
+///   - the segment carries no write-redirect (any redirect writes a file;
+///     writes go through the filesystem tools, not the upgrade);
+///   - no unbounded `cd`/`pushd` anywhere in the segment: only a relative,
+///     interpolation-free, `..`-free single target is accepted (`cd src`);
+///     bare `cd`, `cd -`, and anything else unprovable are rejected;
+///   - no token resolves outside the session project root: absolute path,
+///     `~`-pivot, `..` climb, backslash/UNC or drive-colon form.
 /// - the audit row the upgrade produces is `intent_authorized_shell`
 ///   ([`RULE_INTENT_AUTHORIZED_SHELL`], F4), distinct from the filesystem
 ///   row, so shell auto-approvals are individually auditable.
@@ -630,55 +658,114 @@ pub fn is_project_bounded_shell(action: &PolicyAction<'_>) -> bool {
     // check below (escape/redirect/`cd` scans are defined over symbolic
     // characters that lowercase does not change).
     let lower = text.to_ascii_lowercase();
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    // F1 (env indirection): `$`, backticks, `%`, and quotes in ANY token
-    // mean the text the scanner sees is NOT the text the shell runs — env
+    // Segment independence: the command upgrades ONLY if every
+    // separator-delimited segment independently proves project bounds. An
+    // iteration (not `.all(fn)`): the segment iterator borrows `lower`.
+    let mut all_segments_bounded = true;
+    for segment in command_segments(&lower) {
+        if !segment_is_project_bounded(segment) {
+            all_segments_bounded = false;
+            break;
+        }
+    }
+    all_segments_bounded
+}
+
+/// Shell list-separator characters: `&`, `|`, `;`, and newlines. Splitting on
+/// each character (not just the spaced operators) is deliberately stricter —
+/// it also cuts GLUED separators out of a single token (`cargo build&&rm`,
+/// `ls|rm`; glued `&&`, `||`, spaced `;`, lone `&` background, FD-redirection
+/// continuation). A false cut costs at most an approval prompt; a missed
+/// separator would let a second segment hide its verb from the allowlist.
+const SHELL_SEGMENT_SEPARATORS: &[char] = &['&', '|', ';', '\n', '\r'];
+
+/// Yields the shell command's list segments: the text split on every
+/// [`SHELL_SEGMENT_SEPARATORS`] character, so command lists the shell will
+/// sequence (`a && b`, `a || b`, `a ; b`, `a | b`, `a & b`, newline lists)
+/// become independent segments — spaced or glued alike.
+fn command_segments(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c| SHELL_SEGMENT_SEPARATORS.contains(&c))
+}
+
+/// The positive allowlist a segment's leading verb must name for the shell
+/// upgrade to apply (2026-09-10): provably project-bounded verbs only.
+///
+/// Per-verb argument bounds (applied to the whole segment):
+/// - `cargo` / `rustc`: build/test/lint/format/compile of workspace sources —
+///   every argument must resolve in-root and metachar-free (`-p concerto-core`,
+///   `--lib`, `-- -n` pass; `--target-dir /x` is an absolute-token escape and
+///   keeps approval);
+/// - `mkdir` / `touch` / `mv` / `cp`: the bounded general-purpose mutation
+///   set shell MutateLocal already carries — in-root paths only;
+/// - `echo` / `ls` / `cat`: read/report verbs (and `echo` without a
+///   redirect — any redirect token fails the segment before this point).
+///
+/// Everything else is NOT allowlisted and keeps the existing approval path:
+/// `rm`/`rmdir`/`unlink` (destructive table, tier-Consequential or prompted),
+/// `ln` (symlinks pivot out of the root through the link, so the link target
+/// and its dereference cannot both be proven in-root), `git` (subcommand
+/// surface too broad to bound by verb: `branch -D`, `checkout` discarding
+/// edits, `config` writes; global flags like `--work-tree`/`-C` add a second
+/// root-scoping dialect — git mutations go through the purpose-built
+/// `git` tool, which is grant-reviewed in scope), `find`, `xargs`, `env`,
+/// `make`, `cmake`, `npm`/`pip`/… (runners and package managers), each
+/// interpreter verb, and every unknown verb — all keep approval.
+const SHELL_UPGRADE_ALLOWLIST: &[&str] =
+    &["cargo", "rustc", "mkdir", "touch", "mv", "cp", "echo", "ls", "cat"];
+
+/// True when one whitespace-tokenized [`command_segments`] segment proves it
+/// stays inside the project root: `false` (keep approval) for anything that
+/// cannot positively be proven bounded. An empty segment runs nothing.
+fn segment_is_project_bounded(segment: &str) -> bool {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    if tokens.is_empty() {
+        // `a ; ; b`: an empty segment between separators runs nothing extra
+        // beyond what the surviving tokens already scanned as.
+        return true;
+    }
+    // F1 (env indirection): interpolation metacharacters in any token mean
+    // the text the scanner sees is NOT the text the shell runs — env
     // expansion (`$HOME`, `${HOME}`, `$(…)`, `%USERPROFILE%`) and quoted
     // argument content escape the token scan. Never auto-approved.
     if tokens.iter().any(|token| token.chars().any(|c| SHELL_INTERPOLATION_CHARS.contains(&c))) {
         return false;
     }
-    // F1 (`cd` bounds): a bare `cd` (~$HOME in bash), `cd -`, or any `cd`/
-    // `pushd` target that cannot be proven to resolve inside the project —
-    // containment today only rejects explicit escapes, but the upgrade must
-    // not allow an unproven `cd` target through.
-    if has_unbounded_cd(&tokens) {
+    // Any write-redirect (`>`, `>>`, `2>`, ...) writes a file — the smoke
+    // allowlist does not carry redirect forms at all (file creation belongs
+    // to the filesystem tools).
+    if has_write_redirect(&tokens) {
         return false;
     }
-    // F2/F3 (verb hiding): every token and separator segment is scanned
-    // against the destructive/network/interpreter tables — not just the
-    // first verb (`cargo build && rm -rf src`, `sudo rm f`, `xargs rm`,
-    // `find . -delete`, `timeout 5 rm f`, `python -m http.server`).
-    if command_carries_restricted_verb(&tokens) {
+    // Executing an absolute verb path (or a drive/UNC verb) keeps approval —
+    // the basename allowlist alone cannot prove the executable sits inside
+    // the project.
+    if is_escaping_shell_token(tokens[0]) {
         return false;
     }
-    if tokens.iter().any(|token| is_escaping_shell_token(token)) {
-        // A path-like token that resolves outside the project root (or could
-        // not be proven to stay inside): keep the existing approval path.
+    let verb = verb_basename(tokens[0]);
+    // Interpreter bound (F3, recast): interpreter invocations never upgrade —
+    // code-flag OR plain script-file form. `python pwn.py` runs model-authored
+    // code with effects no text scan can see.
+    if is_upgrade_interpreter(verb) {
         return false;
     }
-    if has_escaping_redirect(&tokens) || has_escaping_cd(&tokens) {
-        // The bounded redirect/`cd` scans already classify workspace escapes
-        // as Consequential (the tier check precedes this call); re-checked
-        // here so the predicate stays standalone-true only for in-project
-        // commands.
+    // `cd`/`pushd`: the ONLY bounded shape is a single relative, metachar-
+    // free, `..`-free target resolving against the in-project working
+    // directory (`cd src`). Nothing else (`cd` bare → `$HOME`, `cd -` →
+    // unknown previous dir, `cd /abs`, `cd ..`) can be proven in-project.
+    if matches!(verb, "cd" | "pushd") {
+        return tokens.len() == 2 && tokens[1] != "-" && !is_escaping_shell_token(tokens[1]);
+    }
+    // Positive allowlist: a leading verb not in the table keeps approval —
+    // this is what replaces the negative destructive/network verb scan.
+    if !SHELL_UPGRADE_ALLOWLIST.contains(&verb) {
         return false;
     }
-    true
-}
-
-/// True when `token` could name a target outside the project root: an
-/// absolute path, a home pivot, or ANY `..`-containing token (`..`, `../x`,
-/// `x/../y`, backslash variants, glued forms). Deliberately coarser than the
-/// execution-time containment canon — a false *positive* here only costs an
-/// approval prompt; a false negative would upgrade an escape.
-fn is_escaping_shell_token(token: &str) -> bool {
-    token.starts_with('/')
-        || token.starts_with('\\')
-        || token.starts_with('~')
-        || token.contains("..")
-        || token.contains('\\')
-        || token.contains(':')
+    // Every argument (and any other token) must resolve inside the project:
+    // no absolute path, `~`, `..` climb, backslash, or drive/UNC colon form.
+    // Belt-and-braces: an unbounded `cd`/`pushd` appearing beyond the verb
+    // position still rejects the segment.
+    tokens.iter().all(|token| !is_escaping_shell_token(token)) && !has_unbounded_cd(&tokens)
 }
 
 /// F1: true when `tokens` contains a `cd`/`pushd` whose target cannot be
@@ -704,6 +791,31 @@ fn has_unbounded_cd(tokens: &[&str]) -> bool {
     })
 }
 
+/// F3 (recast): true when `verb` names ANY code-execution interpreter —
+/// [`SHELL_INTERPRETERS`] (extended per the 2026-09-10 review), the
+/// shell-family invokers [`SHELL_INTERPRETER_INVOKERS`], or any `python*`
+/// dialect (`python3.11`). The upgrade predicate NEVER upgrades these,
+/// code-flag or script-file form alike.
+fn is_upgrade_interpreter(verb: &str) -> bool {
+    SHELL_INTERPRETERS.contains(&verb)
+        || SHELL_INTERPRETER_INVOKERS.contains(&verb)
+        || verb.starts_with("python")
+}
+
+/// True when `token` could name a target outside the project root: an
+/// absolute path, a home pivot, or ANY `..`-containing token (`..`, `../x`,
+/// `x/../y`, backslash variants, glued forms). Deliberately coarser than the
+/// execution-time containment canon — a false *positive* here only costs an
+/// approval prompt; a false negative would upgrade an escape.
+fn is_escaping_shell_token(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with('\\')
+        || token.starts_with('~')
+        || token.contains("..")
+        || token.contains('\\')
+        || token.contains(':')
+}
+
 /// F3: true when `tokens` contains an interpreter verb AND a code flag
 /// (`-c`, `-e`, `-m`, `-r`, exact or glued). Position-independent: a
 /// wrapper verb (`sudo python -c …`, `env python -m …`) is still an
@@ -713,25 +825,6 @@ fn is_interpreter_code_invocation(tokens: &[&str]) -> bool {
         && tokens
             .iter()
             .any(|token| INTERPRETER_CODE_FLAGS.iter().any(|flag| token.starts_with(flag)))
-}
-
-/// F2/F3: true when ANY token in `tokens` — not just the first verb, and
-/// across every `;`/`&&`/`||`/`|`-separated segment — names a destructive
-/// file verb, a network transport client, a destructive find-style flag, or
-/// is an interpreter invocation carrying a code flag. Verb hiding
-/// (`cargo build && rm -rf src`, `sudo rm f`, `timeout 5 rm f`, `xargs rm`,
-/// `env rm`, `find . -delete`) can no longer clear the upgrade predicate.
-/// Chosen over a positive build-verb allowlist because it reuses the
-/// tables this module already maintains, keeps the existing smoke verbs
-/// (`touch`, `mkdir`, `mv`, …) upgradable without enumerating them, and a
-/// false positive only costs the existing approval prompt.
-fn command_carries_restricted_verb(tokens: &[&str]) -> bool {
-    tokens.iter().copied().any(|token| {
-        let verb = verb_basename(token);
-        SHELL_DESTRUCTIVE_VERBS.contains(&verb)
-            || SHELL_NETWORK_VERBS.contains(&verb)
-            || DESTRUCTIVE_FLAGS.contains(&verb)
-    }) || is_interpreter_code_invocation(tokens)
 }
 
 /// Read the tool input's `operation` field, if any.
@@ -1592,6 +1685,150 @@ mod tests {
             assert!(
                 !is_project_bounded_shell(&act),
                 "escape must keep the approval path: {command}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Security recast (2026-09-10): segment-aware positive allowlist
+    // ------------------------------------------------------------------
+
+    /// Recast: a bare `cd`/`pushd` hitting a segment separator
+    /// (`cd && …` — including the GLUED `cd&&touch` form the whitespace
+    /// split used to hide behind) or the end of a segment is UNBOUNDED —
+    /// it pivots the working directory to `$HOME`, outside any
+    /// project-scoped run. The old whitespace-only tokenization let
+    /// `cd && touch pwned` through (`cd` scanned with target `&&`).
+    #[test]
+    fn recast_bare_cd_at_segment_boundaries_is_never_project_bounded() {
+        for command in [
+            "cd && touch pwned",
+            "cd&&touch pwned",          // glued separator
+            "cd; echo pwned > .bashrc", // bare cd then a redirect descend
+            "cd&&echo pwned > .bashrc",
+            "cd||touch pwned",
+            "cd",
+            "cd -",
+            "pushd&&ls",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "bare cd at a segment boundary must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// Recast: glued/separated compound commands — the second segment's
+    /// destructive verb must kill the upgrade no matter how glued the
+    /// separators are (`cargo build&&rm -rf src` used to hide `rm` inside
+    /// the token `build&&rm`).
+    #[test]
+    fn recast_glued_compound_commands_with_hiding_verbs_are_never_project_bounded() {
+        for command in [
+            "cargo build && rm -rf src",
+            "cargo build&&rm -rf src",
+            "cargo build; rm -rf src",
+            "cargo build;rm -rf src",
+            "ls|rm",
+            "ls | rm",
+            "cargo build&&rm -rf src&&echo ok",
+            "cargo build&&rm -rf src;rmdir target",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "hidden verb in any glued segment must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// Recast: interpreter execution NEVER upgrades — the plain
+    /// script-file form (`python pwn.py`) executes model-authored code
+    /// whose network/out-of-root effects no text scan can see. Spaced,
+    /// glued, and either-position forms alike; the shell-family
+    /// invokers (`sh`/`bash`/…) are covered too.
+    #[test]
+    fn recast_interpreter_script_execution_is_never_project_bounded() {
+        for command in [
+            "python pwn.py",
+            "python3 pwn.py",
+            "python3.11 pwn.py",
+            "node pwn.js",
+            "perl x.pl",
+            "ruby x.rb",
+            "php script.php",
+            "lua script.lua",
+            "Rscript x.R",
+            "powershell script.ps1",
+            "pwsh script.ps1",
+            "bash pwn.sh",
+            "sh pwn.sh",
+            "python pwn.py && ls",
+            "ls && python pwn.py",
+            "ls||python pwn.py",
+            "ls|python pwn.py",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "interpreter execution must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// Recast: verbs outside the positive allowlist keep the existing
+    /// approval path — interpreters with code flags, runners, package
+    /// managers, exporters, and symlink pivots.
+    #[test]
+    fn recast_non_allowlisted_verbs_keep_the_approval_path() {
+        for command in [
+            "make install",
+            "cmake --install build",
+            "cmake --install build;ls",
+            "sudo make install",
+            "powershell -c Remove-Item src",
+            "php -r 'print 1'",
+            "python -m http.server",
+            "node -e fetch pwn",
+            "xargs rm",
+            "env cargo build",
+            "find . -delete",
+            "ln -s /etc/passwd here",
+            "npm install x",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "non-allowlisted verb must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// Recast: the smoke-path controls STILL upgrade — the bounded verbs
+    /// of the fixture set, in plain and compound form.
+    #[test]
+    fn recast_smoke_path_controls_still_upgrade() {
+        for command in [
+            "cargo build",
+            "cargo test",
+            "cargo test --lib",
+            "mkdir src",
+            "cd src && cargo build",
+            "cd src && cargo test --lib",
+            "ls",
+            "ls -la src",
+            "cat Cargo.toml",
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                is_project_bounded_shell(&act),
+                "smoke-path command must remain project-bounded: {command}"
             );
         }
     }
