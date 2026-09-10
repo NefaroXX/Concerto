@@ -1407,13 +1407,18 @@ impl AgentLoop {
         }
     }
 
-    /// Phase 8: Run evaluation (test suite) on modified files.
+    /// Phase 8: Run evaluation (test suite) on modified files. The harness
+    /// root is resolved from the run's own write evidence — nearest
+    /// manifest-bearing ancestor of the modified files under the project
+    /// root — so a project built in a subdirectory validates there, with the
+    /// session root as the fallback when nothing better exists.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
         cancel: CancellationToken,
     ) -> Option<concerto_core::types::EvalResult> {
-        self.eval.run_scoped(files_modified, cancel).await.ok()
+        let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files_modified);
+        self.eval.run_scoped_in_dir(&eval_dir, files_modified, cancel).await.ok()
     }
 
     /// Phase 9: Build an `AgentOutput` summarising the current progress

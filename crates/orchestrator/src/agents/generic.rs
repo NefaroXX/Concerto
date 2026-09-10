@@ -1269,7 +1269,7 @@ impl GenericSpecialistAgent {
     async fn run_eval(
         &self,
         task: &SubTask,
-        _context: AgentContext,
+        context: AgentContext,
         cancel: CancellationToken,
     ) -> Result<AgentRunResult, OrchestratorError> {
         let agent_id = self.id.as_str();
@@ -1308,8 +1308,31 @@ impl GenericSpecialistAgent {
 
         let start = std::time::Instant::now();
 
+        // Validation-root resolution from run evidence: prefer the manifest-
+        // bearing directory nearest the files the run actually wrote, falling
+        // back to the session project root when nothing better exists (no
+        // manifest anywhere keeps the honest Unknown failure). The engine's
+        // own configured directory is only redirected when the evidence
+        // actually selects a DIFFERENT directory — an empty evidence set, or
+        // a manifest resolved back at the session root, keeps the engine as
+        // constructed.
+        let evidence_files: Vec<camino::Utf8PathBuf> = context
+            .previous_results
+            .iter()
+            .flat_map(|result| result.files_modified.iter().cloned())
+            .collect();
+        let session_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+            .unwrap_or_default();
+        let resolved =
+            EvalEngine::resolve_manifest_root(&context.session.project_dir, &evidence_files);
+        let eval_dir = (!evidence_files.is_empty() && resolved != session_root.as_std_path())
+            .then_some(resolved);
+
         // Delegate to EvalEngine — no LLM call needed
-        let eval_result = match eval.run(cancel.clone()).await {
+        let eval_result = match match &eval_dir {
+            Some(dir) => eval.run_in_dir(dir, cancel.clone()).await,
+            None => eval.run(cancel.clone()).await,
+        } {
             Ok(result) => result,
             Err(e) => {
                 let latency_ms = start.elapsed().as_millis() as u64;
@@ -4421,6 +4444,99 @@ mod tests {
         assert!(result.summary.contains("runner=make"));
         assert!(result.files_modified.is_empty());
         assert_eq!(result.tool_call_count, 0);
+    }
+
+    /// AgentContext whose session root differs from the engine's configured
+    /// directory (the smoke-session shape: the run built in a subdirectory).
+    fn ctx_at(project_dir: std::path::PathBuf) -> AgentContext {
+        AgentContext {
+            session: concerto_core::types::SessionContext {
+                session_id: concerto_core::ids::Ulid::new(),
+                project_id: ProjectId("test".into()),
+                project_dir,
+                user_prefs: Default::default(),
+            },
+            previous_results: Vec::new(),
+            ..ctx()
+        }
+    }
+
+    /// A pre-existing coder result providing the run's write evidence.
+    fn evidence_result(relative_paths: &[&str]) -> AgentRunResult {
+        AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            outcome: AgentOutcome::Success,
+            summary: "wrote files".into(),
+            files_modified: relative_paths.iter().map(camino::Utf8PathBuf::from).collect(),
+            tool_call_count: 1,
+            cost_usd: 0.0,
+            latency_ms: 0,
+            provider: "test".into(),
+            model: "test-model".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+        }
+    }
+
+    /// The validator resolves its working root from the run's write
+    /// evidence: a manifest inside a build subdirectory (“create a new Cargo
+    /// project” smoke regression) wins over the manifest-free session root,
+    /// where detection used to fail twice with `Unknown("no config file
+    /// found")` despite a fully built and verified project.
+    #[tokio::test]
+    async fn eval_mode_resolves_manifest_root_from_run_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let subdir = root.path().join("hexview");
+        std::fs::create_dir_all(subdir.join("src")).unwrap();
+        std::fs::write(subdir.join("Makefile"), "test:\n\t@echo \"all passed\"\n").unwrap();
+        // The engine is constructed at the (manifest-free) session root,
+        // exactly like the production runtime wiring.
+        let agent = eval_agent(
+            Some(Arc::new(EvalEngine::new(root.path()))),
+            PromptSections { output_format: "Pass/Fail report".into(), ..Default::default() },
+        );
+        let mut context = ctx_at(root.path().to_path_buf());
+        context.previous_results =
+            vec![evidence_result(&["hexview/src/main.rs", "hexview/Cargo.toml"])];
+
+        let result = agent
+            .run(&eval_task(), context, "test-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert!(
+            result.summary.contains("runner=make"),
+            "validation must run inside the subdirectory manifest root: {}",
+            result.summary
+        );
+    }
+
+    /// No manifest anywhere keeps the fallback root — the run still fails
+    /// honestly with the unchanged message instead of silently passing.
+    #[tokio::test]
+    async fn eval_mode_without_manifest_falls_back_to_session_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("loose.rs"), "fn main() {}\n").unwrap();
+        let agent = eval_agent(
+            Some(Arc::new(EvalEngine::new(root.path()))),
+            PromptSections { output_format: "Pass/Fail report".into(), ..Default::default() },
+        );
+        let mut context = ctx_at(root.path().to_path_buf());
+        context.previous_results = vec![evidence_result(&["loose.rs"])];
+
+        let result = agent
+            .run(&eval_task(), context, "test-model", CancellationToken::new())
+            .await
+            .expect("a failed validation is a clean AgentOutcome, not an Err");
+
+        assert!(matches!(result.outcome, AgentOutcome::Failed { .. }));
+        assert!(
+            result.summary.contains("no config file found"),
+            "the honest Unknown failure must surface unchanged: {}",
+            result.summary
+        );
     }
 
     #[tokio::test]
