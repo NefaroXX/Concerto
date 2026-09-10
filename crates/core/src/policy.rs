@@ -666,7 +666,9 @@ fn action_is_network_op(action: &PolicyAction<'_>) -> bool {
 /// Heuristic detection of network-reaching shell commands under the
 /// `NetworkIsolated` sandbox profile. Matches explicit transport verbs and
 /// URL schemes; avoids bare substring scans (`http`, `api.`) that flagged
-/// local files such as `my_http_notes.txt`.
+/// local files such as `my_http_notes.txt`. Word table kept in sync with
+/// `crates/core/src/authorization.rs`'s `SHELL_NETWORK_VERBS` — `sftp`,
+/// `ncat`, and `socat` added (F3, security review 2026-09-09).
 fn cmd_is_network_op(cmd: &str) -> bool {
     let lower = cmd.to_ascii_lowercase();
     if lower.starts_with("curl ")
@@ -681,9 +683,22 @@ fn cmd_is_network_op(cmd: &str) -> bool {
     if lower.contains("http://") || lower.contains("https://") || lower.contains("github.com") {
         return true;
     }
-    lower
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| matches!(w, "curl" | "wget" | "ssh" | "scp" | "rsync" | "ftp" | "telnet" | "nc"))
+    lower.split(|c: char| !c.is_alphanumeric()).any(|w| {
+        matches!(
+            w,
+            "curl"
+                | "wget"
+                | "ssh"
+                | "scp"
+                | "rsync"
+                | "ftp"
+                | "sftp"
+                | "telnet"
+                | "nc"
+                | "ncat"
+                | "socat"
+        )
+    })
 }
 
 #[async_trait]
