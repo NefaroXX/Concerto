@@ -522,16 +522,19 @@ fn is_read_only_verb_invocation(verb: &str, trailing: &[&str]) -> bool {
 }
 
 /// True when `tokens` contains a write-redirect: an exact
-/// [`WRITE_REDIRECT_OPERATORS`] member (`>`, `>>`, `2>`, ...) or a glued form
-/// (`2>/tmp/out`, `>out`). Mirrors the operator scan in
-/// [`has_escaping_redirect`] minus the escape check: any redirect target means
-/// the invocation writes.
+/// [`WRITE_REDIRECT_OPERATORS`] member (`>`, `>>`, `2>`, ...), a glued form
+/// (`2>/tmp/out`, `>out`), or a `>` at any NON-INITIAL position of a token
+/// (`pwned>~/.bashrc`, `a>>b`) — mirroring the execution-time containment
+/// canon (`containment.rs scan_redirects`' `rfind('>')` scan). Mirrors the
+/// operator scan in [`has_escaping_redirect`] minus the escape check: any
+/// redirect target means the invocation writes.
 fn has_write_redirect(tokens: &[&str]) -> bool {
     tokens.iter().any(|token| {
         WRITE_REDIRECT_OPERATORS.contains(token)
             || WRITE_REDIRECT_OPERATORS
                 .iter()
                 .any(|op| token.strip_prefix(*op).is_some_and(|rest| !rest.is_empty()))
+            || token.rfind('>').is_some_and(|idx| idx > 0)
     })
 }
 
@@ -740,6 +743,15 @@ fn segment_is_project_bounded(segment: &str) -> bool {
     // the basename allowlist alone cannot prove the executable sits inside
     // the project.
     if is_escaping_shell_token(tokens[0]) {
+        return false;
+    }
+    // The allowlist matches a BARE verb only: a relative verb path
+    // (`./cargo`, `target/debug/ls`) is a DIFFERENT executable from the
+    // PATH-resolved allowlisted name its basename reduction would mask, so
+    // the reduction must not launder it onto [`SHELL_UPGRADE_ALLOWLIST`].
+    // (`../bin/cargo`-class climbs are already rejected above by the
+    // `..`-containment scan.)
+    if tokens[0].contains('/') {
         return false;
     }
     let verb = verb_basename(tokens[0]);
@@ -1805,6 +1817,66 @@ mod tests {
             assert!(
                 !is_project_bounded_shell(&act),
                 "non-allowlisted verb must keep the approval path: {command}"
+            );
+        }
+    }
+
+    /// Recast follow-up (glued redirect): a `>` at any NON-INITIAL position
+    /// of a token is still a write redirect — `echo pwned>~/.bashrc` writes
+    /// `~/.bashrc` (mirroring the containment canon, `rfind('>')`), yet the
+    /// operator-prefix-only scan used to miss the word-glued form. In-root
+    /// forms stay governed by the existing no-redirect rule (asserted, not
+    /// loosened): the allowlist carries no redirect shapes at all, so even
+    /// `2>err.log` and glued `a>>b` keep the approval path.
+    #[test]
+    fn recast_glued_word_redirects_are_never_project_bounded() {
+        for command in [
+            "echo pwned>~/.bashrc",
+            "cat f>~/.ssh/authorized_keys",
+            "echo x>/tmp/y",
+            "echo a>>b",      // glued append, in-root target
+            "ls x 2>err.log", // in-root FD form — existing prefix rule already fails it
+        ] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "redirect in any glued form must keep the approval path: {command}"
+            );
+        }
+        // No-redirect controls are unaffected.
+        for command in ["echo ok", "cargo build"] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                is_project_bounded_shell(&act),
+                "no-redirect control must stay project-bounded: {command}"
+            );
+        }
+    }
+
+    /// Recast follow-up (relative verb): the allowlist matches a BARE verb
+    /// only — `./cargo` and `target/debug/ls` are relative executables
+    /// distinct from the PATH-resolved allowlisted verbs their basename
+    /// reduction would mask, so reduction must not launder them onto the
+    /// allowlist. `../bin/cargo` climbs regardless of its verb name.
+    #[test]
+    fn recast_relative_verb_paths_are_never_project_bounded() {
+        for command in ["./cargo build", "target/debug/ls x", "../bin/cargo build"] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                !is_project_bounded_shell(&act),
+                "relative verb path must keep the approval path: {command}"
+            );
+        }
+        // Bare verbs still upgrade.
+        for command in ["cargo build", "ls x"] {
+            let input = shell_command(command);
+            let act = shell_action_with(&input, facts(true, false));
+            assert!(
+                is_project_bounded_shell(&act),
+                "bare verb control must stay project-bounded: {command}"
             );
         }
     }
