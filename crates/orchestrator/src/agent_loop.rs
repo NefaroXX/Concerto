@@ -1434,11 +1434,17 @@ impl AgentLoop {
         tool_events: &[ToolExecutionSummary],
         verification: &[VerificationSummary],
     ) -> AgentOutput {
+        // files_modified hygiene (smoke follow-up round 2): the accumulator
+        // records audited-mutation argument paths, which can carry directory
+        // spellings (`hexview/`, `.`) or targets that never existed as files.
+        // Run artifacts must contain only real, in-root, regular files.
+        let files_modified =
+            crate::tool_facts::sanitize_files_modified(&self.project_root, files_modified);
         AgentOutput {
             task_id: task.id,
             session_id: task.session_id,
             final_message: final_message.to_string(),
-            files_modified: files_modified.to_vec(),
+            files_modified,
             tool_call_count,
             eval_result: eval_result.clone(),
             tool_events: tool_events.to_vec(),
@@ -3126,6 +3132,10 @@ mod tests {
             _session: &SessionContext,
             _cancel: CancellationToken,
         ) -> Result<ToolOutput, ToolError> {
+            // Files-modified hygiene (smoke follow-up round 2): run artifacts
+            // must list only regular files actually written by tools, so the
+            // mock write really materializes its claimed path.
+            let _ = std::fs::write("/tmp/test.rs", "new content");
             Ok(ToolOutput {
                 summary: "file written".into(),
                 data: serde_json::json!({"file_path": "/tmp/test.rs"}),
@@ -3763,11 +3773,24 @@ mod tests {
             &self,
             input: serde_json::Value,
             _policy: &dyn concerto_core::traits::policy::PolicyEngine,
-            _session: &SessionContext,
+            session: &SessionContext,
             _cancel: CancellationToken,
         ) -> Result<ToolOutput, ToolError> {
             let op = input.get("operation").and_then(|v| v.as_str()).unwrap_or("");
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            // Files-modified hygiene (smoke follow-up round 2): run artifacts
+            // must list only regular files actually written by tools, so the
+            // mock write really materializes the claimed path under the
+            // session root before reporting the mutation.
+            if op == "write" && !path.is_empty() {
+                let target = session.project_dir.as_path().join(path);
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let content =
+                    input.get("content").and_then(|v| v.as_str()).unwrap_or("mock content");
+                let _ = std::fs::write(&target, content);
+            }
             match op {
                 "write" => Ok(ToolOutput {
                     summary: "wrote".into(),

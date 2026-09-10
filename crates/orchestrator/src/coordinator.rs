@@ -3656,7 +3656,10 @@ impl CoordinatorAgent {
                             task_id: task.id,
                             session_id: task.session_id,
                             final_message,
-                            files_modified: all_files,
+                            files_modified: crate::tool_facts::sanitize_files_modified(
+                                &context.session.project_dir,
+                                &all_files,
+                            ),
                             tool_call_count: total_tool_calls,
                             eval_result: None,
                             tool_events: Vec::new(),
@@ -3717,7 +3720,10 @@ impl CoordinatorAgent {
                         task_id: task.id,
                         session_id: task.session_id,
                         final_message,
-                        files_modified: all_files,
+                        files_modified: crate::tool_facts::sanitize_files_modified(
+                            &context.session.project_dir,
+                            &all_files,
+                        ),
                         tool_call_count: total_tool_calls,
                         eval_result: None,
                         tool_events: Vec::new(),
@@ -4951,7 +4957,10 @@ impl CoordinatorAgent {
                         task_id: task.id,
                         session_id: task.session_id,
                         final_message,
-                        files_modified: all_files,
+                        files_modified: crate::tool_facts::sanitize_files_modified(
+                            &context.session.project_dir,
+                            &all_files,
+                        ),
                         tool_call_count: total_tool_calls,
                         eval_result: None,
                         tool_events: Vec::new(),
@@ -5083,7 +5092,10 @@ impl CoordinatorAgent {
                     recoverable_notes.join(" ")
                 )
                 },
-                files_modified: all_files,
+                files_modified: crate::tool_facts::sanitize_files_modified(
+                    &context.session.project_dir,
+                    &all_files,
+                ),
                 tool_call_count: total_tool_calls,
                 eval_result: None,
                 tool_events: Vec::new(),
