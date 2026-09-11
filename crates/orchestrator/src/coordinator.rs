@@ -879,6 +879,12 @@ pub struct CoordinatorAgent {
     /// accumulators (`DispatchLedger` / graph) and persisted additively so
     /// decision state is inspectable independently of the execution state.
     decision_journal: crate::decisions::DecisionJournal,
+    /// Issue #53: the coordinator progress tracker — per-cycle observable
+    /// fingerprints of the decision loop with bounded stall recovery.
+    /// Persisted/restored through checkpoints like the decision journal so
+    /// stall detection survives a resume; reset when a resume replans (a
+    /// superseded plan's stall history no longer applies).
+    progress_tracker: crate::progress::ProgressTracker,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1362,6 +1368,9 @@ impl CoordinatorAgent {
             // Issue #52: decision state starts empty and grows only through
             // validated decisions; execution state never writes here.
             decision_journal: crate::decisions::DecisionJournal::default(),
+            // Issue #53: stall-detection state starts empty and grows one
+            // fingerprint per completed decision-loop cycle.
+            progress_tracker: crate::progress::ProgressTracker::new(),
         }
     }
 
@@ -2211,6 +2220,10 @@ impl CoordinatorAgent {
             // decision state is restorable/inspectable independently of the
             // execution fields.
             decision_journal: self.decision_journal.entries().to_vec(),
+            // Issue #53: the progress tracker rides every persist so stall
+            // detection (fingerprint history + recovery budget) survives a
+            // resume.
+            progress_tracker: self.progress_tracker.state().clone(),
         }
     }
 
@@ -2999,6 +3012,12 @@ impl CoordinatorAgent {
         // into it (additive; pre-#52 checkpoints carry an empty journal).
         self.decision_journal =
             crate::decisions::DecisionJournal::from_entries(cp.decision_journal.clone());
+        // Issue #53: restore the progress tracker so stall detection
+        // (fingerprint history, equivalence streak, recovery budget)
+        // survives a resume; pre-#53 checkpoints carry the zero-value
+        // state.
+        self.progress_tracker =
+            crate::progress::ProgressTracker::from_state(cp.progress_tracker.clone());
 
         // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
         let pending_decision = cp.pending_decision.clone();
@@ -3028,6 +3047,10 @@ impl CoordinatorAgent {
             // Issue #52: the restored decision journal is also superseded —
             // a replan's strategy cannot govern the replaced plan's steps.
             self.decision_journal = crate::decisions::DecisionJournal::from_entries(Vec::new());
+            // Issue #53: the stall history of the superseded plan is
+            // equally invalid — the new plan starts with a fresh
+            // fingerprint window and a fresh recovery budget.
+            self.progress_tracker = crate::progress::ProgressTracker::new();
             warn!(
                 run_id = %cp.run_id,
                 "ADR-65 §7: resume chose REPLAN — the workspace objectively changed \
@@ -6699,6 +6722,11 @@ impl CoordinatorAgent {
         // Whether the loop ran out of iterations (as opposed to stopping in
         // prose) — only then is the structural-bound note warranted.
         let mut hit_iteration_bound = true;
+        // Issue #53: set when the progress guard escalates (recovery budget
+        // exhausted) — the loop then stops through the recoverable-note
+        // machinery, so the tail must not add a second, misleading
+        // structural-bound note.
+        let mut stall_escalated = false;
 
         for _iteration in 0..MAX_DISPATCH_ITERATIONS {
             if cancel.is_cancelled() {
@@ -6758,6 +6786,16 @@ impl CoordinatorAgent {
                 break;
             }
 
+            // ── Issue #53: per-cycle observables ────────────────────────
+            // One full observe→decide→dispatch cycle completes when this
+            // iteration's tool calls have all run to settlement. Baselines
+            // are captured now; the summary is finalized after the tool
+            // loop below and consulted by the progress tracker once per
+            // cycle.
+            let journal_len_before_cycle = self.decision_journal.len();
+            let cost_before_cycle = ledger.total_cost;
+            let mut observation = crate::progress::CycleObservation::default();
+
             for tool_call in tool_calls {
                 if cancel.is_cancelled() {
                     return Err(OrchestratorError::Cancelled);
@@ -6765,20 +6803,28 @@ impl CoordinatorAgent {
                 let mut call_plan: Option<PlanArtifact> = None;
                 let result = match tool_call.name.as_str() {
                     CALL_SPECIALIST_TOOL if dispatching => {
-                        self.handle_call_specialist(
-                            graph,
-                            task,
-                            base_ctx,
-                            cancel,
-                            scope,
-                            ledger,
-                            state,
-                            design_role,
+                        let result = self
+                            .handle_call_specialist(
+                                graph,
+                                task,
+                                base_ctx,
+                                cancel,
+                                scope,
+                                ledger,
+                                state,
+                                design_role,
+                                &tool_call.arguments,
+                            )
+                            .await;
+                        crate::progress::observe_specialist_result(
                             &tool_call.arguments,
-                        )
-                        .await
+                            &result,
+                            &mut observation,
+                        );
+                        result
                     }
                     DRAFT_PLAN_TOOL if dispatching => {
+                        observation.draft_plan = true;
                         let (result, plan) =
                             self.handle_draft_plan(task, cancel, state.doc.as_ref()).await;
                         call_plan = plan;
@@ -6791,14 +6837,25 @@ impl CoordinatorAgent {
                     name if dispatching
                         && tool_executor_offers(self.tool_executor.as_deref(), name) =>
                     {
-                        self.handle_executor_tool(
-                            base_ctx,
-                            cancel,
-                            ledger,
-                            &tool_call.arguments,
-                            name,
-                        )
-                        .await
+                        let files_len_before = ledger.all_files.len();
+                        let result = self
+                            .handle_executor_tool(
+                                base_ctx,
+                                cancel,
+                                ledger,
+                                &tool_call.arguments,
+                                name,
+                            )
+                            .await;
+                        // Paths the executor tools touched this cycle are
+                        // observable artifacts (the ledger list is
+                        // append-only within a session).
+                        observation.artifacts.extend(
+                            ledger.all_files[files_len_before..]
+                                .iter()
+                                .map(|path| path.to_string()),
+                        );
+                        result
                     }
                     _ => {
                         // Unknown tool, or a tool call while dispatching is
@@ -6846,9 +6903,71 @@ impl CoordinatorAgent {
                     tokens_out: None,
                 });
             }
+
+            // ── Issue #53: progress-aware stall detection ──────────────
+            // Finalize the cycle's summary from the real state and consult
+            // the tracker ONCE per completed cycle. Recovery reuses THIS
+            // loop (a bounded reconsideration prompt into the existing
+            // conversation); escalation stops the loop with a recoverable
+            // note — never a hard error. The hard iteration ceilings remain
+            // untouched complements.
+            observation.snapshot_generation = self.snapshot_generation();
+            observation.spend_delta_usd = ledger.total_cost - cost_before_cycle;
+            observation.timestamp_ms = crate::tool_facts::unix_ms();
+            for entry in self.decision_journal.entries().iter().skip(journal_len_before_cycle) {
+                observation.journal_transitions.push((
+                    crate::progress::decision_kind_label(entry.kind).to_owned(),
+                    crate::progress::decision_status_label(entry.status).to_owned(),
+                ));
+            }
+            match self.progress_tracker.observe(&observation) {
+                crate::progress::CycleVerdict::Progressing => {}
+                crate::progress::CycleVerdict::Reconsider(nudge) => {
+                    tracing::info!(
+                        target: "orchestrator::coordinator",
+                        "progress guard: equivalent coordinator cycles detected; \
+                         injecting a bounded reconsideration"
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: nudge.clone(),
+                        },
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: nudge,
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                }
+                crate::progress::CycleVerdict::Escalate(note) => {
+                    tracing::warn!(
+                        target: "orchestrator::coordinator",
+                        "progress guard: recovery budget exhausted on equivalent \
+                         coordinator cycles; stopping the decision loop"
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: note.clone(),
+                        },
+                    );
+                    ledger.notes.push(note);
+                    stall_escalated = true;
+                    break;
+                }
+            }
         }
 
-        if hit_iteration_bound && !cancel.is_cancelled() {
+        if hit_iteration_bound && !stall_escalated && !cancel.is_cancelled() {
             // The structural bound ran out with tool calls still pending.
             // Finish in prose: the recorded dispatches stay, the loop stops.
             ledger.notes.push(format!(
@@ -9065,6 +9184,180 @@ mod tests {
         assert!(
             !events.iter().any(|kind| matches!(kind, EventKind::SubTaskFailed { .. })),
             "no subtask may fail on the Coordinator-driven correction path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #53: progress-aware stall detection in the decision loop
+    // ------------------------------------------------------------------
+
+    /// Whether the run's decision-loop events carry a progress-guard
+    /// AgentThought (nudge or escalation).
+    fn progress_guard_events(events: &[EventKind]) -> Vec<&String> {
+        events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::AgentThought { content, .. } if content.contains("Progress guard") => {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Issue #53 acceptance: repeated equivalent work is detected BEFORE
+    /// the maximum iteration budget is exhausted. Three identical
+    /// `researcher` dispatch cycles (same agent, same task, same outcome,
+    /// no file/workspace change) produce ONE bounded reconsideration
+    /// prompt — injected into the existing decision-loop conversation as a
+    /// user message — and the run finishes normally (4 model turns used,
+    /// nowhere near the structural bound; recovery budget unexhausted).
+    #[tokio::test]
+    async fn progress_guard_nudges_before_the_iteration_budget_when_work_repeats() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let turns: Vec<CoordinatorTurn> = (0..3)
+            .map(|_| {
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")])
+            })
+            .chain(std::iter::once(CoordinatorTurn::Text("done".into())))
+            .collect();
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            turns,
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        let guards = progress_guard_events(&events);
+        assert_eq!(
+            guards.len(),
+            1,
+            "exactly one reconsideration for three equivalent cycles, got: {guards:?}"
+        );
+        assert!(
+            guards[0].contains("reconsideration") || guards[0].contains("CHANGE"),
+            "the nudge is a prompt for the coordinator to reconsider: {}",
+            guards[0]
+        );
+
+        // The nudge was injected as a user message into the decision loop's
+        // conversation: the FOURTH model request carries it (after three
+        // dispatch cycles).
+        let requests = provider.requests.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        assert_eq!(requests.len(), 4, "3 dispatch turns + the final prose turn");
+        let nudge_injected = requests[3]
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, Role::User) && m.content.contains("Progress guard"));
+        assert!(
+            nudge_injected,
+            "the reconsideration prompt must be injected into the loop conversation"
+        );
+
+        // Not a hard stop: the run finishes normally on the following turn.
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the nudge is a recovery attempt, not an exit downgrade, got: {:?}",
+            output.completion_status
+        );
+    }
+
+    /// Issue #53: recovery is BUDGETED — when the coordinator ignores the
+    /// bounded reconsideration prompts and keeps issuing equivalent work,
+    /// the guard escalates and the decision loop stops through the
+    /// existing note machinery (run surfaces Partial), well before the
+    /// structural 64-turn bound. Deterministic recovery, never a crash.
+    #[tokio::test]
+    async fn progress_guard_escalates_after_the_recovery_budget_is_exhausted() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let turns: Vec<CoordinatorTurn> = (0..9)
+            .map(|_| {
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")])
+            })
+            .collect();
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            turns,
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert!(
+            output.final_message.contains("Progress guard escalation"),
+            "expected the escalation note in the final message, got: {}",
+            output.final_message
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the escalation note downgrades the exit through the note machinery, got: {:?}",
+            output.completion_status
+        );
+        let guards = progress_guard_events(&events);
+        assert_eq!(
+            guards.len(),
+            3,
+            "two reconsideration prompts + one escalation, got: {guards:?}"
+        );
+        // The loop stopped after 7 model turns (stall → 2 ignored recovery
+        // cycles → stall → 2 ignored → escalation) — far below the
+        // structural 64-turn bound, which stays untouched as the hard
+        // safety ceiling.
+        let turn_count = provider.turn_count();
+        assert_eq!(
+            turn_count, 7,
+            "escalation stops the loop at the recovery budget, got: {turn_count} turns"
+        );
+        assert!(turn_count < 64);
+    }
+
+    /// Issue #53 acceptance: a failed operation followed by a valid
+    /// recovery is NOT falsely classified as a stall — the recovery's
+    /// differing outcome advances the fingerprint, so no guard event may
+    /// fire even though the task text repeats.
+    #[tokio::test]
+    async fn failed_dispatch_followed_by_recovery_is_not_flagged() {
+        let bus = EventBus::new(256);
+        let mut failed_attempt =
+            ok_result("researcher", "transient failure").expect("ok_result should not fail");
+        failed_attempt.outcome = AgentOutcome::Failed { error: "transient".into() };
+        let mocks = vec![MockExpertAgent::sequence(
+            AgentId::new("researcher"),
+            vec![Ok(failed_attempt), ok_result("researcher", "recovered and found it")],
+        )];
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("recovered".into()),
+            ],
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        let guards = progress_guard_events(&events);
+        assert!(guards.is_empty(), "failed-then-recovered must never flag: {guards:?}");
+        assert_eq!(
+            provider.turn_count(),
+            3,
+            "no guard interaction: two dispatch turns + the prose turn"
+        );
+        // The failed first dispatch surfaces through the existing
+        // failure/notes machinery — the run exits Partial, no guard event.
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the failed dispatch keeps its non-stall failure semantics, got: {}",
+            output.final_message
         );
     }
 
