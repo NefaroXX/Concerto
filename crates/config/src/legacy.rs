@@ -10,7 +10,9 @@
 //! - **Write**: always use the new path. Old data is never automatically
 //!   migrated — callers can optionally migrate on first write.
 //! - **Env vars**: `CONCERTO_*` is checked first. If a key is not found,
-//!   `OPENCODE_RS_*` is tried as a fallback in `CredentialStore`.
+//!   `OPENCODE_RS_*` is tried as a fallback in `CredentialStore` (the config
+//!   loader itself no longer reads `OPENCODE_RS_*` — only `CredentialStore`
+//!   keeps the legacy read).
 //! - **Keyring**: service name `concerto` is tried first; if an account is
 //!   not found, `opencode-rs` is tried as a fallback.
 
@@ -26,14 +28,13 @@ pub const OLD_CONFIG_DIR: &str = "opencode-rs";
 /// Old data directory name (e.g. `~/.local/share/opencode-rs/`).
 pub const OLD_DATA_DIR: &str = "opencode-rs";
 
-/// Old environment variable prefix.
+/// Old environment variable prefix. Retained only for the
+/// `CredentialStore` legacy read (the config loader no longer merges
+/// `OPENCODE_RS_*` env vars).
 pub const OLD_ENV_PREFIX: &str = "OPENCODE_RS_";
 
 /// Old keyring service name.
 pub const OLD_KEYRING_SERVICE: &str = "opencode-rs";
-
-/// Old project-scoped config filename.
-pub const OLD_PROJECT_CONFIG_FILE: &str = ".opencode-rs.toml";
 
 // ---------------------------------------------------------------------------
 // New names (canonical — use these for all writes)
@@ -82,8 +83,10 @@ pub fn config_path() -> Option<PathBuf> {
 /// Resolve the project-scoped config file path.
 ///
 /// Always returns the new name (`.concerto.toml`). The project file is
-/// typically gitignored and regenerated — there is no benefit to carrying
-/// the old name forward for this file.
+/// typically gitignored and regenerated. The old `.opencode-rs.toml` name is
+/// no longer read — nothing ever generated it under the old name (the rename
+/// predates first use), and a stale file in a project repo must not
+/// resurrect config values.
 pub fn project_config_path(root: &std::path::Path) -> PathBuf {
     root.join(NEW_PROJECT_CONFIG_FILE)
 }
@@ -143,7 +146,6 @@ mod tests {
         assert_ne!(NEW_DATA_DIR, OLD_DATA_DIR);
         assert_ne!(NEW_ENV_PREFIX, OLD_ENV_PREFIX);
         assert_ne!(NEW_KEYRING_SERVICE, OLD_KEYRING_SERVICE);
-        assert_ne!(NEW_PROJECT_CONFIG_FILE, OLD_PROJECT_CONFIG_FILE);
     }
 
     #[test]

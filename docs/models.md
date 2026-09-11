@@ -25,8 +25,8 @@ are display labels only.
 The global file is the platform Concerto configuration file (normally
 `~/.config/concerto/config.toml` on Linux). A project-root `.concerto.toml` can
 override project-specific settings. `CONCERTO_*` environment configuration is
-also supported; legacy `opencode-rs` paths and `OPENCODE_RS_*` variables remain
-recognized for migration. Do not set both prefixes for the same value.
+also supported; legacy `opencode-rs` paths remain recognized for migration, but
+the `OPENCODE_RS_*` env-prefix form is no longer read.
 
 ## Provider list and default
 

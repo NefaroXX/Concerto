@@ -587,6 +587,42 @@ pub(crate) fn extract_affected_paths(
     paths
 }
 
+/// Hygiene filter for the run-artifact `files_modified` lists (completion /
+/// transcript `Completion` entries): every kept entry must resolve —
+/// lexically, like [`canonical_project_path`] — to a real, existing REGULAR
+/// file inside the project root.
+///
+/// The accumulator records the arguments' `path` of audited mutations, which
+/// can carry directory spellings (`hexview/`, `.`) or pre-existing non-run
+/// files (e.g. the project config the UI auto-seeds) that the tool's write
+/// path never materialized. The smoke session's completion therefore listed
+/// "directories" among changed files; those carry no run-artifact truth and
+/// are dropped here:
+///
+/// - the entry must map onto a project-relative key ([`canonical_project_path`]
+///   drops `.`, escaping `..`, and absolute-out-of-root spellings), and
+/// - the resolved path must exist and be a regular file (directories,
+///   missing/deleted targets, and special files are dropped).
+///
+/// Retained entries keep their original spelling (`output.files_modified`
+/// stays the accumulator's record; this filter only decides membership).
+pub(crate) fn sanitize_files_modified(
+    project_root: &std::path::Path,
+    files: &[camino::Utf8PathBuf],
+) -> Vec<camino::Utf8PathBuf> {
+    files
+        .iter()
+        .filter(|raw| {
+            canonical_project_path(project_root, raw.as_str()).is_some()
+                && resolve_path(project_root, raw.as_str())
+                    .metadata()
+                    .map(|meta| meta.is_file())
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -634,6 +670,66 @@ mod tests {
         )
         .await
         .expect("load whiteboard events")
+    }
+
+    // ── files_modified hygiene (smoke follow-up round 2) ─────────────────
+
+    #[test]
+    fn sanitize_files_modified_drops_directory_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("hexview")).unwrap();
+        std::fs::write(dir.path().join("hexview/src.rs"), "fn main() {}\n").unwrap();
+        let files = vec![
+            camino::Utf8PathBuf::from("."),
+            camino::Utf8PathBuf::from("hexview/"),
+            camino::Utf8PathBuf::from("hexview/src.rs"),
+        ];
+        assert_eq!(
+            sanitize_files_modified(dir.path(), &files),
+            vec![camino::Utf8PathBuf::from("hexview/src.rs")],
+            "root-only and subdirectory spellings are not run artifacts"
+        );
+    }
+
+    #[test]
+    fn sanitize_files_modified_drops_entries_the_run_never_materialized() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("written.rs"), "ok\n").unwrap();
+        let files = vec![
+            camino::Utf8PathBuf::from("written.rs"),
+            // A path the run recorded but a tool never materialized.
+            camino::Utf8PathBuf::from("docs/unwritten.md"),
+        ];
+        assert_eq!(
+            sanitize_files_modified(dir.path(), &files),
+            vec![camino::Utf8PathBuf::from("written.rs")],
+            "only files actually on disk survive the filter"
+        );
+    }
+
+    #[test]
+    fn sanitize_files_modified_drops_out_of_root_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("foreign.rs"), "fn main() {}\n").unwrap();
+        let files =
+            vec![camino::Utf8PathBuf::from_path_buf(outside.path().join("foreign.rs")).unwrap()];
+        assert!(
+            sanitize_files_modified(dir.path(), &files).is_empty(),
+            "absolute out-of-root spellings are never run artifacts"
+        );
+    }
+
+    #[test]
+    fn sanitize_files_modified_keeps_absolute_in_root_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let files = vec![camino::Utf8PathBuf::from_path_buf(dir.path().join("main.rs")).unwrap()];
+        assert_eq!(
+            sanitize_files_modified(dir.path(), &files),
+            files,
+            "absolute in-root file spellings are retained verbatim"
+        );
     }
 
     fn facts_for(pool: &sqlx::SqlitePool) -> (ToolFactContext, ResourceFacts) {

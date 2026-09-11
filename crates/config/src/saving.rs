@@ -290,6 +290,26 @@ pub fn roster_materialized(config_path: &Path) -> bool {
         .is_some_and(|table| table.contains_key("custom_agents"))
 }
 
+/// Whether the raw TOML document at `config_path` declares an
+/// `[orchestration]` section at all (any content, including only subtables).
+///
+/// The global-only orchestration decision (smoke follow-up round 2, 2026-09)
+/// uses this as the conflict guard: the Studio refuses its Save while a
+/// PROJECT config still declares `[orchestration]`, because writing the
+/// fresher selection to the GLOBAL file would leave a stale project-layer
+/// selection that figment merges on top and the exactly-one load seam would
+/// reject. A missing file reports `false`.
+pub fn orchestration_declared(config_path: &Path) -> bool {
+    let raw = match fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(_) => return false,
+    };
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    doc.get("orchestration").is_some()
+}
+
 /// Materialize ONLY the agent roster (the five [`builtin_agent_seeds`] under
 /// `[multi_agent.custom_agents]`) into `config_path`, preserving every other
 /// section — including an existing `[orchestration]` blueprint — byte-for-byte
@@ -1216,5 +1236,32 @@ enabled = true
 
         let cfg = crate::load_config(Some(&path), None).expect("created config must load");
         assert!(cfg.owns_agent_roster(), "the created config owns its roster");
+    }
+
+    /// The raw `[orchestration]` presence signal for the global-only Save
+    /// conflict guard: true for any section spelling, false for missing
+    /// files, and false (not a seed-stop) for unparseable files — a broken
+    /// file must not be mistaken for a declared orchestration when deciding
+    /// whether Save may proceed (seeding has its own broken-file stop).
+    #[test]
+    fn orchestration_declared_detects_any_section_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        assert!(!orchestration_declared(&path), "a missing file declares no orchestration section");
+
+        std::fs::write(&path, "schema_version = 7\n[providers]\nprimary = \"x\"\n").unwrap();
+        assert!(!orchestration_declared(&path), "unrelated sections are not orchestration");
+
+        std::fs::write(&path, "schema_version = 7\n\n[orchestration]\nschema_version = 1\n")
+            .unwrap();
+        assert!(orchestration_declared(&path), "a bare [orchestration] table is declared");
+
+        std::fs::write(&path, "# comment\norchestration = { blueprint = { name = \"tdd\" } }\n")
+            .unwrap();
+        assert!(orchestration_declared(&path), "an inline-table spelling is declared too");
+
+        std::fs::write(&path, "[unterminated\n").unwrap();
+        assert!(!orchestration_declared(&path), "an unparseable file declares nothing");
     }
 }

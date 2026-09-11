@@ -1426,7 +1426,12 @@ mod tests {
         let payload = format!("| mkdir {}", marker.to_str().unwrap());
         let input = json!({"command": "echo", "args": [payload], "timeout_secs": 10u64});
         let result = tool.execute(input, &policy, &session, cancel).await;
-        assert!(result.is_ok(), "echo should succeed: {:?}", result.err());
+        // The injected `mkdir` must never create the marker dir. Wrap mode
+        // quoting keeps it from executing; containment (F5 pipe modeling)
+        // additionally rejects the escaping pipe segment outright, which is
+        // an equally valid outcome for the same invariant — but the marker
+        // must stay absent either way.
+        let _ = result;
         assert!(
             !marker.exists(),
             "shell injection regression: marker dir was created via pipe injection"

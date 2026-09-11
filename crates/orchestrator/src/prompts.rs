@@ -269,7 +269,24 @@ pub fn environment_card(profile: Option<&ShellProfileConfig>) -> String {
         card.push_str("\n  - ");
         card.push_str(note);
     }
+    for note in platform_notes(std::env::consts::OS) {
+        card.push_str("\n  - ");
+        card.push_str(&note);
+    }
     card
+}
+
+/// Per-OS gotchas appended after the shell-dialect notes. POSIX systems get
+/// no extra lines (the dialect notes already cover them); Windows warns that
+/// `/tmp` does not exist.
+fn platform_notes(os: &str) -> Vec<String> {
+    match os {
+        "windows" => {
+            vec!["No `/tmp`: scratch files go in `%TEMP%` or the project directory, never `/tmp`."
+                .to_string()]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Parse the first valid JSON value from a model response.
@@ -654,6 +671,51 @@ mod tests {
         assert!(card.contains("Quote every `$VAR`"), "posix gotcha missing: {card}");
         assert!(!card.contains("powershell"), "wrong dialect notes present: {card}");
         assert!(!card.contains("$LASTEXITCODE"), "powershell gotcha present: {card}");
+    }
+
+    // ── per-OS gotchas (smoke follow-up round 2: no /tmp on Windows) ──────
+
+    /// POSIX hosts keep the card as-is: no OS-specific gotcha line is added.
+    #[test]
+    fn platform_notes_posix_adds_nothing() {
+        for os in ["linux", "macos", "freebsd", "openbsd"] {
+            assert!(
+                platform_notes(os).is_empty(),
+                "POSIX platform '{os}' must contribute no extra card line"
+            );
+        }
+    }
+
+    /// Windows hosts get the no-`/tmp` gotcha: scratch files belong in
+    /// `%TEMP%` or the project directory (the smoke session tried
+    /// `/tmp/example.bin` on Windows and was correctly contained — the card
+    /// must tell the model before the policy has to).
+    #[test]
+    fn platform_notes_windows_warn_about_tmp() {
+        let notes = platform_notes("windows");
+        assert_eq!(notes.len(), 1, "exactly one Windows gotcha line");
+        let note = &notes[0];
+        for needle in ["`/tmp`", "%TEMP%", "project directory"] {
+            assert!(note.contains(needle), "Windows gotcha missing '{needle}': {note}");
+        }
+    }
+
+    /// The rendered card delegates the note placement to `platform_notes` —
+    /// exercised here for a POSIX host (the note set for the compile target).
+    #[test]
+    fn environment_card_processes_platform_notes() {
+        let card = environment_card(Some(&fake_profile("/usr/bin/bash", ShellBackendType::System)));
+        let notes = platform_notes(std::env::consts::OS);
+        for note in notes {
+            assert!(card.contains(&note), "platform note missing in card: {card}");
+        }
+        // Exactly the expected notes appear; no Windows line on POSIX hosts.
+        if std::env::consts::OS != "windows" {
+            assert!(
+                !card.contains("%TEMP%"),
+                "no Windows gotcha may leak onto POSIX cards: {card}"
+            );
+        }
     }
 
     #[test]

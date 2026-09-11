@@ -461,6 +461,10 @@ fn scan_directory_changes(
 /// Scan for write-redirect targets (`> file`, `>> file`, `2> file`, `&> file`,
 /// and glued forms) that resolve outside the project root. The block applies
 /// regardless of the verb: a read-only verb must not write outside the root.
+/// Input-redirect (`< file`, glued `<file`) targets are checked the same way
+/// (Finding C): reading from outside the root is the same scope escape —
+/// `cat </etc/passwd` must not bypass containment just because `cat` is a
+/// read-only verb.
 fn scan_redirects(
     root: &Utf8Path,
     cwd: &Utf8Path,
@@ -475,8 +479,26 @@ fn scan_redirects(
             }
             continue;
         }
-        // Operator glued to its target: `2>/tmp/x`, `>file`.
+        // Input-redirect operator (`< file`): the target is read, but from
+        // outside the root it is still an escape.
+        if token == "<" {
+            if let Some(target) = tokens.get(i + 1) {
+                resolve_within(root, cwd, strip_trailing_command_punct(target))?;
+                exempt.insert(i + 1);
+            }
+            continue;
+        }
+        // Operator glued to its target: `2>/tmp/x`, `>file`, `</etc/passwd`.
         if let Some(idx) = token.rfind('>') {
+            let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
+            let after = strip_trailing_command_punct(after);
+            if !after.is_empty() && is_path_like(after) {
+                resolve_within(root, cwd, after)?;
+            }
+            continue;
+        }
+        // Input-redirect glued to its target: `</etc/passwd`.
+        if let Some(idx) = token.find('<') {
             let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
             let after = strip_trailing_command_punct(after);
             if !after.is_empty() && is_path_like(after) {
@@ -560,21 +582,89 @@ fn scan_git_change_dir(
     Ok(())
 }
 
-/// General path-argument containment: for mutation-capable verbs, any
-/// path-like token that resolves outside the project root rejects the command.
-/// Read-only verbs are exempt entirely.
+/// A pipe (`|`) segment of the flattened token list: the token-index range
+/// plus the segment's leading verb when one is known. A pipe ends the current
+/// segment whether it is a standalone token or glued inside one (`ls|tee`,
+/// `x|`); a non-empty post-glue remainder (`ls|tee` → `tee`) becomes the next
+/// segment's leading verb, so the first token after the glue is governed by
+/// the running executable the shell actually resolves there.
+struct PipeSegment {
+    start: usize,
+    end: usize,
+    lead: Option<String>,
+}
+
+/// Split the flattened token list into [`PipeSegment`]s, modeling pipes the
+/// way the shell will sequence them: on every `|` — standalone token, glued
+/// inside a token, or trailing a token. Segments that contain no tokens are
+/// skipped. This is the containment counterpart of the tier classifier's
+/// segment split (`authorization.rs command_segments`).
+fn pipe_segments(tokens: &[String]) -> Vec<PipeSegment> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut lead: Option<String> = None;
+    for (i, token) in tokens.iter().enumerate() {
+        if token == "|" {
+            // Standalone pipe: close the current segment; the `|` itself
+            // carries no content of interest to the path scan.
+            if start < i {
+                segments.push(PipeSegment { start, end: i, lead: lead.clone() });
+            }
+            start = i + 1;
+            lead = None;
+            continue;
+        }
+        if let Some(pos) = token.find('|') {
+            if lead.is_none() && pos > 0 {
+                lead = Some(token[..pos].to_string());
+            }
+            // Glued pipe: the token still belongs to the pre-pipe segment
+            // (its head is real input to that verb), then the segment ends.
+            if start < i {
+                segments.push(PipeSegment { start, end: i + 1, lead: lead.clone() });
+            }
+            let post = strip_trailing_command_punct(&token[pos + 1..]);
+            start = i + 1;
+            lead = if post.is_empty() { None } else { Some(post.to_string()) };
+            continue;
+        }
+        if lead.is_none() {
+            lead = Some(token.clone());
+        }
+    }
+    if start < tokens.len() {
+        segments.push(PipeSegment { start, end: tokens.len(), lead });
+    }
+    segments
+}
+
+/// General path-argument containment: for mutation-capable leads, any
+/// path-like token that resolves outside the project root rejects the
+/// command. The exemption is PER PIPE SEGMENT: a read-only leading verb
+/// exempts only its own segment's tokens — a later `tee`/mutating segment in
+/// a pipe (`cat f | tee /tmp/x`) is a self-contained mutation and must have
+/// its targets contained like any other write.
 fn scan_path_arguments(
     root: &Utf8Path,
     cwd: &Utf8Path,
     tokens: &[String],
     exempt: &HashSet<usize>,
 ) -> Result<(), ToolError> {
-    let verb = &tokens[0];
-    if is_read_only(verb, &tokens[1..]) {
-        return Ok(());
+    let mut read_only_by_token = vec![false; tokens.len()];
+    for segment in pipe_segments(tokens) {
+        let read_only = segment
+            .lead
+            .as_ref()
+            .is_some_and(|lead| is_read_only(lead, &tokens[segment.start + 1..segment.end]));
+        for flag in &mut read_only_by_token[segment.start..segment.end] {
+            *flag = read_only;
+        }
     }
     for (i, token) in tokens.iter().enumerate() {
         if exempt.contains(&i) || i == 0 {
+            continue;
+        }
+        if read_only_by_token[i] {
             continue;
         }
         if is_path_like(token) {
@@ -820,6 +910,84 @@ mod tests {
         // In-root redirect stays allowed.
         contain_shell_command(&root, &root, "cat", &[">".into(), "out.txt".into()])
             .expect("in-root redirect allowed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipe modeling and input redirects (F5, Finding C).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tee_pipe_target_outside_root_rejected() {
+        let (root, _dir) = temp_root();
+        // Read-only leading verb does not exempt a later tee segment: `cat`'s
+        // exemption must not launder the tee-segment's write target.
+        for command in [
+            "cat f | tee /tmp/out",
+            "cat f | tee ~/out",
+            "cat f|tee /tmp/out",
+            "ls | tee /tmp/out",
+            "cat secret | tee ../escape",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the tee target outside root, got: {err}"
+            );
+        }
+        // A tee-subcommand prefix (e.g. `tee -a`) is still a write.
+        assert!(
+            contain_shell_command(&root, &root, "cat f | tee -a /tmp/out", &[]).is_err(),
+            "tee -a with outside-root target must reject"
+        );
+    }
+
+    #[test]
+    fn read_only_pipe_stays_allowed_and_in_root_tee_allowed() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // Read-only chains keep working.
+        contain_shell_command(&root, &root, "cat f | grep x", &[]).expect("read pipe allowed");
+        contain_shell_command(&root, &root, "ls sub | head", &[]).expect("ls|head allowed");
+        contain_shell_command(&root, &root, "cat f", &[]).expect("plain cat allowed");
+        contain_shell_command(&root, &root, "cat f|grep x", &[]).expect("glued pipe allowed");
+        // In-root tee is allowed (existing path rules apply, not a new block).
+        contain_shell_command(&root, &root, "cat f | tee out.txt", &[])
+            .expect("in-root tee target allowed");
+        contain_shell_command(&root, &root, "cat f | tee sub/out.txt", &[])
+            .expect("in-root subdir tee target allowed");
+    }
+
+    #[test]
+    fn mutating_segment_keeps_path_containment() {
+        let (root, dir) = temp_root();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // A mutating second segment keeps its own path args contained: the
+        // read-only exemption of `ls` does not cover `mkdir`'s targets.
+        assert!(
+            contain_shell_command(&root, &root, "ls | mkdir /tmp/pwned", &[]).is_err(),
+            "escaping mkdir segment after pipe must reject"
+        );
+        // In-root mutating segment stays allowed.
+        contain_shell_command(&root, &root, "ls sub | mkdir sub/newdir", &[])
+            .expect("in-root mkdir segment allowed");
+    }
+
+    #[test]
+    fn input_redirect_outside_root_rejected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // Finding C: `< /etc/passwd` reading outside the root is an escape.
+        for command in ["cat < /etc/passwd", "cat </etc/passwd", "wc -l < /etc/passwd"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the input-redirect target, got: {err}"
+            );
+        }
+        // In-root input redirects keep working.
+        contain_shell_command(&root, &root, "cat < f", &[]).expect("in-root < allowed");
+        contain_shell_command(&root, &root, "cat <f", &[]).expect("glued in-root < allowed");
     }
 
     // -----------------------------------------------------------------------
