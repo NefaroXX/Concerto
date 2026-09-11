@@ -1192,6 +1192,63 @@ enabled = true
         assert_eq!(agents, &roster, "the reloaded roster equals the written agents");
     }
 
+    /// Proof of safety for the toml 0.8→1.x bump: strings carrying quotes,
+    /// backslashes, newlines, tabs, TOML metacharacters, `#`, and unicode must
+    /// survive BOTH write converters — the manual `toml` → `toml_edit`
+    /// re-encode ([`toml_edit_value`], used by every roster and inline-blueprint
+    /// write) and the toml 1.x parser on reload — byte-semantically. The reload
+    /// goes through [`crate::load_config`] → `load_config_layers` (figment +
+    /// migration + validation), the exact production seam, not a bare
+    /// `toml::from_str`.
+    #[test]
+    fn save_and_reload_preserve_hostile_string_values_through_the_real_load_seam() {
+        use crate::schema::FewShotExample;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = seed_config(&dir);
+
+        let hostile = "he said \"hi\" and it's C:\\path\nsecond line\ttabbed \
+                       # not-a-comment = { } [ ] , héllo 世界 🚀";
+        let mut agent = rich_agent("hostile");
+        agent.name = format!("Agent {hostile}");
+        agent.prompt_sections.system_instructions = hostile.to_string();
+        agent.prompt_sections.constraints = hostile.to_string();
+        agent.prompt_sections.output_format = hostile.to_string();
+        agent.prompt_sections.few_shot =
+            vec![FewShotExample { input: hostile.to_string(), output: hostile.to_string() }];
+        agent.model_override = Some(hostile.to_string());
+        let roster = vec![agent];
+
+        save_agent_roster(&path, &roster).expect("hostile roster save must succeed");
+
+        let mut edited = standard_blueprint();
+        edited.name = "hostile-blueprint".to_string();
+        edited.description = Some(hostile.to_string());
+        save_inline_blueprint(&path, &edited).expect("hostile inline blueprint save must succeed");
+
+        let cfg = crate::load_config(Some(&path), None)
+            .expect("a config written with hostile strings must still load");
+        let agents = &cfg.multi_agent.as_ref().expect("[multi_agent] present").custom_agents;
+        assert_eq!(
+            agents, &roster,
+            "every hostile string must survive save→load byte-semantically"
+        );
+        let inline = cfg
+            .orchestration
+            .as_ref()
+            .expect("[orchestration] present")
+            .blueprint
+            .inline
+            .as_ref()
+            .expect("the selection must be inline");
+        assert_eq!(inline.name, "hostile-blueprint", "the edited name must survive");
+        assert_eq!(
+            inline.description.as_deref(),
+            Some(hostile),
+            "the hostile description must survive save→load byte-semantically"
+        );
+    }
+
     /// Slice 3 Testing (deletion persists): the array is replaced wholesale, so
     /// an id removed from the saved list is gone from the file — the embedded
     /// seeds and prior entries never merge back in. Also proves idempotency.
