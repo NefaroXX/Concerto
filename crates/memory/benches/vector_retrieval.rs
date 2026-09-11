@@ -26,9 +26,9 @@ const EMBEDDING_DIM: usize = 384;
 
 /// Generate a random unit-normalized embedding vector.
 fn random_embedding() -> Vec<f32> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let mut v: Vec<f32> = (0..EMBEDDING_DIM).map(|_| rng.gen::<f32>()).collect();
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let mut v: Vec<f32> = (0..EMBEDDING_DIM).map(|_| rng.random::<f32>()).collect();
     let norm: f64 = v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     if norm > 0.0 {
         for x in &mut v {
