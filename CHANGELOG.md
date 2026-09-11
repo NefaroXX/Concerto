@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Progress-aware loop + stall detection (#53):** coordinator cycles
+  fingerprint observable state (transitions, facts, snapshot, journal,
+  artifacts); 3 identical cycles trigger bounded reconsideration then
+  escalation — never a hard stop, never a false stall on recoveries;
+  hard ceilings untouched.
 - **Coordinator decision/execution split (#52):** typed `CoordinatorDecision`
   + validator enforced at dispatch seams (ready-set, evidence existence,
   artifact canonicalization); decision journal persisted additively
