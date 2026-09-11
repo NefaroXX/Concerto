@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Coordinator decision/execution split (#52):** typed `CoordinatorDecision`
+  + validator enforced at dispatch seams (ready-set, evidence existence,
+  artifact canonicalization); decision journal persisted additively
+  (old checkpoints load); fabricated evidence now rejects the dispatch.
 - **Containment segmentation + squat/interpolation hardening:** the
   read-only path exemption is now per list-segment (`& | ;` newline,
   glued included); plugin orchestration/observe-class names always
