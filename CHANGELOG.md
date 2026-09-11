@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Inert classifier config removed (Item E):** the `[intent]`
+  classifier keys are gone from the schema (7→8 version-bump migration;
+  legacy files load); the classifier module stays off-hot-path for
+  eval/future use.
 - **Smoke follow-ups:** validation resolves its working root from run
   evidence (manifest nearest modified files, session-root fallback);
   completion `files` keeps only regular files written by tools;
