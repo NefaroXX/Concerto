@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Containment segmentation + squat/interpolation hardening:** the
+  read-only path exemption is now per list-segment (`& | ;` newline,
+  glued included); plugin orchestration/observe-class names always
+  namespace (`plugin:<id>:`); `$`/backtick/`~user`/glued-redirect targets
+  rejected at resolve; second-segment destructive verbs classify
+  Consequential; `mark_stale` direction fixed. Tiers/denylist/grant scopes
+  untouched; legit `cat f | grep x` chains stay free.
 - **Inert classifier config removed (Item E):** the `[intent]`
   classifier keys are gone from the schema (7→8 version-bump migration;
   legacy files load); the classifier module stays off-hot-path for
