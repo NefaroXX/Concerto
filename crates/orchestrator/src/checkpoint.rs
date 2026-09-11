@@ -188,6 +188,12 @@ pub struct CheckpointContext {
     pub snapshot_generation: Option<String>,
     /// ADR-65 §7: the last scheduler dispatch still awaiting completion.
     pub pending_decision: Option<CheckpointPendingDecision>,
+    /// Issue #52: the decision journal captured at save time — the typed,
+    /// validated strategy decisions of this run's Coordinator decision
+    /// loop. Decision state separate from the execution ledger: persisted
+    /// additively, inspectable independently. Old checkpoints default it
+    /// empty (serde default) — additive, no bump.
+    pub decision_journal: Vec<crate::decisions::CoordinatorDecision>,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +312,15 @@ pub struct GraphCheckpoint {
     /// the recorded, evidence-backed decision a resume may continue behind.
     #[serde(default)]
     pub pending_decision: Option<CheckpointPendingDecision>,
+    /// Issue #52: the decision journal — the typed, validated strategy
+    /// decisions of the run's Coordinator decision loop, persisted
+    /// separately from the execution fields so decision state is
+    /// inspectable independently. Additive only: absent on older records
+    /// (serde default = empty journal); the §1 bump-chain stays intact and
+    /// both migrate paths fill it empty, which is the zero-value decision
+    /// state.
+    #[serde(default)]
+    pub decision_journal: Vec<crate::decisions::CoordinatorDecision>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -507,6 +522,9 @@ pub fn build_checkpoint(
         doc_resolution: context.doc_resolution.clone(),
         snapshot_generation: context.snapshot_generation.clone(),
         pending_decision: context.pending_decision.clone(),
+        // Issue #52: additive — decision state rides independently; old
+        // readers treat this key as opaque.
+        decision_journal: context.decision_journal.clone(),
     }
 }
 
@@ -1299,6 +1317,7 @@ mod tests {
                 doc_resolution: None,
                 snapshot_generation: None,
                 pending_decision: None,
+                decision_journal: Vec::new(),
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -1545,6 +1564,7 @@ mod tests {
                 doc_resolution: None,
                 snapshot_generation: None,
                 pending_decision: None,
+                decision_journal: Vec::new(),
             },
         );
 
@@ -1850,7 +1870,86 @@ mod tests {
         assert!(loaded.doc_resolution.is_none());
         assert!(loaded.snapshot_generation.is_none());
         assert!(loaded.pending_decision.is_none());
+        // Issue #52 (additive, backward-compatible): a checkpoint written
+        // before the decision journal loads with an EMPTY journal — the
+        // zero-value decision state; the migration chain never required it.
+        assert!(loaded.decision_journal.is_empty());
         assert!(loaded.validate_scope(loaded.session_id, "test").is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #52: the decision journal persists additively, INDEPENDENTLY
+    // of the execution state — a checkpoint without the key loads empty
+    // (old rows keep restoring), and a captured journal round-trips.
+    // ------------------------------------------------------------------
+
+    /// A pre-#52 v4 record with NO `decision_journal` key loads clean with
+    /// an empty journal: the key is additive only and old checkpoints are
+    /// untouched by the schema bump.
+    #[test]
+    fn old_checkpoint_without_decision_journal_loads_empty() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#52 checkpoint loads");
+        assert!(
+            loaded.decision_journal.is_empty(),
+            "the absent journal field defaults to the empty decision state"
+        );
+    }
+
+    /// A captured decision journal round-trips through the checkpoint JSON:
+    /// decision state is persisted and inspectable independently of the
+    /// execution accumulator fields (the execution fields are absent here).
+    #[test]
+    fn decision_journal_round_trips_through_checkpoint_json() {
+        let decision = crate::decisions::CoordinatorDecision {
+            id: "dec-0001".to_owned(),
+            kind: crate::decisions::DecisionKind::DispatchSpecialist,
+            target_agent: Some(AgentId::new("coder")),
+            task_description: "implement the thing".to_owned(),
+            notes: Some("coordinator choice".to_owned()),
+            supporting_evidence_ids: vec!["ev-real".to_owned()],
+            expected_artifacts: vec!["src/main.rs".to_owned()],
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            status: crate::decisions::DecisionStatus::Settled,
+        };
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "decision_journal": [decision],
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("journal loads");
+        assert_eq!(loaded.decision_journal.len(), 1, "one decision entry");
+        assert_eq!(loaded.decision_journal[0], decision, "the entry survives the round trip");
+        assert_eq!(
+            loaded.decision_journal[0].status,
+            crate::decisions::DecisionStatus::Settled,
+            "decision state is its own, independent of execution state"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -2207,6 +2207,10 @@ impl CoordinatorAgent {
             doc_resolution: self.last_doc_resolution.clone(),
             snapshot_generation: self.snapshot_generation(),
             pending_decision: self.last_dispatch_decision.clone(),
+            // Issue #52: the decision journal rides every persist so
+            // decision state is restorable/inspectable independently of the
+            // execution fields.
+            decision_journal: self.decision_journal.entries().to_vec(),
         }
     }
 
@@ -2990,6 +2994,11 @@ impl CoordinatorAgent {
         // replaces the stale pending one).
         self.last_doc_resolution = cp.doc_resolution.clone();
         self.last_dispatch_decision = cp.pending_decision.clone();
+        // Issue #52: restore decision state independently of the execution
+        // state — the journal round-trips and a resumed run keeps recording
+        // into it (additive; pre-#52 checkpoints carry an empty journal).
+        self.decision_journal =
+            crate::decisions::DecisionJournal::from_entries(cp.decision_journal.clone());
 
         // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
         let pending_decision = cp.pending_decision.clone();
@@ -3016,9 +3025,8 @@ impl CoordinatorAgent {
             self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clear();
             self.last_doc_resolution = None;
             self.last_dispatch_decision = None;
-            // Issue #52: the restored decision journal is also superseded
-            // (leaving it would carry a decided-but-invalid plan's strategy
-            // entries into a run it cannot govern).
+            // Issue #52: the restored decision journal is also superseded —
+            // a replan's strategy cannot govern the replaced plan's steps.
             self.decision_journal = crate::decisions::DecisionJournal::from_entries(Vec::new());
             warn!(
                 run_id = %cp.run_id,
