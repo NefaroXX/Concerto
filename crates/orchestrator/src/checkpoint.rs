@@ -194,6 +194,11 @@ pub struct CheckpointContext {
     /// additively, inspectable independently. Old checkpoints default it
     /// empty (serde default) — additive, no bump.
     pub decision_journal: Vec<crate::decisions::CoordinatorDecision>,
+    /// Issue #53: the coordinator progress tracker's state (fingerprint
+    /// history, equivalence streak, bounded recovery budget) captured at
+    /// save time, so stall detection survives a resume. Old checkpoints
+    /// default it empty (serde default) — additive, no bump.
+    pub progress_tracker: crate::progress::ProgressTrackerState,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +326,13 @@ pub struct GraphCheckpoint {
     /// state.
     #[serde(default)]
     pub decision_journal: Vec<crate::decisions::CoordinatorDecision>,
+    /// Issue #53: the coordinator progress tracker's state — per-cycle
+    /// observable fingerprints of the decision loop, the equivalence
+    /// streak, and the bounded recovery budget, persisted so stall
+    /// detection survives a resume. Additive only: absent on older records
+    /// (serde default = empty/zero state); old readers ignore the key.
+    #[serde(default)]
+    pub progress_tracker: crate::progress::ProgressTrackerState,
 }
 
 const fn current_schema_version() -> u32 {
@@ -525,6 +537,9 @@ pub fn build_checkpoint(
         // Issue #52: additive — decision state rides independently; old
         // readers treat this key as opaque.
         decision_journal: context.decision_journal.clone(),
+        // Issue #53: additive — stall-detection state rides independently;
+        // old readers treat this key as opaque.
+        progress_tracker: context.progress_tracker.clone(),
     }
 }
 
@@ -1318,6 +1333,7 @@ mod tests {
                 snapshot_generation: None,
                 pending_decision: None,
                 decision_journal: Vec::new(),
+                progress_tracker: crate::progress::ProgressTrackerState::default(),
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -1565,6 +1581,7 @@ mod tests {
                 snapshot_generation: None,
                 pending_decision: None,
                 decision_journal: Vec::new(),
+                progress_tracker: crate::progress::ProgressTrackerState::default(),
             },
         );
 
@@ -1949,6 +1966,75 @@ mod tests {
             loaded.decision_journal[0].status,
             crate::decisions::DecisionStatus::Settled,
             "decision state is its own, independent of execution state"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #53: the coordinator progress tracker persist additively —
+    // a checkpoint without the key loads the zero-value state (old rows
+    // keep restoring), and a captured tracker state round-trips so stall
+    // detection survives a resume.
+    // ------------------------------------------------------------------
+
+    /// A pre-#53 v4 record with NO `progress_tracker` key loads clean with
+    /// the empty state: the key is additive only and old checkpoints are
+    /// untouched by the change.
+    #[test]
+    fn old_checkpoint_without_progress_tracker_loads_default() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#53 checkpoint loads");
+        assert_eq!(
+            loaded.progress_tracker,
+            crate::progress::ProgressTrackerState::default(),
+            "the absent tracker field defaults to the zero-value progress state"
+        );
+    }
+
+    /// A captured tracker state (fingerprint history, equivalence streak,
+    /// recovery budget) round-trips through the checkpoint JSON so a
+    /// resumed run keeps its stall-detection window and budget.
+    #[test]
+    fn progress_tracker_round_trips_through_checkpoint_json() {
+        let state = crate::progress::ProgressTrackerState {
+            fingerprint_history: vec!["aaaa".to_owned(), "bbbb".to_owned(), "bbbb".to_owned()],
+            repeated_rounds: 2,
+            stall_recoveries: 1,
+            wasted_spend_usd: 0.42,
+        };
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "progress_tracker": state,
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("tracker state loads");
+        assert_eq!(
+            loaded.progress_tracker, state,
+            "stall-detection state survives the round trip (resume persistence)"
         );
     }
 

@@ -46,6 +46,7 @@ pub use relationship::{
     AgentHandoff, AgentRelationship, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
 pub mod planner;
+pub mod progress;
 pub mod prompts;
 mod read_cache;
 pub mod registry;
