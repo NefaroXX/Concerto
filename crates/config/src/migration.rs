@@ -13,7 +13,8 @@
 //! | 3    | 4  | Add `shell_settings: None` (ADR-28 shell profiles) |
 //! | 4    | 5  | Add `[skills]`/`[mcp]` sections, serde-defaulted to `None` (ADR-43) |
 //! | 5    | 6  | Drop `mode`/`[intent]` — intent gate is the only routing path (ADR-55 Phase 1e) |
-//! | 6    | 7  | Add `[intent]` classifier keys, defaulted on (ADR-55 Phase 2c; ADR-56) |
+//! | 6    | 7  | Add `[intent]` classifier keys (ADR-55 Phase 2c; ADR-56) — retired at v8 |
+//! | 7    | 8  | Drop the `[intent]` classifier keys — classifier is off the run hot path, no reader (ADR-56 2026-09-11 clarification) |
 //!
 //! # Policy
 //!
@@ -48,6 +49,7 @@ pub fn migrate_config(config: AppConfig) -> Result<AppConfig, ConfigError> {
             4 => current = migrate_v4_to_v5(current)?,
             5 => current = migrate_v5_to_v6(current)?,
             6 => current = migrate_v6_to_v7(current)?,
+            7 => current = migrate_v7_to_v8(current)?,
             v => {
                 return Err(ConfigError::SchemaMismatch {
                     found: v,
@@ -95,8 +97,6 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         project_roots: config.project_roots,
         // v5 adds [context] (ADR-48); additive Option defaults to None.
         context: None,
-        // v7 adds [intent] (ADR-55 Phase 2c); filled by migrate_v6_to_v7.
-        intent: None,
         // [tools] is additive and default-on; old configs keep it None.
         tool_settings: None,
         orchestration: None,
@@ -137,8 +137,6 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         project_roots: config.project_roots,
         // v5 adds [context] (ADR-48); preserve any deserialized value.
         context: config.context,
-        // v7 adds [intent] (ADR-55 Phase 2c); filled by migrate_v6_to_v7.
-        intent: None,
         // [tools] is additive and default-on; old configs keep it None.
         tool_settings: None,
         orchestration: None,
@@ -180,17 +178,26 @@ fn migrate_v5_to_v6(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
 
 /// v6 → v7: Add `[intent]` classifier keys (ADR-55 Phase 2c; ADR-56).
 ///
-/// Insert-only, mirroring `migrate_v3_to_v4`'s fill style: when the section is
-/// absent it is inserted with defaults (classifier enabled, no model, 0.7
-/// threshold — ADR-56 §2 flipped the Phase 2c default pin to on). Re-adding
-/// `[intent]` does NOT resurrect the `mode`/`enabled` keys dropped at v5→v6 —
-/// v7 adds only the three classifier keys and the gate stays always-on. The
-/// version bump mirrors `migrate_v4_to_v5`/`migrate_v5_to_v6`.
+/// Historical step. The surface it inserted was retired at v7 → v8, so with
+/// the struct no longer carrying the section this step is now a version bump
+/// only — mirroring `migrate_v4_to_v5`/`migrate_v5_to_v6`. No user field is
+/// modified (insert-only policy).
 fn migrate_v6_to_v7(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
-    if config.intent.is_none() {
-        config.intent = Some(crate::schema::IntentConfig::default());
-    }
     config.schema_version = 7;
+    Ok(config)
+}
+
+/// v7 → v8: Drop the retired `[intent]` classifier keys (ADR-56, the
+/// 2026-09-11 clarification).
+///
+/// With the classifier off the run hot path the three classifier keys serve
+/// no reader and `AppConfig` no longer carries the section. The fields cease
+/// to exist in the struct; stale TOML keys are ignored at load because
+/// `AppConfig` has no `deny_unknown_fields` — the same trajectory as the
+/// v5 → v6 `mode`/`[intent]` removal. Version bump only; no user field is
+/// modified or deleted.
+fn migrate_v7_to_v8(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
+    config.schema_version = 8;
     Ok(config)
 }
 
@@ -223,7 +230,6 @@ mod tests {
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
-            intent: None,
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
@@ -252,7 +258,6 @@ mod tests {
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
-            intent: None,
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
@@ -263,7 +268,7 @@ mod tests {
     fn v1_to_v2_adds_observability_default() {
         let v1 = v1_fixture();
         let v2 = migrate_config(v1).expect("v1→v2 migration should succeed");
-        assert_eq!(v2.schema_version, 7);
+        assert_eq!(v2.schema_version, 8);
         assert_eq!(v2.observability, None);
         assert_eq!(v2.primary_provider.as_deref(), Some("anthropic"));
         assert_eq!(v2.session_spend_cap_usd, Some(5.0));
@@ -273,7 +278,7 @@ mod tests {
     fn v2_to_v3_adds_model_settings_default() {
         let v2 = v2_fixture();
         let v3 = migrate_config(v2).expect("v2→v3 migration should succeed");
-        assert_eq!(v3.schema_version, 7);
+        assert_eq!(v3.schema_version, 8);
         assert_eq!(v3.model_settings, None);
         assert_eq!(v3.primary_provider.as_deref(), Some("openai"));
     }
@@ -301,13 +306,12 @@ mod tests {
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
-            intent: None,
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
         };
         let result = migrate_config(v3.clone()).expect("v3 should pass through");
-        assert_eq!(result.schema_version, 7);
+        assert_eq!(result.schema_version, 8);
         assert_eq!(result.primary_provider.as_deref(), Some("anthropic"));
         assert_eq!(result.model_settings, None);
     }
@@ -326,7 +330,7 @@ mod tests {
     fn v3_to_v4_adds_shell_settings_with_default_profiles() {
         let v3 = AppConfig { schema_version: 3, shell_settings: None, ..v1_fixture() };
         let v4 = migrate_config(v3).expect("v3→v4 migration should succeed");
-        assert_eq!(v4.schema_version, 7);
+        assert_eq!(v4.schema_version, 8);
         assert!(v4.shell_settings.is_some(), "v4 must have shell_settings populated");
 
         let ss = v4.shell_settings.unwrap();
@@ -338,7 +342,7 @@ mod tests {
     fn v4_to_v5_adds_skills_and_mcp_defaults() {
         let v4 = AppConfig { schema_version: 4, ..v1_fixture() };
         let v5 = migrate_config(v4).expect("v4→v5 migration should succeed");
-        assert_eq!(v5.schema_version, 7);
+        assert_eq!(v5.schema_version, 8);
         // Insert-only: the new sections default to None, user fields untouched.
         assert_eq!(v5.skills, None);
         assert_eq!(v5.mcp, None);
@@ -350,48 +354,34 @@ mod tests {
     fn v5_to_v6_drops_mode_and_intent_keys() {
         let v5 = AppConfig { schema_version: 5, ..v1_fixture() };
         let v6 = migrate_config(v5).expect("v5→v6 migration should succeed");
-        assert_eq!(v6.schema_version, 7);
+        assert_eq!(v6.schema_version, 8);
         // The struct no longer carries `mode`/`[intent]`; stale TOML keys are
         // ignored at load because AppConfig has no deny_unknown_fields.
         assert_eq!(v6.primary_provider.as_deref(), Some("anthropic"));
         assert_eq!(v6.session_spend_cap_usd, Some(5.0));
     }
 
-    /// ADR-56 §2: v6 configs migrate with `[intent]` inserted and defaulted
-    /// (classifier ON — the superseding default-pin flip). Re-adding the
-    /// section does NOT resurrect the v6-dropped `mode`/`enabled` keys — only
-    /// the three classifier keys.
+    /// v6 → v7 historically inserted the `[intent]` classifier surface; that
+    /// surface was retired at v7 → v8, so the step is now a version bump only.
     #[test]
-    fn v6_to_v7_inserts_intent_section_with_defaults() {
+    fn v6_to_v7_is_a_version_bump_only() {
         let v6 = AppConfig { schema_version: 6, ..v1_fixture() };
         let v7 = migrate_config(v6).expect("v6→v7 migration should succeed");
-        assert_eq!(v7.schema_version, 7);
-        let intent = v7.intent.expect("v7 must carry the [intent] section");
-        assert!(intent.classifier_enabled, "classifier defaults to on (ADR-56)");
-        assert_eq!(intent.classifier_model, None, "no classifier model by default");
-        assert_eq!(
-            intent.classifier_confidence_threshold,
-            concerto_core::LOW_CONFIDENCE_THRESHOLD,
-            "threshold defaults to LOW_CONFIDENCE_THRESHOLD (0.7)"
-        );
+        assert_eq!(v7.schema_version, 8);
         assert_eq!(v7.primary_provider.as_deref(), Some("anthropic"));
         assert_eq!(v7.session_spend_cap_usd, Some(5.0));
     }
 
-    /// ADR-55 Phase 2c §2: an existing `[intent]` section survives the
-    /// migration untouched (insert-only), including the classifier keys.
+    /// v7 → v8: the `[intent]` classifier surface retires (ADR-56, the
+    /// 2026-09-11 clarification). Version bump only — the fields cease to
+    /// exist in the struct; stale TOML keys are ignored at load because
+    /// AppConfig has no deny_unknown_fields, and no user field is modified.
     #[test]
-    fn v6_to_v7_preserves_existing_intent_section() {
-        let mut v6 = AppConfig { schema_version: 6, ..v1_fixture() };
-        v6.intent = Some(crate::schema::IntentConfig {
-            classifier_enabled: true,
-            classifier_model: Some("claude-sonnet".into()),
-            classifier_confidence_threshold: 0.85,
-        });
-        let v7 = migrate_config(v6).expect("v6→v7 migration should succeed");
-        let intent = v7.intent.expect("existing [intent] section must be preserved");
-        assert!(intent.classifier_enabled);
-        assert_eq!(intent.classifier_model.as_deref(), Some("claude-sonnet"));
-        assert_eq!(intent.classifier_confidence_threshold, 0.85);
+    fn v7_to_v8_drops_intent_classifier_keys() {
+        let v7 = AppConfig { schema_version: 7, ..v1_fixture() };
+        let v8 = migrate_config(v7).expect("v7→v8 migration should succeed");
+        assert_eq!(v8.schema_version, 8);
+        assert_eq!(v8.primary_provider.as_deref(), Some("anthropic"));
+        assert_eq!(v8.session_spend_cap_usd, Some(5.0));
     }
 }
