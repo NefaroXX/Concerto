@@ -90,9 +90,7 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// between the global file and env so per-project overrides (policy rules, model pins, spend cap)
 /// can be committed to the project repo or gitignored as desired.
 ///
-/// Environment variables: `CONCERTO_*` is the primary prefix. As a
-/// convenience, `OPENCODE_RS_*` variables are also merged so existing
-/// shell configs continue working.
+/// Environment variables: `CONCERTO_*` is the primary prefix.
 ///
 /// If the loaded config has an older `schema_version`, automatic schema
 /// migration is applied (see [`migration::migrate_config`]).
@@ -135,26 +133,16 @@ fn load_config_layers(
         let project_file = root.join(legacy::NEW_PROJECT_CONFIG_FILE);
         if project_file.exists() {
             figment = figment.merge(Toml::file(&project_file));
-        } else if let Some(parent) = project_file.parent() {
-            // Legacy project file fallback
-            let legacy_project = parent.join(legacy::OLD_PROJECT_CONFIG_FILE);
-            if legacy_project.exists() {
-                figment = figment.merge(Toml::file(&legacy_project));
-            }
         }
     }
 
-    // 3) Env vars (highest priority over files). Both prefixes remain readable
-    //    for migration; callers should not define the same key under both.
-    //    `project_roots` is excluded from the env providers: its env source is
+    // 3) Env vars (highest priority over files). `project_roots` is excluded from the env providers: its env source is
     //    a path-separated scalar (`CONCERTO_PROJECT_ROOTS`), which would fail
     //    `Vec` deserialization during figment extraction. It is parsed
     //    explicitly after extraction (ADR-44).
     if include_environment {
         figment =
             figment.merge(Env::prefixed(legacy::NEW_ENV_PREFIX).filter(|k| k != "project_roots"));
-        figment =
-            figment.merge(Env::prefixed(legacy::OLD_ENV_PREFIX).filter(|k| k != "project_roots"));
     }
 
     let config: AppConfig = figment.extract().map_err(|e| ConfigError::Load(e.to_string()))?;
@@ -555,6 +543,45 @@ mod tests {
         let global = load_global_config(Some(&global_path)).unwrap();
         assert_eq!(effective.session_spend_cap_usd, Some(2.0));
         assert_eq!(global.session_spend_cap_usd, Some(1.0));
+    }
+
+    /// The old project-scoped filename is no longer read: a stale
+    /// `.opencode-rs.toml` in the project root must be ignored entirely
+    /// (nothing ever generated it — the rename predates first use).
+    #[test]
+    fn stale_opencode_rs_project_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        std::fs::write(
+            project.join(".opencode-rs.toml"),
+            format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 3.0\n"),
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&global_path), Some(&project)).unwrap();
+        assert_eq!(
+            cfg.session_spend_cap_usd, None,
+            "stale .opencode-rs.toml must provide no overrides"
+        );
+    }
+
+    /// The old `OPENCODE_RS_*` env prefix is no longer merged by the config
+    /// loader — only `CONCERTO_*` applies.
+    #[test]
+    fn opencode_rs_env_prefix_is_not_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_global = dir.path().join("nonexistent-config.toml");
+        std::env::set_var("OPENCODE_RS_SESSION_SPEND_CAP_USD", "9.0");
+        let cfg = load_config(Some(&fake_global), Some(dir.path())).unwrap();
+        assert_ne!(
+            cfg.session_spend_cap_usd,
+            Some(9.0),
+            "OPENCODE_RS_* env vars must not reach the config"
+        );
+        std::env::remove_var("OPENCODE_RS_SESSION_SPEND_CAP_USD");
     }
 
     #[test]
