@@ -150,7 +150,9 @@ impl PluginManager {
     /// Register plugin tools into the given registry.
     ///
     /// Tool names are prefixed with `plugin:<plugin_id>:` if a conflict exists
-    /// with existing tools, otherwise the friendly name is used.
+    /// with existing tools (or the name is a reserved grant-sensitive /
+    /// orchestration name: `call_specialist`, `filesystem`, `git`, `shell`),
+    /// otherwise the friendly name is used.
     pub fn register_tools(
         &mut self,
         plugin_id: &str,
@@ -180,12 +182,10 @@ impl PluginManager {
             return Ok(());
         }
 
-        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let registered_names =
+            register_plugin_tools(plugin_id, plugin_arc.clone(), &tools, registry);
 
-        // Register tools into the registry.
-        register_plugin_tools(plugin_id, plugin_arc.clone(), &tools, registry);
-
-        self.plugin_tools.insert(plugin_id.to_string(), tool_names);
+        self.plugin_tools.insert(plugin_id.to_string(), registered_names.clone());
 
         Ok(())
     }

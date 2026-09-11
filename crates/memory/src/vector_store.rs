@@ -594,12 +594,21 @@ impl VectorStore for SqliteVectorStore {
         model_version: &str,
         _cancel: CancellationToken,
     ) -> Result<(), MemoryError> {
-        sqlx::query("UPDATE vector_store SET stale = 1 WHERE project_id = ? AND model_version = ?")
-            .bind(&project_id.0)
-            .bind(model_version)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| MemoryError::Persistence(e.to_string()))?;
+        // Staleness is the MODEL-VERSION MISMATCH: rows carrying the current
+        // model version are the fresh embeddings this refresh will keep; rows
+        // produced by an EARLIER model (`model_version != current`, e.g. after
+        // a fastembed bump) are the ones marked stale for re-indexing. The
+        // inverted `=` match would have marked the fresh rows and skipped
+        // everything actually needing re-index — 2026-09-11 fix. The column is
+        // NOT NULL, so no IS-NULL arm is needed.
+        sqlx::query(
+            "UPDATE vector_store SET stale = 1 WHERE project_id = ? AND model_version != ?",
+        )
+        .bind(&project_id.0)
+        .bind(model_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MemoryError::Persistence(e.to_string()))?;
         Ok(())
     }
 

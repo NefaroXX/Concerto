@@ -154,11 +154,15 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
 
 /// Flatten command + args into whitespace-separated tokens with surrounding
 /// shell quotes stripped, mirroring the denylist's flattened-string scan.
+/// Newline/CR list separators (ADR-55 shell lists: `a\nb` sequences the shell
+/// as two commands) cannot survive whitespace tokenization, so they are
+/// translated into explicit `;` separator tokens that [`list_segments`] can
+/// split on — a quoted multi-line body conservatively gains the separator too.
 fn flat_tokens(command: &str, args: &[String]) -> Vec<String> {
-    let mut flat = command.to_string();
+    let mut flat = command.replace(['\n', '\r'], " ; ");
     for arg in args {
         flat.push(' ');
-        flat.push_str(arg);
+        flat.push_str(&arg.replace(['\n', '\r'], " ; "));
     }
     flat.split_whitespace()
         .filter(|token| !token.is_empty())
@@ -221,6 +225,17 @@ pub(crate) fn msys_drive_to_windows(target: &str) -> Option<String> {
     out.push_str(&rest[letter.len_utf8()..]);
     Some(out)
 }
+
+/// Interpolation metacharacters that make a path target unresolvable at scan
+/// time: the shell expands `$`/backtick substitutions against its own
+/// environment, so the running command's real target is NOT the literal the
+/// scanner anchors (`tee $HOME/x` scans as an in-root relative literal while
+/// the shell writes to the real home — the `$HOME`-spelling asymmetry with
+/// `~/x`, which is expanded and contained). Mirrors the `$`/backtick members
+/// of [`SHELL_INTERPOLATION_CHARS`] (core authorization, tier classifier);
+/// `%`/quote chars stay with the tier classifier (quotes are already stripped
+/// per-token by `flat_tokens`).
+const INTERPOLATION_TARGET_CHARS: &[char] = &['$', '`'];
 
 /// Canonical form of the containment trust anchor.
 fn canonical_root(root: &Utf8Path) -> Result<Utf8PathBuf, ToolError> {
@@ -288,6 +303,36 @@ fn strip_trailing_command_punct(token: &str) -> &str {
 /// components) so new in-root files stay reachable without letting `..`/
 /// symlink tricks climb above the root.
 fn resolve_within(root: &Utf8Path, cwd: &Utf8Path, target: &str) -> Result<Utf8PathBuf, ToolError> {
+    // An interpolation-carrying target is unresolvable, not in-root: the
+    // shell expands the metacharacters after containment returns, so the
+    // lexical candidate is a lie. Reject without execution (2026-09-11: the
+    // `$HOME`-spelling asymmetry — `~/x` expands and is contained, `$HOME/x`
+    // scanned as a harmless relative literal). `/dev/null`-style devices
+    // below cannot contain these characters, so order is immaterial.
+    if target.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)) {
+        return Err(ToolError::VirtualFsConflict {
+            path: Utf8PathBuf::from(target),
+            reason: "shell containment (ADR-55): target contains shell-interpolation \
+                     metacharacters ('$' or '`'); the path the shell resolves cannot \
+                     be scanned and the command is rejected without execution"
+                .into(),
+        });
+    }
+    // A `~user` tilde form (`~root`, `~root/x`) expands in the shell to that
+    // user's home directory — NOT the in-root relative literal
+    // [`build_candidate`] would scan it as. Only the exact `~` (own home)
+    // and `~/...` forms are resolvable here; every other `~`-prefixed target
+    // is rejected without execution (2026-09-11: `~root/x` scanned as an
+    // in-root literal while bash resolved `/root/x`).
+    if target.starts_with('~') && target != "~" && !target.starts_with("~/") {
+        return Err(ToolError::VirtualFsConflict {
+            path: Utf8PathBuf::from(target),
+            reason: "shell containment (ADR-55): '~user' tilde form expands to \
+                     another user's home directory outside the project root; \
+                     command rejected without execution"
+                .into(),
+        });
+    }
     // `/dev/null` and the Windows reserved device names (`nul`, `con`, `prn`,
     // `aux`, `com1`..`com9`, `lpt1`..`lpt9`) are devices, not confined files:
     // canonicalization and root-prefix checks cannot meaningfully confine
@@ -489,19 +534,31 @@ fn scan_redirects(
             continue;
         }
         // Operator glued to its target: `2>/tmp/x`, `>file`, `</etc/passwd`.
+        // Interpolation-carrying glue (`>$HOME`, `>$(cmd)`, `>$VAR`) must flow
+        // into `resolve_within` too (2026-09-11: `$`/backtick targets are not
+        // path-like, so a read-only segment lead exempted them downstream and
+        // the shell expanded the write target out-of-root). `2>&1`/`>&2`
+        // remainders carry neither metacharacter and stay passable.
         if let Some(idx) = token.rfind('>') {
             let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
             let after = strip_trailing_command_punct(after);
-            if !after.is_empty() && is_path_like(after) {
+            if !after.is_empty()
+                && (is_path_like(after)
+                    || after.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)))
+            {
                 resolve_within(root, cwd, after)?;
             }
             continue;
         }
-        // Input-redirect glued to its target: `</etc/passwd`.
+        // Input-redirect glued to its target: `</etc/passwd`. Same gate as the
+        // write-branch above.
         if let Some(idx) = token.find('<') {
             let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
             let after = strip_trailing_command_punct(after);
-            if !after.is_empty() && is_path_like(after) {
+            if !after.is_empty()
+                && (is_path_like(after)
+                    || after.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)))
+            {
                 resolve_within(root, cwd, after)?;
             }
         }
@@ -582,92 +639,147 @@ fn scan_git_change_dir(
     Ok(())
 }
 
-/// A pipe (`|`) segment of the flattened token list: the token-index range
-/// plus the segment's leading verb when one is known. A pipe ends the current
-/// segment whether it is a standalone token or glued inside one (`ls|tee`,
-/// `x|`); a non-empty post-glue remainder (`ls|tee` → `tee`) becomes the next
-/// segment's leading verb, so the first token after the glue is governed by
-/// the running executable the shell actually resolves there.
-struct PipeSegment {
-    start: usize,
-    end: usize,
+/// A list segment of the flattened token list: the content sections (each a
+/// flattened-token index plus its pre-boundary character content) the shell
+/// will sequence as one command, plus the segment's leading verb when one is
+/// known. Every shell list separator ends the current segment — standalone
+/// (`|`, `&&`, `||`, `;`) or glued inside a token (`/;`, `ls&&rm`); a
+/// non-empty post-glue section (`ls|tee` → `tee`) becomes the next segment's
+/// leading verb, so the first token after the boundary is governed by the
+/// running executable the shell actually resolves there.
+struct ListSegment {
+    sections: Vec<(usize, String)>,
     lead: Option<String>,
 }
 
-/// Split the flattened token list into [`PipeSegment`]s, modeling pipes the
-/// way the shell will sequence them: on every `|` — standalone token, glued
-/// inside a token, or trailing a token. Segments that contain no tokens are
-/// skipped. This is the containment counterpart of the tier classifier's
-/// segment split (`authorization.rs command_segments`).
-fn pipe_segments(tokens: &[String]) -> Vec<PipeSegment> {
+/// Width (in characters) of the shell operator at `bytes[pos..]`, or `0` when
+/// that position starts no separator. Operator-aware exactly like the tier
+/// classifier's [`SHELL_SEGMENT_SEPARATORS`] split: glued `&&`/`||` are ONE
+/// boundary (`a||cat /etc/os-release` must not yield a bogus `|`-prefixed
+/// lead that misclassifies a legitimate fallback), while a lone `|` is the
+/// pipe and single `&`/`;`/`\n`/`\r` are plain list separators.
+fn separator_width(s: &str, pos: usize) -> usize {
+    let bytes = s.as_bytes();
+    match bytes[pos] {
+        b'&' if bytes.get(pos + 1) == Some(&b'&') => 2,
+        b'|' if bytes.get(pos + 1) == Some(&b'|') => 2,
+        b'&' | b'|' | b';' | b'\n' | b'\r' => 1,
+        _ => 0,
+    }
+}
+
+/// Split one flattened token into [`ListSegment`] content sections: alternating
+/// non-separator content (carrying the token's index) and separator runs
+/// (`None`), with `&&`/`||` kept as single boundaries.
+fn token_sections(index: usize, token: &str) -> Vec<Option<(usize, String)>> {
+    let mut sections = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = token[cursor..].find(['&', '|', ';', '\n', '\r']) {
+        let pos = cursor + rel;
+        let head = &token[cursor..pos];
+        if !head.is_empty() {
+            sections.push(Some((index, head.to_string())));
+        }
+        let width = separator_width(token, pos);
+        sections.push(None);
+        cursor = pos + width;
+    }
+    let tail = &token[cursor..];
+    if !tail.is_empty() {
+        sections.push(Some((index, tail.to_string())));
+    }
+    sections
+}
+
+/// Split the flattened token list into [`ListSegment`]s, modeling command
+/// lists the way the shell will sequence them: on every separator —
+/// `&`, `|`, `;`, `\n`, `\r` — standalone, glued inside a token, or trailing a
+/// token, with glued `&&`/`||` recognized as single boundaries. Segments that
+/// contain no content sections are skipped. This mirrors the tier classifier's
+/// segment split (`authorization.rs command_segments`) so a read-only leading
+/// verb exempts only its own list segment: `ls /; rm /etc/shadow` and
+/// `ls / && rm -f ~/…` cannot launder the mutating segment behind `ls`'s
+/// read-only tier.
+fn list_segments(tokens: &[String]) -> Vec<ListSegment> {
     let mut segments = Vec::new();
-    let mut start = 0usize;
-    let mut lead: Option<String> = None;
-    for (i, token) in tokens.iter().enumerate() {
-        if token == "|" {
-            // Standalone pipe: close the current segment; the `|` itself
-            // carries no content of interest to the path scan.
-            if start < i {
-                segments.push(PipeSegment { start, end: i, lead: lead.clone() });
+    let mut current: Option<ListSegment> = None;
+    for (index, token) in tokens.iter().enumerate() {
+        for section in token_sections(index, token) {
+            match section {
+                None => {
+                    if let Some(segment) = current.take() {
+                        segments.push(segment);
+                    }
+                }
+                Some(section) => {
+                    let segment = current
+                        .get_or_insert_with(|| ListSegment { sections: Vec::new(), lead: None });
+                    segment.sections.push(section.clone());
+                    if segment.lead.is_none() {
+                        segment.lead = Some(section.1);
+                    }
+                }
             }
-            start = i + 1;
-            lead = None;
-            continue;
-        }
-        if let Some(pos) = token.find('|') {
-            if lead.is_none() && pos > 0 {
-                lead = Some(token[..pos].to_string());
-            }
-            // Glued pipe: the token still belongs to the pre-pipe segment
-            // (its head is real input to that verb), then the segment ends.
-            if start < i {
-                segments.push(PipeSegment { start, end: i + 1, lead: lead.clone() });
-            }
-            let post = strip_trailing_command_punct(&token[pos + 1..]);
-            start = i + 1;
-            lead = if post.is_empty() { None } else { Some(post.to_string()) };
-            continue;
-        }
-        if lead.is_none() {
-            lead = Some(token.clone());
         }
     }
-    if start < tokens.len() {
-        segments.push(PipeSegment { start, end: tokens.len(), lead });
+    if let Some(segment) = current {
+        segments.push(segment);
     }
     segments
 }
 
 /// General path-argument containment: for mutation-capable leads, any
 /// path-like token that resolves outside the project root rejects the
-/// command. The exemption is PER PIPE SEGMENT: a read-only leading verb
+/// command. The exemption is PER LIST SEGMENT: a read-only leading verb
 /// exempts only its own segment's tokens — a later `tee`/mutating segment in
 /// a pipe (`cat f | tee /tmp/x`) is a self-contained mutation and must have
 /// its targets contained like any other write.
+///
+/// A glued token may carry content sections of SEVERAL segments (`cat a||rm
+/// x` → sections `a` and the tail); a token is read-only-exempt only when
+/// EVERY content section it carries belongs to a read-only segment — any
+/// mutating section on the same token disables the exemption for the whole
+/// token (conservative: a false positive only costs a rejection).
 fn scan_path_arguments(
     root: &Utf8Path,
     cwd: &Utf8Path,
     tokens: &[String],
     exempt: &HashSet<usize>,
 ) -> Result<(), ToolError> {
-    let mut read_only_by_token = vec![false; tokens.len()];
-    for segment in pipe_segments(tokens) {
-        let read_only = segment
-            .lead
-            .as_ref()
-            .is_some_and(|lead| is_read_only(lead, &tokens[segment.start + 1..segment.end]));
-        for flag in &mut read_only_by_token[segment.start..segment.end] {
-            *flag = read_only;
+    // Per original token: how many content sections cover it, and whether all
+    // covering segments are read-only. A token with zero content sections
+    // (pure separator) stays out of the general scan.
+    let mut section_count = vec![0u32; tokens.len()];
+    let mut all_read_only = vec![true; tokens.len()];
+    for segment in list_segments(tokens) {
+        let lead = segment.lead.clone().unwrap_or_default();
+        // A segment's trailing tokens for write-flag detection: the flattened
+        // tokens carrying this segment's content (the lead's own token
+        // included only when it is not the lead itself).
+        let trailing: Vec<String> =
+            segment.sections.iter().skip(1).map(|(index, _)| tokens[*index].clone()).collect();
+        let read_only = is_read_only(&lead, &trailing);
+        for (index, _) in &segment.sections {
+            section_count[*index] += 1;
+            if !read_only {
+                all_read_only[*index] = false;
+            }
         }
     }
     for (i, token) in tokens.iter().enumerate() {
-        if exempt.contains(&i) || i == 0 {
+        if exempt.contains(&i) || i == 0 || section_count[i] == 0 {
             continue;
         }
-        if read_only_by_token[i] {
+        if all_read_only[i] {
             continue;
         }
-        if is_path_like(token) {
+        // An interpolation-carrying token (`$HOME`, a backtick form) is not
+        // necessarily path-like — `$HOME` has no `/`/`.`/`~`/`\` — so the
+        // path-shape gate alone would skip it and the shell would expand it
+        // out-of-root after containment returned (2026-09-11: `rm -rf $HOME`,
+        // `mv f $HOME`, `tee >(rm -rf $HOME)`). Flow it into `resolve_within`,
+        // whose interpolation rule rejects it without execution.
+        if is_path_like(token) || token.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)) {
             resolve_within(root, cwd, strip_trailing_command_punct(token))?;
         }
     }
@@ -808,6 +920,132 @@ mod tests {
     // -----------------------------------------------------------------------
     // Read-only verb exemption vs mutation-capable path arguments.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn interpolation_metachar_targets_are_unresolvable() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // The `$HOME`-spelling asymmetry (2026-09-11): `$HOME/x` scanned as an
+        // in-root relative literal while the shell expands it to the real
+        // home (the same as `~/x`, which containment blocks). Targets carrying
+        // `$` / a backtick are UNRESOLVABLE at scan time → reject.
+        for command in ["tee $HOME/x", "cat f > $HOME/x", ">$HOME/x", "cat f >> $(pwd)/x"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated target, got: {err}"
+            );
+        }
+        // The backtick-substituted form rejects like `$HOME`.
+        let err = contain_shell_command(&root, &root, "tee", &["`pwd`/x".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("shell-interpolation"),
+            "backtick target must reject, got: {err}"
+        );
+        // Plain in-root relative targets keep passing — no over-block.
+        contain_shell_command(&root, &root, "tee out.txt", &[]).expect("in-root tee allowed");
+        contain_shell_command(&root, &root, "cat f > out.txt", &[]).expect("in-root > allowed");
+        contain_shell_command(&root, &root, "cat f > sub/out.txt", &[])
+            .expect("in-root subdir > allowed");
+    }
+
+    #[test]
+    fn interpolation_token_in_mutating_segment_rejected_even_without_path_shape() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // N-1 (2026-09-11): `$HOME` carries no `/`/`.`/`~`/`\`, so it is not
+        // path-like and previously skipped the general path scan entirely —
+        // `rm -rf $HOME` passed containment and executed out-of-root on
+        // approval. Any `$`/backtick token in a mutating segment must reject.
+        for command in ["rm -rf $HOME", "mv f $HOME", "tee >(rm -rf $HOME)"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated target, got: {err}"
+            );
+        }
+        // The `$`-free in-root forms keep working — no over-block.
+        contain_shell_command(&root, &root, "rm -rf subdir", &[]).expect("in-root rm allowed");
+        contain_shell_command(&root, &root, "mv f out", &[]).expect("in-root mv allowed");
+        contain_shell_command(&root, &root, "tee >(rm -rf subdir)", &[])
+            .expect("in-root process substitution allowed");
+        // Read-only verbs keep their exemption: `echo $HOME` only prints.
+        contain_shell_command(&root, &root, "echo $HOME", &[]).expect("read-only echo allowed");
+    }
+
+    #[test]
+    fn glued_redirect_interpolated_targets_rejected_under_read_only_lead() {
+        let (root, _dir) = temp_root();
+        // HIGH-sibling (2026-09-11): a glued redirect target carrying `$`/a
+        // backtick is not path-like, so the glued-branch gate skipped it and a
+        // read-only segment lead (`echo`, `cat`) exempted the token downstream
+        // — the shell then expanded the write target out-of-root. Every
+        // interpolated glued write target must reject via `resolve_within`.
+        for command in [
+            "echo x >$HOME",
+            "echo x >$(echo /tmp/pwned)",
+            "FOO=/tmp/x; echo hi >$FOO",
+            "echo x >`/tmp/x`",
+            "FOO=/tmp/x; echo hi <`$FOO`",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated redirect target, got: {err}"
+            );
+        }
+        // Spaced forms were already contained via the standalone branch and
+        // stay rejected.
+        assert!(
+            contain_shell_command(&root, &root, "echo x > /tmp/y", &[]).is_err(),
+            "spaced outside-root redirect must stay rejected"
+        );
+        // A glued bare in-root name without interpolation keeps working.
+        contain_shell_command(&root, &root, "cat f >out", &[])
+            .expect("glued in-root bare redirect target allowed");
+        contain_shell_command(&root, &root, "cat f <in", &[])
+            .expect("glued in-root bare input target allowed");
+        // `2>&1`/`>&2` remainders and a glued extension-bearing name stay
+        // passable — no metadata characters, resolved as in-root literals.
+        contain_shell_command(&root, &root, "echo hi 2>&1", &[])
+            .expect("glued 2>&1 remainder allowed");
+        contain_shell_command(&root, &root, "echo hi >&2", &[])
+            .expect("glued >&2 remainder allowed");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("glued 2>err.log behavior unchanged");
+    }
+
+    #[test]
+    fn tilde_user_form_rejected_own_home_forms_unchanged() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // N-3 (2026-09-11): `~root/x` is not `~`/`~/…`, so `build_candidate`
+        // scanned it as the in-root relative literal `<root>/~root/x` while
+        // bash expands it to `/root/x` — an unanchored escape. Every
+        // `~`-prefixed target other than exactly `~` or `~/…` must reject.
+        for command in ["mv f ~root/", "cat f > ~root/x", "rm -rf ~root", "cd ~root"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("~root"),
+                "'{command}' must reject the tilde-user target, got: {err}"
+            );
+        }
+        // The resolvable tilde forms keep their existing behavior: `~` and
+        // `~/x` expand to the (out-of-root) home and are rejected by the
+        // ordinary outside-root rule — NOT by the new tilde-user rule.
+        for target in ["~", "~/x"] {
+            let err = resolve_within(&root, &root, target).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{target}' must still reject as outside-root, got: {err}"
+            );
+        }
+        // Plain relative targets are untouched.
+        contain_shell_command(&root, &root, "mv f out", &[]).expect("plain relative allowed");
+        contain_shell_command(&root, &root, "mv f ./out", &[]).expect("dot-relative allowed");
+        contain_shell_command(&root, &root, "mv f sub/out", &[]).expect("subdir target allowed");
+        let _ = dir;
+    }
 
     #[test]
     fn read_only_verb_outside_absolute_allowed() {
@@ -956,6 +1194,48 @@ mod tests {
             .expect("in-root tee target allowed");
         contain_shell_command(&root, &root, "cat f | tee sub/out.txt", &[])
             .expect("in-root subdir tee target allowed");
+    }
+
+    #[test]
+    fn fallback_splitter_lets_legit_fallback_through() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // `||` (glued or spaced) is a boundary, not a pipe: the fallback
+        // segment keeps its own read-only lead and legitimate fallback reads
+        // stay allowed.
+        contain_shell_command(&root, &root, "cat a || cat /etc/os-release", &[])
+            .expect("spaced || fallback read allowed");
+        contain_shell_command(&root, &root, "cat f||cat /etc/os-release", &[])
+            .expect("glued || fallback read allowed");
+        // The bogus `|`-lead must not survive splitting; unit-check segments.
+        let segs = list_segments(&["cat".into(), "a||cat".into(), "/etc/os-release".into()]);
+        let leads: Vec<Option<&str>> = segs.iter().map(|s| s.lead.as_deref()).collect();
+        assert_eq!(leads, vec![Some("cat"), Some("cat")], "|| must not produce a `|` lead");
+        // A lone `|` in a chain of reads stays read-only (unchanged).
+        contain_shell_command(&root, &root, "cat f|grep x", &[]).expect("pipe read allowed");
+    }
+
+    #[test]
+    fn read_only_lead_cannot_exempt_later_list_segments() {
+        let (root, _dir) = temp_root();
+        // The read-only exemption is scoped per list segment: a mutating
+        // segment after `&`/`;`/`&&`/`||`/newline separators keeps scanning
+        // even when the FIRST segment's verb is read-only.
+        for command in [
+            "ls /; rm /etc/shadow",
+            "ls / && rm -f ~/.ssh/authorized_keys",
+            "ls /; rm -rf ../outside",
+            "ls /\nrm /etc/shadow",
+            "cat f & rm /etc/shadow",
+            "cat f||rm /etc/shadow",
+            "ls /&&rm -f ../outside",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the mutating later segment, got: {err}"
+            );
+        }
     }
 
     #[test]

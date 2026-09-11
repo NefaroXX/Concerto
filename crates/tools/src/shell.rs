@@ -1391,7 +1391,14 @@ mod tests {
             "timeout_secs": 10u64,
         });
         let result = tool.execute(input, &policy, &session, cancel).await;
-        assert!(result.is_ok(), "echo should succeed even with a weird arg: {:?}", result.err());
+        // The injected `mkdir` must never create the marker dir. Wrap mode
+        // quoting keeps it from executing; containment (2026-09-11 list-
+        // segmentation alignment) additionally treats a flattened `;` glued
+        // in an arg as a segment boundary like the pipe case, so an
+        // escaping `; mkdir <marker>` segment can be rejected outright —
+        // an equally valid outcome for the same invariant — but the marker
+        // must stay absent either way.
+        let _ = result;
         assert!(
             !marker_base.exists(),
             "shell injection regression: marker dir was created, args were not quoted properly"

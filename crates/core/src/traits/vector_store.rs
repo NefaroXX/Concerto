@@ -80,8 +80,10 @@ pub trait VectorStore: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<(), MemoryError>;
 
-    /// Mark all vectors stale for a project (triggered by model
-    /// version mismatch).
+    /// Mark stale every vector whose embedding model version no longer
+    /// matches the current one (`model_version != current_model_version`) — a
+    /// model bump leaves the CURRENT version's rows fresh and everything
+    /// produced by earlier versions gets re-indexed.
     async fn mark_stale(
         &self,
         project_id: &ProjectId,
