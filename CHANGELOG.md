@@ -288,6 +288,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration), `tower-http` 0.6→0.7 (no direct usage, recompile), `nix`
   0.26→0.31 (signal APIs unchanged, unix gating intact). All rust-versions
   within MSRV 1.88; zero behavioral delta (3,565/3,565 tests).
+- **Dependency bumps (careful batch):** `toml` 0.8→1.1 (zero API fixes
+  needed; `toml_edit` stays 0.22, decoupled; new hostile-string save→load
+  roundtrip test) and `fastembed` 4→6 (`&mut` embed wrapper; 384 dims
+  unchanged — stored vectors valid, no migration; network smoke tests
+  committed as ignored). MSRV-safe throughout.
 - **Automatic intent gating (ADR-55 Phase 2d, ADR-56 amendment; issue #27):**
   routing is the decision — a high-confidence route (>= 0.7) to one of the
   five action-grantable outcomes (`Execute`/`Plan`/`Verify`/`Review`/
