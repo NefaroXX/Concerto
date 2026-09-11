@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Structured failure diagnosis + recovery (#54):** provider/tool/agent/
+  task/environment/dependency/contract failures normalize into one typed
+  diagnosis driving deterministic recovery (retry-same / alternate /
+  reconsider / escalate) through existing paths; single-specialist failure
+  no longer hard-stops siblings; permanent failures escalate bounded;
+  denials diagnose permanent instead of burning retries.
 - **Progress-aware loop + stall detection (#53):** coordinator cycles
   fingerprint observable state (transitions, facts, snapshot, journal,
   artifacts); 3 identical cycles trigger bounded reconsideration then
