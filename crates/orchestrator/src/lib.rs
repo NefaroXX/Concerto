@@ -28,6 +28,7 @@ pub mod decisions;
 pub mod delta;
 pub mod design_doc_verifier;
 pub mod exec_backend;
+pub mod failure_diagnosis;
 pub mod fingerprint;
 pub mod gate;
 pub mod gate_proxy;

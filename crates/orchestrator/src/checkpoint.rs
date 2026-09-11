@@ -199,6 +199,11 @@ pub struct CheckpointContext {
     /// save time, so stall detection survives a resume. Old checkpoints
     /// default it empty (serde default) — additive, no bump.
     pub progress_tracker: crate::progress::ProgressTrackerState,
+    /// Issue #54: the run's structured failure diagnoses (normalized,
+    /// bounded history) captured at save time so the audit trail survives a
+    /// resume. Old checkpoints default it empty (serde default) —
+    /// additive, no bump.
+    pub failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +338,13 @@ pub struct GraphCheckpoint {
     /// (serde default = empty/zero state); old readers ignore the key.
     #[serde(default)]
     pub progress_tracker: crate::progress::ProgressTrackerState,
+    /// Issue #54: the run's structured failure diagnoses — the normalized
+    /// failure record with its recovery-relevant flags, captured so the
+    /// diagnosis/evidence trail survives a resume. Additive only: absent
+    /// on older records (serde default = empty history); old readers
+    /// ignore the key.
+    #[serde(default)]
+    pub failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -540,6 +552,9 @@ pub fn build_checkpoint(
         // Issue #53: additive — stall-detection state rides independently;
         // old readers treat this key as opaque.
         progress_tracker: context.progress_tracker.clone(),
+        // Issue #54: additive — the normalized failure-diagnosis history
+        // rides independently; old readers treat this key as opaque.
+        failure_diagnoses: context.failure_diagnoses.clone(),
     }
 }
 
@@ -1333,6 +1348,7 @@ mod tests {
                 snapshot_generation: None,
                 pending_decision: None,
                 decision_journal: Vec::new(),
+                failure_diagnoses: Vec::new(),
                 progress_tracker: crate::progress::ProgressTrackerState::default(),
             },
         );
@@ -1581,6 +1597,7 @@ mod tests {
                 snapshot_generation: None,
                 pending_decision: None,
                 decision_journal: Vec::new(),
+                failure_diagnoses: Vec::new(),
                 progress_tracker: crate::progress::ProgressTrackerState::default(),
             },
         );
@@ -2035,6 +2052,65 @@ mod tests {
         assert_eq!(
             loaded.progress_tracker, state,
             "stall-detection state survives the round trip (resume persistence)"
+        );
+    }
+
+    /// A captured failure-diagnosis history (issue #54) round-trips through
+    /// the checkpoint JSON so a resumed run keeps its diagnosis/evidence
+    /// trail.
+    #[test]
+    fn failure_diagnoses_round_trip_through_checkpoint_json() {
+        let diagnosis =
+            crate::failure_diagnosis::diagnose(&concerto_core::OrchestratorError::Provider(
+                concerto_core::error::ProviderError::Network("reset".into()),
+            ));
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "failure_diagnoses": [diagnosis],
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("diagnosis history loads");
+        assert_eq!(
+            loaded.failure_diagnoses,
+            vec![diagnosis],
+            "the diagnosis/evidence trail survives the round trip (resume persistence)"
+        );
+    }
+
+    /// A pre-#54 checkpoint record with NO `failure_diagnoses` key loads
+    /// clean with the empty history (additive serde default, no bump).
+    #[test]
+    fn old_checkpoint_without_failure_diagnoses_loads_default() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#54 checkpoint loads");
+        assert!(
+            loaded.failure_diagnoses.is_empty(),
+            "the absent diagnosis history defaults to empty"
         );
     }
 
