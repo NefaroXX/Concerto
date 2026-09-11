@@ -31,10 +31,16 @@ use crate::ConfigError;
 /// `classifier_model`, and `classifier_confidence_threshold`. Additive;
 /// `migrate_v6_to_v7` inserts the section with defaults when absent.
 ///
+/// v7 -> v8: drop the retired `[intent]` classifier surface (ADR-56, the
+/// 2026-09-11 clarification). With the classifier off the run hot path the
+/// three keys serve no reader; the section ceases to exist in the struct and
+/// stale TOML keys are ignored at load because `AppConfig` has no
+/// `deny_unknown_fields` (v5 -> v6 precedent).
+///
 /// ADR-56 supersedes the Phase 2c `classifier_enabled` default pin (off → on):
 /// the LLM classifier is the primary intent decider, so the omitted-key
 /// default now enables it. Nothing else changes.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // Provider retry configuration
@@ -213,94 +219,6 @@ impl RetryConfig {
     }
 }
 
-// ---- ADR-55: intent routing and intent-gated authorization ----------------
-
-fn default_classifier_enabled() -> bool {
-    // ADR-56 (model-first): when `[intent] classifier_enabled` is true the LLM
-    // classifier is the PRIMARY intent decider for every non-fast-path
-    // message. The deterministic router (concerto_core::intent::route) remains
-    // the offline / fail-soft fallback and supplies the two fast-path
-    // detections (negation-override, smalltalk). Default is ON — one bounded
-    // model call per non-fast-path message is the intended primary path, not
-    // an opt-in extra (ADR-56 §1/§2).
-    true
-}
-
-fn default_classifier_confidence_threshold() -> f32 {
-    // Bound to the gate's constant (not a literal) so no configured threshold
-    // can create a [threshold, LOW_CONFIDENCE_THRESHOLD) band where a
-    // classifier Execute re-route would miss the gate's arm-1 dialog
-    // (ADR-55 Phase 2c §2).
-    concerto_core::LOW_CONFIDENCE_THRESHOLD
-}
-
-/// LLM intent classifier configuration (ADR-55 Phase 2c §2; ADR-56).
-///
-/// `[intent]` is additive and default-on. When the classifier is enabled it is
-/// the primary intent decider for every non-fast-path request (ADR-56 §1); a
-/// missing `[intent]` section or a disabled classifier leaves the run
-/// deterministic — the offline / fail-soft fallback (ADR-56 §3). The section
-/// carries the three classifier keys only — the `mode`/`enabled` keys dropped
-/// at v6 are NOT resurrected; the intent gate stays always-on.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IntentConfig {
-    /// Whether the LLM classifier is the primary intent decider. Default:
-    /// true (ADR-56 §2) — the classifier runs for every non-fast-path message;
-    /// only the negation-override and smalltalk fast paths bypass it (ADR-56
-    /// §1).
-    #[serde(default = "default_classifier_enabled")]
-    pub classifier_enabled: bool,
-
-    /// Model used for the classifier call. `None` = the run's effective chat
-    /// model (ADR-55 Phase 2c §2, per §9 "same chat model").
-    #[serde(default)]
-    pub classifier_model: Option<String>,
-
-    /// Minimum classifier confidence required to re-route the deterministic
-    /// routing result to the suggested outcome. Default: 0.7 — validated at
-    /// config load to be `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (the
-    /// gate's constant), so a classifier Execute re-route always clears the
-    /// intent gate's arm-1 confirmation dialog (ADR-55 Phase 2c §2; ADR-56 §4
-    /// keeps the invariant).
-    #[serde(default = "default_classifier_confidence_threshold")]
-    pub classifier_confidence_threshold: f32,
-}
-
-impl Default for IntentConfig {
-    fn default() -> Self {
-        Self {
-            classifier_enabled: default_classifier_enabled(),
-            classifier_model: None,
-            classifier_confidence_threshold: default_classifier_confidence_threshold(),
-        }
-    }
-}
-
-impl IntentConfig {
-    /// Validate the classifier settings during config loading, mirroring
-    /// [`RetryConfig::validate`].
-    ///
-    /// The threshold is bound to `concerto_core::LOW_CONFIDENCE_THRESHOLD`
-    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 Phase
-    /// 2d §1) uses that constant, so a configured threshold below it could
-    /// re-route a classifier Execute at a confidence the gate treats as
-    /// ambiguous — landing it in the read-only wildcard instead of the
-    /// auto-grant (ADR-55 Phase 2c §2 invariant retained by the ADR-56
-    /// amendment).
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.classifier_confidence_threshold.is_finite()
-            || self.classifier_confidence_threshold < concerto_core::LOW_CONFIDENCE_THRESHOLD
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "intent.classifier_confidence_threshold must be finite and >= {} \
-                 (concerto_core::LOW_CONFIDENCE_THRESHOLD)",
-                concerto_core::LOW_CONFIDENCE_THRESHOLD
-            )));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub schema_version: u32,
@@ -391,16 +309,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub context: Option<ContextConfig>,
 
-    /// LLM intent classifier (ADR-55 Phase 2c §2; ADR-56).
-    ///
-    /// `None` (a config without a `[intent]` section) disables the classifier
-    /// — the deterministic router is the only routing path, serving as the
-    /// offline / fail-soft fallback (ADR-56 §3). `migrate_v6_to_v7` inserts
-    /// the section with defaults (classifier ON) when absent. Additive: no
-    /// `deny_unknown_fields`, so stale v6 keys keep loading.
-    #[serde(default)]
-    pub intent: Option<IntentConfig>,
-
     /// Tool-level runtime settings applied at session start.
     ///
     /// `None` (a config without a `[tools]` section) keeps the embedded
@@ -464,7 +372,6 @@ impl PartialEq for AppConfig {
             && self.shell_settings == other.shell_settings
             && self.project_roots == other.project_roots
             && self.context == other.context
-            && self.intent == other.intent
             && self.tool_settings == other.tool_settings
             && self.orchestration == other.orchestration
     }
@@ -493,7 +400,6 @@ impl Default for AppConfig {
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
-            intent: None,
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
@@ -1908,28 +1814,6 @@ mod tests {
         assert_eq!(rc.max_elapsed_seconds, Some(15 * 60));
         assert_eq!(rc.time_to_first_byte_seconds, 120);
         assert_eq!(rc.stream_idle_timeout_seconds, 300);
-    }
-
-    /// ADR-56 §2: `classifier_enabled` defaults to true — the LLM classifier
-    /// is the primary intent decider and a config without an explicit key (or
-    /// migrated from v6) enables it. `classifier_model` and the threshold
-    /// keep their unchanged defaults.
-    #[test]
-    fn intent_classifier_defaults_to_enabled() {
-        let intent = IntentConfig::default();
-        assert!(intent.classifier_enabled, "classifier must default ON (ADR-56)");
-        assert_eq!(intent.classifier_model, None, "classifier_model still defaults to None");
-        assert_eq!(
-            intent.classifier_confidence_threshold,
-            concerto_core::LOW_CONFIDENCE_THRESHOLD,
-            "threshold still defaults to LOW_CONFIDENCE_THRESHOLD (0.7)"
-        );
-        // The serde default (what an omitted `classifier_enabled` key loads)
-        // must agree with the `Default` impl — the flip applies to both paths.
-        let from_toml =
-            crate::schema::IntentConfig::deserialize(toml::Value::Table(toml::map::Map::new()))
-                .expect("omitted keys fall back to their serde defaults");
-        assert!(from_toml.classifier_enabled, "serde default must also be ON");
     }
 
     /// `[tools] git_auto_init` defaults to true on both construction paths:

@@ -1231,7 +1231,7 @@ enabled = true
             .expect("saving a missing file must create it");
 
         let raw = std::fs::read_to_string(&path).expect("created config must be readable");
-        assert!(raw.contains("schema_version = 7"), "schema version seeded\n{raw}");
+        assert!(raw.contains("schema_version = 8"), "schema version seeded\n{raw}");
         assert_eq!(raw.matches("[[multi_agent.custom_agents]]").count(), 1, "{raw}");
 
         let cfg = crate::load_config(Some(&path), None).expect("created config must load");

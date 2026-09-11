@@ -275,3 +275,13 @@ hookups). §8 (classifies, never authorizes) holds wherever the module is
 used. The 2026-09-06 auto-grant amendment is moot on the hot path — grants
 derive from the deterministic envelope (ADR-55 Phase 2e §§2–3), not from
 classifier output.
+
+## Clarification (2026-09-11) — classifier config surface removed
+
+With the classifier off the hot path, its dedicated config surface
+(`[intent].classifier_enabled`, `[intent].classifier_model`,
+`[intent].classifier_confidence_threshold`, ADR-55 Phase 2c §2 as adopted
+by §2 here) serves no reader and is removed from the schema (unknown-key
+tolerant: old files keep loading). The `intent_classifier` module itself
+stays for eval/future UX per the 2026-09-09 amendment. ADR-55 Phase 2c §2's
+schema-6→7 history stands as record; no threshold invariant survives it.

@@ -1,12 +1,20 @@
 //! ADR-55 Phase 2c / ADR-56: LLM intent classifier.
 //!
 //! **OFF THE RUN HOT PATH (ADR-55 Phase 2e §4, 2026-09-09).** The classifier
-//! is retired from dispatch: `run_shared_agent` never consults
-//! `[intent].classifier_enabled` anymore, so no run pays the classifier call
-//! or its latency. Deterministic safety rules + the flavor-hint scan remain.
-//! The module and its tests stay as the historical record of the seam (and
-//! for any future, explicitly re-mounted opt-in); nothing in the crate calls
-//! it from the run path.
+//! is retired from dispatch: `run_shared_agent` never invokes this module
+//! anymore, so no run pays the classifier call or its latency. Deterministic
+//! safety rules + the flavor-hint scan remain. The module and its tests stay
+//! as the historical record of the seam (and for any future, explicitly
+//! re-mounted opt-in); nothing in the crate calls it from the run path.
+//!
+//! **Config surface removed (ADR-56, the 2026-09-11 clarification; schema
+//! v7 → v8).** The `[intent]` classifier keys serve no reader and no longer
+//! exist, so the module runs its documented default behavior whenever it is
+//! invoked (what the former ADR-56 §2 defaults produced): the classifier
+//! always attempts (the former `classifier_enabled = true`), the threshold is
+//! the fixed gate constant `concerto_core::LOW_CONFIDENCE_THRESHOLD` (the
+//! former `classifier_confidence_threshold` default), and the model is always
+//! the run's chat model (the former `classifier_model` unset fallback).
 //!
 //! Historical contract (while it was mounted, ADR-55 Phase 2c §1–§6; ADR-56
 //! §1/§3/§4/§5): when `[intent] classifier_enabled` was true (the then
@@ -50,10 +58,9 @@
 //!   read-only (2d §2).
 //!
 //! Audit-row scope (documented interpretation): an *invocation* means the
-//! provider call fired. When the call never fires — classifier disabled, no
-//! model, token already cancelled at entry, or a failed spend reservation —
-//! no row is written (there is no model output to record) and the
-//! deterministic routing result stands.
+//! provider call fired. When the call never fires — a token already cancelled
+//! at entry, or a failed spend reservation — no row is written (there is no
+//! model output to record) and the deterministic routing result stands.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,11 +103,12 @@ pub struct ClassifyOutcome {
 
 /// Everything [`classify_ambiguity`] needs from the calling run.
 pub struct ClassifierContext<'a> {
-    /// Resolved application config (the `[intent]` section).
+    /// Resolved application config (retry / stream timeouts).
     pub config: &'a AppConfig,
     /// The run's provider — the classifier goes through the normal stack.
     pub provider: &'a Arc<dyn LlmProvider>,
-    /// The run's chat model — fallback when `classifier_model` is unset (§2).
+    /// The run's chat model — used for the classifier call (§2, §9; the
+    /// `classifier_model` override retired with the config surface).
     pub run_model: &'a str,
     /// Audit channel for the classifier row.
     pub executor: &'a ToolExecutor,
@@ -119,8 +127,9 @@ pub struct ClassifierCall {
     /// Correlation id created at classifier start; the caller reuses it for
     /// the router-decision row of the same event (§5).
     pub correlation_id: Ulid,
-    /// The configured threshold the classifier applied (validated
-    /// `>= LOW_CONFIDENCE_THRESHOLD` at config load, §2).
+    /// The threshold the classifier applied — the fixed gate constant
+    /// `LOW_CONFIDENCE_THRESHOLD` (the former config-default; the key was
+    /// removed at schema v8).
     pub threshold: f32,
     /// `Some` = the model produced a valid classification (any confidence;
     /// whether it re-routes is the caller's [`should_reroute`] decision).
@@ -130,27 +139,23 @@ pub struct ClassifierCall {
 
 /// Run the LLM intent classifier for one non-fast-path request (ADR-56 §1).
 ///
-/// Returns `None` when the classifier is disabled or unavailable (no
-/// invocation, no audit row). Returns `Some(ClassifierCall)` for every
-/// attempted invocation; `call.outcome` is `None` on fail-soft (below
-/// threshold is **not** fail-soft — the suggestion is returned and the
-/// caller decides whether to re-route).
+/// Returns `Some(ClassifierCall)` for every attempted invocation; `call.outcome`
+/// is `None` on fail-soft (below threshold is **not** fail-soft — the
+/// suggestion is returned and the caller decides whether to re-route). The
+/// per-request skip paths remaining are the caller-supplied guards: a run
+/// already cancelled at entry never invokes. (The config gate retired at
+/// schema v8 — the module runs whenever it is invoked.)
 pub async fn classify_ambiguity(ctx: ClassifierContext<'_>) -> Option<ClassifierCall> {
-    let Some(intent) = ctx.config.intent.as_ref() else {
-        debug!("intent classifier disabled: no [intent] section configured");
-        return None;
-    };
-    if !intent.classifier_enabled {
-        debug!("intent classifier disabled: classifier_enabled = false");
-        return None;
-    }
     if ctx.cancel.is_cancelled() {
         debug!("intent classifier skipped: run already cancelled");
         return None;
     }
 
-    let threshold = intent.classifier_confidence_threshold;
-    let model = classifier_model(intent, ctx.run_model);
+    // Former config surface (removed at schema v8, ADR-56 2026-09-11) — this
+    // function now runs its documented default behavior: attempt the
+    // classifier, threshold at the gate constant, run's chat model.
+    let threshold = concerto_core::LOW_CONFIDENCE_THRESHOLD;
+    let model = ctx.run_model.to_owned();
     let correlation_id = Ulid::new();
 
     // Reserve-before-call (§6): a cap-exceeded reservation means the call
@@ -222,11 +227,11 @@ pub async fn classify_ambiguity(ctx: ClassifierContext<'_>) -> Option<Classifier
 }
 
 /// Path-selection decision (§3/§4): re-route the deterministic result only
-/// when the classified confidence is at or above the configured threshold. The
-/// threshold is validated `>= LOW_CONFIDENCE_THRESHOLD` at config load, so a
-/// re-route always satisfies the gate's auto-grant predicate too (ADR-55
-/// Phase 2d §1) — no configured threshold can create a
-/// `[threshold, LOW_CONFIDENCE_THRESHOLD)` band (§2).
+/// when the classified confidence is at or above the threshold. The
+/// threshold is the fixed gate constant `LOW_CONFIDENCE_THRESHOLD` (the
+/// config-default that the former schema supplied), so a re-route always
+/// satisfies the gate's auto-grant predicate too (ADR-55 Phase 2d §1) — no
+/// `[threshold, LOW_CONFIDENCE_THRESHOLD)` band exists (§2).
 pub fn should_reroute(outcome: &ClassifyOutcome, threshold: f32) -> bool {
     outcome.confidence >= threshold
 }
@@ -252,17 +257,6 @@ pub fn apply_classifier_decision(routing: &mut RouterOutput, call: &ClassifierCa
     routing.confidence = outcome.confidence;
     routing.route = RouterRoute::LlmClassifier;
     true
-}
-
-/// The effective classifier model: the configured `classifier_model` when set
-/// and non-empty, else the run's chat model (§2, §9).
-fn classifier_model(intent: &concerto_config::IntentConfig, run_model: &str) -> String {
-    intent
-        .classifier_model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| run_model.to_owned())
 }
 
 /// The one-shot prompt: a system instruction demanding a single JSON object
@@ -380,7 +374,6 @@ fn classifier_envelope(outcome: Option<&ClassifyOutcome>, threshold: f32) -> Str
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use concerto_config::IntentConfig;
     use concerto_core::error::ProviderError;
     use concerto_core::intent::LOW_CONFIDENCE_THRESHOLD;
     use concerto_core::traits::policy::{AuditEntry, AuditLog};
@@ -491,15 +484,11 @@ mod tests {
         }
     }
 
-    fn classifier_config(enabled: bool, model: Option<&str>, threshold: f32) -> AppConfig {
-        AppConfig {
-            intent: Some(IntentConfig {
-                classifier_enabled: enabled,
-                classifier_model: model.map(str::to_owned),
-                classifier_confidence_threshold: threshold,
-            }),
-            ..AppConfig::default()
-        }
+    /// The classifier config surface was removed at schema v8 (ADR-56,
+    /// 2026-09-11): every test runs against the plain default config — the
+    /// module's documented default behavior.
+    fn classifier_config() -> AppConfig {
+        AppConfig::default()
     }
 
     fn make_executor(audit: CapturingAudit) -> Arc<ToolExecutor> {
@@ -529,42 +518,13 @@ mod tests {
         }
     }
 
+    /// ADR-56 (2026-09-11 clarification): the `[intent]` config surface was
+    /// removed, so the plain default config — with no `[intent]` keys
+    /// anywhere — invokes the classifier for a non-fast-path utterance
+    /// (the former ADR-56 §2 default-on behavior).
     #[tokio::test]
-    async fn missing_intent_section_skips_the_classifier() {
-        // A config with NO `[intent]` section has no classifier config at all —
-        // the deterministic router is the only routing path (ADR-56 §3): no
-        // provider call, no invocation, no audit row.
-        let config = AppConfig::default();
-        let stub = Arc::new(StubProvider::new(vec![Ok(
-            r#"{"route":"execute","confidence":0.95,"rationale":"clear request"}"#.into(),
-        )]));
-        let provider: Arc<dyn LlmProvider> = stub.clone();
-        let audit = CapturingAudit::new();
-        let executor = make_executor(audit.clone());
-
-        let call = classify_ambiguity(context(
-            &config,
-            &provider,
-            &executor,
-            &SpendTracker::new(None, None, None),
-            Ulid::new(),
-            "hello there",
-            CancellationToken::new(),
-        ))
-        .await;
-
-        assert!(call.is_none(), "a config without [intent] never invokes the classifier");
-        assert_eq!(stub.calls(), 0, "no provider call without a [intent] section");
-        assert!(audit.entries().is_empty(), "no audit row without an invocation");
-    }
-
-    /// ADR-56 §2: `[intent] classifier_enabled` now DEFAULTS to true — the
-    /// defaulted section inserted by `migrate_v6_to_v7` (no explicit
-    /// `classifier_enabled` key) invokes the classifier for a non-fast-path
-    /// utterance instead of skipping it.
-    #[tokio::test]
-    async fn classifier_runs_by_default_with_defaulted_intent_section() {
-        let config = AppConfig { intent: Some(IntentConfig::default()), ..AppConfig::default() };
+    async fn classifier_runs_with_default_config() {
+        let config = classifier_config();
         let stub = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"execute","confidence":0.95,"rationale":"clear request"}"#.into(),
         )]));
@@ -582,16 +542,16 @@ mod tests {
             CancellationToken::new(),
         ))
         .await
-        .expect("a defaulted [intent] section must invoke the classifier");
+        .expect("the default configuration must invoke the classifier");
 
-        assert!(call.outcome.is_some(), "the default-on classifier parses the reply");
-        assert_eq!(stub.calls(), 1, "default-on classifier makes exactly one provider call");
+        assert!(call.outcome.is_some(), "the classifier parses the reply");
+        assert_eq!(stub.calls(), 1, "the classifier makes exactly one provider call");
         assert_eq!(audit.entries().len(), 1, "an invocation writes one classifier row");
     }
 
     #[tokio::test]
     async fn above_threshold_classification_is_returned_for_reroute() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"execute","confidence":0.92,"rationale":"mutate the parser"}"#.into(),
         )]));
@@ -647,7 +607,7 @@ mod tests {
     /// pre-classifier route name — and asserts the chain (re-routed case).
     #[tokio::test]
     async fn classifier_event_records_two_row_audit_chain() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"execute","confidence":0.92,"rationale":"mutate the parser"}"#.into(),
         )]));
@@ -697,7 +657,7 @@ mod tests {
     /// under one correlation id.
     #[tokio::test]
     async fn classifier_event_fail_soft_records_two_row_chain() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> =
             Arc::new(StubProvider::new(vec![Ok("this is not valid json at all".into())]));
         let audit = CapturingAudit::new();
@@ -743,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn below_threshold_suggestion_is_recorded_but_never_reroutes() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"execute","confidence":0.4,"rationale":"weak signal"}"#.into(),
         )]));
@@ -835,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_json_fails_soft_with_audit_row() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> =
             Arc::new(StubProvider::new(vec![Ok("sorry, I cannot do that".into())]));
         let audit = CapturingAudit::new();
@@ -866,7 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_outside_six_outcome_set_is_rejected() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"paint","confidence":0.9,"rationale":"not an outcome"}"#.into(),
         )]));
@@ -892,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_error_fails_soft_with_audit_row() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> =
             Arc::new(StubProvider::new(vec![Err(ProviderError::NotConfigured)]));
         let audit = CapturingAudit::new();
@@ -916,7 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_before_call_skips_invocation() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let stub = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"execute","confidence":0.95,"rationale":"n/a"}"#.into(),
         )]));
@@ -944,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn spend_cap_exceeded_skips_the_call_and_stands_ask_user() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let stub = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"execute","confidence":0.95,"rationale":"n/a"}"#.into(),
         )]));
@@ -975,7 +935,7 @@ mod tests {
 
     #[tokio::test]
     async fn confidence_is_clamped_to_the_unit_interval() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![
             Ok(r#"{"route":"execute","confidence":1.7,"rationale":"too high"}"#.into()),
             Ok(r#"{"route":"answer","confidence":-0.5,"rationale":"too low"}"#.into()),
@@ -1015,7 +975,7 @@ mod tests {
         let long_rationale = "r".repeat(600);
         let reply =
             format!(r#"{{"route":"review","confidence":0.8,"rationale":"{long_rationale}"}}"#);
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![Ok(reply)]));
         let executor = make_executor(CapturingAudit::new());
 
@@ -1037,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn fenced_json_reply_is_accepted() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+        let config = classifier_config();
         let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider::new(vec![Ok(
             "Here you go:\n```json\n{\"route\":\"review\",\"confidence\":0.85,\"rationale\":\"read-only critique\"}\n```"
                 .into(),
@@ -1061,32 +1021,12 @@ mod tests {
         assert_eq!(outcome.confidence, 0.85);
     }
 
+    /// The classifier model: the run's chat model is the only source since
+    /// the `classifier_model` key was removed at schema v8 (ADR-56,
+    /// 2026-09-11).
     #[tokio::test]
-    async fn configured_classifier_model_overrides_the_run_model() {
-        let config = classifier_config(true, Some("classifier-model-v2"), LOW_CONFIDENCE_THRESHOLD);
-        let stub = Arc::new(StubProvider::new(vec![Ok(
-            r#"{"route":"answer","confidence":0.9,"rationale":"ok"}"#.into(),
-        )]));
-        let provider: Arc<dyn LlmProvider> = stub.clone();
-        let executor = make_executor(CapturingAudit::new());
-
-        let _ = classify_ambiguity(context(
-            &config,
-            &provider,
-            &executor,
-            &SpendTracker::new(None, None, None),
-            Ulid::new(),
-            "hello there",
-            CancellationToken::new(),
-        ))
-        .await;
-
-        assert_eq!(stub.models(), vec!["classifier-model-v2".to_owned()]);
-    }
-
-    #[tokio::test]
-    async fn run_model_is_used_when_classifier_model_is_unset() {
-        let config = classifier_config(true, None, LOW_CONFIDENCE_THRESHOLD);
+    async fn run_model_is_used_for_the_classifier_call() {
+        let config = classifier_config();
         let stub = Arc::new(StubProvider::new(vec![Ok(
             r#"{"route":"answer","confidence":0.9,"rationale":"ok"}"#.into(),
         )]));
@@ -1094,7 +1034,7 @@ mod tests {
         let executor = make_executor(CapturingAudit::new());
         let spend = SpendTracker::new(None, None, None);
 
-        let mut ctx = context(
+        let _ = classify_ambiguity(context(
             &config,
             &provider,
             &executor,
@@ -1102,10 +1042,8 @@ mod tests {
             Ulid::new(),
             "hello there",
             CancellationToken::new(),
-        );
-        ctx.run_model = "run-chat-model";
-
-        let _ = classify_ambiguity(ctx).await;
+        ))
+        .await;
 
         assert_eq!(stub.models(), vec!["run-chat-model".to_owned()]);
     }

@@ -44,10 +44,10 @@ pub use saving::{
 pub use schema::{
     builtin_agent_seeds, parse_tool_schema_mode, AgentCapabilities, AgentModelAssignment,
     AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig, CustomAgentConfig,
-    FewShotExample, IntentConfig, McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig,
-    ModelProfileOverride, ModelSettings, MultiAgentConfig, ObservabilityConfig, PipelinePreset,
-    PlanBindingSource, PolicyConfig, PolicyRuleDef, PromptSections, ProviderConfig, RetryConfig,
-    SkillsConfig, ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
+    FewShotExample, McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride,
+    ModelSettings, MultiAgentConfig, ObservabilityConfig, PipelinePreset, PlanBindingSource,
+    PolicyConfig, PolicyRuleDef, PromptSections, ProviderConfig, RetryConfig, SkillsConfig,
+    ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};
 pub use shell::{
@@ -174,14 +174,6 @@ fn load_config_layers(
     // Validate retry settings (after migration so defaults are in place).
     config.retry.validate()?;
     config.memory.validate()?;
-
-    // Validate the Phase-2c intent classifier threshold (ADR-55 Phase 2c §2):
-    // a configured threshold below the deterministic gate constant would
-    // create a band where a classifier Execute re-route misses the gate's
-    // arm-1 confirmation dialog.
-    if let Some(intent) = &config.intent {
-        intent.validate()?;
-    }
 
     // Validate MCP server entries (ADR-43 §4: non-empty id, no ':').
     if let Some(mcp) = &config.mcp {
@@ -738,85 +730,50 @@ mod tests {
     }
 
     #[test]
-    fn v4_config_file_migrates_to_schema_v7() {
+    fn v4_config_file_migrates_to_latest_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "schema_version = 4\n").unwrap();
         let cfg = load_config(Some(&path), None).expect("v4 config must load");
         // v4 -> v5 (version bump) -> v6 (mode/intent removal) -> v7 ([intent]
-        // classifier keys), landing on the latest schema.
-        assert_eq!(cfg.schema_version, 7, "v4 config must migrate to the current schema");
+        // classifier keys) -> v8 (classifier keys retired), landing on the
+        // latest schema.
+        assert_eq!(cfg.schema_version, 8, "v4 config must migrate to the current schema");
         assert!(cfg.skills.is_none());
         assert!(cfg.mcp.is_none());
-        // v6→v7 inserts [intent] with defaults: classifier on (ADR-56).
-        let intent = cfg.intent.expect("migrated config must carry [intent]");
-        assert!(intent.classifier_enabled, "classifier defaults to on (ADR-56)");
     }
 
-    /// ADR-56 §2 (C1 superseded): an existing v6 config file loads at schema 7
-    /// with `[intent]` defaulted (classifier ON).
+    /// A retired v6 config file still loads — the migration chain bumps it
+    /// through v7 into v8 without resurrecting the `[intent]` surface
+    /// (removed at v8; ADR-56 2026-09-11 clarification).
     #[test]
-    fn v6_config_file_loads_with_intent_defaulted() {
+    fn v6_config_file_migrates_to_latest_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "schema_version = 6\nsession_spend_cap_usd = 1.0\n").unwrap();
         let cfg = load_config(Some(&path), None).expect("v6 config must load");
-        assert_eq!(cfg.schema_version, 7);
+        assert_eq!(cfg.schema_version, 8);
         assert_eq!(cfg.session_spend_cap_usd, Some(1.0));
-        let intent = cfg.intent.expect("v6→v7 migration must insert [intent]");
-        assert!(intent.classifier_enabled, "classifier defaults to on (ADR-56)");
-        assert_eq!(intent.classifier_model, None);
-        assert_eq!(intent.classifier_confidence_threshold, concerto_core::LOW_CONFIDENCE_THRESHOLD);
     }
 
-    /// ADR-55 Phase 2c §2 (C1): a configured threshold below
-    /// `LOW_CONFIDENCE_THRESHOLD` is rejected at load.
+    /// Schema v8 removed the `[intent]` classifier keys, but `AppConfig` has
+    /// no `deny_unknown_fields`: a legacy file carrying the full retired
+    /// section — including a threshold value that v7's validation used to
+    /// reject — ignores the stale keys and loads unchanged (v5 → v6 removal
+    /// precedent).
     #[test]
-    fn intent_threshold_below_low_confidence_rejected_at_load() {
+    fn legacy_config_with_intent_classifier_keys_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 7\n[intent]\nclassifier_enabled = true\nclassifier_confidence_threshold = 0.5\n",
+            "schema_version = 7\n[intent]\nclassifier_enabled = false\n\
+             classifier_model = \"claude-sonnet-4\"\nclassifier_confidence_threshold = 0.5\n",
         )
         .unwrap();
-        let err = load_config(Some(&path), None).expect_err("sub-0.7 threshold must be rejected");
-        assert!(
-            format!("{err}").contains("classifier_confidence_threshold"),
-            "expected threshold rejection, got: {err}"
-        );
-    }
-
-    /// ADR-55 Phase 2c §2: a threshold exactly at `LOW_CONFIDENCE_THRESHOLD`
-    /// (0.7) is accepted — the boundary value clears validation.
-    #[test]
-    fn intent_threshold_at_low_confidence_is_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "schema_version = 7\n[intent]\nclassifier_enabled = true\nclassifier_confidence_threshold = 0.7\n",
-        )
-        .unwrap();
-        let cfg = load_config(Some(&path), None).expect("threshold 0.7 must load");
-        let intent = cfg.intent.expect("[intent] section must be present");
-        assert!(intent.classifier_enabled);
-        assert_eq!(intent.classifier_confidence_threshold, 0.7);
-    }
-
-    /// ADR-55 Phase 2c §2: the `classifier_model` key parses.
-    #[test]
-    fn intent_classifier_model_key_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "schema_version = 7\n[intent]\nclassifier_enabled = true\nclassifier_model = \"claude-sonnet-4\"\n",
-        )
-        .unwrap();
-        let cfg = load_config(Some(&path), None).expect("config with classifier_model must load");
-        let intent = cfg.intent.expect("[intent] section must be present");
-        assert_eq!(intent.classifier_model.as_deref(), Some("claude-sonnet-4"));
+        let cfg = load_config(Some(&path), None)
+            .expect("legacy [intent] classifier keys must not block loading");
+        assert_eq!(cfg.schema_version, 8, "v7 file migrates over the retired keys");
     }
 
     #[test]
