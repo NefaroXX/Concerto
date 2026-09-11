@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Smoke follow-ups:** validation resolves its working root from run
+  evidence (manifest nearest modified files, session-root fallback);
+  completion `files` keeps only regular files written by tools;
+  orchestration (blueprint + agent roster) persists to the global config
+  only — project `.concerto.toml` files are never created by Studio and
+  existing ones keep loading unchanged; legacy `.opencode-rs.toml` /
+  `OPENCODE_RS_*` fallback merges deleted (live keyring/data-dir compat
+  reads kept); pipes/`tee`/`<` modeled in read-only classification and
+  containment (`cat f | grep x` stays free, exfiltrating shapes don't).
 - **Coordinator delegation grant:** `call_specialist` is covered under Acting
   grants (`intent_authorized_delegation` audit row) — the coordinator can
   delegate unattended; ReadOnly still denies, ungranted still prompts, and
