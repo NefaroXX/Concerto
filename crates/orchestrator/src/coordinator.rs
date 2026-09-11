@@ -188,34 +188,24 @@ enum SubtaskFailureClass {
     NonRecoverable,
 }
 
-/// Classify a subtask dispatch error into the retry/ladder/exit decision
-/// space (ADR-42 §1). Cancellation short-circuits to `NonRecoverable` before
-/// any ladder tier.
-fn classify_subtask_error(error: &OrchestratorError) -> SubtaskFailureClass {
-    if is_cancellation_error(error) {
-        return SubtaskFailureClass::NonRecoverable;
-    }
-    match error {
-        OrchestratorError::AgentLoopError(_)
-        | OrchestratorError::Memory(_)
-        | OrchestratorError::Tool(_) => SubtaskFailureClass::Recoverable,
-        // Transient provider errors (rate limits, network, timeouts, 5xx)
-        // may resolve on retry — treat as Recoverable.
-        OrchestratorError::Provider(p) if p.is_transient() => SubtaskFailureClass::Recoverable,
-        // Provider/model-specific hard failure (auth, context overflow,
-        // rate-limit ceiling) or model-selection failure (no affordable or
-        // capable model, pinned model missing/unavailable/budget-blocked) is a
-        // property of the *assignment*, not of the task — a different model or
-        // agent may still complete it, so walk the fallback ladder.
-        OrchestratorError::Provider(_)
-        | OrchestratorError::NoAffordableModel { .. }
-        | OrchestratorError::NoCapableModel { .. }
-        | OrchestratorError::PinnedModelNotFound { .. }
-        | OrchestratorError::PinnedModelMissingCapability { .. }
-        | OrchestratorError::PinnedModelBudgetExceeded { .. } => SubtaskFailureClass::LimitReached,
-        // Structural errors (invalid task graph, cycle detection, planning
-        // failure, exhausted budgets for delegation) exit immediately.
-        _ => SubtaskFailureClass::NonRecoverable,
+/// Issue #54: the deterministic diagnosis → recovery-class bridge. A
+/// same-agent-viable diagnosis retries in place (ADR-42 Recoverable); an
+/// alternate-viable one walks the fallback ladder (ADR-42 LimitReached);
+/// anything else exits through the graceful non-recoverable path. The
+/// diagnosis flags are the single source of the class — no error-matching
+/// happens outside [`crate::failure_diagnosis`]. Cancellation
+/// short-circuits to `NonRecoverable` before any ladder tier, exactly as
+/// the historical hand-written classifier did (callers check
+/// [`is_cancellation_error`] before diagnosing).
+impl From<&crate::failure_diagnosis::FailureDiagnosis> for SubtaskFailureClass {
+    fn from(diagnosis: &crate::failure_diagnosis::FailureDiagnosis) -> Self {
+        if diagnosis.same_agent_viable {
+            SubtaskFailureClass::Recoverable
+        } else if diagnosis.alternate_agent_viable {
+            SubtaskFailureClass::LimitReached
+        } else {
+            SubtaskFailureClass::NonRecoverable
+        }
     }
 }
 
@@ -885,6 +875,11 @@ pub struct CoordinatorAgent {
     /// stall detection survives a resume; reset when a resume replans (a
     /// superseded plan's stall history no longer applies).
     progress_tracker: crate::progress::ProgressTracker,
+    /// Issue #54: the run's structured failure diagnoses — normalized at
+    /// each failure surface (dispatch settlement, specialist result
+    /// handling, tool self-execution), bounded, and persisted additively
+    /// so the diagnosis/evidence trail survives a resume.
+    failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1371,6 +1366,9 @@ impl CoordinatorAgent {
             // Issue #53: stall-detection state starts empty and grows one
             // fingerprint per completed decision-loop cycle.
             progress_tracker: crate::progress::ProgressTracker::new(),
+            // Issue #54: the failure-diagnosis history starts empty and
+            // grows one entry per diagnosed failure surface.
+            failure_diagnoses: Vec::new(),
         }
     }
 
@@ -2224,6 +2222,9 @@ impl CoordinatorAgent {
             // detection (fingerprint history + recovery budget) survives a
             // resume.
             progress_tracker: self.progress_tracker.state().clone(),
+            // Issue #54: the run's normalized failure diagnoses ride every
+            // persist so the diagnosis/evidence trail survives a resume.
+            failure_diagnoses: self.failure_diagnoses.clone(),
         }
     }
 
@@ -3018,6 +3019,16 @@ impl CoordinatorAgent {
         // state.
         self.progress_tracker =
             crate::progress::ProgressTracker::from_state(cp.progress_tracker.clone());
+        // Issue #54: restore the failure-diagnosis history so the
+        // diagnosis/evidence trail survives a resume; pre-#54 checkpoints
+        // carry the empty default.
+        self.failure_diagnoses = {
+            let mut diagnoses = cp.failure_diagnoses.clone();
+            let excess =
+                diagnoses.len().saturating_sub(crate::failure_diagnosis::MAX_DIAGNOSIS_HISTORY);
+            diagnoses.drain(0..excess);
+            diagnoses
+        };
 
         // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
         let pending_decision = cp.pending_decision.clone();
@@ -4170,7 +4181,21 @@ impl CoordinatorAgent {
                             cancelled_during_batch = true;
                             continue;
                         }
-                        match classify_subtask_error(&e) {
+                        // Issue #54: normalize the error into ONE structured
+                        // diagnosis at the point the failure surfaces; the
+                        // recovery below is deterministic from it (the class
+                        // mapping preserves ADR-42 §1 behavior), and the
+                        // diagnosis rides the audit trail (events + whiteboard
+                        // + the checkpointed history).
+                        let diagnosis = crate::failure_diagnosis::diagnose(&e);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &diagnosis,
+                        )
+                        .await;
+                        match SubtaskFailureClass::from(&diagnosis) {
                             // Transient errors retry the same agent/model
                             // while attempts remain (ADR-42 §1 Recoverable).
                             SubtaskFailureClass::Recoverable
@@ -4227,7 +4252,7 @@ impl CoordinatorAgent {
                                 // counter would drift to MAX + 1, skewing the
                                 // `attempt {attempt}/{MAX}` reporting.
                                 let is_recoverable = matches!(
-                                    classify_subtask_error(&e),
+                                    SubtaskFailureClass::from(&diagnosis),
                                     SubtaskFailureClass::Recoverable
                                 );
                                 if is_recoverable && !self.escalation_attempted.contains(&task_id) {
@@ -4736,6 +4761,20 @@ impl CoordinatorAgent {
                                 error: error.clone(),
                             },
                         );
+                        // Issue #54: normalize the settled failure into the
+                        // structured diagnosis (artifact-contract misses,
+                        // malformed output, generic agent failures) and put
+                        // it on the audit trail; the retry/escalation/replan/
+                        // ladder flow below is the recovery the diagnosis's
+                        // flags map onto.
+                        let diagnosis = crate::failure_diagnosis::diagnose_outcome_failure(&error);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &diagnosis,
+                        )
+                        .await;
                         if attempt < self.max_subtask_attempts {
                             retry_feedback.entry(task_id).or_default().push(result.clone());
                             graph.mark_pending(&task_id);
@@ -4999,6 +5038,17 @@ impl CoordinatorAgent {
                         }
                     }
                     AgentOutcome::Blocked { on } => {
+                        // Issue #54: a blocked outcome is the Dependency
+                        // dimension — diagnosed and audited before the
+                        // existing dependency-attach/retry handling.
+                        let diagnosis = crate::failure_diagnosis::diagnose_blocked(&on);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &diagnosis,
+                        )
+                        .await;
                         if attempt < self.max_subtask_attempts {
                             let mut attached = 0usize;
                             let mut failures = Vec::new();
@@ -7264,10 +7314,22 @@ impl CoordinatorAgent {
                     "call_specialist: model selection failed; returning the error to the \
                      coordinator model"
                 );
+                // Issue #54: the diagnosis (Environment/model-unavailable,
+                // alternate viable) rides the tool result so the Coordinator's
+                // next decision is diagnosis-informed, and the audit trail.
+                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                self.record_failure_diagnosis(
+                    task.session_id,
+                    Some(subtask_id),
+                    &agent_id,
+                    &diagnosis,
+                )
+                .await;
                 self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
                 return serde_json::json!({
                     "error": "model_selection_failed",
                     "message": format!("no model could be selected for {agent_id}: {error}"),
+                    "diagnosis": diagnosis.tool_summary(),
                 });
             }
         };
@@ -7288,12 +7350,25 @@ impl CoordinatorAgent {
                 warn!(
                     %error, role = %agent_id,
                     "call_specialist: specialist dispatch failed; returning the error to \
-                     the coordinator model"
+                      the coordinator model"
                 );
+                // Issue #54: normalize the dispatch failure (provider, tool,
+                // agent, environment, task dimensions) into the structured
+                // diagnosis; it rides the tool result and the audit trail,
+                // and the recovery decision is diagnosis-shaped.
+                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                self.record_failure_diagnosis(
+                    task.session_id,
+                    Some(subtask_id),
+                    &agent_id,
+                    &diagnosis,
+                )
+                .await;
                 self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
                 return serde_json::json!({
                     "error": "dispatch_failed",
                     "message": error.to_string(),
+                    "diagnosis": diagnosis.tool_summary(),
                 });
             }
         };
@@ -7359,6 +7434,11 @@ impl CoordinatorAgent {
         ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(result.tool_call_count);
         ledger.all_files.extend(files.iter().cloned());
 
+        // Issue #54: a failed/blocked settled outcome is diagnosed at this
+        // surface (specialist result handling) — the diagnosis rides the
+        // tool result so the Coordinator's next decision is diagnosis-
+        // informed, and the audit trail.
+        let mut outcome_diagnosis: Option<crate::failure_diagnosis::FailureDiagnosis> = None;
         match result.outcome {
             AgentOutcome::Success => {
                 if let Some(node) = graph.get_mut(&subtask_id) {
@@ -7406,6 +7486,21 @@ impl CoordinatorAgent {
             // with an unresolved failure surfaces as `Partial`, never as a
             // vacuous completion.
             _ => {
+                let diagnosis = match &result.outcome {
+                    AgentOutcome::Failed { error } => {
+                        crate::failure_diagnosis::diagnose_outcome_failure(error)
+                    }
+                    AgentOutcome::Blocked { on } => crate::failure_diagnosis::diagnose_blocked(on),
+                    _ => crate::failure_diagnosis::diagnose_outcome_failure(&summary_text),
+                };
+                self.record_failure_diagnosis(
+                    task.session_id,
+                    Some(subtask_id),
+                    &agent_id,
+                    &diagnosis,
+                )
+                .await;
+                outcome_diagnosis = Some(diagnosis);
                 graph.mark_blocked(&subtask_id);
                 if let Some(node) = graph.get_mut(&subtask_id) {
                     node.completed_at = Some(time::OffsetDateTime::now_utc());
@@ -7430,14 +7525,18 @@ impl CoordinatorAgent {
         // ── Checkpoint the settled dispatch ─────────────────────────────────
         self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
 
-        serde_json::json!({
+        let mut tool_result = serde_json::json!({
             "outcome": outcome_label,
             "agent_id": agent_id.as_str(),
             "summary": bounded_text(&summary_text, 2_000),
             "files_modified": files.iter().map(|path| path.as_str()).collect::<Vec<_>>(),
             "tool_call_count": result.tool_call_count,
             "cost_usd": result.cost_usd,
-        })
+        });
+        if let Some(diagnosis) = &outcome_diagnosis {
+            tool_result["diagnosis"] = diagnosis.tool_summary();
+        }
+        tool_result
     }
 
     /// Mark a dispatch that never produced a run result (model-selection or
@@ -7662,12 +7761,82 @@ impl CoordinatorAgent {
             Err(error) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                // Issue #54: the tool fault is normalized into the
+                // structured diagnosis (Tool/Environment dimension) so the
+                // Coordinator's next decision is diagnosis-informed; the
+                // audit trail records it too.
+                let diagnosis = crate::failure_diagnosis::diagnose_tool(&error);
+                self.record_failure_diagnosis(
+                    base_ctx.session.session_id,
+                    None,
+                    &AgentId::new("coordinator"),
+                    &diagnosis,
+                )
+                .await;
                 serde_json::json!({
                     "error": "tool_execution_failed",
                     "message": error.to_string(),
-                    "retryable": true,
+                    "retryable": diagnosis.retryable,
+                    "diagnosis": diagnosis.tool_summary(),
                 })
             }
+        }
+    }
+
+    /// Issue #54: record ONE normalized failure diagnosis at the surface it
+    /// surfaced. Pushes the bounded diagnosis history (checkpointed
+    /// additively), publishes a coordinator thought so the run's UI/events
+    /// show the diagnosis, and appends a fail-soft `Failure` whiteboard
+    /// event carrying the diagnosis payload — the audit trail the recovery
+    /// decision cites. Never fails the run (every append is fail-soft,
+    /// mirroring [`Self::append_dispatch_decision`]).
+    async fn record_failure_diagnosis(
+        &mut self,
+        session_id: Ulid,
+        task_id: Option<TaskId>,
+        role: &AgentId,
+        diagnosis: &crate::failure_diagnosis::FailureDiagnosis,
+    ) {
+        self.failure_diagnoses.push(diagnosis.clone());
+        let excess = self
+            .failure_diagnoses
+            .len()
+            .saturating_sub(crate::failure_diagnosis::MAX_DIAGNOSIS_HISTORY);
+        self.failure_diagnoses.drain(0..excess);
+
+        let brief = diagnosis.brief();
+        let _ = self.bus.publish_for_session(
+            session_id,
+            task_id.map(|id| id.0).unwrap_or_default(),
+            EventKind::AgentThought { agent_id: "coordinator".into(), content: brief.clone() },
+        );
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Failure,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                // The evidence excerpt under the `error` key the
+                // run-continuity ledger folds (one grammar with the gate's
+                // failure rows), plus the full structured diagnosis.
+                "error": bounded_text(&diagnosis.evidence, 512),
+                "role": role.as_str(),
+                "task_id": task_id.map(|id| id.0),
+                "diagnosis": diagnosis.tool_summary(),
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(err) = append_whiteboard_event(pool, &event).await {
+            warn!(
+                %err,
+                "issue #54: failure-diagnosis whiteboard append failed (fail-soft, the \
+                 diagnosis still rides the events and the checkpoint history)"
+            );
         }
     }
 
@@ -8091,24 +8260,34 @@ mod tests {
     // rate-limit ceiling, no-affordable-model) are LimitReached and walk the
     // fallback ladder. Cancellation and structural errors are NonRecoverable
     // and exit immediately.
+    //
+    // Issue #54: the classification is now DERIVED from the structured
+    // failure diagnosis — [`subtask_class_from_diagnosis`] is the bridge
+    // the dispatch loop keys on (`SubtaskFailureClass::from(&diagnose(e))`),
+    // so the pins below prove the diagnosis normalization preserved the
+    // historical partition for every asserted family.
+    fn subtask_class_from_diagnosis(error: &OrchestratorError) -> SubtaskFailureClass {
+        SubtaskFailureClass::from(&crate::failure_diagnosis::diagnose(error))
+    }
+
     #[test]
     fn classify_subtask_error_partition() {
         // Recoverable: AgentLoopError, Memory, any Tool error that isn't
         // Cancelled, and transient Provider errors.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::AgentLoopError(
+            subtask_class_from_diagnosis(&OrchestratorError::AgentLoopError(
                 "transient loop issue".into()
             )),
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Memory(
+            subtask_class_from_diagnosis(&OrchestratorError::Memory(
                 concerto_core::MemoryError::NotFound("chunk".into())
             )),
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Tool(
+            subtask_class_from_diagnosis(&OrchestratorError::Tool(
                 concerto_core::ToolError::ExecutionFailed { message: "oops".into() }
             )),
             SubtaskFailureClass::Recoverable
@@ -8116,7 +8295,7 @@ mod tests {
 
         // Transient provider errors — will be retried
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::RateLimit {
                     retry_after: std::time::Duration::from_secs(1)
                 }
@@ -8124,13 +8303,13 @@ mod tests {
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::Network("connection reset".into())
             )),
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::Timeout {
                     phase: "request",
                     timeout: std::time::Duration::from_secs(30),
@@ -8139,7 +8318,7 @@ mod tests {
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::HttpStatus {
                     status: 503,
                     retry_after: None,
@@ -8149,7 +8328,7 @@ mod tests {
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::InvalidResponse("bad json".into())
             )),
             SubtaskFailureClass::Recoverable
@@ -8160,13 +8339,13 @@ mod tests {
         // different model or agent may still complete the task, so the
         // fallback ladder is walked before any Partial exit.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::AuthFailure
             )),
             SubtaskFailureClass::LimitReached
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::ContextOverflow {
                     tokens_in: 200_000,
                     capacity: 128_000,
@@ -8177,7 +8356,7 @@ mod tests {
         // RetryExhausted is the rate-limit ceiling: the provider's own retry
         // layer is done, but the subtask may still be solvable elsewhere.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::RetryExhausted {
                     attempts: 3,
                     elapsed: std::time::Duration::from_secs(30),
@@ -8187,13 +8366,13 @@ mod tests {
             SubtaskFailureClass::LimitReached
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::NoAffordableModel {
+            subtask_class_from_diagnosis(&OrchestratorError::NoAffordableModel {
                 role: AgentId::new("coder")
             }),
             SubtaskFailureClass::LimitReached
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::PinnedModelNotFound {
+            subtask_class_from_diagnosis(&OrchestratorError::PinnedModelNotFound {
                 role: AgentId::new("coder"),
                 provider_config_id: None,
                 model: "claude-3.5-sonnet".into(),
@@ -8204,25 +8383,27 @@ mod tests {
         // NonRecoverable: cancellation and structural errors — retrying or
         // re-routing within a single task won't fix them.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Cancelled),
+            subtask_class_from_diagnosis(&OrchestratorError::Cancelled),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Tool(concerto_core::ToolError::Cancelled)),
+            subtask_class_from_diagnosis(&OrchestratorError::Tool(
+                concerto_core::ToolError::Cancelled
+            )),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::NoBudgetForDelegation),
+            subtask_class_from_diagnosis(&OrchestratorError::NoBudgetForDelegation),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::MultiAgentPlanFailed {
+            subtask_class_from_diagnosis(&OrchestratorError::MultiAgentPlanFailed {
                 reason: "no model available".into()
             }),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::TaskGraphError("no such task".into())),
+            subtask_class_from_diagnosis(&OrchestratorError::TaskGraphError("no such task".into())),
             SubtaskFailureClass::NonRecoverable
         ));
     }
@@ -9566,13 +9747,15 @@ mod tests {
         assert_eq!(result.cost_usd, 0.0);
     }
 
-    /// Verify that `classify_subtask_error` correctly classifies edge-case
-    /// error variants (budget, cycle, task-graph, and exhausted-retry errors).
+    /// Verify that `SubtaskFailureClass::from(&diagnose(e))` — the
+    /// diagnosis-derived class bridge the dispatch loop now keys on —
+    /// correctly classifies edge-case error variants (budget, cycle,
+    /// task-graph, and exhausted-retry errors).
     #[test]
     fn classify_subtask_error_edge_cases() {
         // SubTaskRetriesExhausted is a terminal condition — no ladder.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::SubTaskRetriesExhausted {
+            subtask_class_from_diagnosis(&OrchestratorError::SubTaskRetriesExhausted {
                 task_id: TaskId::new(),
                 role: AgentId::new("coder"),
                 attempts: 3,
@@ -9582,14 +9765,14 @@ mod tests {
         ));
         // InvalidTaskGraph is structural — graph corruption needs a human.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::InvalidTaskGraph {
+            subtask_class_from_diagnosis(&OrchestratorError::InvalidTaskGraph {
                 reason: "missing node".into(),
             }),
             SubtaskFailureClass::NonRecoverable
         ));
         // CycleDetected is structural — needs human intervention.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::CycleDetected {
+            subtask_class_from_diagnosis(&OrchestratorError::CycleDetected {
                 tool_name: "reviewer".into(),
                 count: 3,
             }),
@@ -9597,14 +9780,16 @@ mod tests {
         ));
         // MultiAgentPlanFailed is structural.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::MultiAgentPlanFailed {
+            subtask_class_from_diagnosis(&OrchestratorError::MultiAgentPlanFailed {
                 reason: "architect failed".into(),
             }),
             SubtaskFailureClass::NonRecoverable
         ));
         // Unrecoverable is structural by construction.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Unrecoverable { message: "fatal".into() }),
+            subtask_class_from_diagnosis(&OrchestratorError::Unrecoverable {
+                message: "fatal".into()
+            }),
             SubtaskFailureClass::NonRecoverable
         ));
     }
@@ -10057,6 +10242,288 @@ mod tests {
             events.push(event.kind.clone());
         }
         (output, events)
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #54: structured failure diagnosis and recovery
+    // ------------------------------------------------------------------
+
+    /// A transient provider fault (network loss) is diagnosed, retried on
+    /// the same agent within the existing attempt budget, and the run
+    /// completes WITHOUT losing coordinator state (the graph completes, the
+    /// diagnosis is on the record). Issue acceptance: "A provider/network
+    /// failure can be retried without losing coordinator state."
+    #[tokio::test]
+    async fn network_failure_is_diagnosed_and_retried_without_losing_state() {
+        let bus = EventBus::new(256);
+        let architect = MockExpertAgent::sequence(
+            AgentId::new("architect"),
+            vec![
+                Err(OrchestratorError::Provider(ProviderError::Network(
+                    "connection reset by peer".into(),
+                ))),
+                ok_result("architect", "recovered after network loss"),
+            ],
+        );
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![architect],
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _task_id) = single_pending_graph(session_id, "architect");
+
+        let events = {
+            let (output, events) = run_graph_for_test(
+                &mut coordinator,
+                bus.clone(),
+                graph,
+                session_id,
+                HashMap::new(),
+            )
+            .await;
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Completed,
+                "a retried network failure must not lose the run: {:?}",
+                output.completion_status
+            );
+            assert!(
+                output.final_message.contains("Multi-agent orchestration completed"),
+                "completed run, not a partial one: {}",
+                output.final_message
+            );
+            events
+        };
+
+        // The failure was normalized into the Provider/network-loss
+        // diagnosis at the dispatch settlement.
+        assert_eq!(coordinator.failure_diagnoses.len(), 1, "one diagnosed failure");
+        let diagnosis = &coordinator.failure_diagnoses[0];
+        assert_eq!(diagnosis.kind, crate::failure_diagnosis::FailureKind::Provider);
+        assert_eq!(diagnosis.code, "network-loss");
+        assert!(diagnosis.transient && diagnosis.retryable);
+
+        // And the diagnosis is observable in the run's event stream.
+        let diagnosed = events.iter().any(|kind| {
+            matches!(kind, EventKind::AgentThought { content, .. }
+                if content.contains("failure diagnosis: provider [network-loss]"))
+        });
+        assert!(diagnosed, "the diagnosis rides the coordinator's event stream");
+    }
+
+    /// A failed subtask degrades to a retry while its independent sibling
+    /// in the SAME ready batch keeps running — no hard stop on a
+    /// single-specialist failure (issue #54's "siblings continuing").
+    #[tokio::test]
+    async fn mixed_batch_failure_degrades_to_retry_and_siblings_continue() {
+        let bus = EventBus::new(256);
+        let flaky = MockExpertAgent::sequence(
+            AgentId::new("researcher"),
+            vec![
+                Err(OrchestratorError::Tool(concerto_core::ToolError::ExecutionFailed {
+                    message: "transient tool fault".into(),
+                })),
+                ok_result("researcher", "recovered after tool failure"),
+            ],
+        );
+        let steady = MockExpertAgent::always_succeed(AgentId::new("docs"), "sibling succeeded");
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![flaky, steady],
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        // Two independent roots enter the SAME first batch.
+        let mut graph = TaskGraph::new();
+        for (role, description) in
+            [("researcher", "flaky work"), ("docs", "independent sibling work")]
+        {
+            let id = TaskId::new();
+            graph.add_root(SubTask {
+                id,
+                parent_id: None,
+                session_id,
+                role: AgentId::new(role),
+                description: description.into(),
+                status: SubTaskStatus::Pending,
+                dependencies: vec![],
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            });
+        }
+
+        let (output, _events) =
+            run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the tool-failed subtask retried and both subtasks completed: {:?}",
+            output.completion_status
+        );
+        // The tool fault was diagnosed as the Tool dimension.
+        assert!(coordinator.failure_diagnoses.iter().any(|diagnosis| {
+            diagnosis.kind == crate::failure_diagnosis::FailureKind::Tool
+                && diagnosis.code == "tool-failed"
+        }));
+    }
+
+    /// Permanent-failure + exhausted-ladder escalation is BOUNDED: the
+    /// provider-auth diagnosis (permanent, alternate-only viable) walks the
+    /// fallback ladder at most once per tier and then escalates to a
+    /// graceful Partial exit with a preserved checkpoint — never an
+    /// infinite retry. Issue acceptance: "Permanent failures
+    /// escalate/replan instead of infinite retry" + boundedness.
+    #[tokio::test]
+    async fn permanent_failure_escalates_bounded_not_infinite() {
+        let bus = EventBus::new(256);
+        // Every attempt fails hard (auth): the queue default would
+        // eventually succeed, so over-provision errors to prove the run
+        // STOPS within its budget.
+        let architect = MockExpertAgent::sequence(
+            AgentId::new("architect"),
+            (0..6).map(|_| Err(OrchestratorError::Provider(ProviderError::AuthFailure))).collect(),
+        );
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![architect],
+            concerto_config::ModelPinConfig {
+                default_model: Some("mid".into()),
+                ..Default::default()
+            },
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _task_id) = single_pending_graph(session_id, "architect");
+
+        let (output, _events) =
+            run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a permanently failing subtask escalates to the graceful Partial exit"
+        );
+        // BOUNDED: exactly the primary dispatch + the two ladder dispatches
+        // (tier-1 default-model and tier-2 self-execute) ran — 3 total, not
+        // an unbounded retry loop. The mock queue held 6 errors, but the
+        // recovery machinery can never consume them all.
+        assert_eq!(
+            coordinator.model_dispatch_count, 3,
+            "the escalation is bounded by the existing ladder guards"
+        );
+        assert!(output.checkpoint_json.is_some(), "the stalled run keeps its resumable checkpoint");
+        // Every failure surfaced carried the provider-auth diagnosis.
+        assert!(
+            coordinator.failure_diagnoses.iter().all(|diagnosis| diagnosis.code == "provider-auth"),
+            "each escalation re-diagnosed the same permanent failure: {:?}",
+            coordinator.failure_diagnoses
+        );
+    }
+
+    /// In the Coordinator's decision loop, a failed specialist dispatch
+    /// returns a diagnosis-carrying tool result — the model decides the
+    /// recovery (retry / alternate / replan) from structured data, and the
+    /// diagnosis is recorded on the coordinator (issue #54's "specialist
+    /// result handling" surface).
+    #[tokio::test]
+    async fn call_specialist_failure_carries_the_diagnosis() {
+        let bus = EventBus::new(256);
+        let consultant = MockExpertAgent::sequence(
+            AgentId::new("consultant"),
+            vec![
+                Err(OrchestratorError::AgentLoopError("specialist crashed mid-run".into())),
+                ok_result("consultant", "recovered on the model's retry"),
+            ],
+        );
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![consultant]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("consultant", "advise on the plan")]),
+                CoordinatorTurn::Calls(vec![call_specialist("consultant", "retry with notes")]),
+                CoordinatorTurn::Text("recovered".into()),
+            ],
+        );
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("run completes");
+        assert_eq!(provider.turn_count(), 3, "the loop served all three scripted turns");
+
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        // The failed dispatch was diagnosed at the specialist result
+        // handling surface: Agent dimension, agent-crash code.
+        assert!(
+            coordinator.failure_diagnoses.iter().any(|diagnosis| {
+                diagnosis.kind == crate::failure_diagnosis::FailureKind::Agent
+                    && diagnosis.code == "agent-crash"
+            }),
+            "the crash diagnosis is recorded: {:?}",
+            coordinator.failure_diagnoses
+        );
+    }
+
+    /// The failure-diagnosis history is recorded to the WHITEBOARD as
+    /// `failure` events carrying the structured diagnosis payload (the
+    /// audit trail the recovery decision cites).
+    #[tokio::test]
+    async fn failure_diagnosis_is_appended_to_the_whiteboard() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let architect = MockExpertAgent::sequence(
+            AgentId::new("architect"),
+            vec![
+                Err(OrchestratorError::Provider(ProviderError::RateLimit {
+                    retry_after: std::time::Duration::from_secs(1),
+                })),
+                ok_result("architect", "recovered after rate limit"),
+            ],
+        );
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![architect],
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_review_store(Some(pool.clone()));
+        let (graph, _task_id) = single_pending_graph(session_id, "architect");
+        run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new()).await;
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let diagnosed_failures: Vec<_> = logged
+            .iter()
+            .filter(|event| event.kind == WhiteboardKind::Failure)
+            .filter(|event| event.payload.get("diagnosis").is_some())
+            .collect();
+        assert!(
+            diagnosed_failures.iter().any(|event| {
+                event.payload["diagnosis"]["code"] == "rate-limit"
+                    && event.payload["diagnosis"]["kind"] == "provider"
+                    && event.payload["diagnosis"]["retryable"] == true
+            }),
+            "the whiteboard carries the structured diagnosis: {:?}",
+            logged.iter().map(|event| (event.kind, &event.payload)).collect::<Vec<_>>()
+        );
     }
 
     /// ADR-42 tier 1: when the first dispatch hits a hard provider limit

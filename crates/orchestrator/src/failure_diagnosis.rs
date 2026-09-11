@@ -281,8 +281,9 @@ pub fn diagnose(error: &concerto_core::OrchestratorError) -> FailureDiagnosis {
             diagnose_agent_message(message)
         }
         // An agent that hit its iteration cap or repeated identical tool
-        // calls stalled — the same agent cannot do better, but a different
-        // model/agent may (bounded by the ladder's at-most-once guards).
+        // calls stalled structurally — the historical classifier exits
+        // immediately (human intervention), and the diagnosis preserves
+        // that: no retry, no ladder, a reconsideration verdict instead.
         concerto_core::OrchestratorError::MaxIterationsReached { .. }
         | concerto_core::OrchestratorError::CycleDetected { .. } => FailureDiagnosis::new(
             FailureKind::Agent,
@@ -290,8 +291,8 @@ pub fn diagnose(error: &concerto_core::OrchestratorError) -> FailureDiagnosis {
             false,
             false,
             false,
-            true,
             false,
+            true,
             &error.to_string(),
         ),
         concerto_core::OrchestratorError::Memory(_) => FailureDiagnosis::new(
@@ -891,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_stall_is_alternate_viable_not_same_agent() {
+    fn agent_stall_is_structural_replan_not_a_futile_retry() {
         for error in [
             OrchestratorError::MaxIterationsReached { max: 25 },
             OrchestratorError::CycleDetected { tool_name: "shell".into(), count: 4 },
@@ -899,8 +900,12 @@ mod tests {
             let diagnosis = diagnose(&error);
             assert_eq!(diagnosis.kind, FailureKind::Agent);
             assert_eq!(diagnosis.code, "agent-stalled");
-            assert!(!diagnosis.same_agent_viable, "the same agent would stall again");
-            assert!(diagnosis.alternate_agent_viable);
+            assert!(
+                !diagnosis.same_agent_viable && !diagnosis.alternate_agent_viable,
+                "a stalled agent would stall again — no retry verdict"
+            );
+            assert!(diagnosis.replan_required);
+            assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Reconsider);
         }
     }
 
