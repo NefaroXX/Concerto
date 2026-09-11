@@ -534,19 +534,31 @@ fn scan_redirects(
             continue;
         }
         // Operator glued to its target: `2>/tmp/x`, `>file`, `</etc/passwd`.
+        // Interpolation-carrying glue (`>$HOME`, `>$(cmd)`, `>$VAR`) must flow
+        // into `resolve_within` too (2026-09-11: `$`/backtick targets are not
+        // path-like, so a read-only segment lead exempted them downstream and
+        // the shell expanded the write target out-of-root). `2>&1`/`>&2`
+        // remainders carry neither metacharacter and stay passable.
         if let Some(idx) = token.rfind('>') {
             let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
             let after = strip_trailing_command_punct(after);
-            if !after.is_empty() && is_path_like(after) {
+            if !after.is_empty()
+                && (is_path_like(after)
+                    || after.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)))
+            {
                 resolve_within(root, cwd, after)?;
             }
             continue;
         }
-        // Input-redirect glued to its target: `</etc/passwd`.
+        // Input-redirect glued to its target: `</etc/passwd`. Same gate as the
+        // write-branch above.
         if let Some(idx) = token.find('<') {
             let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
             let after = strip_trailing_command_punct(after);
-            if !after.is_empty() && is_path_like(after) {
+            if !after.is_empty()
+                && (is_path_like(after)
+                    || after.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)))
+            {
                 resolve_within(root, cwd, after)?;
             }
         }
@@ -959,6 +971,48 @@ mod tests {
             .expect("in-root process substitution allowed");
         // Read-only verbs keep their exemption: `echo $HOME` only prints.
         contain_shell_command(&root, &root, "echo $HOME", &[]).expect("read-only echo allowed");
+    }
+
+    #[test]
+    fn glued_redirect_interpolated_targets_rejected_under_read_only_lead() {
+        let (root, _dir) = temp_root();
+        // HIGH-sibling (2026-09-11): a glued redirect target carrying `$`/a
+        // backtick is not path-like, so the glued-branch gate skipped it and a
+        // read-only segment lead (`echo`, `cat`) exempted the token downstream
+        // — the shell then expanded the write target out-of-root. Every
+        // interpolated glued write target must reject via `resolve_within`.
+        for command in [
+            "echo x >$HOME",
+            "echo x >$(echo /tmp/pwned)",
+            "FOO=/tmp/x; echo hi >$FOO",
+            "echo x >`/tmp/x`",
+            "FOO=/tmp/x; echo hi <`$FOO`",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated redirect target, got: {err}"
+            );
+        }
+        // Spaced forms were already contained via the standalone branch and
+        // stay rejected.
+        assert!(
+            contain_shell_command(&root, &root, "echo x > /tmp/y", &[]).is_err(),
+            "spaced outside-root redirect must stay rejected"
+        );
+        // A glued bare in-root name without interpolation keeps working.
+        contain_shell_command(&root, &root, "cat f >out", &[])
+            .expect("glued in-root bare redirect target allowed");
+        contain_shell_command(&root, &root, "cat f <in", &[])
+            .expect("glued in-root bare input target allowed");
+        // `2>&1`/`>&2` remainders and a glued extension-bearing name stay
+        // passable — no metadata characters, resolved as in-root literals.
+        contain_shell_command(&root, &root, "echo hi 2>&1", &[])
+            .expect("glued 2>&1 remainder allowed");
+        contain_shell_command(&root, &root, "echo hi >&2", &[])
+            .expect("glued >&2 remainder allowed");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("glued 2>err.log behavior unchanged");
     }
 
     #[test]
