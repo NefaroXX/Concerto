@@ -645,7 +645,7 @@ struct DecomposeResult {
 /// `call_specialist` dispatch). Threaded into `execute_graph` so the
 /// loop's work flows into the same accumulators, checkpoints, and final
 /// output the graph-execution machinery maintains.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DispatchLedger {
     completed_results: HashMap<TaskId, AgentRunResult>,
     total_cost: f64,
@@ -874,6 +874,11 @@ pub struct CoordinatorAgent {
     /// checkpoint's own append". `None` (no hint) is fail-soft: the cursor
     /// stays unknown and the resume treats the whole log as pre-cursor.
     resume_cursor_hint_ms: Option<i64>,
+    /// Issue #52: the decision journal — typed, validated strategy decisions
+    /// of this run's Coordinator decision loop, separate from the execution
+    /// accumulators (`DispatchLedger` / graph) and persisted additively so
+    /// decision state is inspectable independently of the execution state.
+    decision_journal: crate::decisions::DecisionJournal,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1157,30 +1162,40 @@ struct CallSpecialistArgs {
     task: String,
     notes: Option<String>,
     supporting_evidence_ids: Vec<String>,
+    /// Issue #52: optional model-supplied artifact paths. NEVER trusted:
+    /// they validate (lexically canonicalize inside the project root) at
+    /// decision-validation time before any materialization.
+    expected_artifacts: Vec<String>,
 }
 
 impl CallSpecialistArgs {
-    /// Parse and validate the tool arguments. Malformed arguments (missing
-    /// or non-string `agent_id`/`task`) yield `None` — the caller answers
-    /// with a structured tool error, never a crash.
+    /// Parse the tool arguments. Malformed arguments (missing or non-string
+    /// `agent_id`/`task`) yield `None` — the caller answers with a
+    /// structured tool error, never a crash.
     fn parse(arguments: &serde_json::Value) -> Option<Self> {
         let agent_id = arguments.get("agent_id").and_then(serde_json::Value::as_str)?;
         let task = arguments.get("task").and_then(serde_json::Value::as_str)?;
         let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
-        let supporting_evidence_ids = arguments
-            .get("supporting_evidence_ids")
-            .and_then(serde_json::Value::as_array)
-            .map(|ids| {
-                ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect()
-            })
-            .unwrap_or_default();
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        let expected_artifacts = parse_string_array(arguments, "expected_artifacts");
         Some(Self {
             agent_id: agent_id.to_owned(),
             task: task.to_owned(),
             notes: notes.map(str::to_owned),
             supporting_evidence_ids,
+            expected_artifacts,
         })
     }
+}
+
+/// Read an optional JSON array-of-strings field, dropping non-string
+/// entries (absent/non-array ⇒ empty).
+fn parse_string_array(arguments: &serde_json::Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// Mutable working state of one Coordinator decision session: the current
@@ -1344,6 +1359,9 @@ impl CoordinatorAgent {
             last_doc_resolution: None,
             last_dispatch_decision: None,
             resume_cursor_hint_ms: None,
+            // Issue #52: decision state starts empty and grows only through
+            // validated decisions; execution state never writes here.
+            decision_journal: crate::decisions::DecisionJournal::default(),
         }
     }
 
@@ -1353,6 +1371,78 @@ impl CoordinatorAgent {
     pub fn with_resume_cursor_hint_ms(mut self, hint_ms: Option<i64>) -> Self {
         self.resume_cursor_hint_ms = hint_ms;
         self
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #52: decision validation helpers — every model-proposed
+    // decision is validated deterministically against the roster, the real
+    // whiteboard evidence, and the project root BEFORE any state mutation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Which of the cited evidence ids do NOT exist as whiteboard rows. The
+    /// ADR-65 acceptance-8 check, run at DECISION time (dispatch validation),
+    /// not only inside the append transaction. Bounded: one tiny indexed
+    /// lookup per cited id; cancellation observed up front.
+    async fn missing_evidence_ids(
+        &self,
+        cited: &[String],
+        cancel: &CancellationToken,
+    ) -> Vec<String> {
+        if cited.is_empty() || cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let Some(pool) = self.review_store.as_ref() else {
+            // No log pool: no evidence can be verified against anything.
+            return cited.to_vec();
+        };
+        let mut missing = Vec::new();
+        for id in cited {
+            let known: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM whiteboard_events WHERE event_id = ?")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if known.is_none() {
+                missing.push(id.clone());
+            }
+        }
+        missing
+    }
+
+    /// Build a validator for one decision: the registry's registered ids are
+    /// the roster, `known_event_ids` (REAL log rows) are the only citable
+    /// evidence, and `project_root` bounds artifact canonicalization.
+    fn decision_roster(&self) -> HashSet<String> {
+        self.registry.ids().into_iter().map(|id| id.as_str().to_owned()).collect()
+    }
+
+    /// Journal one no-target side decision (`DraftPlan`/`SelfExecute`, issue
+    /// #52: ADR-35 §8/§2 surfaces whose structure is fixed by the machine —
+    /// no ids, no model-controlled fields). Returns the recorded id.
+    fn record_side_decision(
+        &mut self,
+        kind: crate::decisions::DecisionKind,
+        description: &str,
+    ) -> String {
+        let decision = crate::decisions::CoordinatorDecision {
+            id: concerto_core::ids::new_id().to_string(),
+            kind,
+            target_agent: None,
+            task_description: description
+                .chars()
+                .take(crate::decisions::MAX_DECISION_TASK_CHARS)
+                .collect(),
+            notes: None,
+            supporting_evidence_ids: Vec::new(),
+            expected_artifacts: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+            status: crate::decisions::DecisionStatus::Validated,
+        };
+        let id = decision.id.clone();
+        self.decision_journal.record(decision);
+        id
     }
 
     /// Attach the ADR-45 tier-1b fallback target: the run's default provider
@@ -2261,12 +2351,20 @@ impl CoordinatorAgent {
         // A role with no registered agent is a configuration error: do not
         // silently rescue it with tier-2 self-execution (which would bypass
         // the missing specialist entirely). The caller surfaces the original
-        // error through its terminal handling.
+        // error through its terminal handling. Issue #52: the ladder is
+        // deterministic, not model-driven — the tier target is ASSERTED
+        // registered before any tier runs, and the rejected ladder attempt
+        // is journaled (decision state, not execution state).
         if self.registry.get(original_role).is_none() {
             tracing::warn!(
                 target: "orchestrator::coordinator",
                 role = ?original_role,
                 "role has no registered agent; skipping fallback ladder",
+            );
+            self.decision_journal.record(
+                crate::decisions::DecisionValidator::ladder_rejected_decision(
+                    original_role.as_str(),
+                ),
             );
             return FallbackOutcome::Exhausted;
         }
@@ -2918,6 +3016,10 @@ impl CoordinatorAgent {
             self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clear();
             self.last_doc_resolution = None;
             self.last_dispatch_decision = None;
+            // Issue #52: the restored decision journal is also superseded
+            // (leaving it would carry a decided-but-invalid plan's strategy
+            // entries into a run it cannot govern).
+            self.decision_journal = crate::decisions::DecisionJournal::from_entries(Vec::new());
             warn!(
                 run_id = %cp.run_id,
                 "ADR-65 §7: resume chose REPLAN — the workspace objectively changed \
@@ -3132,6 +3234,53 @@ impl CoordinatorAgent {
             let facts = resume::task_facts_after_cursor(post_cursor, &subtask.id.0.to_string());
             Some((subtask.id, subtask.role.clone(), facts, ledger_failures))
         });
+
+        // ── Issue #52: deterministically re-validate the checkpoint's
+        // pending decision BEFORE the resume evaluation consumes it. The
+        // selected agent must still be on the roster, and every cited
+        // evidence id must still exist in the whiteboard log (per-id check
+        // — the exact acceptance-8 predicate). A stale pending decision
+        // cannot stand: the outcome is a forced Replan — deterministic
+        // recovery, the model is never asked to repair checkpoint state.
+        // Without a log pool the evidence is unverifiable (fail-soft: no
+        // staleness is imputed on unknowable facts; roster staleness still
+        // applies).
+        if let Some(pending) = pending_decision {
+            let missing_evidence: Vec<String> = match self.review_store.as_ref() {
+                Some(_) => {
+                    self.missing_evidence_ids(&pending.supporting_evidence_ids, cancel).await
+                }
+                None => Vec::new(),
+            };
+            let known_evidence: HashSet<String> = pending
+                .supporting_evidence_ids
+                .iter()
+                .filter(|id| !missing_evidence.contains(id))
+                .cloned()
+                .collect();
+            let roster_ids = self.decision_roster();
+            let stale = crate::decisions::DecisionValidator {
+                roster_ids: &roster_ids,
+                known_event_ids: &known_evidence,
+                project_root: None,
+            }
+            .pending_decision_is_stale(&pending.selected_agent, &pending.supporting_evidence_ids);
+            if stale {
+                warn!(
+                    selected_agent = %pending.selected_agent,
+                    missing_evidence = missing_evidence.len(),
+                    "ADR-65 §7 + issue #52: the pending decision is stale (unregistered \
+                     target or fabricated evidence); forcing Replan"
+                );
+                self.decision_journal.record(
+                    crate::decisions::DecisionValidator::replan_rejection_decision(
+                        &pending.selected_agent,
+                        &missing_evidence,
+                    ),
+                );
+                return ResumeApplication::Replan;
+            }
+        }
 
         let mut blocked: Option<resume::BlockedStep> = None;
         let mut step_facts = resume::TaskFacts::default();
@@ -3615,6 +3764,40 @@ impl CoordinatorAgent {
             } else {
                 ready_ids
             };
+
+            // ── Issue #52: batch-validate the ready set BEFORE dispatch ──
+            // Deterministic execution, but the invariant is enforced — every
+            // ready target must still be a registered agent. A role the
+            // registry no longer holds is blocked structurally (never
+            // silently dropped the batch's work): the step is marked
+            // blocked with a run note, keeping the DAG resumable.
+            let (ready_ids, batch_invalid): (Vec<_>, Vec<_>) = {
+                let mut ok = Vec::new();
+                let mut bad = Vec::new();
+                for pair in ready_ids.into_iter() {
+                    if self.registry.get(&pair.1).is_some() {
+                        ok.push(pair);
+                    } else {
+                        bad.push(pair);
+                    }
+                }
+                (ok, bad)
+            };
+            for (task_id, role) in batch_invalid {
+                warn!(%role, %task_id, "ready batch contains an unregistered role; \
+                     blocking the step (issue #52 batch validation)");
+                graph.mark_blocked(&task_id);
+                action_ledger.push(checkpoint::CheckpointAction {
+                    kind: "decision-rejected".into(),
+                    task_id: Some(task_id),
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    evidence: None,
+                });
+                recoverable_notes.push(format!(
+                    "Ready step {task_id} was blocked before dispatch: its role {role} is \
+                     no longer a registered agent (issue #52 decision validation)."
+                ));
+            }
 
             if ready_ids.is_empty() {
                 if graph.all_completed() {
@@ -6698,10 +6881,83 @@ impl CoordinatorAgent {
                 "message": "call_specialist requires string agent_id and task",
             });
         };
+
+        // ── Issue #52: validate the decision BEFORE any mutation ────────
+        // The model output is a proposition, not an instruction. Evidence
+        // existence is the real whiteboard-row check (dispatch-time, not
+        // only the append-side); the pure rules cover roster membership,
+        // bounds, and kind conflicts. Any failure is a structured tool
+        // error — no state changes, no dispatch.
+        let cited_ids = args.supporting_evidence_ids.clone();
+        let missing_evidence = self.missing_evidence_ids(&cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let decision = match validator.validate(
+            crate::decisions::DecisionKind::DispatchSpecialist,
+            Some(&args.agent_id),
+            &args.task,
+            args.notes.as_deref(),
+            &cited_ids,
+            &args.expected_artifacts,
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    agent = %args.agent_id,
+                    "call_specialist rejected an invalid Coordinator decision (structured \
+                     error, no state mutation)"
+                );
+                return rejection.tool_value();
+            }
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── The DAG frontier must be settled: the chain parent (when any)
+        // is done or definitively blocked — the model cannot back-chain a
+        // new dispatch out of order past open work (ready-set gate) ─────
+        if let Some(parent) = state.last_node {
+            let stall = match graph.get(&parent) {
+                None => Some("no longer in the graph"),
+                Some(node)
+                    if !matches!(
+                        node.status,
+                        SubTaskStatus::Completed | SubTaskStatus::Blocked | SubTaskStatus::Failed
+                    ) =>
+                {
+                    Some("still open")
+                }
+                Some(_) => None,
+            };
+            if stall.is_some() {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    parent = %parent,
+                    "call_specialist rejected: the decision's chain parent is not settled"
+                );
+                return serde_json::json!({
+                    "error": "decision_not_ready",
+                    "message": format!(
+                        "the decision's parent step {parent} is {stall:?}; the dispatch \
+                         would bypass the task DAG — wait for or close it first"
+                    ),
+                });
+            }
+        }
+
         let agent_id = AgentId::new(&args.agent_id);
         let Some(agent) = self.registry.get(&agent_id) else {
-            // Unknown or disabled id (ADR-58: `disabled = true` removes the
-            // agent from the runtime topology) — a tool error, not a crash.
+            // Structural re-check (the roster can only shrink via
+            // configuration): unreachable through the validator — fail
+            // closed, identical to the historical rejection semantics.
             return serde_json::json!({
                 "error": "unknown_agent",
                 "message": format!(
@@ -6888,6 +7144,10 @@ impl CoordinatorAgent {
                 });
             }
         };
+        // The decision is dispatched (Deterministic execution never
+        // re-consults the model — the strategy is the record from here on).
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
         let result = match self
             .runner
             .run(agent_id.clone(), &run_subtask, run_ctx, &profile, cancel.clone())
@@ -6910,7 +7170,6 @@ impl CoordinatorAgent {
                 });
             }
         };
-
         // ── ADR-65 §5: a design-mode call may produce a DesignDoc — the
         // verifier chain runs (an optional policy-gated check, never a
         // mandatory stage) ─────────────────────────────────────────────────
@@ -6959,6 +7218,10 @@ impl CoordinatorAgent {
         let files = result.files_modified.clone();
         let summary_text = result.summary.clone();
         self.settle_dispatch_record(ledger, subtask_id, &result);
+        // The decision settled: the specialist outcome is the decision's
+        // outcome too (decision state mirrors — never replaces — the
+        // execution ledger).
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
         let settled = metrics_from_result(&result);
         ledger.provider_metrics.push(settled.clone());
         self.settled_metrics.push(settled);
@@ -7150,6 +7413,13 @@ impl CoordinatorAgent {
         cancel: &CancellationToken,
         doc: Option<&DesignDoc>,
     ) -> (serde_json::Value, Option<PlanArtifact>) {
+        // Issue #52: the advisor invocation is itself a journaled decision —
+        // no target, advisory only, deterministic bounds (a draft_plan call
+        // carries no model-controlled ids, so validation cannot fail here).
+        let decision_id = self.record_side_decision(
+            crate::decisions::DecisionKind::DraftPlan,
+            "request the bounded advisory work breakdown",
+        );
         let roster: Vec<PlannerAgentInfo> = self
             .registry
             .ids()
@@ -7179,6 +7449,8 @@ impl CoordinatorAgent {
             .await
         {
             Ok(outcome) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
                 let mut rendered = String::from(
                     "Advisory draft work breakdown (context only — you decide; nothing \
                      here is scheduled):\n",
@@ -7199,13 +7471,17 @@ impl CoordinatorAgent {
                     Some(outcome.artifact),
                 )
             }
-            Err(error) => (
-                serde_json::json!({
-                    "error": "planner_unavailable",
-                    "message": format!("the planner advisor produced no usable draft: {error}"),
-                }),
-                None,
-            ),
+            Err(error) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                (
+                    serde_json::json!({
+                        "error": "planner_unavailable",
+                        "message": format!("the planner advisor produced no usable draft: {error}"),
+                    }),
+                    None,
+                )
+            }
         }
     }
 
@@ -7227,12 +7503,20 @@ impl CoordinatorAgent {
                 "message": "the coordinator has no tool executor attached for self-execution",
             });
         };
+        // Issue #52: self-execution is a journaled decision (ADR-35 §8);
+        // validation is structural only (no target, bounded description).
+        let decision_id = self.record_side_decision(
+            crate::decisions::DecisionKind::SelfExecute,
+            &format!("execute own tool {tool_name}"),
+        );
         ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(1);
         match executor
             .execute(tool_name, arguments.clone(), &base_ctx.session, cancel.clone())
             .await
         {
             Ok(output) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
                 // Collect the paths the coordinator's own work touched so
                 // the run's file ledger stays complete.
                 for key in ["destination", "path", "file_path"] {
@@ -7248,11 +7532,15 @@ impl CoordinatorAgent {
                     "summary": output.summary,
                 }))
             }
-            Err(error) => serde_json::json!({
-                "error": "tool_execution_failed",
-                "message": error.to_string(),
-                "retryable": true,
-            }),
+            Err(error) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({
+                    "error": "tool_execution_failed",
+                    "message": error.to_string(),
+                    "retryable": true,
+                })
+            }
         }
     }
 
@@ -12799,6 +13087,34 @@ mod tests {
         .to_string()
     }
 
+    /// Issue #52: the same shape with an explicit `pending_decision` — the
+    /// additive §7 field a real v4 writer produces.
+    #[allow(clippy::too_many_arguments)]
+    fn blocked_step_checkpoint_json_with_pending(
+        project_id: &str,
+        session_id: Ulid,
+        subtask_id: Ulid,
+        role: &str,
+        status: &str,
+        ledger_failed_entries: usize,
+        cursor: Option<u64>,
+        pending: serde_json::Value,
+    ) -> String {
+        let base = blocked_step_checkpoint_json(
+            project_id,
+            session_id,
+            subtask_id,
+            role,
+            status,
+            ledger_failed_entries,
+            cursor,
+        );
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&base).expect("base checkpoint json parses");
+        parsed["pending_decision"] = pending;
+        parsed.to_string()
+    }
+
     /// Append a `ToolExecuted` fact row attributed to a task (real id,
     /// session-scoped — the shape the fact writer produces).
     async fn append_tool_fact(
@@ -13942,16 +14258,20 @@ mod tests {
     // ADR-35 amendment (2026-09-05) contract tests
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Contract 1b: a `Decision` event citing a FABRICATED evidence id is
-    /// rejected at append (ADR-65 acceptance 8) — the append side re-lands
-    /// the record WITHOUT the rejected citations (fail-soft), so the ledger
-    /// always carries the dispatch record and never a fabricated id.
+    /// Contract 1b (updated by issue #52): a dispatch citing a FABRICATED
+    /// evidence id is rejected at DECISION-validation time — a structured
+    /// `fabricated_evidence` tool error, NO dispatch, and NO mutation (never
+    /// accepted to the ledger). The append-side acceptance-8 check stays on
+    /// as defense-in-depth (covered by the `concerto-sessions` tests).
+    ///
+    /// Contrast with the real id: `fabricated_evidence_real_document` below
+    /// dispatches fine.
     #[tokio::test]
-    async fn fabricated_evidence_id_is_rejected_at_append() {
+    async fn fabricated_evidence_id_is_rejected_at_dispatch() {
         let (_store_dir, pool) = fallback_evidence_pool().await;
         let bus = EventBus::new(256);
         let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
-        let (output, _events) = run_for_test(
+        let (output, events) = run_for_test(
             coordinator_with_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
@@ -13962,19 +14282,36 @@ mod tests {
                         None,
                         &["ev-fabricated-0001"],
                     )]),
-                    CoordinatorTurn::Text("done".into()),
+                    CoordinatorTurn::Text("adjusted after the rejection".into()),
                 ],
             )
             .with_review_store(Some(pool.clone())),
             bus.clone(),
         )
         .await;
+        // The dispatch never happens: no specialist ran.
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "researcher"
+            )),
+            "a fabricated-evidence dispatch is rejected before any dispatch: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("fabricated_evidence")
+            )),
+            "the structured rejection surfaces to the Coordinator: {events:?}"
+        );
         assert!(
             output.final_message.contains("Multi-agent orchestration completed"),
-            "a rejected citation must not fail the dispatch, got: {}",
+            "a rejected citation must not crash the run, got: {}",
             output.final_message
         );
 
+        // The whiteboard never gains a decision record for the rejected
+        // dispatch (constraint: no state mutation on validation failure).
         let logged = concerto_sessions::whiteboard::load_whiteboard_events(
             &pool,
             &concerto_sessions::whiteboard::WhiteboardLoadOpts {
@@ -13986,22 +14323,402 @@ mod tests {
         )
         .await
         .expect("whiteboard loads");
-        let decisions: Vec<_> = logged
-            .iter()
-            .filter(|event| {
-                event.kind == WhiteboardKind::Decision
-                    && event.payload.get("selected_agent").is_some()
-            })
-            .collect();
-        assert_eq!(decisions.len(), 1, "the dispatch record still lands: {decisions:?}");
-        let cited = decisions[0].payload["supporting_evidence_ids"]
-            .as_array()
-            .expect("supporting ids array");
         assert!(
-            !cited.iter().any(|id| id == "ev-fabricated-0001"),
-            "the fabricated id must not appear on the log: {cited:?}"
+            !logged.iter().any(|event| event.kind == WhiteboardKind::Decision),
+            "a rejected decision leaves no ledger record: {logged:?}"
         );
-        assert!(cited.is_empty(), "the re-append drops the rejected citations: {cited:?}");
+    }
+
+    /// Issue #52 (gap 2, positive control): a dispatch citing REAL log rows
+    /// passes decision validation and dispatches with the citations intact.
+    #[tokio::test]
+    async fn real_evidence_document_dispatches() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        // Seed ONE real row the Coordinator can cite.
+        let real = concerto_sessions::NewWhiteboardEvent {
+            event_id: format!("ev-real-{}", Ulid::new()),
+            agent_id: "researcher".into(),
+            kind: WhiteboardKind::Finding,
+            scope: "test".into(),
+            session_id: None,
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({ "note": "real evidence row" }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        let stored = concerto_sessions::whiteboard::append_whiteboard_event(&pool, &real)
+            .await
+            .expect("real evidence row appends");
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist_with(
+                        "researcher",
+                        "inspect",
+                        None,
+                        &[stored.event_id.as_str()],
+                    )]),
+                    CoordinatorTurn::Text("done citing real evidence".into()),
+                ],
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "researcher"
+            )),
+            "a REAL-evidence decision dispatches: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "real citations never block: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52 (gap 1): the decision session's DAG-frontier gate. A
+    /// dispatch whose chain parent is NOT settled (Pending) is a
+    /// structured `decision_not_ready` tool error — the model cannot
+    /// back-chain a new dispatch out of order past open work (the
+    /// ready-set bypass is gone), and no state mutates.
+    #[tokio::test]
+    async fn call_specialist_with_unsettled_chain_parent_rejects() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+
+        // A chain parent that is still Pending — the model must not be able
+        // to dispatch behind it (bounded, resumable state, never a crash).
+        let open_parent = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: open_parent,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "open work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(open_parent) };
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let decision_value = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "next step" }),
+            )
+            .await;
+
+        assert_eq!(
+            decision_value["error"], "decision_not_ready",
+            "structured, yes: {decision_value:?}"
+        );
+        // No state mutation: the graph stays untouched, nothing dispatched.
+        assert!(
+            ledger.action_ledger.is_empty() && ledger.completed_results.is_empty(),
+            "a rejected dispatch mutates nothing: {ledger:?}"
+        );
+        assert_eq!(graph.len(), 1, "no new node materializes: only the open parent");
+    }
+
+    /// Issue #52 (structured malformed arguments): an empty agent_id is an
+    /// `incomplete_decision` rejection — no dispatch, no crash.
+    #[tokio::test]
+    async fn call_specialist_incomplete_empty_target_rejects() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("", "dispatch me")]),
+                    CoordinatorTurn::Text("after the rejection".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "an empty target never dispatches: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("incomplete_decision")
+            )),
+            "the structured rejection surfaces: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "an incomplete decision never crashes the run: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52: a model-supplied `expected_artifacts` path that escapes
+    /// the workspace (traversal) rejects the decision structurally — model
+    /// paths are never trusted, canonicalized at validation time only.
+    #[tokio::test]
+    async fn call_specialist_artifact_traversal_rejects() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![ToolCall {
+                        id: "call-coder".into(),
+                        name: CALL_SPECIALIST_TOOL.to_string(),
+                        arguments: serde_json::json!({
+                            "agent_id": "coder",
+                            "task": "implement",
+                            "expected_artifacts": ["../../etc/passwd"],
+                        }),
+                    }]),
+                    CoordinatorTurn::Text("after the rejection".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "a traversal artifact never dispatches: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("invalid_artifact_path")
+            )),
+            "the rejection surfaces: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "{}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52: the stale-pending-decision resume gate. A checkpoint whose
+    /// pending decision (a fabricated evidence id or an unregistered
+    /// target) cannot stand: the resume deterministically forces Replan —
+    /// the restored graph is discarded for a FRESH decompose (never a model
+    // repair loop) — even though the step facts alone would have continued.
+    #[tokio::test]
+    async fn resume_with_stale_pending_decision_forces_replan() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Post-cursor progress fact: WITHOUT the stale gate the resume
+        // would continue behind it — the Replan below is attributable ONLY
+        // to the stale pending decision.
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = AgentRegistry::from_mocks(vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not re-design"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ]);
+        let registry = Arc::new(registry);
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        // The pending decision cites a FABRICATED id — stale by the exact
+        // acceptance-8 predicate (per-id existence), validated BEFORE the
+        // resume evaluation consumes the decision.
+        let cp_json = blocked_step_checkpoint_json_with_pending(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+            serde_json::json!({
+                "selected_agent": "coder",
+                "reason": "resume-continue-blocked",
+                "required_output": "the blocked work",
+                "supporting_evidence_ids": ["ev-fabricated-0001"],
+                "task_id": subtask_id.to_string(),
+            }),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .restore_and_evaluate(&cp_json, &task, &context, &CancellationToken::new())
+            .await
+            .expect("stale pending never crashes the restore");
+
+        // Forced Replan: the restored graph is thrown away (Ok(None)) — the
+        // model is never asked to repair coordinator state, and the restored
+        // step is never re-dispatched behind a stale decision.
+        assert!(
+            result.is_none(),
+            "a stale pending decision forces Replan; the restored graph must not resume"
+        );
+
+        // No resume-decision decision event lands for a forced Replan (the
+        // staleness gate runs BEFORE the resume evaluation writes anything).
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let holder: Vec<serde_json::Value> = logged
+            .iter()
+            .filter(|event| event.payload.get("reason").is_some())
+            .map(|event| event.payload.clone())
+            .collect();
+        assert!(
+            !holder.iter().any(|payload| payload["reason"] == "resume-continue-blocked"),
+            "a stale decision is never continued: {holder:?}"
+        );
+    }
+
+    /// Issue #52 (control): a pending decision whose evidence is REAL and
+    /// whose target is on the roster re-validates cleanly — the resume
+    /// proceeds exactly like the pre-#52 evaluation (continue-behind).
+    #[tokio::test]
+    async fn resume_with_valid_pending_decision_still_continues() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Post-cursor progress fact — the SAME id the pending decision cites.
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json_with_pending(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+            serde_json::json!({
+                "selected_agent": "coder",
+                "reason": "resume-continue-blocked",
+                "required_output": "the blocked work",
+                "supporting_evidence_ids": ["ev-post-progress"],
+                "task_id": subtask_id.to_string(),
+            }),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let restored = coordinator
+            .restore_and_evaluate(&cp_json, &task, &context, &CancellationToken::new())
+            .await
+            .expect("a valid pending decision still restores");
+        assert!(restored.is_some(), "a FRESH pending decision does not force Replan");
+        let restored = restored.expect("checked");
+        let graph_task = restored
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("the restored step");
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "continue re-arms the step");
     }
 
     /// Contract 2: the Coordinator's prompt carries EVERY registered agent's

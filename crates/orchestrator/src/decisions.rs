@@ -67,7 +67,10 @@ pub enum DecisionKind {
 impl DecisionKind {
     /// Whether this kind names a dispatch target.
     pub fn requires_target(self) -> bool {
-        matches!(self, DecisionKind::DispatchSpecialist | DecisionKind::Retry | DecisionKind::FallbackTier)
+        matches!(
+            self,
+            DecisionKind::DispatchSpecialist | DecisionKind::Retry | DecisionKind::FallbackTier
+        )
     }
 
     /// Whether this kind must NOT carry a target (a carry-over makes the
@@ -326,6 +329,60 @@ impl<'a> DecisionValidator<'a> {
         agent_unknown || evidence_unknown
     }
 
+    /// The journal record for a structurally rejected pending-decision
+    /// continuation (issue #52): a Replan forced on resume because the
+    /// checked decision named an unregistered target or cited evidence the
+    /// log does not hold. Recorded so the decision state shows WHY the run
+    /// replanned.
+    #[must_use]
+    pub fn replan_rejection_decision(
+        selected_agent: &str,
+        missing_evidence: &[String],
+    ) -> CoordinatorDecision {
+        CoordinatorDecision {
+            id: concerto_core::ids::new_id().to_string(),
+            kind: DecisionKind::Replan,
+            target_agent: None,
+            task_description: format!(
+                "for the pending decision's continuation behind {selected_agent}"
+            ),
+            notes: Some(format!(
+                "issue #52: pending decision is stale ({} unverifiable evidence id(s) \
+                 or an unregistered target); the resume cannot stand behind it",
+                missing_evidence.len(),
+            )),
+            supporting_evidence_ids: Vec::new(),
+            expected_artifacts: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+            status: DecisionStatus::Rejected,
+        }
+    }
+
+    /// The journal record for a fallback-ladder attempt that cannot run
+    /// (issue #52): the tier target is asserted registered BEFORE any tier
+    /// executes (deterministic — the ladder never consults the model). When
+    /// the assertion fails the ladder attempt is journaled as Rejected.
+    #[must_use]
+    pub fn ladder_rejected_decision(original_role: &str) -> CoordinatorDecision {
+        CoordinatorDecision {
+            id: concerto_core::ids::new_id().to_string(),
+            kind: DecisionKind::FallbackTier,
+            target_agent: Some(AgentId::new(original_role)),
+            task_description: format!(
+                "the fallback ladder for {original_role} — assertive tier validation"
+            ),
+            notes: Some(
+                "issue #52: skipped before any tier ran — no registered agent for the \
+                 tier target (structured rejection, no execution)"
+                    .to_owned(),
+            ),
+            supporting_evidence_ids: Vec::new(),
+            expected_artifacts: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+            status: DecisionStatus::Rejected,
+        }
+    }
+
     /// Lexically canonicalize one model-supplied artifact path against the
     /// validator's project root. Absolute paths inside the root, `.`/`..`
     /// segments, and backslashes all normalize; anything escaping the root
@@ -459,18 +516,20 @@ mod tests {
         DecisionValidator { roster_ids, known_event_ids: known, project_root: root }
     }
 
-    fn dispatch(evidence: &[String], artifacts: &[String]) -> Result<CoordinatorDecision, DecisionRejection> {
+    fn dispatch(
+        evidence: &[String],
+        artifacts: &[String],
+    ) -> Result<CoordinatorDecision, DecisionRejection> {
         let roster_ids = roster(&["researcher", "coder"]);
         let known = events(&["ev-0001", "ev-0002"]);
-        validator(&roster_ids, &known, Some(Path::new("/tmp/proj")))
-            .validate(
-                DecisionKind::DispatchSpecialist,
-                Some("coder"),
-                "implement the thing",
-                Some("use the existing module"),
-                evidence,
-                artifacts,
-            )
+        validator(&roster_ids, &known, Some(Path::new("/tmp/proj"))).validate(
+            DecisionKind::DispatchSpecialist,
+            Some("coder"),
+            "implement the thing",
+            Some("use the existing module"),
+            evidence,
+            artifacts,
+        )
     }
 
     #[test]
@@ -500,14 +559,7 @@ mod tests {
         let roster_ids = roster(&["coder"]);
         let known = events(&[]);
         let error = validator(&roster_ids, &known, None)
-            .validate(
-                DecisionKind::DispatchSpecialist,
-                Some("ghost"),
-                "work",
-                None,
-                &[],
-                &[],
-            )
+            .validate(DecisionKind::DispatchSpecialist, Some("ghost"), "work", None, &[], &[])
             .expect_err("outside the roster");
         assert_eq!(error.code, "unknown_agent");
     }
@@ -517,14 +569,7 @@ mod tests {
         let roster_ids = roster(&["coder"]);
         let known = events(&[]);
         let error = validator(&roster_ids, &known, None)
-            .validate(
-                DecisionKind::DispatchSpecialist,
-                Some("coder"),
-                "   ",
-                None,
-                &[],
-                &[],
-            )
+            .validate(DecisionKind::DispatchSpecialist, Some("coder"), "   ", None, &[], &[])
             .expect_err("empty task");
         assert_eq!(error.code, "incomplete_decision");
     }
@@ -535,14 +580,7 @@ mod tests {
         let known = events(&[]);
         let oversized = "x".repeat(MAX_DECISION_TASK_CHARS + 1);
         let error = validator(&roster_ids, &known, None)
-            .validate(
-                DecisionKind::DispatchSpecialist,
-                Some("coder"),
-                &oversized,
-                None,
-                &[],
-                &[],
-            )
+            .validate(DecisionKind::DispatchSpecialist, Some("coder"), &oversized, None, &[], &[])
             .expect_err("too long");
         assert_eq!(error.code, "task_too_long");
     }
@@ -552,14 +590,7 @@ mod tests {
         let roster_ids = roster(&["coder"]);
         let known = events(&[]);
         let error = validator(&roster_ids, &known, None)
-            .validate(
-                DecisionKind::Replan,
-                Some("coder"),
-                "start over",
-                None,
-                &[],
-                &[],
-            )
+            .validate(DecisionKind::Replan, Some("coder"), "start over", None, &[], &[])
             .expect_err("conflicting");
         assert_eq!(error.code, "conflicting_decision");
     }
@@ -594,22 +625,14 @@ mod tests {
     #[test]
     fn too_many_evidence_ids_reject() {
         let roster_ids = roster(&["coder"]);
-        let known = (0..MAX_DECISION_EVIDENCE_IDS)
-            .map(|i| format!("ev-{i}"))
-            .collect::<HashSet<_>>();
+        let known =
+            (0..MAX_DECISION_EVIDENCE_IDS).map(|i| format!("ev-{i}")).collect::<HashSet<_>>();
         let the_ids: Vec<String> = known.iter().cloned().collect();
-        let overflow: String = format!("ev-overflow");
+        let overflow: String = "ev-overflow".to_owned();
         let mut cited = the_ids.clone();
         cited.push(overflow);
         let error = validator(&roster_ids, &known, None)
-            .validate(
-                DecisionKind::DispatchSpecialist,
-                Some("coder"),
-                "work",
-                None,
-                &cited,
-                &[],
-            )
+            .validate(DecisionKind::DispatchSpecialist, Some("coder"), "work", None, &cited, &[])
             .expect_err("too many");
         assert_eq!(error.code, "too_many_evidence_ids");
     }
@@ -646,11 +669,8 @@ mod tests {
 
     #[test]
     fn duplicate_evidence_and_artifacts_dedupe() {
-        let raw = vec![
-            "src/main.rs".to_owned(),
-            "src/main.rs".to_owned(),
-            "./src/lib.rs".to_owned(),
-        ];
+        let raw =
+            vec!["src/main.rs".to_owned(), "src/main.rs".to_owned(), "./src/lib.rs".to_owned()];
         let cited = vec!["ev-0001".to_owned(), "ev-0001".to_owned()];
         let decision = dispatch(&cited, &raw).expect("dupes allowed");
         assert_eq!(decision.supporting_evidence_ids, vec!["ev-0001"]);
