@@ -154,11 +154,15 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
 
 /// Flatten command + args into whitespace-separated tokens with surrounding
 /// shell quotes stripped, mirroring the denylist's flattened-string scan.
+/// Newline/CR list separators (ADR-55 shell lists: `a\nb` sequences the shell
+/// as two commands) cannot survive whitespace tokenization, so they are
+/// translated into explicit `;` separator tokens that [`list_segments`] can
+/// split on — a quoted multi-line body conservatively gains the separator too.
 fn flat_tokens(command: &str, args: &[String]) -> Vec<String> {
-    let mut flat = command.to_string();
+    let mut flat = command.replace(['\n', '\r'], " ; ");
     for arg in args {
         flat.push(' ');
-        flat.push_str(arg);
+        flat.push_str(&arg.replace(['\n', '\r'], " ; "));
     }
     flat.split_whitespace()
         .filter(|token| !token.is_empty())
@@ -582,89 +586,138 @@ fn scan_git_change_dir(
     Ok(())
 }
 
-/// A pipe (`|`) segment of the flattened token list: the token-index range
-/// plus the segment's leading verb when one is known. A pipe ends the current
-/// segment whether it is a standalone token or glued inside one (`ls|tee`,
-/// `x|`); a non-empty post-glue remainder (`ls|tee` → `tee`) becomes the next
-/// segment's leading verb, so the first token after the glue is governed by
-/// the running executable the shell actually resolves there.
-struct PipeSegment {
-    start: usize,
-    end: usize,
+/// A list segment of the flattened token list: the content sections (each a
+/// flattened-token index plus its pre-boundary character content) the shell
+/// will sequence as one command, plus the segment's leading verb when one is
+/// known. Every shell list separator ends the current segment — standalone
+/// (`|`, `&&`, `||`, `;`) or glued inside a token (`/;`, `ls&&rm`); a
+/// non-empty post-glue section (`ls|tee` → `tee`) becomes the next segment's
+/// leading verb, so the first token after the boundary is governed by the
+/// running executable the shell actually resolves there.
+struct ListSegment {
+    sections: Vec<(usize, String)>,
     lead: Option<String>,
 }
 
-/// Split the flattened token list into [`PipeSegment`]s, modeling pipes the
-/// way the shell will sequence them: on every `|` — standalone token, glued
-/// inside a token, or trailing a token. Segments that contain no tokens are
-/// skipped. This is the containment counterpart of the tier classifier's
-/// segment split (`authorization.rs command_segments`).
-fn pipe_segments(tokens: &[String]) -> Vec<PipeSegment> {
+/// Width (in characters) of the shell operator at `bytes[pos..]`, or `0` when
+/// that position starts no separator. Operator-aware exactly like the tier
+/// classifier's [`SHELL_SEGMENT_SEPARATORS`] split: glued `&&`/`||` are ONE
+/// boundary (`a||cat /etc/os-release` must not yield a bogus `|`-prefixed
+/// lead that misclassifies a legitimate fallback), while a lone `|` is the
+/// pipe and single `&`/`;`/`\n`/`\r` are plain list separators.
+fn separator_width(s: &str, pos: usize) -> usize {
+    let bytes = s.as_bytes();
+    match bytes[pos] {
+        b'&' if bytes.get(pos + 1) == Some(&b'&') => 2,
+        b'|' if bytes.get(pos + 1) == Some(&b'|') => 2,
+        b'&' | b'|' | b';' | b'\n' | b'\r' => 1,
+        _ => 0,
+    }
+}
+
+/// Split one flattened token into [`ListSegment`] content sections: alternating
+/// non-separator content (carrying the token's index) and separator runs
+/// (`None`), with `&&`/`||` kept as single boundaries.
+fn token_sections(index: usize, token: &str) -> Vec<Option<(usize, String)>> {
+    let mut sections = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = token[cursor..].find(['&', '|', ';', '\n', '\r']) {
+        let pos = cursor + rel;
+        let head = &token[cursor..pos];
+        if !head.is_empty() {
+            sections.push(Some((index, head.to_string())));
+        }
+        let width = separator_width(token, pos);
+        sections.push(None);
+        cursor = pos + width;
+    }
+    let tail = &token[cursor..];
+    if !tail.is_empty() {
+        sections.push(Some((index, tail.to_string())));
+    }
+    sections
+}
+
+/// Split the flattened token list into [`ListSegment`]s, modeling command
+/// lists the way the shell will sequence them: on every separator —
+/// `&`, `|`, `;`, `\n`, `\r` — standalone, glued inside a token, or trailing a
+/// token, with glued `&&`/`||` recognized as single boundaries. Segments that
+/// contain no content sections are skipped. This mirrors the tier classifier's
+/// segment split (`authorization.rs command_segments`) so a read-only leading
+/// verb exempts only its own list segment: `ls /; rm /etc/shadow` and
+/// `ls / && rm -f ~/…` cannot launder the mutating segment behind `ls`'s
+/// read-only tier.
+fn list_segments(tokens: &[String]) -> Vec<ListSegment> {
     let mut segments = Vec::new();
-    let mut start = 0usize;
-    let mut lead: Option<String> = None;
-    for (i, token) in tokens.iter().enumerate() {
-        if token == "|" {
-            // Standalone pipe: close the current segment; the `|` itself
-            // carries no content of interest to the path scan.
-            if start < i {
-                segments.push(PipeSegment { start, end: i, lead: lead.clone() });
+    let mut current: Option<ListSegment> = None;
+    for (index, token) in tokens.iter().enumerate() {
+        for section in token_sections(index, token) {
+            match section {
+                None => {
+                    if let Some(segment) = current.take() {
+                        segments.push(segment);
+                    }
+                }
+                Some(section) => {
+                    let segment = current
+                        .get_or_insert_with(|| ListSegment { sections: Vec::new(), lead: None });
+                    segment.sections.push(section.clone());
+                    if segment.lead.is_none() {
+                        segment.lead = Some(section.1);
+                    }
+                }
             }
-            start = i + 1;
-            lead = None;
-            continue;
-        }
-        if let Some(pos) = token.find('|') {
-            if lead.is_none() && pos > 0 {
-                lead = Some(token[..pos].to_string());
-            }
-            // Glued pipe: the token still belongs to the pre-pipe segment
-            // (its head is real input to that verb), then the segment ends.
-            if start < i {
-                segments.push(PipeSegment { start, end: i + 1, lead: lead.clone() });
-            }
-            let post = strip_trailing_command_punct(&token[pos + 1..]);
-            start = i + 1;
-            lead = if post.is_empty() { None } else { Some(post.to_string()) };
-            continue;
-        }
-        if lead.is_none() {
-            lead = Some(token.clone());
         }
     }
-    if start < tokens.len() {
-        segments.push(PipeSegment { start, end: tokens.len(), lead });
+    if let Some(segment) = current {
+        segments.push(segment);
     }
     segments
 }
 
 /// General path-argument containment: for mutation-capable leads, any
 /// path-like token that resolves outside the project root rejects the
-/// command. The exemption is PER PIPE SEGMENT: a read-only leading verb
+/// command. The exemption is PER LIST SEGMENT: a read-only leading verb
 /// exempts only its own segment's tokens — a later `tee`/mutating segment in
 /// a pipe (`cat f | tee /tmp/x`) is a self-contained mutation and must have
 /// its targets contained like any other write.
+///
+/// A glued token may carry content sections of SEVERAL segments (`cat a||rm
+/// x` → sections `a` and the tail); a token is read-only-exempt only when
+/// EVERY content section it carries belongs to a read-only segment — any
+/// mutating section on the same token disables the exemption for the whole
+/// token (conservative: a false positive only costs a rejection).
 fn scan_path_arguments(
     root: &Utf8Path,
     cwd: &Utf8Path,
     tokens: &[String],
     exempt: &HashSet<usize>,
 ) -> Result<(), ToolError> {
-    let mut read_only_by_token = vec![false; tokens.len()];
-    for segment in pipe_segments(tokens) {
-        let read_only = segment
-            .lead
-            .as_ref()
-            .is_some_and(|lead| is_read_only(lead, &tokens[segment.start + 1..segment.end]));
-        for flag in &mut read_only_by_token[segment.start..segment.end] {
-            *flag = read_only;
+    // Per original token: how many content sections cover it, and whether all
+    // covering segments are read-only. A token with zero content sections
+    // (pure separator) stays out of the general scan.
+    let mut section_count = vec![0u32; tokens.len()];
+    let mut all_read_only = vec![true; tokens.len()];
+    for segment in list_segments(tokens) {
+        let lead = segment.lead.clone().unwrap_or_default();
+        // A segment's trailing tokens for write-flag detection: the flattened
+        // tokens carrying this segment's content (the lead's own token
+        // included only when it is not the lead itself).
+        let trailing: Vec<String> =
+            segment.sections.iter().skip(1).map(|(index, _)| tokens[*index].clone()).collect();
+        let read_only = is_read_only(&lead, &trailing);
+        for (index, _) in &segment.sections {
+            section_count[*index] += 1;
+            if !read_only {
+                all_read_only[*index] = false;
+            }
         }
     }
     for (i, token) in tokens.iter().enumerate() {
-        if exempt.contains(&i) || i == 0 {
+        if exempt.contains(&i) || i == 0 || section_count[i] == 0 {
             continue;
         }
-        if read_only_by_token[i] {
+        if all_read_only[i] {
             continue;
         }
         if is_path_like(token) {
@@ -956,6 +1009,48 @@ mod tests {
             .expect("in-root tee target allowed");
         contain_shell_command(&root, &root, "cat f | tee sub/out.txt", &[])
             .expect("in-root subdir tee target allowed");
+    }
+
+    #[test]
+    fn fallback_splitter_lets_legit_fallback_through() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // `||` (glued or spaced) is a boundary, not a pipe: the fallback
+        // segment keeps its own read-only lead and legitimate fallback reads
+        // stay allowed.
+        contain_shell_command(&root, &root, "cat a || cat /etc/os-release", &[])
+            .expect("spaced || fallback read allowed");
+        contain_shell_command(&root, &root, "cat f||cat /etc/os-release", &[])
+            .expect("glued || fallback read allowed");
+        // The bogus `|`-lead must not survive splitting; unit-check segments.
+        let segs = list_segments(&["cat".into(), "a||cat".into(), "/etc/os-release".into()]);
+        let leads: Vec<Option<&str>> = segs.iter().map(|s| s.lead.as_deref()).collect();
+        assert_eq!(leads, vec![Some("cat"), Some("cat")], "|| must not produce a `|` lead");
+        // A lone `|` in a chain of reads stays read-only (unchanged).
+        contain_shell_command(&root, &root, "cat f|grep x", &[]).expect("pipe read allowed");
+    }
+
+    #[test]
+    fn read_only_lead_cannot_exempt_later_list_segments() {
+        let (root, _dir) = temp_root();
+        // The read-only exemption is scoped per list segment: a mutating
+        // segment after `&`/`;`/`&&`/`||`/newline separators keeps scanning
+        // even when the FIRST segment's verb is read-only.
+        for command in [
+            "ls /; rm /etc/shadow",
+            "ls / && rm -f ~/.ssh/authorized_keys",
+            "ls /; rm -rf ../outside",
+            "ls /\nrm /etc/shadow",
+            "cat f & rm /etc/shadow",
+            "cat f||rm /etc/shadow",
+            "ls /&&rm -f ../outside",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the mutating later segment, got: {err}"
+            );
+        }
     }
 
     #[test]
