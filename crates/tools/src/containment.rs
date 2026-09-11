@@ -318,6 +318,21 @@ fn resolve_within(root: &Utf8Path, cwd: &Utf8Path, target: &str) -> Result<Utf8P
                 .into(),
         });
     }
+    // A `~user` tilde form (`~root`, `~root/x`) expands in the shell to that
+    // user's home directory — NOT the in-root relative literal
+    // [`build_candidate`] would scan it as. Only the exact `~` (own home)
+    // and `~/...` forms are resolvable here; every other `~`-prefixed target
+    // is rejected without execution (2026-09-11: `~root/x` scanned as an
+    // in-root literal while bash resolved `/root/x`).
+    if target.starts_with('~') && target != "~" && !target.starts_with("~/") {
+        return Err(ToolError::VirtualFsConflict {
+            path: Utf8PathBuf::from(target),
+            reason: "shell containment (ADR-55): '~user' tilde form expands to \
+                     another user's home directory outside the project root; \
+                     command rejected without execution"
+                .into(),
+        });
+    }
     // `/dev/null` and the Windows reserved device names (`nul`, `con`, `prn`,
     // `aux`, `com1`..`com9`, `lpt1`..`lpt9`) are devices, not confined files:
     // canonicalization and root-prefix checks cannot meaningfully confine
@@ -746,7 +761,13 @@ fn scan_path_arguments(
         if all_read_only[i] {
             continue;
         }
-        if is_path_like(token) {
+        // An interpolation-carrying token (`$HOME`, a backtick form) is not
+        // necessarily path-like — `$HOME` has no `/`/`.`/`~`/`\` — so the
+        // path-shape gate alone would skip it and the shell would expand it
+        // out-of-root after containment returned (2026-09-11: `rm -rf $HOME`,
+        // `mv f $HOME`, `tee >(rm -rf $HOME)`). Flow it into `resolve_within`,
+        // whose interpolation rule rejects it without execution.
+        if is_path_like(token) || token.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)) {
             resolve_within(root, cwd, strip_trailing_command_punct(token))?;
         }
     }
@@ -914,6 +935,62 @@ mod tests {
         contain_shell_command(&root, &root, "cat f > out.txt", &[]).expect("in-root > allowed");
         contain_shell_command(&root, &root, "cat f > sub/out.txt", &[])
             .expect("in-root subdir > allowed");
+    }
+
+    #[test]
+    fn interpolation_token_in_mutating_segment_rejected_even_without_path_shape() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // N-1 (2026-09-11): `$HOME` carries no `/`/`.`/`~`/`\`, so it is not
+        // path-like and previously skipped the general path scan entirely —
+        // `rm -rf $HOME` passed containment and executed out-of-root on
+        // approval. Any `$`/backtick token in a mutating segment must reject.
+        for command in ["rm -rf $HOME", "mv f $HOME", "tee >(rm -rf $HOME)"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated target, got: {err}"
+            );
+        }
+        // The `$`-free in-root forms keep working — no over-block.
+        contain_shell_command(&root, &root, "rm -rf subdir", &[]).expect("in-root rm allowed");
+        contain_shell_command(&root, &root, "mv f out", &[]).expect("in-root mv allowed");
+        contain_shell_command(&root, &root, "tee >(rm -rf subdir)", &[])
+            .expect("in-root process substitution allowed");
+        // Read-only verbs keep their exemption: `echo $HOME` only prints.
+        contain_shell_command(&root, &root, "echo $HOME", &[]).expect("read-only echo allowed");
+    }
+
+    #[test]
+    fn tilde_user_form_rejected_own_home_forms_unchanged() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // N-3 (2026-09-11): `~root/x` is not `~`/`~/…`, so `build_candidate`
+        // scanned it as the in-root relative literal `<root>/~root/x` while
+        // bash expands it to `/root/x` — an unanchored escape. Every
+        // `~`-prefixed target other than exactly `~` or `~/…` must reject.
+        for command in ["mv f ~root/", "cat f > ~root/x", "rm -rf ~root", "cd ~root"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("~root"),
+                "'{command}' must reject the tilde-user target, got: {err}"
+            );
+        }
+        // The resolvable tilde forms keep their existing behavior: `~` and
+        // `~/x` expand to the (out-of-root) home and are rejected by the
+        // ordinary outside-root rule — NOT by the new tilde-user rule.
+        for target in ["~", "~/x"] {
+            let err = resolve_within(&root, &root, target).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{target}' must still reject as outside-root, got: {err}"
+            );
+        }
+        // Plain relative targets are untouched.
+        contain_shell_command(&root, &root, "mv f out", &[]).expect("plain relative allowed");
+        contain_shell_command(&root, &root, "mv f ./out", &[]).expect("dot-relative allowed");
+        contain_shell_command(&root, &root, "mv f sub/out", &[]).expect("subdir target allowed");
+        let _ = dir;
     }
 
     #[test]

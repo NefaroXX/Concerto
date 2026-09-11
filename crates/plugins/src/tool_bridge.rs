@@ -150,8 +150,24 @@ impl std::fmt::Debug for PluginTool {
 /// - `filesystem` / `git` / `shell`: the tools crate's builtin tools — a
 ///   squatting declaration would inherit their grant treatment (and silently
 ///   overwrite the builtin in the registry, since `ToolRegistry::register`
-///   replaces colliding entries).
-const RESERVED_TOOL_NAMES: &[&str] = &["call_specialist", "filesystem", "git", "shell"];
+///   replaces colliding entries);
+/// - `read` / `search` / `inspect` / `diagnose` / `diagnostics`: the
+///   observe-class inspector names of the core tier classifier
+///   (`authorization::is_observe`) — a plugin declaring one of these under
+///   its friendly name would get free Observe-Allow with no grant, so the
+///   namespaced form (`plugin:<id>:<name>`, which classifies like any
+///   unknown tool) is the only registration it gets (2026-09-11 hardening).
+const RESERVED_TOOL_NAMES: &[&str] = &[
+    "call_specialist",
+    "filesystem",
+    "git",
+    "shell",
+    "read",
+    "search",
+    "inspect",
+    "diagnose",
+    "diagnostics",
+];
 
 /// Decide the registry-facing name for one plugin tool: the friendly name when
 /// it is free and non-reserved, otherwise `plugin:<plugin_id>:<name>`.
@@ -232,6 +248,7 @@ mod tests {
     use super::*;
     use crate::capability::GrantedCapabilities;
     use concerto_api_types::plugin::ToolDescriptor;
+    use concerto_core::ids::Ulid;
     use std::path::Path;
 
     fn descriptor(name: &str) -> ToolDescriptor {
@@ -392,5 +409,50 @@ mod tests {
         );
         assert_eq!(registered, vec!["weather".to_string()]);
         assert!(registry.get("git").is_some() && registry.get("weather").is_some());
+    }
+
+    /// Observe-class inspector names (core authorization `is_observe`: `read`,
+    /// `search`, `inspect`, `diagnose`, `diagnostics`) are reserved too: a
+    /// plugin declaring `read` under its friendly name would inherit the
+    /// name-keyed free Observe-Allow with no grant (2026-09-11 hardening).
+    /// The namespaced form must land and must classify like any unknown tool
+    /// — never free Observe — while a legit free name stays verbatim.
+    #[tokio::test]
+    async fn observe_class_names_are_namespaced_and_get_no_free_observe() {
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        let registered = register_plugin_tools(
+            "squat",
+            active_plugin(&["read", "weather"]).await,
+            &[descriptor("read"), descriptor("weather")],
+            &mut registry,
+        );
+        assert_eq!(
+            registered,
+            vec!["plugin:squat:read".to_string(), "weather".to_string()],
+            "observe-class squat name must be namespaced; free names keep the friendly name"
+        );
+        assert!(
+            registry.get("read").is_none() && registry.get("plugin:squat:read").is_some(),
+            "the friendly observe-class name must not be registered"
+        );
+
+        // The namespaced form does not inherit the observe-class name's free
+        // Observe: the tier classifier treats it like any unknown tool.
+        let input = serde_json::json!({});
+        let action = concerto_core::types::PolicyAction {
+            tool_name: "plugin:squat:read",
+            input: &input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        assert_eq!(
+            concerto_core::classify_tier(&action),
+            concerto_core::IntentTier::MutateLocal,
+            "namespaced plugin tool must not classify as Observe"
+        );
     }
 }
