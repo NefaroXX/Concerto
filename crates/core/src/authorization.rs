@@ -431,6 +431,19 @@ fn git_is_observe(action: &PolicyAction<'_>) -> bool {
     )
 }
 
+/// Segment-lead check for [`shell_is_consequential`]: a segment whose leading
+/// verb is a destructive fs verb or a network-egress client (existing tables,
+/// unchanged content) makes the whole command Consequential. Empty segments
+/// run nothing and never match.
+fn is_consequential_segment_lead(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    let Some(lead) = words.next() else {
+        return false;
+    };
+    let verb = verb_basename(lead);
+    SHELL_DESTRUCTIVE_VERBS.contains(&verb) || SHELL_NETWORK_VERBS.contains(&verb)
+}
+
 fn shell_is_consequential(action: &PolicyAction<'_>) -> bool {
     // Structured facts that flag egress are conclusive: the producing tool has
     // already decided this command reaches the network.
@@ -447,12 +460,14 @@ fn shell_is_consequential(action: &PolicyAction<'_>) -> bool {
     };
     let verb = verb_basename(first);
 
-    // Destructive fs verbs.
-    if SHELL_DESTRUCTIVE_VERBS.contains(&verb) {
-        return true;
-    }
-    // Network-egress clients.
-    if SHELL_NETWORK_VERBS.contains(&verb) {
+    // Destructive fs verbs / network-egress clients — token-position-
+    // independent (2026-09-11 residual sweep): EVERY [`command_segments`]
+    // segment's leading verb is checked, so a second segment's destructive
+    // verb (`ls; shred /dev/sda`) classifies Consequential exactly like a
+    // leading one. Only segment LEAD positions are consulted — argument
+    // basenames that merely look like verbs (`ls /opt/cat`) never match — and
+    // the tables are the existing destructives/network tables, unchanged.
+    if command_segments(&lower).any(is_consequential_segment_lead) {
         return true;
     }
     // Interpreter invocations carrying a code flag (`python -c …`, `node -e …`,
@@ -1331,6 +1346,33 @@ mod tests {
                 "{command} {args:?} should be Consequential"
             );
         }
+    }
+
+    #[test]
+    fn second_segment_destructive_verb_is_consequential() {
+        // Token-position-independent (2026-09-11 residual sweep): a
+        // destructive/network verb in ANY list-segment lead position makes
+        // the command Consequential, exactly like a leading one.
+        for command in ["ls; shred /dev/sda", "ls && rm -rf x", "echo hi | shred /dev/sda"] {
+            assert_eq!(
+                tier("shell", serde_json::json!({"command": command})),
+                IntentTier::Consequential,
+                "non-leading destructive segment must be Consequential: '{command}'"
+            );
+        }
+        // First-verb behavior is unchanged: leading destructive verbs stay
+        // Consequential and benign verbs keep their scan.
+        assert_eq!(
+            tier("shell", serde_json::json!({"command": "shred", "args": ["file"]})),
+            IntentTier::Consequential
+        );
+        // A verb basename in an argument position is NOT a segment lead:
+        // `ls /opt/cat` must not flip Consequential.
+        assert_eq!(
+            tier("shell", serde_json::json!({"command": "ls /opt/cat"})),
+            IntentTier::Observe,
+            "argument basename that looks like a verb must not trigger Consequential"
+        );
     }
 
     #[test]

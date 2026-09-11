@@ -1038,8 +1038,15 @@ mod tests {
     #[test]
     fn f2_hidden_verbs_never_upgrade() {
         let (_store, auth) = acting_auth();
+        // `cargo build && rm -rf src` (2026-09-11): with the verb-position-
+        // independent Consequential scan, the hidden `rm` segment is now
+        // classified Consequential → `require: consequential`, not rule-keyed
+        // `shell_requires_approval`. Same verdict shape (RequireApproval,
+        // never upgraded to Allow, never grantable) — the pin's original
+        // expected rule encoded the first-verb-only classification this sweep
+        // fixed, so the rule identifier follows the stricter classifier.
         for (command, expected_rule) in [
-            ("cargo build && rm -rf src", RULE_SHELL_REQUIRES_APPROVAL),
+            ("cargo build && rm -rf src", RULE_CONSEQUENTIAL),
             ("sudo rm f", RULE_SHELL_REQUIRES_APPROVAL),
             ("timeout 5 rm f", RULE_SHELL_REQUIRES_APPROVAL),
             ("find . -delete", RULE_SHELL_REQUIRES_APPROVAL),

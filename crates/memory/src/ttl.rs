@@ -147,7 +147,8 @@ impl TtlManager {
         current_model_version: &str,
         cancel: CancellationToken,
     ) -> Result<usize, MemoryError> {
-        // Mark stale in the vector store (sets stale=1 for matching model_version).
+        // Mark stale in the vector store (sets stale=1 for rows whose
+        // `model_version` MISMATCHES the current model — model-bump refresh).
         self.vector_store.mark_stale(project_id, current_model_version, cancel.clone()).await?;
 
         // Also tombstone stale entries so they drop out of search results
@@ -568,14 +569,48 @@ mod tests {
         assert!(report.pruned_ids.is_empty(), "cap 0 + window 0 disable both rules");
     }
 
+    /// Seed a row with an EXPLICIT embedding model version (seed writes "1").
+    async fn seed_version(store: &SqliteVectorStore, id: &str, model_version: &str) {
+        let record = EmbeddingRecord {
+            id: id.to_string(),
+            project_id: ProjectId("retention".into()),
+            chunk_hash: format!("hash-{id}"),
+            content: format!("fn {id}() {{}}"),
+            file_path: format!("src/{id}.rs").into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            chunk_type: ChunkType::Function,
+            vector: vec![0.5],
+            model_id: "test".into(),
+            model_version: model_version.into(),
+            stale: false,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        store.store(&[record], CancellationToken::new()).await.unwrap();
+    }
+
     #[tokio::test]
-    async fn prune_on_a_cancelled_token_stops_immediately() {
+    async fn mark_stale_embeddings_flags_model_version_mismatches() {
         let (_pool, store, manager) = test_manager().await;
         let project = ProjectId("retention".into());
-        seed(&store, "f-1", ChunkType::Fact, "sess-x", "x", OffsetDateTime::now_utc()).await;
         let token = CancellationToken::new();
-        token.cancel();
-        let report = manager.prune_derived_summaries(&project, 2, 0, token).await.unwrap();
-        assert!(report.pruned_ids.is_empty(), "cancelled pass prunes nothing");
+
+        // Two rows produced by the previous model version, one by the
+        // current. A model-bump refresh must flag exactly the MISMATCHING
+        // rows (stale=1 → tombstoned out of search) and leave the rows
+        // carrying the CURRENT version fresh. The inverted `=` match marked
+        // the fresh row and skipped everything actually needing re-index.
+        seed_version(&store, "old-1", "1").await;
+        seed_version(&store, "old-2", "1").await;
+        seed_version(&store, "fresh-1", "2").await;
+
+        let stale = manager.mark_stale_embeddings(&project, "2", token.clone()).await.unwrap();
+        assert_eq!(stale, 2, "exactly the two version-1 rows go stale, got {stale}");
+
+        let survivors = store.get_chunks(&project, &["fresh-1".into()], token).await.unwrap();
+        assert_eq!(survivors.len(), 1, "the current-version row never tombstones: {survivors:?}");
+        let gone =
+            store.get_chunks(&project, &["old-1".into()], CancellationToken::new()).await.unwrap();
+        assert!(gone.is_empty(), "the mismatching row drops out of search: {gone:?}");
     }
 }

@@ -226,6 +226,17 @@ pub(crate) fn msys_drive_to_windows(target: &str) -> Option<String> {
     Some(out)
 }
 
+/// Interpolation metacharacters that make a path target unresolvable at scan
+/// time: the shell expands `$`/backtick substitutions against its own
+/// environment, so the running command's real target is NOT the literal the
+/// scanner anchors (`tee $HOME/x` scans as an in-root relative literal while
+/// the shell writes to the real home — the `$HOME`-spelling asymmetry with
+/// `~/x`, which is expanded and contained). Mirrors the `$`/backtick members
+/// of [`SHELL_INTERPOLATION_CHARS`] (core authorization, tier classifier);
+/// `%`/quote chars stay with the tier classifier (quotes are already stripped
+/// per-token by `flat_tokens`).
+const INTERPOLATION_TARGET_CHARS: &[char] = &['$', '`'];
+
 /// Canonical form of the containment trust anchor.
 fn canonical_root(root: &Utf8Path) -> Result<Utf8PathBuf, ToolError> {
     root.canonicalize_utf8().map_err(|error| ToolError::ExecutionFailed {
@@ -292,6 +303,21 @@ fn strip_trailing_command_punct(token: &str) -> &str {
 /// components) so new in-root files stay reachable without letting `..`/
 /// symlink tricks climb above the root.
 fn resolve_within(root: &Utf8Path, cwd: &Utf8Path, target: &str) -> Result<Utf8PathBuf, ToolError> {
+    // An interpolation-carrying target is unresolvable, not in-root: the
+    // shell expands the metacharacters after containment returns, so the
+    // lexical candidate is a lie. Reject without execution (2026-09-11: the
+    // `$HOME`-spelling asymmetry — `~/x` expands and is contained, `$HOME/x`
+    // scanned as a harmless relative literal). `/dev/null`-style devices
+    // below cannot contain these characters, so order is immaterial.
+    if target.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)) {
+        return Err(ToolError::VirtualFsConflict {
+            path: Utf8PathBuf::from(target),
+            reason: "shell containment (ADR-55): target contains shell-interpolation \
+                     metacharacters ('$' or '`'); the path the shell resolves cannot \
+                     be scanned and the command is rejected without execution"
+                .into(),
+        });
+    }
     // `/dev/null` and the Windows reserved device names (`nul`, `con`, `prn`,
     // `aux`, `com1`..`com9`, `lpt1`..`lpt9`) are devices, not confined files:
     // canonicalization and root-prefix checks cannot meaningfully confine
@@ -861,6 +887,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // Read-only verb exemption vs mutation-capable path arguments.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn interpolation_metachar_targets_are_unresolvable() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // The `$HOME`-spelling asymmetry (2026-09-11): `$HOME/x` scanned as an
+        // in-root relative literal while the shell expands it to the real
+        // home (the same as `~/x`, which containment blocks). Targets carrying
+        // `$` / a backtick are UNRESOLVABLE at scan time → reject.
+        for command in ["tee $HOME/x", "cat f > $HOME/x", ">$HOME/x", "cat f >> $(pwd)/x"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated target, got: {err}"
+            );
+        }
+        // The backtick-substituted form rejects like `$HOME`.
+        let err = contain_shell_command(&root, &root, "tee", &["`pwd`/x".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("shell-interpolation"),
+            "backtick target must reject, got: {err}"
+        );
+        // Plain in-root relative targets keep passing — no over-block.
+        contain_shell_command(&root, &root, "tee out.txt", &[]).expect("in-root tee allowed");
+        contain_shell_command(&root, &root, "cat f > out.txt", &[]).expect("in-root > allowed");
+        contain_shell_command(&root, &root, "cat f > sub/out.txt", &[])
+            .expect("in-root subdir > allowed");
+    }
 
     #[test]
     fn read_only_verb_outside_absolute_allowed() {
