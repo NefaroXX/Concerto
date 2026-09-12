@@ -272,6 +272,11 @@ impl OwnershipTable {
         None
     }
 
+    /// The owner of `artifact`, if owned.
+    pub fn current_owner(&self, artifact: &str) -> Option<String> {
+        self.records.get(artifact).map(|record| record.owner.clone())
+    }
+
     /// Whether `agent` currently holds `artifact` (Owned or Stale — both
     /// count as holding; stale ownership keeps the honest-conflict channel
     /// open rather than letting a foreigner in through the stale door).

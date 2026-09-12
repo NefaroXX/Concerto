@@ -837,6 +837,13 @@ impl WriteGate {
         Ok(flipped)
     }
 
+    /// The current owner of `artifact`, if owned (mediation read view —
+    /// never consulted on ANY read path of the workspace itself).
+    #[must_use]
+    pub fn ownership_owner(&self, artifact: &str) -> Option<String> {
+        self.ownership.lock().ok().and_then(|ownership| ownership.current_owner(artifact))
+    }
+
     /// Deterministic snapshot of the ownership table (checkpoint persistence
     /// — additive; the state is re-derivable from the log's applied writes
     /// and ownership events when absent).
@@ -3391,5 +3398,43 @@ mod tests {
         // Marking a second time is quiet (stale is absorbing), and an
         // unowned path never flips.
         assert!(matches!(gate.mark_artifact_stale("watched.txt", "again").await, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn ownership_survives_checkpoint_projection_through_the_write_path() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // The write path produces the record (auto-acquire).
+        gate.submit(
+            owned_fs_write("agent-a", "ck-1", "persisted.txt", "v1"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("owner acquires");
+
+        // Persist: the additive checkpoint projection.
+        let state = crate::ownership::OwnershipState { records: gate.ownership_records() };
+        let json = serde_json::to_string(&state).expect("ownership serializes");
+
+        // Resume: a fresh gate restores the projection (post-run round-trip).
+        let restored_gate = real_fs_gate(pool, root);
+        let restored: crate::ownership::OwnershipState =
+            serde_json::from_str(&json).expect("ownership deserializes");
+        restored_gate.restore_ownership_state(&restored);
+        assert_eq!(restored_gate.ownership_owner("persisted.txt").as_deref(), Some("agent-a"));
+        // And the restored state still enforces.
+        let foreign = restored_gate
+            .submit(
+                owned_fs_write("agent-b", "ck-2", "persisted.txt", "clobber"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(foreign, Err(GateError::OwnershipConflict { .. })),
+            "post-restore enforcement holds: {foreign:?}"
+        );
     }
 }
