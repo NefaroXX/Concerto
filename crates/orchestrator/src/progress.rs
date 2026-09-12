@@ -365,6 +365,8 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         // Issue #57 task transforms.
         DecisionKind::Split => "split",
         DecisionKind::Merge => "merge",
+        // Issue #59 consultation.
+        DecisionKind::Consult => "consult",
     }
 }
 

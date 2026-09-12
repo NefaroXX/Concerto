@@ -1239,6 +1239,7 @@ mod tests {
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: artifacts.iter().map(|p| (*p).to_owned()).collect(),
             transform: None,
+            max_tool_calls: None,
             created_at: time::OffsetDateTime::from_unix_timestamp(1_240)
                 .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
             status,

@@ -18,6 +18,7 @@ pub mod capsule;
 pub mod checkpoint;
 pub mod conflict;
 pub mod consolidation;
+mod consultation;
 mod context_compaction;
 pub mod context_engine;
 pub mod coordinator;

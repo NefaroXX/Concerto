@@ -45,6 +45,10 @@ use concerto_sessions::{
 use crate::agent_runner::AgentRunner;
 use crate::agents::GenericSpecialistAgent;
 use crate::checkpoint;
+use crate::consultation::{
+    consult_read_only_executor, consult_task_description, consult_tool_definition,
+    CONSULT_SPECIALIST_TOOL,
+};
 use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
 use crate::delta::FileDeltaTracker;
 use crate::design_doc_verifier::{
@@ -139,6 +143,10 @@ Restructuring an open task (use sparingly, deterministically):
 - When one open task is doing too much, split_task re-cuts it into ordered children that inherit the task's specialist role, evidence, and attempt counter. Splits of pending/running tasks only — completed work is never re-cut.
 - When several open pending tasks overlap in role and substance, merge_tasks folds them into one survivor with the lowest id. Merge only tasks of the SAME role.
 - Both tools are validated against the real graph BEFORE anything changes; a rejected split or merge is a structured error you can read and fix, never a crash.
+
+Consultation (read-only, use it to resolve open questions):
+- consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
+- The consultation returns findings plus a real evidence id; cite that id in supporting_evidence_ids when a later decision rests on the advice.
 "#;
 
 /// Argument schema for the Coordinator's `call_specialist` tool.
@@ -1403,8 +1411,9 @@ impl MergeTaskArgs {
 }
 
 /// Read an optional JSON array-of-strings field, dropping non-string
-/// entries (absent/non-array ⇒ empty).
-fn parse_string_array(arguments: &serde_json::Value, key: &str) -> Vec<String> {
+/// entries (absent/non-array ⇒ empty). `pub(crate)`: the consultation
+/// machinery (issue #59) parses its evidence list with the same shape.
+pub(crate) fn parse_string_array(arguments: &serde_json::Value, key: &str) -> Vec<String> {
     arguments
         .get(key)
         .and_then(serde_json::Value::as_array)
@@ -1872,6 +1881,7 @@ impl CoordinatorAgent {
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: Vec::new(),
             transform: None,
+            max_tool_calls: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: crate::decisions::DecisionStatus::Validated,
         };
@@ -7237,6 +7247,9 @@ impl CoordinatorAgent {
             // not dispatch paths.
             tool_defs.push(split_task_tool_definition());
             tool_defs.push(merge_tasks_tool_definition());
+            // Issue #59: the typed CONSULT surface — read-only advisory,
+            // findings become evidence, never task work.
+            tool_defs.push(consult_tool_definition());
             if let Some(executor) = &self.tool_executor {
                 tool_defs.extend(executor.tool_definitions());
             }
@@ -7267,6 +7280,9 @@ impl CoordinatorAgent {
         // Whether the loop ran out of iterations (as opposed to stopping in
         // prose) — only then is the structural-bound note warranted.
         let mut hit_iteration_bound = true;
+        // Issue #59: question ids the deterministic consultation request has
+        // already been injected for (once per question per session).
+        let mut consult_nudged_questions: HashSet<String> = HashSet::new();
         // Issue #53: set when the progress guard escalates (recovery budget
         // exhausted) — the loop then stops through the recoverable-note
         // machinery, so the tail must not add a second, misleading
@@ -7406,6 +7422,23 @@ impl CoordinatorAgent {
                         )
                         .await
                     }
+                    // Issue #59: the typed CONSULT operation. Read-only
+                    // advisory: validate → policy-gate → consult the named
+                    // specialist under the read-only grant boundary →
+                    // record the findings as evidence. No SubTask node, no
+                    // ownership/completion/ledger-task state.
+                    CONSULT_SPECIALIST_TOOL if dispatching => {
+                        self.handle_consult_specialist(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
                     // ADR-35 §8 self-execution: the coordinator's own tools
                     // (shared executor — policy engine, VirtualFs, write
                     // gates apply unchanged). Offered only while dispatching
@@ -7504,6 +7537,40 @@ impl CoordinatorAgent {
                 let ledger_paths: Vec<camino::Utf8PathBuf> = ledger.all_files.clone();
                 let models: Vec<String> = ledger.model_assignments.values().cloned().collect();
                 self.refresh_world_model(task, &ledger_paths, models, cancel).await;
+                // Issue #59: the deterministic low-confidence trigger — a
+                // standing unresolved question aged past
+                // [`crate::consultation::CONSULT_TRIGGER_MIN_CYCLES`]
+                // requests a consultation BEFORE the next decision turn.
+                // Placement: immediately after the projection the next
+                // decision consumes, riding the same reconsideration-nudge
+                // pattern as issue #53 (a bounded user message into the
+                // existing conversation — never a forced tool call). A
+                // settled consultation resolves the question (issue #56
+                // Q-RESOLVE rules read the Settled consult decision), so
+                // the request stops once the advice lands.
+                if let Some((question_id, nudge)) =
+                    crate::consultation::consultation_nudge(&self.world_model)
+                {
+                    if consult_nudged_questions.insert(question_id) {
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task.id.0,
+                            EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: nudge.clone(),
+                            },
+                        );
+                        messages.push(Message {
+                            role: Role::User,
+                            content: nudge,
+                            tool_calls: None,
+                            tool_results: None,
+                            reasoning_content: None,
+                            tokens_in: None,
+                            tokens_out: None,
+                        });
+                    }
+                }
             }
             match self.progress_tracker.observe(&observation) {
                 crate::progress::CycleVerdict::Progressing => {}
@@ -8083,6 +8150,341 @@ impl CoordinatorAgent {
         tool_result
     }
 
+    /// Issue #59: handle ONE `consult_specialist` tool call — the typed
+    /// CONSULT operation beside dispatch. The named specialist answers a
+    /// bounded question in a READ-ONLY advisory capacity:
+    ///
+    /// validate (#52 flow, kind `Consult`) → policy-gate → record the
+    /// consultative Decision event → run the consultant under the read-only
+    /// grant boundary (its tool calls evaluate under
+    /// [`crate::consultation::ConsultReadOnlyPolicy`] — writes denied even
+    /// under an Acting run grant) → record the findings as a consultative
+    /// `Finding` evidence event → return the real evidence id the
+    /// Coordinator can cite in later decisions.
+    ///
+    /// HARD guardrails (the point of the operation): NO SubTask node is
+    /// created, the graph is untouched, ownership/completion/ledger-task
+    /// state never changes (only run-level cost/tool-call accounting and
+    /// consultative evidence/journal entries), and a workspace mutation
+    /// attempt inside the consultation fails closed with a structured
+    /// error. Findings are never task results.
+    ///
+    /// Failure discipline mirrors [`Self::handle_call_specialist`]:
+    /// structured tool errors, never a crash; cancellation propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_consult_specialist(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = crate::consultation::ConsultSpecialistArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "consult_specialist requires string agent_id and question",
+            });
+        };
+        // Consultations are read-only: declaring expected artifacts would
+        // imply a work contract — a conflicting decision, rejected.
+        if !parse_string_array(arguments, "expected_artifacts").is_empty() {
+            return serde_json::json!({
+                "error": "conflicting_decision",
+                "message": "consultations are read-only and never declare expected \
+                            artifacts; drop the field and re-decide",
+            });
+        }
+        let question_trimmed = args.question.trim();
+        if question_trimmed.chars().count() > crate::consultation::MAX_CONSULT_QUESTION_CHARS {
+            return serde_json::json!({
+                "error": "question_too_long",
+                "message": format!(
+                    "the consultation question exceeds {} characters ({}); shorten it \
+                     and re-decide",
+                    crate::consultation::MAX_CONSULT_QUESTION_CHARS,
+                    question_trimmed.chars().count(),
+                ),
+            });
+        }
+        let effort_cap =
+            args.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+        if effort_cap == 0 || effort_cap > crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS {
+            return serde_json::json!({
+                "error": "invalid_effort_cap",
+                "message": format!(
+                    "max_tool_calls must be between 1 and {} (got {effort_cap})",
+                    crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS,
+                ),
+            });
+        }
+
+        // ── Issue #52 flow: validate the consult decision BEFORE any
+        // mutation — roster membership, evidence existence (REAL log rows),
+        // bounds. Any failure is a structured tool error, no state change.
+        let cited_ids = args.supporting_evidence_ids.clone();
+        let missing_evidence = self.missing_evidence_ids(&cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut decision = match validator.validate(
+            crate::decisions::DecisionKind::Consult,
+            Some(&args.agent_id),
+            question_trimmed,
+            args.notes.as_deref(),
+            &cited_ids,
+            // A consult carries no artifact contract.
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    agent = %args.agent_id,
+                    "consult_specialist rejected an invalid Coordinator decision \
+                     (structured error, no state mutation)"
+                );
+                return rejection.tool_value();
+            }
+        };
+        // The effort cap rides the journaled decision (additive field).
+        decision.max_tool_calls = Some(effort_cap);
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── Policy gate (the SAME engine the dispatch decisions evaluate
+        // under) — the consult op itself is gated like any tool call ──────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; consultation is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: CONSULT_SPECIALIST_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            // The coordinator loop carries no approval sink: any non-`Allow`
+            // verdict is a denial here, mirroring the dispatch semantics.
+            Ok(_) => {
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this consultation",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── Consultative Decision event (audit trail; never a pending
+        // dispatch continuation — consultations dispatch nothing) ─────────
+        let agent_id = AgentId::new(&args.agent_id);
+        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_consultation".to_owned());
+        self.append_consult_decision(
+            task.session_id,
+            &agent_id,
+            question_trimmed,
+            &reason,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+
+        // ── The consultant: the target role in advisory capacity — the
+        // persona (name/stage/prompt sections) comes from the registry
+        // config, the output mode is forced Freeform (findings are prose),
+        // and the tool executor is the READ-ONLY facade (issue #59): a
+        // minimal filesystem-read toolset whose every call evaluates under
+        // the consultation gate BEFORE the run's policy. The consultant
+        // runs on the coordinator's planning provider stack (like the
+        // draft_plan advisor) — model selection machinery is untouched.
+        let profile = match self.planning_profile.clone() {
+            Some(profile) => profile,
+            None => match self.model_selector.select_for_session(
+                &AgentId::new("coordinator"),
+                None,
+                task.id,
+                Some(task.session_id),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    if is_cancellation_error(&error) || cancel.is_cancelled() {
+                        return serde_json::json!({ "error": "cancelled" });
+                    }
+                    warn!(
+                        %error,
+                        "consult_specialist: model selection failed; returning the error \
+                         to the coordinator model"
+                    );
+                    self.decision_journal
+                        .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                    return serde_json::json!({
+                        "error": "model_selection_failed",
+                        "message": format!("no model could be selected for the consultation: {error}"),
+                    });
+                }
+            },
+        };
+        let config = self.registry.config(&agent_id);
+        let name = config.map(|config| config.name.clone()).unwrap_or_else(|| agent_id.to_string());
+        let stage = self.registry.get(&agent_id).and_then(|agent| agent.stage());
+        let prompt_sections =
+            config.map(|config| config.prompt_sections.clone()).unwrap_or_default();
+        let consult_executor = Arc::new(consult_read_only_executor(
+            base_ctx.session.project_dir.as_path(),
+            policy.clone(),
+            effort_cap,
+        ));
+        let consult_agent = Arc::new(
+            GenericSpecialistAgent::new(
+                agent_id.clone(),
+                name,
+                stage,
+                self.planning_provider.clone(),
+                Some(consult_executor),
+                self.bus.clone(),
+                self.retry_policy.clone(),
+                prompt_sections,
+                // Read-only capability shape: the consultant declares read
+                // access only, matching the enforced boundary.
+                concerto_config::AgentCapabilities {
+                    fs_read: Some(true),
+                    fs_write: Some(false),
+                    shell: Some(false),
+                    git: Some(false),
+                    lsp: Some(false),
+                    eval: Some(false),
+                },
+            )
+            .with_output_mode(concerto_core::types::OutputMode::Freeform)
+            .with_skills_section(&self.skills_section),
+        );
+        let mut consult_registry = AgentRegistry::new();
+        consult_registry.register(consult_agent);
+        let consult_runner = AgentRunner::new(
+            Arc::new(consult_registry),
+            self.bus.clone(),
+            self.spend_tracker.clone(),
+        );
+
+        // The transient SubTask is ONLY the runner's input record — it is
+        // never added to the graph, the ledger, or any completion state.
+        let consult_task_id = TaskId::new();
+        let consult_subtask = SubTask {
+            id: consult_task_id,
+            parent_id: None,
+            session_id: task.session_id,
+            role: agent_id.clone(),
+            description: consult_task_description(question_trimmed, args.notes.as_deref()),
+            status: SubTaskStatus::Running,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let consult_ctx = AgentContext {
+            session: base_ctx.session.clone(),
+            parent_task: Some(task.clone()),
+            working_memory: base_ctx.working_memory.clone(),
+            retrieved_chunks: base_ctx.retrieved_chunks.clone(),
+            previous_results: Vec::new(),
+            budget_remaining_usd: None,
+            expected_artifacts: Vec::new(),
+            workspace_capsule: None,
+            workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+            run_id: self.run_id.clone(),
+            workspace_generation: self.snapshot_generation(),
+        };
+        let result = match consult_runner
+            .run(agent_id.clone(), &consult_subtask, consult_ctx, &profile, cancel.clone())
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                warn!(
+                    %error, role = %agent_id,
+                    "consult_specialist: the consultation run failed; returning the \
+                     error to the coordinator model"
+                );
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                return serde_json::json!({
+                    "error": "consult_failed",
+                    "message": error.to_string(),
+                    "diagnosis": diagnosis.tool_summary(),
+                });
+            }
+        };
+
+        // ── Settle: the consult decision is journaled Settled (which the
+        // issue-#56 question lifecycle reads as recovery evidence for
+        // standing questions), the findings become a consultative Finding
+        // evidence event, and the run-level cost accounting stays honest.
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        ledger.total_cost += result.cost_usd;
+        ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(result.tool_call_count);
+        // Findings are NEVER task results: no completed_results entry, no
+        // graph node, no files-ledger merge (the read-only gate denies
+        // workspace mutation; any claimed file list is dropped).
+        let findings =
+            bounded_text(&result.summary, crate::consultation::MAX_CONSULT_FINDINGS_CHARS);
+        let evidence_id = self
+            .append_consult_finding(
+                task.session_id,
+                &agent_id,
+                question_trimmed,
+                &findings,
+                &decision_id,
+                &args.supporting_evidence_ids,
+            )
+            .await;
+
+        // ── Checkpoint the consultative journal state (the graph itself is
+        // unchanged) ────────────────────────────────────────────────────────
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        let tool_result = serde_json::json!({
+            "outcome": "consulted",
+            "agent_id": agent_id.as_str(),
+            "consultative": true,
+            "findings": findings,
+            "evidence_id": evidence_id,
+            "effort_cap": effort_cap,
+            "cost_usd": result.cost_usd,
+            "tool_call_count": result.tool_call_count,
+        });
+        tool_result
+    }
+
     /// Issue #57: the decision-validation preamble shared by the split/merge
     /// handlers — evidence existence check against the REAL whiteboard log,
     /// then typed decision validation with NO target (transforms inherit /
@@ -8159,6 +8561,97 @@ impl CoordinatorAgent {
         let _ = task_id; // transforms record no per-node continuation
         if let Err(err) = append_whiteboard_event(pool, &event).await {
             warn!(%err, "issue #57: transform decision append failed (fail-soft)");
+        }
+    }
+
+    /// Issue #59: the whiteboard `Decision` record for one consultation —
+    /// the same payload shape as a dispatch decision plus the
+    /// `consultative: true` marker, written directly (never via
+    /// [`Self::append_dispatch_decision`], which drives the ADR-65 §7
+    /// pending-dispatch continuation — a consultation dispatches nothing
+    /// and leaves no pending continuation behind). Fail-soft: a rejected
+    /// citation set is re-appended without its citations so the record
+    /// always lands, mirroring the dispatch decision discipline.
+    async fn append_consult_decision(
+        &mut self,
+        session_id: Ulid,
+        agent_id: &AgentId,
+        question: &str,
+        reason: &str,
+        supporting_evidence_ids: &[String],
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": agent_id.as_str(),
+                "reason": reason,
+                "required_output": question,
+                "supporting_evidence_ids": evidence_ids,
+                "consultative": true,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(err) = append_whiteboard_event(pool, &event(supporting_evidence_ids)).await {
+            warn!(
+                %err,
+                "issue #59: consult decision append rejected; re-appending without the \
+                 rejected citations (fail-soft, the record still lands)"
+            );
+            if let Err(err) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(%err, "issue #59: consult decision append failed (fail-soft)");
+            }
+        }
+    }
+
+    /// Issue #59: append the consultation's findings as a consultative
+    /// `Finding` evidence event. The findings are an ASSERTION (F-ASSUME in
+    /// the issue-#56 world model — no executed observation behind them) and
+    /// the returned event id is the REAL evidence id later decisions cite.
+    /// `causation` names the consult decision that produced the findings.
+    /// Fail-soft: an append failure yields `None` (the findings still ride
+    /// the tool result; no evidence id is fabricated).
+    async fn append_consult_finding(
+        &self,
+        session_id: Ulid,
+        agent_id: &AgentId,
+        question: &str,
+        findings: &str,
+        consult_decision_id: &str,
+        cited_evidence_ids: &[String],
+    ) -> Option<String> {
+        let pool = self.review_store.as_ref()?;
+        let event_id = Ulid::new().to_string();
+        let event = NewWhiteboardEvent {
+            event_id: event_id.clone(),
+            agent_id: agent_id.as_str().to_owned(),
+            kind: WhiteboardKind::Finding,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: Some(consult_decision_id.to_owned()),
+            payload: serde_json::json!({
+                "consultative": true,
+                "question": bounded_text(question, 512),
+                "findings": findings,
+                "supporting_evidence_ids": cited_evidence_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        match append_whiteboard_event(pool, &event).await {
+            Ok(_) => Some(event_id),
+            Err(err) => {
+                warn!(%err, "issue #59: consult findings append failed (fail-soft)");
+                None
+            }
         }
     }
 
@@ -9271,6 +9764,40 @@ mod tests {
         }
     }
 
+    /// A recording audit probe for the consultation tests (issue #59): the
+    /// read-only gate records every denial through the run's audit log, so
+    /// the test observes "denied + recorded" end-to-end.
+    #[derive(Default)]
+    struct ConsultAuditProbe {
+        entries: std::sync::Mutex<Vec<AuditEntry>>,
+    }
+
+    impl ConsultAuditProbe {
+        fn rows(&self) -> Vec<AuditEntry> {
+            self.entries.lock().unwrap_or_else(|error| error.into_inner()).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLog for ConsultAuditProbe {
+        async fn record(
+            &self,
+            entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            self.entries.lock().unwrap_or_else(|error| error.into_inner()).push(entry);
+            Ok(())
+        }
+    }
+
+    /// The allow-all policy wired to a recording audit probe.
+    fn coordinator_policy_with_audit(
+        audit: Arc<ConsultAuditProbe>,
+    ) -> Arc<dyn concerto_core::traits::policy::PolicyEngine> {
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        Arc::new(SimplePolicyEngine::new(allow_all, audit))
+    }
+
     // Pin the three-way failure classification that the dispatch loop relies
     // on (ADR-42 §1). Transient provider errors (rate limits, network,
     // timeouts, 5xx) are Recoverable and subject to subtask retry.
@@ -9566,6 +10093,53 @@ mod tests {
         }
     }
 
+    /// A `consult_specialist` tool call for a test turn (issue #59).
+    fn consult_specialist(agent_id: &str, question: &str) -> ToolCall {
+        consult_specialist_with(agent_id, question, None, &[], None)
+    }
+
+    /// A `consult_specialist` tool call with notes, cited evidence ids, and
+    /// an optional effort cap.
+    fn consult_specialist_with(
+        agent_id: &str,
+        question: &str,
+        notes: Option<&str>,
+        evidence: &[&str],
+        max_tool_calls: Option<u32>,
+    ) -> ToolCall {
+        ToolCall {
+            id: format!("consult-{agent_id}"),
+            name: CONSULT_SPECIALIST_TOOL.to_string(),
+            arguments: {
+                let mut arguments =
+                    serde_json::json!({ "agent_id": agent_id, "question": question });
+                if let Some(notes) = notes {
+                    arguments["notes"] = serde_json::json!(notes);
+                }
+                if !evidence.is_empty() {
+                    arguments["supporting_evidence_ids"] = serde_json::json!(evidence
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>());
+                }
+                if let Some(cap) = max_tool_calls {
+                    arguments["max_tool_calls"] = serde_json::json!(cap);
+                }
+                arguments
+            },
+        }
+    }
+
+    /// A read-only filesystem read tool call (the consultant's allowed
+    /// operation shape).
+    fn filesystem_read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("read-{path}"),
+            name: "filesystem".to_string(),
+            arguments: serde_json::json!({ "operation": "read", "path": path }),
+        }
+    }
+
     /// Planning provider that serves one scripted Coordinator turn per
     /// request, in order. Beyond the script it returns an empty final text
     /// (the loop then stops in prose). Captures every request it receives so
@@ -9596,6 +10170,36 @@ mod tests {
                         .first()
                         .map(|message| message.content.clone())
                         .unwrap_or_default()
+                })
+                .collect()
+        }
+
+        /// Every message content the provider has observed (prompts, tool
+        /// results, injected user messages) in arrival order.
+        fn message_contents(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| request.messages.iter().map(|message| message.content.clone()))
+                .collect()
+        }
+
+        /// Every tool-result JSON payload observed in Tool messages of the
+        /// captured requests — the results the coordinator loop and the
+        /// consult agent read back (issue #59 observability).
+        fn tool_result_contents(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.tool_results.as_ref())
+                        .flat_map(|results| results.iter().map(|result| result.content.clone()))
+                        .collect::<Vec<_>>()
                 })
                 .collect()
         }
@@ -9658,6 +10262,121 @@ mod tests {
         }
     }
 
+    /// A planning provider that drives the full consult→evidence→dispatch
+    /// chain (issue #59 end-to-end acceptance): the first request consults;
+    /// once the consult tool result (carrying the REAL finding event id)
+    /// appears in the conversation, the next coordinator turn dispatches a
+    /// specialist citing that id; afterwards it finishes in prose. The
+    /// consultant's own requests (which share this provider) fall through
+    /// to the prose branch — they never carry a consult tool result.
+    #[derive(Default)]
+    struct EvidenceChainProvider {
+        requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
+        dispatch_served: std::sync::atomic::AtomicBool,
+    }
+
+    impl EvidenceChainProvider {
+        /// Every tool-result JSON payload observed in Tool messages of the
+        /// captured requests (issue #59 observability).
+        fn tool_result_contents(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.tool_results.as_ref())
+                        .flat_map(|results| results.iter().map(|result| result.content.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        /// The consult tool result's evidence id, once it has appeared in
+        /// any observed conversation.
+        fn evidence_id(&self) -> Option<String> {
+            self.requests.lock().unwrap().iter().find_map(|request| {
+                request.messages.iter().find_map(|message| {
+                    message.tool_results.as_ref().and_then(|results| {
+                        results.iter().find_map(|result| {
+                            if result.name != CONSULT_SPECIALIST_TOOL {
+                                return None;
+                            }
+                            result
+                                .content
+                                .get("evidence_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                    })
+                })
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for EvidenceChainProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            use std::sync::atomic::Ordering;
+            self.requests.lock().unwrap().push(request);
+            let chunk = if self.requests.lock().unwrap().len() == 1 {
+                // First coordinator turn: consult.
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(consult_specialist(
+                        "researcher",
+                        "is the module graph sound before we implement?",
+                    )),
+                    is_final: true,
+                    usage: None,
+                }
+            } else if let (Some(id), false) =
+                (self.evidence_id(), self.dispatch_served.load(Ordering::SeqCst))
+            {
+                // The consult result is in the conversation: dispatch citing
+                // the REAL finding event id (once).
+                self.dispatch_served.store(true, Ordering::SeqCst);
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(call_specialist_with(
+                        "coder",
+                        "implement the thing",
+                        None,
+                        &[id.as_str()],
+                    )),
+                    is_final: true,
+                    usage: None,
+                }
+            } else {
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: "advisory findings: the module graph is sound".to_string(),
+                    tool_call: None,
+                    is_final: true,
+                    usage: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "evidence-chain"
+        }
+    }
+
     /// Build a fully-wired coordinator whose planning provider serves the
     /// scripted decision-loop turns. `registry` carries the agents the run
     /// may call; the allow-all policy gates every `call_specialist`.
@@ -9666,8 +10385,32 @@ mod tests {
         registry: Arc<AgentRegistry>,
         turns: Vec<CoordinatorTurn>,
     ) -> CoordinatorAgent {
+        coordinator_with_turns_and_policy(bus, registry, turns, coordinator_allow_all_policy())
+    }
+
+    /// [`coordinator_with_turns`] with an explicit policy engine (issue #59
+    /// tests wire a recording audit probe so gate denials are observable).
+    fn coordinator_with_turns_and_policy(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+        policy: Arc<dyn concerto_core::traits::policy::PolicyEngine>,
+    ) -> CoordinatorAgent {
         let planning_provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
             Arc::new(TurnProvider::new(turns));
+        coordinator_with_provider_and_policy(bus, registry, planning_provider, policy)
+    }
+
+    /// Build a fully-wired coordinator over an ARBITRARY planning provider
+    /// (issue #59: the consult agent shares the planning provider, so tests
+    /// that need dynamic turn behavior or extra builder steps construct
+    /// through here).
+    fn coordinator_with_provider_and_policy(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        planning_provider: Arc<dyn concerto_core::traits::provider::LlmProvider>,
+        policy: Arc<dyn concerto_core::traits::policy::PolicyEngine>,
+    ) -> CoordinatorAgent {
         let spend_tracker = Arc::new(SpendTracker::default());
         let runner = AgentRunner::new(registry.clone(), bus.clone(), spend_tracker.clone());
         let profiles: Vec<concerto_core::types::RoutingProfile> = vec![
@@ -9725,7 +10468,7 @@ mod tests {
             planning_provider,
             Arc::new(NullMemoryStore),
         )
-        .with_policy_engine(coordinator_allow_all_policy())
+        .with_policy_engine(policy)
     }
 
     /// The allow-all policy the coordinator test helpers wire: every
@@ -10053,6 +10796,343 @@ mod tests {
             output.final_message.contains("Multi-agent orchestration completed"),
             "unexpected final message: {}",
             output.final_message
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #59: the typed CONSULT operation
+    // ------------------------------------------------------------------
+
+    /// Issue #59 acceptance — a consulting agent that ATTEMPTS a workspace
+    /// write fails closed: the write is denied (the file never appears on
+    /// disk), the denial is recorded through the run's audit log, the
+    /// consultation still settles with consultative findings, and no
+    /// SubTask node is ever created for the consult.
+    #[tokio::test]
+    async fn consultation_cannot_mutate_adversarial_write_denied() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![consult_specialist(
+                "researcher",
+                "assess the module graph",
+            )]),
+            // The consultant's first turn: attempt a WRITE through the
+            // filesystem tool — the read-only gate must deny it.
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "write-attempt".to_string(),
+                name: "filesystem".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "write",
+                    "path": "injected.rs",
+                    "content": "// pwned",
+                }),
+            }]),
+            CoordinatorTurn::Text("I could not write; here is my advisory answer.".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        let (output, events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_policy_with_audit(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+
+        // The write NEVER landed (fail closed).
+        assert!(
+            !workspace.path().join("injected.rs").exists(),
+            "a consultation must never mutate the workspace"
+        );
+        // The denial is recorded (audit row: consult_read_only).
+        let rows = audit.rows();
+        assert!(
+            rows.iter().any(|row| {
+                row.rule_matched.as_deref() == Some("consult_read_only")
+                    && row.tool_name == "filesystem"
+                    && row.verdict == "Deny"
+            }),
+            "the write denial must be recorded: {rows:?}"
+        );
+        // The consultation settled with consultative findings (never task
+        // results): the tool result the model read back carries the
+        // consultative marker and the consultant's answer.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        assert!(
+            consult_result["findings"]
+                .as_str()
+                .is_some_and(|findings| { findings.contains("advisory answer") }),
+            "the consultant's answer rides the tool result: {consult_result:?}"
+        );
+        // No SubTask node was ever created for the consultation.
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "a consultation must not create SubTask nodes: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #59 acceptance (end to end): a consultation's findings become
+    /// REAL evidence — the consult tool result carries a real finding event
+    /// id, the event is on the whiteboard marked consultative, and a
+    /// subsequent dispatch decision cites it (the #52 validator accepts the
+    /// REAL id; fabricated ids are rejected).
+    #[tokio::test]
+    async fn consult_findings_become_citable_evidence_for_dispatch() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let provider = Arc::new(EvidenceChainProvider::default());
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        let (_output, _events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+        // The run's tail may surface recovery notes (zero-work/validation
+        // guards on the mocked dispatch) — the acceptance facts are the
+        // evidence chain on the whiteboard, asserted below.
+
+        // The consultative Finding event is on the whiteboard.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let finding = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .expect("a consultative finding event was recorded");
+        // The consult tool result carried the REAL evidence id.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(
+            consult_result["evidence_id"].as_str(),
+            Some(finding.event_id.as_str()),
+            "the tool result's evidence id is the REAL finding event id"
+        );
+        // A subsequent dispatch decision CITES the consult findings.
+        let dispatch_decision = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"] == serde_json::Value::String("coder".into())
+            })
+            .expect("the follow-up dispatch decision was recorded");
+        let cited: Vec<&str> = dispatch_decision.payload["supporting_evidence_ids"]
+            .as_array()
+            .expect("citations array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            cited.contains(&finding.event_id.as_str()),
+            "the dispatch must cite the consult findings as evidence: {cited:?}"
+        );
+    }
+
+    /// Issue #59 acceptance: the consultation effort cap is enforced. With
+    /// `max_tool_calls = 2`, exactly two read-only executions run and the
+    /// third is denied (`consult_effort_capped`, recorded); the
+    /// consultation still settles.
+    #[tokio::test]
+    async fn consultation_effort_cap_enforced() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![consult_specialist_with(
+                "researcher",
+                "read the notes and summarize",
+                None,
+                &[],
+                Some(2),
+            )]),
+            CoordinatorTurn::Calls(vec![filesystem_read_call("notes.md")]),
+            CoordinatorTurn::Calls(vec![filesystem_read_call("notes.md")]),
+            CoordinatorTurn::Calls(vec![filesystem_read_call("notes.md")]),
+            CoordinatorTurn::Text("I was capped; here is what I could read.".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        std::fs::write(workspace.path().join("notes.md"), "hello").expect("seed the read target");
+        let (output, _events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_policy_with_audit(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+
+        let rows = audit.rows();
+        let allowed_reads = rows
+            .iter()
+            .filter(|row| row.tool_name == "filesystem" && row.verdict == "Allow")
+            .count();
+        assert_eq!(allowed_reads, 2, "exactly the capped number of reads ran: {rows:?}");
+        assert!(
+            rows.iter().any(|row| {
+                row.rule_matched.as_deref() == Some("consult_effort_capped")
+                    && row.tool_name == "filesystem"
+            }),
+            "the cap denial is recorded: {rows:?}"
+        );
+        // The consultation still settled with findings.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        assert_eq!(consult_result["effort_cap"], 2);
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #59 acceptance: the deterministic low-confidence trigger. A
+    /// failed dispatch whose diagnosis requires replanning opens an
+    /// unresolved question (issue #56); once it has stood
+    /// [`CONSULT_TRIGGER_MIN_CYCLES`] rebuilds, the decision loop injects
+    /// the consultation request BEFORE the next decision turn (exactly
+    /// once), and a settled consultation resolves the question (the #56
+    /// lifecycle reads the Settled consult decision as recovery evidence).
+    #[tokio::test]
+    async fn low_confidence_question_triggers_consultation_deterministically() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_fail(
+                AgentId::new("coder"),
+                "expected artifacts not produced: src/lib.rs",
+            ),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            // Cycle 1: a dispatch whose failure requires replanning — the
+            // OpenProblem question opens (age 1, below the trigger).
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the feature")]),
+            // Cycle 2: a REJECTED decision (fabricated evidence — no journal
+            // record, no settled work) so the question stands another
+            // rebuild and crosses the trigger age.
+            CoordinatorTurn::Calls(vec![call_specialist_with(
+                "coder",
+                "implement the feature",
+                None,
+                &["ev-fabricated"],
+            )]),
+            // The model obeys the consultation request.
+            CoordinatorTurn::Calls(vec![consult_specialist(
+                "researcher",
+                "why do implementations keep missing the artifacts?",
+            )]),
+            // The consultant's answer (the consult agent shares the
+            // planning provider).
+            CoordinatorTurn::Text(
+                "the artifacts miss because the design contract was never grounded".into(),
+            ),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            coordinator_allow_all_policy(),
+        )
+        .with_review_store(Some(pool.clone()));
+        let _rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the coordinator run completes");
+
+        // The consultation request was injected into the decision loop
+        // (deterministically, once the question crossed the trigger age).
+        let nudge_count = provider
+            .message_contents()
+            .iter()
+            .filter(|content| content.contains("CONSULTATION REQUEST"))
+            .count();
+        assert!(nudge_count >= 1, "the consultation request must be injected");
+        // The consult settled with findings recorded as consultative
+        // evidence on the whiteboard.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        let evidence_id = consult_result["evidence_id"].as_str().expect("a real evidence id");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let finding = logged
+            .iter()
+            .find(|event| event.event_id == evidence_id)
+            .expect("the finding event exists on the whiteboard");
+        assert_eq!(finding.kind, WhiteboardKind::Finding);
+        assert_eq!(finding.payload["consultative"], serde_json::Value::Bool(true));
+        // The settled consultation RESOLVED the standing question (the #56
+        // lifecycle consumes the Settled consult decision as recovery
+        // evidence). The finding event's causation IS the consult decision
+        // id the resolution recorded.
+        let resolved = coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.state == crate::world_model::QuestionState::Resolved)
+            .expect("the standing question was resolved by the consultation");
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            finding.causation.as_deref(),
+            "the question was resolved by the consult decision"
         );
     }
 

@@ -70,6 +70,12 @@ pub enum DecisionKind {
     /// Payload rides `transform`; no target is named (the survivor's role
     /// is the group's shared role).
     Merge,
+    /// Issue #59: consult a registered specialist in an advisory, READ-ONLY
+    /// capacity (`consult_specialist`). The question is bounded, the cited
+    /// evidence is validated exactly like any decision, and the findings
+    /// return as structured evidence — never as task results, never as
+    /// SubTask nodes, never touching ownership/completion state.
+    Consult,
 }
 
 impl DecisionKind {
@@ -77,7 +83,10 @@ impl DecisionKind {
     pub fn requires_target(self) -> bool {
         matches!(
             self,
-            DecisionKind::DispatchSpecialist | DecisionKind::Retry | DecisionKind::FallbackTier
+            DecisionKind::DispatchSpecialist
+                | DecisionKind::Retry
+                | DecisionKind::FallbackTier
+                | DecisionKind::Consult
         )
     }
 
@@ -99,7 +108,10 @@ impl DecisionKind {
 
     /// Whether this kind requires a non-empty task description.
     pub fn requires_task(self) -> bool {
-        matches!(self, DecisionKind::DispatchSpecialist | DecisionKind::Retry)
+        matches!(
+            self,
+            DecisionKind::DispatchSpecialist | DecisionKind::Retry | DecisionKind::Consult
+        )
     }
 }
 
@@ -146,6 +158,13 @@ pub struct CoordinatorDecision {
     /// so old journal entries and old checkpoints (no field) still load.
     #[serde(default)]
     pub transform: Option<crate::task_transform::TaskTransformSpec>,
+    /// Issue #59: the consultation effort cap — the maximum tool executions
+    /// the consulted specialist may perform (bounded read-only work, small
+    /// default at the execution seam). `None` for every non-consult kind and
+    /// for consults that carry no explicit cap. Additive serde (`default`),
+    /// so old journal entries and old checkpoints (no field) still load.
+    #[serde(default)]
+    pub max_tool_calls: Option<u32>,
     pub created_at: time::OffsetDateTime,
     pub status: DecisionStatus,
 }
@@ -336,6 +355,10 @@ impl<'a> DecisionValidator<'a> {
             // validated by the task-transform machinery against the real
             // graph state).
             transform: None,
+            // The consultation effort cap is attached by the coordinator
+            // handler AFTER structural validation (issue #59), the same
+            // way the transform payload is.
+            max_tool_calls: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Validated,
         })
@@ -382,6 +405,7 @@ impl<'a> DecisionValidator<'a> {
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: Vec::new(),
             transform: None,
+            max_tool_calls: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -408,6 +432,7 @@ impl<'a> DecisionValidator<'a> {
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: Vec::new(),
             transform: None,
+            max_tool_calls: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -785,6 +810,86 @@ mod tests {
             !validator.pending_decision_is_stale("coder", &["ev-real".to_owned()]),
             "a grounded pending decision is fresh"
         );
+    }
+
+    // ── Issue #59: the Consult decision kind ─────────────────────────────
+
+    #[test]
+    fn consult_decision_validates_with_target_and_evidence() {
+        let roster_ids = roster(&["researcher", "coder"]);
+        let known = events(&["ev-0001"]);
+        let decision = validator(&roster_ids, &known, None)
+            .validate(
+                DecisionKind::Consult,
+                Some("researcher"),
+                "why does the build fail after the refactor?",
+                Some("focus on the module graph"),
+                &["ev-0001".to_owned()],
+                &[],
+            )
+            .expect("a grounded consult validates");
+        assert_eq!(decision.kind, DecisionKind::Consult);
+        assert_eq!(decision.target_agent.as_ref().map(AgentId::as_str), Some("researcher"));
+        assert_eq!(decision.supporting_evidence_ids, vec!["ev-0001"]);
+        assert!(decision.expected_artifacts.is_empty());
+        assert_eq!(decision.max_tool_calls, None, "the cap is attached by the handler");
+        assert!(DecisionKind::Consult.requires_target(), "consult names a specialist");
+        assert!(DecisionKind::Consult.requires_task(), "consult carries a bounded question");
+        assert!(!DecisionKind::Consult.rejects_target());
+    }
+
+    #[test]
+    fn consult_without_target_or_question_rejects() {
+        let roster_ids = roster(&["researcher"]);
+        let known = events(&[]);
+        let validator = validator(&roster_ids, &known, None);
+        let error = validator
+            .validate(DecisionKind::Consult, None, "why?", None, &[], &[])
+            .expect_err("consult requires a target");
+        assert_eq!(error.code, "incomplete_decision");
+        let error = validator
+            .validate(DecisionKind::Consult, Some("researcher"), "   ", None, &[], &[])
+            .expect_err("consult requires a non-empty question");
+        assert_eq!(error.code, "incomplete_decision");
+    }
+
+    #[test]
+    fn consult_with_unknown_agent_or_fabricated_evidence_rejects() {
+        let roster_ids = roster(&["researcher"]);
+        let known = events(&["ev-real"]);
+        let validator = validator(&roster_ids, &known, None);
+        let error = validator
+            .validate(DecisionKind::Consult, Some("ghost"), "why?", None, &[], &[])
+            .expect_err("outside the roster");
+        assert_eq!(error.code, "unknown_agent");
+        let error = validator
+            .validate(
+                DecisionKind::Consult,
+                Some("researcher"),
+                "why?",
+                None,
+                &["ev-fabricated".to_owned()],
+                &[],
+            )
+            .expect_err("fabricated evidence");
+        assert_eq!(error.code, "fabricated_evidence");
+    }
+
+    #[test]
+    fn consult_kind_round_trips_and_old_entries_default_the_cap() {
+        let decision = validator(&roster(&["researcher"]), &events(&[]), None)
+            .validate(DecisionKind::Consult, Some("researcher"), "why?", None, &[], &[])
+            .expect("valid");
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(json.contains("\"consult\""), "kebab-case consult kind: {json}");
+        let back: CoordinatorDecision = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, decision);
+
+        // A pre-#59 entry: no `max_tool_calls` key → additive default None.
+        let mut value = serde_json::to_value(&back).expect("serialize");
+        value.as_object_mut().expect("an object").remove("max_tool_calls");
+        let old: CoordinatorDecision = serde_json::from_value(value).expect("an old entry loads");
+        assert_eq!(old.max_tool_calls, None, "the additive effort cap defaults");
     }
 
     #[test]
