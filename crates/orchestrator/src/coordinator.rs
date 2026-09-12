@@ -99,6 +99,11 @@ Constraints:
 /// registered specialists.
 pub(crate) const CALL_SPECIALIST_TOOL: &str = "call_specialist";
 
+/// Issue #61: the coordinator-mediated artifact-ownership transfer tool.
+/// The only lawful handover of an owned artifact — validated as a typed
+/// decision, applied by the attached gate, never a steal.
+pub(crate) const TRANSFER_OWNERSHIP_TOOL: &str = "transfer_ownership";
+
 /// The optional advisory work-breakdown tool (ADR-35 amendment §2 / ADR-52
 /// amendment 2026-09-05). Its output is context for the Coordinator — NEVER
 /// materialized as `SubTask` roles or dependencies.
@@ -147,6 +152,9 @@ Restructuring an open task (use sparingly, deterministically):
 Consultation (read-only, use it to resolve open questions):
 - consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
 - The consultation returns findings plus a real evidence id; cite that id in supporting_evidence_ids when a later decision rests on the advice.
+
+Artifact ownership (issue #61):
+- A write by a non-owner to an OWNED artifact is refused; the refusal names the owner and its acquiring event. To hand an owned artifact over to another agent, call transfer_ownership — the mediated handover is the only lawful way; ownership is never stolen.
 "#;
 
 /// Argument schema for the Coordinator's `call_specialist` tool.
@@ -179,6 +187,45 @@ fn call_specialist_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["agent_id", "task"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `transfer_ownership` tool
+/// (issue #61): the coordinator-mediated handover of an owned artifact.
+fn transfer_ownership_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: TRANSFER_OWNERSHIP_TOOL.to_string(),
+        description: "Mediate an artifact-ownership transfer (issue #61). A write by a non-owner \
+                      to an OWNED artifact is refused (the failed tool result names the owner \
+                      and its acquiring event); when another agent must take the artifact \
+                      over, grant that transfer here. The refusing agent never claims the \
+                      artifact by writing again — only this mediated decision can move it, \
+                      and only from its actual current owner."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "The id of the specialist that RECEIVES the artifact's ownership, exactly as listed in the roster."
+                },
+                "expected_artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The owned artifact paths (workspace-root-relative) to transfer. Unowned or foreign-owned paths are rejected with a structured error; nothing is stolen."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the handover. Recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids (from the context) that justify this decision. Fabricated ids are rejected."
+                }
+            },
+            "required": ["agent_id", "expected_artifacts"]
         }),
     }
 }
@@ -965,6 +1012,14 @@ pub struct CoordinatorAgent {
     /// review cycles to pre-Phase 3 behavior — observable via a debug log at
     /// cycle entry, never a run failure.
     review_store: Option<sqlx::SqlitePool>,
+    /// Issue #61: the shared [`WriteGate`], when one is attached to the run,
+    /// for artifact-ownership mediation: settle-release of a task's
+    /// ownerships, coordinator-mediated transfers (validated
+    /// `TransferOwnership` decisions), external-modification stale marks,
+    /// and checkpoint-persisted ownership state. `None` (the default) means
+    /// the coordinator path deploys no gate — ownership is then inert (no
+    /// enforcement exists to mediate; plain-executor writes are unchanged).
+    write_gate: Option<std::sync::Arc<crate::gate::WriteGate>>,
     /// ADR-65 §2 (Phase 2): the pre-planning workspace snapshot captured by
     /// the readiness barrier, threaded through to agent dispatch so every
     /// dispatched agent receives the snapshot digest in its context.
@@ -1598,6 +1653,7 @@ impl CoordinatorAgent {
             approved_plan_seed: None,
             headless_resume_seed: None,
             review_store: None,
+            write_gate: None,
             workspace_snapshot: None,
             run_id: None,
             last_doc_resolution: None,
@@ -2232,6 +2288,15 @@ impl CoordinatorAgent {
             Err(error) => {
                 let error_string = error.to_string();
                 let cancelled = is_cancellation_error(&error) || cancel.is_cancelled();
+                // Issue #61: the subtask has settled (failed / cancelled) —
+                // its ownerships release (evented) so the artifacts go back
+                // on the table before the next dispatch decision.
+                let settle_reason = if cancelled {
+                    "subtask settled: cancelled"
+                } else {
+                    "subtask settled: failed"
+                };
+                self.settle_release_task_ownership(&subtask.role, settle_reason).await;
                 let _ = self.bus.publish_for_session(
                     subtask.session_id,
                     correlation_id,
@@ -2384,6 +2449,46 @@ impl CoordinatorAgent {
     pub fn with_review_store(mut self, pool: Option<sqlx::SqlitePool>) -> Self {
         self.review_store = pool;
         self
+    }
+
+    /// Issue #61: attach the shared [`WriteGate`] for ownership mediation
+    /// (settle-release, coordinator-mediated transfers, external-modification
+    /// stale marks, checkpoint persistence). `None` leaves ownership inert.
+    pub fn with_write_gate(mut self, gate: Option<std::sync::Arc<crate::gate::WriteGate>>) -> Self {
+        self.write_gate = gate;
+        self
+    }
+
+    /// Issue #61: restore the ownership table from a checkpoint projection
+    /// (resume path). Fail-soft: without an attached gate the state keeps
+    /// living on the checkpoint alone (additively re-persisted next save).
+    pub fn restore_ownership_state(&self, state: &crate::ownership::OwnershipState) {
+        if let Some(gate) = self.write_gate.as_ref() {
+            gate.restore_ownership_state(state);
+        }
+    }
+
+    /// Issue #61: the ownership records to persist additively in every
+    /// checkpoint (empty when no gate is attached).
+    #[must_use]
+    pub fn ownership_state(&self) -> crate::ownership::OwnershipState {
+        crate::ownership::OwnershipState {
+            records: self
+                .write_gate
+                .as_ref()
+                .map(|gate| gate.ownership_records())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Issue #61: release the ownerships an agent's settled subtask held
+    /// (completed / failed / cancelled). Fail-soft: without a gate or with a
+    /// release failure this is logged, never a run failure.
+    async fn settle_release_task_ownership(&self, role: &AgentId, reason: &str) {
+        let Some(gate) = self.write_gate.as_ref() else { return };
+        if let Err(error) = gate.release_agent(role.as_str(), reason).await {
+            tracing::debug!(role = %role, %error, "settle ownership release failed (fail-soft)");
+        }
     }
 
     /// ADR-65 §2 (Phase 2): attach the pre-planning workspace snapshot so its
@@ -2696,6 +2801,10 @@ impl CoordinatorAgent {
             // delegation-quality evidence survives a resume (additive
             // checkpoint field).
             suitability: self.suitability.state(),
+            // Issue #61: the ownership table rides every persist so the
+            // artifact-ownership state survives a resume (additive
+            // checkpoint field).
+            ownership: self.ownership_state(),
         }
     }
 
@@ -3510,6 +3619,10 @@ impl CoordinatorAgent {
         // until outcomes are recorded again); the caps are enforced on
         // restore so resumed stores stay bounded.
         self.suitability = crate::suitability::SuitabilityIndex::from_state(cp.suitability.clone());
+        // Issue #61: restore the artifact-ownership table additively (the
+        // gate is the live read when attached; old checkpoints carry the
+        // empty default — ownership re-derives from the log then).
+        self.restore_ownership_state(&cp.ownership);
         self.workspace_changed_since_checkpoint =
             match (&cp.snapshot_generation, self.snapshot_generation()) {
                 (Some(recorded), Some(current)) => recorded.as_str() != current.as_str(),
@@ -3710,6 +3823,14 @@ impl CoordinatorAgent {
                 continue;
             }
             change.externally_changed.push((row.path.clone(), row.last_event_id.clone()));
+            // Issue #61: the external write is observed OUTSIDE the gate —
+            // an owned record for that artifact flips stale (never a silent
+            // overwrite); the conflict channel surfaces it later.
+            if let Some(gate) = self.write_gate.as_ref() {
+                if let Err(error) = gate.mark_artifact_stale(&canonical, "resume-f3").await {
+                    tracing::warn!(%error, "issue #61: stale mark failed (fail-soft)");
+                }
+            }
         }
         change
     }
@@ -4978,6 +5099,10 @@ impl CoordinatorAgent {
                         completed_results.insert(task_id, result.clone());
                         retry_feedback.remove(&task_id);
                         graph.mark_done(&task_id);
+                        // Issue #61: the subtask settled completed — the role's
+                        // ownerships release (evented via the attached gate).
+                        self.settle_release_task_ownership(&role, "subtask settled: completed")
+                            .await;
 
                         // ── Replan fallback: design-stage redesign complete ──
                         // When a design-stage replan subtask finishes
@@ -5283,6 +5408,10 @@ impl CoordinatorAgent {
                         self.queue_revision_subtask(&mut graph, task_id, sid, role.clone(), reason);
                     }
                     AgentOutcome::Failed { error } => {
+                        // Issue #61: failure is a settle — release the role's
+                        // leases; a retrying generation re-acquires on its
+                        // first write.
+                        self.settle_release_task_ownership(&role, "subtask settled: failed").await;
                         let _ = self.bus.publish_for_session(
                             task.session_id,
                             task_id.0,
@@ -5569,6 +5698,9 @@ impl CoordinatorAgent {
                         }
                     }
                     AgentOutcome::Blocked { on } => {
+                        // Issue #61: a blocked settle also frees the leases
+                        // (recoverable later — a retried task re-acquires).
+                        self.settle_release_task_ownership(&role, "subtask settled: blocked").await;
                         // Issue #54: a blocked outcome is the Dependency
                         // dimension — diagnosed and audited before the
                         // existing dependency-attach/retry handling.
@@ -7285,6 +7417,11 @@ impl CoordinatorAgent {
             // Issue #59: the typed CONSULT surface — read-only advisory,
             // findings become evidence, never task work.
             tool_defs.push(consult_tool_definition());
+            // Issue #61: the mediated ownership-transfer surface — only
+            // lawful when a write gate is attached to the run.
+            if self.write_gate.is_some() {
+                tool_defs.push(transfer_ownership_tool_definition());
+            }
             if let Some(executor) = &self.tool_executor {
                 tool_defs.extend(executor.tool_definitions());
             }
@@ -7473,6 +7610,15 @@ impl CoordinatorAgent {
                             &tool_call.arguments,
                         )
                         .await
+                    }
+                    // Issue #61: the mediated transfer operation — a typed,
+                    // validated decision applied by the attached gate. It
+                    // moves records only from their actual current owner;
+                    // rejected/unowned paths are structured errors; never a
+                    // dispatch surface.
+                    TRANSFER_OWNERSHIP_TOOL if dispatching => {
+                        self.handle_transfer_ownership(task, base_ctx, cancel, &tool_call.arguments)
+                            .await
                     }
                     // ADR-35 §8 self-execution: the coordinator's own tools
                     // (shared executor — policy engine, VirtualFs, write
@@ -8256,6 +8402,242 @@ impl CoordinatorAgent {
             tool_result["world_model"] = advisory;
         }
         tool_result
+    }
+
+    /// Issue #61: the whiteboard `Decision` record for a mediated ownership
+    /// transfer — the same payload shape as a consult decision plus the
+    /// `transfer_mediation: true` marker. Written directly (never via
+    /// [`Self::append_dispatch_decision`]: a transfer dispatches nothing and
+    /// leaves no pending continuation behind). Returns the REAL recorded
+    /// event id on success — it is the acquiring event the transferred
+    /// ownership stamps — and `None` on an append failure (fail-soft, as
+    /// with every Decision append here).
+    async fn append_transfer_decision(
+        &mut self,
+        session_id: Ulid,
+        to_agent: &AgentId,
+        artifacts: &[String],
+        reason: &str,
+        restart_evidence_ids: &[String],
+    ) -> Option<String> {
+        let pool = self.review_store.as_ref()?;
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "artifact_paths": artifacts,
+                "reason": reason,
+                "required_output": format!("relinquish the named artifacts to {to_agent}"),
+                "supporting_evidence_ids": evidence_ids,
+                "transfer_mediation": true,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        match append_whiteboard_event(pool, &event(restart_evidence_ids)).await {
+            Ok(stored) => Some(stored.event_id),
+            Err(err) => {
+                warn!(
+                    %err,
+                    "issue #61: transfer decision append rejected; re-appending without the \
+                     rejected citations (fail-soft, the record still lands)"
+                );
+                match append_whiteboard_event(pool, &event(&[])).await {
+                    Ok(stored) => Some(stored.event_id),
+                    Err(err) => {
+                        warn!(%err, "issue #61: transfer decision append failed (fail-soft)");
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #61: handle ONE `transfer_ownership` tool call. The typed
+    /// reception is: validate (#52 flow, kind `TransferOwnership` — the
+    /// target names the RECEIVING agent from the roster, the
+    /// `expected_artifacts` name the artifacts) → policy-gate → record the
+    /// typed `Decision` event → apply the mediated transfer through the
+    /// attached gate, structurally rejecting every path that is not owned
+    /// by its actual current holder. Nothing is stolen.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_transfer_ownership(
+        &mut self,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(gate) = self.write_gate.clone() else {
+            return serde_json::json!({
+                "error": "ownership_unavailable",
+                "message": "no write gate is attached to this run — there is no ownership to \
+                            mediate (plain-executor runs deploy no artifact ownership)",
+            });
+        };
+        let to_agent = arguments.get("agent_id").and_then(serde_json::Value::as_str);
+        let artifact_paths = parse_string_array(arguments, "expected_artifacts");
+        let Some(to_agent) = to_agent else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "transfer_ownership requires string agent_id and \
+                            expected_artifacts (the artifacts being handed over)",
+            });
+        };
+        if artifact_paths.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "transfer_ownership requires at least one artifact path in \
+                            expected_artifacts",
+            });
+        }
+
+        // ── Issue #52 flow: validate the transfer decision BEFORE any
+        // mutation. A transfer to-tune target: roster membership; artifact
+        // canonicalization; bounds (each validated decision shares one rule
+        // set). Fabricated evidence ids refuse.
+        let cited_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        let missing_evidence = self.missing_evidence_ids(&cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let decision = match validator.validate(
+            crate::decisions::DecisionKind::TransferOwnership,
+            Some(to_agent),
+            "artifact-ownership transfer mediation",
+            arguments
+                .get("notes")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|notes| !notes.is_empty()),
+            &cited_ids,
+            &artifact_paths,
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    to_agent = %to_agent,
+                    "transfer_ownership rejected an invalid Coordinator decision (structured \
+                     error, no state mutation)"
+                );
+                return rejection.tool_value();
+            }
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── Policy gate (the same engine every Coordinator decision
+        // evaluates under) ──
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; transfers are denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: TRANSFER_OWNERSHIP_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this ownership transfer",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── Record the typed Decision event FIRST (the audit trail / the
+        // acquiring event of the transfer), then apply the transfers ────
+        let reason = arguments
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|notes| !notes.is_empty())
+            .unwrap_or("coordinator_mediation")
+            .to_owned();
+        let Some(decision_event_id) = self
+            .append_transfer_decision(
+                task.session_id,
+                &AgentId::new(to_agent),
+                &artifact_paths,
+                &reason,
+                &cited_ids,
+            )
+            .await
+        else {
+            // No session store — the mediated handover cannot be audited;
+            // deny rather than move ownership without an audit trail.
+            self.decision_journal
+                .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+            return serde_json::json!({
+                "error": "evidence_unavailable",
+                "message": "no session log is attached — the transfer cannot be recorded; \
+                            retry after the store is re-attached",
+            });
+        };
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+
+        // ── Apply: move each record from its ACTUAL current owner (the
+        // gate proves ownership — the decision claims nothing). ─────────
+        let mut transferred: Vec<String> = Vec::new();
+        let mut rejected: Vec<serde_json::Value> = Vec::new();
+        for artifact in &artifact_paths {
+            let Some(from_owner) = gate.ownership_owner(artifact) else {
+                rejected.push(serde_json::json!({
+                    "artifact": artifact,
+                    "error": "artifact_not_owned",
+                }));
+                continue;
+            };
+            match gate.transfer_ownership(artifact, &from_owner, to_agent, &decision_event_id).await
+            {
+                Ok(_) => transferred.push(artifact.clone()),
+                Err(error) => rejected.push(serde_json::json!({
+                    "artifact": artifact,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        serde_json::json!({
+            "outcome": "settled",
+            "decision_id": decision_id,
+            "transferred": transferred,
+            "rejected": rejected,
+        })
     }
 
     /// Issue #59: handle ONE `consult_specialist` tool call — the typed
@@ -19484,5 +19866,296 @@ mod tests {
             "the advisory names the world-model basis"
         );
         assert!(advisory.contains("src/main.rs"), "the advisory names the verified-clean artifact");
+    }
+
+    // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────
+
+    /// A gate over the coordinator's own hermetic pool + workspace root,
+    /// with FilesystemTool wired so writes materialize.
+    async fn transfer_test_gate(
+        pool: sqlx::SqlitePool,
+        root: &std::path::Path,
+    ) -> Arc<crate::gate::WriteGate> {
+        let policy: Arc<dyn concerto_core::traits::policy::PolicyEngine> =
+            Arc::new(SimplePolicyEngine::new(
+                vec![PolicyRule::AutoApprove(Condition::Always)],
+                Arc::new(TestAudit),
+            ));
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        registry.register(Box::new(concerto_tools::filesystem::FilesystemTool::new(
+            camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+                .expect("workspace root is utf-8"),
+        )));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy.clone()));
+        Arc::new(crate::gate::WriteGate::new(
+            policy,
+            executor,
+            pool,
+            Arc::new(crate::gate::FilePreImageReader::new(root.to_path_buf())),
+            root.to_path_buf(),
+            1,
+        ))
+    }
+
+    /// Issue #61: the mediated transfer flow — request → validation (typed
+    /// `TransferOwnership` decision) → whiteboard Decision event → gate
+    /// transfer → the receiving agent may write, the former owner may not.
+    #[tokio::test]
+    async fn transfer_ownership_mediation_moves_an_owned_artifact_to_the_receiving_agent() {
+        use concerto_core::CancellationToken;
+
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+
+        // agent-a's first write auto-acquires ownership.
+        let acquire = crate::gate::GateRequest {
+            call_id: "med-1".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            tool: "filesystem".to_owned(),
+            input: serde_json::json!({
+                "operation": "write", "path": "shared.txt", "content": "v1"
+            }),
+            session_id: None,
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: std::collections::BTreeMap::new(),
+        };
+        gate.submit(acquire, CancellationToken::new()).await.expect("owner acquires");
+        assert_eq!(gate.ownership_owner("shared.txt").as_deref(), Some("agent-a"));
+
+        // A coordinator over the same pool + gate, with a roster holding the
+        // receiver.
+        let bus = EventBus::new(16);
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let registry = AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("agent-b"),
+            "received",
+        )]);
+        let coordinator = CoordinatorAgent::new(
+            Arc::new(registry),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            Arc::new(MockProvider::default())
+                as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_policy_engine(Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Arc::new(TestAudit),
+        )))
+        .with_review_store(Some(pool.clone()))
+        .with_write_gate(Some(gate.clone()));
+        let mut coordinator = coordinator;
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "mediation");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .handle_transfer_ownership(
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &serde_json::json!({
+                    "agent_id": "agent-b",
+                    "expected_artifacts": ["shared.txt"],
+                    "notes": "agent-b owns the next revision",
+                }),
+            )
+            .await;
+        assert_eq!(result["outcome"], serde_json::json!("settled"));
+        assert_eq!(result["transferred"], serde_json::json!(["shared.txt"]));
+        assert!(result["rejected"].as_array().map(Vec::is_empty).unwrap_or(true));
+        assert_eq!(gate.ownership_owner("shared.txt").as_deref(), Some("agent-b"));
+        let decision_id = result["decision_id"].as_str().expect("decision id");
+        assert!(
+            coordinator.decision_journal.entries().iter().any(|entry| entry.id == decision_id),
+            "the mediation is journaled"
+        );
+
+        // The typed Decision event (audit) carries a real id and the marker.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("log loads");
+        let transfer_decision = logged
+            .iter()
+            .find(|event| event.payload.get("transfer_mediation") == Some(&serde_json::json!(true)))
+            .expect("transfer decision recorded");
+
+        // The transferred record's acquiring event is the decision event id.
+        let records = gate.ownership_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].acquiring_event_id, transfer_decision.event_id);
+        assert_eq!(records[0].owner, "agent-b");
+    }
+
+    /// Issue #61: settle release — when a subtask settles (completed /
+    /// failed / cancelled), the coordinator releases the role's leases
+    /// (evented) so the artifacts go back on the table.
+    #[tokio::test]
+    async fn subtask_settle_releases_the_role_ownerships_and_audits_the_release() {
+        use concerto_core::CancellationToken;
+
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+
+        let acquire = crate::gate::GateRequest {
+            call_id: "srel-1".to_owned(),
+            agent_id: "coder".to_owned(),
+            tool: "filesystem".to_owned(),
+            input: serde_json::json!({
+                "operation": "write", "path": "multi.txt", "content": "v1"
+            }),
+            session_id: None,
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: std::collections::BTreeMap::new(),
+        };
+        gate.submit(acquire, CancellationToken::new()).await.expect("owner acquires");
+        assert_eq!(gate.ownership_owner("multi.txt").as_deref(), Some("coder"));
+
+        let bus = EventBus::new(16);
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let coordinator = CoordinatorAgent::new(
+            Arc::new(AgentRegistry::new()),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            Arc::new(MockProvider::default())
+                as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        // The settle path (completed / failed / cancelled alike) releases.
+        coordinator
+            .settle_release_task_ownership(&AgentId::new("coder"), "subtask settled: failed")
+            .await;
+        assert_eq!(
+            gate.ownership_owner("multi.txt"),
+            None,
+            "a settled subtask's leases go back on the table"
+        );
+
+        // The release is audited with an ownership-event row.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("log loads");
+        let release = logged
+            .iter()
+            .find(|event| {
+                event.kind == concerto_sessions::whiteboard::WhiteboardKind::OwnershipEvent
+            })
+            .expect("the release is audited");
+        assert_eq!(
+            release.payload.get("reason"),
+            Some(&serde_json::json!("subtask settled: failed"))
+        );
+    }
+
+    /// Issue #61: the ownership table round-trips through the checkpoint
+    /// projection and a resume restores it into a fresh gate.
+    #[tokio::test]
+    async fn ownership_survives_checkpoint_projection_and_resume_restore() {
+        let gate = transfer_test_gate(
+            sqlx::pool::PoolOptions::new()
+                .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true)),
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        // Direct-table acquires (no submissions needed for the projection
+        // shape): rely on the ownership table API for the checkpoint data.
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/main.rs".into(),
+                owner: "coder".into(),
+                acquiring_event_id: "w-1".into(),
+                acquired_at_ms: 7,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let coordinator = CoordinatorAgent::new(
+            Arc::new(AgentRegistry::new()),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            Arc::new(MockProvider::default())
+                as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_write_gate(Some(gate.clone()));
+        let saved = coordinator.ownership_state();
+        assert_eq!(saved.records.len(), 1);
+        let json = serde_json::to_string(&saved).expect("ownership serializes");
+
+        // Resume: a fresh gate (new run) restores the projection.
+        let restored_gate = transfer_test_gate(
+            sqlx::pool::PoolOptions::new()
+                .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true)),
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        let state: crate::ownership::OwnershipState =
+            serde_json::from_str(&json).expect("ownership deserializes");
+        restored_gate.restore_ownership_state(&state);
+        let record = restored_gate.ownership_records().first().expect("restored record").clone();
+        assert_eq!(record.artifact, "src/main.rs");
+        assert_eq!(record.owner, "coder");
+        assert_eq!(record.acquiring_event_id, "w-1");
+        assert_eq!(restored_gate.ownership_owner("src/main.rs").as_deref(), Some("coder"));
+        let _ = gate; // silence moved-value lint chafing
     }
 }

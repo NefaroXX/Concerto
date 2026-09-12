@@ -399,7 +399,10 @@ async fn identical_fixture_replays_byte_identical_log_fs_and_cursors() {
     let (log_2, fs_2, cursors_2) = run_fixture().await;
 
     // The pinned TOTAL ORDER — divergence in interleaving fails here even
-    // when end states would have matched (oracle comment 3).
+    // when end states would have matched (oracle comment 3). Issue #61 adds
+    // the evented ownership release after each agent's completed run; the
+    // handover (a → b) is lawful because agent-a's settle released the lease
+    // before agent-b's write.
     let expected = [
         json!({
             "event_id": "call-a",
@@ -409,14 +412,26 @@ async fn identical_fixture_replays_byte_identical_log_fs_and_cursors() {
         }),
         json!({ "event_id": "", "gate_seq": 2, "kind": "subtask-completed", "agent_id": "agent-a" }),
         json!({
-            "event_id": "call-b",
+            "event_id": "",
             "gate_seq": 3,
+            "kind": "ownership-event",
+            "agent_id": "agent-a",
+        }),
+        json!({
+            "event_id": "call-b",
+            "gate_seq": 4,
             "kind": "write-applied",
             "agent_id": "agent-b",
         }),
-        json!({ "event_id": "", "gate_seq": 4, "kind": "subtask-completed", "agent_id": "agent-b" }),
+        json!({ "event_id": "", "gate_seq": 5, "kind": "subtask-completed", "agent_id": "agent-b" }),
+        json!({
+            "event_id": "",
+            "gate_seq": 6,
+            "kind": "ownership-event",
+            "agent_id": "agent-b",
+        }),
     ];
-    assert_eq!(log_1.len(), 4, "exactly the four deterministic events: {log_1:?}");
+    assert_eq!(log_1.len(), 6, "exactly the six deterministic events: {log_1:?}");
     for (index, event) in log_1.iter().enumerate() {
         for key in ["event_id", "gate_seq", "kind", "agent_id"] {
             assert_eq!(

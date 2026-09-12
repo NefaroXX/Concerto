@@ -42,6 +42,7 @@ pub mod intent_grants;
 pub mod ipc;
 mod memory_prompt;
 pub mod memory_serial;
+pub mod ownership;
 pub mod plan_approval;
 pub mod relationship;
 pub use relationship::{

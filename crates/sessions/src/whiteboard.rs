@@ -63,7 +63,21 @@ pub enum WhiteboardKind {
     /// is an *assertion about the intended workspace contract*, not a record
     /// of observed reality — so it is spelled `design-doc`, not folded into
     /// the runtime-observed kinds above.
+    /// Payload is the serialized `DesignDoc`; the
+    /// deterministic verifier later resolves that claim against grounded
+    /// observations to either bind it (Verified) or quarantine it. Note this
+    /// is an *assertion about the intended workspace contract*, not a record
+    /// of observed reality — so it is spelled `design-doc`, not folded into
+    /// the runtime-observed kinds above.
     DesignDoc,
+    /// Issue #61: an artifact-ownership lifecycle audit event (transfer /
+    /// release / stale-mark), appended by the gate or its supervisor
+    /// callers. Payload is free-form JSON
+    /// (`ownership.rs::OwnershipAction` producers); the first-writer
+    /// auto-acquire is NOT a separate event — it rides the write's own
+    /// `write-applied` row (`ownership_acquired` payload), whose event id is
+    /// the acquiring-event id of the produced record.
+    OwnershipEvent,
 }
 
 impl WhiteboardKind {
@@ -90,6 +104,7 @@ impl WhiteboardKind {
             Self::ToolExecuted => "tool-executed",
             Self::WorkspaceSnapshot => "workspace-snapshot",
             Self::DesignDoc => "design-doc",
+            Self::OwnershipEvent => "ownership-event",
         }
     }
 
