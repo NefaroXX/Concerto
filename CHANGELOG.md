@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Fault-injection eval suite (#55):** 16 deterministic failure scenarios
+  + 3 gate tests proving #52/#53/#54 end to end, test-gated harness
+  (zero production changes), ~0.05s suite runtime for CI.
 - **Structured failure diagnosis + recovery (#54):** provider/tool/agent/
   task/environment/dependency/contract failures normalize into one typed
   diagnosis driving deterministic recovery (retry-same / alternate /
