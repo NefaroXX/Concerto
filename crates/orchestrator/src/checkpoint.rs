@@ -201,9 +201,15 @@ pub struct CheckpointContext {
     pub progress_tracker: crate::progress::ProgressTrackerState,
     /// Issue #54: the run's structured failure diagnoses (normalized,
     /// bounded history) captured at save time so the audit trail survives a
-    /// resume. Old checkpoints default it empty (serde default) —
-    /// additive, no bump.
+    /// resume. Old checkpoints default it empty (serde default) — additive,
+    /// no bump.
     pub failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
+    /// Issue #56: the coordinator's compact world-model projection captured
+    /// at save time, so a resume restores the SAME model (the question
+    /// ledger travels with it). Old checkpoints default it empty —
+    /// additive, no bump; those runs rebuild the model from their own
+    /// restored state at the next decision session.
+    pub world_model: crate::world_model::WorldModel,
 }
 
 // ---------------------------------------------------------------------------
@@ -340,11 +346,20 @@ pub struct GraphCheckpoint {
     pub progress_tracker: crate::progress::ProgressTrackerState,
     /// Issue #54: the run's structured failure diagnoses — the normalized
     /// failure record with its recovery-relevant flags, captured so the
-    /// diagnosis/evidence trail survives a resume. Additive only: absent
-    /// on older records (serde default = empty history); old readers
-    /// ignore the key.
+    /// diagnosis/evidence trail survives a resume. Additive only: absent on
+    /// older records (serde default = empty history); old readers ignore
+    /// the key.
     #[serde(default)]
     pub failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
+    /// Issue #56: the coordinator world-model projection (facts, tasks,
+    /// artifacts, unresolved questions, roster, risks, pending decision),
+    /// persisted so a resume reconstructs the SAME model — the round-trip
+    /// "restore or rebuild" story: this field for current checkpoints, a
+    /// deterministic rebuild from the restored state for older ones.
+    /// Additive only (serde default = the empty model); old readers ignore
+    /// the key.
+    #[serde(default)]
+    pub world_model: crate::world_model::WorldModel,
 }
 
 const fn current_schema_version() -> u32 {
@@ -555,6 +570,9 @@ pub fn build_checkpoint(
         // Issue #54: additive — the normalized failure-diagnosis history
         // rides independently; old readers treat this key as opaque.
         failure_diagnoses: context.failure_diagnoses.clone(),
+        // Issue #56: additive — the world-model projection rides
+        // independently; old readers treat this key as opaque.
+        world_model: context.world_model.clone(),
     }
 }
 
@@ -1338,6 +1356,7 @@ mod tests {
             &HashMap::new(),
             &CheckpointContext {
                 design_doc: Some(design_doc.clone()),
+                world_model: crate::world_model::WorldModel::default(),
                 model_assignments: model_assignments.clone(),
                 action_ledger: action_ledger.clone(),
                 default_model_provider_attempted: HashSet::new(),
@@ -1587,6 +1606,7 @@ mod tests {
             &HashMap::new(),
             &CheckpointContext {
                 design_doc: Some(design_doc.clone()),
+                world_model: crate::world_model::WorldModel::default(),
                 model_assignments: model_assignments.clone(),
                 action_ledger: action_ledger.clone(),
                 default_model_provider_attempted: HashSet::new(),
@@ -2111,6 +2131,127 @@ mod tests {
         assert!(
             loaded.failure_diagnoses.is_empty(),
             "the absent diagnosis history defaults to empty"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #56: the world-model projection persists additively so a
+    // resume reconstructs the SAME model — a captured model round-trips
+    // through the checkpoint JSON (build → serialize → load → identical
+    // render), and a checkpoint without the key loads the empty default
+    // (those runs rebuild the model from their own restored state).
+    // ------------------------------------------------------------------
+
+    /// A captured world model round-trips through the checkpoint JSON and
+    /// renders BIT-IDENTICALLY after a deserialize.
+    #[test]
+    fn world_model_round_trips_through_checkpoint_json() {
+        let model = crate::world_model::WorldModel {
+            built_at_ms: 1_000,
+            generation: Some("gen-7".to_owned()),
+            workspace_changed: true,
+            objective: Some("fix the parser".to_owned()),
+            criteria: vec!["tests pass".to_owned()],
+            agents: vec!["coordinator".to_owned(), "coder".to_owned()],
+            models: vec!["cheap".to_owned()],
+            facts: vec![crate::world_model::WorldFact {
+                ref_id: "ev-1".to_owned(),
+                label: "wrote src/main.rs by coder".to_owned(),
+                status: crate::world_model::FactStatus::Verified,
+                artifact: Some("src/main.rs".to_owned()),
+                seq: 12,
+            }],
+            tasks: vec![crate::world_model::WorldTask {
+                ref_id: "dec-1".to_owned(),
+                label: "implement the thing".to_owned(),
+                status: "settled".to_owned(),
+            }],
+            artifacts: vec![crate::world_model::WorldArtifact {
+                path: "src/main.rs".to_owned(),
+                status: crate::world_model::ArtifactStatus::Written,
+                owner: Some("coder".to_owned()),
+                last_ref: Some("ev-1".to_owned()),
+            }],
+            questions: vec![crate::world_model::UnresolvedQuestion {
+                id: "q-abc123".to_owned(),
+                kind: crate::world_model::QuestionKind::BlockedPath,
+                question: "is 'src/main.rs' as recorded? re-verify".to_owned(),
+                blocks: Some("src/main.rs".to_owned()),
+                needed: vec!["obs-1".to_owned()],
+                opened_journal_len: 1,
+                opened_ref: Some("obs-1".to_owned()),
+                opened_at_ms: 900,
+                cycles_open: 2,
+                state: crate::world_model::QuestionState::Open,
+                resolved_by: None,
+            }],
+            assumptions: vec![crate::world_model::WorldAssumption {
+                ref_id: "ev-2".to_owned(),
+                label: "design doc binds 2 paths".to_owned(),
+            }],
+            risks: vec![crate::world_model::WorldRisk {
+                ref_id: "ev-2".to_owned(),
+                label: "expected artifact src/main.rs is stale".to_owned(),
+            }],
+            pending: Some("dispatch to coder: implement".to_owned()),
+        };
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "world_model": model,
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("world model loads");
+        assert_eq!(
+            loaded.world_model, model,
+            "the projection survives the round trip (resume persistence)"
+        );
+        assert_eq!(
+            loaded.world_model.render(),
+            model.render(),
+            "the resume reconstructs the SAME model (identical render)"
+        );
+    }
+
+    /// A pre-#56 checkpoint record with NO `world_model` key loads clean
+    /// with the empty model (additive serde default, no bump): those runs
+    /// rebuild the projection from their own restored state.
+    #[test]
+    fn old_checkpoint_without_world_model_loads_empty() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#56 checkpoint loads");
+        assert_eq!(
+            loaded.world_model,
+            crate::world_model::WorldModel::default(),
+            "the absent world-model field defaults to the empty projection"
+        );
+        assert!(
+            loaded.world_model.is_empty_beyond_objective(),
+            "the empty model carries nothing to consume"
         );
     }
 
