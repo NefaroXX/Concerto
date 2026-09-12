@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Dynamic task split/merge (#57):** open tasks split into children
+  (edges union-rewritten, lineage kept) and overlapping pending tasks merge
+  (lowest-ULID survivor, unions deduped), proven on throwaway copies —
+  settled work untouchable, old checkpoints load.
 - **Coordinator world model (#56):** deterministic structured projection
   (objective, facts-by-id with freshness rules, artifacts+owners,
   unresolved-question lifecycle, risks) consumed by dispatch decisions and
