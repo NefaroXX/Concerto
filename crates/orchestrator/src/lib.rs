@@ -65,6 +65,7 @@ mod tool_facts;
 mod tool_guard;
 mod working_memory;
 pub mod workspace_snapshot;
+pub mod world_model;
 
 #[path = "runtime_runner_persistent.rs"]
 pub mod runtime_runner;

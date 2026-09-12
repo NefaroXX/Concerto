@@ -880,6 +880,19 @@ pub struct CoordinatorAgent {
     /// handling, tool self-execution), bounded, and persisted additively
     /// so the diagnosis/evidence trail survives a resume.
     failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
+    /// Issue #56: the compact structured world model — a deterministic
+    /// projection of the run's workspace facts, work, freshness (verified /
+    /// assumed / stale), unresolved questions, roster, artifact ownership,
+    /// risks, and the pending dispatch decision. Rebuilt at every refresh
+    /// point from existing state only (never a new store, never model
+    /// calls); the question ledger is the only carried progress and is
+    /// checkpointed additively so a resume restores the same model.
+    world_model: crate::world_model::WorldModel,
+    /// Issue #56: whether the workspace changed materially between the
+    /// recorded checkpoint generation and the current snapshot generation
+    /// (computed once at restore time). While set, the world model marks
+    /// log-derived facts stale and answers no verified-clean queries.
+    workspace_changed_since_checkpoint: bool,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1369,6 +1382,16 @@ impl CoordinatorAgent {
             // Issue #54: the failure-diagnosis history starts empty and
             // grows one entry per diagnosed failure surface.
             failure_diagnoses: Vec::new(),
+            // Issue #56: the coordinator's compact world-model projection
+            // (rebuilt at every refresh point; the question ledger is the
+            // only carried progress). Starts empty; a resume restores it
+            // from the checkpoint's additive field, or an old checkpoint
+            // defaults it and the next decision session rebuilds it.
+            world_model: crate::world_model::WorldModel::default(),
+            // Issue #56: whether the workspace changed materially between
+            // the checkpoint and this resume (the F3 generation verdict);
+            // the world-model builder consumes it for the V-CHANGE rule.
+            workspace_changed_since_checkpoint: false,
         }
     }
 
@@ -1423,6 +1446,210 @@ impl CoordinatorAgent {
     /// evidence, and `project_root` bounds artifact canonicalization.
     fn decision_roster(&self) -> HashSet<String> {
         self.registry.ids().into_iter().map(|id| id.as_str().to_owned()).collect()
+    }
+
+    /// The decision time's advisory the coordinator's decision machinery
+    /// derives from the world model (issue #56). A real consumed query — the
+    /// skip-recommendation for completed-verified work: `Some` ONLY when the
+    /// decision names expected artifacts and EVERY one is verified-clean in
+    /// the projection as of decision time.
+    fn world_model_decision_advisory(
+        &self,
+        expected_artifacts: &[String],
+    ) -> Option<serde_json::Value> {
+        if expected_artifacts.is_empty() {
+            return None;
+        }
+        let verified = self.world_model.verified_clean_artifacts(expected_artifacts);
+        if verified.len() != expected_artifacts.len() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "verified_clean": verified,
+            "advisory": format!(
+                "all expected artifacts are verified clean in the world model as of \
+        decision time ({}); consider whether the work is already complete before \
+        re-producing them",
+                verified.join(", ")
+            ),
+        }))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #56: the coordinator world model — a bounded, structured
+    // projection rebuilt from existing state (whiteboard facts, resource
+    // rows, decision journal, diagnoses, roster, generation signals). The
+    // builder is pure; this refresh only adapts the I/O the coordinator
+    // already performs.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The bounded event window the builder reads (newest anchored).
+    const WORLD_MODEL_EVENT_WINDOW: usize = 256;
+    /// The observation-row read bound per refresh.
+    const WORLD_MODEL_OBSERVATION_ROWS: usize = 64;
+
+    /// Rebuild `self.world_model` from the current state (Issue #56).
+    ///
+    /// All inputs are existing signals: the bounded whiteboard event window
+    /// (ADR-65 evidence spine), the bounded resource-fact rows (ADR-65 §4),
+    /// the decision journal (issue #52), the failure diagnoses (issue #54),
+    /// the roster, the ledger's artifact paths/models where supplied, the
+    /// DesignDoc goals, the workspace snapshot generation, and the resume
+    /// workspace-change verdict. Fail-soft: a log or row read failure
+    /// degrades that axis to empty — a projection must never fail the
+    /// dispatch loop. Cancellation is honored (the reads carry the token).
+    async fn refresh_world_model(
+        &mut self,
+        task: &AgentTask,
+        ledger_paths: &[camino::Utf8PathBuf],
+        models: Vec<String>,
+        cancel: &CancellationToken,
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let events = self.load_world_model_events(task.session_id, cancel).await;
+        let mut artifacts = self.load_world_model_observations(&events, cancel).await;
+        // Ledger paths: write attribution only (no observation row) — the
+        // builder classifies them `Written` with the ledger's owner slot
+        // unknown.
+        for path in ledger_paths {
+            artifacts.push(crate::world_model::ArtifactObservation {
+                path: path.to_string(),
+                observed: false,
+                dirty: false,
+                generation: None,
+                last_agent_id: None,
+                last_event_id: None,
+            });
+        }
+
+        let roster = self.decision_roster().into_iter().collect::<Vec<String>>();
+        let criteria: Vec<String> =
+            self.design_doc_snapshot().map(|doc| doc.goals.to_vec()).unwrap_or_default();
+        // The pending decision's staleness: the same roster/evidence shape
+        // the ADR-65 §7 resume check uses (deterministic, no new machinery).
+        let pending_stale = match self.last_dispatch_decision.as_ref() {
+            Some(pending) => {
+                let missing =
+                    self.missing_evidence_ids(&pending.supporting_evidence_ids, cancel).await;
+                !missing.is_empty()
+                    || (!pending.selected_agent.is_empty()
+                        && !roster.contains(&pending.selected_agent))
+            }
+            None => false,
+        };
+        let pending = self.last_dispatch_decision.clone();
+        let previous_questions = self.world_model.questions.clone();
+        let now_ms = crate::tool_facts::unix_ms();
+        self.world_model =
+            crate::world_model::WorldModel::build(&crate::world_model::WorldModelInput {
+                objective: &task.description,
+                criteria,
+                current_generation: self.snapshot_generation(),
+                workspace_changed: self.workspace_changed_since_checkpoint,
+                events: &events,
+                artifacts,
+                decisions: self.decision_journal.entries(),
+                diagnoses: &self.failure_diagnoses,
+                roster,
+                models,
+                pending: pending.as_ref(),
+                pending_stale,
+                previous_questions,
+                now_ms,
+            });
+        tracing::debug!(
+            target: "orchestrator::coordinator",
+            facts = self.world_model.facts.len(),
+            questions = self.world_model.open_question_count(),
+            "world model rebuilt (issue #56 projection)"
+        );
+    }
+
+    /// The bounded newest event window for the world-model builder.
+    /// Fail-soft: no pool or a read failure yields an empty window.
+    async fn load_world_model_events(
+        &self,
+        session_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Vec<WhiteboardEvent> {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let Some(pool) = self.review_store.as_ref() else {
+            return Vec::new();
+        };
+        let head = match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
+            Ok(head) => head,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "issue #56: world-model event read failed (head); \
+                         the projection builds without events this refresh");
+                }
+                return Vec::new();
+            }
+        };
+        let after = head.saturating_sub(Self::WORLD_MODEL_EVENT_WINDOW as u64);
+        match load_whiteboard_events(
+            pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: after,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: Self::WORLD_MODEL_EVENT_WINDOW,
+            },
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "issue #56: world-model event read failed (fail-soft)");
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Adapt the session's resource-fact rows into the builder's observation
+    /// shape, scoped to this project root exactly as the snapshot digest
+    /// machinery reconciles them (ADR-65 §4 F5c). Fail-soft: a read failure
+    /// yields an empty row list.
+    async fn load_world_model_observations(
+        &self,
+        events: &[WhiteboardEvent],
+        cancel: &CancellationToken,
+    ) -> Vec<crate::world_model::ArtifactObservation> {
+        let _ = events;
+        let (Some(pool), Some(snapshot)) =
+            (self.review_store.as_ref(), self.workspace_snapshot.as_ref())
+        else {
+            return Vec::new();
+        };
+        let root_hash = crate::tool_facts::project_root_hash(snapshot.project_root.as_std_path());
+        let rows = match ResourceFacts::new(pool.clone())
+            .list_observations(&root_hash, Self::WORLD_MODEL_OBSERVATION_ROWS, cancel)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "issue #56: world-model observation read failed (fail-soft)");
+                }
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .map(|row| crate::world_model::ArtifactObservation {
+                path: row.path,
+                observed: true,
+                dirty: row.dirty,
+                generation: (!row.generation.is_empty()).then_some(row.generation),
+                last_agent_id: row.last_agent_id,
+                last_event_id: row.last_event_id,
+            })
+            .collect()
     }
 
     /// Journal one no-target side decision (`DraftPlan`/`SelfExecute`, issue
@@ -2225,6 +2452,9 @@ impl CoordinatorAgent {
             // Issue #54: the run's normalized failure diagnoses ride every
             // persist so the diagnosis/evidence trail survives a resume.
             failure_diagnoses: self.failure_diagnoses.clone(),
+            // Issue #56: the world-model projection rides every persist so
+            // a resume restores the SAME model (additive checkpoint field).
+            world_model: self.world_model.clone(),
         }
     }
 
@@ -3029,6 +3259,16 @@ impl CoordinatorAgent {
             diagnoses.drain(0..excess);
             diagnoses
         };
+        // Issue #56: restore the world-model projection additively (old
+        // checkpoints carry the empty default and the next decision session
+        // rebuilds the model from the restored state), and compute the
+        // workspace-change verdict the model's freshness rules consume.
+        self.world_model = cp.world_model.clone();
+        self.workspace_changed_since_checkpoint =
+            match (&cp.snapshot_generation, self.snapshot_generation()) {
+                (Some(recorded), Some(current)) => recorded.as_str() != current.as_str(),
+                _ => false,
+            };
 
         // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
         let pending_decision = cp.pending_decision.clone();
@@ -6737,6 +6977,10 @@ impl CoordinatorAgent {
         intro: &str,
     ) -> Result<(String, Option<PlanArtifact>), OrchestratorError> {
         let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
+        // Issue #56: rebuild the world model BEFORE the decision prompt is
+        // rendered so the injected block reflects the state the decisions
+        // run against (restored checkpoint state included).
+        self.refresh_world_model(task, &[], Vec::new(), cancel).await;
         let system_prompt = self.render_dispatch_system_prompt(task, intro, dispatching);
         let mut tool_defs: Vec<ToolDefinition> = Vec::new();
         if dispatching {
@@ -6970,6 +7214,15 @@ impl CoordinatorAgent {
                     crate::progress::decision_status_label(entry.status).to_owned(),
                 ));
             }
+            // Issue #56: rebuild the world model once per completed cycle so
+            // every subsequent decision (the verified-clean skip check at
+            // dispatch time, the next session's prompt) consumes a CURRENT
+            // projection, not the session-entry snapshot.
+            if !stall_escalated {
+                let ledger_paths: Vec<camino::Utf8PathBuf> = ledger.all_files.clone();
+                let models: Vec<String> = ledger.model_assignments.values().cloned().collect();
+                self.refresh_world_model(task, &ledger_paths, models, cancel).await;
+            }
             match self.progress_tracker.observe(&observation) {
                 crate::progress::CycleVerdict::Progressing => {}
                 crate::progress::CycleVerdict::Reconsider(nudge) => {
@@ -7095,6 +7348,12 @@ impl CoordinatorAgent {
             }
         };
         let decision_id = decision.id.clone();
+        // Issue #56: the decision consumes the world model at DECISION time
+        // — the deterministic skip-recommendation for completed-verified
+        // work (every expected artifact already verified-clean in the
+        // projection), captured here and attached to the tool result the
+        // model reads back.
+        let world_model_advisory = self.world_model_decision_advisory(&args.expected_artifacts);
         self.decision_journal.record(decision);
 
         // ── The DAG frontier must be settled: the chain parent (when any)
@@ -7536,6 +7795,9 @@ impl CoordinatorAgent {
         if let Some(diagnosis) = &outcome_diagnosis {
             tool_result["diagnosis"] = diagnosis.tool_summary();
         }
+        if let Some(advisory) = world_model_advisory {
+            tool_result["world_model"] = advisory;
+        }
         tool_result
     }
 
@@ -7970,6 +8232,14 @@ impl CoordinatorAgent {
             prompt.push_str("\n\n");
         }
         prompt.push_str(&format!("Objective: {}\n", task.description));
+        // Issue #56: the Coordinator's decisions consume the structured
+        // world model — a bounded rendered block rides every dispatch-
+        // decision prompt (the projection is refreshed by the session
+        // entry; the block is character-bounded by the builder's render).
+        if !self.world_model.is_empty_beyond_objective() {
+            prompt.push_str(&self.world_model.render());
+            prompt.push('\n');
+        }
         if !self.supplemental_prompt.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&self.supplemental_prompt);
@@ -16647,5 +16917,177 @@ mod tests {
                 "every claim event has a decision caused by it"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #56: the coordinator's decisions CONSUME the structured world
+    // model — a bounded rendered block rides the dispatch-decision prompt,
+    // and the dispatch decision query answers the verified-clean question.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A `call_specialist` tool call carrying model-supplied expected
+    /// artifacts (the advisory surface consumes them).
+    fn call_specialist_with_artifacts(agent_id: &str, task: &str, artifacts: &[&str]) -> ToolCall {
+        ToolCall {
+            id: format!("call-with-artifacts-{agent_id}"),
+            name: CALL_SPECIALIST_TOOL.to_string(),
+            arguments: serde_json::json!({
+                "agent_id": agent_id,
+                "task": task,
+                "expected_artifacts": artifacts,
+            }),
+        }
+    }
+
+    /// The displatch-decision prompt carries the structured world-model
+    /// block (issue acceptance: decisions consume the model), derived from
+    /// the session's real recorded facts — here one WriteApplied event the
+    /// test seeds into the evidence store — and the block stays within its
+    /// pinned character bound even when the model is large.
+    #[tokio::test]
+    async fn world_model_block_rides_the_dispatch_decision_prompt() {
+        let (_dir, pool) = resume_log_pool().await;
+        let session_id = Ulid::new();
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "ev-write".to_owned(),
+                agent_id: "coder".to_owned(),
+                kind: WhiteboardKind::WriteApplied,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({ "input": { "path": "src/main.rs" } }),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("world-model fact appended");
+
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let mut coordinator = coordinator.with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(session_id, "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "run completes: {}",
+            output.final_message
+        );
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 1, "one model turn (text-only script)");
+        let prompt = &prompts[0];
+        let Some(start) = prompt.find("<world_model>") else {
+            panic!("the dispatch-decision prompt must carry the world-model block: {prompt}")
+        };
+        let Some(end) = prompt.find("</world_model>") else {
+            panic!("the world-model block must close");
+        };
+        let block = &prompt[start..=end];
+        let block_chars = block.chars().count();
+        assert!(
+            block_chars <= crate::world_model::MAX_RENDER_CHARS,
+            "the pinned prompt bound: {block_chars} > {}",
+            crate::world_model::MAX_RENDER_CHARS
+        );
+        assert!(
+            prompt.contains("wrote src/main.rs by coder"),
+            "the block renders the session's real recorded facts"
+        );
+        assert!(
+            prompt.contains("status: Verified"),
+            "freshness statuses are explicit in the block (issue #56)"
+        );
+    }
+
+    /// The verified-clean consumption: a decision whose expected artifacts
+    /// were produced by the run's own completed work gets the deterministic
+    /// skip-recommendation advisory attached to its tool result — the world
+    /// model queried at decision time in a real decision path.
+    #[tokio::test]
+    async fn decision_advises_skip_for_completed_verified_artifacts() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::clone(&registry),
+            vec![
+                CoordinatorTurn::Calls(vec![test_write_tool_call("src/main.rs")]),
+                CoordinatorTurn::Calls(vec![call_specialist_with_artifacts(
+                    "coder",
+                    "re-implement the module",
+                    &["src/main.rs"],
+                )]),
+                CoordinatorTurn::Text("the artifact was already produced".into()),
+            ],
+        );
+        let mut coordinator = coordinator.with_executor(self_execute_executor());
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let _output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        while rx.try_recv().is_ok() {}
+
+        let prompts = provider.prompts();
+        assert!(
+            prompts.len() >= 3,
+            "two scripted tool turns plus the final text, got {}",
+            prompts.len()
+        );
+        // The advisory rides the call_specialist TOOL RESULT the model reads
+        // back (tool_results on the conversation's message list), not the
+        // first-message prompt text — inspect the captured requests.
+        let requests = provider.requests.lock().unwrap();
+        let advisory = requests
+            .iter()
+            .find_map(|request| {
+                request.messages.iter().find_map(|message| {
+                    message.tool_results.as_ref()?.iter().find_map(|result| {
+                        result
+                            .content
+                            .get("world_model")
+                            .and_then(serde_json::Value::as_object)
+                            .and_then(|world_model| {
+                                world_model.get("advisory").and_then(serde_json::Value::as_str)
+                            })
+                            .map(str::to_owned)
+                    })
+                })
+            })
+            .expect("the skip advisory reached the conversation");
+        assert!(
+            advisory.contains("verified clean in the world model"),
+            "the advisory names the world-model basis"
+        );
+        assert!(advisory.contains("src/main.rs"), "the advisory names the verified-clean artifact");
     }
 }
