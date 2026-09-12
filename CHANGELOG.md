@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Global-only orchestration enforced:** project-layer `[orchestration]` /
+  roster / model-pins are ignored at load (warned, never silent) so seeded
+  global selections can no longer collide with project selections and break
+  blueprint resolution; Studio offers explicit import-to-global (with
+  conflict refusal); existing project files keep loading for all other
+  keys; no migration, no deletion.
 - **Fault-injection eval suite (#55):** 16 deterministic failure scenarios
   + 3 gate tests proving #52/#53/#54 end to end, test-gated harness
   (zero production changes), ~0.05s suite runtime for CI.
