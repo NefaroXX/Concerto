@@ -215,6 +215,13 @@ pub struct CheckpointContext {
     /// save time, so delegation-quality evidence survives a resume. Old
     /// records default it empty — additive, no bump.
     pub suitability: crate::suitability::SuitabilityState,
+    /// Issue #61: the artifact-ownership table (canonical artifact → owner +
+    /// acquiring event + acquired-at + stale-or-owned status) captured at
+    /// save time, so a resume restores the SAME ownership state. Old
+    /// records default it empty — additive, no bump; ownership is
+    /// re-derivable from the log's applied writes and ownership events when
+    /// absent.
+    pub ownership: crate::ownership::OwnershipState,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +380,12 @@ pub struct GraphCheckpoint {
     /// readers ignore the key.
     #[serde(default)]
     pub suitability: crate::suitability::SuitabilityState,
+    /// Issue #61: the artifact-ownership table (see
+    /// [`CheckpointContext::ownership`]). Additive only: absent on older
+    /// records (serde default = the empty state); old readers ignore the
+    /// key.
+    #[serde(default)]
+    pub ownership: crate::ownership::OwnershipState,
 }
 
 const fn current_schema_version() -> u32 {
@@ -589,6 +602,9 @@ pub fn build_checkpoint(
         // Issue #60: additive — the suitability record rides
         // independently; old readers treat this key as opaque.
         suitability: context.suitability.clone(),
+        // Issue #61: additive — the artifact-ownership table rides
+        // independently; old readers treat this key as opaque.
+        ownership: context.ownership.clone(),
     }
 }
 
@@ -1386,6 +1402,24 @@ mod tests {
                 decision_journal: Vec::new(),
                 failure_diagnoses: Vec::new(),
                 progress_tracker: crate::progress::ProgressTrackerState::default(),
+                ownership: crate::ownership::OwnershipState {
+                    records: vec![
+                        crate::ownership::OwnershipRecord {
+                            artifact: "src/main.rs".to_owned(),
+                            owner: "coder".to_owned(),
+                            acquiring_event_id: "write-1".to_owned(),
+                            acquired_at_ms: 42,
+                            status: crate::ownership::OwnershipStatus::Stale,
+                        },
+                        crate::ownership::OwnershipRecord {
+                            artifact: "docs/plan.md".to_owned(),
+                            owner: "docs-writer".to_owned(),
+                            acquiring_event_id: "transfer-1".to_owned(),
+                            acquired_at_ms: 48,
+                            status: crate::ownership::OwnershipStatus::Owned,
+                        },
+                    ],
+                },
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -1416,6 +1450,26 @@ mod tests {
             loaded.self_execute_attempted.is_empty() && loaded.escalation_attempted.is_empty(),
             "empty guard sets preserved"
         );
+        // Issue #61: the ownership table round-trips (records, owners,
+        // acquiring events, and the stale status survive the restore).
+        assert_eq!(loaded.ownership.records.len(), 2, "ownership records preserved");
+        let main_rs = loaded
+            .ownership
+            .records
+            .iter()
+            .find(|record| record.artifact == "src/main.rs")
+            .expect("src/main.rs record survives");
+        assert_eq!(main_rs.owner, "coder");
+        assert_eq!(main_rs.acquiring_event_id, "write-1");
+        assert_eq!(main_rs.status, crate::ownership::OwnershipStatus::Stale);
+        let plan_md = loaded
+            .ownership
+            .records
+            .iter()
+            .find(|record| record.artifact == "docs/plan.md")
+            .expect("docs/plan.md record survives");
+        assert_eq!(plan_md.owner, "docs-writer");
+        assert_eq!(plan_md.status, crate::ownership::OwnershipStatus::Owned);
 
         // Original timestamps survive the restore.
         let restored = restore_graph(&loaded).unwrap();
@@ -1637,6 +1691,7 @@ mod tests {
                 decision_journal: Vec::new(),
                 failure_diagnoses: Vec::new(),
                 progress_tracker: crate::progress::ProgressTrackerState::default(),
+                ownership: crate::ownership::OwnershipState::default(),
             },
         );
 

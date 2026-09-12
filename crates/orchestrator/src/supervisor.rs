@@ -748,6 +748,20 @@ pub struct SupervisorServices {
     pub consolidation: Option<std::sync::Arc<crate::consolidation::Consolidator>>,
 }
 
+// ---------------------------------------------------------------------------
+// Issue #61: ownership release on agent lifecycle signals
+// ---------------------------------------------------------------------------
+
+/// Release the owned artifacts of `agent_id` through the gate (fail-soft:
+/// a release/audit failure is logged, never a run failure — the lease is
+/// best-effort bookkeeping whose authority can always be re-derived from
+/// the log).
+async fn release_agent_ownership(services: &SupervisorServices, agent_id: &str, reason: &str) {
+    if let Err(error) = services.gate.release_agent(agent_id, reason).await {
+        tracing::warn!(%agent_id, %error, "supervisor: ownership release failed (fail-soft)");
+    }
+}
+
 /// One supervisor instance: owns all agent children, their pipes, and their
 /// lifecycle metadata (ADR-60 D1).
 pub struct Supervisor {
@@ -1275,6 +1289,17 @@ impl Supervisor {
                             // goes through the one_for_one restart path.
                             if child_exited_cleanly(&mut process.child) {
                                 process.meta.state = AgentState::Completed;
+                                // Issue #61: the lease is tied to the live
+                                // agent lifecycle — a completed child's
+                                // ownerships release here (evented).
+                                if let Some(services) = services.as_ref() {
+                                    release_agent_ownership(
+                                        services,
+                                        agent_id,
+                                        "agent completed its run",
+                                    )
+                                    .await;
+                                }
                             } else {
                                 push_unique(&mut to_restart, agent_id);
                             }
@@ -1330,6 +1355,14 @@ impl Supervisor {
                 }
             }
             for agent_id in &to_restart {
+                // Issue #61: the agent's child died (crash/stall signal) —
+                // release the leases it held BEFORE the restart decision so
+                // a restarted generation re-acquires fresh (the crash
+                // boundary is the documented reclaim rule; existing supervisor
+                // signals only, no new liveness machinery).
+                if let Some(services) = services.as_ref() {
+                    release_agent_ownership(services, agent_id, "agent crash detected").await;
+                }
                 match self.restart_agent(agent_id).await {
                     Ok(()) => {}
                     Err(SupervisorError::RestartsExhausted { .. }) => {

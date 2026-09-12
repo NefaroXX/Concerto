@@ -76,6 +76,14 @@ pub enum DecisionKind {
     /// return as structured evidence — never as task results, never as
     /// SubTask nodes, never touching ownership/completion state.
     Consult,
+    /// Issue #61: coordinator-mediated transfer of one or more OWNED
+    /// artifacts to the target agent. The target names the RECEIVING agent
+    /// (must be registered) and the decision's `expected_artifacts` name the
+    /// owned artifacts (canonical paths, validated like any decision). The
+    /// gate moves a record only from its actual current owner — rejecting
+    /// with holder info and refusing the unowned / foreign-owned artifacts.
+    /// This is the ONLY lawful handover: ownership is never stolen.
+    TransferOwnership,
 }
 
 impl DecisionKind {
@@ -87,6 +95,7 @@ impl DecisionKind {
                 | DecisionKind::Retry
                 | DecisionKind::FallbackTier
                 | DecisionKind::Consult
+                | DecisionKind::TransferOwnership
         )
     }
 
