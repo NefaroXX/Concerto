@@ -73,3 +73,9 @@ mod runtime_runner_impl;
 pub mod services;
 pub mod session_manager;
 pub mod testing;
+
+// Issue #55: the coordinator fault-injection and recovery evaluation
+// suite. Entirely test-support — gated out of production builds where it
+// would be dead code; never wired into any production path.
+#[cfg(test)]
+mod fault_injection;
