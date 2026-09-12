@@ -60,6 +60,7 @@ mod shell_repair;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;
+pub mod suitability;
 pub mod supervisor;
 pub mod task_transform;
 pub mod timeline;
