@@ -100,6 +100,16 @@ pub(crate) const CALL_SPECIALIST_TOOL: &str = "call_specialist";
 /// materialized as `SubTask` roles or dependencies.
 pub(crate) const DRAFT_PLAN_TOOL: &str = "draft_plan";
 
+/// Issue #57: the task-restructuring surfaces. The Coordinator's model may
+/// re-cut an OPEN task into ordered children (`split_task`) or fold
+/// compatible open tasks into one survivor (`merge_tasks`). Both are
+/// deterministic graph transforms validated against the REAL graph state
+/// before anything changes; they dispatch no agents and touch no tools,
+/// which is why they apply no policy gate (there is nothing to gate) and
+/// why the decision loop can offer them alongside `call_specialist`.
+pub(crate) const SPLIT_TASK_TOOL: &str = "split_task";
+pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -124,6 +134,11 @@ How to work:
 Evidence discipline:
 - When your decision rests on recorded evidence, cite the real event ids from the context in supporting_evidence_ids. Fabricated ids are rejected and your decision loses its citations.
 - The stage tag of a specialist is informational context. You are never required to follow a stage order — call whoever the work needs, whenever the work needs it.
+
+Restructuring an open task (use sparingly, deterministically):
+- When one open task is doing too much, split_task re-cuts it into ordered children that inherit the task's specialist role, evidence, and attempt counter. Splits of pending/running tasks only — completed work is never re-cut.
+- When several open pending tasks overlap in role and substance, merge_tasks folds them into one survivor with the lowest id. Merge only tasks of the SAME role.
+- Both tools are validated against the real graph BEFORE anything changes; a rejected split or merge is a structured error you can read and fix, never a crash.
 "#;
 
 /// Argument schema for the Coordinator's `call_specialist` tool.
@@ -171,6 +186,113 @@ fn draft_plan_tool_definition() -> ToolDefinition {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {}
+        }),
+    }
+}
+
+/// Issue #57: argument schema for `split_task` — re-cut one open task into
+/// ordered child tasks that inherit the parent's specialist role, evidence
+/// context, and attempt baseline.
+fn split_task_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: SPLIT_TASK_TOOL.to_string(),
+        description: "Restructure an OPEN (pending/running) task: replace it with 1-8 \
+                      ordered child tasks that inherit the task's specialist role, \
+                      session evidence, and attempt counter. Children may order among \
+                      themselves with `after` (indices of strictly EARLIER children). \
+                      Everything outside the split parent is rewired deterministically \
+                      (its dependencies gate every child; its dependents wait for every \
+                      child). Completed work is never touched."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The id of the open task to split."
+                },
+                "children": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "The complete, self-contained work text for this child."
+                            },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional workspace-root-relative paths this child should produce (canonicalized; fabricated-traversal paths are rejected)."
+                            },
+                            "after": {
+                                "type": "array",
+                                "items": { "type": "integer" },
+                                "description": "Optional indices of strictly EARLIER children (positions in this children list) that must finish before this child runs."
+                            }
+                        },
+                        "required": ["description"]
+                    }
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the split, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the split."
+                }
+            },
+            "required": ["task_id", "children"]
+        }),
+    }
+}
+
+/// Issue #57: argument schema for `merge_tasks` — fold compatible open
+/// tasks (same specialist role, all pending) into one survivor.
+fn merge_tasks_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: MERGE_TASKS_TOOL.to_string(),
+        description: "Fold 2-16 compatible OPEN pending tasks (same specialist role — \
+                      equivalent/overlapping work) into ONE surviving task with the \
+                      lowest id, whose description you supply. Artifacts, evidence, and \
+                      attempt counters carry over deterministically; edges of the \
+                      removed members rewire onto the survivor. Completed or failed \
+                      work never merges."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 16,
+                    "items": { "type": "string" },
+                    "description": "The pending tasks to fold. The survivor is deterministically the lowest id."
+                },
+                "merged_description": {
+                    "type": "string",
+                    "description": "The complete merged task text that replaces the members' descriptions."
+                },
+                "merged_artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional workspace-root-relative paths the merged task should produce."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the merge, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the merge."
+                }
+            },
+            "required": ["task_ids", "merged_description"]
         }),
     }
 }
@@ -1198,6 +1320,84 @@ impl CallSpecialistArgs {
             notes: notes.map(str::to_owned),
             supporting_evidence_ids,
             expected_artifacts,
+        })
+    }
+}
+
+/// Issue #57: `split_task` tool arguments.
+struct SplitTaskArgs {
+    task_id: String,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+    children: Vec<SplitChildArgs>,
+}
+
+struct SplitChildArgs {
+    description: String,
+    expected_artifacts: Vec<String>,
+    after: Vec<usize>,
+}
+
+impl SplitTaskArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let task_id = arguments.get("task_id").and_then(serde_json::Value::as_str)?;
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        let children = arguments.get("children").and_then(serde_json::Value::as_array)?;
+        let children = children
+            .iter()
+            .filter_map(|child| {
+                let description = child.get("description").and_then(serde_json::Value::as_str)?;
+                let expected_artifacts = parse_string_array(child, "expected_artifacts");
+                let after = child
+                    .get("after")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values.iter().filter_map(serde_json::Value::as_u64).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| usize::try_from(value).ok())
+                    .collect();
+                Some(SplitChildArgs {
+                    description: description.to_owned(),
+                    expected_artifacts,
+                    after,
+                })
+            })
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            return None;
+        }
+        Some(Self {
+            task_id: task_id.to_owned(),
+            notes: notes.map(str::to_owned),
+            supporting_evidence_ids,
+            children,
+        })
+    }
+}
+
+/// Issue #57: `merge_tasks` tool arguments.
+struct MergeTaskArgs {
+    task_ids: Vec<String>,
+    merged_description: String,
+    merged_artifacts: Vec<String>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl MergeTaskArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let task_ids = parse_string_array(arguments, "task_ids");
+        let merged_description =
+            arguments.get("merged_description").and_then(serde_json::Value::as_str)?;
+        Some(Self {
+            task_ids,
+            merged_description: merged_description.to_owned(),
+            merged_artifacts: parse_string_array(arguments, "merged_artifacts"),
+            notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
+            supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
         })
     }
 }
@@ -6987,6 +7187,11 @@ impl CoordinatorAgent {
         if dispatching {
             tool_defs.push(call_specialist_tool_definition());
             tool_defs.push(draft_plan_tool_definition());
+            // Issue #57: the task-restructuring surfaces ride beside the
+            // dispatch decision; they are deterministic graph transforms,
+            // not dispatch paths.
+            tool_defs.push(split_task_tool_definition());
+            tool_defs.push(merge_tasks_tool_definition());
             if let Some(executor) = &self.tool_executor {
                 tool_defs.extend(executor.tool_definitions());
             }
@@ -7124,6 +7329,37 @@ impl CoordinatorAgent {
                             self.handle_draft_plan(task, cancel, state.doc.as_ref()).await;
                         call_plan = plan;
                         result
+                    }
+                    // Issue #57: the deterministic task-restructuring
+                    // surfaces. Same failure discipline as the dispatch
+                    // decision: validate against the real graph BEFORE any
+                    // mutation; a rejected transform is a structured tool
+                    // error the model reads, never a crash.
+                    SPLIT_TASK_TOOL if dispatching => {
+                        self.handle_split_task(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    MERGE_TASKS_TOOL if dispatching => {
+                        self.handle_merge_tasks(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
+                            &tool_call.arguments,
+                        )
+                        .await
                     }
                     // ADR-35 §8 self-execution: the coordinator's own tools
                     // (shared executor — policy engine, VirtualFs, write
@@ -7800,6 +8036,472 @@ impl CoordinatorAgent {
             tool_result["world_model"] = advisory;
         }
         tool_result
+    }
+
+    /// Issue #57: the decision-validation preamble shared by the split/merge
+    /// handlers — evidence existence check against the REAL whiteboard log,
+    /// then typed decision validation with NO target (transforms inherit /
+    /// reuse specialist roles; naming a target is a `conflicting_decision`
+    /// rejection by [`crate::decisions::DecisionKind::rejects_target`]).
+    /// Returns the validated decision with its transform payload attached.
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_transform_decision(
+        &mut self,
+        kind: crate::decisions::DecisionKind,
+        transform: Option<crate::task_transform::TaskTransformSpec>,
+        summary_task: &str,
+        notes: Option<&str>,
+        cited_ids: &[String],
+        artifact_paths: &[String],
+        cancel: &CancellationToken,
+        base_ctx: &AgentContext,
+    ) -> Result<crate::decisions::CoordinatorDecision, serde_json::Value> {
+        let missing_evidence = self.missing_evidence_ids(cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        match validator.validate(kind, None, summary_task, notes, cited_ids, artifact_paths) {
+            Ok(mut decision) => {
+                decision.transform = transform;
+                Ok(decision)
+            }
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    "a split/merge decision failed validation (structured error, no state \
+                     mutation)"
+                );
+                Err(rejection.tool_value())
+            }
+        }
+    }
+
+    /// Issue #57: the whiteboard Decision record for a split/merge. Written
+    /// directly (never via [`Self::append_dispatch_decision`], which drives
+    /// the ADR-65 §7 pending-dispatch continuation — a transform dispatches
+    /// nothing to continue behind).
+    async fn append_transform_decision(
+        &mut self,
+        session_id: Ulid,
+        task_id: Option<TaskId>,
+        reason: &str,
+        required_output: &str,
+        supporting_evidence_ids: &[String],
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": "coordinator",
+                "reason": reason,
+                "required_output": required_output,
+                "supporting_evidence_ids": supporting_evidence_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        let _ = task_id; // transforms record no per-node continuation
+        if let Err(err) = append_whiteboard_event(pool, &event).await {
+            warn!(%err, "issue #57: transform decision append failed (fail-soft)");
+        }
+    }
+
+    /// Issue #57: handle ONE `split_task` tool call — parse → decision
+    /// validation (no target; evidence-backed) → transform proof-and-apply
+    /// against the REAL graph (a proof COPY takes any rejection; never the
+    /// live DAG) → whiteboard/ledger/journal trail → structured result.
+    ///
+    /// Failure discipline mirrors [`Self::handle_call_specialist`]:
+    /// structured tool errors, never a crash; cancellation propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_split_task(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = SplitTaskArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "split_task requires string task_id and a children array                             of {description, expected_artifacts?, after?} specs",
+            });
+        };
+        let Ok(parent) = Ulid::from_string(&args.task_id).map(TaskId) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!("split_task: task_id {} is not a task id", args.task_id),
+            });
+        };
+
+        // Artifact canonicalization: every child-specified path resolves
+        // INSIDE the project root before it reaches the transform spec
+        // (model paths are never trusted).
+        let path_validator = crate::decisions::DecisionValidator {
+            roster_ids: &HashSet::new(),
+            known_event_ids: &HashSet::new(),
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut child_specs = Vec::with_capacity(args.children.len());
+        let mut all_artifacts: Vec<String> = Vec::new();
+        for child in &args.children {
+            let mut expected_artifacts: Vec<String> = Vec::new();
+            for raw in &child.expected_artifacts {
+                let Some(canonical) = path_validator.canonical_artifact_path(raw) else {
+                    return serde_json::json!({
+                        "error": "invalid_artifact_path",
+                        "message": format!(
+                            "split_task: expected-artifact path {raw:?} escapes the                              workspace; give a workspace-root-relative path"
+                        ),
+                    });
+                };
+                if !expected_artifacts.contains(&canonical) {
+                    expected_artifacts.push(canonical.clone());
+                }
+                if !all_artifacts.contains(&canonical) {
+                    all_artifacts.push(canonical);
+                }
+            }
+            child_specs.push(crate::task_transform::SplitChildSpec {
+                description: child.description.clone(),
+                expected_artifacts,
+                after: child.after.clone(),
+            });
+        }
+
+        let summary = format!("split of open task {parent}");
+        let transform_spec =
+            crate::task_transform::TaskTransformSpec::Split { parent, children: child_specs };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Split,
+                Some(transform_spec.clone()),
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &all_artifacts,
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        let children = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Split(outcome)) => outcome.children,
+            Ok(crate::task_transform::TransformOutcome::Merge(_)) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the split decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    task = %parent,
+                    "split_task rejected by the deterministic transform validation"
+                );
+                ledger.notes.push(format!("Split of {parent} rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── The trail: journal transitions, whiteboard decision + events,
+        // ledger rows, attempt baselines. ──────────────────────────────────
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        let baseline = ledger.subtask_attempts.get(&parent).copied().unwrap_or(0);
+        ledger.subtask_attempts.remove(&parent);
+        ledger.model_assignments.remove(&parent);
+        for child in &children {
+            *ledger.subtask_attempts.entry(*child).or_insert(0) = baseline;
+            let role = graph
+                .get(child)
+                .map(|child_task| child_task.role.clone())
+                .unwrap_or_else(|| AgentId::new("coder"));
+            let description = graph
+                .get(child)
+                .map(|child_task| child_task.description.clone())
+                .unwrap_or_default();
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                child.0,
+                EventKind::SubTaskCreated { task_id: *child, role, description },
+            );
+        }
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "split".into(),
+            task_id: Some(parent),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            Some(parent),
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // The chain frontier (when this split consumed the chain head)
+        // resets: the children re-enter through the ordinary ready queue,
+        // not through the chain-parent slot.
+        if state.last_node == Some(parent) {
+            state.last_node = None;
+        }
+        // Expected-artifact ownership stays single-owner: declared children
+        // own only their declared paths; unspecified children inherit the
+        // parent's artifact set (and its ownership); the parent leaves.
+        let inherited_artifacts = self
+            .expected_artifacts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&parent)
+            .cloned();
+        {
+            let mut expected =
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+            expected.remove(&parent);
+            // args.children aligns index-for-index with the committed
+            // children list (the transform never reorders child specs).
+            for (child, spec) in children.iter().zip(args.children.iter()) {
+                let inherited = if spec.expected_artifacts.is_empty() {
+                    inherited_artifacts.clone().unwrap_or_default()
+                } else {
+                    spec.expected_artifacts.iter().map(camino::Utf8PathBuf::from).collect()
+                };
+                expected.insert(*child, inherited);
+            }
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "split",
+            "parent": parent.to_string(),
+            "children": children.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "children_attempt_baseline": baseline,
+        })
+    }
+
+    /// Issue #57: handle ONE `merge_tasks` tool call — same failure
+    /// discipline as [`Self::handle_split_task`]: parse → decision
+    /// validation → proof-and-apply against the REAL graph → trail →
+    /// structured result. Compatibility is deterministic: ≥ 2 DISTINCT
+    /// pending tasks of the SAME specialist role; the survivor is the
+    /// LOWEST task id (same input ⇒ same survivor, spec, edge set).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_merge_tasks(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = MergeTaskArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "merge_tasks requires task_ids (>= 2) and merged_description",
+            });
+        };
+        let mut parsed_ids: Vec<TaskId> = Vec::with_capacity(args.task_ids.len());
+        for raw in &args.task_ids {
+            let Ok(id) = Ulid::from_string(raw).map(TaskId) else {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": format!("merge_tasks: {} is not a task id", raw),
+                });
+            };
+            parsed_ids.push(id);
+        }
+
+        // Artifact canonicalization for the merged artifact set.
+        let path_validator = crate::decisions::DecisionValidator {
+            roster_ids: &HashSet::new(),
+            known_event_ids: &HashSet::new(),
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut merged_artifacts = Vec::new();
+        for raw in &args.merged_artifacts {
+            let Some(canonical) = path_validator.canonical_artifact_path(raw) else {
+                return serde_json::json!({
+                    "error": "invalid_artifact_path",
+                    "message": format!(
+                        "merge_tasks: expected-artifact path {raw:?} escapes the workspace; \
+                         give a workspace-root-relative path"
+                    ),
+                });
+            };
+            if !merged_artifacts.contains(&canonical) {
+                merged_artifacts.push(canonical);
+            }
+        }
+
+        let summary = format!("merge of {} open tasks into one survivor", parsed_ids.len());
+        let transform_spec = crate::task_transform::TaskTransformSpec::Merge {
+            task_ids: parsed_ids,
+            merged_description: args.merged_description.clone(),
+            merged_artifacts: merged_artifacts.clone(),
+        };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Merge,
+                Some(transform_spec.clone()),
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &args.merged_artifacts,
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        let (survivor, removed) = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Merge(outcome)) => {
+                (outcome.survivor, outcome.removed)
+            }
+            Ok(crate::task_transform::TransformOutcome::Split(_)) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the merge decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    "merge_tasks rejected by the deterministic transform validation"
+                );
+                ledger.notes.push(format!("Merge rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── The trail: journal transitions, whiteboard decision, ledger
+        // rows, attempt counters, artifact ownership. ──────────────────────
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        // Attempt counters: the MAXIMUM of the merged group — no extra
+        // budget is granted by folding. Loser counters leave the ledger.
+        let attempts = std::mem::take(&mut ledger.subtask_attempts);
+        let mut kept_attempts = attempts;
+        let survivor_attempts = kept_attempts.get(&survivor).copied();
+        let merged_attempts = removed
+            .iter()
+            .filter_map(|id| kept_attempts.remove(id))
+            .chain(survivor_attempts)
+            .max()
+            .unwrap_or(0);
+        *kept_attempts.entry(survivor).or_insert(0) = merged_attempts;
+        ledger.subtask_attempts = kept_attempts;
+        // Artifact ownership stays single-owner: the survivor unions the
+        // removed members' artifact sets (deterministic in task id order)
+        // plus the merged artifact set; the losers leave the map entirely.
+        {
+            let mut expected =
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+            let mut union = expected.get(&survivor).cloned().unwrap_or_default();
+            for id in &removed {
+                if let Some(loser_artifacts) = expected.remove(id) {
+                    for path in loser_artifacts {
+                        if !union.contains(&path) {
+                            union.push(path);
+                        }
+                    }
+                }
+            }
+            for path in &merged_artifacts {
+                let path = camino::Utf8PathBuf::from(path);
+                if !union.contains(&path) {
+                    union.push(path);
+                }
+            }
+            expected.insert(survivor, union);
+        }
+        let role = graph
+            .get(&survivor)
+            .map(|task| task.role.clone())
+            .unwrap_or_else(|| AgentId::new("coder"));
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            survivor.0,
+            EventKind::SubTaskCreated {
+                task_id: survivor,
+                role,
+                description: args.merged_description.clone(),
+            },
+        );
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "merge".into(),
+            task_id: Some(survivor),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            Some(survivor),
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // A chain frontier that pointed at a removed member now points at
+        // the survivor (deterministic continuation).
+        if state.last_node.is_some_and(|head| removed.contains(&head)) {
+            state.last_node = Some(survivor);
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "merged",
+            "survivor": survivor.to_string(),
+            "removed": removed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        })
     }
 
     /// Mark a dispatch that never produced a run result (model-selection or
@@ -15490,6 +16192,431 @@ mod tests {
             "a rejected dispatch mutates nothing: {ledger:?}"
         );
         assert_eq!(graph.len(), 1, "no new node materializes: only the open parent");
+    }
+
+    // ── Issue #57: dynamic task splitting and merging ────────────────────
+
+    /// Build a split_task tool call for a test turn.
+    fn split_task_call(task_id: &str, children: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call-split".into(),
+            name: SPLIT_TASK_TOOL.to_string(),
+            arguments: serde_json::json!({
+                "task_id": task_id,
+                "children": children,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_task_handler_materializes_children_with_state_preserved() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+
+        // The graph: completed(1) → open(2) → pending depend(3), where 1
+        // carried 2 attempts and 2 ran once already.
+        let completed = TaskId::new();
+        let open = TaskId::new();
+        let depend = TaskId::new();
+        let mut graph = TaskGraph::new();
+        for (id, status) in [
+            (completed, SubTaskStatus::Completed),
+            (open, SubTaskStatus::Pending),
+            (depend, SubTaskStatus::Pending),
+        ] {
+            let mut subtask = SubTask {
+                id,
+                parent_id: None,
+                session_id,
+                role: AgentId::new("coder"),
+                description: format!("task {id}"),
+                status,
+                dependencies: vec![],
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            };
+            if status == SubTaskStatus::Completed {
+                subtask.deliverable = Some("settled work".into());
+            }
+            graph.add_root(subtask);
+        }
+        graph.add_dependency(open, completed, Dependency::MustFinishBefore).unwrap();
+        graph.add_dependency(depend, open, Dependency::MustFinishBefore).unwrap();
+        let mut ledger = DispatchLedger::default();
+        ledger.subtask_attempts.insert(completed, 2);
+        ledger.subtask_attempts.insert(open, 3);
+        ledger.completed_results.insert(
+            completed,
+            AgentRunResult {
+                task_id: completed,
+                role: AgentId::new("coder"),
+                outcome: AgentOutcome::Success,
+                summary: "settled work".into(),
+                files_modified: vec![],
+                tool_call_count: 0,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                provider: "test".into(),
+                model: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
+            },
+        );
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(open) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_split_task(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_id": open.to_string(),
+                    "children": [
+                        { "description": "write the module" },
+                        { "description": "test the module", "after": [0] },
+                    ],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "split", "structured success: {result:?}");
+        let children: Vec<String> = result["children"]
+            .as_array()
+            .expect("children ids")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(children.len(), 2);
+        // The graph: parent gone, children in, cycle-free, edges right.
+        assert!(graph.get(&open).is_none());
+        assert!(TaskGraphValidator::validate(&graph).is_ok(), "DAG stays valid");
+        for child in &children {
+            let child_id = TaskId(Ulid::from_string(child).expect("child id parses"));
+            let node = graph.get(&child_id).expect("child node");
+            assert_eq!(node.role.as_str(), "coder", "the role is inherited");
+            assert_eq!(node.status, SubTaskStatus::Pending);
+            assert!(
+                node.dependencies.contains(&completed),
+                "the parent's dependency is inherited by EVERY child"
+            );
+        }
+        // Attempt baseline: each child starts at the parent's 3.
+        for child in &children {
+            let child_id = TaskId(Ulid::from_string(child).expect("parses"));
+            assert_eq!(ledger.subtask_attempts.get(&child_id), Some(&3));
+        }
+        assert!(!ledger.subtask_attempts.contains_key(&open), "parent baseline moves");
+        // Completed work never invalidated (byte-identical deliverable).
+        assert_eq!(
+            graph.get(&completed).map(|task| task.deliverable.clone()).unwrap_or_default(),
+            Some("settled work".into())
+        );
+        assert_eq!(ledger.subtask_attempts.get(&completed), Some(&2));
+        assert!(ledger.completed_results.contains_key(&completed));
+        // The journal carries a SPLIT decision with its payload.
+        let entry =
+            coordinator.decision_journal.entries().last().expect("the split decision is journaled");
+        assert!(matches!(entry.kind, crate::decisions::DecisionKind::Split));
+        assert!(entry.transform.is_some(), "the split payload rides the decision");
+        assert_eq!(entry.status, crate::decisions::DecisionStatus::Settled);
+        // The chain frontier reset (the split consumed the chain head).
+        assert_eq!(state.last_node, None);
+        // The action ledger records the split.
+        assert!(ledger
+            .action_ledger
+            .iter()
+            .any(|action| action.kind == "split" && action.task_id == Some(open)));
+    }
+
+    #[tokio::test]
+    async fn split_task_handler_rejects_completed_parent_structurally() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let completed = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: completed,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "done work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_split_task(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_id": completed.to_string(),
+                    "children": [ { "description": "never" } ],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "not_splittable", "structured: {result:?}");
+        assert_eq!(graph.len(), 1, "nothing mutates");
+        {
+            let entries = coordinator.decision_journal.entries();
+            let rejected = entries
+                .iter()
+                .rev()
+                .find(|entry| matches!(entry.kind, crate::decisions::DecisionKind::Split))
+                .expect("the rejected split decision is journaled");
+            assert_eq!(
+                rejected.status,
+                crate::decisions::DecisionStatus::Rejected,
+                "the journal shows the rejection, never a settled fake split"
+            );
+        }
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_tasks_handler_is_deterministic_survivor_and_state() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+
+        // Two overlapping pending tasks + a dependent waiting on the loser.
+        // Fixed ids make the deterministic survivor rule observable.
+        let survivor = TaskId(Ulid::from(4_000));
+        let loser = TaskId(Ulid::from(9_000));
+        let depend = TaskId(Ulid::from(5_000));
+        let mut graph = TaskGraph::new();
+        let base = |id: &TaskId, status| SubTask {
+            id: *id,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "overlapping work".into(),
+            status,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        graph.add_root(base(&survivor, SubTaskStatus::Pending));
+        graph.add_root(base(&loser, SubTaskStatus::Pending));
+        graph.add_root(base(&depend, SubTaskStatus::Pending));
+        graph.add_dependency(depend, survivor, Dependency::MustFinishBefore).unwrap();
+        graph.add_dependency(depend, loser, Dependency::MustFinishBefore).unwrap();
+        let mut ledger = DispatchLedger::default();
+        ledger.subtask_attempts.insert(survivor, 1);
+        ledger.subtask_attempts.insert(loser, 5);
+        {
+            let mut expected =
+                coordinator.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+            expected.insert(survivor, vec![camino::Utf8PathBuf::from("src/ours.rs")]);
+            expected.insert(loser, vec![camino::Utf8PathBuf::from("src/theirs.rs")]);
+        }
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(loser) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_merge_tasks(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_ids": [loser.to_string(), survivor.to_string()],
+                    "merged_description": "one merged work item",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "merged", "structured: {result:?}");
+        assert!(graph.get(&loser).is_none(), "the loser leaves the graph");
+        let merged = graph.get(&survivor).expect("the survivor stays");
+        assert_eq!(merged.description, "one merged work item");
+        assert_eq!(merged.status, SubTaskStatus::Pending);
+        assert_eq!(merged.dependencies.len(), 0);
+        // Attempt counter = MAX of the group (no extra budget granted).
+        assert_eq!(ledger.subtask_attempts.get(&survivor), Some(&5));
+        assert!(!ledger.subtask_attempts.contains_key(&loser));
+        // The artifact union is single-owner and carries both sides.
+        let expected =
+            coordinator.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+        let survivor_artifacts = expected.get(&survivor).cloned().unwrap_or_default();
+        let as_strings: Vec<String> =
+            survivor_artifacts.iter().map(|path| path.to_string()).collect();
+        assert!(as_strings.contains(&"src/ours.rs".to_owned()), "{as_strings:?}");
+        assert!(as_strings.contains(&"src/theirs.rs".to_owned()), "{as_strings:?}");
+        drop(expected);
+        // The frontier that pointed at a removed member now points at the
+        // survivor.
+        assert_eq!(state.last_node, Some(survivor));
+        // The journal carries the MERGE decision, settled.
+        let entry =
+            coordinator.decision_journal.entries().last().expect("the merge decision is journaled");
+        assert!(matches!(entry.kind, crate::decisions::DecisionKind::Merge));
+        assert!(matches!(
+            entry.transform,
+            Some(crate::task_transform::TaskTransformSpec::Merge { .. })
+        ));
+        assert!(TaskGraphValidator::validate(&graph).is_ok());
+    }
+
+    #[tokio::test]
+    async fn merge_tasks_handler_rejects_role_mismatch_structurally() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let a = TaskId::new();
+        let b = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: a,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "code work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.add_root(SubTask {
+            id: b,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("reviewer"),
+            description: "review work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_merge_tasks(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_ids": [a.to_string(), b.to_string()],
+                    "merged_description": "cannot merge roles",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "merge_role_mismatch", "structured: {result:?}");
+        assert_eq!(graph.len(), 2, "nothing mutates");
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    /// The decision-loop wiring: the split tool call surfaces through the
+    /// SAME decision loop, journaled and answered structurally.
+    #[tokio::test]
+    async fn split_task_tool_rides_the_decision_loop() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![split_task_call(
+                        "01-NoSuchTaskId-000000000000",
+                        serde_json::json!([{ "description": "child" }]),
+                    )]),
+                    CoordinatorTurn::Text("after the rejection".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            events.iter().any(|kind| matches!(kind, EventKind::AgentThought { content, .. }
+                if content.contains("invalid_arguments")
+                    || content.contains("unknown_task"))),
+            "the rejection surfaces through the loop: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "a rejected split never crashes the run: {}",
+            output.final_message
+        );
     }
 
     /// Issue #52 (structured malformed arguments): an empty agent_id is an
