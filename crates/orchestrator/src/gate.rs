@@ -69,6 +69,26 @@
 //!   conflict logic — a foreign-held lock is a loud [`GateError::Conflict`]
 //!   carrying holder info, never a silent race or drop.
 //!
+//! ## Artifact ownership (issue #61)
+//!
+//! Every gated write's versioned targets participate in artifact ownership
+//! (`crate::ownership::OwnershipTable`, ADR-style rules in the module docs):
+//!
+//! - **Acquire is atomic with the write decision**: after all conflict
+//!   checks pass, just before the WAL append, unowned targets are inserted
+//!   (acquiring event = `call_id`) and the applied payload records them as
+//!   `ownership_acquired`; a failed append rolls the batch back.
+//! - **Enforcement**: a write by a non-owner to an owned target is rejected
+//!   fail-closed (`GateError::OwnershipConflict`, naming the owner and its
+//!   owning event) BEFORE any WAL append — a policy grant never overrides
+//!   it (ownership is orthogonal to policy).
+//! - **Release/transfer/stale** are explicit lifecycle operations on the
+//!   gate ([`WriteGate::release_agent`], [`WriteGate::transfer_ownership`],
+//!   [`WriteGate::mark_artifact_stale`]), each appending an
+//!   `ownership-event` audit record. Transfers only move from the actual
+//!   current owner with a coordinator decision id; never a steal.
+//! - **Reads never consult ownership.**
+//!
 //! ## Fairness across agents (ADR-60 D4 — resolved)
 //!
 //! D4's fairness requirement is "no chatty-agent starvation"; the gate
@@ -115,6 +135,7 @@
 //! resolved above.)
 
 use crate::hunk::{stage_three_way, HunkStaging};
+use crate::ownership::{OwnershipRecord, OwnershipState, OwnershipTable, OwnershipVerdict};
 use concerto_core::error::{PolicyError, ToolError};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::{new_id, Ulid};
@@ -250,6 +271,30 @@ pub enum GateError {
         event_id: String,
         /// Human-readable mismatch detail.
         reason: String,
+    },
+    /// Issue #61 ownership conflict: the request's versioned target is
+    /// owned by another agent (recorded by that agent's first write, or a
+    /// later coordinator-mediated transfer). Nothing is appended — the write
+    /// is refused fail-closed BEFORE the WAL append. Ownership is
+    /// orthogonal to policy: an allowed (policy-granted) write from a
+    /// non-owner is still refused here; the conflict must be resolved by an
+    /// explicit coordinator-mediated transfer
+    /// ([`WriteGate::transfer_ownership`], a validated
+    /// `DecisionKind::TransferOwnership` decision), never by a steal.
+    #[error(
+        "ownership conflict on {event_id}: artifact {path} is owned by agent '{owner}' \
+         (acquired by event {acquiring_event}); obtain a coordinator-mediated transfer"
+    )]
+    OwnershipConflict {
+        /// The rejected `call_id`.
+        event_id: String,
+        /// The contested artifact (canonical project-relative path).
+        path: String,
+        /// The owning agent.
+        owner: String,
+        /// The event id that recorded the owner's acquisition (its winning
+        /// write, or the transfer decision that granted it).
+        acquiring_event: String,
     },
     /// ADR-60 D5 explicit lock tokens: an acquire/release attempt on a path
     /// whose exclusive-write reservation belongs to a different agent or
@@ -444,6 +489,10 @@ pub struct WriteGate {
     /// Exclusive-write reservations for hot shared files (ADR-60 D5 lock
     /// tokens); lazily purged of expired entries.
     locks: Arc<Mutex<LockTable>>,
+    /// Issue #61: artifact ownership over versioned targets — first writer
+    /// auto-acquires with the write decision, non-owner writes are refused,
+    /// and the lifecycle (release/transfer/stale) is explicit and evented.
+    ownership: Arc<Mutex<OwnershipTable>>,
     /// Observed pre-image bytes keyed by blake3 hex — lets hunk staging
     /// recover a claimed base text without a wire format change.
     text_cache: Mutex<PreImageTextCache>,
@@ -577,6 +626,7 @@ impl WriteGate {
             limits: Mutex::new(HashMap::new()),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             locks: Arc::new(Mutex::new(HashMap::new())),
+            ownership: Arc::new(Mutex::new(OwnershipTable::new())),
             text_cache: Mutex::new(PreImageTextCache::default()),
         }
     }
@@ -655,6 +705,152 @@ impl WriteGate {
                 Err(GateError::Locked { path: token.path.clone(), holder: active.agent_id.clone() })
             }
             None => Ok(()),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #61: artifact-ownership lifecycle
+    // ------------------------------------------------------------------
+
+    /// Append one `ownership-event` audit record for a lifecycle mutation.
+    async fn append_ownership_event(
+        &self,
+        agent_id: &str,
+        action: crate::ownership::OwnershipAction,
+        payload: serde_json::Value,
+    ) -> Result<(), GateError> {
+        let mut payload = payload;
+        payload["action"] = serde_json::to_value(action)
+            .map_err(|error| GateError::Whiteboard(format!("action serialization: {error}")))?;
+        append_whiteboard_event(
+            &self.log_pool,
+            &NewWhiteboardEvent {
+                event_id: new_id().to_string(),
+                agent_id: agent_id.to_owned(),
+                kind: WhiteboardKind::OwnershipEvent,
+                scope: String::new(),
+                session_id: None,
+                plan_id: None,
+                causation: None,
+                payload,
+                pre_image_hash: None,
+                created_at: now_millis(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Coordinator-mediated transfer of one owned artifact: `from_owner` →
+    /// `to_agent`, re-stamping the record's acquiring event with
+    /// `decision_event_id` (the validated `DecisionKind::TransferOwnership`
+    /// decision). Never a steal: only the actual current owner can move a
+    /// record, an unowned path is refused, and the transfer is audited with
+    /// an `ownership-event` row (action `transfer`).
+    pub async fn transfer_ownership(
+        &self,
+        artifact: &str,
+        from_owner: &str,
+        to_agent: &str,
+        decision_event_id: &str,
+    ) -> Result<OwnershipRecord, GateError> {
+        let record = {
+            let mut ownership = self.ownership.lock().map_err(|error| {
+                GateError::Policy(format!("write-gate ownership table poisoned: {error}"))
+            })?;
+            ownership
+                .transfer(artifact, from_owner, to_agent, decision_event_id, now_millis())
+                .map_err(|error| {
+                    GateError::InvalidRequest(format!("ownership transfer refused: {error:?}"))
+                })?
+        };
+        self.append_ownership_event(
+            to_agent,
+            crate::ownership::OwnershipAction::Transfer,
+            serde_json::json!({
+                "artifact": artifact,
+                "from_owner": from_owner,
+                "to_agent": to_agent,
+                "decision_event_id": decision_event_id,
+                "acquiring_event_id": record.acquiring_event_id,
+            }),
+        )
+        .await?;
+        Ok(record)
+    }
+
+    /// Release every artifact `agent_id` owns (subtask settle: completed /
+    /// failed / cancelled, or supervisor crash detection — the lease is tied
+    /// to the live agent lifecycle). Appends one `ownership-event` row
+    /// (action `release`) when anything was released; a no-op returns `Ok(0)`
+    /// without an event.
+    pub async fn release_agent(&self, agent_id: &str, reason: &str) -> Result<usize, GateError> {
+        let released = {
+            let mut ownership = self.ownership.lock().map_err(|error| {
+                GateError::Policy(format!("write-gate ownership table poisoned: {error}"))
+            })?;
+            ownership.release_agent(agent_id)
+        };
+        if released.is_empty() {
+            return Ok(0);
+        }
+        self.append_ownership_event(
+            agent_id,
+            crate::ownership::OwnershipAction::Release,
+            serde_json::json!({ "agent_id": agent_id, "reason": reason, "artifacts": released }),
+        )
+        .await?;
+        Ok(released.len())
+    }
+
+    /// An external write outside the gate flips an owned record to
+    /// [`OwnershipStatus::Stale`] — never a silent overwrite: subsequent
+    /// non-owner writes still conflict, and the stale mark is audited
+    /// (action `stale`). `observed_by` names who observed the out-of-gate
+    /// write (e.g. `snapshot` / `resume`); `Ok(None)` when nothing was
+    /// held.
+    pub async fn mark_artifact_stale(
+        &self,
+        artifact: &str,
+        observed_by: &str,
+    ) -> Result<Option<String>, GateError> {
+        let flipped = {
+            let mut ownership = self.ownership.lock().map_err(|error| {
+                GateError::Policy(format!("write-gate ownership table poisoned: {error}"))
+            })?;
+            ownership.mark_stale(artifact)
+        };
+        if flipped.is_none() {
+            return Ok(None);
+        }
+        self.append_ownership_event(
+            observed_by,
+            crate::ownership::OwnershipAction::Stale,
+            serde_json::json!({
+                "artifact": artifact,
+                "observed_by": observed_by,
+                "detail": "a write outside the gate changed an owned artifact; \
+                           ownership marked stale (owner reconciles via the conflict channel)",
+            }),
+        )
+        .await?;
+        Ok(flipped)
+    }
+
+    /// Deterministic snapshot of the ownership table (checkpoint persistence
+    /// — additive; the state is re-derivable from the log's applied writes
+    /// and ownership events when absent).
+    #[must_use]
+    pub fn ownership_records(&self) -> Vec<OwnershipRecord> {
+        self.ownership.lock().map(|ownership| ownership.records()).unwrap_or_default()
+    }
+
+    /// Restore the ownership table from a checkpoint projection (resume).
+    /// Replaces the whole in-memory state — no events are appended for the
+    /// restore itself.
+    pub fn restore_ownership_state(&self, state: &OwnershipState) {
+        if let Ok(mut ownership) = self.ownership.lock() {
+            ownership.restore(state);
         }
     }
 
@@ -920,6 +1116,29 @@ impl WriteGate {
             }
         }
 
+        // Issue #61 ownership: a write by a non-owner to an owned artifact is
+        // refused fail-closed here — before any WAL append — with the owner
+        // and its acquiring event named in the structured error. Ownership is
+        // orthogonal to policy: a policy-ALLOWED write from a non-owner is
+        // still rejected (the verdict was already `Allow`). Same-agent
+        // rewrites pass; unowned targets fall through to acquire below.
+        for target in &versioned {
+            let held = {
+                let ownership = self.ownership.lock().map_err(|error| {
+                    GateError::Policy(format!("write-gate ownership table poisoned: {error}"))
+                })?;
+                ownership.verdict(&req.agent_id, target)
+            };
+            if let OwnershipVerdict::HeldBy { owner, acquiring_event_id } = held {
+                return Err(GateError::OwnershipConflict {
+                    event_id: req.call_id.clone(),
+                    path: target.clone(),
+                    owner,
+                    acquiring_event: acquiring_event_id,
+                });
+            }
+        }
+
         // ADR-60 D5: optimistic base_version conflict detection over every
         // mutated (versioned) target, refined by hunk-aware staging. When the
         // caller declared the hash of a target's state it believes it is
@@ -983,6 +1202,18 @@ impl WriteGate {
             });
         }
 
+        // Issue #61: atomic-with-the-write-decision acquire — every unowned
+        // versioned target is inserted NOW (after all conflict checks), with
+        // the applied write itself as the acquiring event. If the WAL append
+        // fails, the batch rolls back below so an acquire never outlives a
+        // write that did not commit.
+        let acquired_now = {
+            let mut ownership = self.ownership.lock().map_err(|error| {
+                GateError::Policy(format!("write-gate ownership table poisoned: {error}"))
+            })?;
+            ownership.acquire_missing(&req.agent_id, &versioned, &req.call_id, now_millis())
+        };
+
         // WAL-before-execute: the applied event is durable before the tool
         // runs; a crash after this point replays as `replayed: true`.
         let mut payload = serde_json::json!({
@@ -991,12 +1222,17 @@ impl WriteGate {
             "policy_verdict": "allow",
             "pre_images": &pre_images,
         });
+        if !acquired_now.is_empty() {
+            payload["ownership_acquired"] = serde_json::Value::Array(
+                acquired_now.clone().into_iter().map(serde_json::Value::String).collect(),
+            );
+        }
         if !staging_notes.is_empty() {
             // Observability for the manual-resolution trail: records exactly
             // what was staged onto whose state (ADR-60 D5 attribution).
             payload["hunk_staging"] = serde_json::Value::Array(staging_notes);
         }
-        let stored = append_whiteboard_event(
+        let stored = match append_whiteboard_event(
             &self.log_pool,
             &NewWhiteboardEvent {
                 event_id: req.call_id.clone(),
@@ -1011,7 +1247,18 @@ impl WriteGate {
                 created_at: now_millis(),
             },
         )
-        .await?;
+        .await
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                // The write did not commit — do not leave the rolled acquire
+                // behind (atomic with the write decision, both directions).
+                if let Ok(mut ownership) = self.ownership.lock() {
+                    ownership.rollback_acquires(&acquired_now);
+                }
+                return Err(error.into());
+            }
+        };
 
         // Execute AFTER the WAL append commits. Cancellation propagates as-is
         // (no `failure` event — the attempt was abandoned, not failed); other
@@ -2662,6 +2909,12 @@ mod tests {
         let mut req_b = filesystem_request("cp-b", "write", "shared.txt");
         req_b.agent_id = "agent-b".to_owned();
         req_b.input["content"] = json!("from-b");
+        // Issue #61: agent-a's write auto-acquired ownership of shared.txt —
+        // agent-b enters by a coordinator-mediated transfer (a validated
+        // decision), the only lawful handover.
+        gate.transfer_ownership("shared.txt", "agent-a", "agent-b", "transfer-decision-cp")
+            .await
+            .expect("mediated transfer moves ownership");
         gate.submit(req_b, CancellationToken::new()).await.expect("agent-b applies");
 
         // Cut at seq 1: only agent-a's write is inside the consistent cut.
@@ -2672,7 +2925,7 @@ mod tests {
         // Head checkpoint ("checkpoint now"): both writes folded, and the
         // log's total order decides the surviving content.
         let head = gate.create_checkpoint(None).await.expect("checkpoint at head");
-        assert_eq!(head.gate_seq, 2, "the head is the latest assigned gate_seq");
+        assert_eq!(head.gate_seq, 3, "the head is the latest assigned gate_seq (incl. transfer)");
         assert_eq!(head.files.get("shared.txt").map(String::as_str), Some("from-b"));
 
         // Per-agent revert (D5 ii): restore to the cut, replay the tail
@@ -2721,6 +2974,12 @@ mod tests {
         let mut req_b = real_fs_write("stage-b", "shared.txt", &b_content);
         req_b.agent_id = "agent-b".to_owned();
         req_b.base_versions.insert("shared.txt".to_owned(), base_hash); // stale on purpose
+
+        // Issue #61: agent-a's landing auto-acquired ownership — agent-b
+        // enters by a coordinator-mediated transfer before its staged write.
+        gate.transfer_ownership("shared.txt", "agent-a", "agent-b", "transfer-decision-stage")
+            .await
+            .expect("mediated transfer moves ownership");
 
         let outcome =
             gate.submit(req_b, CancellationToken::new()).await.expect("disjoint hunks stage");
@@ -2776,6 +3035,13 @@ mod tests {
         req_b.agent_id = "agent-b".to_owned();
         req_b.base_versions.insert("shared.txt".to_owned(), base_hash);
 
+        // Issue #61: the same-hunk collision is reached through the lawful
+        // path — agent-b first gets a coordinator-mediated transfer; the
+        // ownership conflict does not silently pre-empt the collision class.
+        gate.transfer_ownership("shared.txt", "agent-a", "agent-b", "transfer-decision-collide")
+            .await
+            .expect("mediated transfer moves ownership");
+
         let error = gate
             .submit(req_b, CancellationToken::new())
             .await
@@ -2798,8 +3064,10 @@ mod tests {
 
         assert_eq!(
             whiteboard_row_count(&pool).await,
-            1,
-            "only agent-a's applied row — the collision appends nothing"
+            // agent-a's applied row + the mediated transfer audit row — the
+            // collision itself appends nothing (issue #61 transfer in flight).
+            2,
+            "only agent-a's applied row among write rows — the collision appends nothing"
         );
         assert_eq!(
             std::fs::read_to_string(root.join("shared.txt")).expect("read"),
@@ -2859,6 +3127,13 @@ mod tests {
         // ...and the genuine token frees the path.
         gate.release_lock(&token).expect("genuine release succeeds");
 
+        // Issue #61: releasing the LOCK reservation does not hand over the
+        // agent-a ownership agent-a's lock-2 write auto-acquired — ownership
+        // moves through coordinator-mediated transfers only.
+        gate.transfer_ownership("hot.txt", "agent-a", "agent-b", "transfer-decision-lock")
+            .await
+            .expect("mediated transfer moves ownership");
+
         let mut after = real_fs_write("lock-3", "hot.txt", "free-now");
         after.agent_id = "agent-b".to_owned();
         let outcome = gate.submit(after, CancellationToken::new()).await;
@@ -2893,5 +3168,228 @@ mod tests {
         // desired state is already reached.
         gate.release_lock(&token).expect("release after lapse still succeeds");
         assert_eq!(whiteboard_row_count(&pool).await, 1, "only the post-lapse write applied");
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #61: artifact ownership and conflict control
+    // ------------------------------------------------------------------
+
+    /// A filesystem write request for a SPECIFIC agent — ownership is
+    /// per-agent, so the tests need the attribution knob.
+    fn owned_fs_write(agent: &str, call_id: &str, path: &str, content: &str) -> GateRequest {
+        let mut request = real_fs_write(call_id, path, content);
+        request.agent_id = agent.to_owned();
+        request
+    }
+
+    async fn ownership_rows(pool: &sqlx::SqlitePool) -> Vec<WhiteboardEvent> {
+        let events = load_whiteboard_events(pool, &WhiteboardLoadOpts::default())
+            .await
+            .expect("load events");
+        events.into_iter().filter(|event| event.kind == WhiteboardKind::OwnershipEvent).collect()
+    }
+
+    #[tokio::test]
+    async fn non_owner_write_to_owned_artifact_is_rejected_naming_owner_and_acquiring_event() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // First writer auto-acquires on the successful write.
+        let first = gate
+            .submit(
+                owned_fs_write("agent-a", "a-snag-1", "shared.txt", "one"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(first.is_ok(), "first writer proceeds: {first:?}");
+        let applied = applied_row(&pool, "a-snag-1").await;
+        assert_eq!(
+            applied.payload.get("ownership_acquired"),
+            Some(&json!(["shared.txt"])),
+            "the applied write records its auto-acquire"
+        );
+
+        // A non-owner write is refused fail-closed with the owner and its
+        // acquiring event named — nothing was appended.
+        let foreign = gate
+            .submit(
+                owned_fs_write("agent-b", "b-snag-1", "shared.txt", "clobber"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared.txt"))
+                .expect("the acquired file exists — only the refused write may not land"),
+            "one",
+            "the refused write never landed on disk"
+        );
+        match foreign {
+            Err(GateError::OwnershipConflict { event_id, path, owner, acquiring_event }) => {
+                assert_eq!(event_id, "b-snag-1");
+                assert_eq!(path, "shared.txt");
+                assert_eq!(owner, "agent-a");
+                assert_eq!(acquiring_event, "a-snag-1");
+            }
+            _ => panic!("expected OwnershipConflict, got {foreign:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_agent_rewrites_pass_and_unowned_first_write_acquires_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        // Multi-write task: the owner holds across successive writes.
+        for (call, content) in [("multi-1", "one"), ("multi-2", "two"), ("multi-3", "three")] {
+            let outcome = gate
+                .submit(
+                    owned_fs_write("agent-a", call, "task.txt", content),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(outcome.is_ok(), "owner rewrite {call} passes: {outcome:?}");
+        }
+        let first = applied_row(&pool, "multi-1").await;
+        assert_eq!(first.payload.get("ownership_acquired"), Some(&json!(["task.txt"])));
+        for later_call in ["multi-2", "multi-3"] {
+            let row = applied_row(&pool, later_call).await;
+            assert!(
+                row.payload.get("ownership_acquired").is_none(),
+                "re-entry does not re-acquire (idempotent)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_mediated_transfer_grants_the_receiving_agent() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        gate.submit(
+            owned_fs_write("agent-a", "tf-1", "handoff.txt", "v1"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("owner acquires");
+        let foreign = gate
+            .submit(
+                owned_fs_write("agent-b", "tf-2", "handoff.txt", "steal"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(foreign, Err(GateError::OwnershipConflict { .. })));
+
+        // Coordinator-mediated transfer (a validated decision id), from the
+        // actual owner.
+        gate.transfer_ownership("handoff.txt", "agent-a", "agent-b", "transfer-decision-1")
+            .await
+            .expect("transfer applies");
+
+        // The receiving agent now writes freely; the former owner is now the
+        // foreign party.
+        let granted = gate
+            .submit(
+                owned_fs_write("agent-b", "tf-3", "handoff.txt", "granted"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(granted.is_ok(), "transfer grants the receiving agent: {granted:?}");
+        let clawback = gate
+            .submit(
+                owned_fs_write("agent-a", "tf-4", "handoff.txt", "mine again"),
+                CancellationToken::new(),
+            )
+            .await;
+        match clawback {
+            Err(GateError::OwnershipConflict { owner, acquiring_event, .. }) => {
+                assert_eq!(owner, "agent-b");
+                // The transfer decision is the new acquiring event.
+                assert_eq!(acquiring_event, "transfer-decision-1");
+            }
+            _ => panic!("expected the finished-owner to conflict now, got {clawback:?}"),
+        }
+
+        // The transfer is audited with an ownership-event row.
+        let events = ownership_rows(&pool).await;
+        assert_eq!(events.len(), 1, "transfer logged exactly one audit event");
+        let event = events.first().expect("transfer event present");
+        assert_eq!(event.payload.get("action"), Some(&json!("transfer")));
+        assert_eq!(event.payload.get("artifact"), Some(&json!("handoff.txt")));
+        assert_eq!(event.payload.get("to_agent"), Some(&json!("agent-b")));
+    }
+
+    #[tokio::test]
+    async fn release_on_subtask_settle_is_evented_and_frees_the_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        gate.submit(owned_fs_write("agent-a", "rel-1", "done.txt", "v1"), CancellationToken::new())
+            .await
+            .expect("owner acquires");
+
+        // Release the owner's artifacts (the settle path: completed).
+        let released = gate.release_agent("agent-a", "subtask-settled: completed").await;
+        assert!(matches!(released, Ok(1)), "the owner's one artifact was released: {released:?}");
+
+        // The freed artifact head is up for grabs by another agent.
+        let next = gate
+            .submit(owned_fs_write("agent-b", "rel-2", "done.txt", "v2"), CancellationToken::new())
+            .await;
+        assert!(next.is_ok(), "post-release write proceeds: {next:?}");
+
+        // The release is evented; a later no-op release is not.
+        assert_eq!(ownership_rows(&pool).await.len(), 1, "one release event");
+        let again = gate.release_agent("agent-a", "second settle burst").await;
+        assert!(matches!(again, Ok(0)), "empty release is a quiet no-op: {again:?}");
+        assert_eq!(ownership_rows(&pool).await.len(), 1, "no event for the empty release");
+    }
+
+    #[tokio::test]
+    async fn external_modification_marks_stale_and_the_conflict_channel_stays_shut_for_strangers() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), root.clone());
+
+        gate.submit(
+            owned_fs_write("agent-a", "ext-1", "watched.txt", "v1"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("owner acquires");
+
+        // Someone edits the file OUTSIDE the gate.
+        std::fs::write(root.join("watched.txt"), "external edit").expect("external modification");
+        let flipped = gate.mark_artifact_stale("watched.txt", "resume-reconciliation").await;
+        assert!(matches!(flipped, Ok(Some(_))), "an owned record flips stale: {flipped:?}");
+
+        // The stranger is STILL refused — stale is not a silent transfer.
+        let foreign = gate
+            .submit(
+                owned_fs_write("agent-b", "ext-2", "watched.txt", "grab"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(foreign, Err(GateError::OwnershipConflict { ref owner, .. }) if *owner == "agent-a"),
+            "foreign writes stay blocked by a stale record: {foreign:?}"
+        );
+
+        // The stale mark is audited.
+        let events = ownership_rows(&pool).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.first().and_then(|row| row.payload.get("action")), Some(&json!("stale")));
+
+        // Marking a second time is quiet (stale is absorbing), and an
+        // unowned path never flips.
+        assert!(matches!(gate.mark_artifact_stale("watched.txt", "again").await, Ok(None)));
     }
 }

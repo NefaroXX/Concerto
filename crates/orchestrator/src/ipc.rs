@@ -434,6 +434,9 @@ impl IpcError {
             GateError::Denied { reason, .. } => Self::new(IpcErrorCode::GateDenied, reason.clone()),
             GateError::Cancelled => Self::new(IpcErrorCode::Cancelled, error.to_string()),
             GateError::Conflict { .. } => Self::new(IpcErrorCode::Conflict, error.to_string()),
+            GateError::OwnershipConflict { .. } => {
+                Self::new(IpcErrorCode::Conflict, error.to_string())
+            }
             other => Self::new(IpcErrorCode::GateError, other.to_string()),
         }
     }
