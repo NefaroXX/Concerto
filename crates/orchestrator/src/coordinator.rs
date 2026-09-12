@@ -4063,11 +4063,15 @@ impl CoordinatorAgent {
         // already rejects that case). Tags are resolved through the facade
         // by kind, so renamed Planning/Execution stages keep their replan
         // and revision machinery (issue #150).
+        // In-memory starvation-aging counters for the #58 scheduler: cycles
+        // each task waited ready without being dispatched. Recomputed from
+        // graph state, never persisted (stateless across resume by design).
         let design_tag =
             kind_stage_tag(self.blueprint_facade.as_ref(), StageKind::Planning, AgentStage::DESIGN);
         let design_role = self.first_agent_for_stage(&AgentStage::new(design_tag));
         let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
         let implement_ids = self.registry.ids_for_stage(&AgentStage::new(implement_tag));
+        let mut scheduler_aging: HashMap<TaskId, u32> = HashMap::new();
 
         loop {
             if cancel.is_cancelled() {
@@ -4107,9 +4111,50 @@ impl CoordinatorAgent {
                 return Err(OrchestratorError::Cancelled);
             }
 
-            // Clone IDs to avoid borrow conflicts with mutable graph access
-            let ready_ids: Vec<(TaskId, AgentId)> =
-                graph.ready_tasks().iter().map(|st| (st.id, st.role.clone())).collect();
+            // ── Issue #58: deterministic critical-path-ready batch order ──
+            // `ready_tasks()` yields in HashMap order; the batch used to be
+            // dispatched in that raw order. It is now ranked by the pure
+            // scheduler (live graph re-derived each cycle, so #57 splits and
+            // merges are naturally reflected) and each pick carries a WHY
+            // reason, surfaced as one whiteboard thought per cycle. The
+            // whole batch still dispatches, so the aging reset below is the
+            // "everything was picked" branch of the starvation protocol.
+            let ready_ids: Vec<(TaskId, AgentId)> = {
+                let registered: HashSet<AgentId> = self.registry.ids().into_iter().collect();
+                let scheduling = crate::scheduler::SchedulerContext {
+                    attempts: &subtask_attempts,
+                    available_roles: Some(&registered),
+                    aging: &scheduler_aging,
+                };
+                let picks = crate::scheduler::schedule_batch(&graph, &scheduling, None);
+                scheduler_aging.clear();
+                if picks.len() > 1 {
+                    let summary = picks
+                        .iter()
+                        .map(|pick| format!("{} — {}", pick.task_id, pick.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    tracing::info!(
+                        target: "orchestrator::scheduler",
+                        picks = picks.len(),
+                        "ready batch ranked by critical-path priority"
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: format!("Task scheduling ranked the ready batch: {summary}"),
+                        },
+                    );
+                }
+                picks
+                    .into_iter()
+                    .filter_map(|pick| {
+                        graph.get(&pick.task_id).map(|subtask| (pick.task_id, subtask.role.clone()))
+                    })
+                    .collect()
+            };
 
             // ADR-64 Phase 5: capsule projection — clone the timeline
             // projection out of the resolver block so it is available
