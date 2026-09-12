@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Specialist consultation (#59):** typed `Consult` operation distinct
+  from dispatch — read-only enforced (writes/shell/git denied even under
+  Acting grants, proven adversarially), findings become citable evidence,
+  deterministic trigger on aged open questions, effort-bounded.
 - **Critical-path scheduling (#58):** ready batches ranked by deterministic
   priority (chain/dependents/sole-blocker/failure-penalty/availability,
   TaskId tie-break) with per-cycle reasons; starvation-guarded; live-graph
