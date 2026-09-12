@@ -62,6 +62,14 @@ pub enum DecisionKind {
     Retry,
     /// A fallback-ladder tier dispatch (ADR-42/ADR-45 — deterministic).
     FallbackTier,
+    /// Issue #57: re-cut one OPEN task into ordered children. The children
+    /// inherit the parent's specialist role, so no target is named; the
+    /// payload rides the decision's `transform` field.
+    Split,
+    /// Issue #57: fold two or more compatible OPEN tasks into one survivor.
+    /// Payload rides `transform`; no target is named (the survivor's role
+    /// is the group's shared role).
+    Merge,
 }
 
 impl DecisionKind {
@@ -74,9 +82,19 @@ impl DecisionKind {
     }
 
     /// Whether this kind must NOT carry a target (a carry-over makes the
-    /// decision self-contradictory — e.g. a Replan naming an agent).
+    /// decision self-contradictory — e.g. a Replan naming an agent, or a
+    /// split/merge naming a specialist the transform cannot use: children
+    /// INHERIT the split parent's role and the merge survivor keeps the
+    /// group's).
     pub fn rejects_target(self) -> bool {
-        matches!(self, DecisionKind::DraftPlan | DecisionKind::SelfExecute | DecisionKind::Replan)
+        matches!(
+            self,
+            DecisionKind::DraftPlan
+                | DecisionKind::SelfExecute
+                | DecisionKind::Replan
+                | DecisionKind::Split
+                | DecisionKind::Merge
+        )
     }
 
     /// Whether this kind requires a non-empty task description.
@@ -123,6 +141,11 @@ pub struct CoordinatorDecision {
     /// bounded).
     #[serde(default)]
     pub expected_artifacts: Vec<String>,
+    /// Issue #57: the split/merge payload for the transform kinds.
+    /// `None` for every non-transform kind. Additive serde (`default`),
+    /// so old journal entries and old checkpoints (no field) still load.
+    #[serde(default)]
+    pub transform: Option<crate::task_transform::TaskTransformSpec>,
     pub created_at: time::OffsetDateTime,
     pub status: DecisionStatus,
 }
@@ -308,6 +331,11 @@ impl<'a> DecisionValidator<'a> {
             notes: notes.map(str::to_owned),
             supporting_evidence_ids: dedupe(evidence_ids),
             expected_artifacts,
+            // A transform payload is attached by the coordinator handler
+            // AFTER structural validation (the payload's own shape is
+            // validated by the task-transform machinery against the real
+            // graph state).
+            transform: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Validated,
         })
@@ -353,6 +381,7 @@ impl<'a> DecisionValidator<'a> {
             )),
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: Vec::new(),
+            transform: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -378,6 +407,7 @@ impl<'a> DecisionValidator<'a> {
             ),
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: Vec::new(),
+            transform: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -389,7 +419,11 @@ impl<'a> DecisionValidator<'a> {
     /// yields `None` (rejected by the caller). The validation is the
     /// lexical join — no filesystem access, matching the project's
     /// no-filesystem-touch path-identity convention.
-    fn canonical_artifact_path(&self, raw: &str) -> Option<String> {
+    /// `pub(crate)`: the issue-#57 split/merge handlers reuse the exact
+    /// same normalizer for per-child artifact canonicalization so the
+    /// decision's path discipline and the transform's artifacts can never
+    /// diverge.
+    pub(crate) fn canonical_artifact_path(&self, raw: &str) -> Option<String> {
         match self.project_root {
             Some(root) => crate::tool_facts::canonical_project_path(root, raw),
             // Pure-unit fallback: no root supplied — allow only relative
@@ -675,6 +709,63 @@ mod tests {
         let decision = dispatch(&cited, &raw).expect("dupes allowed");
         assert_eq!(decision.supporting_evidence_ids, vec!["ev-0001"]);
         assert_eq!(decision.expected_artifacts.len(), 2, "two distinct keys");
+    }
+
+    #[test]
+    fn transform_kinds_reject_targets_and_round_trip() {
+        // Split/merge never name a target (children inherit the role).
+        let error = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::Split, Some("coder"), "split", None, &[], &[])
+            .expect_err("the split kind must reject a target");
+        assert_eq!(error.code, "conflicting_decision");
+
+        // The transform payload rides the decision additively.
+        let parent = concerto_core::types::TaskId(concerto_core::ids::Ulid::from(0x57u128));
+        let decision = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::Split, None, "split of the parent", None, &[], &[])
+            .expect("valid split decision shape");
+        let mut decision = decision;
+        decision.transform = Some(crate::task_transform::TaskTransformSpec::Split {
+            parent,
+            children: vec![crate::task_transform::SplitChildSpec {
+                description: "child".to_owned(),
+                expected_artifacts: vec![],
+                after: vec![],
+            }],
+        });
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(json.contains("\"type\":\"split\""), "the payload is a tagged split: {json}");
+        let back: CoordinatorDecision = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, decision, "the payload survives the round trip");
+
+        // Merge kind.
+        let decision = validator(&roster(&["coder"]), &events(&[]), None).validate(
+            DecisionKind::Merge,
+            None,
+            "merged work",
+            None,
+            &[],
+            &[],
+        );
+        assert!(decision.is_ok());
+    }
+
+    #[test]
+    fn old_journal_entry_without_transform_deserializes_to_none() {
+        // A pre-#57 entry: no `transform` key → additive default None.
+        // The record is built from a REAL current serialization so every
+        // other field matches the wire format exactly; then the additive
+        // `transform` key is dropped to simulate the old writer.
+        let base = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::DispatchSpecialist, Some("coder"), "work", None, &[], &[])
+            .expect("valid");
+        let mut value = serde_json::to_value(&base).expect("serialize");
+        assert!(value.get("transform").is_some(), "current entries carry the key");
+        let object = value.as_object_mut().expect("an object");
+        object.remove("transform");
+        let decision: CoordinatorDecision =
+            serde_json::from_value(value).expect("an old entry loads");
+        assert_eq!(decision.transform, None, "the additive transform defaults");
     }
 
     #[test]

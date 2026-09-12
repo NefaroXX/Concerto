@@ -9,7 +9,7 @@ use concerto_core::OrchestratorError;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::relationship::AgentRelationship;
 use tracing::warn;
@@ -31,6 +31,7 @@ pub struct TaskEdge {
 }
 
 /// In-memory task graph for multi-agent orchestration.
+#[derive(Clone)]
 pub struct TaskGraph {
     graph: DiGraph<TaskId, TaskEdge>,
     tasks: HashMap<TaskId, SubTask>,
@@ -219,6 +220,65 @@ impl TaskGraph {
     /// Return all tasks in the graph.
     pub fn all_tasks(&self) -> Vec<&SubTask> {
         self.tasks.values().collect()
+    }
+
+    /// Return every DIRECT dependency of a task together with its edge
+    /// `Dependency` type (the setter side for issue-#57 transforms).
+    /// Order-preserving dedupe so transform rewiring never creates
+    /// parallel or order-nondeterministic edge work.
+    pub fn incoming_dependencies(&self, id: &TaskId) -> Vec<(TaskId, Dependency)> {
+        let Some(&idx) = self.node_indices.get(id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(TaskId, Dependency)> = Vec::new();
+        let mut seen: HashSet<TaskId> = HashSet::new();
+        for edge in self.graph.edges_directed(idx, petgraph::Direction::Incoming) {
+            let dep = self.graph[edge.source()];
+            if seen.insert(dep) {
+                out.push((dep, edge.weight().dependency));
+            }
+        }
+        out
+    }
+
+    /// Return every DIRECT dependent (a task that waits on this one) with
+    /// its outgoing edge `Dependency` type (order-preserving dedupe).
+    pub fn outgoing_dependents(&self, id: &TaskId) -> Vec<(TaskId, Dependency)> {
+        let Some(&idx) = self.node_indices.get(id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(TaskId, Dependency)> = Vec::new();
+        let mut seen: HashSet<TaskId> = HashSet::new();
+        for edge in self.graph.edges_directed(idx, petgraph::Direction::Outgoing) {
+            let target = self.graph[edge.target()];
+            if seen.insert(target) {
+                out.push((target, edge.weight().dependency));
+            }
+        }
+        out
+    }
+
+    /// Remove a task and ALL its incident edges from the graph (issue-#57
+    /// transforms), keeping the tasks and node-index maps in step. A no-op
+    /// when the task is absent. petgraph COMPACTS node indices on removal,
+    /// so the id→index map is rebuilt rather than patched.
+    pub fn remove_task(&mut self, id: &TaskId) {
+        if let Some(idx) = self.node_indices.remove(id) {
+            self.graph.remove_node(idx);
+            self.tasks.remove(id);
+            let mut rebuilt = HashMap::with_capacity(self.tasks.len());
+            for node in self.graph.node_indices() {
+                rebuilt.insert(self.graph[node], node);
+            }
+            self.node_indices = rebuilt;
+        }
+    }
+
+    /// A deep copy for transform validation (issue #57): the transform
+    /// machinery proves a rewrite against a copy so an invalid result never
+    /// touches the live graph.
+    pub fn clone_for_transform(&self) -> Self {
+        self.clone()
     }
 
     /// Add a subtask to the graph without specifying parent or dependencies.
@@ -584,7 +644,6 @@ mod tests {
         use crate::checkpoint::{
             build_checkpoint, restore_graph, CheckpointScope, CheckpointStage, GraphCheckpoint,
         };
-        use std::collections::HashMap;
 
         // Build a graph with several tasks and a known dependency tree.
         let mut graph = TaskGraph::new();

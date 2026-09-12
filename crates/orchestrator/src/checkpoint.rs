@@ -1977,6 +1977,7 @@ mod tests {
             notes: Some("coordinator choice".to_owned()),
             supporting_evidence_ids: vec!["ev-real".to_owned()],
             expected_artifacts: vec!["src/main.rs".to_owned()],
+            transform: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             status: crate::decisions::DecisionStatus::Settled,
         };
