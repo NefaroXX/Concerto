@@ -1527,11 +1527,7 @@ mod tests {
         let model =
             WorldModel::build(&input(&facts_events, rows, &decisions, &diagnoses, Vec::new()));
         assert!(model.facts.len() <= MAX_WORLD_FACTS, "facts are capped");
-        assert_eq!(
-            model.open_question_count(),
-            MAX_OPEN_QUESTIONS,
-            "questions are capped"
-        );
+        assert_eq!(model.open_question_count(), MAX_OPEN_QUESTIONS, "questions are capped");
         assert!(model.artifacts.len() <= MAX_WORLD_ARTIFACTS, "artifacts are capped");
         assert!(model.tasks.len() <= MAX_WORLD_TASKS, "tasks are capped");
         assert!(model.risks.len() <= MAX_WORLD_RISKS, "risks are capped");

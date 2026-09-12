@@ -1525,10 +1525,8 @@ impl CoordinatorAgent {
         }
 
         let roster = self.decision_roster().into_iter().collect::<Vec<String>>();
-        let criteria: Vec<String> = self
-            .design_doc_snapshot()
-            .map(|doc| doc.goals.to_vec())
-            .unwrap_or_default();
+        let criteria: Vec<String> =
+            self.design_doc_snapshot().map(|doc| doc.goals.to_vec()).unwrap_or_default();
         // The pending decision's staleness: the same roster/evidence shape
         // the ADR-65 §7 resume check uses (deterministic, no new machinery).
         let pending_stale = match self.last_dispatch_decision.as_ref() {
