@@ -38,8 +38,11 @@ pub use managed::{
 };
 pub use projects::ProjectRegistry;
 pub use saving::{
-    orchestration_declared, roster_materialized, save_agent_roster, save_blueprint,
-    save_inline_blueprint, seed_agent_roster_only, seed_orchestration_roster,
+    declared_project_orchestration_keys, import_project_orchestration_to_global,
+    orchestration_declared, remove_project_orchestration_keys, roster_materialized,
+    save_agent_roster, save_blueprint, save_inline_blueprint, seed_agent_roster_only,
+    seed_orchestration_roster, strip_project_orchestration_keys, ImportOrchestrationOutcome,
+    ProjectOrchestrationStrip, GLOBAL_ONLY_ORCHESTRATION_KEYS,
 };
 pub use schema::{
     builtin_agent_seeds, parse_tool_schema_mode, AgentCapabilities, AgentModelAssignment,
@@ -128,11 +131,40 @@ fn load_config_layers(
         }
     }
 
-    // 2) Project-scoped config (inserted between global config and env)
+    // 2) Project-scoped config (inserted between global config and env).
+    // Maintainer decision (2026-09): orchestration is GLOBAL ONLY — the
+    // global-only orchestration keys ([`saving::GLOBAL_ONLY_ORCHESTRATION_KEYS`])
+    // are stripped from the PROJECT document before the merge, so a project
+    // `[orchestration]` / `[multi_agent.custom_agents]` /
+    // `[multi_agent.model_pins]` no longer collides with a seeded global
+    // selection at the exactly-one blueprint seam. Every other project key
+    // (policy, spend caps, relationships, presets, run limits, the rest of
+    // `[multi_agent]`) keeps its layered precedence. Nothing is ever written:
+    // removal is load-time only. When nothing is to strip the raw file is
+    // merged exactly as before (figment reads it, byte-identical behavior).
     if let Some(root) = project_root {
         let project_file = root.join(legacy::NEW_PROJECT_CONFIG_FILE);
         if project_file.exists() {
-            figment = figment.merge(Toml::file(&project_file));
+            let stripped = crate::saving::strip_project_orchestration_keys(
+                &std::fs::read_to_string(&project_file).map_err(|e| {
+                    ConfigError::Load(format!("failed to read {}: {e}", project_file.display()))
+                })?,
+            )?;
+            match stripped {
+                Some(stripped) => {
+                    tracing::warn!(
+                        project = %project_file.display(),
+                        ignored = %stripped.removed_keys.join(", "),
+                        "orchestration is global only: ignoring project config \
+                         orchestration keys — use the Studio's import action to move \
+                         them into the global config"
+                    );
+                    figment = figment.merge(Toml::string(&stripped.document));
+                }
+                // Nothing to strip: the document merges exactly as before,
+                // straight from the file (byte-identical behavior).
+                None => figment = figment.merge(Toml::file(&project_file)),
+            }
         }
     }
 
@@ -1116,5 +1148,114 @@ relationship = "watches"
             msg.contains("watches") && msg.contains("reviewer") && msg.contains("coder"),
             "expected relationship naming, got: {msg}"
         );
+    }
+
+    // ---- global-only orchestration enforcement at load (maintainer decision 2026-09) ----
+
+    /// A project config declaring the global-only orchestration keys is
+    /// IGNORED at load: the merged config resolves the blueprint, roster, and
+    /// model pins from the global file only — while every non-orchestration
+    /// project key keeps its layered override (spend cap, run limit,
+    /// relationships policy).
+    #[test]
+    fn merged_config_ignores_project_orchestration_but_honors_other_project_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            format!(
+                r#"schema_version = {SCHEMA_VERSION}
+[orchestration]
+schema_version = 1
+[orchestration.blueprint]
+name = "standard"
+[multi_agent]
+custom_agents = []
+"#
+            ),
+        )
+        .unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(legacy::NEW_PROJECT_CONFIG_FILE),
+            format!(
+                r#"schema_version = {SCHEMA_VERSION}
+session_spend_cap_usd = 2.5
+[orchestration]
+schema_version = 1
+[orchestration.blueprint]
+name = "tdd"
+[multi_agent]
+max_concurrent_agents = 3
+model_pins = {{ coder = "project-pin" }}
+[[multi_agent.custom_agents]]
+id = "proj-agent"
+name = "Proj"
+role = "proj-agent"
+[[multi_agent.relationships]]
+from = "architect"
+to = "coder"
+relationship = "supervises"
+"#
+            ),
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&global_path), Some(&project)).expect("must load");
+        // Orchestration keys resolved GLOBAL-ONLY:
+        assert_eq!(
+            cfg.orchestration
+                .as_ref()
+                .expect("global orchestration present")
+                .blueprint
+                .name
+                .as_deref(),
+            Some("standard"),
+            "the project [orchestration] selection is ignored; global wins"
+        );
+        let multi_agent = cfg.multi_agent.as_ref().expect("[multi_agent] present");
+        assert!(
+            multi_agent.custom_agents.is_empty(),
+            "the project roster is ignored: {:?}",
+            multi_agent.custom_agents
+        );
+        assert!(multi_agent.model_pins.is_empty(), "project model_pins are ignored");
+        // Non-orchestration project keys keep applying:
+        assert_eq!(cfg.session_spend_cap_usd, Some(2.5), "project spend cap still applies");
+        assert_eq!(
+            multi_agent.max_concurrent_agents, 3,
+            "unrelated [multi_agent] keys still apply"
+        );
+        assert_eq!(multi_agent.relationships.len(), 1, "project relationships stay layered");
+    }
+
+    /// No-strip case is byte-identical to the pre-enforcement loader: a
+    /// project config without orchestration keys merges exactly as before
+    /// (one precedence run proving both layers resolve).
+    #[test]
+    fn no_strip_case_merges_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 1.0\n"),
+        )
+        .unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(legacy::NEW_PROJECT_CONFIG_FILE),
+            format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 2.0\n"),
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(project.join(legacy::NEW_PROJECT_CONFIG_FILE)).unwrap();
+        assert!(
+            saving::strip_project_orchestration_keys(&raw).expect("parsed").is_none(),
+            "the document carries none of the ignored keys"
+        );
+        let cfg = load_config(Some(&global_path), Some(&project)).unwrap();
+        assert_eq!(cfg.session_spend_cap_usd, Some(2.0));
     }
 }
