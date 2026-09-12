@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Critical-path scheduling (#58):** ready batches ranked by deterministic
+  priority (chain/dependents/sole-blocker/failure-penalty/availability,
+  TaskId tie-break) with per-cycle reasons; starvation-guarded; live-graph
+  recomputation keeps #57 transforms correct.
 - **Dynamic task split/merge (#57):** open tasks split into children
   (edges union-rewritten, lineage kept) and overlapping pending tasks merge
   (lowest-ULID survivor, unions deduped), proven on throwaway copies —
