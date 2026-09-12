@@ -1978,6 +1978,7 @@ mod tests {
             supporting_evidence_ids: vec!["ev-real".to_owned()],
             expected_artifacts: vec!["src/main.rs".to_owned()],
             transform: None,
+            max_tool_calls: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             status: crate::decisions::DecisionStatus::Settled,
         };
