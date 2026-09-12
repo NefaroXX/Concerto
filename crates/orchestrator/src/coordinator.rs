@@ -160,7 +160,7 @@ fn call_specialist_tool_definition() -> ToolDefinition {
     }
 }
 
-/// Argument schema for the Coordinator's optional `draft_plan` advisor.
+/// Argument schema for the Coordinator's `draft_plan` advisor.
 fn draft_plan_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: DRAFT_PLAN_TOOL.to_string(),
@@ -1671,6 +1671,7 @@ impl CoordinatorAgent {
             notes: None,
             supporting_evidence_ids: Vec::new(),
             expected_artifacts: Vec::new(),
+            transform: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: crate::decisions::DecisionStatus::Validated,
         };

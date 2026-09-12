@@ -59,6 +59,7 @@ pub mod skills_context;
 pub mod state;
 pub mod subscriptions;
 pub mod supervisor;
+pub mod task_transform;
 pub mod timeline;
 pub mod tool_driver;
 mod tool_facts;

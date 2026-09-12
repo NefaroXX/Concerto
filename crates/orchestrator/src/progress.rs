@@ -362,6 +362,9 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Replan => "replan",
         DecisionKind::Retry => "retry",
         DecisionKind::FallbackTier => "fallback-tier",
+        // Issue #57 task transforms.
+        DecisionKind::Split => "split",
+        DecisionKind::Merge => "merge",
     }
 }
 
