@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Artifact ownership (#61):** acquire-on-write, evented release on
+  settle/crash, coordinator-mediated transfer only, stale on out-of-gate
+  modification — enforced at the write gate, fail-closed; additive
+  persistence. (Known limit: in-process specialists bypass gate-level
+  ownership today; tracked follow-up.)
 - **Delegation quality (#60):** per-(agent, task-class) suitability from
   dispatch history (14-day decay, exclusion floor, bounded reasons),
   advisory-only; spend recorded, never scored; models never selected.
