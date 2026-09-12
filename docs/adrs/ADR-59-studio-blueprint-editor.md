@@ -109,6 +109,25 @@ edit, disable, delete agents freely; the Coordinator consumes them as context.
 `seed_orchestration_roster` behavior is unchanged (it materializes the seeds
 as the user's own editable config).
 
+## Amendment (2026-09) — global-only orchestration (in place)
+
+Revised **in place** (no new ADR number). Orchestration persistence is
+**GLOBAL ONLY**: the Studio's Save and the auto-seed write only
+`default_config_path()` (both were already global-only via the earlier
+smoke follow-up), and the LOAD path now enforces it too — the project-layer
+`[orchestration]` table, `[multi_agent.custom_agents]`, and
+`[multi_agent.model_pins]` are **ignored at load**
+(`strip_project_orchestration_keys` in `concerto-config`, warn-logged, no
+file mutation). A project file still declaring those keys surfaces a Studio
+banner with one explicit user action — **Import to global** relocations the
+keys into the global config via the merge-aware atomic seams and removes
+them from the project file; refusal-with-message when the global layer
+already declares the same keys. This ends the exactly-one collision between
+a seeded global `blueprint.inline` and a merged project-user `blueprint`
+selection that degraded the Studio to agents-only. Other project-layer
+keys (relationships, presets, run limits, spend caps, policy rules) remain
+layered exactly as before.
+
 ## Consequences
 
 - The config file is the sanctioned user-editable artifact; Studio and
