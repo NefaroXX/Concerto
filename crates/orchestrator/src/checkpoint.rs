@@ -210,6 +210,11 @@ pub struct CheckpointContext {
     /// additive, no bump; those runs rebuild the model from their own
     /// restored state at the next decision session.
     pub world_model: crate::world_model::WorldModel,
+    /// Issue #60: the coordinator's suitability record (bounded, decayed
+    /// dispatch-outcome history per specialist × task class) captured at
+    /// save time, so delegation-quality evidence survives a resume. Old
+    /// records default it empty — additive, no bump.
+    pub suitability: crate::suitability::SuitabilityState,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +365,14 @@ pub struct GraphCheckpoint {
     /// the key.
     #[serde(default)]
     pub world_model: crate::world_model::WorldModel,
+    /// Issue #60: the coordinator's suitability record — the bounded,
+    /// decayed dispatch-outcome history per (specialist, task class),
+    /// persisted so a resume keeps scoring delegation quality on the FULL
+    /// history (history informs ranking across resumes). Additive only:
+    /// absent on older records (serde default = the empty record); old
+    /// readers ignore the key.
+    #[serde(default)]
+    pub suitability: crate::suitability::SuitabilityState,
 }
 
 const fn current_schema_version() -> u32 {
@@ -573,6 +586,9 @@ pub fn build_checkpoint(
         // Issue #56: additive — the world-model projection rides
         // independently; old readers treat this key as opaque.
         world_model: context.world_model.clone(),
+        // Issue #60: additive — the suitability record rides
+        // independently; old readers treat this key as opaque.
+        suitability: context.suitability.clone(),
     }
 }
 
@@ -1357,6 +1373,7 @@ mod tests {
             &CheckpointContext {
                 design_doc: Some(design_doc.clone()),
                 world_model: crate::world_model::WorldModel::default(),
+                suitability: crate::suitability::SuitabilityState::default(),
                 model_assignments: model_assignments.clone(),
                 action_ledger: action_ledger.clone(),
                 default_model_provider_attempted: HashSet::new(),
@@ -1607,6 +1624,7 @@ mod tests {
             &CheckpointContext {
                 design_doc: Some(design_doc.clone()),
                 world_model: crate::world_model::WorldModel::default(),
+                suitability: crate::suitability::SuitabilityState::default(),
                 model_assignments: model_assignments.clone(),
                 action_ledger: action_ledger.clone(),
                 default_model_provider_attempted: HashSet::new(),
@@ -2108,6 +2126,105 @@ mod tests {
             vec![diagnosis],
             "the diagnosis/evidence trail survives the round trip (resume persistence)"
         );
+    }
+
+    /// Issue #60: the suitability record round-trips through checkpoint
+    /// JSON — delegation-quality evidence survives a resume.
+    #[test]
+    fn suitability_round_trips_through_checkpoint_json() {
+        let mut index = crate::suitability::SuitabilityIndex::default();
+        index.record(
+            "coder",
+            crate::suitability::TaskClass::CodeEdit,
+            crate::suitability::OutcomeKind::Success,
+            None,
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid unix epoch"),
+            1_200,
+        );
+        index.record(
+            "coder",
+            crate::suitability::TaskClass::CodeEdit,
+            crate::suitability::OutcomeKind::Failure,
+            Some("tool"),
+            time::OffsetDateTime::from_unix_timestamp(1_700_086_400).expect("valid unix offset"),
+            0,
+        );
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "suitability": index.state(),
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("suitability history loads");
+        assert_eq!(
+            loaded.suitability,
+            index.state(),
+            "the suitability record survives the round trip (resume persistence)"
+        );
+        // The restored history ranks the same as the in-memory one.
+        let restored = crate::suitability::SuitabilityIndex::from_state(loaded.suitability);
+        let candidates = vec!["coder".to_owned()];
+        assert_eq!(
+            index.rank(
+                &candidates,
+                crate::suitability::TaskClass::CodeEdit,
+                time::OffsetDateTime::from_unix_timestamp(1_700_172_800)
+                    .expect("valid unix offset")
+            ),
+            restored.rank(
+                &candidates,
+                crate::suitability::TaskClass::CodeEdit,
+                time::OffsetDateTime::from_unix_timestamp(1_700_172_800)
+                    .expect("valid unix offset")
+            ),
+        );
+    }
+
+    /// Issue #60: a pre-#60 checkpoint record with NO `suitability` key
+    /// loads clean with the EMPTY default — additive, no schema bump, old
+    /// runs are neutral until suitability is recorded again.
+    #[test]
+    fn old_checkpoint_without_suitability_loads_default() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null,
+            "world_model": {}
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#60 checkpoint loads");
+        assert!(
+            crate::suitability::SuitabilityIndex::from_state(loaded.suitability.clone()).is_empty(),
+            "the absent suitability record defaults to the empty index"
+        );
+        // The empty record queries neutrally — every candidate tie at 0.
+        let index = crate::suitability::SuitabilityIndex::from_state(loaded.suitability.clone());
+        let candidates = vec!["a".to_owned(), "b".to_owned()];
+        let ranked = index.rank(
+            &candidates,
+            crate::suitability::TaskClass::CodeEdit,
+            time::OffsetDateTime::now_utc(),
+        );
+        assert!(ranked.iter().all(|entry| entry.score_milli == 0));
     }
 
     /// A pre-#54 checkpoint record with NO `failure_diagnoses` key loads

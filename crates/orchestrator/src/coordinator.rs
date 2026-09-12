@@ -1018,6 +1018,14 @@ pub struct CoordinatorAgent {
     /// calls); the question ledger is the only carried progress and is
     /// checkpointed additively so a resume restores the same model.
     world_model: crate::world_model::WorldModel,
+    /// Issue #60: the suitability record — the bounded, decayed
+    /// dispatch-outcome history per (specialist id, task class) DERIVED
+    /// from the coordinator's own dispatch machinery (settled outcomes,
+    /// #54 diagnoses, retry/recovery turns, dispatch policy denials).
+    /// Scored ONLY as advisory ranking context for the Coordinator's
+    /// model — the model still decides; no cost/spend input exists.
+    /// Persisted additively through checkpoints.
+    suitability: crate::suitability::SuitabilityIndex,
     /// Issue #56: whether the workspace changed materially between the
     /// recorded checkpoint generation and the current snapshot generation
     /// (computed once at restore time). While set, the world model marks
@@ -1450,6 +1458,19 @@ fn specialist_task_description(task: &str, notes: Option<&str>) -> String {
     }
 }
 
+/// Issue #60: the observed dispatch spend in thousandths of a dollar —
+/// recorded for ledger-interpretation parity ONLY. This value is stored
+/// on the suitability observation and NEVER reaches the score (pinned by
+/// `crates/orchestrator/src/suitability.rs::tests::
+/// spend_does_not_change_ranking`).
+fn settled_cost_milli(result: &AgentRunResult) -> u64 {
+    if result.cost_usd.is_finite() {
+        (result.cost_usd.max(0.0) * 1_000.0).round() as u64
+    } else {
+        0
+    }
+}
+
 /// A short machine label for an agent outcome (the `call_specialist` tool
 /// result the Coordinator's model reads).
 fn outcome_label(outcome: &AgentOutcome) -> &'static str {
@@ -1597,6 +1618,11 @@ impl CoordinatorAgent {
             // from the checkpoint's additive field, or an old checkpoint
             // defaults it and the next decision session rebuilds it.
             world_model: crate::world_model::WorldModel::default(),
+            // Issue #60: the suitability record starts empty and grows
+            // only through the coordinator's OWN dispatch settlements
+            // (derived evidence); a resume restores it from the
+            // checkpoint's additive field.
+            suitability: crate::suitability::SuitabilityIndex::default(),
             // Issue #56: whether the workspace changed materially between
             // the checkpoint and this resume (the F3 generation verdict);
             // the world-model builder consumes it for the V-CHANGE rule.
@@ -2666,6 +2692,10 @@ impl CoordinatorAgent {
             // Issue #56: the world-model projection rides every persist so
             // a resume restores the SAME model (additive checkpoint field).
             world_model: self.world_model.clone(),
+            // Issue #60: the suitability record rides every persist so
+            // delegation-quality evidence survives a resume (additive
+            // checkpoint field).
+            suitability: self.suitability.state(),
         }
     }
 
@@ -3475,6 +3505,11 @@ impl CoordinatorAgent {
         // rebuilds the model from the restored state), and compute the
         // workspace-change verdict the model's freshness rules consume.
         self.world_model = cp.world_model.clone();
+        // Issue #60: restore the suitability record additively (old
+        // checkpoints carry the empty default — the ranking is neutral
+        // until outcomes are recorded again); the caps are enforced on
+        // restore so resumed stores stay bounded.
+        self.suitability = crate::suitability::SuitabilityIndex::from_state(cp.suitability.clone());
         self.workspace_changed_since_checkpoint =
             match (&cp.snapshot_generation, self.snapshot_generation()) {
                 (Some(recorded), Some(current)) => recorded.as_str() != current.as_str(),
@@ -7697,6 +7732,12 @@ impl CoordinatorAgent {
             }
         };
         let decision_id = decision.id.clone();
+        // Issue #60: the deterministic task class for the suitability
+        // record — derived from the task text + expected artifacts (never
+        // model-judged), attributed to the REQUESTED specialist.
+        let suitability_class =
+            crate::suitability::TaskClass::derive(&args.task, &args.expected_artifacts);
+        let suitability_now = time::OffsetDateTime::now_utc();
         // Issue #56: the decision consumes the world model at DECISION time
         // — the deterministic skip-recommendation for completed-verified
         // work (every expected artifact already verified-clean in the
@@ -7776,6 +7817,17 @@ impl CoordinatorAgent {
             // executor's requires-approval-no-sink semantics. Any non-`Allow`
             // verdict (current or future) is likewise a denial.
             Ok(_) => {
+                // Issue #60: a denied dispatch is a tool/permission
+                // compatibility miss for the requested specialist —
+                // recorded (derive-only history; spend is never scored).
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
                 return serde_json::json!({
                     "error": "policy_denied",
                     "message": "the run's policy denied this specialist dispatch",
@@ -7787,6 +7839,14 @@ impl CoordinatorAgent {
                 {
                     return serde_json::json!({ "error": "cancelled" });
                 }
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
                 return serde_json::json!({
                     "error": "policy_denied",
                     "message": format!("policy evaluation failed: {error}"),
@@ -7933,6 +7993,14 @@ impl CoordinatorAgent {
                     &diagnosis,
                 )
                 .await;
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Failure,
+                    Some(diagnosis.kind.as_str()),
+                    suitability_now,
+                    0,
+                );
                 self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
                 return serde_json::json!({
                     "error": "model_selection_failed",
@@ -7972,6 +8040,14 @@ impl CoordinatorAgent {
                     &diagnosis,
                 )
                 .await;
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Failure,
+                    Some(diagnosis.kind.as_str()),
+                    suitability_now,
+                    0,
+                );
                 self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
                 return serde_json::json!({
                     "error": "dispatch_failed",
@@ -8047,8 +8123,22 @@ impl CoordinatorAgent {
         // tool result so the Coordinator's next decision is diagnosis-
         // informed, and the audit trail.
         let mut outcome_diagnosis: Option<crate::failure_diagnosis::FailureDiagnosis> = None;
+        // Issue #60: the observed spend is captured before the outcome
+        // match can partially move the result — the recorded observation
+        // travels with the outcome record.
+        let result_cost_milli = settled_cost_milli(&result);
         match result.outcome {
             AgentOutcome::Success => {
+                // Issue #60: settled success — recorded with the observed
+                // spend (record-only; never a score input).
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Success,
+                    None,
+                    suitability_now,
+                    result_cost_milli,
+                );
                 if let Some(node) = graph.get_mut(&subtask_id) {
                     node.deliverable = Some(summary_text.clone());
                     node.completed_at = Some(time::OffsetDateTime::now_utc());
@@ -8075,7 +8165,17 @@ impl CoordinatorAgent {
                     ledger.notes.push(note);
                 }
             }
-            AgentOutcome::NeedsRevision { reason } => {
+            AgentOutcome::NeedsRevision { ref reason } => {
+                // Issue #60: the need-correction cycle is observed —
+                // recorded against the specialist's standing.
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::NeedsRevision,
+                    None,
+                    suitability_now,
+                    result_cost_milli,
+                );
                 // The completed task stays done; the Coordinator decides the
                 // correction (it sees `needs_revision` in the tool result).
                 if let Some(node) = graph.get_mut(&subtask_id) {
@@ -8101,6 +8201,14 @@ impl CoordinatorAgent {
                     AgentOutcome::Blocked { on } => crate::failure_diagnosis::diagnose_blocked(on),
                     _ => crate::failure_diagnosis::diagnose_outcome_failure(&summary_text),
                 };
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Failure,
+                    Some(diagnosis.kind.as_str()),
+                    suitability_now,
+                    result_cost_milli,
+                );
                 self.record_failure_diagnosis(
                     task.session_id,
                     Some(subtask_id),
@@ -9405,7 +9513,7 @@ impl CoordinatorAgent {
     /// system-instruction excerpt. Deleted/disabled agents are absent by
     /// construction (the registry never holds them) — this is how the
     /// Coordinator "knows" who to call: context, not policy.
-    fn render_specialist_roster(&self) -> String {
+    fn render_specialist_roster(&self, task: &AgentTask) -> String {
         let mut ids = self.registry.ids();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut out = String::from("[Available specialists]\n");
@@ -9432,6 +9540,40 @@ impl CoordinatorAgent {
                  output_mode: {output_mode}\n  instructions: {instructions}\n"
             ));
         }
+        out.push_str(&self.render_suitability_advisory(task));
+        out
+    }
+
+    /// Issue #60: the suitability ranking as ADVISORY context under the
+    /// roster — the deterministic, decayed dispatch-outcome evidence for
+    /// the run's task class, ranked with bounded reasons (no cost/spend/
+    /// latency/model-quality inputs exist on the scoring path). ADVICE,
+    /// NOT a gate: the Coordinator's model still decides who to call, and
+    /// a candidate absent from the section (fresh history) is not
+    /// disadvantaged — the ranking ordering only ranks; no dispatch rule
+    /// reacts to it. Rendered ONCE per decision session, exactly where
+    /// the candidate roles live.
+    fn render_suitability_advisory(&self, task: &AgentTask) -> String {
+        let ids = self.registry.ids();
+        if ids.is_empty() || self.suitability.is_empty() {
+            return String::new();
+        }
+        let class = crate::suitability::TaskClass::derive(&task.description, &[]);
+        let candidate_ids: Vec<String> = ids.iter().map(|id| id.as_str().to_owned()).collect();
+        let now = time::OffsetDateTime::now_utc();
+        let ranking = self.suitability.rank(&candidate_ids, class, now);
+        let mut out = String::from(
+            "\n[Suitability signal (advisory — measured from past dispatch outcomes for              this task class; not a rule, never a dispatch requirement; contains no cost,              spend, or workload inputs)]\n",
+        );
+        for entry in ranking {
+            let score = if entry.score_milli < 0 {
+                format!("-{}", entry.score_milli.abs())
+            } else {
+                format!("+{}", entry.score_milli)
+            };
+            let reasons = crate::suitability::bound_reasons(&entry.reasons);
+            out.push_str(&format!("- {}: score {} — {reasons}\n", entry.agent_id, score));
+        }
         out
     }
 
@@ -9448,7 +9590,7 @@ impl CoordinatorAgent {
         if dispatching {
             prompt.push_str(COORDINATOR_DISPATCH_PROMPT);
             prompt.push_str("\n\n");
-            prompt.push_str(&self.render_specialist_roster());
+            prompt.push_str(&self.render_specialist_roster(task));
         } else {
             prompt.push_str(
                 "You are the Coordinator. This run is PLANNING-ONLY: produce the plan for \
