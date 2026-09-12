@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Coordinator world model (#56):** deterministic structured projection
+  (objective, facts-by-id with freshness rules, artifacts+owners,
+  unresolved-question lifecycle, risks) consumed by dispatch decisions and
+  persisted additively across resume; bounded and capped.
 - **Global-only orchestration enforced:** project-layer `[orchestration]` /
   roster / model-pins are ignored at load (warned, never silent) so seeded
   global selections can no longer collide with project selections and break
