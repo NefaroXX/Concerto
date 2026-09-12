@@ -49,6 +49,11 @@ pub const MAX_CONSULT_QUESTION_CHARS: usize = 2_000;
 /// Maximum characters of the findings recorded as evidence.
 pub const MAX_CONSULT_FINDINGS_CHARS: usize = 4_000;
 
+/// Issue #59: the deterministic low-confidence trigger. An unresolved
+/// question that has stood at least this many world-model rebuilds without
+/// resolution requests a consultation before the next decision turn.
+pub const CONSULT_TRIGGER_MIN_CYCLES: u32 = 2;
+
 /// The audit `rule_matched` label for a write-classified denial.
 const RULE_CONSULT_READ_ONLY: &str = "consult_read_only";
 /// The audit `rule_matched` label for an effort-cap denial.
@@ -283,6 +288,35 @@ pub(crate) fn consult_read_only_executor(
     )
 }
 
+/// The deterministic low-confidence consultation request (issue #59).
+///
+/// When an OPEN unresolved question has stood at least
+/// [`CONSULT_TRIGGER_MIN_CYCLES`] world-model rebuilds without resolution,
+/// the decision loop injects a bounded message asking the Coordinator to
+/// consult before re-dispatching related work. The pick is deterministic:
+/// the question with the highest standing age, ties broken by the smallest
+/// id. `None` when no question qualifies.
+pub(crate) fn consultation_nudge(
+    world: &crate::world_model::WorldModel,
+) -> Option<(String, String)> {
+    let candidate = world
+        .questions
+        .iter()
+        .filter(|question| {
+            question.state == crate::world_model::QuestionState::Open
+                && question.cycles_open >= CONSULT_TRIGGER_MIN_CYCLES
+        })
+        .max_by_key(|question| (question.cycles_open, std::cmp::Reverse(question.id.clone())))?;
+    let message = format!(
+        "CONSULTATION REQUEST: unresolved question {} — \"{}\" — has stood {} decision \
+         cycles without resolution. Use the consult_specialist tool (read-only; its \
+         findings are recorded as citable evidence) to resolve it before \
+         re-dispatching related work, or resolve it deliberately another way.",
+        candidate.id, candidate.question, candidate.cycles_open,
+    );
+    Some((candidate.id.clone(), message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +491,53 @@ mod tests {
         let definition = consult_tool_definition();
         assert_eq!(definition.name, CONSULT_SPECIALIST_TOOL);
         assert!(definition.description.contains("Read-only"));
+    }
+
+    #[test]
+    fn consultation_nudge_fires_only_for_aged_open_questions() {
+        use crate::world_model::{QuestionKind, QuestionState, UnresolvedQuestion, WorldModel};
+
+        fn question(id: &str, cycles_open: u32, state: QuestionState) -> UnresolvedQuestion {
+            UnresolvedQuestion {
+                id: id.to_owned(),
+                kind: QuestionKind::OpenProblem,
+                question: format!("the {id} question"),
+                blocks: None,
+                needed: Vec::new(),
+                opened_journal_len: 0,
+                opened_ref: None,
+                opened_at_ms: 1,
+                cycles_open,
+                state,
+                resolved_by: None,
+            }
+        }
+
+        // Below the trigger age: no nudge.
+        let mut world = WorldModel {
+            questions: vec![question(
+                "q-young",
+                CONSULT_TRIGGER_MIN_CYCLES - 1,
+                QuestionState::Open,
+            )],
+            ..Default::default()
+        };
+        assert!(consultation_nudge(&world).is_none(), "a young question does not trigger");
+
+        // An aged OPEN question triggers, deterministically picking the
+        // oldest standing one (ties broken by the smallest id).
+        world.questions = vec![
+            question("q-b", CONSULT_TRIGGER_MIN_CYCLES, QuestionState::Open),
+            question("q-a", CONSULT_TRIGGER_MIN_CYCLES, QuestionState::Open),
+            question("q-old", CONSULT_TRIGGER_MIN_CYCLES + 3, QuestionState::Open),
+            question("q-resolved", CONSULT_TRIGGER_MIN_CYCLES + 9, QuestionState::Resolved),
+        ];
+        let (id, message) = consultation_nudge(&world).expect("an aged question triggers");
+        assert_eq!(id, "q-old", "the oldest standing question wins");
+        assert!(message.contains("consult_specialist"), "the nudge names the tool: {message}");
+        assert!(message.contains("q-old"), "the nudge names the question id");
+
+        // Determinism: identical input, identical output.
+        assert_eq!(consultation_nudge(&world), Some((id, message)));
     }
 }

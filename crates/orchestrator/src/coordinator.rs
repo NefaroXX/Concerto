@@ -7280,6 +7280,9 @@ impl CoordinatorAgent {
         // Whether the loop ran out of iterations (as opposed to stopping in
         // prose) — only then is the structural-bound note warranted.
         let mut hit_iteration_bound = true;
+        // Issue #59: question ids the deterministic consultation request has
+        // already been injected for (once per question per session).
+        let mut consult_nudged_questions: HashSet<String> = HashSet::new();
         // Issue #53: set when the progress guard escalates (recovery budget
         // exhausted) — the loop then stops through the recoverable-note
         // machinery, so the tail must not add a second, misleading
@@ -7534,6 +7537,40 @@ impl CoordinatorAgent {
                 let ledger_paths: Vec<camino::Utf8PathBuf> = ledger.all_files.clone();
                 let models: Vec<String> = ledger.model_assignments.values().cloned().collect();
                 self.refresh_world_model(task, &ledger_paths, models, cancel).await;
+                // Issue #59: the deterministic low-confidence trigger — a
+                // standing unresolved question aged past
+                // [`crate::consultation::CONSULT_TRIGGER_MIN_CYCLES`]
+                // requests a consultation BEFORE the next decision turn.
+                // Placement: immediately after the projection the next
+                // decision consumes, riding the same reconsideration-nudge
+                // pattern as issue #53 (a bounded user message into the
+                // existing conversation — never a forced tool call). A
+                // settled consultation resolves the question (issue #56
+                // Q-RESOLVE rules read the Settled consult decision), so
+                // the request stops once the advice lands.
+                if let Some((question_id, nudge)) =
+                    crate::consultation::consultation_nudge(&self.world_model)
+                {
+                    if consult_nudged_questions.insert(question_id) {
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task.id.0,
+                            EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: nudge.clone(),
+                            },
+                        );
+                        messages.push(Message {
+                            role: Role::User,
+                            content: nudge,
+                            tool_calls: None,
+                            tool_results: None,
+                            reasoning_content: None,
+                            tokens_in: None,
+                            tokens_out: None,
+                        });
+                    }
+                }
             }
             match self.progress_tracker.observe(&observation) {
                 crate::progress::CycleVerdict::Progressing => {}
@@ -10137,6 +10174,17 @@ mod tests {
                 .collect()
         }
 
+        /// Every message content the provider has observed (prompts, tool
+        /// results, injected user messages) in arrival order.
+        fn message_contents(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| request.messages.iter().map(|message| message.content.clone()))
+                .collect()
+        }
+
         /// Every tool-result JSON payload observed in Tool messages of the
         /// captured requests — the results the coordinator loop and the
         /// consult agent read back (issue #59 observability).
@@ -10977,6 +11025,114 @@ mod tests {
             output.final_message.contains("Multi-agent orchestration completed"),
             "unexpected final message: {}",
             output.final_message
+        );
+    }
+
+    /// Issue #59 acceptance: the deterministic low-confidence trigger. A
+    /// failed dispatch whose diagnosis requires replanning opens an
+    /// unresolved question (issue #56); once it has stood
+    /// [`CONSULT_TRIGGER_MIN_CYCLES`] rebuilds, the decision loop injects
+    /// the consultation request BEFORE the next decision turn (exactly
+    /// once), and a settled consultation resolves the question (the #56
+    /// lifecycle reads the Settled consult decision as recovery evidence).
+    #[tokio::test]
+    async fn low_confidence_question_triggers_consultation_deterministically() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_fail(
+                AgentId::new("coder"),
+                "expected artifacts not produced: src/lib.rs",
+            ),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            // Cycle 1: a dispatch whose failure requires replanning — the
+            // OpenProblem question opens (age 1, below the trigger).
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the feature")]),
+            // Cycle 2: a REJECTED decision (fabricated evidence — no journal
+            // record, no settled work) so the question stands another
+            // rebuild and crosses the trigger age.
+            CoordinatorTurn::Calls(vec![call_specialist_with(
+                "coder",
+                "implement the feature",
+                None,
+                &["ev-fabricated"],
+            )]),
+            // The model obeys the consultation request.
+            CoordinatorTurn::Calls(vec![consult_specialist(
+                "researcher",
+                "why do implementations keep missing the artifacts?",
+            )]),
+            // The consultant's answer (the consult agent shares the
+            // planning provider).
+            CoordinatorTurn::Text(
+                "the artifacts miss because the design contract was never grounded".into(),
+            ),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            coordinator_allow_all_policy(),
+        )
+        .with_review_store(Some(pool.clone()));
+        let _rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the coordinator run completes");
+
+        // The consultation request was injected into the decision loop
+        // (deterministically, once the question crossed the trigger age).
+        let nudge_count = provider
+            .message_contents()
+            .iter()
+            .filter(|content| content.contains("CONSULTATION REQUEST"))
+            .count();
+        assert!(nudge_count >= 1, "the consultation request must be injected");
+        // The consult settled with findings recorded as consultative
+        // evidence on the whiteboard.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        let evidence_id = consult_result["evidence_id"].as_str().expect("a real evidence id");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let finding = logged
+            .iter()
+            .find(|event| event.event_id == evidence_id)
+            .expect("the finding event exists on the whiteboard");
+        assert_eq!(finding.kind, WhiteboardKind::Finding);
+        assert_eq!(finding.payload["consultative"], serde_json::Value::Bool(true));
+        // The settled consultation RESOLVED the standing question (the #56
+        // lifecycle consumes the Settled consult decision as recovery
+        // evidence). The finding event's causation IS the consult decision
+        // id the resolution recorded.
+        let resolved = coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.state == crate::world_model::QuestionState::Resolved)
+            .expect("the standing question was resolved by the consultation");
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            finding.causation.as_deref(),
+            "the question was resolved by the consult decision"
         );
     }
 
