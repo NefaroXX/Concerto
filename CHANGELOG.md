@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Delegation quality (#60):** per-(agent, task-class) suitability from
+  dispatch history (14-day decay, exclusion floor, bounded reasons),
+  advisory-only; spend recorded, never scored; models never selected.
 - **Specialist consultation (#59):** typed `Consult` operation distinct
   from dispatch — read-only enforced (writes/shell/git denied even under
   Acting grants, proven adversarially), findings become citable evidence,
