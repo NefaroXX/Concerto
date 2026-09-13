@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Hardcoded coordinator + Studio 2.0 panels:** coordinator leaves the
+  Studio roster on all paths (frozen definition, global-default model,
+  existing config entries ignored at display); legacy pipeline speaks
+  Relationships vocabulary; four read-only observability panels (decision
+  journal, world model, failure diagnoses, suitability) fed from
+  checkpoints with fail-soft empty states.
 - **Studio fallback + default seeding:** the inactive-blueprint view no
   longer directs users to project config; opening the Studio fills a
   default standard blueprint selection when none is declared (idempotent,
