@@ -33,6 +33,12 @@
 //!   array wholesale (merge-aware, atomic) so the written entries ARE the
 //!   roster — a deletion stays deleted, and the embedded seeds never merge
 //!   back in.
+//! - [`ensure_default_blueprint`] fills a TOTAL absence of a blueprint
+//!   selection (no `name`/`include`/`inline` under an existing
+//!   `[orchestration]`) with the shipped `standard` selector, so a config
+//!   that declares the section but never selected a pipeline can no longer
+//!   leave the Studio in its degraded fallback. Any declared selector is left
+//!   untouched, which keeps the exactly-one invariant safe by construction.
 //!
 //! A failed write never leaves a truncated file at the target: the temp file
 //! is written and flushed first, `rename` then atomically replaces the target
@@ -603,6 +609,88 @@ pub fn seed_agent_roster_only(config_path: &Path) -> Result<(), ConfigError> {
     multi_agent.insert("custom_agents", toml_edit::Item::ArrayOfTables(agents));
 
     atomic_write(config_path, doc.to_string().as_bytes())
+}
+
+/// The three mutually exclusive blueprint selector keys of
+/// [`crate::blueprint::BlueprintSelection`]. Any one being declared means the
+/// selection is owned.
+const BLUEPRINT_SELECTOR_KEYS: [&str; 3] = ["name", "include", "inline"];
+
+/// Whether an `[orchestration.blueprint]` item — a real table or an inline
+/// table — declares any blueprint selector key.
+fn blueprint_selector_declared(item: &toml_edit::Item) -> bool {
+    match item {
+        toml_edit::Item::Table(table) => {
+            BLUEPRINT_SELECTOR_KEYS.iter().any(|key| table.contains_key(key))
+        }
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)) => {
+            BLUEPRINT_SELECTOR_KEYS.iter().any(|key| inline.contains_key(key))
+        }
+        _ => false,
+    }
+}
+
+/// Fill a missing blueprint selection in `config_path` with the default
+/// `standard` selector (`BlueprintSelection::default()`: the shipped catalog
+/// name, `named_blueprint("standard")`).
+///
+/// The Studio's degraded fallback ("orchestration blueprint inactive") is
+/// reachable only when `[orchestration]` exists without any selector — the
+/// section is present but no `name`/`include`/`inline` was ever written. This
+/// writer closes that gap through the same `toml_edit` document model as the
+/// roster seed, preserving every other key — an existing `[orchestration]`
+/// table, its `schema_version`, comments, and unrelated sections — byte for
+/// byte. The write is atomic ([`atomic_write`]) and idempotent (a second run
+/// sees the selector and is a strict no-op).
+///
+/// The exactly-one load invariant is safe **by construction**: the write is
+/// skipped whenever ANY of the three selectors is present, so only a total
+/// absence is ever filled and an existing (valid) selection is never
+/// overwritten.
+///
+/// A document with no `[orchestration]` table at all is left alone — such a
+/// config is on the legacy path, and converting it to blueprint mode is not
+/// this writer's job (the fresh roster seed already emits an inline standard
+/// selection for a brand-new config).
+///
+/// Returns `true` when the file was written, `false` when no selection was
+/// missing (or no `[orchestration]` table exists).
+pub fn ensure_default_blueprint(config_path: &Path) -> Result<bool, ConfigError> {
+    let raw = fs::read_to_string(config_path)
+        .map_err(|e| ConfigError::Load(format!("failed to read {}: {e}", config_path.display())))?;
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        ConfigError::Load(format!("failed to parse {}: {e}", config_path.display()))
+    })?;
+
+    // Only an existing `[orchestration]` section is in scope.
+    if doc.get("orchestration").is_none() {
+        return Ok(false);
+    }
+    let orchestration =
+        ensure_table_mut(doc.as_table_mut(), "orchestration").map_err(|message| {
+            ConfigError::Load(format!(
+                "cannot fill the blueprint selection in '{}': {message}",
+                config_path.display()
+            ))
+        })?;
+
+    // Ownership rule: any declared selector means the selection is owned —
+    // never overwrite it. This is what keeps the exactly-one invariant safe.
+    if orchestration.get("blueprint").is_some_and(blueprint_selector_declared) {
+        return Ok(false);
+    }
+
+    let blueprint = ensure_table_mut(orchestration, "blueprint").map_err(|message| {
+        ConfigError::Load(format!(
+            "cannot fill the blueprint selection in '{}': {message}",
+            config_path.display()
+        ))
+    })?;
+    // `BlueprintSelection::default()` written as the explicit catalog name.
+    blueprint.insert("name", toml_edit::value("standard"));
+
+    atomic_write(config_path, doc.to_string().as_bytes())?;
+    Ok(true)
 }
 
 /// Encode a roster of agents into a `toml_edit` array-of-tables, serializing
@@ -1204,6 +1292,167 @@ name = "tdd"
         let resolved =
             orchestration.resolve(&[], None).expect("the seeded standard blueprint must resolve");
         assert_eq!(resolved.stages.len(), 5, "standard pipeline has five stages");
+    }
+
+    /// An `[orchestration]` section with no selector at all is filled with
+    /// the default `standard` catalog selection; unrelated content survives
+    /// byte-for-byte, the result loads and resolves, and a second run is a
+    /// strict no-op (idempotent, byte-identical).
+    #[test]
+    fn ensure_default_blueprint_fills_total_absence_with_the_standard_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# user config
+schema_version = 7
+
+[providers]
+primary = "openai"
+model = "gpt-4o"
+
+[orchestration]
+schema_version = 1
+"#,
+        )
+        .expect("seed config");
+
+        assert!(
+            ensure_default_blueprint(&path).expect("fill must succeed"),
+            "a total absence of name/include/inline must be filled"
+        );
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("name = \"standard\""),
+            "the standard default must be written\n{after}"
+        );
+        for line in ["# user config", "[providers]", "primary = \"openai\"", "[orchestration]"] {
+            assert!(after.contains(line), "unrelated content changed: missing {line}\n{after}");
+        }
+
+        let cfg =
+            crate::load_config(Some(&path), None).expect("the filled config must load and resolve");
+        let orchestration = cfg.orchestration.expect("[orchestration] must be present");
+        assert_eq!(
+            orchestration.blueprint.name.as_deref(),
+            Some("standard"),
+            "the filled selection must be the standard catalog default"
+        );
+        assert_eq!(
+            cfg.resolved_blueprint.as_ref().map(|r| r.blueprint.name.as_str()),
+            Some("standard"),
+            "the config must resolve to the standard blueprint"
+        );
+
+        // Idempotent: the second run sees the selector and writes nothing.
+        assert!(
+            !ensure_default_blueprint(&path).expect("second run must succeed"),
+            "a config that already declares a selector is never written"
+        );
+        let second = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, second, "the second run must be byte-identical");
+    }
+
+    /// Every present-selector shape — `name`, `include`, `inline`, and each
+    /// selector expressed as an inline table — is owned: the writer reports
+    /// `false` and leaves the file byte-identical.
+    #[test]
+    fn ensure_default_blueprint_leaves_every_present_selector_shape_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let named = dir.path().join("named.toml");
+        std::fs::write(
+            &named,
+            "schema_version = 7\n[orchestration]\nschema_version = 1\n[orchestration.blueprint]\nname = \"tdd\"\n",
+        )
+        .expect("seed named selection");
+
+        let included = dir.path().join("included.toml");
+        std::fs::write(
+            &included,
+            "schema_version = 7\n[orchestration]\nschema_version = 1\n[orchestration.blueprint]\ninclude = \"orchestration.blueprint.toml\"\n",
+        )
+        .expect("seed include selection");
+
+        let inline = dir.path().join("inline.toml");
+        std::fs::write(&inline, "schema_version = 7\n").expect("seed inline base");
+        crate::save_blueprint_selection(
+            &inline,
+            &BlueprintSelection {
+                name: None,
+                include: None,
+                inline: Some(crate::blueprint::standard_blueprint()),
+            },
+        )
+        .expect("seed inline selection");
+
+        // Selector carried by an inline table rather than a section header.
+        let inline_table = dir.path().join("inline_table.toml");
+        std::fs::write(
+            &inline_table,
+            "schema_version = 7\norchestration = { schema_version = 1, blueprint = { name = \"tdd\" } }\n",
+        )
+        .expect("seed inline-table selection");
+
+        for path in [&named, &included, &inline, &inline_table] {
+            let before = std::fs::read_to_string(path).expect("read before");
+            assert!(
+                !ensure_default_blueprint(path).expect("present selector must not error"),
+                "an existing selection must never be overwritten: {}",
+                path.display()
+            );
+            let after = std::fs::read_to_string(path).expect("read after");
+            assert_eq!(after, before, "present-selection file changed: {}", path.display());
+        }
+    }
+
+    /// A config with no `[orchestration]` table at all is on the legacy path
+    /// and is left untouched — the writer never converts a legacy config into
+    /// blueprint mode, and a missing file is a read error (never silently
+    /// created here; the roster seed owns first-run creation).
+    #[test]
+    fn ensure_default_blueprint_is_a_noop_without_an_orchestration_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        let original = "schema_version = 7\n[providers]\nprimary = \"openai\"\n";
+        std::fs::write(&path, original).expect("seed legacy config");
+
+        assert!(
+            !ensure_default_blueprint(&path).expect("legacy config must not error"),
+            "a config without [orchestration] has no selection to fill"
+        );
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, original, "a legacy config must remain byte-identical");
+
+        let missing = dir.path().join("missing.toml");
+        assert!(ensure_default_blueprint(&missing).is_err(), "a missing file is a read error");
+    }
+
+    /// An empty `[orchestration.blueprint]` table (present but selector-less)
+    /// is total absence too: it is filled, and the previously failing load now
+    /// succeeds with the standard default.
+    #[test]
+    fn ensure_default_blueprint_fills_an_empty_blueprint_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 7\n[orchestration]\nschema_version = 1\n[orchestration.blueprint]\n",
+        )
+        .expect("seed empty selection");
+
+        assert!(
+            ensure_default_blueprint(&path).expect("fill must succeed"),
+            "an empty blueprint table is total absence and must be filled"
+        );
+        let cfg = crate::load_config(Some(&path), None)
+            .expect("the filled config must load after being fixed");
+        assert_eq!(
+            cfg.orchestration.and_then(|o| o.blueprint.name).as_deref(),
+            Some("standard"),
+            "the empty table must resolve to the standard default"
+        );
     }
 
     /// ADR-58/59 (rewritten) Testing (orphan contract): [`roster_materialized`]

@@ -2448,13 +2448,16 @@ impl App {
     /// the Studio banner + the explicit import action own moving those keys
     /// project→global.
     ///
-    /// Seeding runs ONLY against the global config file and ONLY when its
-    /// roster was never materialized. Three global-file shapes:
+    /// Two independent fills run ONLY against the global config file: the
+    /// roster seed (only when its roster was never materialized) and the
+    /// blueprint-selection fill (only when `[orchestration]` exists with no
+    /// selector). Three global-file shapes for the roster seed:
     ///
     /// 1. **Key present** (`roster_materialized` on the global file) →
-    ///    strict no-op: whether the array is empty (all agents deleted) or
-    ///    populated, the global config owns its roster and the seed is
-    ///    skipped.
+    ///    strict no-op for the ROSTER: whether the array is empty (all agents
+    ///    deleted) or populated, the global config owns its roster and the
+    ///    seed is skipped. The blueprint fill below still runs — roster
+    ///    ownership and selection ownership are independent.
     /// 2. Orphan shape — `[orchestration]` present in the global file but
     ///    the roster key never materialized: `seed_agent_roster_only`
     ///    writes ONLY `[multi_agent.custom_agents]` into the global file,
@@ -2464,10 +2467,15 @@ impl App {
     ///    `seed_orchestration_roster` writes `[orchestration]`
     ///    standard-inline + the five agents, unchanged first-run bootstrap.
     ///
+    /// Independently of the roster, `ensure_default_blueprint` fills a TOTAL
+    /// absence of `name`/`include`/`inline` under an existing
+    /// `[orchestration]` with the default standard selection, so the Studio
+    /// surface can always activate; any declared selector is never touched.
+    ///
     /// A broken global file makes `roster_materialized` report owned so the
     /// seed is never attempted over it (`config_broken` already surfaces
-    /// dirty config elsewhere). After seeding, state re-derives from disk so
-    /// the first render already resolves the seeded blueprint.
+    /// dirty config elsewhere). After either fill, state re-derives from disk
+    /// so the first render already resolves the seeded blueprint.
     fn ensure_orchestration_seeded(&mut self) {
         // Global-only orchestration (2026-09): when the project file declares
         // ANY load-ignored orchestration key — its old `[orchestration]`
@@ -2489,28 +2497,47 @@ impl App {
         // Raw-file ownership test on the global layer: the `custom_agents`
         // key exists in the TOML (even `[]` = every agent deleted). "Key
         // present" means owned — deletions stick and nothing is ever written.
-        if concerto_config::roster_materialized(&config_path) {
-            return;
+        // The roster seed is skipped then, but the blueprint fill below still
+        // runs: roster ownership and blueprint-selection ownership are
+        // independent, and a config may own a roster while never having
+        // selected a blueprint (the old early return left the Studio in the
+        // degraded fallback forever).
+        let mut wrote = false;
+        if !concerto_config::roster_materialized(&config_path) {
+            // Orphan shape (global `[orchestration]` present, roster never
+            // materialized) seeds ONLY the agents so the searchable library
+            // matches the blueprint's staffing; the existing (possibly
+            // user-edited) `[orchestration]` table is preserved byte-for-byte.
+            // The raw presence signal avoids re-parsing the merged config —
+            // the orphan decision must key on the GLOBAL file only. A failed
+            // seed leaves the previous file at the target intact.
+            let global_has_orchestration = concerto_config::orchestration_declared(&config_path);
+            let seeded = if global_has_orchestration {
+                concerto_config::seed_agent_roster_only(&config_path)
+            } else {
+                concerto_config::seed_orchestration_roster(&config_path)
+            };
+            if seeded.is_err() {
+                // A failed seed leaves the previous file at the target intact;
+                // nothing to reconcile then. Broken config is surfaced
+                // elsewhere.
+                return;
+            }
+            wrote = true;
         }
-        // Orphan shape (global `[orchestration]` present, roster never
-        // materialized) seeds ONLY the agents so the searchable library
-        // matches the blueprint's staffing; the existing (possibly
-        // user-edited) `[orchestration]` table is preserved byte-for-byte.
-        // The raw presence signal avoids re-parsing the merged config — the
-        // orphan decision must key on the GLOBAL file only. A failed seed
-        // leaves the previous file at the target intact.
-        let global_has_orchestration = concerto_config::orchestration_declared(&config_path);
-        let seeded = if global_has_orchestration {
-            concerto_config::seed_agent_roster_only(&config_path)
-        } else {
-            concerto_config::seed_orchestration_roster(&config_path)
-        };
-        if seeded.is_err() {
-            // A failed seed leaves the previous file at the target intact;
-            // nothing to reconcile then. Broken config is surfaced elsewhere.
-            return;
+        // Blueprint content fill (global-only, roster-independent): when
+        // `[orchestration]` exists with NO selector (`name`/`include`/`inline`
+        // all absent) write the default standard selection so the Studio
+        // surface can always activate. Only total absence is filled — any
+        // declared selector is left untouched, so the exactly-one load
+        // invariant is safe by construction. A failure (broken/unreadable
+        // file) is ignored here; broken config is surfaced via `config_broken`.
+        if matches!(concerto_config::ensure_default_blueprint(&config_path), Ok(true)) {
+            wrote = true;
         }
-        self.reconcile_config_from_reload();
+        if wrote {
+            self.reconcile_config_from_reload();
+        }
     }
 
     /// ADR-58/59 (rewritten) Slice 2 (single-arm Save), AMENDED (global-only
@@ -4595,6 +4622,66 @@ mod tests {
             config.resolved_blueprint.as_ref().map(|r| r.blueprint.pipeline.stages.len()),
             Some(5),
             "the seeded standard blueprint resolves with a five-stage pipeline"
+        );
+        assert!(
+            app.orchestration_studio.blueprint().is_some(),
+            "the Studio must hold the editable blueprint from the first open"
+        );
+    }
+
+    /// Global-only blueprint fill on Studio open: a global config that owns
+    /// its roster (`custom_agents` present) but declares `[orchestration]`
+    /// with NO selector used to hit the old early return and stay
+    /// blueprint-selection-less forever. The seed flow now fills the default
+    /// standard selection into the global file (never a project file), so the
+    /// Studio activates the blueprint surface from the first open.
+    #[test]
+    fn ensure_orchestration_seeded_fills_a_missing_blueprint_selection() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        // Roster owned (custom_agents key present, no agents), orchestration
+        // declared, but no name/include/inline selection.
+        std::fs::write(
+            &global_config_path,
+            "schema_version = 7\n\n[orchestration]\nschema_version = 1\n\n[multi_agent]\ncustom_agents = []\n",
+        )
+        .expect("seed global config");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let raw = std::fs::read_to_string(&global_config_path).expect("global config read back");
+        assert!(
+            raw.contains("name = \"standard\""),
+            "the missing selection must be filled with the standard default\n{raw}"
+        );
+        // The roster was already owned — the fill must not have re-seeded it.
+        assert!(raw.contains("custom_agents = []"), "the owned roster must be preserved\n{raw}");
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the fill must never create a project .concerto.toml"
+        );
+
+        let config = app.config.as_ref().expect("config loaded after the fill");
+        assert_eq!(
+            config.resolved_blueprint.as_ref().map(|r| r.blueprint.name.as_str()),
+            Some("standard"),
+            "the filled selection must resolve to the standard blueprint"
         );
         assert!(
             app.orchestration_studio.blueprint().is_some(),

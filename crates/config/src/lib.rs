@@ -38,11 +38,12 @@ pub use managed::{
 };
 pub use projects::ProjectRegistry;
 pub use saving::{
-    declared_project_orchestration_keys, import_project_orchestration_to_global,
-    orchestration_declared, remove_project_orchestration_keys, roster_materialized,
-    save_agent_roster, save_blueprint, save_inline_blueprint, seed_agent_roster_only,
-    seed_orchestration_roster, strip_project_orchestration_keys, ImportOrchestrationOutcome,
-    ProjectOrchestrationStrip, GLOBAL_ONLY_ORCHESTRATION_KEYS,
+    declared_project_orchestration_keys, ensure_default_blueprint,
+    import_project_orchestration_to_global, orchestration_declared,
+    remove_project_orchestration_keys, roster_materialized, save_agent_roster, save_blueprint,
+    save_inline_blueprint, seed_agent_roster_only, seed_orchestration_roster,
+    strip_project_orchestration_keys, ImportOrchestrationOutcome, ProjectOrchestrationStrip,
+    GLOBAL_ONLY_ORCHESTRATION_KEYS,
 };
 pub use schema::{
     builtin_agent_seeds, parse_tool_schema_mode, AgentCapabilities, AgentModelAssignment,
