@@ -2502,9 +2502,10 @@ impl State {
         } else if self.selected_agent_id.is_some() {
             self.inspector_view(theme)
         } else {
-            // ADR-58/59 (rewritten) Slice 2: no splash and no manual-init button — the roster
-            // is auto-seeded on Studio open, so this inactive fallback renders
-            // only as a defensive placeholder (a broken/torn-down config).
+            // ADR-58/59 (rewritten) Slice 2: no splash and no manual-init button — the
+            // roster is auto-seeded and a missing blueprint selection is filled
+            // on Studio open, so this inactive fallback renders only as a
+            // defensive placeholder (a broken/torn-down config).
             self.blueprint_inactive_view(theme)
         };
         let panes = row![
@@ -2594,9 +2595,11 @@ impl State {
     // Blueprint surface inactive (ADR-58/59 (rewritten) Slice 2).
     //
     // Rendered only when the blueprint surface is NOT active — a defensive
-    // fallback, because Slice 2 auto-seeds the orchestration roster on Studio
-    // open (`App::ensure_orchestration_seeded`), so the surface is active
-    // from the very first open. There is no splash and no manual-init button
+    // fallback. Studio open auto-seeds the orchestration roster AND fills a
+    // missing blueprint selection (`App::ensure_orchestration_seeded`), so a
+    // config that declares `[orchestration]` with no `name`/`include`/`inline`
+    // can no longer reach this view: the fill writes the standard selection
+    // before the first render. There is no splash and no manual-init button
     // anymore: this placeholder carries nothing actionable. Palette colors
     // only.
     // ------------------------------------------------------------------
@@ -2609,8 +2612,8 @@ impl State {
             column![
                 text("Orchestration blueprint inactive").size(ts.title).color(palette.text),
                 text(
-                    "The orchestration roster is not active. Check the project config to \
-                     re-enable it.",
+                    "The orchestration blueprint is not active. Check the global config, \
+                     or reopen the Studio to restore defaults.",
                 )
                 .size(ts.body)
                 .color(palette.text_muted),
