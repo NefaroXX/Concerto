@@ -102,6 +102,7 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         orchestration: None,
         // ADR-58 P2+P3: derived state, filled by the load seam; never in files.
         resolved_blueprint: None,
+        agent_files_authoritative: false,
     })
 }
 
@@ -142,6 +143,7 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         orchestration: None,
         // ADR-58 P2+P3: derived state, filled by the load seam; never in files.
         resolved_blueprint: None,
+        agent_files_authoritative: false,
     })
 }
 
@@ -233,6 +235,7 @@ mod tests {
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
+            agent_files_authoritative: false,
         }
     }
 
@@ -261,6 +264,7 @@ mod tests {
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
+            agent_files_authoritative: false,
         }
     }
 
@@ -309,6 +313,7 @@ mod tests {
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
+            agent_files_authoritative: false,
         };
         let result = migrate_config(v3.clone()).expect("v3 should pass through");
         assert_eq!(result.schema_version, 8);

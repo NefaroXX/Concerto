@@ -126,7 +126,10 @@ pub(crate) fn merge_edit_toml(
 /// a temp file in the same directory, flush, then `rename` over the target.
 /// On any failure the temp file is removed and any pre-existing file at
 /// `path` is left untouched.
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+///
+/// Shared with the per-agent file store ([`crate::agents`]) so both write
+/// seams reuse the same atomic temp+rename discipline.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| ConfigError::Load(format!("failed to create config dir: {e}")))?;
@@ -2014,5 +2017,69 @@ role = "proj-agent"
             "the project config must stay untouched"
         );
         let _ = pdir;
+    }
+
+    // ---- blueprint-selection guarantee in the degraded shapes ----
+
+    /// A present-but-empty `[orchestration]` table (the section exists with no
+    /// selector key at all) is filled with the default standard selection, so
+    /// the Studio's stage editor is reachable instead of the inactive
+    /// placeholder.
+    #[test]
+    fn ensure_default_blueprint_fills_a_present_but_empty_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("schema_version = {}\n[orchestration]\n", crate::schema::SCHEMA_VERSION),
+        )
+        .expect("write");
+
+        assert!(ensure_default_blueprint(&config_path).expect("fill"), "must fill");
+        let cfg = crate::load_config(Some(&config_path), None).expect("load after fill");
+        let orchestration = cfg.orchestration.expect("[orchestration] present");
+        assert_eq!(orchestration.blueprint.name.as_deref(), Some("standard"));
+        let resolved = cfg.resolved_blueprint.expect("blueprint resolves");
+        assert!(!resolved.stages.is_empty(), "the stage editor has stages to render");
+    }
+
+    /// A missing selector under an existing `[orchestration]` table is the
+    /// same degraded shape; the fill makes the blueprint resolvable.
+    #[test]
+    fn ensure_default_blueprint_fills_a_missing_selector() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n[orchestration]\nschema_version = 1\n",
+                crate::schema::SCHEMA_VERSION
+            ),
+        )
+        .expect("write");
+
+        assert!(ensure_default_blueprint(&config_path).expect("fill"));
+        let cfg = crate::load_config(Some(&config_path), None).expect("load after fill");
+        assert!(cfg.resolved_blueprint.is_some());
+    }
+
+    /// A declared selector is never overwritten (exactly-one invariant is safe
+    /// by construction): the fill is a strict no-op.
+    #[test]
+    fn ensure_default_blueprint_never_overwrites_a_declared_selector() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n[orchestration]\nschema_version = 1\n[orchestration.blueprint]\nname = \"tdd\"\n",
+                crate::schema::SCHEMA_VERSION
+            ),
+        )
+        .expect("write");
+        let before = std::fs::read_to_string(&config_path).expect("read");
+
+        assert!(!ensure_default_blueprint(&config_path).expect("no-op"), "selector is owned");
+        assert_eq!(std::fs::read_to_string(&config_path).expect("read"), before);
     }
 }

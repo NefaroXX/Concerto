@@ -9,6 +9,7 @@
 //! and project configuration, provider/model assignments, retry and policy
 //! settings, shell profiles, and OS-keychain credential storage.
 
+pub mod agents;
 pub mod blueprint;
 pub mod credentials;
 pub mod facade;
@@ -20,6 +21,12 @@ mod saving;
 mod schema;
 pub mod setup;
 pub mod shell;
+
+pub use agents::{
+    agent_file_path, agents_dir_for_config, delete_agent_file, ensure_agent_files,
+    load_agent_roster, save_agent_roster_files, write_agent_file, AgentFile,
+    EnsureAgentFilesOutcome, AGENTS_DIR_NAME, AGENT_FILE_SCHEMA_VERSION,
+};
 
 pub use blueprint::{
     coordinator_fallback, coordinator_self_implement_fallback, include_write_target,
@@ -183,6 +190,24 @@ fn load_config_layers(
     // Apply schema migration if needed.
     let mut config = migration::migrate_config(config)?;
 
+    // Per-agent config files (single source of truth): when the global
+    // config dir has an `agents/` directory, the files ARE the roster. Merge
+    // them into `multi_agent.custom_agents` here — the one load-time seam —
+    // so every downstream consumer (Studio, runtime role resolution, agent
+    // registry) reads the file-sourced roster through the same types it
+    // already used. The directory's absence means files are not yet
+    // authoritative (legacy inline roster stands; the Studio's init seam
+    // materializes the files once).
+    if let Some(ref path) = global_config {
+        if let Ok(dir) = agents::agents_dir_for_config(path) {
+            if let Some(roster) = agents::load_agent_roster(&dir)? {
+                let multi = config.multi_agent.get_or_insert_with(Default::default);
+                multi.custom_agents = roster;
+                config.agent_files_authoritative = true;
+            }
+        }
+    }
+
     // ADR-44 §1: `CONCERTO_PROJECT_ROOTS` (path-separated) replaces the roots
     // from config files when set to a non-empty value — env wins per the
     // existing figment layering. Parsed here so every consumer of
@@ -288,7 +313,8 @@ impl AppConfig {
     /// config stays deleted. Only when the config declares neither do the
     /// embedded seeds stand in (the legacy embedded default, unchanged).
     pub fn owns_agent_roster(&self) -> bool {
-        self.orchestration.is_some()
+        self.agent_files_authoritative
+            || self.orchestration.is_some()
             || self.multi_agent.as_ref().is_some_and(|m| !m.custom_agents.is_empty())
     }
 }
@@ -1258,5 +1284,72 @@ relationship = "supervises"
         );
         let cfg = load_config(Some(&global_path), Some(&project)).unwrap();
         assert_eq!(cfg.session_spend_cap_usd, Some(2.0));
+    }
+
+    // ---- per-agent config files (single source of truth) ----
+
+    /// The load seam merges the per-agent files into `multi_agent.custom_agents`
+    /// and marks the roster file-authoritative, so every downstream consumer
+    /// reads the file roster through the same types.
+    #[test]
+    fn per_agent_files_are_merged_into_the_roster_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        let agents_dir = crate::agents::agents_dir_for_config(&global_path).unwrap();
+        crate::agents::write_agent_file(
+            &agents_dir,
+            &CustomAgentConfig {
+                id: "file-agent".into(),
+                name: "File Agent".into(),
+                role: "file-agent".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&global_path), None).unwrap();
+        assert!(cfg.agent_files_authoritative, "files rule when the directory exists");
+        assert!(cfg.owns_agent_roster());
+        let roster = &cfg.multi_agent.as_ref().expect("[multi_agent] present").custom_agents;
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].id, "file-agent");
+    }
+
+    /// An intentionally empty file-backed roster (every agent deleted) still
+    /// owns the roster: no builtin seed is resurrected.
+    #[test]
+    fn empty_agents_dir_owns_the_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        let agents_dir = crate::agents::agents_dir_for_config(&global_path).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let cfg = load_config(Some(&global_path), None).unwrap();
+        assert!(cfg.agent_files_authoritative);
+        assert!(
+            cfg.owns_agent_roster(),
+            "an initialized-but-empty roster still owns the roster (deletions stick)"
+        );
+    }
+
+    /// A file with a future schema version refuses loudly rather than silently
+    /// dropping settings (the load seam surfaces the error).
+    #[test]
+    fn future_agent_file_version_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        let agents_dir = crate::agents::agents_dir_for_config(&global_path).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("future.toml"),
+            "schema_version = 99\nid = \"future\"\nname = \"Future\"\nrole = \"future\"\n",
+        )
+        .unwrap();
+
+        let err = load_config(Some(&global_path), None).expect_err("future version must fail");
+        assert!(err.to_string().contains("newer"), "{err}");
     }
 }
