@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Studio fallback + default seeding:** the inactive-blueprint view no
+  longer directs users to project config; opening the Studio fills a
+  default standard blueprint selection when none is declared (idempotent,
+  never overwrites, repairs the present-but-empty table shape that breaks
+  loading).
 - **Artifact ownership (#61):** acquire-on-write, evented release on
   settle/crash, coordinator-mediated transfer only, stale on out-of-gate
   modification — enforced at the write gate, fail-closed; additive
