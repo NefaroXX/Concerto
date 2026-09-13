@@ -906,27 +906,48 @@ fn relationships_have_cycle(relationships: &[AgentRelationshipConfig]) -> bool {
     false
 }
 
+/// The single hardcoded coordinator definition (ADR-35 §5; maintainer decision
+/// 2026-09): the coordinator is constructed in code, never a user-configurable
+/// roster agent, and its prompts/capabilities are frozen here. It is never
+/// written to config and is filtered from every rendered roster surface, but it
+/// stays in [`State::agents`] so the pipeline topology and relationships that
+/// reference it remain referentially complete.
+fn default_coordinator_agent() -> AgentConfig {
+    AgentConfig {
+        id: "coordinator".into(),
+        name: "Coordinator".into(),
+        role: "coordinator".into(),
+        stage: None,
+        output_mode: OutputMode::Freeform,
+        prompt_sections: PromptSections {
+            system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
+            constraints: "Never bypass a specialist to do their job directly. If a step is ambiguous, get clarification from the Architect or Researcher before assigning it to the Coder. Don't exceed configured max_cycles between any two agents. If a specialist reports a blocking risk (security, data loss, destructive command), stop and surface it to the user instead of proceeding.".into(),
+            output_format: "1) Plan (numbered steps), 2) Specialist assignments, 3) Final synthesized result once specialists report back. No internal chain-of-thought.".into(),
+            ..Default::default()
+        },
+        model_override: None,
+        provider_id: None,
+        capabilities: AgentCapabilities { fs_read: Some(true), ..Default::default() },
+        is_custom: false,
+        disabled: false,
+    }
+}
+
+/// True when a roster row is the engine-constructed coordinator.
+///
+/// The coordinator is hardcoded (maintainer decision 2026-09): it is not a
+/// user-configured roster agent, so every rendered roster surface filters it
+/// out and the persist path never writes it back to config. Identity matches
+/// either the `id` or the legacy `role` key, case-insensitively — mirroring
+/// how the runtime reserves the role.
+fn is_coordinator_agent(agent: &AgentConfig) -> bool {
+    agent.id.eq_ignore_ascii_case("coordinator") || agent.role.eq_ignore_ascii_case("coordinator")
+}
+
 fn default_builtin_agents() -> Vec<AgentConfig> {
     // Matches config::supported.builtin_agent_seeds() typed submission contracts.
     vec![
-        AgentConfig {
-            id: "coordinator".into(),
-            name: "Coordinator".into(),
-            role: "coordinator".into(),
-            stage: None,
-            output_mode: OutputMode::Freeform,
-            prompt_sections: PromptSections {
-                system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
-                constraints: "Never bypass a specialist to do their job directly. If a step is ambiguous, get clarification from the Architect or Researcher before assigning it to the Coder. Don't exceed configured max_cycles between any two agents. If a specialist reports a blocking risk (security, data loss, destructive command), stop and surface it to the user instead of proceeding.".into(),
-                output_format: "1) Plan (numbered steps), 2) Specialist assignments, 3) Final synthesized result once specialists report back. No internal chain-of-thought.".into(),
-                ..Default::default()
-            },
-            model_override: None,
-            provider_id: None,
-            capabilities: AgentCapabilities { fs_read: Some(true), ..Default::default() },
-            is_custom: false,
-            disabled: false,
-        },
+        default_coordinator_agent(),
         AgentConfig {
             id: "architect".into(),
             name: "Architect".into(),
@@ -1092,6 +1113,12 @@ impl State {
     /// default).
     pub fn load_from_config(&mut self, config: &AppConfig) {
         let multi = config.multi_agent.clone().unwrap_or_default();
+        // The coordinator is hardcoded (maintainer decision 2026-09): an
+        // existing config file entry matching its identity is ignored at every
+        // rendered roster surface (`visible_agents`) and never persisted back,
+        // but it is left in `self.agents` untouched so the pipeline topology
+        // that references it stays referentially complete and no user data on
+        // disk is rewritten or lost.
         let config_agents: Vec<AgentConfig> =
             multi.custom_agents.iter().map(custom_to_agent).collect();
         self.agents = if config.owns_agent_roster() {
@@ -1240,11 +1267,21 @@ impl State {
         }
     }
 
+    /// Roster rows the user may see or edit. The hardcoded coordinator is
+    /// engine-owned and filtered from every rendered roster surface
+    /// (maintainer decision 2026-09); it remains in `self.agents` so the
+    /// pipeline topology and relationships stay complete.
+    fn visible_agents(&self) -> impl Iterator<Item = &AgentConfig> {
+        self.agents.iter().filter(|agent| !is_coordinator_agent(agent))
+    }
+
     /// Parts of the studio that should be persisted back to config.
     pub fn persisted_parts(
         &self,
     ) -> (Vec<CustomAgentConfig>, Vec<AgentRelationshipConfig>, Vec<PipelinePreset>) {
-        let custom = self.agents.iter().map(agent_to_custom).collect();
+        // The coordinator is hardcoded and never persisted (maintainer
+        // decision 2026-09): filter it from the roster written to config.
+        let custom = self.visible_agents().map(agent_to_custom).collect();
         let rels = self.relationships.clone();
         // Built-in presets are seeded in code and must never round-trip
         // through config — persisting them is what made the list grow.
@@ -1290,9 +1327,9 @@ impl State {
             messages.push("Run limits: spend cap multiplier must be a positive number".into());
         }
 
-        if !self.agents.iter().any(|a| a.id == "coordinator" || a.role == "coordinator") {
-            messages.push("No coordinator agent present".into());
-        }
+        // The coordinator is code-injected (hardcoded, maintainer decision
+        // 2026-09), so roster validation no longer warns about its absence:
+        // it exists by construction, not by roster membership.
 
         // ADR-35 phase 4: the eval engine is gated on the validator's `eval`
         // capability. Warn in the studio so an eval-off validator doesn't
@@ -3233,7 +3270,9 @@ impl State {
 
         let query = self.search_query.to_lowercase();
         let mut list = column![].spacing(sp.xs);
-        for agent in &self.agents {
+        // The hardcoded coordinator is engine-owned and never rendered as a
+        // roster row (maintainer decision 2026-09), on either path.
+        for agent in self.visible_agents() {
             if query.is_empty()
                 || agent.name.to_lowercase().contains(&query)
                 || agent.role.to_lowercase().contains(&query)
@@ -3265,48 +3304,32 @@ impl State {
                 )
                 .style(if selected { button::primary } else { button::text })
                 .width(Length::Fill);
-                // The coordinator is engine-owned (ADR-35 §5): on the roster
-                // surface it is a locked row — visibly rendered with an
-                // "Engine-owned" marker, but never selectable into the
-                // inspector and with no Edit/Delete affordance. Guarding the
-                // affordance here (not the row) keeps the sibling
-                // `RemoveAgent`/`SelectAgent` message guards as the final
-                // backstop for non-UI paths.
-                let select = if agent.id == "coordinator" && blueprint_path {
-                    select
-                } else {
-                    select.on_press(Message::OrchestrationStudio(StudioMessage::SelectAgent(Some(
-                        agent.id.clone(),
-                    ))))
-                };
+                // The coordinator is filtered from `visible_agents`, so every
+                // rendered row is selectable/editable (no engine-owned special
+                // case remains here).
+                let select = select.on_press(Message::OrchestrationStudio(
+                    StudioMessage::SelectAgent(Some(agent.id.clone())),
+                ));
                 // Slice 3 roster CRUD: on the blueprint path every agent is a
-                // fully editable template except the engine-owned coordinator
-                // (locked, see above). Edit routes to the per-agent inspector
-                // (persisted through the roster Save arm); Delete removes the
-                // agent from config on the next Save. The legacy path keeps
-                // its historical "Remove custom agent only" affordance.
+                // fully editable template. Edit routes to the per-agent
+                // inspector (persisted through the roster Save arm); Delete
+                // removes the agent from config on the next Save. The legacy
+                // path keeps its historical "Remove custom agent only"
+                // affordance.
                 let agent_row = if blueprint_path {
-                    if agent.id == "coordinator" {
-                        row![select, badge(theme, "Engine-owned")]
-                            .spacing(sp.xs)
-                            .align_y(Alignment::Center)
-                    } else {
-                        row![
-                            select,
-                            button("Edit").style(button::text).on_press(
-                                Message::OrchestrationStudio(StudioMessage::SelectAgent(Some(
-                                    agent.id.clone()
-                                )),)
-                            ),
-                            button("Delete").style(button::text).on_press(
-                                Message::OrchestrationStudio(StudioMessage::RemoveAgent(
-                                    agent.id.clone()
-                                ),)
-                            ),
-                        ]
-                        .spacing(sp.xs)
-                        .align_y(Alignment::Center)
-                    }
+                    row![
+                        select,
+                        button("Edit").style(button::text).on_press(Message::OrchestrationStudio(
+                            StudioMessage::SelectAgent(Some(agent.id.clone())),
+                        )),
+                        button("Delete").style(button::text).on_press(
+                            Message::OrchestrationStudio(StudioMessage::RemoveAgent(
+                                agent.id.clone()
+                            ),)
+                        ),
+                    ]
+                    .spacing(sp.xs)
+                    .align_y(Alignment::Center)
                 } else if agent.is_custom {
                     row![
                         select,
@@ -4042,6 +4065,131 @@ mod tests {
 
         assert!(state.agents.iter().any(|a| a.id == "coordinator"));
         assert!(!state.unsaved, "blocked removal must not mark the studio dirty");
+    }
+
+    /// Maintainer decision 2026-09: the coordinator is hardcoded, so exactly
+    /// one canonical frozen definition exists in code and the seeded fallback
+    /// uses it verbatim.
+    #[test]
+    fn hardcoded_coordinator_is_the_single_frozen_definition() {
+        let frozen = default_coordinator_agent();
+        assert_eq!(frozen.id, "coordinator");
+        assert_eq!(frozen.role, "coordinator");
+
+        let seeded = default_builtin_agents();
+        let coordinators: Vec<&AgentConfig> =
+            seeded.iter().filter(|agent| is_coordinator_agent(agent)).collect();
+        assert_eq!(coordinators.len(), 1, "exactly one hardcoded coordinator row");
+        assert_eq!(coordinators[0].id, frozen.id);
+        assert_eq!(
+            coordinators[0].prompt_sections.system_instructions,
+            frozen.prompt_sections.system_instructions
+        );
+    }
+
+    /// The rendered roster hides the coordinator on the seeded/fallback path,
+    /// while the row stays in `State::agents` so the topology that references
+    /// it (the standard preset's hand-offs) remains complete.
+    #[test]
+    fn studio_roster_excludes_coordinator_on_seeded_path() {
+        let state = State::new();
+        assert!(
+            state.agents.iter().any(is_coordinator_agent),
+            "the frozen row stays in state for topology"
+        );
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "the coordinator must never render as a roster row"
+        );
+    }
+
+    /// An EXISTING config file that carries a coordinator roster entry is
+    /// ignored at display time: the entry is not stripped from state (no user
+    /// data rewritten), but every rendered roster surface filters it.
+    #[test]
+    fn existing_config_coordinator_entry_is_ignored_in_the_roster() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![
+                    concerto_config::CustomAgentConfig {
+                        id: "coordinator".into(),
+                        name: "User Coordinator".into(),
+                        role: "coordinator".into(),
+                        ..Default::default()
+                    },
+                    concerto_config::CustomAgentConfig {
+                        id: "coder".into(),
+                        role: "coder".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "a config-injected coordinator must not render"
+        );
+        assert!(
+            state.agents.iter().any(|agent| agent.id == "coordinator"),
+            "the config entry is ignored, not stripped from state"
+        );
+        assert_eq!(
+            state.visible_agents().filter(|agent| agent.id == "coder").count(),
+            1,
+            "the rest of the roster is untouched"
+        );
+    }
+
+    /// Persisted rosters never contain the coordinator, even when the seeded or
+    /// config-injected in-memory roster does.
+    #[test]
+    fn persisted_roster_never_contains_the_coordinator() {
+        let is_custom_coordinator = |agent: &CustomAgentConfig| {
+            agent.id.eq_ignore_ascii_case("coordinator")
+                || agent.role.eq_ignore_ascii_case("coordinator")
+        };
+
+        // Seeded fallback path.
+        let seeded = State::new();
+        assert!(seeded.agents.iter().any(is_coordinator_agent));
+        let (custom, _, _) = seeded.persisted_parts();
+        assert!(!custom.iter().any(is_custom_coordinator), "seeded roster must not persist it");
+
+        // Config-injected path: the entry does not survive the persist round-trip.
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "coordinator".into(),
+                    role: "coordinator".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut injected = State::new();
+        injected.load_from_config(&config);
+        let (custom, _, _) = injected.persisted_parts();
+        assert!(!custom.iter().any(is_custom_coordinator), "config entry must not persist");
+    }
+
+    /// The obsolete "No coordinator agent present" warning is gone: the
+    /// coordinator exists by construction, not by roster membership.
+    #[test]
+    fn validation_no_longer_warns_about_a_missing_coordinator() {
+        let state = State::default();
+        assert!(state.agents.is_empty());
+        let report = state.validation();
+        assert!(
+            !report.messages.iter().any(|message| message.contains("No coordinator")),
+            "obsolete warning still present: {:?}",
+            report.messages
+        );
     }
 
     #[test]
