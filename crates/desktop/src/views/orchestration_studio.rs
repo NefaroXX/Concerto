@@ -802,6 +802,36 @@ fn semantics_label(semantics: RelationshipSemantics) -> &'static str {
     }
 }
 
+/// Map a legacy `multi_agent` relationship kind to the closed
+/// [`RelationshipSemantics`] it references (ADR-58 §4), so the legacy
+/// pipeline canvas and relationship editor speak the same vocabulary as the
+/// blueprint surface instead of the stale kind strings. The legacy kind
+/// vocabulary is closed (`supervises`, `provides_context_to`, `reports_to`,
+/// `owns_design`); the mapping mirrors the standard blueprint registry and the
+/// config facade's `reports_to → Delegation` fold, with any unknown kind
+/// degrading to `Delegation` (the same family `supervises` and `reports_to`
+/// already use) rather than hiding the row.
+fn legacy_relationship_semantics(kind: &str) -> RelationshipSemantics {
+    match kind {
+        "provides_context_to" => RelationshipSemantics::ContextFlow,
+        "supervises" | "reports_to" | "owns_design" => RelationshipSemantics::Delegation,
+        _ => RelationshipSemantics::Delegation,
+    }
+}
+
+/// The legacy relationship-kind picker options: every closed kind paired with
+/// its `RelationshipSemantics` so the label renders the semantic glyph
+/// (mirrors the blueprint path's [`RelationshipKindOption`]).
+fn legacy_rel_kind_options() -> Vec<RelationshipKindOption> {
+    ["supervises", "provides_context_to", "reports_to", "owns_design"]
+        .into_iter()
+        .map(|kind| RelationshipKindOption {
+            kind: kind.to_string(),
+            semantics: legacy_relationship_semantics(kind),
+        })
+        .collect()
+}
+
 /// Per-field validation surface (ADR-59 D5, spec §5): wrap one editable
 /// widget so a rulebook violation on its field path renders as a 1px
 /// `theme.palette.danger` border around the field, an alert icon to the
@@ -1738,14 +1768,26 @@ impl State {
             let Some(to) = self.agents.iter().position(|a| a.id == rel.to) else {
                 continue;
             };
-            let kind = if rel.relationship == "supervises" {
-                EdgeKind::Delegation
-            } else {
-                EdgeKind::Dependency
+            let semantics = legacy_relationship_semantics(&rel.relationship);
+            let kind = match semantics {
+                RelationshipSemantics::Delegation => EdgeKind::Delegation,
+                RelationshipSemantics::ApprovalGate | RelationshipSemantics::ContextFlow => {
+                    EdgeKind::Dependency
+                }
             };
             let cycles =
                 rel.max_cycles.map(|value| value.to_string()).unwrap_or_else(|| "∞".into());
-            model.add_labeled_edge(from, to, kind, format!("{} · {}", rel.relationship, cycles));
+            model.add_labeled_edge(
+                from,
+                to,
+                kind,
+                format!(
+                    "{} {} · {}",
+                    semantics_glyph(semantics),
+                    semantics_label(semantics),
+                    cycles
+                ),
+            );
             edge_to_relationship.push(rel_index);
         }
         let result = (model, edge_to_relationship);
@@ -2616,7 +2658,7 @@ impl State {
 
         column![
             toolbar,
-            text("Configure the agents and hand-offs used by multi-agent mode.")
+            text("Configure the agents and relationships used by multi-agent mode.")
                 .size(ts.body)
                 .color(theme.palette.text_muted),
             validation_detail_bar,
@@ -3423,6 +3465,7 @@ impl State {
                 .max_cycles
                 .map(|value| format!("{value} cycle{}", if value == 1 { "" } else { "s" }))
                 .unwrap_or_else(|| "unlimited cycles".into());
+            let semantics = legacy_relationship_semantics(&rel.relationship);
             relationship_list = relationship_list.push(
                 row![
                     column![
@@ -3432,9 +3475,13 @@ impl State {
                             self.agent_label(&rel.to)
                         ))
                         .size(ts.body),
-                        text(format!("{} · {cycles}", rel.relationship))
-                            .size(ts.caption)
-                            .color(theme.palette.text_muted),
+                        text(format!(
+                            "{} {} · {cycles}",
+                            semantics_glyph(semantics),
+                            semantics_label(semantics)
+                        ))
+                        .size(ts.caption)
+                        .color(theme.palette.text_muted),
                     ]
                     .spacing(sp.xs)
                     .width(Length::Fill),
@@ -3451,7 +3498,9 @@ impl State {
         }
         if self.relationships.is_empty() {
             relationship_list = relationship_list.push(
-                text("No hand-offs configured yet.").size(ts.body).color(theme.palette.text_muted),
+                text("No relationships configured yet.")
+                    .size(ts.body)
+                    .color(theme.palette.text_muted),
             );
         }
 
@@ -3473,12 +3522,9 @@ impl State {
             .collect();
         let selected_from = agent_options.iter().find(|o| o.id == self.new_rel_from).cloned();
         let selected_to = agent_options.iter().find(|o| o.id == self.new_rel_to).cloned();
-        let rel_types: Vec<String> = vec![
-            "supervises".into(),
-            "provides_context_to".into(),
-            "reports_to".into(),
-            "owns_design".into(),
-        ];
+        let rel_types = legacy_rel_kind_options();
+        let selected_rel_type =
+            rel_types.iter().find(|option| option.kind == self.new_rel_type).cloned();
         // The add/edit form only renders while it is relevant: when an edge is
         // clicked (or "Add hand-off" is pressed). Browsing the pipeline and
         // editing a hand-off are now visually distinct states.
@@ -3500,7 +3546,7 @@ impl State {
         };
         let draft_note: Element<'_, Message> = match draft_error {
             Some(error) => text(error).size(ts.caption).color(theme.palette.text_muted).into(),
-            None => text("This hand-off keeps the pipeline acyclic.")
+            None => text("This relationship keeps the pipeline acyclic.")
                 .size(ts.caption)
                 .color(theme.palette.success)
                 .into(),
@@ -3521,17 +3567,9 @@ impl State {
                     Message::OrchestrationStudio(StudioMessage::NewRelTo(option.id))
                 })
                 .placeholder("To agent"),
-                pick_list(
-                    rel_types,
-                    if self.new_rel_type.is_empty() {
-                        None
-                    } else {
-                        Some(self.new_rel_type.clone())
-                    },
-                    |relationship| Message::OrchestrationStudio(StudioMessage::NewRelType(
-                        relationship
-                    )),
-                )
+                pick_list(rel_types, selected_rel_type, |option| {
+                    Message::OrchestrationStudio(StudioMessage::NewRelType(option.kind))
+                })
                 .placeholder("Relationship type"),
                 text_input("Max cycles (optional)", &self.new_rel_max_cycles).on_input(|value| {
                     Message::OrchestrationStudio(StudioMessage::NewRelMaxCycles(value))
@@ -3590,14 +3628,14 @@ impl State {
             if editor_visible { relationship_editor.into() } else { Space::new().into() };
         let handoffs_card = section_card(
             theme,
-            "Hand-offs",
+            "Relationships",
             column![
                 row![
                     text(format!("{} configured", self.relationships.len()))
                         .size(ts.caption)
                         .color(theme.palette.text_muted),
                     Space::new().width(Length::Fill),
-                    button("+ Add hand-off").style(button::secondary).on_press(
+                    button("+ Add relationship").style(button::secondary).on_press(
                         Message::OrchestrationStudio(StudioMessage::ToggleRelationshipEditor(true))
                     ),
                 ]
@@ -4222,9 +4260,11 @@ mod tests {
         assert_eq!(edge_to_relationship, (0..state.relationships.len()).collect::<Vec<_>>());
         // Node ids follow agent order: the coordinator seed is index 0.
         assert_eq!(model.nodes[0].label, "Coordinator");
-        // Edge ids follow relationship order, with type + cycle labels.
-        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("supervises · 3")));
-        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("provides_context_to · 3")));
+        // Edge ids follow relationship order, with the CLOSED relationship
+        // semantics (glyph + label) + cycle labels — never the stale legacy
+        // kind string (M4 terminology).
+        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("⛓ delegation · 3")));
+        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("➜ context flow · 3")));
     }
 
     #[test]
@@ -5634,6 +5674,31 @@ mod tests {
         for semantics in closed {
             assert!(!semantics_glyph(semantics).is_empty());
             assert!(!semantics_label(semantics).is_empty());
+        }
+    }
+
+    /// M4 terminology: the legacy pipeline editor maps every closed legacy
+    /// kind to its `RelationshipSemantics` and renders the semantic glyph
+    /// (never the stale kind string alone). The vocabulary the options carry
+    /// is exactly the current one (`delegation` / `context flow`).
+    #[test]
+    fn legacy_relationship_options_carry_closed_semantics() {
+        let options = legacy_rel_kind_options();
+        assert_eq!(options.len(), 4, "the closed legacy vocabulary is four kinds");
+        let semantics_of = |kind: &str| {
+            options.iter().find(|option| option.kind == kind).map(|option| option.semantics)
+        };
+        assert_eq!(semantics_of("supervises"), Some(RelationshipSemantics::Delegation));
+        assert_eq!(semantics_of("provides_context_to"), Some(RelationshipSemantics::ContextFlow));
+        assert_eq!(semantics_of("reports_to"), Some(RelationshipSemantics::Delegation));
+        assert_eq!(semantics_of("owns_design"), Some(RelationshipSemantics::Delegation));
+        // The picker label pairs the semantic glyph with the kind, so the
+        // affordance is never color/string-only.
+        for option in &options {
+            assert!(
+                option.to_string().starts_with(semantics_glyph(option.semantics)),
+                "option label must carry its semantic glyph: {option}"
+            );
         }
     }
 
