@@ -387,7 +387,10 @@ impl Default for State {
             stage_max_cycles_drafts: HashMap::new(),
             global_max_dispatch_cycles: None,
             runtime_snapshot: StudioRuntimeSnapshot::default(),
-            runtime_collapsed: HashSet::new(),
+            // The Coordinator 2.0 observability rail starts COLLAPSED so the
+            // blueprint stage editor has the real estate by default; a single
+            // click on any panel header reopens it. View-only state.
+            runtime_collapsed: StudioRuntimePanel::ALL.into_iter().collect(),
         }
     }
 }
@@ -2989,8 +2992,7 @@ impl State {
             })
             .collect();
         let candidates: Vec<AgentOption> = self
-            .agents
-            .iter()
+            .visible_agents()
             .filter(|agent| !stage.agents.contains(&agent.id))
             .map(|agent| AgentOption { id: agent.id.clone(), label: agent.name.clone() })
             .collect();
@@ -4217,6 +4219,64 @@ mod tests {
 
         assert!(state.validation().ok);
         assert_eq!(state.relationships.len(), 5);
+    }
+
+    /// Degraded blueprint-selection shape (present-but-empty `[orchestration]`
+    /// table): the init fill writes the default standard selector, the load
+    /// seam resolves it, and the Studio activates the stage-card editor — the
+    /// surface is reachable instead of the inactive placeholder.
+    #[test]
+    fn stage_editor_is_reachable_after_the_default_selection_fill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("schema_version = {}\n[orchestration]\n", concerto_config::SCHEMA_VERSION),
+        )
+        .expect("write degraded config");
+        assert!(concerto_config::ensure_default_blueprint(&config_path).expect("fill selection"));
+        let config = concerto_config::load_config(Some(&config_path), None).expect("load");
+
+        let mut state = State::new();
+        state.load_from_config(&config);
+        assert!(state.on_blueprint_path(), "the stage editor surface must be active");
+        assert!(
+            state.blueprint.as_ref().is_some_and(|blueprint| !blueprint.pipeline.stages.is_empty()),
+            "the editor must have stage cards to render"
+        );
+        // Rendering must not panic (the stage-card surface is exercised).
+        let theme = AppTheme::by_name("Midnight");
+        let _ = state.stage_cards_view(&theme);
+    }
+
+    /// The roster derived from the per-agent files is exactly the list the
+    /// Studio renders (no seed resurrection, no second roster copy). The
+    /// stage-staffing picker draws from `visible_agents`, so it lists the same
+    /// file-derived roster and never the hardcoded coordinator.
+    #[test]
+    fn file_derived_roster_is_exactly_the_studio_roster() {
+        let config = AppConfig {
+            agent_files_authoritative: true,
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "from-file".into(),
+                    name: "From File".into(),
+                    role: "from-file".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut state = State::new();
+        state.load_from_config(&config);
+        assert_eq!(state.agents.len(), 1, "the file roster is exactly the list");
+        assert_eq!(state.agents[0].id, "from-file");
+        assert!(
+            state.visible_agents().all(|agent| !is_coordinator_agent(agent)),
+            "the staffing picker source excludes the hardcoded coordinator"
+        );
     }
 
     #[test]
@@ -6169,14 +6229,17 @@ mod tests {
         );
         let mut state = State::new();
         for panel in StudioRuntimePanel::ALL {
-            assert!(!state.runtime_collapsed.contains(&panel), "expanded by default");
+            assert!(
+                state.runtime_collapsed.contains(&panel),
+                "collapsed by default (editor real estate restored)"
+            );
             let _ = state.update(StudioMessage::ToggleRuntimePanel(panel));
-            assert!(state.runtime_collapsed.contains(&panel), "toggle collapses");
+            assert!(!state.runtime_collapsed.contains(&panel), "one click reopens");
         }
         assert!(!state.unsaved, "view-only panel toggles never mark the studio dirty");
         for panel in StudioRuntimePanel::ALL {
             let _ = state.update(StudioMessage::ToggleRuntimePanel(panel));
-            assert!(!state.runtime_collapsed.contains(&panel), "toggle expands again");
+            assert!(state.runtime_collapsed.contains(&panel), "toggle collapses again");
         }
     }
 

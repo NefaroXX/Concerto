@@ -343,6 +343,16 @@ pub struct AppConfig {
     /// config object was not built through the load seam.
     #[serde(skip)]
     pub resolved_blueprint: Option<Arc<ResolvedBlueprint>>,
+
+    /// Whether the working roster was sourced from the per-agent config files
+    /// under `<global-config-dir>/agents/` (the single source of truth).
+    ///
+    /// Derived load-time state — never round-trips through a config file
+    /// (`#[serde(skip)]`); set by the load seam when the agents directory
+    /// exists. Ensures an intentionally empty file-backed roster (every agent
+    /// deleted) still owns the roster, so no builtin seed is resurrected.
+    #[serde(skip)]
+    pub agent_files_authoritative: bool,
 }
 
 impl PartialEq for AppConfig {
@@ -403,6 +413,7 @@ impl Default for AppConfig {
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
+            agent_files_authoritative: false,
         }
     }
 }

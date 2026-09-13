@@ -2556,6 +2556,26 @@ impl App {
         if matches!(concerto_config::ensure_default_blueprint(&config_path), Ok(true)) {
             wrote = true;
         }
+        // Per-agent config files (single source of truth): materialize the
+        // agents directory once. When it is absent the roster is exported from
+        // the just-seeded inline roster (or an existing one), or seeded from
+        // the builtin defaults. If it already exists this is a strict no-op —
+        // files rule and deletions stick. A failure is logged and ignored: the
+        // inline roster stays authoritative for this session (readable, never
+        // dropped).
+        match concerto_config::ensure_agent_files(&config_path, Some(&project_config)) {
+            Ok(outcome) => {
+                if outcome.dir_created {
+                    wrote = true;
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "failed to materialize per-agent config files; the inline roster remains authoritative"
+                );
+            }
+        }
         if wrote {
             self.reconcile_config_from_reload();
         }
@@ -2649,15 +2669,17 @@ impl App {
             }
         }
 
-        // ADR-58/59 (rewritten) Slice 3: the agent roster. Written only after the
-        // blueprint write above succeeds — the roster has no rulebook of its own,
-        // so it is gated on the same blueprint validation that ran up front (a
-        // failed blueprint never reaches the config). `persisted_parts` maps the
-        // Studio's authoritative agent list to config types (coordinator + the
-        // five seeds as `is_custom: false` mirrors + user agents). The write is
-        // merge-aware and atomic; deletion is permanent (`owns_agent_roster`).
+        // ADR-58/59 (rewritten) Slice 3, per-agent files: the agent roster is
+        // written to its own files (`<global-config-dir>/agents/<id>.toml`) —
+        // the single source of truth. Additions create files; deletions remove
+        // them (deletion sticks: the directory stays initialized). The write is
+        // atomic per file. The roster has no rulebook of its own, so it is
+        // gated on the same blueprint validation that ran up front (a failed
+        // blueprint never reaches the files).
         let (roster, _, _) = self.orchestration_studio.persisted_parts();
-        concerto_config::save_agent_roster(&config_path, &roster)
+        let agents_dir = concerto_config::agents_dir_for_config(&config_path)
+            .map_err(|error| error.to_string())?;
+        concerto_config::save_agent_roster_files(&agents_dir, &roster)
             .map_err(|error| error.to_string())?;
 
         self.reconcile_config_from_reload();
@@ -5210,7 +5232,6 @@ custom_agents = []
         // must not pre-own a roster, or the seed short-circuits.
         app.config = None;
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-        let global_config_path = dir.path().join("concerto").join("config.toml");
 
         // Add a user agent to the roster (mirrors Add/Rename in the library).
         let _ = app.orchestration_studio.update(
@@ -5229,14 +5250,19 @@ custom_agents = []
             !app.orchestration_studio.unsaved,
             "a successful save marks the studio clean (blueprint + roster)"
         );
-        let after = std::fs::read_to_string(&global_config_path).expect("global config read back");
+        // The roster is written to per-agent files, never inline into the
+        // config (single source of truth).
+        let agents_dir = dir.path().join("concerto").join(concerto_config::AGENTS_DIR_NAME);
+        let after_agents: Vec<String> = std::fs::read_dir(&agents_dir)
+            .expect("read agents dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect();
         assert!(
-            after.contains("[[multi_agent.custom_agents]]"),
-            "the roster table must be written\n{after}"
-        );
-        assert!(
-            after.contains("Planner"),
-            "the added roster agent must appear in [[multi_agent.custom_agents]]\n{after}"
+            after_agents.iter().any(|raw| raw.contains("Planner")),
+            "the added roster agent must exist as a per-agent file"
         );
         assert!(
             !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
@@ -7269,9 +7295,27 @@ custom_agents = []
             "the edited inline blueprint must never reach the global file (global-only \
              roster aside; the include selection itself is there)\n{global_after}"
         );
+        // The roster now lives in per-agent files (single source of truth):
+        // the added agent reaches `<global-config-dir>/agents/`, not the config
+        // file.
+        let agents_dir = global_dir.join(concerto_config::AGENTS_DIR_NAME);
         assert!(
-            global_after.contains("[[multi_agent.custom_agents]]"),
-            "the agent roster is written to the global config (global-only)\n{global_after}"
+            agents_dir.is_dir(),
+            "the per-agent roster directory must exist next to the global config"
+        );
+        let planner = std::fs::read_dir(&agents_dir)
+            .expect("read agents dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("toml"))
+            .any(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .map(|raw| raw.contains("Planner"))
+                    .unwrap_or(false)
+            });
+        assert!(planner, "the added roster agent must exist as a per-agent file");
+        assert!(
+            !global_after.contains("[[multi_agent.custom_agents]]"),
+            "the roster must no longer be written inline into the config\n{global_after}"
         );
     }
 

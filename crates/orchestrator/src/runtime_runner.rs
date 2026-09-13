@@ -5255,6 +5255,59 @@ mod runtime_runner_tests {
         );
     }
 
+    /// The per-agent files are the single source of truth at the runtime
+    /// boundary too: a file-backed config (`agent_files_authoritative`) owns
+    /// the roster, so `merge_seeds` is false and `build_agent_config_map`
+    /// yields exactly the file roster — a deleted builtin is not resurrected.
+    #[test]
+    fn file_backed_roster_is_authoritative_for_runtime_role_resolution() {
+        use concerto_config::{AppConfig, CustomAgentConfig, MultiAgentConfig};
+
+        let config = AppConfig {
+            agent_files_authoritative: true,
+            multi_agent: Some(MultiAgentConfig {
+                custom_agents: vec![CustomAgentConfig {
+                    id: "coder".into(),
+                    name: "Coder".into(),
+                    role: "coder".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(config.owns_agent_roster(), "the file-backed roster is authoritative");
+        // Mirrors the call-site expression: `merge_seeds = !owns_agent_roster()`.
+        let merge_seeds = !config.owns_agent_roster();
+        assert!(!merge_seeds, "no builtin seed is merged back over a file roster");
+
+        let map = build_agent_config_map(&config.multi_agent);
+        assert_eq!(map.len(), 1, "the file roster is exactly the runtime config map");
+        assert!(map.contains_key(&AgentId::new("coder")));
+        assert!(
+            !map.contains_key(&AgentId::new("architect")),
+            "a builtin missing from the files stays deleted at runtime"
+        );
+    }
+
+    /// An initialized-but-empty file roster (every agent deleted) still owns
+    /// the runtime roster: no seed resurrection.
+    #[test]
+    fn empty_file_roster_owns_the_runtime_roster() {
+        use concerto_config::AppConfig;
+
+        let config = AppConfig {
+            agent_files_authoritative: true,
+            multi_agent: Some(concerto_config::MultiAgentConfig::default()),
+            ..Default::default()
+        };
+
+        assert!(config.owns_agent_roster());
+        let map = build_agent_config_map(&config.multi_agent);
+        assert!(map.is_empty(), "an empty file roster registers no specialists from config");
+    }
+
     #[test]
     fn topology_roles_excludes_disabled() {
         let multi_agent = concerto_config::MultiAgentConfig {
