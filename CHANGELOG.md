@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Per-agent config files:** each agent owns `<config>/agents/<id>.toml`
+  (model/prompt/permissions), seeded from hardcoded defaults when missing,
+  migrated when stale; Studio CRUD writes files directly (add/remove/edit,
+  deletions stick); stage editor restored with file-derived staffing;
+  observability rail collapsed by default; coordinator never
+  seeded/listed/persisted/staffable.
 - **Hardcoded coordinator + Studio 2.0 panels:** coordinator leaves the
   Studio roster on all paths (frozen definition, global-default model,
   existing config entries ignored at display); legacy pipeline speaks
