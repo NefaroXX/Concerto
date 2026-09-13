@@ -3331,10 +3331,10 @@ impl State {
             // The empty-registry caption mirrors the resolution seam
             // (blueprint.rs:649-657): an empty registry falls back to the
             // engine's five standard rows at resolve time, so the caption
-            // names those kinds rather than implying no hand-offs exist.
+            // names those kinds rather than implying no relationships exist.
             rows = rows.push(
                 text(
-                    "Registry is empty — the engine falls back to the standard hand-offs \
+                    "Registry is empty — the engine falls back to the standard relationships \
                      (supervises, provides_context_to, owns_design). Add a row to override.",
                 )
                 .size(ts.body)
