@@ -266,6 +266,20 @@ fn legacy_pins_from_config(
     pins
 }
 
+/// The coordinator's model.
+///
+/// The coordinator is hardcoded (maintainer decision 2026-09) and always
+/// follows the run's global default model. `_configured_pins` is accepted so
+/// the call site documents the pin source the coordinator used to consult, but
+/// it is deliberately never read: `model_pins` / `agent_assignments` entries
+/// naming `coordinator` are inert (their user data is left on disk untouched).
+fn resolve_coordinator_model(
+    _configured_pins: &HashMap<AgentId, String>,
+    default_model: &str,
+) -> String {
+    default_model.to_string()
+}
+
 /// ADR-35 phase 4: the roles needing provider/model resolution mirror the
 /// runtime topology: the coordinator plus every registered specialist —
 /// built-ins not disabled by config, then custom agents (disabled ones
@@ -3693,27 +3707,21 @@ async fn run_multi_agent(
         }
     }
 
-    let coordinator_provider = role_providers
-        .get(&AgentId::new("coordinator"))
-        .cloned()
-        .unwrap_or_else(|| default_provider.clone());
-    let coordinator_model = pins
-        .get(&AgentId::new("coordinator"))
-        .cloned()
-        .unwrap_or_else(|| default_model.to_string());
+    // Hardcoded coordinator (maintainer decision 2026-09): the coordinator is
+    // not a user-configurable roster agent. It is constructed in code and
+    // always runs on the run's global default provider/model — any
+    // `model_pins` or `model_settings.agent_assignments` entry naming
+    // `coordinator` is inert (none are read here). Existing pin data is left
+    // untouched on disk; it is simply never consulted for the coordinator.
+    let coordinator_provider = default_provider.clone();
+    let coordinator_model = resolve_coordinator_model(&pins, default_model);
     // ADR-42 §4 tier 2: the routing profile of the coordinator's model on its
-    // serving pipe. Built the same way the ADR-45 tier-1b profile is built
-    // above (base profile by config id, model overridden), so self-execution
-    // dispatches through the runner like any other role instead of a raw
-    // single-shot request. `None` when the coordinator's pipe has no routing
-    // profile — tier 2 then skips with a note (the profile is advisory for
-    // the coordinator's own dispatch). The coordinator's pipe is the provider
-    // config id it resolved to during the role-resolution loop above; roles
-    // without a resolution (coordinator fallback) serve on the default pipe.
-    let coordinator_pipe_id = provider_pins
-        .get(&AgentId::new("coordinator"))
-        .cloned()
-        .unwrap_or_else(|| ProviderFactory::config_id(default_provider_config));
+    // serving pipe. With the coordinator pinned to the global default, this is
+    // always the run's default pipe (the profile the ADR-45 tier-1b ladder
+    // rebuilds onto), built the same way as every role profile above. The
+    // coordinator's self-execution dispatches therefore route through the
+    // runner like any other role instead of a raw single-shot request.
+    let coordinator_pipe_id = ProviderFactory::config_id(default_provider_config);
     let planning_profile = base_profiles
         .iter()
         .find(|profile| profile.provider_config_id == coordinator_pipe_id)
@@ -5381,6 +5389,32 @@ mod runtime_runner_tests {
         assert!(
             !pins.contains_key(&AgentId::new("docs-writer")),
             "custom agent without model_override adds no pin"
+        );
+    }
+
+    /// Maintainer decision 2026-09: the coordinator always follows the run's
+    /// global default model. Even when a legacy `model_pins` entry names
+    /// `coordinator`, resolution ignores it — the pin stays parsed (user data
+    /// preserved) but is inert for the coordinator.
+    #[test]
+    fn coordinator_model_ignores_configured_pins() {
+        let multi_agent = concerto_config::MultiAgentConfig {
+            model_pins: std::collections::HashMap::from([(
+                AgentId::new("coordinator"),
+                "pinned-coordinator-model".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let pins = legacy_pins_from_config(&Some(multi_agent));
+        assert_eq!(
+            pins.get(&AgentId::new("coordinator")),
+            Some(&"pinned-coordinator-model".to_string()),
+            "the legacy pin is still parsed (user data preserved)"
+        );
+        assert_eq!(
+            resolve_coordinator_model(&pins, "global-default-model"),
+            "global-default-model",
+            "the coordinator must ignore the pin and use the global default"
         );
     }
 

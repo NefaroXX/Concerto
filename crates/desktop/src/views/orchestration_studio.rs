@@ -14,6 +14,10 @@ use iced::{Alignment, Color, Element, Length};
 use crate::app::Message;
 use crate::theme::AppTheme;
 use crate::ui::section_card::{section_card, section_card_with_subtitle};
+use crate::views::studio_runtime::{StudioRuntimePanel, StudioRuntimeSnapshot};
+use crate::views::{
+    studio_decision_journal, studio_failure_diagnoses, studio_suitability, studio_world_model,
+};
 use crate::widgets::agent_graph::{
     self, AgentGraphModel, AgentState, EdgeKind, Message as GraphMessage,
 };
@@ -330,6 +334,15 @@ pub struct State {
     /// config so `validation()`'s rule (f) is bounded exactly like the config
     /// load seam (`crates/config/src/lib.rs` ~220). `None` = unbounded.
     pub global_max_dispatch_cycles: Option<usize>,
+
+    /// The read-only Coordinator 2.0 runtime snapshot the observability panels
+    /// render. Loaded on Studio open/refresh through the
+    /// `StudioRuntimeReader` seam from the session's persisted checkpoint;
+    /// empty until a run state exists (fail-soft).
+    pub runtime_snapshot: StudioRuntimeSnapshot,
+    /// Observability panels collapsed to their header. View-only presentation
+    /// state — toggling never marks the studio dirty.
+    pub runtime_collapsed: HashSet<StudioRuntimePanel>,
 }
 
 impl Default for State {
@@ -373,6 +386,8 @@ impl Default for State {
             stage_advanced_open: HashSet::new(),
             stage_max_cycles_drafts: HashMap::new(),
             global_max_dispatch_cycles: None,
+            runtime_snapshot: StudioRuntimeSnapshot::default(),
+            runtime_collapsed: HashSet::new(),
         }
     }
 }
@@ -471,6 +486,10 @@ pub enum StudioMessage {
     GraphNodeClicked(usize),
     /// Expand/collapse the inline issue summary under the toolbar badge.
     ToggleValidationDetail,
+    /// Expand/collapse one read-only observability panel by its kind. A
+    /// view-only toggle: it mutates presentation state, never run data, so it
+    /// never marks the studio dirty and never emits a runtime action.
+    ToggleRuntimePanel(StudioRuntimePanel),
     /// Expand/collapse one stage card's collapsible "Advanced" section. The
     /// payload is the stage's index into `blueprint.pipeline.stages`. This is
     /// a view-only toggle: it mutates the presentation set, never blueprint
@@ -802,6 +821,36 @@ fn semantics_label(semantics: RelationshipSemantics) -> &'static str {
     }
 }
 
+/// Map a legacy `multi_agent` relationship kind to the closed
+/// [`RelationshipSemantics`] it references (ADR-58 §4), so the legacy
+/// pipeline canvas and relationship editor speak the same vocabulary as the
+/// blueprint surface instead of the stale kind strings. The legacy kind
+/// vocabulary is closed (`supervises`, `provides_context_to`, `reports_to`,
+/// `owns_design`); the mapping mirrors the standard blueprint registry and the
+/// config facade's `reports_to → Delegation` fold, with any unknown kind
+/// degrading to `Delegation` (the same family `supervises` and `reports_to`
+/// already use) rather than hiding the row.
+fn legacy_relationship_semantics(kind: &str) -> RelationshipSemantics {
+    match kind {
+        "provides_context_to" => RelationshipSemantics::ContextFlow,
+        "supervises" | "reports_to" | "owns_design" => RelationshipSemantics::Delegation,
+        _ => RelationshipSemantics::Delegation,
+    }
+}
+
+/// The legacy relationship-kind picker options: every closed kind paired with
+/// its `RelationshipSemantics` so the label renders the semantic glyph
+/// (mirrors the blueprint path's [`RelationshipKindOption`]).
+fn legacy_rel_kind_options() -> Vec<RelationshipKindOption> {
+    ["supervises", "provides_context_to", "reports_to", "owns_design"]
+        .into_iter()
+        .map(|kind| RelationshipKindOption {
+            kind: kind.to_string(),
+            semantics: legacy_relationship_semantics(kind),
+        })
+        .collect()
+}
+
 /// Per-field validation surface (ADR-59 D5, spec §5): wrap one editable
 /// widget so a rulebook violation on its field path renders as a 1px
 /// `theme.palette.danger` border around the field, an alert icon to the
@@ -906,27 +955,48 @@ fn relationships_have_cycle(relationships: &[AgentRelationshipConfig]) -> bool {
     false
 }
 
+/// The single hardcoded coordinator definition (ADR-35 §5; maintainer decision
+/// 2026-09): the coordinator is constructed in code, never a user-configurable
+/// roster agent, and its prompts/capabilities are frozen here. It is never
+/// written to config and is filtered from every rendered roster surface, but it
+/// stays in [`State::agents`] so the pipeline topology and relationships that
+/// reference it remain referentially complete.
+fn default_coordinator_agent() -> AgentConfig {
+    AgentConfig {
+        id: "coordinator".into(),
+        name: "Coordinator".into(),
+        role: "coordinator".into(),
+        stage: None,
+        output_mode: OutputMode::Freeform,
+        prompt_sections: PromptSections {
+            system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
+            constraints: "Never bypass a specialist to do their job directly. If a step is ambiguous, get clarification from the Architect or Researcher before assigning it to the Coder. Don't exceed configured max_cycles between any two agents. If a specialist reports a blocking risk (security, data loss, destructive command), stop and surface it to the user instead of proceeding.".into(),
+            output_format: "1) Plan (numbered steps), 2) Specialist assignments, 3) Final synthesized result once specialists report back. No internal chain-of-thought.".into(),
+            ..Default::default()
+        },
+        model_override: None,
+        provider_id: None,
+        capabilities: AgentCapabilities { fs_read: Some(true), ..Default::default() },
+        is_custom: false,
+        disabled: false,
+    }
+}
+
+/// True when a roster row is the engine-constructed coordinator.
+///
+/// The coordinator is hardcoded (maintainer decision 2026-09): it is not a
+/// user-configured roster agent, so every rendered roster surface filters it
+/// out and the persist path never writes it back to config. Identity matches
+/// either the `id` or the legacy `role` key, case-insensitively — mirroring
+/// how the runtime reserves the role.
+fn is_coordinator_agent(agent: &AgentConfig) -> bool {
+    agent.id.eq_ignore_ascii_case("coordinator") || agent.role.eq_ignore_ascii_case("coordinator")
+}
+
 fn default_builtin_agents() -> Vec<AgentConfig> {
     // Matches config::supported.builtin_agent_seeds() typed submission contracts.
     vec![
-        AgentConfig {
-            id: "coordinator".into(),
-            name: "Coordinator".into(),
-            role: "coordinator".into(),
-            stage: None,
-            output_mode: OutputMode::Freeform,
-            prompt_sections: PromptSections {
-                system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
-                constraints: "Never bypass a specialist to do their job directly. If a step is ambiguous, get clarification from the Architect or Researcher before assigning it to the Coder. Don't exceed configured max_cycles between any two agents. If a specialist reports a blocking risk (security, data loss, destructive command), stop and surface it to the user instead of proceeding.".into(),
-                output_format: "1) Plan (numbered steps), 2) Specialist assignments, 3) Final synthesized result once specialists report back. No internal chain-of-thought.".into(),
-                ..Default::default()
-            },
-            model_override: None,
-            provider_id: None,
-            capabilities: AgentCapabilities { fs_read: Some(true), ..Default::default() },
-            is_custom: false,
-            disabled: false,
-        },
+        default_coordinator_agent(),
         AgentConfig {
             id: "architect".into(),
             name: "Architect".into(),
@@ -1092,6 +1162,12 @@ impl State {
     /// default).
     pub fn load_from_config(&mut self, config: &AppConfig) {
         let multi = config.multi_agent.clone().unwrap_or_default();
+        // The coordinator is hardcoded (maintainer decision 2026-09): an
+        // existing config file entry matching its identity is ignored at every
+        // rendered roster surface (`visible_agents`) and never persisted back,
+        // but it is left in `self.agents` untouched so the pipeline topology
+        // that references it stays referentially complete and no user data on
+        // disk is rewritten or lost.
         let config_agents: Vec<AgentConfig> =
             multi.custom_agents.iter().map(custom_to_agent).collect();
         self.agents = if config.owns_agent_roster() {
@@ -1240,11 +1316,21 @@ impl State {
         }
     }
 
+    /// Roster rows the user may see or edit. The hardcoded coordinator is
+    /// engine-owned and filtered from every rendered roster surface
+    /// (maintainer decision 2026-09); it remains in `self.agents` so the
+    /// pipeline topology and relationships stay complete.
+    fn visible_agents(&self) -> impl Iterator<Item = &AgentConfig> {
+        self.agents.iter().filter(|agent| !is_coordinator_agent(agent))
+    }
+
     /// Parts of the studio that should be persisted back to config.
     pub fn persisted_parts(
         &self,
     ) -> (Vec<CustomAgentConfig>, Vec<AgentRelationshipConfig>, Vec<PipelinePreset>) {
-        let custom = self.agents.iter().map(agent_to_custom).collect();
+        // The coordinator is hardcoded and never persisted (maintainer
+        // decision 2026-09): filter it from the roster written to config.
+        let custom = self.visible_agents().map(agent_to_custom).collect();
         let rels = self.relationships.clone();
         // Built-in presets are seeded in code and must never round-trip
         // through config — persisting them is what made the list grow.
@@ -1290,9 +1376,9 @@ impl State {
             messages.push("Run limits: spend cap multiplier must be a positive number".into());
         }
 
-        if !self.agents.iter().any(|a| a.id == "coordinator" || a.role == "coordinator") {
-            messages.push("No coordinator agent present".into());
-        }
+        // The coordinator is code-injected (hardcoded, maintainer decision
+        // 2026-09), so roster validation no longer warns about its absence:
+        // it exists by construction, not by roster membership.
 
         // ADR-35 phase 4: the eval engine is gated on the validator's `eval`
         // capability. Warn in the studio so an eval-off validator doesn't
@@ -1647,6 +1733,13 @@ impl State {
         *self.graph_cache.borrow_mut() = None;
     }
 
+    /// Replace the read-only runtime snapshot the observability panels render.
+    /// Called by `App` when the Studio opens/refreshes (or when a load
+    /// fail-softs); never mutates run state or marks the studio dirty.
+    pub fn set_runtime_snapshot(&mut self, snapshot: StudioRuntimeSnapshot) {
+        self.runtime_snapshot = snapshot;
+    }
+
     pub fn mark_saved(&mut self) {
         self.unsaved = false;
         self.saved_notice = true;
@@ -1701,14 +1794,26 @@ impl State {
             let Some(to) = self.agents.iter().position(|a| a.id == rel.to) else {
                 continue;
             };
-            let kind = if rel.relationship == "supervises" {
-                EdgeKind::Delegation
-            } else {
-                EdgeKind::Dependency
+            let semantics = legacy_relationship_semantics(&rel.relationship);
+            let kind = match semantics {
+                RelationshipSemantics::Delegation => EdgeKind::Delegation,
+                RelationshipSemantics::ApprovalGate | RelationshipSemantics::ContextFlow => {
+                    EdgeKind::Dependency
+                }
             };
             let cycles =
                 rel.max_cycles.map(|value| value.to_string()).unwrap_or_else(|| "∞".into());
-            model.add_labeled_edge(from, to, kind, format!("{} · {}", rel.relationship, cycles));
+            model.add_labeled_edge(
+                from,
+                to,
+                kind,
+                format!(
+                    "{} {} · {}",
+                    semantics_glyph(semantics),
+                    semantics_label(semantics),
+                    cycles
+                ),
+            );
             edge_to_relationship.push(rel_index);
         }
         let result = (model, edge_to_relationship);
@@ -1897,6 +2002,12 @@ impl State {
             }
             StudioMessage::ToggleValidationDetail => {
                 self.show_validation_detail = !self.show_validation_detail;
+            }
+            StudioMessage::ToggleRuntimePanel(panel) => {
+                // View-only: a miss means "was expanded, collapse it now".
+                if !self.runtime_collapsed.remove(&panel) {
+                    self.runtime_collapsed.insert(panel);
+                }
             }
             StudioMessage::StageAdvancedToggle(index) => {
                 // View-only presentation toggle: no `mark_dirty()`, no
@@ -2514,6 +2625,11 @@ impl State {
                 .padding([0.0, sp.md])
                 .width(Length::Fill)
                 .height(Length::Fill),
+            // Read-only Coordinator 2.0 observability rail (S1–S4), fed only
+            // by the runtime snapshot loaded on Studio open/refresh.
+            container(scrollable(self.observability_view(theme)).height(Length::Fill))
+                .width(Length::Fixed(340.0))
+                .height(Length::Fill),
         ]
         .spacing(sp.md)
         .height(Length::Fill);
@@ -2579,7 +2695,7 @@ impl State {
 
         column![
             toolbar,
-            text("Configure the agents and hand-offs used by multi-agent mode.")
+            text("Configure the agents and relationships used by multi-agent mode.")
                 .size(ts.body)
                 .color(theme.palette.text_muted),
             validation_detail_bar,
@@ -2589,6 +2705,92 @@ impl State {
         .spacing(sp.md)
         .height(Length::Fill)
         .into()
+    }
+
+    // ------------------------------------------------------------------
+    // Read-only Coordinator 2.0 observability panels (S1–S4).
+    //
+    // Registered in the panes row as a right-hand rail. Every panel is fed
+    // ONLY by `self.runtime_snapshot`, loaded on Studio open/refresh through
+    // the `StudioRuntimeReader` seam (checkpoint-backed). Nothing here
+    // dispatches, approves, or mutates run state; the only message is the
+    // view-only collapse toggle. Palette colors only.
+    // ------------------------------------------------------------------
+
+    /// The observability rail: a header, an optional fail-soft note, and the
+    /// four collapsible panels.
+    fn observability_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
+        let ts = &theme.type_scale;
+        let sp = &theme.spacing;
+        let mut panels = column![text("Runtime").size(ts.title).color(theme.palette.text)]
+            .spacing(sp.md)
+            .width(Length::Fill);
+        if let Some(error) = self.runtime_snapshot.load_error.as_deref() {
+            // Fail-soft: the panels still render their empty states below; the
+            // reason is surfaced here, muted and non-blocking.
+            panels = panels.push(
+                text(error).size(ts.caption).color(theme.palette.warning).width(Length::Fill),
+            );
+        }
+        for panel in StudioRuntimePanel::ALL {
+            panels = panels.push(self.runtime_panel_card(theme, panel));
+        }
+        panels.padding([sp.xs, 0.0]).into()
+    }
+
+    /// One collapsible observability card. The header is the only interactive
+    /// affordance (a view-only toggle); the body is the panel's read-only
+    /// projection of `runtime_snapshot`.
+    fn runtime_panel_card<'a>(
+        &'a self,
+        theme: &'a AppTheme,
+        panel: StudioRuntimePanel,
+    ) -> Element<'a, Message> {
+        let ts = &theme.type_scale;
+        let sp = &theme.spacing;
+        let collapsed = self.runtime_collapsed.contains(&panel);
+        let arrow = if collapsed { "▸" } else { "▾" };
+        let header = button(
+            row![
+                text(format!("{arrow} {}", panel.title())).size(ts.label).color(theme.palette.text),
+                Space::new().width(Length::Fill),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .style(button::text)
+        .width(Length::Fill)
+        .on_press(Message::OrchestrationStudio(StudioMessage::ToggleRuntimePanel(panel)));
+        let body: Element<'_, Message> = if collapsed {
+            Space::new().height(0.0).into()
+        } else {
+            match panel {
+                StudioRuntimePanel::DecisionJournal => {
+                    studio_decision_journal::body(&self.runtime_snapshot, theme)
+                }
+                StudioRuntimePanel::WorldModel => {
+                    studio_world_model::body(&self.runtime_snapshot, theme)
+                }
+                StudioRuntimePanel::FailureDiagnoses => {
+                    studio_failure_diagnoses::body(&self.runtime_snapshot, theme)
+                }
+                StudioRuntimePanel::Suitability => {
+                    studio_suitability::body(&self.runtime_snapshot, theme)
+                }
+            }
+        };
+        container(column![header, body].spacing(sp.sm))
+            .width(Length::Fill)
+            .padding(sp.sm)
+            .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme.palette.surface_variant)),
+                border: iced::Border {
+                    color: theme.palette.border,
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..iced::widget::container::Style::default()
+            })
+            .into()
     }
 
     // ------------------------------------------------------------------
@@ -3129,10 +3331,10 @@ impl State {
             // The empty-registry caption mirrors the resolution seam
             // (blueprint.rs:649-657): an empty registry falls back to the
             // engine's five standard rows at resolve time, so the caption
-            // names those kinds rather than implying no hand-offs exist.
+            // names those kinds rather than implying no relationships exist.
             rows = rows.push(
                 text(
-                    "Registry is empty — the engine falls back to the standard hand-offs \
+                    "Registry is empty — the engine falls back to the standard relationships \
                      (supervises, provides_context_to, owns_design). Add a row to override.",
                 )
                 .size(ts.body)
@@ -3233,7 +3435,9 @@ impl State {
 
         let query = self.search_query.to_lowercase();
         let mut list = column![].spacing(sp.xs);
-        for agent in &self.agents {
+        // The hardcoded coordinator is engine-owned and never rendered as a
+        // roster row (maintainer decision 2026-09), on either path.
+        for agent in self.visible_agents() {
             if query.is_empty()
                 || agent.name.to_lowercase().contains(&query)
                 || agent.role.to_lowercase().contains(&query)
@@ -3265,48 +3469,32 @@ impl State {
                 )
                 .style(if selected { button::primary } else { button::text })
                 .width(Length::Fill);
-                // The coordinator is engine-owned (ADR-35 §5): on the roster
-                // surface it is a locked row — visibly rendered with an
-                // "Engine-owned" marker, but never selectable into the
-                // inspector and with no Edit/Delete affordance. Guarding the
-                // affordance here (not the row) keeps the sibling
-                // `RemoveAgent`/`SelectAgent` message guards as the final
-                // backstop for non-UI paths.
-                let select = if agent.id == "coordinator" && blueprint_path {
-                    select
-                } else {
-                    select.on_press(Message::OrchestrationStudio(StudioMessage::SelectAgent(Some(
-                        agent.id.clone(),
-                    ))))
-                };
+                // The coordinator is filtered from `visible_agents`, so every
+                // rendered row is selectable/editable (no engine-owned special
+                // case remains here).
+                let select = select.on_press(Message::OrchestrationStudio(
+                    StudioMessage::SelectAgent(Some(agent.id.clone())),
+                ));
                 // Slice 3 roster CRUD: on the blueprint path every agent is a
-                // fully editable template except the engine-owned coordinator
-                // (locked, see above). Edit routes to the per-agent inspector
-                // (persisted through the roster Save arm); Delete removes the
-                // agent from config on the next Save. The legacy path keeps
-                // its historical "Remove custom agent only" affordance.
+                // fully editable template. Edit routes to the per-agent
+                // inspector (persisted through the roster Save arm); Delete
+                // removes the agent from config on the next Save. The legacy
+                // path keeps its historical "Remove custom agent only"
+                // affordance.
                 let agent_row = if blueprint_path {
-                    if agent.id == "coordinator" {
-                        row![select, badge(theme, "Engine-owned")]
-                            .spacing(sp.xs)
-                            .align_y(Alignment::Center)
-                    } else {
-                        row![
-                            select,
-                            button("Edit").style(button::text).on_press(
-                                Message::OrchestrationStudio(StudioMessage::SelectAgent(Some(
-                                    agent.id.clone()
-                                )),)
-                            ),
-                            button("Delete").style(button::text).on_press(
-                                Message::OrchestrationStudio(StudioMessage::RemoveAgent(
-                                    agent.id.clone()
-                                ),)
-                            ),
-                        ]
-                        .spacing(sp.xs)
-                        .align_y(Alignment::Center)
-                    }
+                    row![
+                        select,
+                        button("Edit").style(button::text).on_press(Message::OrchestrationStudio(
+                            StudioMessage::SelectAgent(Some(agent.id.clone())),
+                        )),
+                        button("Delete").style(button::text).on_press(
+                            Message::OrchestrationStudio(StudioMessage::RemoveAgent(
+                                agent.id.clone()
+                            ),)
+                        ),
+                    ]
+                    .spacing(sp.xs)
+                    .align_y(Alignment::Center)
                 } else if agent.is_custom {
                     row![
                         select,
@@ -3400,6 +3588,7 @@ impl State {
                 .max_cycles
                 .map(|value| format!("{value} cycle{}", if value == 1 { "" } else { "s" }))
                 .unwrap_or_else(|| "unlimited cycles".into());
+            let semantics = legacy_relationship_semantics(&rel.relationship);
             relationship_list = relationship_list.push(
                 row![
                     column![
@@ -3409,9 +3598,13 @@ impl State {
                             self.agent_label(&rel.to)
                         ))
                         .size(ts.body),
-                        text(format!("{} · {cycles}", rel.relationship))
-                            .size(ts.caption)
-                            .color(theme.palette.text_muted),
+                        text(format!(
+                            "{} {} · {cycles}",
+                            semantics_glyph(semantics),
+                            semantics_label(semantics)
+                        ))
+                        .size(ts.caption)
+                        .color(theme.palette.text_muted),
                     ]
                     .spacing(sp.xs)
                     .width(Length::Fill),
@@ -3428,7 +3621,9 @@ impl State {
         }
         if self.relationships.is_empty() {
             relationship_list = relationship_list.push(
-                text("No hand-offs configured yet.").size(ts.body).color(theme.palette.text_muted),
+                text("No relationships configured yet.")
+                    .size(ts.body)
+                    .color(theme.palette.text_muted),
             );
         }
 
@@ -3450,12 +3645,9 @@ impl State {
             .collect();
         let selected_from = agent_options.iter().find(|o| o.id == self.new_rel_from).cloned();
         let selected_to = agent_options.iter().find(|o| o.id == self.new_rel_to).cloned();
-        let rel_types: Vec<String> = vec![
-            "supervises".into(),
-            "provides_context_to".into(),
-            "reports_to".into(),
-            "owns_design".into(),
-        ];
+        let rel_types = legacy_rel_kind_options();
+        let selected_rel_type =
+            rel_types.iter().find(|option| option.kind == self.new_rel_type).cloned();
         // The add/edit form only renders while it is relevant: when an edge is
         // clicked (or "Add hand-off" is pressed). Browsing the pipeline and
         // editing a hand-off are now visually distinct states.
@@ -3477,7 +3669,7 @@ impl State {
         };
         let draft_note: Element<'_, Message> = match draft_error {
             Some(error) => text(error).size(ts.caption).color(theme.palette.text_muted).into(),
-            None => text("This hand-off keeps the pipeline acyclic.")
+            None => text("This relationship keeps the pipeline acyclic.")
                 .size(ts.caption)
                 .color(theme.palette.success)
                 .into(),
@@ -3498,17 +3690,9 @@ impl State {
                     Message::OrchestrationStudio(StudioMessage::NewRelTo(option.id))
                 })
                 .placeholder("To agent"),
-                pick_list(
-                    rel_types,
-                    if self.new_rel_type.is_empty() {
-                        None
-                    } else {
-                        Some(self.new_rel_type.clone())
-                    },
-                    |relationship| Message::OrchestrationStudio(StudioMessage::NewRelType(
-                        relationship
-                    )),
-                )
+                pick_list(rel_types, selected_rel_type, |option| {
+                    Message::OrchestrationStudio(StudioMessage::NewRelType(option.kind))
+                })
                 .placeholder("Relationship type"),
                 text_input("Max cycles (optional)", &self.new_rel_max_cycles).on_input(|value| {
                     Message::OrchestrationStudio(StudioMessage::NewRelMaxCycles(value))
@@ -3567,14 +3751,14 @@ impl State {
             if editor_visible { relationship_editor.into() } else { Space::new().into() };
         let handoffs_card = section_card(
             theme,
-            "Hand-offs",
+            "Relationships",
             column![
                 row![
                     text(format!("{} configured", self.relationships.len()))
                         .size(ts.caption)
                         .color(theme.palette.text_muted),
                     Space::new().width(Length::Fill),
-                    button("+ Add hand-off").style(button::secondary).on_press(
+                    button("+ Add relationship").style(button::secondary).on_press(
                         Message::OrchestrationStudio(StudioMessage::ToggleRelationshipEditor(true))
                     ),
                 ]
@@ -4044,6 +4228,131 @@ mod tests {
         assert!(!state.unsaved, "blocked removal must not mark the studio dirty");
     }
 
+    /// Maintainer decision 2026-09: the coordinator is hardcoded, so exactly
+    /// one canonical frozen definition exists in code and the seeded fallback
+    /// uses it verbatim.
+    #[test]
+    fn hardcoded_coordinator_is_the_single_frozen_definition() {
+        let frozen = default_coordinator_agent();
+        assert_eq!(frozen.id, "coordinator");
+        assert_eq!(frozen.role, "coordinator");
+
+        let seeded = default_builtin_agents();
+        let coordinators: Vec<&AgentConfig> =
+            seeded.iter().filter(|agent| is_coordinator_agent(agent)).collect();
+        assert_eq!(coordinators.len(), 1, "exactly one hardcoded coordinator row");
+        assert_eq!(coordinators[0].id, frozen.id);
+        assert_eq!(
+            coordinators[0].prompt_sections.system_instructions,
+            frozen.prompt_sections.system_instructions
+        );
+    }
+
+    /// The rendered roster hides the coordinator on the seeded/fallback path,
+    /// while the row stays in `State::agents` so the topology that references
+    /// it (the standard preset's hand-offs) remains complete.
+    #[test]
+    fn studio_roster_excludes_coordinator_on_seeded_path() {
+        let state = State::new();
+        assert!(
+            state.agents.iter().any(is_coordinator_agent),
+            "the frozen row stays in state for topology"
+        );
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "the coordinator must never render as a roster row"
+        );
+    }
+
+    /// An EXISTING config file that carries a coordinator roster entry is
+    /// ignored at display time: the entry is not stripped from state (no user
+    /// data rewritten), but every rendered roster surface filters it.
+    #[test]
+    fn existing_config_coordinator_entry_is_ignored_in_the_roster() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![
+                    concerto_config::CustomAgentConfig {
+                        id: "coordinator".into(),
+                        name: "User Coordinator".into(),
+                        role: "coordinator".into(),
+                        ..Default::default()
+                    },
+                    concerto_config::CustomAgentConfig {
+                        id: "coder".into(),
+                        role: "coder".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "a config-injected coordinator must not render"
+        );
+        assert!(
+            state.agents.iter().any(|agent| agent.id == "coordinator"),
+            "the config entry is ignored, not stripped from state"
+        );
+        assert_eq!(
+            state.visible_agents().filter(|agent| agent.id == "coder").count(),
+            1,
+            "the rest of the roster is untouched"
+        );
+    }
+
+    /// Persisted rosters never contain the coordinator, even when the seeded or
+    /// config-injected in-memory roster does.
+    #[test]
+    fn persisted_roster_never_contains_the_coordinator() {
+        let is_custom_coordinator = |agent: &CustomAgentConfig| {
+            agent.id.eq_ignore_ascii_case("coordinator")
+                || agent.role.eq_ignore_ascii_case("coordinator")
+        };
+
+        // Seeded fallback path.
+        let seeded = State::new();
+        assert!(seeded.agents.iter().any(is_coordinator_agent));
+        let (custom, _, _) = seeded.persisted_parts();
+        assert!(!custom.iter().any(is_custom_coordinator), "seeded roster must not persist it");
+
+        // Config-injected path: the entry does not survive the persist round-trip.
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "coordinator".into(),
+                    role: "coordinator".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut injected = State::new();
+        injected.load_from_config(&config);
+        let (custom, _, _) = injected.persisted_parts();
+        assert!(!custom.iter().any(is_custom_coordinator), "config entry must not persist");
+    }
+
+    /// The obsolete "No coordinator agent present" warning is gone: the
+    /// coordinator exists by construction, not by roster membership.
+    #[test]
+    fn validation_no_longer_warns_about_a_missing_coordinator() {
+        let state = State::default();
+        assert!(state.agents.is_empty());
+        let report = state.validation();
+        assert!(
+            !report.messages.iter().any(|message| message.contains("No coordinator")),
+            "obsolete warning still present: {:?}",
+            report.messages
+        );
+    }
+
     #[test]
     fn relationship_editor_opens_and_closes_via_toggle() {
         let mut state = State::new();
@@ -4074,9 +4383,11 @@ mod tests {
         assert_eq!(edge_to_relationship, (0..state.relationships.len()).collect::<Vec<_>>());
         // Node ids follow agent order: the coordinator seed is index 0.
         assert_eq!(model.nodes[0].label, "Coordinator");
-        // Edge ids follow relationship order, with type + cycle labels.
-        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("supervises · 3")));
-        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("provides_context_to · 3")));
+        // Edge ids follow relationship order, with the CLOSED relationship
+        // semantics (glyph + label) + cycle labels — never the stale legacy
+        // kind string (M4 terminology).
+        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("⛓ delegation · 3")));
+        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("➜ context flow · 3")));
     }
 
     #[test]
@@ -5489,6 +5800,31 @@ mod tests {
         }
     }
 
+    /// M4 terminology: the legacy pipeline editor maps every closed legacy
+    /// kind to its `RelationshipSemantics` and renders the semantic glyph
+    /// (never the stale kind string alone). The vocabulary the options carry
+    /// is exactly the current one (`delegation` / `context flow`).
+    #[test]
+    fn legacy_relationship_options_carry_closed_semantics() {
+        let options = legacy_rel_kind_options();
+        assert_eq!(options.len(), 4, "the closed legacy vocabulary is four kinds");
+        let semantics_of = |kind: &str| {
+            options.iter().find(|option| option.kind == kind).map(|option| option.semantics)
+        };
+        assert_eq!(semantics_of("supervises"), Some(RelationshipSemantics::Delegation));
+        assert_eq!(semantics_of("provides_context_to"), Some(RelationshipSemantics::ContextFlow));
+        assert_eq!(semantics_of("reports_to"), Some(RelationshipSemantics::Delegation));
+        assert_eq!(semantics_of("owns_design"), Some(RelationshipSemantics::Delegation));
+        // The picker label pairs the semantic glyph with the kind, so the
+        // affordance is never color/string-only.
+        for option in &options {
+            assert!(
+                option.to_string().starts_with(semantics_glyph(option.semantics)),
+                "option label must carry its semantic glyph: {option}"
+            );
+        }
+    }
+
     #[test]
     fn fallback_persona_edits_mutate_and_revalidate_immediately() {
         // The standard blueprint's review stage (index 3) ships a fallback
@@ -5814,5 +6150,76 @@ mod tests {
             "no orchestration ⇒ legacy path (library and actions rendered)"
         );
         let _ = legacy.view(&theme);
+    }
+
+    /// The four read-only observability panels are registered in the panes
+    /// rail as one `StudioRuntimePanel` each, and their only message is the
+    /// view-only collapse toggle (never a dirtying edit).
+    #[test]
+    fn observability_panels_are_registered_and_toggle_without_dirtying() {
+        assert_eq!(
+            StudioRuntimePanel::ALL,
+            [
+                StudioRuntimePanel::DecisionJournal,
+                StudioRuntimePanel::WorldModel,
+                StudioRuntimePanel::FailureDiagnoses,
+                StudioRuntimePanel::Suitability,
+            ],
+            "every S1–S4 panel is registered exactly once"
+        );
+        let mut state = State::new();
+        for panel in StudioRuntimePanel::ALL {
+            assert!(!state.runtime_collapsed.contains(&panel), "expanded by default");
+            let _ = state.update(StudioMessage::ToggleRuntimePanel(panel));
+            assert!(state.runtime_collapsed.contains(&panel), "toggle collapses");
+        }
+        assert!(!state.unsaved, "view-only panel toggles never mark the studio dirty");
+        for panel in StudioRuntimePanel::ALL {
+            let _ = state.update(StudioMessage::ToggleRuntimePanel(panel));
+            assert!(!state.runtime_collapsed.contains(&panel), "toggle expands again");
+        }
+    }
+
+    /// The Studio renders the rail with an empty snapshot (muted empty states)
+    /// and with populated runtime state, without panicking.
+    #[test]
+    fn studio_view_renders_the_observability_rail_with_empty_and_populated_state() {
+        use concerto_orchestrator::decisions::{CoordinatorDecision, DecisionKind, DecisionStatus};
+        use concerto_orchestrator::suitability::SuitabilityState;
+        use concerto_orchestrator::world_model::WorldModel;
+
+        let theme = AppTheme::by_name("Midnight");
+
+        let mut empty = State::new();
+        assert!(empty.runtime_snapshot.is_empty());
+        let _ = empty.view(&theme);
+
+        let world = WorldModel { objective: Some("ship the slice".into()), ..Default::default() };
+        let decision = CoordinatorDecision {
+            id: "d1".into(),
+            kind: DecisionKind::DispatchSpecialist,
+            target_agent: Some(concerto_core::types::AgentId::new("coder")),
+            task_description: "work".into(),
+            notes: None,
+            supporting_evidence_ids: vec!["e1".into()],
+            expected_artifacts: Vec::new(),
+            transform: None,
+            max_tool_calls: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            status: DecisionStatus::Settled,
+        };
+        empty.set_runtime_snapshot(StudioRuntimeSnapshot::from_parts(
+            &[decision],
+            &[],
+            &world,
+            &SuitabilityState::default(),
+            time::OffsetDateTime::now_utc(),
+        ));
+        assert!(!empty.runtime_snapshot.is_empty());
+        let _ = empty.view(&theme);
+
+        // Fail-soft note path: an unavailable snapshot still renders.
+        empty.set_runtime_snapshot(StudioRuntimeSnapshot::unavailable("checkpoint read failed"));
+        let _ = empty.view(&theme);
     }
 }

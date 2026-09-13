@@ -13,6 +13,9 @@ use crate::widgets::circuit_background;
 use crate::services::session_handler::DesktopSessionHandler;
 use crate::views::memory::MemoryStatus;
 use crate::views::spend::CapUiState;
+use crate::views::studio_runtime::{
+    CheckpointStudioRuntimeReader, StudioRuntimeReader, StudioRuntimeSnapshot,
+};
 use camino::Utf8PathBuf;
 use concerto_config::AppConfig;
 use concerto_config::CredentialStore;
@@ -122,6 +125,11 @@ pub enum Message {
     AgentGraph(views::agent_graph::Message),
     Terminal(views::terminal::Message),
     OrchestrationStudio(views::orchestration_studio::StudioMessage),
+    /// Read-only Studio observability snapshot loaded from the session's
+    /// persisted orchestration checkpoint on Studio open/refresh. The
+    /// `Option<Ulid>` is the session the load was for, so a result arriving
+    /// after the active session changed is discarded.
+    StudioRuntimeLoaded(Option<Ulid>, Box<StudioRuntimeSnapshot>),
     /// Explicit import action (global-only orchestration enforcement): copy
     /// the ignored project-layer orchestration keys
     /// (`[orchestration]`, `[multi_agent.custom_agents]`,
@@ -944,6 +952,11 @@ impl App {
                     // (only updates dropdown options, not agent assignments).
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
+                    // Read-only Coordinator 2.0 observability: refresh the
+                    // runtime snapshot from the active session's persisted
+                    // checkpoint. No polling — Studio open/refresh is the only
+                    // trigger.
+                    return self.load_studio_runtime();
                 }
                 iced::Task::none()
             }
@@ -1489,6 +1502,14 @@ impl App {
                     }
                 }
                 task
+            }
+            Message::StudioRuntimeLoaded(session_id, snapshot) => {
+                // Discard a stale load: only apply the snapshot whose session
+                // still matches the active one.
+                if session_id == self.active_session_id {
+                    self.orchestration_studio.set_runtime_snapshot(*snapshot);
+                }
+                iced::Task::none()
             }
             Message::Editor(msg) => self
                 .editor
@@ -3478,6 +3499,56 @@ impl App {
         )
     }
 
+    /// Load the read-only Coordinator 2.0 runtime snapshot for the Studio's
+    /// observability panels from the active session's persisted checkpoint.
+    ///
+    /// Fail-soft: a missing session, a store failure, or a checkpoint parse
+    /// failure yields an empty snapshot (with a muted note) rather than an
+    /// error. The read is outside the run lifecycle, so it carries a fresh
+    /// cancellation token (the reader still honors it at the seam) — the
+    /// run's own token must not permanently disable the panel after a cancel.
+    fn load_studio_runtime(&self) -> iced::Task<Message> {
+        let session_id = self.active_session_id;
+        let session_manager = self.session_manager.clone();
+        let app_config = self.config.clone().unwrap_or_default();
+        iced::Task::perform(
+            async move {
+                let Some(session_id) = session_id else {
+                    // No active session yet: empty panels, no error.
+                    return (None, Box::new(StudioRuntimeSnapshot::default()));
+                };
+                let handler = {
+                    let existing =
+                        session_manager.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    match existing {
+                        Some(handler) => handler,
+                        None => match DesktopSessionHandler::connect_with_config(&app_config).await
+                        {
+                            Ok(handler) => Arc::new(handler),
+                            Err(error) => {
+                                return (
+                                    Some(session_id),
+                                    Box::new(StudioRuntimeSnapshot::unavailable(format!(
+                                        "runtime state unavailable: {error}"
+                                    ))),
+                                );
+                            }
+                        },
+                    }
+                };
+                let reader = CheckpointStudioRuntimeReader::new(handler.manager().store());
+                let snapshot = match reader.load(session_id, CancellationToken::new()).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => StudioRuntimeSnapshot::unavailable(format!(
+                        "runtime state unavailable: {error}"
+                    )),
+                };
+                (Some(session_id), Box::new(snapshot))
+            },
+            |(session_id, snapshot)| Message::StudioRuntimeLoaded(session_id, snapshot),
+        )
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let sidebar = views::nav::sidebar_view(self);
 
@@ -4351,6 +4422,35 @@ mod tests {
         let (mut app, _) = App::new();
         let _ = app.update(Message::Navigate(Page::Settings));
         assert_eq!(app.page, Page::Settings);
+    }
+
+    /// The read-only Studio runtime snapshot is applied only for the active
+    /// session; a result for a session the user has left is discarded.
+    #[test]
+    fn studio_runtime_loaded_applies_only_for_the_active_session() {
+        use crate::views::studio_runtime::StudioRuntimeSnapshot;
+
+        let (mut app, _) = App::new();
+        let active = Ulid::new();
+        app.active_session_id = Some(active);
+        assert!(app.orchestration_studio.runtime_snapshot.load_error.is_none());
+
+        // A result for a different session is dropped.
+        let _ = app.update(Message::StudioRuntimeLoaded(
+            Some(Ulid::new()),
+            Box::new(StudioRuntimeSnapshot::unavailable("stale")),
+        ));
+        assert!(
+            app.orchestration_studio.runtime_snapshot.load_error.is_none(),
+            "a stale-session result must be discarded"
+        );
+
+        // A result for the active session is applied.
+        let _ = app.update(Message::StudioRuntimeLoaded(
+            Some(active),
+            Box::new(StudioRuntimeSnapshot::unavailable("fresh")),
+        ));
+        assert_eq!(app.orchestration_studio.runtime_snapshot.load_error.as_deref(), Some("fresh"));
     }
 
     #[test]

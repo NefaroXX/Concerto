@@ -1966,6 +1966,20 @@ mod tests {
         assert_eq!(decoded, agent);
     }
 
+    /// Maintainer decision 2026-09: the embedded agent seeds never contain the
+    /// coordinator — it is constructed in code, not seeded or persisted.
+    #[test]
+    fn builtin_agent_seeds_never_contain_the_coordinator() {
+        let seeds = builtin_agent_seeds();
+        assert!(
+            !seeds.iter().any(|seed| {
+                seed.id.eq_ignore_ascii_case("coordinator")
+                    || seed.role.eq_ignore_ascii_case("coordinator")
+            }),
+            "the config seed roster must never carry a coordinator entry: {seeds:?}"
+        );
+    }
+
     #[test]
     fn pipeline_warnings_flags_coordinator_entries() {
         let agent = |id: &str, role: &str| CustomAgentConfig {
