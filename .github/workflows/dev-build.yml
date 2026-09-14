@@ -1,0 +1,75 @@
+# Dev artifact builder: fresh Windows smoke-test binary without local builds.
+#
+# Triggers on every push to `dev` (docs-only changes excluded) and manually
+# via workflow_dispatch. Builds the `concerto` entry binary (default features
+# include the desktop frontend) in the debug profile — fast with a warm
+# cache, and behavior-identical for smoke testing — then uploads it with the
+# commit SHA baked into the filename, so a downloaded binary is always
+# traceable to its exact commit (no more stale-binary questions: the SHA is
+# the version).
+#
+# Download: Actions tab → "Dev Windows build" → latest green run →
+# Artifacts → concerto-windows-dev (contains concerto-dev-<sha>-*.exe).
+# Retention is deliberately short; tagged releases remain the durable
+# artifacts (see release.yml).
+
+name: Dev Windows build
+
+on:
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/dev-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows-dev:
+    name: Windows dev binary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-dev
+
+      - name: Build debug binary
+        run: cargo build --target x86_64-pc-windows-msvc -p concerto
+
+      - name: Stage SHA-named binary
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "SHORT_SHA=${SHORT_SHA}" >> "${GITHUB_ENV}"
+          cp "target/x86_64-pc-windows-msvc/debug/concerto.exe" \
+             "concerto-dev-${SHORT_SHA}-x86_64-pc-windows-msvc.exe"
+
+      - name: Upload dev artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: concerto-windows-dev
+          path: concerto-dev-${{ env.SHORT_SHA }}-x86_64-pc-windows-msvc.exe
+          if-no-files-found: error
+          retention-days: 14
