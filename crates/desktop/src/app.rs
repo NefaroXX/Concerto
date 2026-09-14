@@ -125,10 +125,10 @@ pub enum Message {
     AgentGraph(views::agent_graph::Message),
     Terminal(views::terminal::Message),
     OrchestrationStudio(views::orchestration_studio::StudioMessage),
-    /// Read-only Studio observability snapshot loaded from the session's
-    /// persisted orchestration checkpoint on Studio open/refresh. The
-    /// `Option<Ulid>` is the session the load was for, so a result arriving
-    /// after the active session changed is discarded.
+    /// Read-only observability snapshot loaded from the session's persisted
+    /// orchestration checkpoint when the Runtime modal (Ctrl+R) or the Studio
+    /// opens. The `Option<Ulid>` is the session the load was for, so a result
+    /// arriving after the active session changed is discarded.
     StudioRuntimeLoaded(Option<Ulid>, Box<StudioRuntimeSnapshot>),
     /// Explicit import action (global-only orchestration enforcement): copy
     /// the ignored project-layer orchestration keys
@@ -954,8 +954,8 @@ impl App {
                         .sync_models(self.settings.cached_models_by_provider());
                     // Read-only Coordinator 2.0 observability: refresh the
                     // runtime snapshot from the active session's persisted
-                    // checkpoint. No polling — Studio open/refresh is the only
-                    // trigger.
+                    // checkpoint. No polling — Studio open and the Runtime
+                    // modal (Ctrl+R) are the only triggers.
                     return self.load_studio_runtime();
                 }
                 iced::Task::none()
@@ -974,6 +974,12 @@ impl App {
                 // the modal body is fresh (idempotent re-open).
                 if sub_view == views::chat::SubView::SpendLog {
                     return self.load_spend_log();
+                }
+                // Opening the Runtime modal refreshes the active session's
+                // read-only observability snapshot through the existing
+                // checkpoint reader (idempotent re-open).
+                if sub_view == views::chat::SubView::Runtime {
+                    return self.load_studio_runtime();
                 }
                 iced::Task::none()
             }
@@ -1977,6 +1983,16 @@ impl App {
                 self.update(Message::SetSubView(new_sub))
             }
             Shortcut::Terminal => self.update(Message::ToggleTerminalPanel),
+            Shortcut::RuntimePanels => {
+                let new_sub = if self.page == Page::Chat
+                    && self.chat.sub_view == views::chat::SubView::Runtime
+                {
+                    views::chat::SubView::Main
+                } else {
+                    views::chat::SubView::Runtime
+                };
+                self.update(Message::SetSubView(new_sub))
+            }
             Shortcut::UndoRun => {
                 // On the Editor page with an open file, Ctrl+Z is text undo.
                 if self.page == Page::Editor && self.editor.active_file().is_some() {
@@ -2025,6 +2041,11 @@ impl App {
                 self.show_help = false;
                 // Esc also dismisses the Memory explorer modal.
                 self.memory_view_open = false;
+                // Esc dismisses the Runtime panels modal (memory-modal parity;
+                // the Diff / Tool Log overlays stay close-button-only).
+                if self.page == Page::Chat && self.chat.sub_view == views::chat::SubView::Runtime {
+                    return self.update(Message::SetSubView(views::chat::SubView::Main));
+                }
                 // On the Editor page, Esc also dismisses the find/goto bars.
                 if self.page == Page::Editor {
                     let close_find =
@@ -3521,8 +3542,9 @@ impl App {
         )
     }
 
-    /// Load the read-only Coordinator 2.0 runtime snapshot for the Studio's
-    /// observability panels from the active session's persisted checkpoint.
+    /// Load the read-only Coordinator 2.0 runtime snapshot for the chat
+    /// Runtime modal's observability panels from the active session's
+    /// persisted checkpoint.
     ///
     /// Fail-soft: a missing session, a store failure, or a checkpoint parse
     /// failure yields an empty snapshot (with a muted note) rather than an
@@ -3716,6 +3738,10 @@ impl App {
                         &self.current_theme,
                     )
                     .map(Message::Chat),
+                    views::chat::SubView::Runtime => views::studio_runtime::runtime_modal_view(
+                        &self.orchestration_studio.runtime_snapshot,
+                        &self.current_theme,
+                    ),
                 }
             } else {
                 // Fade-out placeholder: a text-free empty body so the card can
@@ -3734,6 +3760,7 @@ impl App {
                 views::chat::SubView::AgentGraph => "Agent Graph",
                 views::chat::SubView::ToolLog => "Tool Log",
                 views::chat::SubView::SpendLog => "Spend Log",
+                views::chat::SubView::Runtime => "Runtime",
             };
 
             let header = row![text(title).size(18), iced::widget::space::horizontal(), close_btn]
@@ -3751,6 +3778,7 @@ impl App {
                     .into()
             } else if self.chat.sub_view == views::chat::SubView::ToolLog
                 || self.chat.sub_view == views::chat::SubView::SpendLog
+                || self.chat.sub_view == views::chat::SubView::Runtime
             {
                 // Centered modal with max-width — let the child determine its
                 // natural height; never force Length::Shrink on the container
@@ -4493,6 +4521,31 @@ mod tests {
         assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Diff);
     }
 
+    /// Ctrl+R opens the per-session Runtime modal in the chat canvas, and
+    /// pressing it again closes it (toggle, mirroring Ctrl+D / Ctrl+L).
+    #[test]
+    fn runtime_shortcut_toggles_the_runtime_subview() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::RuntimePanels));
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Runtime);
+
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::RuntimePanels));
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Main);
+    }
+
+    /// Esc closes the Runtime modal in the chat canvas (mirrors the Memory
+    /// modal's Esc dismissal).
+    #[test]
+    fn escape_closes_the_runtime_modal() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::SetSubView(crate::views::chat::SubView::Runtime));
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Runtime);
+
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::CancelDialog));
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Main);
+    }
+
     // ── ADR-57 — config reload reconciliation ──────────────────────────────
     //
     // `apply_reloaded_config` is the harness-free half of
@@ -5022,6 +5075,13 @@ custom_agents = []
             "precondition: the selection is catalog-name based"
         );
         app.orchestration_studio.load_from_config(&config);
+
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save is not pre-empted.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
 
         // Edit the first stage's label, then Save.
         let _ = app.orchestration_studio.update(
@@ -7252,6 +7312,13 @@ custom_agents = []
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
 
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save is not pre-empted.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
+
         // The Studio draft: edit the first stage's label, add a roster agent
         // (a roster edit alongside the blueprint — exactly one agent list is
         // persisted), then Save.
@@ -7423,6 +7490,14 @@ custom_agents = []
         app.reconcile_config_from_reload();
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
+
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save reaches the include
+        // guard under test.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
 
         // The watcher (or a hand edit) replaced the include with garbage
         // AFTER the load: the on-disk file no longer parses.
