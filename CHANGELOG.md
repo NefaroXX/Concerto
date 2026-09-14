@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Shell containment hardening batch:** xargs-fed argv contained
+  (including wrapper-prefixed and any-position triggers), glued redirect
+  suffixes resolved per-operator, plugin namespace claims force-prefixed;
+  all fail-closed with pinned tests. Three security reviews drove it.
 - **Supply-chain green again:** fixed the deny CI job (toolchain pin) and
   patched RUSTSEC-2026-0285 by bumping rustls 0.23.41 → 0.23.45 (TLS 1.3
   handshake hardening; patch-level, no API changes).
