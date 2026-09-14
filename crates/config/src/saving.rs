@@ -34,11 +34,14 @@
 //!   roster — a deletion stays deleted, and the embedded seeds never merge
 //!   back in.
 //! - [`ensure_default_blueprint`] fills a TOTAL absence of a blueprint
-//!   selection (no `name`/`include`/`inline` under an existing
-//!   `[orchestration]`) with the shipped `standard` selector, so a config
-//!   that declares the section but never selected a pipeline can no longer
-//!   leave the Studio in its degraded fallback. Any declared selector is left
-//!   untouched, which keeps the exactly-one invariant safe by construction.
+//!   selection with the shipped `standard` selector. "Total absence" covers
+//!   both an existing `[orchestration]` with no `name`/`include`/`inline` and
+//!   a config with no `[orchestration]` table at all (migrate-when-missing,
+//!   maintainer decision): a global config that owns a roster but never
+//!   declared the section can no longer leave the Studio in its degraded
+//!   fallback. The created table carries ONLY the default selector, and any
+//!   declared selector is left untouched, which keeps the exactly-one
+//!   invariant safe by construction.
 //!
 //! A failed write never leaves a truncated file at the target: the temp file
 //! is written and flushed first, `rename` then atomically replaces the target
@@ -638,26 +641,29 @@ fn blueprint_selector_declared(item: &toml_edit::Item) -> bool {
 /// name, `named_blueprint("standard")`).
 ///
 /// The Studio's degraded fallback ("orchestration blueprint inactive") is
-/// reachable only when `[orchestration]` exists without any selector — the
-/// section is present but no `name`/`include`/`inline` was ever written. This
-/// writer closes that gap through the same `toml_edit` document model as the
-/// roster seed, preserving every other key — an existing `[orchestration]`
-/// table, its `schema_version`, comments, and unrelated sections — byte for
-/// byte. The write is atomic ([`atomic_write`]) and idempotent (a second run
-/// sees the selector and is a strict no-op).
+/// reachable when no selector was ever written: either `[orchestration]`
+/// exists without any `name`/`include`/`inline`, or the table is entirely
+/// absent (the roster-owning global config shape). This writer closes that gap
+/// through the same `toml_edit` document model as the roster seed, preserving
+/// every other key — an existing `[orchestration]` table, its
+/// `schema_version`, comments, and unrelated sections — byte for byte. The
+/// write is atomic ([`atomic_write`]) and idempotent (a second run sees the
+/// selector and is a strict no-op).
+///
+/// **Migrate-when-missing** (maintainer decision): a config with NO
+/// `[orchestration]` table at all gains one containing ONLY the default
+/// selector — no roster writes, no `schema_version`, no other keys. The old
+/// "legacy configs are never converted" rule is overridden for this case. A
+/// missing FILE is still a read error; first-run creation stays the roster
+/// seed's job.
 ///
 /// The exactly-one load invariant is safe **by construction**: the write is
-/// skipped whenever ANY of the three selectors is present, so only a total
-/// absence is ever filled and an existing (valid) selection is never
-/// overwritten.
-///
-/// A document with no `[orchestration]` table at all is left alone — such a
-/// config is on the legacy path, and converting it to blueprint mode is not
-/// this writer's job (the fresh roster seed already emits an inline standard
-/// selection for a brand-new config).
+/// skipped whenever ANY of the three selectors is present, and a freshly
+/// created table contains the single selector this writer just made, so an
+/// existing (valid) selection is never overwritten.
 ///
 /// Returns `true` when the file was written, `false` when no selection was
-/// missing (or no `[orchestration]` table exists).
+/// missing.
 pub fn ensure_default_blueprint(config_path: &Path) -> Result<bool, ConfigError> {
     let raw = fs::read_to_string(config_path)
         .map_err(|e| ConfigError::Load(format!("failed to read {}: {e}", config_path.display())))?;
@@ -665,10 +671,13 @@ pub fn ensure_default_blueprint(config_path: &Path) -> Result<bool, ConfigError>
         ConfigError::Load(format!("failed to parse {}: {e}", config_path.display()))
     })?;
 
-    // Only an existing `[orchestration]` section is in scope.
-    if doc.get("orchestration").is_none() {
-        return Ok(false);
-    }
+    // Migrate-when-missing: create the `[orchestration]` table when the
+    // document has none, so a global config that owns a roster but never
+    // declared the section is no longer stuck in the Studio's degraded
+    // fallback forever. The table's ONLY content is the default selector
+    // written below (no roster, no schema_version, no other keys); when the
+    // table already exists this is the same `ensure_table_mut` traversal as
+    // before (including the inline-table promotion).
     let orchestration =
         ensure_table_mut(doc.as_table_mut(), "orchestration").map_err(|message| {
             ConfigError::Load(format!(
@@ -1410,26 +1419,122 @@ schema_version = 1
         }
     }
 
-    /// A config with no `[orchestration]` table at all is on the legacy path
-    /// and is left untouched — the writer never converts a legacy config into
-    /// blueprint mode, and a missing file is a read error (never silently
-    /// created here; the roster seed owns first-run creation).
+    /// Migrate-when-missing: a config with no `[orchestration]` table at all
+    /// (the roster-owning global shape) gains one carrying ONLY the default
+    /// `standard` selector. Every unrelated section stays byte-identical, no
+    /// roster or other orchestration keys are invented, the merged config now
+    /// declares `orchestration` (so the Studio gate would open), a rerun is a
+    /// strict no-op (byte-identical), and a missing file is still a read error
+    /// (first-run creation stays the roster seed's job).
     #[test]
-    fn ensure_default_blueprint_is_a_noop_without_an_orchestration_section() {
+    fn ensure_default_blueprint_creates_a_missing_orchestration_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.toml");
         let original = "schema_version = 7\n[providers]\nprimary = \"openai\"\n";
         std::fs::write(&path, original).expect("seed legacy config");
 
         assert!(
-            !ensure_default_blueprint(&path).expect("legacy config must not error"),
-            "a config without [orchestration] has no selection to fill"
+            ensure_default_blueprint(&path).expect("an absent table must be created"),
+            "a missing [orchestration] table must be created with the default selection"
         );
         let after = std::fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, original, "a legacy config must remain byte-identical");
+        // Unrelated content byte-identical.
+        for line in ["schema_version = 7", "[providers]", "primary = \"openai\""] {
+            assert!(after.contains(line), "unrelated content changed: missing {line}\n{after}");
+        }
+        // The created table carries exactly the one default selector.
+        assert_eq!(
+            after.matches("name = \"standard\"").count(),
+            1,
+            "exactly one default selector must be written\n{after}"
+        );
+        assert!(
+            !after.contains("include =") && !after.contains("inline ="),
+            "no sibling selector may be invented\n{after}"
+        );
+        // ONLY the selector: no schema_version, roster, or multi_agent writes.
+        assert_eq!(
+            after.matches("schema_version").count(),
+            1,
+            "the created table must not add an orchestration schema_version\n{after}"
+        );
+        assert!(!after.contains("custom_agents"), "no roster writes\n{after}");
+        assert!(!after.contains("multi_agent"), "no multi_agent table\n{after}");
+
+        let cfg = crate::load_config(Some(&path), None).expect("the migrated config must load");
+        assert!(cfg.orchestration.is_some(), "the merged config must now declare [orchestration]");
+        assert_eq!(
+            cfg.orchestration.as_ref().and_then(|o| o.blueprint.name.as_deref()),
+            Some("standard"),
+            "the created section must resolve to the standard default"
+        );
+
+        // Idempotent: the rerun sees the selector and writes nothing.
+        assert!(
+            !ensure_default_blueprint(&path).expect("second run must succeed"),
+            "a config that now declares a selector is never written again"
+        );
+        let second = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, second, "the second run must be byte-identical");
 
         let missing = dir.path().join("missing.toml");
         assert!(ensure_default_blueprint(&missing).is_err(), "a missing file is a read error");
+    }
+
+    /// The reported bug shape: the global config owns a roster
+    /// (`[multi_agent.custom_agents]`) but never declared `[orchestration]`.
+    /// Creating the table must leave the roster, `model_pins`, and every other
+    /// section byte-identical — only the default selector is added, and the
+    /// merged config now passes the Studio gate (`orchestration.is_some()`).
+    #[test]
+    fn ensure_default_blueprint_creates_the_table_without_touching_a_present_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = r#"# user config
+schema_version = 7
+
+[providers]
+primary = "openai"
+
+[multi_agent]
+max_concurrent_agents = 3
+model_pins = { coder = "local-model" }
+
+[[multi_agent.custom_agents]]
+id = "coder"
+name = "Coder"
+role = "coder"
+"#;
+        std::fs::write(&path, original).expect("seed roster-owning config");
+
+        assert!(
+            ensure_default_blueprint(&path).expect("an absent table must be created"),
+            "the missing [orchestration] table must be created"
+        );
+        let after = std::fs::read_to_string(&path).expect("read back");
+        // Every original line survives verbatim (roster, pins, sections).
+        for line in original.lines().filter(|line| !line.is_empty()) {
+            assert!(after.contains(line), "existing content changed or lost: {line}\n{after}");
+        }
+        assert_eq!(
+            after.matches("name = \"standard\"").count(),
+            1,
+            "the created table must add exactly the default selector\n{after}"
+        );
+        assert_eq!(
+            after.matches("custom_agents").count(),
+            1,
+            "the roster key must not be duplicated or rewritten\n{after}"
+        );
+
+        let cfg = crate::load_config(Some(&path), None).expect("the migrated config must load");
+        assert!(cfg.orchestration.is_some(), "the Studio gate (orchestration.is_some()) opens");
+        assert!(cfg.owns_agent_roster(), "the pre-existing roster stays owned and untouched");
+        assert_eq!(
+            cfg.multi_agent.as_ref().map(|m| m.custom_agents.len()),
+            Some(1),
+            "the pre-existing roster must be preserved"
+        );
     }
 
     /// An empty `[orchestration.blueprint]` table (present but selector-less)
