@@ -360,6 +360,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provides explicit user revocation.
 
 ### Changed
+- **Dev Windows artifacts:** every `dev` push builds the desktop binary on
+  Windows CI and uploads it SHA-named (`concerto-dev-<sha>-*.exe`, 14-day
+  retention) — smoke-test binaries are traceable to their commit, no local
+  builds required.
 - **Dependency bumps (low-risk batch):** `rand` 0.8→0.10 (bench-only
   migration), `tower-http` 0.6→0.7 (no direct usage, recompile), `nix`
   0.26→0.31 (signal APIs unchanged, unix gating intact). All rust-versions
