@@ -5076,6 +5076,13 @@ custom_agents = []
         );
         app.orchestration_studio.load_from_config(&config);
 
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save is not pre-empted.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
+
         // Edit the first stage's label, then Save.
         let _ = app.orchestration_studio.update(
             crate::views::orchestration_studio::StudioMessage::StageLabelEdited(
@@ -7305,6 +7312,13 @@ custom_agents = []
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
 
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save is not pre-empted.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
+
         // The Studio draft: edit the first stage's label, add a roster agent
         // (a roster edit alongside the blueprint — exactly one agent list is
         // persisted), then Save.
@@ -7476,6 +7490,14 @@ custom_agents = []
         app.reconcile_config_from_reload();
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
+
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save reaches the include
+        // guard under test.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
 
         // The watcher (or a hand edit) replaced the include with garbage
         // AFTER the load: the on-disk file no longer parses.

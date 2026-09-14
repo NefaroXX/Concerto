@@ -470,6 +470,11 @@ pub enum StudioMessage {
     NewAgentName(String),
     NewAgentRole(String),
     AddAgent,
+    /// Restore the five specialist builtin defaults into an EMPTY roster.
+    /// Shown only as an explicit empty-state action next to "+ Add agent";
+    /// never an automatic re-seed (deletions stick). The coordinator is never
+    /// seeded.
+    RestoreDefaultAgents,
     RemoveAgent(String),
     SelectAgent(Option<String>),
     SelectRelationship(Option<usize>),
@@ -1434,7 +1439,13 @@ impl State {
             };
         };
         match validate_blueprint(blueprint, self.global_max_dispatch_cycles) {
-            Ok(()) => ValidationReport { ok: true, messages: Vec::new() },
+            Ok(()) => match self.staffing_membership_error() {
+                Some(error) => {
+                    let view = blueprint_error_view(&error);
+                    ValidationReport { ok: false, messages: vec![view.message] }
+                }
+                None => ValidationReport { ok: true, messages: Vec::new() },
+            },
             Err(error) => {
                 let view = blueprint_error_view(&error);
                 ValidationReport { ok: false, messages: vec![view.message] }
@@ -1442,18 +1453,48 @@ impl State {
         }
     }
 
+    /// Roster-membership rule for blueprint stage staffing (Studio-level
+    /// extension of the `validate_blueprint` rulebook): every id in a stage's
+    /// `agents` list must name an agent present in the rendered roster
+    /// (`visible_agents`). A dangling id — a ghost left by a deleted agent or a
+    /// hand-edited/included blueprint — is a validation error so the toolbar
+    /// badge and the "Pipeline valid" claim can never disagree with the
+    /// staffing the canvas shows. The engine-owned coordinator is not a roster
+    /// member, so it is rejected here too. Returns only the first violation
+    /// (fail-fast, matching `validate_blueprint`'s report shape).
+    fn staffing_membership_error(&self) -> Option<BlueprintError> {
+        let blueprint = self.blueprint.as_ref()?;
+        for stage in &blueprint.pipeline.stages {
+            for agent in &stage.agents {
+                if !self.visible_agents().any(|candidate| &candidate.id == agent) {
+                    return Some(BlueprintError::rule(
+                        "stage.agents",
+                        "rule_k",
+                        &format!(
+                            "stage '{}' staffs unknown agent '{}': the id is absent from the roster",
+                            stage.tag, agent
+                        ),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Recompute the stored per-field validation errors for the editable
     /// blueprint (ADR-59 D5). Called on every `load_from_config`; later slices
     /// call it after each Studio mutation of `self.blueprint` so the toolbar
-    /// badge and detail bar stay current. Never panics: a missing `blueprint`
-    /// simply clears the collection.
+    /// badge and detail bar stay current. The Studio-level staffing-membership
+    /// rule (rule_k, `"stage.agents"`) runs when the rulebook itself is clean,
+    /// so the badge count always agrees with `validation()`. Never panics: a
+    /// missing `blueprint` simply clears the collection.
     pub fn refresh_blueprint_validation(&mut self) {
-        self.blueprint_errors = match self.blueprint.as_ref().and_then(|blueprint| {
-            validate_blueprint(blueprint, self.global_max_dispatch_cycles).err()
-        }) {
-            Some(error) => vec![error],
-            None => Vec::new(),
+        let rulebook_error = match self.blueprint.as_ref() {
+            Some(blueprint) => validate_blueprint(blueprint, self.global_max_dispatch_cycles).err(),
+            None => None,
         };
+        let error = rulebook_error.or_else(|| self.staffing_membership_error());
+        self.blueprint_errors = error.into_iter().collect();
     }
 
     /// Number of structured validation errors on the editable blueprint model.
@@ -1733,6 +1774,50 @@ impl State {
         self.runtime_snapshot = snapshot;
     }
 
+    /// Whether the rendered roster has no agents (the empty state that offers
+    /// the explicit "Restore defaults" action). The engine-owned coordinator is
+    /// filtered here on purpose: a roster holding only the coordinator still
+    /// has zero user-visible agents.
+    pub fn roster_is_empty(&self) -> bool {
+        self.visible_agents().next().is_none()
+    }
+
+    /// Explicit "Restore defaults" action: seed the five specialist builtin
+    /// defaults into an EMPTY roster through the same `default_builtin_agents()`
+    /// seed path `State::new()` uses. Never seeds the engine-owned coordinator,
+    /// and never touches a populated roster (a stale click is a silent no-op),
+    /// so deletions stick — this is the only recovery path, and it is one
+    /// deliberate click. Marks the studio dirty so Save persists the roster.
+    fn restore_default_agents(&mut self) -> iced::Task<Message> {
+        if !self.roster_is_empty() {
+            return iced::Task::none();
+        }
+        let mut seeded = 0usize;
+        // The shared seed path, filtered to the five specialist defaults: the
+        // coordinator is code-constructed and never a roster member.
+        for agent in default_builtin_agents() {
+            if is_coordinator_agent(&agent) {
+                continue;
+            }
+            if self.agents.iter().any(|existing| existing.id == agent.id) {
+                continue;
+            }
+            self.agents.push(agent);
+            seeded += 1;
+        }
+        if seeded > 0 {
+            // The restored roster can satisfy a stage's staffing (rule_k), so
+            // recompute the stored errors before the dirty flag flips.
+            self.refresh_blueprint_validation();
+            self.mark_dirty();
+            tracing::info!(
+                count = seeded,
+                "restored default specialist agents into an empty roster"
+            );
+        }
+        iced::Task::none()
+    }
+
     pub fn mark_saved(&mut self) {
         self.unsaved = false;
         self.saved_notice = true;
@@ -1920,6 +2005,9 @@ impl State {
                     self.mark_dirty();
                 }
             }
+            StudioMessage::RestoreDefaultAgents => {
+                return self.restore_default_agents();
+            }
             StudioMessage::RemoveAgent(id) => {
                 // The coordinator is code-constructed and always active (see
                 // ADR-35 §5). Guard the invariant at the message level, not
@@ -1940,6 +2028,10 @@ impl State {
                     self.show_relationship_editor = false;
                     self.clear_relationship_draft();
                 }
+                // Removing a roster agent can strand a blueprint stage's
+                // staffing (rule_k): recompute so the badge agrees with
+                // `validation()` immediately, not only after the next edit.
+                self.refresh_blueprint_validation();
                 self.mark_dirty();
             }
             StudioMessage::SelectAgent(opt) => {
@@ -2419,6 +2511,9 @@ impl State {
                 self.selected_agent_id = None;
                 self.show_relationship_editor = false;
                 self.clear_relationship_draft();
+                // A preset can add the agents a blueprint stage staffs, so
+                // recompute rule_k along with the legacy checks.
+                self.refresh_blueprint_validation();
                 self.mark_dirty();
             }
             StudioMessage::SaveOrchestration => {}
@@ -3431,6 +3526,18 @@ impl State {
         };
         let add_toggle_label =
             if self.show_add_agent_form { "− Hide form" } else { "+ Add agent" };
+        // Explicit recovery for an EMPTY roster: seed the five specialists in
+        // one deliberate click. Auto-reseed stays forbidden (deletions stick),
+        // so the action renders ONLY while there is nothing to delete; a
+        // populated roster renders a zero-size space in its place.
+        let restore_defaults: Element<'_, Message> = if self.roster_is_empty() {
+            button("Restore defaults")
+                .style(button::secondary)
+                .on_press(Message::OrchestrationStudio(StudioMessage::RestoreDefaultAgents))
+                .into()
+        } else {
+            Space::new().into()
+        };
 
         column![
             text(format!("{} agents", self.agents.len()))
@@ -3439,9 +3546,14 @@ impl State {
             search,
             scrollable(list).height(Length::Fill),
             iced::widget::rule::horizontal(1),
-            button(add_toggle_label)
-                .style(button::secondary)
-                .on_press(Message::OrchestrationStudio(StudioMessage::ToggleAddAgentForm)),
+            row![
+                button(add_toggle_label)
+                    .style(button::secondary)
+                    .on_press(Message::OrchestrationStudio(StudioMessage::ToggleAddAgentForm)),
+                restore_defaults,
+            ]
+            .spacing(sp.xs)
+            .align_y(Alignment::Center),
             new_agent,
         ]
         .spacing(sp.sm)
@@ -5087,16 +5199,27 @@ mod tests {
     fn load_from_config_recomputes_blueprint_validation_and_rule_f_bound() {
         // A resolved `[orchestration]` config loads the editable blueprint and
         // recomputes the (empty) error collection; rule (f)'s bound mirrors
-        // the load seam's `max_total_iterations`.
+        // the load seam's `max_total_iterations`. The roster names exactly the
+        // five agents the standard blueprint staffs, so the roster-membership
+        // rule (rule_k) is satisfied.
         let blueprint =
             concerto_config::named_blueprint("standard").expect("standard blueprint exists");
         let resolved =
             concerto_config::resolve_blueprint(&blueprint).expect("standard resolves cleanly");
+        let roster: Vec<concerto_config::CustomAgentConfig> =
+            ["architect", "researcher", "coder", "reviewer", "validator"]
+                .into_iter()
+                .map(|id| concerto_config::CustomAgentConfig {
+                    id: id.into(),
+                    ..Default::default()
+                })
+                .collect();
         let config = AppConfig {
             orchestration: Some(OrchestrationConfig::default()),
             resolved_blueprint: Some(Arc::new(resolved)),
             multi_agent: Some(concerto_config::MultiAgentConfig {
                 max_total_iterations: Some(50),
+                custom_agents: roster,
                 ..Default::default()
             }),
             ..Default::default()
@@ -5153,13 +5276,18 @@ mod tests {
     // populated via struct literal over `Default`).
     // ────────────────────────────────────────────────────────────────────────
 
-    /// A blueprint-path `State` carrying the valid standard blueprint.
+    /// A blueprint-path `State` carrying the valid standard blueprint. The
+    /// roster holds the five specialist builtins (plus the engine-owned
+    /// coordinator) so the standard blueprint's staffing satisfies the
+    /// Studio's roster-membership rule (rule_k); the coordinator is filtered
+    /// from `visible_agents`, so it never counts as staffable.
     fn standard_blueprint_state() -> State {
         State {
             orchestration: Some(OrchestrationConfig::default()),
             blueprint: Some(Arc::new(
                 concerto_config::named_blueprint("standard").expect("standard blueprint exists"),
             )),
+            agents: default_builtin_agents(),
             ..Default::default()
         }
     }
@@ -5976,9 +6104,15 @@ mod tests {
         let mut state = standard_blueprint_state();
         let index = 2;
         let mut blueprint = state.blueprint.as_ref().expect("blueprint loaded").as_ref().clone();
-        // Staff the stage with the would-be `implement_fallback` id.
+        // Staff the stage with the would-be `implement_fallback` id. The id is
+        // also added to the roster so rule_k (roster membership) stays clean
+        // while rulebook rule (d) (self-fallback) is what this test exercises.
         blueprint.pipeline.stages[index].agents.push("implement_fallback".into());
         state.blueprint = Some(Arc::new(blueprint));
+        state.agents.push(custom_to_agent(&concerto_config::CustomAgentConfig {
+            id: "implement_fallback".into(),
+            ..Default::default()
+        }));
 
         let _ = state.update(StudioMessage::FallbackAdded(index));
         let fallback = fallback_of(&state, index);
@@ -6007,12 +6141,10 @@ mod tests {
         let stage = &mut blueprint.pipeline.stages[3]; // `review`
         stage.fallback = Some(sentinel);
 
-        let state = State {
-            orchestration: Some(OrchestrationConfig::default()),
-            blueprint: Some(Arc::new(blueprint)),
-            ..Default::default()
-        };
-        let mut state = state;
+        // Roster seeded with the standard specialists so rule_k stays clean
+        // (this test pins the sentinel invariant, not staffing).
+        let mut state = standard_blueprint_state();
+        state.blueprint = Some(Arc::new(blueprint));
         let _ = state.update(StudioMessage::FallbackAdded(3));
         let fallback = fallback_of(&state, 3);
         assert_eq!(fallback.id, FALLBACK_SENTINEL_ID, "sentinel id stays untouched");
@@ -6149,5 +6281,84 @@ mod tests {
         // Fail-soft note path: an unavailable snapshot still renders.
         empty.set_runtime_snapshot(StudioRuntimeSnapshot::unavailable("checkpoint read failed"));
         let _ = empty.view(&theme);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Roster visibility: the explicit "Restore defaults" empty-state action
+    // plus the staffing roster-membership validation (rule_k).
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn restore_defaults_is_offered_only_for_an_empty_roster() {
+        // Empty roster: the action is available (the guard the view reads).
+        let mut empty = State { agents: Vec::new(), ..Default::default() };
+        assert!(empty.roster_is_empty());
+        let _ = empty.view(&AppTheme::by_name("Midnight"));
+        let _ = empty.update(StudioMessage::RestoreDefaultAgents);
+        assert_eq!(empty.agents.len(), 5, "the five specialist defaults are seeded");
+        assert!(empty.unsaved, "the restored roster is persisted on Save");
+
+        // Populated roster: the action is hidden (guard false) and a stale
+        // click is a no-op that never dirties the studio.
+        let mut populated = State::new();
+        assert!(!populated.roster_is_empty());
+        let before: Vec<String> = populated.agents.iter().map(|a| a.id.clone()).collect();
+        let _ = populated.update(StudioMessage::RestoreDefaultAgents);
+        let after: Vec<String> = populated.agents.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(before, after, "a populated roster is never re-seeded");
+        assert!(!populated.unsaved, "a no-op restore never dirties the studio");
+    }
+
+    #[test]
+    fn restore_defaults_seeds_the_five_specialists_and_never_the_coordinator() {
+        let mut state = State { agents: Vec::new(), ..Default::default() };
+        let _ = state.update(StudioMessage::RestoreDefaultAgents);
+
+        let ids: Vec<String> = state.agents.iter().map(|id| id.id.clone()).collect();
+        assert_eq!(ids, vec!["architect", "researcher", "coder", "reviewer", "validator"]);
+        assert!(
+            !state.agents.iter().any(is_coordinator_agent),
+            "the engine-owned coordinator is never seeded as a roster agent"
+        );
+        assert!(state.visible_agents().all(|a| a.id != "coordinator"));
+    }
+
+    #[test]
+    fn valid_staffing_passes_validation() {
+        let state = standard_blueprint_state();
+        let report = state.validation();
+        assert!(report.ok, "standard staffing names roster agents: {:?}", report.messages);
+        assert_eq!(state.blueprint_error_count(), 0);
+        assert!(state.errors_for("stage.agents").is_empty());
+    }
+
+    #[test]
+    fn ghost_staffed_blueprint_fails_validation_with_the_id_named() {
+        let mut state = standard_blueprint_state();
+        // Staff stage 0 with an id absent from the roster (the gap the chip
+        // and the add pick-list cannot produce but a hand-edited/included
+        // blueprint can).
+        let _ = state.update(StudioMessage::StageStaffingToggle(0, AgentId::new("ghost")));
+
+        let report = state.validation();
+        assert!(!report.ok, "a ghost-staffed stage must not claim a valid pipeline");
+        assert_eq!(report.messages.len(), 1);
+        assert!(
+            report.messages[0].contains("ghost"),
+            "the offending id must be named: {}",
+            report.messages[0]
+        );
+        // The toolbar badge agrees with the report (fail-fast → one entry).
+        assert_eq!(state.blueprint_error_count(), 1);
+        let errors = state.errors_for("stage.agents");
+        assert_eq!(errors.len(), 1);
+        match errors[0] {
+            BlueprintError::Rule { field, code, message } => {
+                assert_eq!(field, "stage.agents");
+                assert_eq!(*code, "rule_k");
+                assert!(message.contains("ghost"));
+            }
+            other => panic!("expected a structured rule error, got {other:?}"),
+        }
     }
 }
