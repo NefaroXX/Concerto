@@ -19,10 +19,11 @@ pub struct PluginTool {
     tool_name: String,
     /// Registry-facing name. Defaults to the friendly [`Self::tool_name`];
     /// namespaced (`plugin:<plugin_id>:<name>`) whenever the friendly name is
-    /// already taken at registration time or is a reserved
-    /// grant-sensitive/orchestration name, so a locally installed plugin can
-    /// neither inherit the name-keyed grant treatment of a builtin tool nor
-    /// squat the coordinator's dispatch tool.
+    /// already taken at registration time, is a reserved
+    /// grant-sensitive/orchestration name, or claims the `plugin:`/`mcp:`
+    /// namespace, so a locally installed plugin can neither inherit the
+    /// name-keyed grant treatment of a builtin tool, squat the coordinator's
+    /// dispatch tool, nor impersonate another registration's namespace.
     registered_name: String,
     tool_description: String,
     /// JSON Schema for this tool's input parameters (from plugin manifest).
@@ -140,6 +141,16 @@ impl std::fmt::Debug for PluginTool {
 // Helper to register plugin tools into a ToolRegistry
 // ---------------------------------------------------------------------------
 
+/// Tool-name namespace prefixes a plugin must never register under verbatim:
+/// a declaration literally named `plugin:<id>:<name>` or `mcp:<id>:<name>`
+/// would impersonate the namespacing contract of another plugin or of an MCP
+/// server (ADR-43) — inheriting any prefix-keyed policy treatment of that
+/// namespace or colliding with an existing namespaced registration. Such
+/// declared names are forced under the declaring plugin's own namespace
+/// instead (`plugin:<declaring-id>:<declared-name>`), which cannot collide
+/// and carries no impersonated head prefix (F2, 2026-09-14).
+const RESERVED_NAME_PREFIXES: &[&str] = &["plugin:", "mcp:"];
+
 /// Tool names that are grant-sensitive or orchestration-owned and can never be
 /// exposed under a plugin's own (unnamespaced) declaration:
 ///
@@ -170,7 +181,8 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
 ];
 
 /// Decide the registry-facing name for one plugin tool: the friendly name when
-/// it is free and non-reserved, otherwise `plugin:<plugin_id>:<name>`.
+/// it is free, non-reserved, and claims no namespace (`plugin:`/`mcp:` prefix),
+/// otherwise `plugin:<plugin_id>:<name>`.
 ///
 /// Option chosen for the 2026-09-11 name-squat guard: **conditional
 /// namespacing**, not a registry-level reserved-name guard. (a) The
@@ -183,12 +195,20 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
 /// builtins stay untouched and plugin tool discovering its name taken simply
 /// lands under its own namespace — the grant treatment keyed by the friendly
 /// name can never be inherited.
+///
+/// F2 (2026-09-14): a declaration whose name literally starts with
+/// `plugin:` or `mcp:` impersonates another registration's namespace, so it
+/// is force-namespaced under the declaring plugin's id — the resulting name
+/// (`plugin:<declaring-id>:<declared-name>`) can never collide with the
+/// impersonated form and carries no impersonated head prefix.
 fn registered_name_for(
     tool_name: &str,
     plugin_id: &str,
     registry: &concerto_core::types::ToolRegistry,
 ) -> String {
-    let conflict = RESERVED_TOOL_NAMES.contains(&tool_name) || registry.get(tool_name).is_some();
+    let conflict = RESERVED_NAME_PREFIXES.iter().any(|prefix| tool_name.starts_with(prefix))
+        || RESERVED_TOOL_NAMES.contains(&tool_name)
+        || registry.get(tool_name).is_some();
     if conflict {
         format!("plugin:{plugin_id}:{tool_name}")
     } else {
@@ -453,6 +473,65 @@ mod tests {
             concerto_core::classify_tier(&action),
             concerto_core::IntentTier::MutateLocal,
             "namespaced plugin tool must not classify as Observe"
+        );
+    }
+
+    /// F2 (2026-09-14): a declaration whose name literally impersonates a
+    /// namespace (`plugin:<other-id>:…` or `mcp:<server-id>:…`) must not
+    /// register verbatim — it would inherit any prefix-keyed policy treatment
+    /// of that namespace or collide with another registration's namespaced
+    /// form. Such declarations are forced under the declaring plugin's own
+    /// namespace, while free names stay verbatim.
+    #[tokio::test]
+    async fn namespace_claiming_declarations_are_forced_under_plugin_namespace() {
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        let registered = register_plugin_tools(
+            "squat",
+            active_plugin(&["mcp:srv:echo", "plugin:other:read", "weather"]).await,
+            &[descriptor("mcp:srv:echo"), descriptor("plugin:other:read"), descriptor("weather")],
+            &mut registry,
+        );
+        assert_eq!(
+            registered,
+            vec![
+                "plugin:squat:mcp:srv:echo".to_string(),
+                "plugin:squat:plugin:other:read".to_string(),
+                "weather".to_string(),
+            ],
+            "namespace-claiming names must be force-namespaced; free names keep the friendly name"
+        );
+        // Neither impersonated form is reachable under its verbatim name.
+        assert!(
+            registry.get("mcp:srv:echo").is_none() && registry.get("plugin:other:read").is_none(),
+            "the impersonated namespace names must not be registered verbatim"
+        );
+        // The forced names carry the declaring plugin's own id: a rule keyed
+        // on `mcp:` / another plugin's `plugin:<other-id>:` prefix can never
+        // match them.
+        assert!(
+            registry.get("plugin:squat:mcp:srv:echo").is_some()
+                && registry.get("plugin:squat:plugin:other:read").is_some(),
+            "the forced-namespace registrations must be reachable under the declaring plugin's id"
+        );
+
+        // The forced names classify like any unknown tool — the `mcp:srv:echo`
+        // impersonation must not drag an `mcp:`-keyed free pass along (the
+        // classifier has no `mcp:` grant; the tier stays MutateLocal).
+        let input = serde_json::json!({});
+        let action = concerto_core::types::PolicyAction {
+            tool_name: "plugin:squat:mcp:srv:echo",
+            input: &input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        assert_eq!(
+            concerto_core::classify_tier(&action),
+            concerto_core::IntentTier::MutateLocal,
+            "forced-namespace name must not classify as Observe"
         );
     }
 }
