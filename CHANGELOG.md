@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Runtime modal + roster visibility:** Coordinator 2.0 panels moved from
+  the Studio rail to a per-session chat modal (Ctrl+R, Esc closes),
+  restoring full editor width; explicit Restore-defaults action for empty
+  rosters (no auto-reseed, never coordinator); ghost staffing fails
+  validation with the id named.
 - **Missing-table migration:** a global config owning a roster but no
   `[orchestration]` table gains only the default blueprint selection
   (idempotent, never overwrites) — the degraded Studio fallback had no
