@@ -14,10 +14,7 @@ use iced::{Alignment, Color, Element, Length};
 use crate::app::Message;
 use crate::theme::AppTheme;
 use crate::ui::section_card::{section_card, section_card_with_subtitle};
-use crate::views::studio_runtime::{StudioRuntimePanel, StudioRuntimeSnapshot};
-use crate::views::{
-    studio_decision_journal, studio_failure_diagnoses, studio_suitability, studio_world_model,
-};
+use crate::views::studio_runtime::StudioRuntimeSnapshot;
 use crate::widgets::agent_graph::{
     self, AgentGraphModel, AgentState, EdgeKind, Message as GraphMessage,
 };
@@ -335,14 +332,15 @@ pub struct State {
     /// load seam (`crates/config/src/lib.rs` ~220). `None` = unbounded.
     pub global_max_dispatch_cycles: Option<usize>,
 
-    /// The read-only Coordinator 2.0 runtime snapshot the observability panels
-    /// render. Loaded on Studio open/refresh through the
-    /// `StudioRuntimeReader` seam from the session's persisted checkpoint;
-    /// empty until a run state exists (fail-soft).
+    /// The read-only Coordinator 2.0 runtime snapshot the chat Runtime modal
+    /// renders (loaded through the `StudioRuntimeReader` seam from the session's
+    /// persisted checkpoint; empty until a run state exists — fail-soft).
+    ///
+    /// The Studio no longer renders these panels itself: the observability rail
+    /// was removed so the blueprint editor keeps its width, and the panels now
+    /// live in the per-session chat modal. The snapshot is still cached here
+    /// because it is loaded through this view's `StudioRuntimeLoaded` plumbing.
     pub runtime_snapshot: StudioRuntimeSnapshot,
-    /// Observability panels collapsed to their header. View-only presentation
-    /// state — toggling never marks the studio dirty.
-    pub runtime_collapsed: HashSet<StudioRuntimePanel>,
 }
 
 impl Default for State {
@@ -387,10 +385,6 @@ impl Default for State {
             stage_max_cycles_drafts: HashMap::new(),
             global_max_dispatch_cycles: None,
             runtime_snapshot: StudioRuntimeSnapshot::default(),
-            // The Coordinator 2.0 observability rail starts COLLAPSED so the
-            // blueprint stage editor has the real estate by default; a single
-            // click on any panel header reopens it. View-only state.
-            runtime_collapsed: StudioRuntimePanel::ALL.into_iter().collect(),
         }
     }
 }
@@ -489,10 +483,6 @@ pub enum StudioMessage {
     GraphNodeClicked(usize),
     /// Expand/collapse the inline issue summary under the toolbar badge.
     ToggleValidationDetail,
-    /// Expand/collapse one read-only observability panel by its kind. A
-    /// view-only toggle: it mutates presentation state, never run data, so it
-    /// never marks the studio dirty and never emits a runtime action.
-    ToggleRuntimePanel(StudioRuntimePanel),
     /// Expand/collapse one stage card's collapsible "Advanced" section. The
     /// payload is the stage's index into `blueprint.pipeline.stages`. This is
     /// a view-only toggle: it mutates the presentation set, never blueprint
@@ -1736,8 +1726,8 @@ impl State {
         *self.graph_cache.borrow_mut() = None;
     }
 
-    /// Replace the read-only runtime snapshot the observability panels render.
-    /// Called by `App` when the Studio opens/refreshes (or when a load
+    /// Replace the read-only runtime snapshot the chat Runtime modal renders.
+    /// Called by `App` when the modal opens or the Studio opens (or when a load
     /// fail-softs); never mutates run state or marks the studio dirty.
     pub fn set_runtime_snapshot(&mut self, snapshot: StudioRuntimeSnapshot) {
         self.runtime_snapshot = snapshot;
@@ -2005,12 +1995,6 @@ impl State {
             }
             StudioMessage::ToggleValidationDetail => {
                 self.show_validation_detail = !self.show_validation_detail;
-            }
-            StudioMessage::ToggleRuntimePanel(panel) => {
-                // View-only: a miss means "was expanded, collapse it now".
-                if !self.runtime_collapsed.remove(&panel) {
-                    self.runtime_collapsed.insert(panel);
-                }
             }
             StudioMessage::StageAdvancedToggle(index) => {
                 // View-only presentation toggle: no `mark_dirty()`, no
@@ -2628,11 +2612,6 @@ impl State {
                 .padding([0.0, sp.md])
                 .width(Length::Fill)
                 .height(Length::Fill),
-            // Read-only Coordinator 2.0 observability rail (S1–S4), fed only
-            // by the runtime snapshot loaded on Studio open/refresh.
-            container(scrollable(self.observability_view(theme)).height(Length::Fill))
-                .width(Length::Fixed(340.0))
-                .height(Length::Fill),
         ]
         .spacing(sp.md)
         .height(Length::Fill);
@@ -2708,92 +2687,6 @@ impl State {
         .spacing(sp.md)
         .height(Length::Fill)
         .into()
-    }
-
-    // ------------------------------------------------------------------
-    // Read-only Coordinator 2.0 observability panels (S1–S4).
-    //
-    // Registered in the panes row as a right-hand rail. Every panel is fed
-    // ONLY by `self.runtime_snapshot`, loaded on Studio open/refresh through
-    // the `StudioRuntimeReader` seam (checkpoint-backed). Nothing here
-    // dispatches, approves, or mutates run state; the only message is the
-    // view-only collapse toggle. Palette colors only.
-    // ------------------------------------------------------------------
-
-    /// The observability rail: a header, an optional fail-soft note, and the
-    /// four collapsible panels.
-    fn observability_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
-        let ts = &theme.type_scale;
-        let sp = &theme.spacing;
-        let mut panels = column![text("Runtime").size(ts.title).color(theme.palette.text)]
-            .spacing(sp.md)
-            .width(Length::Fill);
-        if let Some(error) = self.runtime_snapshot.load_error.as_deref() {
-            // Fail-soft: the panels still render their empty states below; the
-            // reason is surfaced here, muted and non-blocking.
-            panels = panels.push(
-                text(error).size(ts.caption).color(theme.palette.warning).width(Length::Fill),
-            );
-        }
-        for panel in StudioRuntimePanel::ALL {
-            panels = panels.push(self.runtime_panel_card(theme, panel));
-        }
-        panels.padding([sp.xs, 0.0]).into()
-    }
-
-    /// One collapsible observability card. The header is the only interactive
-    /// affordance (a view-only toggle); the body is the panel's read-only
-    /// projection of `runtime_snapshot`.
-    fn runtime_panel_card<'a>(
-        &'a self,
-        theme: &'a AppTheme,
-        panel: StudioRuntimePanel,
-    ) -> Element<'a, Message> {
-        let ts = &theme.type_scale;
-        let sp = &theme.spacing;
-        let collapsed = self.runtime_collapsed.contains(&panel);
-        let arrow = if collapsed { "▸" } else { "▾" };
-        let header = button(
-            row![
-                text(format!("{arrow} {}", panel.title())).size(ts.label).color(theme.palette.text),
-                Space::new().width(Length::Fill),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .style(button::text)
-        .width(Length::Fill)
-        .on_press(Message::OrchestrationStudio(StudioMessage::ToggleRuntimePanel(panel)));
-        let body: Element<'_, Message> = if collapsed {
-            Space::new().height(0.0).into()
-        } else {
-            match panel {
-                StudioRuntimePanel::DecisionJournal => {
-                    studio_decision_journal::body(&self.runtime_snapshot, theme)
-                }
-                StudioRuntimePanel::WorldModel => {
-                    studio_world_model::body(&self.runtime_snapshot, theme)
-                }
-                StudioRuntimePanel::FailureDiagnoses => {
-                    studio_failure_diagnoses::body(&self.runtime_snapshot, theme)
-                }
-                StudioRuntimePanel::Suitability => {
-                    studio_suitability::body(&self.runtime_snapshot, theme)
-                }
-            }
-        };
-        container(column![header, body].spacing(sp.sm))
-            .width(Length::Fill)
-            .padding(sp.sm)
-            .style(move |_t: &iced::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(theme.palette.surface_variant)),
-                border: iced::Border {
-                    color: theme.palette.border,
-                    width: 1.0,
-                    radius: 12.0.into(),
-                },
-                ..iced::widget::container::Style::default()
-            })
-            .into()
     }
 
     // ------------------------------------------------------------------
@@ -6212,41 +6105,13 @@ mod tests {
         let _ = legacy.view(&theme);
     }
 
-    /// The four read-only observability panels are registered in the panes
-    /// rail as one `StudioRuntimePanel` each, and their only message is the
-    /// view-only collapse toggle (never a dirtying edit).
+    /// The Coordinator observability rail is GONE from the Studio: the panes
+    /// row is library + workspace only, and the four read-only panels now live
+    /// in the per-session chat Runtime modal (`views::studio_runtime`). The
+    /// cached snapshot field survives only as the modal's load cache, so the
+    /// Studio must still render with and without it and never panic.
     #[test]
-    fn observability_panels_are_registered_and_toggle_without_dirtying() {
-        assert_eq!(
-            StudioRuntimePanel::ALL,
-            [
-                StudioRuntimePanel::DecisionJournal,
-                StudioRuntimePanel::WorldModel,
-                StudioRuntimePanel::FailureDiagnoses,
-                StudioRuntimePanel::Suitability,
-            ],
-            "every S1–S4 panel is registered exactly once"
-        );
-        let mut state = State::new();
-        for panel in StudioRuntimePanel::ALL {
-            assert!(
-                state.runtime_collapsed.contains(&panel),
-                "collapsed by default (editor real estate restored)"
-            );
-            let _ = state.update(StudioMessage::ToggleRuntimePanel(panel));
-            assert!(!state.runtime_collapsed.contains(&panel), "one click reopens");
-        }
-        assert!(!state.unsaved, "view-only panel toggles never mark the studio dirty");
-        for panel in StudioRuntimePanel::ALL {
-            let _ = state.update(StudioMessage::ToggleRuntimePanel(panel));
-            assert!(state.runtime_collapsed.contains(&panel), "toggle collapses again");
-        }
-    }
-
-    /// The Studio renders the rail with an empty snapshot (muted empty states)
-    /// and with populated runtime state, without panicking.
-    #[test]
-    fn studio_view_renders_the_observability_rail_with_empty_and_populated_state() {
+    fn studio_view_renders_without_the_runtime_rail() {
         use concerto_orchestrator::decisions::{CoordinatorDecision, DecisionKind, DecisionStatus};
         use concerto_orchestrator::suitability::SuitabilityState;
         use concerto_orchestrator::world_model::WorldModel;

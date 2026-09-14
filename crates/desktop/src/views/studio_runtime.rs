@@ -26,11 +26,14 @@ use concerto_orchestrator::world_model::WorldModel;
 use concerto_sessions::SessionStore;
 use time::OffsetDateTime;
 
-use iced::widget::text;
-use iced::Element;
+use iced::widget::{column, container, scrollable, text};
+use iced::{Element, Length};
 
 use crate::app::Message;
 use crate::theme::AppTheme;
+use crate::views::{
+    studio_decision_journal, studio_failure_diagnoses, studio_suitability, studio_world_model,
+};
 
 /// Hard cap on how many entries one panel renders (newest first). The
 /// snapshot keeps the faithful, checkpoint-bounded history; the display is
@@ -270,6 +273,68 @@ pub fn panel_note<'a>(theme: &'a AppTheme, message: &'a str) -> Element<'a, Mess
     text(message).size(theme.type_scale.caption).color(theme.palette.text_muted).into()
 }
 
+/// Height budget for the runtime modal's scrollable panel list (mirrors the
+/// Spend Log modal's fixed list height so the card keeps a bounded, stable
+/// size regardless of how much run state a session accumulated).
+const RUNTIME_MODAL_BODY_HEIGHT: f32 = 560.0;
+
+/// The per-session runtime modal body: the same four read-only observability
+/// panels the Studio used to show in its right-hand rail, now rendered in the
+/// chat canvas overlay bound to the active session's snapshot.
+///
+/// This is a pure renderer over a [`StudioRuntimeSnapshot`] already loaded
+/// through the [`StudioRuntimeReader`] seam — no new transport, no runtime
+/// calls. Fail-soft: a missing checkpoint yields an empty snapshot and every
+/// panel renders its own muted empty state; a load error is shown as a muted,
+/// non-blocking note above the panels.
+pub fn runtime_modal_view<'a>(
+    snapshot: &'a StudioRuntimeSnapshot,
+    theme: &'a AppTheme,
+) -> Element<'a, Message> {
+    let ts = &theme.type_scale;
+    let sp = &theme.spacing;
+    let mut panels = column![].spacing(sp.md).width(Length::Fill);
+    if let Some(error) = snapshot.load_error.as_deref() {
+        // Fail-soft: the panels still render their empty states below; the
+        // reason is surfaced here, muted and non-blocking.
+        panels = panels
+            .push(text(error).size(ts.caption).color(theme.palette.warning).width(Length::Fill));
+    }
+    for panel in StudioRuntimePanel::ALL {
+        panels = panels.push(runtime_panel_card(panel, snapshot, theme));
+    }
+    scrollable(panels).height(Length::Fixed(RUNTIME_MODAL_BODY_HEIGHT)).into()
+}
+
+/// One read-only panel card (title + body). The card chrome is the same
+/// palette-only surface the Studio rail used; the body is the untouched
+/// panel projection from the corresponding `studio_*` module.
+fn runtime_panel_card<'a>(
+    panel: StudioRuntimePanel,
+    snapshot: &'a StudioRuntimeSnapshot,
+    theme: &'a AppTheme,
+) -> Element<'a, Message> {
+    let ts = &theme.type_scale;
+    let sp = &theme.spacing;
+    let body: Element<'_, Message> = match panel {
+        StudioRuntimePanel::DecisionJournal => studio_decision_journal::body(snapshot, theme),
+        StudioRuntimePanel::WorldModel => studio_world_model::body(snapshot, theme),
+        StudioRuntimePanel::FailureDiagnoses => studio_failure_diagnoses::body(snapshot, theme),
+        StudioRuntimePanel::Suitability => studio_suitability::body(snapshot, theme),
+    };
+    container(
+        column![text(panel.title()).size(ts.label).color(theme.palette.text), body].spacing(sp.sm),
+    )
+    .width(Length::Fill)
+    .padding(sp.sm)
+    .style(move |_t: &iced::Theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme.palette.surface_variant)),
+        border: iced::Border { color: theme.palette.border, width: 1.0, radius: 12.0.into() },
+        ..iced::widget::container::Style::default()
+    })
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +528,52 @@ mod tests {
             .expect("missing checkpoint is not an error");
         assert!(loaded.is_empty());
         assert!(loaded.load_error.is_none());
+    }
+
+    /// The per-session modal renders all four panels when the active session's
+    /// snapshot carries data. Asserted through the mock reader (no store, no
+    /// Coordinator) plus a non-panicking render of the populated modal body —
+    /// iced 0.14 elements are opaque in headless tests, so the panel set is
+    /// pinned via `StudioRuntimePanel::ALL`.
+    #[tokio::test]
+    async fn runtime_modal_renders_all_four_panels_for_a_session_with_data() {
+        let fixed = StudioRuntimeSnapshot::from_parts(
+            &[decision("d1", DecisionStatus::Settled)],
+            &[diagnosis("tool-error")],
+            &WorldModel { objective: Some("ship the slice".into()), ..WorldModel::default() },
+            &suitability_state(),
+            OffsetDateTime::now_utc(),
+        );
+        let reader = MockStudioRuntimeReader::new(fixed);
+        let loaded = reader
+            .load(Ulid::new(), CancellationToken::new())
+            .await
+            .expect("mock reader never fails");
+        assert_eq!(StudioRuntimePanel::ALL.len(), 4, "the modal shows all four panels");
+        assert!(!loaded.is_empty(), "the session snapshot carries all four sources");
+        let theme = AppTheme::by_name("Midnight");
+        let _ = runtime_modal_view(&loaded, &theme);
+    }
+
+    /// An empty session (or an unavailable checkpoint) renders the panels'
+    /// empty states plus the muted fail-soft note, never a crash.
+    #[test]
+    fn runtime_modal_renders_empty_states_and_fail_soft_note_without_panicking() {
+        let theme = AppTheme::by_name("Midnight");
+        let _ = runtime_modal_view(&StudioRuntimeSnapshot::default(), &theme);
+        let _ = runtime_modal_view(
+            &StudioRuntimeSnapshot::unavailable("checkpoint read failed: boom"),
+            &theme,
+        );
+    }
+
+    /// Every panel the modal iterates has a distinct display title (the card
+    /// header), so the four cards never collapse into duplicates.
+    #[test]
+    fn runtime_modal_panels_have_distinct_titles() {
+        let mut titles: Vec<&str> = StudioRuntimePanel::ALL.iter().map(|p| p.title()).collect();
+        titles.sort_unstable();
+        titles.dedup();
+        assert_eq!(titles.len(), 4);
     }
 }
