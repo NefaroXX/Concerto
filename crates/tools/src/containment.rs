@@ -535,7 +535,10 @@ fn scan_directory_changes(
 /// read-only verb. A glued token carrying BOTH operators (`2>&1</etc/passwd`)
 /// resolves each operator's suffix independently (N-…: the write branch's
 /// `continue` used to consume the whole token and the input target never got
-/// resolved).
+/// resolved). A token gluing SEVERAL redirect operators (F-B 2026-09-14:
+/// `echo hi 2>/etc/passwd>&2` resolved only the `rfind('>')`/`find('<')`
+/// extremes) resolves every `>`/`<` occurrence's suffix so no mid-token
+/// target slips past the boundary operators.
 fn resolve_glued_suffix(root: &Utf8Path, cwd: &Utf8Path, suffix: &str) -> Result<(), ToolError> {
     let after = suffix.trim_matches(|c| c == '\'' || c == '"');
     let after = strip_trailing_command_punct(after);
@@ -577,26 +580,25 @@ fn scan_redirects(
         // the shell expanded the write target out-of-root). `2>&1`/`>&2`
         // remainders carry neither metacharacter and stay passable.
         //
-        // A token may glue BOTH operators (`2>&1</etc/passwd`): each
-        // operator's suffix is resolved independently, bounded by the other
-        // operator, so the write suffix (`&1`) is not misread as a path and
-        // the input target (`</etc/passwd`) cannot hide behind the write
-        // branch's `continue`.
-        if let (Some(gt), Some(lt)) = (token.rfind('>'), token.find('<')) {
-            let write_end = if lt > gt { lt } else { token.len() };
-            let input_end = if gt > lt { gt } else { token.len() };
-            resolve_glued_suffix(root, cwd, &token[gt + 1..write_end])?;
-            resolve_glued_suffix(root, cwd, &token[lt + 1..input_end])?;
+        // EVERY `>`/`<` occurrence resolves its own suffix, bounded by the next
+        // operator occurrence (or token end): extremes like `rfind('>')` see
+        // only the LAST write operand, so `2>/etc/passwd>&2` resolved only the
+        // fd-dup remainder and the earlier redirect target hid in the middle.
+        // A token may also glue BOTH operator kinds (`2>&1</etc/passwd`); with
+        // per-occurrence resolution each suffix is bounded by the next `>`/`<`
+        // automatically, so the write suffix (`&1`) is not misread as a path
+        // and the input target cannot hide behind the write branch's
+        // `continue`.
+        let op_positions: Vec<usize> = token
+            .char_indices()
+            .filter_map(|(i, c)| ((c == '>') || (c == '<')).then_some(i))
+            .collect();
+        if !op_positions.is_empty() {
+            for (k, pos) in op_positions.iter().enumerate() {
+                let end = op_positions.get(k + 1).copied().unwrap_or(token.len());
+                resolve_glued_suffix(root, cwd, &token[pos + 1..end])?;
+            }
             continue;
-        }
-        if let Some(idx) = token.rfind('>') {
-            resolve_glued_suffix(root, cwd, &token[idx + 1..])?;
-            continue;
-        }
-        // Input-redirect glued to its target: `</etc/passwd`. Same gate as the
-        // write-branch above.
-        if let Some(idx) = token.find('<') {
-            resolve_glued_suffix(root, cwd, &token[idx + 1..])?;
         }
     }
     Ok(())
@@ -781,6 +783,13 @@ fn is_xargs_lead(lead: &str) -> bool {
 /// (fail-closed). Tokens owned by dedicated rules (`cd` targets, redirect
 /// targets, git `-C` values) stay exempt — those scans ran first and own
 /// their containment.
+///
+/// Wrapper-prefixed forms (F-A 2026-09-14: `env xargs rm`, `nohup xargs`,
+/// `timeout 10 xargs`) do not place `xargs` at the segment lead, so the
+/// lead-based gate misses them. The read-only exemption is instead suspended
+/// pipeline-wide from `scan_path_arguments`: an `xargs` basename appearing in
+/// ANY content section arms it, unless the WHOLE pipeline is read-only (then
+/// nothing can mutate and the exemption is harmless).
 fn scan_xargs_pipeline(
     root: &Utf8Path,
     cwd: &Utf8Path,
@@ -828,9 +837,11 @@ fn scan_path_arguments(
     // Per original token: how many content sections cover it, and whether all
     // covering segments are read-only. A token with zero content sections
     // (pure separator) stays out of the general scan.
+    let segments = list_segments(tokens);
     let mut section_count = vec![0u32; tokens.len()];
     let mut all_read_only = vec![true; tokens.len()];
-    for segment in list_segments(tokens) {
+    let mut fully_read_only = true;
+    for segment in &segments {
         let lead = segment.lead.clone().unwrap_or_default();
         // A segment's trailing tokens for write-flag detection: the flattened
         // tokens carrying this segment's content (the lead's own token
@@ -838,11 +849,26 @@ fn scan_path_arguments(
         let trailing: Vec<String> =
             segment.sections.iter().skip(1).map(|(index, _)| tokens[*index].clone()).collect();
         let read_only = is_read_only(&lead, &trailing);
+        fully_read_only = fully_read_only && read_only;
         for (index, _) in &segment.sections {
             section_count[*index] += 1;
             if !read_only {
                 all_read_only[*index] = false;
             }
+        }
+    }
+    // F-A (2026-09-14): `xargs` behind a wrapper (`env xargs rm`, `nice xargs`,
+    // `sh -c 'xargs rm'`) is not a segment lead, and its segment is fed the
+    // whole pipeline's stdout as argv — so ANY `xargs` basename in any content
+    // section distrusts the read-only exemption, unless the entire pipeline is
+    // read-only (nothing to exempt against). Fail-closed: a false trigger only
+    // costs a rejection.
+    let xargs_anywhere = segments
+        .iter()
+        .any(|segment| segment.sections.iter().any(|(_, section)| is_xargs_lead(section)));
+    if xargs_anywhere && !fully_read_only {
+        for flag in all_read_only.iter_mut() {
+            *flag = false;
         }
     }
     for (i, token) in tokens.iter().enumerate() {
@@ -1387,6 +1413,43 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_prefixed_xargs_suspends_read_only_exemption() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // F-A (2026-09-14): the segment lead is the wrapper (`env`, `nice`,
+        // `nohup`, `timeout`, `stdbuf`, `command`, `sh -c`), not `xargs`, so
+        // the lead-based gate passed `echo /etc/shadow | env xargs rm`. The
+        // read-only exemption is suspended pipeline-wide whenever an `xargs`
+        // basename appears in ANY content section of a non-read-only
+        // pipeline.
+        for command in [
+            "echo /etc/shadow | env xargs rm",
+            "echo /etc/shadow | nice xargs rm",
+            "echo /etc/shadow | nohup xargs rm",
+            "echo /etc/shadow | timeout 10 xargs rm",
+            "echo /etc/shadow | stdbuf -o0 xargs rm",
+            "echo /etc/shadow | command xargs rm",
+            // Quoted wrapper body: flat tokens strip outer quotes, so the
+            // inner `xargs` token is visible.
+            "sh -c 'xargs rm /etc/shadow'",
+            "sh -c 'echo /etc/shadow | xargs rm'",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "wrapper-prefixed '{command}' must not launder the read-only exemption, got: {err}"
+            );
+        }
+        // A wrapper-led xargs segment without path-like tokens is not a new
+        // block — nothing to resolve.
+        contain_shell_command(&root, &root, "echo hi | env xargs grep hi", &[])
+            .expect("wrapper-prefixed xargs without path-like tokens allowed");
+        // An in-root wrapper pipeline keeps working.
+        contain_shell_command(&root, &root, "echo notes.txt | env xargs rm", &[])
+            .expect("in-root wrapper-prefixed xargs pipeline allowed");
+    }
+
+    #[test]
     fn xargs_in_root_pipeline_and_non_xargs_reads_stay_free() {
         let (root, dir) = temp_root();
         std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
@@ -1396,9 +1459,17 @@ mod tests {
         contain_shell_command(&root, &root, "echo hi | xargs echo", &[])
             .expect("xargs without path-like tokens allowed");
         contain_shell_command(&root, &root, "ls | xargs", &[]).expect("bare xargs allowed");
-        // `xargs` as a plain ARGUMENT is not a segment lead — no pipeline-wide
-        // suspension, the read-only pipeline stays free.
-        contain_shell_command(&root, &root, "echo xargs", &[]).expect("xargs as argument allowed");
+        // F-A (2026-09-14) fail-closed tradeoff: a bare `xargs` token ANYWHERE
+        // now arms the pipeline-wide exemption suspension in any non-read-only
+        // pipeline, so `echo xargs …` is no longer exempt as a plain-argument
+        // pipeline. It stays allowed here only because the pipeline is fully
+        // read-only AND bare `xargs` carries no path shape — a deliberate
+        // narrowing, not a preserved guarantee.
+        contain_shell_command(&root, &root, "echo xargs", &[]).expect("bare echo xargs allowed");
+        // Likewise: `xargs` purely as a read-only pipeline's argument/pattern
+        // keeps working; no path-like token exists to resolve.
+        contain_shell_command(&root, &root, "cat notes.txt | grep xargs | head", &[])
+            .expect("grep xargs pattern in read-only pipeline stays free");
         // Preserved behavior: the classic read-only pipeline without xargs
         // keeps its per-segment read exemption.
         contain_shell_command(&root, &root, "cat notes.txt | grep x | head", &[])
@@ -1440,6 +1511,39 @@ mod tests {
             .expect("glued fd-dup with in-root input allowed");
         contain_shell_command(&root, &root, "echo hi 2>err.log 2>&1", &[])
             .expect("in-root glued write plus fd-dup unchanged");
+    }
+
+    #[test]
+    fn multi_operator_glue_resolves_each_redirect_suffix() {
+        let (root, _dir) = temp_root();
+        // F-B (2026-09-14): `2>/etc/passwd>&2` passed because only the
+        // extremes (`rfind('>')`, `find('<')`) resolved — the middle
+        // redirect's target hid between them. Every `>`/`<` occurrence now
+        // resolves its suffix up to the next operator.
+        for command in [
+            "echo hi 2>/etc/passwd>&2",
+            "echo hi 2>/etc/passwd>out.txt",
+            "echo hi 2>/etc/passwd>>out.txt",
+            "cat f 2>/etc/shadow>&1",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the mid-token redirect target, got: {err}"
+            );
+        }
+        // Preserved pins: fd-dup remainders (`2>&1`/`>&2`) and in-root targets
+        // through the same glue stay passable.
+        contain_shell_command(&root, &root, "echo hi 2>&1", &[]).expect("bare 2>&1 unchanged");
+        contain_shell_command(&root, &root, "echo hi >&2", &[]).expect("bare >&2 unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("in-root 2>err.log unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>>err.log", &[])
+            .expect("in-root 2>>err.log unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>err.log>&2", &[])
+            .expect("in-root same-operator glue with fd-dup tail unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>err.log>out.txt", &[])
+            .expect("in-root double write glue unchanged");
     }
 
     // -----------------------------------------------------------------------
