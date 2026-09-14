@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Supply-chain green again:** fixed the deny CI job (toolchain pin) and
+  patched RUSTSEC-2026-0285 by bumping rustls 0.23.41 → 0.23.45 (TLS 1.3
+  handshake hardening; patch-level, no API changes).
 - **Runtime modal + roster visibility:** Coordinator 2.0 panels moved from
   the Studio rail to a per-session chat modal (Ctrl+R, Esc closes),
   restoring full editor width; explicit Restore-defaults action for empty
