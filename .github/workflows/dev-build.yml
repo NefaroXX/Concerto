@@ -22,6 +22,11 @@ on:
     paths-ignore:
       - "**.md"
       - "docs/**"
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/dev-build.yml
   workflow_dispatch:
 
 permissions:
