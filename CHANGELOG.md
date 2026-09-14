@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Missing-table migration:** a global config owning a roster but no
+  `[orchestration]` table gains only the default blueprint selection
+  (idempotent, never overwrites) — the degraded Studio fallback had no
+  other exit for this shape.
 - **Per-agent config files:** each agent owns `<config>/agents/<id>.toml`
   (model/prompt/permissions), seeded from hardcoded defaults when missing,
   migrated when stale; Studio CRUD writes files directly (add/remove/edit,
