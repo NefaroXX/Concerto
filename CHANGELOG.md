@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Shell containment residuals:** xargs quote/backslash/glued-redirect
+  obfuscations detected; interpreter program bodies (`awk system()`/`getline`,
+  `sed s///e`, standalone `e`) and process-substitution bodies demoted from
+  free Observe in both the tier classifier and the containment scanner; plugin
+  `plugin:`/`mcp:` name claims force-namespaced. All movement toward approval
+  only; known v1 limits documented.
 - **Shell containment hardening batch:** xargs-fed argv contained
   (including wrapper-prefixed and any-position triggers), glued redirect
   suffixes resolved per-operator, plugin namespace claims force-prefixed;
