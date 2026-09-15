@@ -222,6 +222,13 @@ pub struct CheckpointContext {
     /// re-derivable from the log's applied writes and ownership events when
     /// absent.
     pub ownership: crate::ownership::OwnershipState,
+    /// Issue #63: the in-flight WAIT record — a wait still parked when the
+    /// snapshot was taken (set before `execute_wait` sleeps so a crash
+    /// mid-wait is resumable). The resume re-evaluates the restored wait
+    /// against the CURRENT world once and reports the outcome to the model
+    /// instead of silently dropping the wait or re-entering the sleep loop.
+    /// Old checkpoints default it empty (serde default) — additive, no bump.
+    pub active_wait: Option<crate::wait::WaitingRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +393,12 @@ pub struct GraphCheckpoint {
     /// key.
     #[serde(default)]
     pub ownership: crate::ownership::OwnershipState,
+    /// Issue #63: the in-flight WAIT record (see
+    /// [`CheckpointContext::active_wait`]). Additive only: absent on older
+    /// records (serde default = no wait parked); old readers ignore the
+    /// key.
+    #[serde(default)]
+    pub active_wait: Option<crate::wait::WaitingRecord>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -605,6 +618,9 @@ pub fn build_checkpoint(
         // Issue #61: additive — the artifact-ownership table rides
         // independently; old readers treat this key as opaque.
         ownership: context.ownership.clone(),
+        // Issue #63: additive — the in-flight WAIT record rides
+        // independently; old readers treat this key as opaque.
+        active_wait: context.active_wait.clone(),
     }
 }
 
@@ -1420,6 +1436,7 @@ mod tests {
                         },
                     ],
                 },
+                active_wait: None,
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -1692,6 +1709,7 @@ mod tests {
                 failure_diagnoses: Vec::new(),
                 progress_tracker: crate::progress::ProgressTrackerState::default(),
                 ownership: crate::ownership::OwnershipState::default(),
+                active_wait: None,
             },
         );
 
