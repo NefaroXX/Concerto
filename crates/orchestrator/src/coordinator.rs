@@ -21782,6 +21782,237 @@ mod tests {
         assert!(advisory.contains("src/main.rs"), "the advisory names the verified-clean artifact");
     }
 
+    // ── Issue #63: declarative WAIT decisions ────────────────────────
+
+    /// Issue #63 acceptance (handler level): a wait whose `event-resolved`
+    /// condition ALREADY holds wakes with zero sleep. The tool result names
+    /// `outcome: woken`, the journaled Wait decision settles, the park
+    /// clears, and the wait's Decision record lands on the whiteboard as
+    /// real evidence (with its own gate_seq as the evidence cursor).
+    #[tokio::test]
+    async fn wait_handler_wakes_immediately_when_condition_holds() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        // The whiteboard log the wait's Decision record is written to (the
+        // checkpoint store from `coordinator_with_store` is a separate
+        // in-memory DB; the review store is the resume log pool).
+        let (_dir, pool) = resume_log_pool().await;
+        coordinator = coordinator.with_review_store(Some(pool.clone()));
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // The wait's target: an ALREADY-resolved subtask, so the first
+        // refine (before any sleep) trips the condition.
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("the artifact".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "review gate pending",
+                    "conditions": [{ "type": "event-resolved", "task_ids": [done.to_string()] }],
+                    "affected_task_ids": [done.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "woken", "immediate satisfaction wakes: {result}");
+        assert_eq!(result["reason"], "event-resolved", "the tripped condition is named: {result}");
+        let decision_id = result["decision_id"].as_str().expect("the result names the decision id");
+        let entry = coordinator
+            .decision_journal
+            .entries()
+            .iter()
+            .find(|entry| entry.id == decision_id)
+            .expect("the wait decision is journaled");
+        assert_eq!(entry.kind, crate::decisions::DecisionKind::Wait);
+        assert_eq!(entry.status, crate::decisions::DecisionStatus::Settled, "a woken wait settles");
+        assert!(coordinator.active_wait.is_none(), "the park clears after settle");
+
+        // The wait's Decision record is real evidence on the whiteboard.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("the whiteboard loads");
+        let wait = logged
+            .iter()
+            .find(|event| event.payload["decision_kind"] == serde_json::json!("wait"))
+            .expect("a wait Decision event is recorded");
+        assert_eq!(wait.payload["reason"], "review gate pending");
+        assert_eq!(
+            wait.payload["affected_task_ids"],
+            serde_json::json!([done.to_string()]),
+            "wait payload mismatch: {}",
+            serde_json::to_string_pretty(&wait.payload).expect("payload is json")
+        );
+        // The marker's own gate_seq is the evidence cursor: the wait's
+        // Decision event is never counted as new evidence.
+        assert!(wait.gate_seq > 0, "the whiteboard stamps a positive gate_seq on the wait record");
+    }
+
+    /// Issue #63 acceptance (argument discipline): waits that cannot make
+    /// progress are rejected before ANY state mutation — no journal entry,
+    /// no ledger writes, no whiteboard record, no parked wait.
+    #[tokio::test]
+    async fn wait_handler_rejects_self_contradictory_and_over_bounded_waits() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let journal_before = coordinator.decision_journal.entries().len();
+
+        // No condition, no deadline: a park that can only run to the cap and
+        // then still-wait — self-contradictory, rejected before mutation.
+        let degenerate = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "reason": "waiting" }),
+            )
+            .await;
+        assert_eq!(degenerate["error"], "degenerate_wait", "{degenerate}");
+
+        // 33 affected ids (32 max): bounded, trimmed, re-decided.
+        let too_many: Vec<String> = (0..33).map(|_| Ulid::new().to_string()).collect();
+        let over_bounded = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "experimental wait",
+                    "conditions": [{ "type": "replan-or-cancel" }],
+                    "affected_task_ids": too_many,
+                }),
+            )
+            .await;
+        assert_eq!(
+            over_bounded["error"], "too_many_affected_ids",
+            "a wait may name at most {MAX_WAIT_AFFECTED_IDS} ids: {over_bounded}"
+        );
+
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            journal_before,
+            "rejected waits journal nothing"
+        );
+        assert!(coordinator.active_wait.is_none(), "rejected waits never park");
+        assert!(ledger.action_ledger.is_empty(), "rejected waits mutate no ledger: {ledger:?}");
+    }
+
+    /// Issue #63 acceptance (policy): the wait decision passes through the
+    /// run's policy engine exactly like any other coordinator operation —
+    /// a denial rejects the decision and never parks.
+    #[tokio::test]
+    async fn wait_handler_respects_policy_denial() {
+        let deny: Arc<dyn concerto_core::traits::policy::PolicyEngine> =
+            Arc::new(SimplePolicyEngine::new(
+                vec![PolicyRule::RequireApproval(Condition::Always)],
+                Arc::new(TestAudit),
+            ));
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let mut coordinator = coordinator_with_turns_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            deny,
+        );
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "policy-gated wait",
+                    "conditions": [{ "type": "replan-or-cancel" }],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "policy_denied", "denials are structured: {result}");
+        let last = coordinator
+            .decision_journal
+            .entries()
+            .last()
+            .expect("the denied decision is still journaled");
+        assert_eq!(last.status, crate::decisions::DecisionStatus::Rejected);
+        assert!(coordinator.active_wait.is_none(), "a denied wait never parks");
+    }
+
     // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────
 
     /// A gate over the coordinator's own hermetic pool + workspace root,

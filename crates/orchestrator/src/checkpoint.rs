@@ -961,6 +961,16 @@ mod tests {
 
     /// Build a minimal checkpoint for round-trip tests.
     fn build_minimal_checkpoint(graph: &TaskGraph) -> GraphCheckpoint {
+        build_minimal_checkpoint_with_context(graph, &CheckpointContext::default())
+    }
+
+    /// [`build_minimal_checkpoint`] with an explicit context — the additive
+    /// §7-style fields (pending decision, active wait, …) are exercised with
+    /// a tailored context instead of the default.
+    fn build_minimal_checkpoint_with_context(
+        graph: &TaskGraph,
+        context: &CheckpointContext,
+    ) -> GraphCheckpoint {
         build_checkpoint(
             &CheckpointScope {
                 run_id: Ulid::new(),
@@ -990,7 +1000,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &CheckpointContext::default(),
+            context,
         )
     }
 
@@ -2200,6 +2210,65 @@ mod tests {
             vec![diagnosis],
             "the diagnosis/evidence trail survives the round trip (resume persistence)"
         );
+    }
+
+    /// Issue #63: an in-flight WAIT survives the serialized checkpoint
+    /// surface — the resume path re-evaluates the restored record instead of
+    /// losing the park. Both proof directions: the field is absent on legacy
+    /// JSON (serde-default = none parked) and round-trips in full when the
+    /// checkpoint context carries it.
+    #[test]
+    fn in_flight_wait_survives_checkpoint_json() {
+        // Direction 1: a legacy-shape checkpoint has no wait parked.
+        let legacy = serde_json::json!({
+            "schema_version": 3,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+        })
+        .to_string();
+        assert!(!legacy.contains("active_wait"), "a legacy checkpoint predates the wait field");
+        let migrated = GraphCheckpoint::from_json(&legacy).expect("legacy loads");
+        assert!(migrated.active_wait.is_none(), "additive default = no wait parked");
+
+        // Direction 2: a parked wait survives the build → JSON → load path.
+        let graph = TaskGraph::new();
+        let record = crate::wait::WaitingRecord {
+            decision_id: "wait-1".into(),
+            reason: "review gate pending".into(),
+            supporting_evidence_ids: vec!["ev-9".into()],
+            conditions: vec![
+                crate::wait::WakeCondition::EventResolved { task_ids: vec![TaskId::new()] },
+                crate::wait::WakeCondition::NewEvidence {
+                    event_kinds: vec!["finding".into(), "review-state".into()],
+                },
+            ],
+            affected_task_ids: vec![TaskId::new()],
+            affected_resource_ids: vec!["docs/plan.md".into()],
+            started_at_ms: 42,
+            deadline_ms: Some(9_999_999_999),
+            start_gate_seq: Some(7),
+        };
+        let context =
+            CheckpointContext { active_wait: Some(record.clone()), ..CheckpointContext::default() };
+        let cp = build_minimal_checkpoint_with_context(&graph, &context);
+        let json = serde_json::to_string(&cp).expect("the checkpoint serializes");
+        let loaded = GraphCheckpoint::from_json(&json).expect("the checkpoint loads");
+        let restored = loaded.active_wait.expect("the in-flight wait survives");
+        assert_eq!(restored.decision_id, record.decision_id);
+        assert_eq!(restored.reason, record.reason);
+        assert_eq!(restored.deadline_ms, record.deadline_ms);
+        assert_eq!(restored.start_gate_seq, Some(7));
+        assert_eq!(restored.conditions, record.conditions);
+        assert_eq!(restored.affected_task_ids, record.affected_task_ids);
+        assert_eq!(restored.affected_resource_ids, record.affected_resource_ids);
     }
 
     /// Issue #60: the suitability record round-trips through checkpoint
