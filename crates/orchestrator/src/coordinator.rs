@@ -12693,6 +12693,378 @@ mod tests {
         );
     }
 
+    /// A delegating planning provider that answers every request from the
+    /// inner [`TurnProvider`] EXCEPT one consultant's turn, which it fails
+    /// with a non-retryable [`ProviderError`] — a scripted provider fault,
+    /// the sanctioned issue-#62 failure route (an effort-cap exhaustion is
+    /// NOT fatal to a consultant run: it only denies the next tool call, and
+    /// the loop feeds the denial back as a corrective message).
+    ///
+    /// The failing consultant is identified by its question. The consult
+    /// prompt embeds the question verbatim
+    /// ([`crate::consultation::consult_task_description`]) and no other
+    /// message CONTENT in the run repeats it — the coordinator's
+    /// continuation request carries the investigate tool result, whose JSON
+    /// never quotes the question back (it stays inside the tool_call
+    /// arguments, which are not message content).
+    struct FailsOneConsultProvider {
+        inner: Arc<TurnProvider>,
+        fail_question: String,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for FailsOneConsultProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            let is_failing_consult = request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&self.fail_question));
+            if is_failing_consult {
+                // Non-retryable: `with_provider_retry` fails fast (no retry
+                // budget consumed), so the consultant's run errors
+                // deterministically on its first and only completion turn.
+                return Err(ProviderError::InvalidResponse(format!(
+                    "scripted provider fault for the question '{}'",
+                    self.fail_question
+                )));
+            }
+            self.inner.stream_completion(request, cancel).await
+        }
+        fn context_capacity(&self, model: &str) -> concerto_core::types::TokenBudget {
+            self.inner.context_capacity(model)
+        }
+        fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
+            self.inner.approximate_cost(tokens_in, tokens_out)
+        }
+        fn provider_name(&self) -> &'static str {
+            "failing-consult"
+        }
+    }
+
+    /// A delegating planning provider that serves exactly the single dispatch
+    /// turn, then fails every later call with [`ProviderError::Cancelled`] —
+    /// cancelling the shared [`CancellationToken`] on the FIRST concurrent
+    /// consultant call. Which hypothesis occupies that first slot is racy
+    /// but immaterial: both consultants error before any completing turn, so
+    /// both hypotheses settle `failed` with `reasons == ["cancelled"]`,
+    /// `batch_cancelled` is latched, and the coordinator aborts at its next
+    /// loop-top cancellation check.
+    struct CancelOnConsultProvider {
+        inner: Arc<TurnProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for CancelOnConsultProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                // The initiating dispatch turn that produces the investigate
+                // tool call — the handler (and therefore both consultants)
+                // can only start after this stream is fully assembled, so the
+                // cancellation lands strictly AFTER the spawn.
+                self.inner.stream_completion(request, cancel).await
+            } else {
+                if call == 1 {
+                    cancel.cancel();
+                }
+                Err(ProviderError::Cancelled)
+            }
+        }
+        fn context_capacity(&self, model: &str) -> concerto_core::types::TokenBudget {
+            self.inner.context_capacity(model)
+        }
+        fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
+            self.inner.approximate_cost(tokens_in, tokens_out)
+        }
+        fn provider_name(&self) -> &'static str {
+            "cancelling-consult"
+        }
+    }
+
+    /// Issue #62 acceptance: one hypothesis failing inside concurrent
+    /// investigation (a scripted, non-retryable provider fault on the
+    /// researcher's consultant) settles that hypothesis `failed` WITH
+    /// reasons and WITHOUT evidence, while the coder's hypothesis still
+    /// completes with attributed findings — the batch completes and the
+    /// comparator recommends the healthy hypothesis.
+    #[tokio::test]
+    async fn one_failed_hypothesis_leaves_sibling_completed() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let fail_question = "will the lockfile patch fix the red build?";
+        let inner = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("hyp-a", "researcher", fail_question, None, &[], None),
+                hypothesis_spec(
+                    "hyp-b",
+                    "coder",
+                    "does the schema change stay additive?",
+                    None,
+                    &[],
+                    None,
+                ),
+            ])]),
+            // Only the coder's consultant consumes a turn; the researcher's
+            // consultant errors before it can take a completing turn.
+            CoordinatorTurn::Text("the schema change stays additive".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let provider = Arc::new(FailsOneConsultProvider {
+            inner: inner.clone(),
+            fail_question: fail_question.to_owned(),
+        });
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, events) = run.await;
+
+        // Exactly three model turns were served by the inner provider:
+        // dispatch + the surviving coder consultant + the coordinator's
+        // continuation. The failing consultant consumed none.
+        assert_eq!(inner.turn_count(), 3, "dispatch + surviving consultant + coordinator final");
+
+        let result = inner
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert!(
+            result.get("cancelled").is_none(),
+            "a one-sided failure is not a batch cancellation"
+        );
+        let hypotheses = result["hypotheses"].as_array().expect("hypotheses array");
+        assert_eq!(hypotheses.len(), 2, "both hypotheses are ranked");
+
+        let failed = hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis["hypothesis_id"] == "hyp-a")
+            .expect("the failed hypothesis is ranked");
+        assert_eq!(failed["status"], "failed");
+        assert!(failed["evidence_id"].is_null(), "a failed hypothesis carries no evidence");
+        assert!(failed["findings"].is_null(), "a failed hypothesis carries no findings");
+        assert_eq!(failed["tool_call_count"], 0);
+        assert_eq!(failed["cost_usd"].as_f64(), Some(0.0));
+        let reasons = failed["reasons"].as_array().expect("the failure reasons array");
+        assert!(
+            reasons.iter().any(|reason| {
+                reason.as_str().unwrap_or_default().contains("invalid response from provider")
+            }),
+            "the failure reason names the provider fault: {reasons:?}"
+        );
+
+        let completed = hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis["hypothesis_id"] == "hyp-b")
+            .expect("the completed hypothesis is ranked");
+        assert_eq!(completed["status"], "completed");
+        let evidence_id =
+            completed["evidence_id"].as_str().expect("the completed hypothesis has evidence");
+        assert!(completed["findings"].as_str().is_some(), "the completed hypothesis has findings");
+        assert_eq!(
+            result["recommended_hypothesis_id"].as_str(),
+            Some("hyp-b"),
+            "the comparator recommends the only completed-with-evidence hypothesis"
+        );
+
+        // Whiteboard: exactly one consultative Finding (attributed to hyp-b
+        // and REAL — its event id is the comparator's evidence id), while
+        // BOTH per-hypothesis consult decisions — the failed one included —
+        // were recorded before spawn, plus the batch decision.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let consult_findings: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .collect();
+        assert_eq!(consult_findings.len(), 1, "only the completed hypothesis produced findings");
+        assert_eq!(consult_findings[0].payload["hypothesis_id"].as_str(), Some("hyp-b"));
+        assert!(
+            logged.iter().any(|event| event.event_id == evidence_id),
+            "the comparator's evidence id is the real finding event"
+        );
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+                    && event.payload["hypothesis_id"].as_str() == Some("hyp-a")
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("researcher".into())
+            }),
+            "the failed hypothesis's consult decision was still recorded pre-spawn"
+        );
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("coordinator".into())
+            }),
+            "the batch Investigate decision is recorded"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "an investigation must not create SubTask nodes"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 acceptance: a mid-batch cancellation that fires exactly
+    /// AFTER the investigation spawns (the first consultant call, never the
+    /// pre-spawn check) cancels BOTH hypotheses — each settles `failed` with
+    /// `reasons == ["cancelled"]` — and aborts the coordinator run
+    /// deterministically at the next loop-top cancellation check: a
+    /// `Partial` `AgentOutput` with an "Automation paused … cancelled" final
+    /// message. No partial evidence state is left behind: the per-hypothesis
+    /// consult decisions (pre-spawn) exist but NO finding lands, and no
+    /// subtask is ever dispatched.
+    #[tokio::test]
+    async fn mid_batch_cancellation_aborts_without_partial_state() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let inner =
+            Arc::new(TurnProvider::new(vec![CoordinatorTurn::Calls(vec![investigate_with(
+                vec![
+                    hypothesis_spec(
+                        "hyp-a",
+                        "researcher",
+                        "will the lockfile patch fix the red build?",
+                        None,
+                        &[],
+                        None,
+                    ),
+                    hypothesis_spec(
+                        "hyp-b",
+                        "coder",
+                        "does the schema change stay additive?",
+                        None,
+                        &[],
+                        None,
+                    ),
+                ],
+            )])]));
+        let provider = Arc::new(CancelOnConsultProvider {
+            inner: inner.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_for_test_in_dir(
+                coordinator_with_provider_and_policy(
+                    bus.clone(),
+                    Arc::new(AgentRegistry::from_mocks(mocks)),
+                    provider as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                    coordinator_allow_all_policy(),
+                )
+                .with_review_store(Some(pool.clone())),
+                bus.clone(),
+                workspace.path(),
+            ),
+        );
+        let (output, events) = run.await.expect("the cancelled run terminates (no hang)");
+
+        // The run preserves partial progress instead of hanging or failing.
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "mid-batch cancellation yields a Partial outcome"
+        );
+        assert!(
+            output.final_message.contains("Automation paused"),
+            "the final message explains the pause: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.to_lowercase().contains("cancelled"),
+            "the final message names the cancellation: {}",
+            output.final_message
+        );
+
+        // Only the single dispatch turn was served by the inner provider:
+        // both consultants errored before any completing turn, and the
+        // coordinator aborted before its continuation turn.
+        assert_eq!(inner.turn_count(), 1, "the dispatch turn only");
+        assert!(
+            inner.tool_result_contents().is_empty(),
+            "the aborted coordinator never read a tool result back"
+        );
+
+        // No partial evidence/journal state: the consult decisions landed
+        // (pre-spawn attribution) but no finding exists for either
+        // hypothesis — nothing settled.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            logged.iter().all(|event| event.kind != WhiteboardKind::Finding),
+            "a cancelled batch must not record any finding"
+        );
+        for (hypothesis_id, agent) in [("hyp-a", "researcher"), ("hyp-b", "coder")] {
+            assert!(
+                logged.iter().any(|event| {
+                    event.kind == WhiteboardKind::Decision
+                        && event.payload["consultative"] == serde_json::Value::Bool(true)
+                        && event.payload["hypothesis_id"].as_str() == Some(hypothesis_id)
+                        && event.payload["selected_agent"]
+                            == serde_json::Value::String(agent.into())
+                }),
+                "the consult decision for {hypothesis_id} ({agent}) is recorded pre-spawn"
+            );
+        }
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("coordinator".into())
+            }),
+            "the batch Investigate decision is recorded"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "a cancelled investigation never dispatches subtasks"
+        );
+    }
+
     // ------------------------------------------------------------------
     // ADR-35 phase 3: pipeline shape follows the registry's stage tags
     // ------------------------------------------------------------------
