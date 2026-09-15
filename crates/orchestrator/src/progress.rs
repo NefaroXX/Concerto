@@ -369,6 +369,8 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Consult => "consult",
         // Issue #61 mediated artifact transfer.
         DecisionKind::TransferOwnership => "transfer-ownership",
+        // Issue #62 speculative investigation.
+        DecisionKind::Investigate => "investigate",
     }
 }
 
