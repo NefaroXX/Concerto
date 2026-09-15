@@ -51,6 +51,7 @@ fn kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Merge => "merge",
         DecisionKind::Consult => "consult",
         DecisionKind::TransferOwnership => "transfer-ownership",
+        DecisionKind::Investigate => "investigate",
     }
 }
 

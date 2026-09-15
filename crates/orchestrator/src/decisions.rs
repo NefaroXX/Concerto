@@ -84,6 +84,13 @@ pub enum DecisionKind {
     /// with holder info and refusing the unowned / foreign-owned artifacts.
     /// This is the ONLY lawful handover: ownership is never stolen.
     TransferOwnership,
+    /// Issue #62: speculative read-only investigation. The Coordinator runs
+    /// 2–4 bounded, concurrent consultations under distinct hypotheses. The
+    /// comparator ranks findings and returns a structured tool result; no
+    /// hypothesis is auto-promoted to verified. This decision kind carries
+    /// no target (it names hypotheses, not a single specialist) and carries
+    /// no task description (the hypotheses themselves are the work text).
+    Investigate,
 }
 
 impl DecisionKind {

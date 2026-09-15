@@ -45,6 +45,7 @@ pub mod memory_serial;
 pub mod ownership;
 pub mod plan_approval;
 pub mod relationship;
+pub mod speculation;
 pub use relationship::{
     AgentHandoff, AgentRelationship, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
