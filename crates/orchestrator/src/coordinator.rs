@@ -45,10 +45,7 @@ use concerto_sessions::{
 use crate::agent_runner::AgentRunner;
 use crate::agents::GenericSpecialistAgent;
 use crate::checkpoint;
-use crate::consultation::{
-    consult_read_only_executor, consult_task_description, consult_tool_definition,
-    CONSULT_SPECIALIST_TOOL,
-};
+use crate::consultation::{consult_tool_definition, CONSULT_SPECIALIST_TOOL};
 use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
 use crate::delta::FileDeltaTracker;
 use crate::design_doc_verifier::{
@@ -66,6 +63,12 @@ use crate::relationship::{
 };
 use crate::resolver_integration::{self, ResolverOutcome};
 use crate::resume::{self, ResumeOutcome};
+use crate::speculation::{
+    compare_hypotheses, investigate_tool_definition, run_consult_execution, ConsultExecutionInputs,
+    HypothesisCompareInput, HypothesisTerminal, InvestigateHypothesesArgs,
+    INVESTIGATE_HYPOTHESES_TOOL, MAX_SPECULATION_TOTAL_TOOL_CALLS, MAX_SPECULATIVE_HYPOTHESES,
+    MIN_SPECULATIVE_HYPOTHESES,
+};
 use crate::state::OrchestratorState;
 use tracing::warn;
 
@@ -152,6 +155,11 @@ Restructuring an open task (use sparingly, deterministically):
 Consultation (read-only, use it to resolve open questions):
 - consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
 - The consultation returns findings plus a real evidence id; cite that id in supporting_evidence_ids when a later decision rests on the advice.
+
+Speculative investigation (read-only, for conflicting hypotheses):
+- investigate_hypotheses runs 2–4 bounded consultations in parallel. Each hypothesis is a distinct question to a named specialist under the same read-only contract as consult_specialist.
+- Findings are advisory only; the comparator ranks them (completed-with-evidence first) and returns a recommended hypothesis. No hypothesis is auto-promoted to verified — a separate explicit verification step is required before promoting any finding.
+- Use this when a decision is ambiguous and you want competing advisory answers before committing to a dispatch. Verify the recommended hypothesis (or reconcile conflicting findings) before acting on it.
 
 Artifact ownership (issue #61):
 - A write by a non-owner to an OWNED artifact is refused; the refusal names the owner and its acquiring event. To hand an owned artifact over to another agent, call transfer_ownership — the mediated handover is the only lawful way; ownership is never stolen.
@@ -7417,6 +7425,9 @@ impl CoordinatorAgent {
             // Issue #59: the typed CONSULT surface — read-only advisory,
             // findings become evidence, never task work.
             tool_defs.push(consult_tool_definition());
+            // Issue #62: the speculative investigation surface — concurrent
+            // bounded read-only consultations; findings are advisory.
+            tool_defs.push(investigate_tool_definition());
             // Issue #61: the mediated ownership-transfer surface — only
             // lawful when a write gate is attached to the run.
             if self.write_gate.is_some() {
@@ -7601,6 +7612,23 @@ impl CoordinatorAgent {
                     // ownership/completion/ledger-task state.
                     CONSULT_SPECIALIST_TOOL if dispatching => {
                         self.handle_consult_specialist(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #62: concurrent speculative read-only
+                    // investigation. Multiple hypotheses run bounded
+                    // consultations in parallel via `join_all` (mirroring
+                    // the `execute_graph` concurrency precedent); findings
+                    // are advisory only, never auto-promoted to verified.
+                    INVESTIGATE_HYPOTHESES_TOOL if dispatching => {
+                        self.handle_investigate_hypotheses(
                             graph,
                             task,
                             base_ctx,
@@ -8800,6 +8828,7 @@ impl CoordinatorAgent {
             question_trimmed,
             &reason,
             &args.supporting_evidence_ids,
+            None,
         )
         .await;
         self.decision_journal
@@ -8845,74 +8874,32 @@ impl CoordinatorAgent {
         let stage = self.registry.get(&agent_id).and_then(|agent| agent.stage());
         let prompt_sections =
             config.map(|config| config.prompt_sections.clone()).unwrap_or_default();
-        let consult_executor = Arc::new(consult_read_only_executor(
-            base_ctx.session.project_dir.as_path(),
-            policy.clone(),
+        let result = match run_consult_execution(ConsultExecutionInputs {
+            project_dir: base_ctx.session.project_dir.clone(),
+            agent_id: agent_id.clone(),
+            name,
+            stage,
+            profile,
+            planning_provider: self.planning_provider.clone(),
+            bus: self.bus.clone(),
+            retry_policy: self.retry_policy.clone(),
+            prompt_sections,
+            skills_section: self.skills_section.clone(),
+            policy,
+            spend_tracker: self.spend_tracker.clone(),
             effort_cap,
-        ));
-        let consult_agent = Arc::new(
-            GenericSpecialistAgent::new(
-                agent_id.clone(),
-                name,
-                stage,
-                self.planning_provider.clone(),
-                Some(consult_executor),
-                self.bus.clone(),
-                self.retry_policy.clone(),
-                prompt_sections,
-                // Read-only capability shape: the consultant declares read
-                // access only, matching the enforced boundary.
-                concerto_config::AgentCapabilities {
-                    fs_read: Some(true),
-                    fs_write: Some(false),
-                    shell: Some(false),
-                    git: Some(false),
-                    lsp: Some(false),
-                    eval: Some(false),
-                },
-            )
-            .with_output_mode(concerto_core::types::OutputMode::Freeform)
-            .with_skills_section(&self.skills_section),
-        );
-        let mut consult_registry = AgentRegistry::new();
-        consult_registry.register(consult_agent);
-        let consult_runner = AgentRunner::new(
-            Arc::new(consult_registry),
-            self.bus.clone(),
-            self.spend_tracker.clone(),
-        );
-
-        // The transient SubTask is ONLY the runner's input record — it is
-        // never added to the graph, the ledger, or any completion state.
-        let consult_task_id = TaskId::new();
-        let consult_subtask = SubTask {
-            id: consult_task_id,
-            parent_id: None,
-            session_id: task.session_id,
-            role: agent_id.clone(),
-            description: consult_task_description(question_trimmed, args.notes.as_deref()),
-            status: SubTaskStatus::Running,
-            dependencies: Vec::new(),
-            deliverable: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            completed_at: None,
-        };
-        let consult_ctx = AgentContext {
+            question: question_trimmed.to_string(),
+            notes: args.notes.clone(),
+            task: task.clone(),
             session: base_ctx.session.clone(),
-            parent_task: Some(task.clone()),
             working_memory: base_ctx.working_memory.clone(),
             retrieved_chunks: base_ctx.retrieved_chunks.clone(),
-            previous_results: Vec::new(),
-            budget_remaining_usd: None,
-            expected_artifacts: Vec::new(),
-            workspace_capsule: None,
-            workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+            snapshot_digest: self.snapshot_digest(cancel).await,
             run_id: self.run_id.clone(),
             workspace_generation: self.snapshot_generation(),
-        };
-        let result = match consult_runner
-            .run(agent_id.clone(), &consult_subtask, consult_ctx, &profile, cancel.clone())
-            .await
+            cancel: cancel.clone(),
+        })
+        .await
         {
             Ok(result) => result,
             Err(error) => {
@@ -8955,6 +8942,7 @@ impl CoordinatorAgent {
                 &findings,
                 &decision_id,
                 &args.supporting_evidence_ids,
+                None,
             )
             .await;
 
@@ -8973,6 +8961,559 @@ impl CoordinatorAgent {
             "tool_call_count": result.tool_call_count,
         });
         tool_result
+    }
+
+    /// Issue #62: handle one `investigate_hypotheses` tool call — the
+    /// speculative read-only investigation surface.
+    ///
+    /// Flow (mirrors `handle_consult_specialist` failure + checkpoint
+    /// discipline):
+    ///
+    /// 1. Parse args + batch-level arg validation (count bounds,
+    ///    per-hypothesis effort caps, question/notes bounds, total effort
+    ///    ceiling, `expected_artifacts` rejection, duplicate id check).
+    /// 2. Per-hypothesis Consult validation (`missing_evidence_ids` +
+    ///    `DecisionValidator` with `DecisionKind::Consult`) — ANY invalid
+    ///    hypothesis rejects the whole batch (fail fast, no state mutation).
+    /// 3. Policy gate (`investigate_hypotheses`, same engine as consult) —
+    ///    once for the batch; denied → `policy_denied` with `state_log`
+    ///    containing the rejected decision payload.
+    /// 4. Batch `Investigate` decision + per-hypothesis `Consult` decisions
+    ///    journaled; consultative Decision events carry `hypothesis_id`
+    ///    attribution.
+    /// 5. Pre-spawn cancellation check.
+    /// 6. Build N concurrent futures via [`futures::future::join_all`] (same
+    ///    concurrency shape as `execute_graph`), each calling the free
+    ///    [`run_consult_execution`] with its own read-only
+    ///    policy-gated executor. Findings NEVER become task results.
+    /// 7. Sequential settle: per-hypothesis journal transitions, ledger
+    ///    cost/tool calls, consultative Finding events, comparator input.
+    /// 8. ONE checkpoint persist.
+    /// 9. Comparator output (advisory, `speculative: true`).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_investigate_hypotheses(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── Local types ──────────────────────────────────────────────────
+        // Per-hypothesis record built during validation and consumed during
+        // future construction. Carries all owned data needed for the
+        // concurrent execution future and the sequential settle phase.
+        struct PerHypothesisRecord {
+            hypothesis_id: String,
+            agent_id: AgentId,
+            question: String,
+            notes: Option<String>,
+            cited_ids: Vec<String>,
+            effort_cap: u32,
+            decision_id: String,
+        }
+
+        /// Result of one hypothesis execution future, consumed during settle.
+        struct PerHypothesisResult {
+            hypothesis_id: String,
+            decision_id: String,
+            agent_id: AgentId,
+            question: String,
+            cited_ids: Vec<String>,
+            outcome: Result<AgentRunResult, OrchestratorError>,
+        }
+
+        // ── 1. Parse + batch-level arg validation ────────────────────────
+        let Some(args) = InvestigateHypothesesArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "investigate_hypotheses requires a hypotheses array of \
+                            {hypothesis_id, agent_id, question} specs",
+            });
+        };
+        // Investigations are read-only: declaring expected artifacts would
+        // imply a work contract — a conflicting decision, rejected.
+        if !parse_string_array(arguments, "expected_artifacts").is_empty() {
+            return serde_json::json!({
+                "error": "conflicting_decision",
+                "message": "speculative investigations are read-only and never declare \
+                            expected artifacts; drop the field and re-decide",
+            });
+        }
+        if args.hypotheses.len() < MIN_SPECULATIVE_HYPOTHESES {
+            return serde_json::json!({
+                "error": "too_few_hypotheses",
+                "message": format!(
+                    "investigate_hypotheses requires at least {} competing hypotheses \
+                     (got {}); for a single question use consult_specialist",
+                    MIN_SPECULATIVE_HYPOTHESES,
+                    args.hypotheses.len(),
+                ),
+            });
+        }
+        if args.hypotheses.len() > MAX_SPECULATIVE_HYPOTHESES {
+            return serde_json::json!({
+                "error": "too_many_hypotheses",
+                "message": format!(
+                    "investigate_hypotheses accepts at most {} hypotheses (got {})",
+                    MAX_SPECULATIVE_HYPOTHESES,
+                    args.hypotheses.len(),
+                ),
+            });
+        }
+
+        // ── 2. Per-hypothesis batch-level validation (pre-state-mutation) ─
+        let mut total_effort: u32 = 0;
+        let mut seen_ids = std::collections::HashSet::new();
+        for h in &args.hypotheses {
+            let q = h.question.trim();
+            if q.chars().count() > crate::consultation::MAX_CONSULT_QUESTION_CHARS {
+                return serde_json::json!({
+                    "error": "question_too_long",
+                    "message": format!(
+                        "hypothesis {} question exceeds {} characters ({}); \
+                         shorten and re-decide",
+                        h.hypothesis_id,
+                        crate::consultation::MAX_CONSULT_QUESTION_CHARS,
+                        q.chars().count(),
+                    ),
+                });
+            }
+            if let Some(notes) = h.notes.as_deref() {
+                if notes.chars().count() > crate::decisions::MAX_DECISION_NOTES_CHARS {
+                    return serde_json::json!({
+                        "error": "notes_too_long",
+                        "message": format!(
+                            "hypothesis {} notes exceeds {} characters ({}); \
+                             shorten and re-decide",
+                            h.hypothesis_id,
+                            crate::decisions::MAX_DECISION_NOTES_CHARS,
+                            notes.chars().count(),
+                        ),
+                    });
+                }
+            }
+            let cap =
+                h.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+            if cap == 0 || cap > crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS {
+                return serde_json::json!({
+                    "error": "invalid_effort_cap",
+                    "message": format!(
+                        "hypothesis {} max_tool_calls must be 1..={} (got {})",
+                        h.hypothesis_id,
+                        crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS,
+                        cap,
+                    ),
+                });
+            }
+            total_effort = total_effort.saturating_add(cap);
+            if !seen_ids.insert(&h.hypothesis_id) {
+                return serde_json::json!({
+                    "error": "duplicate_hypothesis_id",
+                    "message": format!(
+                        "each hypothesis_id in the batch must be unique; \
+                         duplicate: {}",
+                        h.hypothesis_id,
+                    ),
+                });
+            }
+        }
+        if total_effort > MAX_SPECULATION_TOTAL_TOOL_CALLS {
+            return serde_json::json!({
+                "error": "total_effort_exceeded",
+                "message": format!(
+                    "the summed per-hypothesis max_tool_calls {} exceeds the batch \
+                     ceiling {}; lower per-hypothesis caps and re-decide",
+                    total_effort,
+                    MAX_SPECULATION_TOTAL_TOOL_CALLS,
+                ),
+            });
+        }
+
+        // ── 3. Per-hypothesis Consult validation (DecisionValidator) ──────
+        //    ANY invalid hypothesis rejects the whole batch (fail fast,
+        //    no state mutation). This mirrors the consult handler's early
+        //    validation block.
+        let roster_ids = self.decision_roster();
+        let mut per_hyp: Vec<PerHypothesisRecord> = Vec::with_capacity(args.hypotheses.len());
+        for h in &args.hypotheses {
+            let agent_id = AgentId::new(&h.agent_id);
+            let question_trimmed = h.question.trim().to_owned();
+            let missing = self.missing_evidence_ids(&h.supporting_evidence_ids, cancel).await;
+            let known_evidence: std::collections::HashSet<String> = h
+                .supporting_evidence_ids
+                .iter()
+                .filter(|id| !missing.contains(id))
+                .cloned()
+                .collect();
+            let validator = crate::decisions::DecisionValidator {
+                roster_ids: &roster_ids,
+                known_event_ids: &known_evidence,
+                project_root: Some(base_ctx.session.project_dir.as_path()),
+            };
+            let mut decision = match validator.validate(
+                crate::decisions::DecisionKind::Consult,
+                Some(&h.agent_id),
+                &question_trimmed,
+                h.notes.as_deref(),
+                &h.supporting_evidence_ids,
+                // A consult carries no artifact contract.
+                &[],
+            ) {
+                Ok(decision) => decision,
+                Err(rejection) => {
+                    warn!(
+                        code = %rejection.code,
+                        hypothesis_id = %h.hypothesis_id,
+                        agent = %h.agent_id,
+                        "investigate_hypotheses rejected an invalid Coordinator decision \
+                         (structured error, no state mutation)"
+                    );
+                    return rejection.tool_value();
+                }
+            };
+            // The effort cap rides the journaled decision (additive field).
+            let effort_cap =
+                h.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+            decision.max_tool_calls = Some(effort_cap);
+            let decision_id = decision.id.clone();
+            self.decision_journal.record(decision);
+
+            per_hyp.push(PerHypothesisRecord {
+                hypothesis_id: h.hypothesis_id.clone(),
+                agent_id,
+                question: question_trimmed,
+                notes: h.notes.clone(),
+                cited_ids: h.supporting_evidence_ids.clone(),
+                effort_cap,
+                decision_id,
+            });
+        }
+
+        // ── 3b. Batch-level Investigate decision (journal) ────────────────
+        // One Investigate-kind decision covers the whole batch; the
+        // per-hypothesis Consult decisions carry the detail. Validated like
+        // any decision against the same roster + evidence sets used above
+        // (every cited id was already proven real — a missing id rejects the
+        // whole batch before this point).
+        let batch_evidence: Vec<String> = per_hyp
+            .iter()
+            .flat_map(|h| h.cited_ids.iter().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let known_ids: std::collections::HashSet<String> =
+            per_hyp.iter().flat_map(|h| h.cited_ids.iter().cloned()).collect();
+        let batch_task_text = {
+            let ids: Vec<&str> = per_hyp.iter().map(|h| h.hypothesis_id.as_str()).collect();
+            format!(
+                "speculative investigation across hypotheses [{}]; each runs \
+                 bounded read-only consultation under a distinct question",
+                ids.join(", "),
+            )
+        };
+        let batch_reason = "coordinator_speculative_investigation".to_owned();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_ids,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut batch_decision = match validator.validate(
+            crate::decisions::DecisionKind::Investigate,
+            None,
+            &batch_task_text,
+            Some(&batch_reason),
+            &batch_evidence,
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => return rejection.tool_value(),
+        };
+        // The summed effort ceiling rides the journaled batch decision
+        // (additive field), mirroring how each hypothesis' own cap rides its
+        // consult decision.
+        batch_decision.max_tool_calls = Some(total_effort);
+        let batch_decision_id = batch_decision.id.clone();
+        self.decision_journal.record(batch_decision);
+
+        // ── 4. Policy gate (SINGLE evaluation for the batch) ─────────────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; speculative investigation is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: INVESTIGATE_HYPOTHESES_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this speculative investigation",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── 5. Batch Investigate decision → Dispatched + event ──────────
+        //    The batch decision was journaled (Validated) at step 3b; the
+        //    whiteboard event names the batch; per-hypothesis consultative
+        //    Decision events carry the attribution detail.
+        self.decision_journal
+            .transition(&batch_decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.append_consult_decision(
+            task.session_id,
+            &AgentId::new("coordinator"),
+            &batch_task_text,
+            &batch_reason,
+            &batch_evidence,
+            None,
+        )
+        .await;
+        // Per-hypothesis consultative Decision events (attribution via
+        // hypothesis_id in the payload).
+        for h in &per_hyp {
+            let reason = h.notes.clone().unwrap_or_else(|| "coordinator_consultation".to_owned());
+            self.append_consult_decision(
+                task.session_id,
+                &h.agent_id,
+                &h.question,
+                &reason,
+                &h.cited_ids,
+                Some(&h.hypothesis_id),
+            )
+            .await;
+            self.decision_journal
+                .transition(&h.decision_id, crate::decisions::DecisionStatus::Dispatched);
+        }
+
+        // ── 6. Pre-spawn cancellation check ──────────────────────────────
+        if cancel.is_cancelled() {
+            return serde_json::json!({ "error": "cancelled" });
+        }
+
+        // ── 7. Build concurrent futures ──────────────────────────────────
+        //    Same concurrency shape as `execute_graph`: one future per
+        //    hypothesis, all owned data, `join_all` waits for all.
+        let snapshot_digest = self.snapshot_digest(cancel).await;
+        let workspace_generation = self.snapshot_generation();
+        let planning_provider = self.planning_provider.clone();
+        let bus = self.bus.clone();
+        let retry_policy = self.retry_policy.clone();
+        let skills_section = self.skills_section.clone();
+        let policy = Arc::clone(&policy);
+        let spend_tracker = self.spend_tracker.clone();
+        let project_dir = base_ctx.session.project_dir.clone();
+        let session = base_ctx.session.clone();
+        let working_memory = base_ctx.working_memory.clone();
+        let retrieved_chunks = base_ctx.retrieved_chunks.clone();
+        let run_id = self.run_id.clone();
+
+        // ── 6a. Profile resolution (once for the whole batch) ───────────
+        // The coordinator's planning profile is shared across all hypotheses.
+        // If model selection fails, the whole batch fails — mirroring the
+        // single-consult error shape.
+        let profile = match self.planning_profile.clone() {
+            Some(profile) => profile,
+            None => match self.model_selector.select_for_session(
+                &AgentId::new("coordinator"),
+                None,
+                task.id,
+                Some(task.session_id),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    if is_cancellation_error(&error) || cancel.is_cancelled() {
+                        return serde_json::json!({ "error": "cancelled" });
+                    }
+                    warn!(
+                        %error,
+                        "investigate_hypotheses: model selection failed; returning the \
+                         error to the coordinator model"
+                    );
+                    return serde_json::json!({
+                        "error": "model_selection_failed",
+                        "message": format!(
+                            "no model could be selected for the investigation: {error}"
+                        ),
+                    });
+                }
+            },
+        };
+
+        let this: &CoordinatorAgent = &*self;
+        let registry = &this.registry;
+
+        // ── 6b. Build concurrent futures ─────────────────────────────────
+        //    Same concurrency shape as `execute_graph`: one future per
+        //    hypothesis, all owned data, `join_all` waits for all.
+        let futures: Vec<_> = per_hyp
+            .into_iter()
+            .map(|h| {
+                let config = registry.config(&h.agent_id);
+                let name = config.map(|c| c.name.clone()).unwrap_or_else(|| h.agent_id.to_string());
+                let stage = registry.get(&h.agent_id).and_then(|a| a.stage());
+                let prompt_sections = config.map(|c| c.prompt_sections.clone()).unwrap_or_default();
+                let inputs = ConsultExecutionInputs {
+                    project_dir: project_dir.clone(),
+                    agent_id: h.agent_id.clone(),
+                    name,
+                    stage,
+                    profile: profile.clone(),
+                    planning_provider: planning_provider.clone(),
+                    bus: bus.clone(),
+                    retry_policy: retry_policy.clone(),
+                    prompt_sections,
+                    skills_section: skills_section.clone(),
+                    policy: Arc::clone(&policy),
+                    spend_tracker: Arc::clone(&spend_tracker),
+                    effort_cap: h.effort_cap,
+                    question: h.question.clone(),
+                    notes: h.notes.clone(),
+                    task: task.clone(),
+                    session: session.clone(),
+                    working_memory: working_memory.clone(),
+                    retrieved_chunks: retrieved_chunks.clone(),
+                    snapshot_digest: snapshot_digest.clone(),
+                    run_id: run_id.clone(),
+                    workspace_generation: workspace_generation.clone(),
+                    cancel: cancel.clone(),
+                };
+                let hypothesis_id = h.hypothesis_id.clone();
+                let decision_id = h.decision_id.clone();
+                let agent_id = h.agent_id.clone();
+                let cited_ids = h.cited_ids.clone();
+                async move {
+                    let outcome = run_consult_execution(inputs).await;
+                    PerHypothesisResult {
+                        hypothesis_id,
+                        decision_id,
+                        agent_id,
+                        question: h.question,
+                        cited_ids,
+                        outcome,
+                    }
+                }
+            })
+            .collect();
+
+        let run_results = join_all(futures).await;
+
+        // ── 8. Settle ────────────────────────────────────────────────────
+        //    Sequential post-join: per-hypothesis journal transitions,
+        //    ledger cost/tool calls, consultative Finding events.
+        let batch_cancelled = cancel.is_cancelled();
+        let mut compare_inputs: Vec<HypothesisCompareInput> = Vec::with_capacity(run_results.len());
+        for r in run_results {
+            match r.outcome {
+                Ok(result) => {
+                    self.decision_journal
+                        .transition(&r.decision_id, crate::decisions::DecisionStatus::Settled);
+                    ledger.total_cost += result.cost_usd;
+                    ledger.total_tool_calls =
+                        ledger.total_tool_calls.saturating_add(result.tool_call_count);
+                    let findings = bounded_text(
+                        &result.summary,
+                        crate::consultation::MAX_CONSULT_FINDINGS_CHARS,
+                    );
+                    let evidence_id = self
+                        .append_consult_finding(
+                            task.session_id,
+                            &r.agent_id,
+                            &r.question,
+                            &findings,
+                            &r.decision_id,
+                            &r.cited_ids,
+                            Some(&r.hypothesis_id),
+                        )
+                        .await;
+                    compare_inputs.push(HypothesisCompareInput {
+                        hypothesis_id: r.hypothesis_id,
+                        agent_id: r.agent_id,
+                        terminal: HypothesisTerminal::Completed,
+                        evidence_id,
+                        findings: Some(findings),
+                        tool_call_count: result.tool_call_count,
+                        cost_usd: result.cost_usd,
+                        reasons: Vec::new(),
+                    });
+                }
+                Err(error) => {
+                    let mut reasons: Vec<String> = Vec::new();
+                    if is_cancellation_error(&error) || cancel.is_cancelled() {
+                        reasons.push("cancelled".to_owned());
+                        self.decision_journal
+                            .transition(&r.decision_id, crate::decisions::DecisionStatus::Rejected);
+                    } else {
+                        warn!(
+                            %error,
+                            hypothesis_id = %r.hypothesis_id,
+                            "investigate_hypotheses: hypothesis run failed; \
+                             recording failure and continuing with remaining hypotheses"
+                        );
+                        let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                        reasons.push(error.to_string());
+                        reasons.push(diagnosis.tool_summary().to_string());
+                        self.decision_journal
+                            .transition(&r.decision_id, crate::decisions::DecisionStatus::Rejected);
+                    }
+                    compare_inputs.push(HypothesisCompareInput {
+                        hypothesis_id: r.hypothesis_id,
+                        agent_id: r.agent_id,
+                        terminal: HypothesisTerminal::Failed,
+                        evidence_id: None,
+                        findings: None,
+                        tool_call_count: 0,
+                        cost_usd: 0.0,
+                        reasons,
+                    });
+                }
+            }
+        }
+
+        // ── 9. Batch Investigate decision → Settled / Rejected ──────────
+        if batch_cancelled {
+            self.decision_journal
+                .transition(&batch_decision_id, crate::decisions::DecisionStatus::Rejected);
+        } else {
+            self.decision_journal
+                .transition(&batch_decision_id, crate::decisions::DecisionStatus::Settled);
+            // ONE checkpoint persist (the graph itself is unchanged;
+            // consultative journal state is the only mutation).
+            self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+        }
+
+        // ── 10. Comparator output ────────────────────────────────────────
+        let outcome = if batch_cancelled { "investigated_cancelled" } else { "investigated" };
+        let mut result = compare_hypotheses(&compare_inputs);
+        result["outcome"] = serde_json::json!(outcome);
+        result["speculative"] = serde_json::json!(true);
+        result["advisory"] = serde_json::json!(true);
+        if batch_cancelled {
+            result["cancelled"] = serde_json::json!(true);
+        }
+        result
     }
 
     /// Issue #57: the decision-validation preamble shared by the split/merge
@@ -9069,6 +9610,7 @@ impl CoordinatorAgent {
         question: &str,
         reason: &str,
         supporting_evidence_ids: &[String],
+        hypothesis_id: Option<&str>,
     ) {
         let Some(pool) = self.review_store.as_ref() else { return };
         let event = |evidence_ids: &[String]| NewWhiteboardEvent {
@@ -9085,6 +9627,7 @@ impl CoordinatorAgent {
                 "required_output": question,
                 "supporting_evidence_ids": evidence_ids,
                 "consultative": true,
+                "hypothesis_id": hypothesis_id,
             }),
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
@@ -9108,6 +9651,7 @@ impl CoordinatorAgent {
     /// `causation` names the consult decision that produced the findings.
     /// Fail-soft: an append failure yields `None` (the findings still ride
     /// the tool result; no evidence id is fabricated).
+    #[allow(clippy::too_many_arguments)] // 7 params + self; the extra `hypothesis_id` attribution
     async fn append_consult_finding(
         &self,
         session_id: Ulid,
@@ -9116,6 +9660,7 @@ impl CoordinatorAgent {
         findings: &str,
         consult_decision_id: &str,
         cited_evidence_ids: &[String],
+        hypothesis_id: Option<&str>,
     ) -> Option<String> {
         let pool = self.review_store.as_ref()?;
         let event_id = Ulid::new().to_string();
@@ -9132,6 +9677,7 @@ impl CoordinatorAgent {
                 "question": bounded_text(question, 512),
                 "findings": findings,
                 "supporting_evidence_ids": cited_evidence_ids,
+                "hypothesis_id": hypothesis_id,
             }),
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
@@ -10664,6 +11210,43 @@ mod tests {
         }
     }
 
+    /// One hypothesis spec for an `investigate_hypotheses` tool call
+    /// (issue #62).
+    fn hypothesis_spec(
+        hypothesis_id: &str,
+        agent_id: &str,
+        question: &str,
+        notes: Option<&str>,
+        evidence: &[&str],
+        max_tool_calls: Option<u32>,
+    ) -> serde_json::Value {
+        let mut spec = serde_json::json!({
+            "hypothesis_id": hypothesis_id,
+            "agent_id": agent_id,
+            "question": question,
+        });
+        if let Some(notes) = notes {
+            spec["notes"] = serde_json::json!(notes);
+        }
+        if !evidence.is_empty() {
+            spec["supporting_evidence_ids"] =
+                serde_json::json!(evidence.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+        }
+        if let Some(cap) = max_tool_calls {
+            spec["max_tool_calls"] = serde_json::json!(cap);
+        }
+        spec
+    }
+
+    /// An `investigate_hypotheses` tool call for a test turn (issue #62).
+    fn investigate_with(specs: Vec<serde_json::Value>) -> ToolCall {
+        ToolCall {
+            id: "inv-batch".to_string(),
+            name: INVESTIGATE_HYPOTHESES_TOOL.to_string(),
+            arguments: serde_json::json!({ "hypotheses": specs }),
+        }
+    }
+
     /// Planning provider that serves one scripted Coordinator turn per
     /// request, in order. Beyond the script it returns an empty final text
     /// (the loop then stops in prose). Captures every request it receives so
@@ -11657,6 +12240,456 @@ mod tests {
             resolved.resolved_by.as_deref(),
             finding.causation.as_deref(),
             "the question was resolved by the consult decision"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #62: speculative read-only investigation
+    // ------------------------------------------------------------------
+
+    /// Issue #62 acceptance: `investigate_hypotheses` runs the competing
+    /// hypotheses as bounded read-only consultations concurrently (inside ONE
+    /// handler turn), records each finding on the whiteboard WITH its
+    /// hypothesis id (attribution), and returns the comparator ranking
+    /// carrying the REAL finding-event id for every completed hypothesis —
+    /// advisory evidence, never task results.
+    #[tokio::test]
+    async fn investigation_runs_hypotheses_concurrently_with_attributed_findings() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("hyp-1", "researcher", "why is the build red?", None, &[], None),
+                hypothesis_spec("hyp-2", "coder", "is the migration additive?", None, &[], None),
+            ])]),
+            // The two consultants share the planning provider and finish in
+            // prose; the pop order between them is concurrent/racy but the
+            // turns are interchangeable — each settles with its own text.
+            CoordinatorTurn::Text("the build is red because the lockfile is stale".into()),
+            CoordinatorTurn::Text("the migration only adds a column".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, events) = run.await;
+
+        // Exactly the scripted model turns were consumed (dispatch turn +
+        // two consultant turns + final) — both consults ran INSIDE the single
+        // investigate turn and nothing else was invoked.
+        assert_eq!(provider.turn_count(), 4, "dispatch + 2 consultants + coordinator final");
+
+        // The comparator result the model read back.
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert_eq!(result["speculative"], true);
+        assert_eq!(result["advisory"], true);
+        let hypotheses = result["hypotheses"].as_array().expect("hypotheses array");
+        assert_eq!(hypotheses.len(), 2, "both hypotheses ranked");
+        let evidence_ids: Vec<String> = hypotheses
+            .iter()
+            .map(|h| h["evidence_id"].as_str().expect("real evidence id").to_owned())
+            .collect();
+        assert_eq!(
+            result["recommended_hypothesis_id"].as_str(),
+            Some("hyp-1"),
+            "both completed-with-evidence tie-break by creation order"
+        );
+
+        // The whiteboard carries the attributed, consultative findings.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let findings: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .collect();
+        assert_eq!(findings.len(), 2, "one finding per hypothesis");
+        let attributed: Vec<&str> = findings
+            .iter()
+            .map(|event| event.payload["hypothesis_id"].as_str().expect("attributed finding"))
+            .collect();
+        assert!(
+            attributed.contains(&"hyp-1") && attributed.contains(&"hyp-2"),
+            "findings carry their hypothesis id: {attributed:?}"
+        );
+        // Every evidence id the comparator returned is REAL.
+        for id in &evidence_ids {
+            assert!(
+                logged.iter().any(|event| event.event_id == *id),
+                "the finding event for {id} is on the whiteboard"
+            );
+        }
+        // The batch Investigate decision event names the whole investigation.
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("coordinator".into())
+            }),
+            "the batch Investigate decision is recorded"
+        );
+        // Advisory only: no SubTask node was ever created.
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "an investigation must not create SubTask nodes"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 acceptance: hypotheses with CONFLICTING findings still
+    /// settle side-by-side; the comparator only RANKS them — nothing is
+    /// auto-promoted to verified, and every finding stays consultative (an
+    /// assertion, never a task result).
+    #[tokio::test]
+    async fn conflicting_hypotheses_stay_advisory_and_are_never_promoted() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec(
+                    "hyp-a",
+                    "researcher",
+                    "does the API change break callers?",
+                    None,
+                    &[],
+                    None,
+                ),
+                hypothesis_spec(
+                    "hyp-b",
+                    "validator",
+                    "does the API change break callers?",
+                    None,
+                    &[],
+                    None,
+                ),
+            ])]),
+            CoordinatorTurn::Text("the API change is source-compatible".into()),
+            CoordinatorTurn::Text("the API change breaks two callers".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, events) = run.await;
+
+        // Both contradictory findings landed side by side.
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert_eq!(
+            result["hypotheses"].as_array().map(Vec::len),
+            Some(2),
+            "conflicting hypotheses are ranked, not resolved"
+        );
+        assert_eq!(result["advisory"], true);
+        assert!(
+            result["recommended_hypothesis_id"].as_str().is_some(),
+            "the comparator recommends (rank) without promoting"
+        );
+        // Nothing was promoted: every finding is consultative and no SubTask
+        // node exists anywhere in the run.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let consultative_findings = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .count();
+        assert_eq!(consultative_findings, 2);
+        assert!(
+            logged.iter().all(|event| event.kind != WhiteboardKind::Finding
+                || event.payload["consultative"] == serde_json::Value::Bool(true)),
+            "no finding is ever non-consultative (not a task result)"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "no hypothesis was auto-promoted into the execution graph"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 acceptance: investigations inherit the read-only gate — a
+    /// hypothesis that attempts a workspace write is denied fail-closed
+    /// (recorded), the finding still settles, and the batch completes.
+    #[tokio::test]
+    async fn investigation_write_attempt_is_denied_read_only() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec(
+                    "hyp-w",
+                    "researcher",
+                    "would a patched lockfile help?",
+                    None,
+                    &[],
+                    None,
+                ),
+                hypothesis_spec("hyp-ro", "coder", "is the schema additive?", None, &[], None),
+            ])]),
+            // One hypothesis attempts a WRITE through the filesystem tool.
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "write-attempt".to_string(),
+                name: "filesystem".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "write",
+                    "path": "injected.rs",
+                    "content": "// pwned",
+                }),
+            }]),
+            // Whichever consultant popped the write still settles in prose,
+            // then the other conclusion, then the coordinator.
+            CoordinatorTurn::Text("the write was denied; the lockfile patch helps".into()),
+            CoordinatorTurn::Text("the schema is additive".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_policy_with_audit(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        // Fail closed: the write never landed and the denial is recorded.
+        assert!(
+            !workspace.path().join("injected.rs").exists(),
+            "an investigation must never mutate the workspace"
+        );
+        let rows = audit.rows();
+        assert!(
+            rows.iter().any(|row| {
+                row.rule_matched.as_deref() == Some("consult_read_only")
+                    && row.tool_name == "filesystem"
+                    && row.verdict == "Deny"
+            }),
+            "the write denial must be recorded: {rows:?}"
+        );
+        // Both hypotheses still settled with consultative findings.
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert_eq!(
+            result["hypotheses"].as_array().map(Vec::len),
+            Some(2),
+            "the batch completes even when a hypothesis is denied a write"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 guardrail: fewer than two competing hypotheses cannot be
+    /// investigated — the tool answers a structured error and nothing runs.
+    #[tokio::test]
+    async fn investigation_requires_at_least_two_hypotheses() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![hypothesis_spec(
+                "hyp-1",
+                "researcher",
+                "is the plan sound?",
+                None,
+                &[],
+                None,
+            )])]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            ),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("error").is_some())
+            .expect("the structured rejection was observed");
+        assert_eq!(result["error"], "too_few_hypotheses");
+        // No consultant ever spawned: exactly two model turns (dispatch +
+        // final), and no speculative result was produced.
+        assert_eq!(provider.turn_count(), 2, "validation rejects before any spawn");
+        assert!(
+            provider.tool_result_contents().iter().all(|value| value.get("speculative").is_none()),
+            "no investigation result was produced"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 guardrail: the summed per-hypothesis effort caps are bounded
+    /// by the batch ceiling — exceeding it answers a structured error before
+    /// anything runs.
+    #[tokio::test]
+    async fn investigation_enforces_the_batch_effort_ceiling() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("h1", "researcher", "q1", None, &[], Some(16)),
+                hypothesis_spec("h2", "researcher", "q2", None, &[], Some(16)),
+                hypothesis_spec("h3", "researcher", "q3", None, &[], Some(16)),
+            ])]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            ),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("error").is_some())
+            .expect("the structured rejection was observed");
+        assert_eq!(result["error"], "total_effort_exceeded");
+        assert_eq!(provider.turn_count(), 2, "the ceiling rejects before any spawn");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 guardrail: an unregistered hypothesis agent rejects the WHOLE
+    /// batch with a structured error, before any state mutation or spawn — no
+    /// finding, no decision event lands on the whiteboard.
+    #[tokio::test]
+    async fn investigation_rejects_unregistered_agent_without_state_mutation() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("hyp-1", "researcher", "q1", None, &[], None),
+                hypothesis_spec("hyp-2", "ghost", "q2", None, &[], None),
+            ])]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("error").is_some())
+            .expect("the structured rejection was observed");
+        assert_eq!(result["error"], "unknown_agent");
+        assert_eq!(provider.turn_count(), 2, "validation rejects before any spawn");
+        // No mutation: the evidence spine gained nothing.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            logged.iter().all(|event| event.kind != WhiteboardKind::Finding),
+            "an invalid batch must not record findings"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
         );
     }
 
