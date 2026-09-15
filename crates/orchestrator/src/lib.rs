@@ -69,6 +69,7 @@ pub mod timeline;
 pub mod tool_driver;
 mod tool_facts;
 mod tool_guard;
+pub mod wait;
 mod working_memory;
 pub mod workspace_snapshot;
 pub mod world_model;
