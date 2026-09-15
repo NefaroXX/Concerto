@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native preferred, fallback labeled in transcript + audit.
 
 ### Fixed
+- **Speculative investigation (#62):** bounded concurrent read-only
+  consults over competing hypotheses with per-hypothesis attribution,
+  a deterministic comparator, batch budgets, shared cancellation, and
+  no auto-promotion of speculation to fact.
 - **Shell containment residuals:** xargs quote/backslash/glued-redirect
   obfuscations detected; interpreter program bodies (`awk system()`/`getline`,
   `sed s///e`, standalone `e`) and process-substitution bodies demoted from
