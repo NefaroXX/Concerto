@@ -373,6 +373,8 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Investigate => "investigate",
         // Issue #63 explicit wait.
         DecisionKind::Wait => "wait",
+        // Issue #64 explicit reconsideration (supersede a decision + freeze).
+        DecisionKind::Reconsider => "reconsider",
     }
 }
 
@@ -385,6 +387,8 @@ pub(crate) fn decision_status_label(status: DecisionStatus) -> &'static str {
         DecisionStatus::Dispatched => "dispatched",
         DecisionStatus::Settled => "settled",
         DecisionStatus::Rejected => "rejected",
+        // Issue #64: a RECONSIDER has voided the decision's assumptions.
+        DecisionStatus::Superseded => "superseded",
     }
 }
 

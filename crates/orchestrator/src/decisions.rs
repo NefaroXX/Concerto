@@ -100,6 +100,16 @@ pub enum DecisionKind {
     /// call in `execute_graph` (so the #53 no-progress tracker is never
     /// invoked during the wait).
     Wait,
+    /// Issue #64: explicit RECONSIDER. The Coordinator supersedes a decision
+    /// whose assumptions proved wrong by marking it
+    /// [`DecisionStatus::Superseded`] and freezing ONLY the affected pending
+    /// tasks (deterministic `Freeze` transform — completed work, valid
+    /// evidence, and accepted artifacts are never touched). The model
+    /// supplies a reason (recorded as the task description) and cites the
+    /// superseded decision id plus supporting evidence. This kind rejects a
+    /// target (it names decisions and tasks, not a specialist) and requires
+    /// a task description (the reason rides the task text, like WAIT).
+    Reconsider,
 }
 
 impl DecisionKind {
@@ -129,6 +139,7 @@ impl DecisionKind {
                 | DecisionKind::Split
                 | DecisionKind::Merge
                 | DecisionKind::Wait
+                | DecisionKind::Reconsider // names decisions/tasks, not a specialist
         )
     }
 
@@ -140,6 +151,7 @@ impl DecisionKind {
                 | DecisionKind::Retry
                 | DecisionKind::Consult
                 | DecisionKind::Wait // the WAIT reason rides the task text
+                | DecisionKind::Reconsider // the RECONSIDER reason rides the task text
         )
     }
 }
@@ -147,8 +159,9 @@ impl DecisionKind {
 /// Lifecycle of a decision. Forward transitions:
 /// `Pending → Validated → Dispatched → Settled`; any state may go
 /// `Rejected` when validation or execution fails to accept or make the
-/// decision. The status is decision state — persisted independently of the
-/// execution ledger.
+/// decision, or go `Superseded` (issue #64) when a RECONSIDER marks the
+/// decision's assumptions void. The status is decision state — persisted
+/// independently of the execution ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DecisionStatus {
@@ -157,6 +170,11 @@ pub enum DecisionStatus {
     Dispatched,
     Settled,
     Rejected,
+    /// Issue #64: a RECONSIDER has voided the decision's assumptions; what
+    /// it stood behind is frozen (or already settled). Terminal, forward
+    /// from every other status, and re-marking a Superseded decision is an
+    /// idempotent no-op (a repeated reconsideration cannot un-void it).
+    Superseded,
 }
 
 /// One strategy decision the Coordinator's model produced, reduced to the
@@ -595,6 +613,9 @@ fn is_forward_status(from: DecisionStatus, to: DecisionStatus) -> bool {
         DecisionStatus::Dispatched => 2,
         DecisionStatus::Settled => 3,
         DecisionStatus::Rejected => 4,
+        // Issue #64: Superseded ranks above everything — forward from any
+        // status, terminal (re-marking is a no-op).
+        DecisionStatus::Superseded => 5,
     };
     rank(to) > rank(from)
 }
@@ -1030,5 +1051,125 @@ mod tests {
         value.as_object_mut().expect("an object").remove("wait_record");
         let old: CoordinatorDecision = serde_json::from_value(value).expect("an old entry loads");
         assert_eq!(old.wait_record, None, "the additive wait_record defaults");
+    }
+
+    // ── Issue #64: the Reconsider decision kind + Superseded status ────
+
+    #[test]
+    fn reconsider_decision_validates_with_reason_and_evidence() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&["ev-0001"]);
+        let decision = validator(&roster_ids, &known, None)
+            .validate(
+                DecisionKind::Reconsider,
+                None, // Reconsider never names a specialist target.
+                "superseding decision d-1: the artifact contract changed",
+                Some("the CI contract moved; freeze the stale plan"),
+                &["ev-0001".to_owned()],
+                &[],
+            )
+            .expect("a grounded reconsider validates");
+        assert_eq!(decision.kind, DecisionKind::Reconsider);
+        assert_eq!(decision.target_agent, None, "Reconsider never names a target");
+        assert_eq!(
+            decision.task_description, "superseding decision d-1: the artifact contract changed",
+            "the reason rides the task text"
+        );
+        assert_eq!(decision.supporting_evidence_ids, vec!["ev-0001"]);
+        assert_eq!(decision.transform, None, "the freeze payload is attached by the handler");
+        assert!(DecisionKind::Reconsider.rejects_target());
+        assert!(DecisionKind::Reconsider.requires_task());
+        assert!(!DecisionKind::Reconsider.requires_target());
+    }
+
+    #[test]
+    fn reconsider_with_empty_reason_rejects() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&[]);
+        let error = validator(&roster_ids, &known, None)
+            .validate(DecisionKind::Reconsider, None, "  ", None, &[], &[])
+            .expect_err("reconsider requires a non-empty reason");
+        assert_eq!(error.code, "incomplete_decision");
+    }
+
+    #[test]
+    fn reconsider_with_target_rejects() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&[]);
+        let error = validator(&roster_ids, &known, None)
+            .validate(DecisionKind::Reconsider, Some("coder"), "freeze stale plan", None, &[], &[])
+            .expect_err("reconsider rejects a specialist target");
+        assert_eq!(error.code, "conflicting_decision");
+    }
+
+    #[test]
+    fn reconsider_rejects_fabricated_evidence() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&[]);
+        let error = validator(&roster_ids, &known, None)
+            .validate(
+                DecisionKind::Reconsider,
+                None,
+                "supersede d-1",
+                None,
+                &["ghost".to_owned()],
+                &[],
+            )
+            .expect_err("fabricated evidence is rejected");
+        assert_eq!(error.code, "fabricated_evidence");
+    }
+
+    #[test]
+    fn superseded_is_forward_from_any_status_and_terminal() {
+        let mut journal = DecisionJournal::default();
+        let decision = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::Reconsider, None, "supersede d-1", None, &[], &[])
+            .expect("valid");
+        let id = decision.id.clone();
+        journal.record(decision);
+
+        // Validated (1) → Superseded (5) is forward.
+        journal.transition(&id, DecisionStatus::Superseded);
+        assert_eq!(journal.entries()[0].status, DecisionStatus::Superseded);
+
+        // Re-marking Superseded is an idempotent no-op (not forward).
+        journal.transition(&id, DecisionStatus::Superseded);
+        assert_eq!(journal.entries()[0].status, DecisionStatus::Superseded);
+
+        // Leaving Superseded is never forward — terminal.
+        journal.transition(&id, DecisionStatus::Settled);
+        journal.transition(&id, DecisionStatus::Rejected);
+        assert_eq!(
+            journal.entries()[0].status,
+            DecisionStatus::Superseded,
+            "Superseded is terminal"
+        );
+
+        // A Settled decision may still be superseded.
+        let mut journal = DecisionJournal::default();
+        let decision = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::Reconsider, None, "supersede d-2", None, &[], &[])
+            .expect("valid");
+        let id = decision.id.clone();
+        journal.record(decision);
+        journal.transition(&id, DecisionStatus::Settled);
+        journal.transition(&id, DecisionStatus::Superseded);
+        assert_eq!(journal.entries()[0].status, DecisionStatus::Superseded);
+    }
+
+    #[test]
+    fn superseded_status_round_trips_and_old_entries_default() {
+        let decision = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::Reconsider, None, "supersede d-1", None, &[], &[])
+            .expect("valid");
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(json.contains("\"reconsider\""), "kebab-case reconsider kind: {json}");
+        let back: CoordinatorDecision = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, decision);
+
+        let mut value = serde_json::to_value(&back).expect("serialize");
+        value["status"] = serde_json::json!("superseded");
+        let restored: CoordinatorDecision = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(restored.status, DecisionStatus::Superseded);
     }
 }
