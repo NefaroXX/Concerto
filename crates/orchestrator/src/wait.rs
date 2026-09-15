@@ -41,7 +41,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use concerto_core::types::{SubTaskStatus, TaskId};
+use concerto_core::ids::Ulid;
+use concerto_core::types::{SubTaskStatus, TaskId, ToolDefinition};
 
 /// Default sleep slice between wake re-evaluations.
 pub const DEFAULT_WAIT_SLICE_MS: u64 = 4_000;
@@ -335,6 +336,194 @@ pub async fn execute_wait<R: WakeRefiner>(
             _ = cancel.cancelled() => return WakeOutcome::Woken(WakeReason::Cancelled),
             _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire surface (issue #63): the Coordinator's `wait` tool definition and its
+// typed argument parser. Pure shape work — no I/O, no clock reads — so the
+// whole surface is testable without a runtime.
+// ---------------------------------------------------------------------------
+
+/// Tool name for the Coordinator's declarative `wait` surface (issue #63).
+pub(crate) const WAIT_TOOL: &str = "wait";
+
+/// The `wait` tool definition offered to the Coordinator's decision loop:
+/// park the loop on declarative conditions / a deadline with zero model
+/// turns, re-evaluated in bounded, cancellable slices.
+pub(crate) fn wait_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: WAIT_TOOL.to_string(),
+        description: "Slow external dependencies your specialists cannot change right away: \
+                      suspend work until a declarative condition holds, a deadline passes, \
+                      or the absolute wait cap is reached. The decision loop parks (no model \
+                      turns, no dispatch) and re-evaluates in bounded, cancellable slices; \
+                      the tool returns why the wait ended (woken / expired / still-waiting) \
+                      so you can re-decide."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the coordinator is waiting. Recorded as the decision reason."
+                },
+                "conditions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "event-resolved",
+                                    "workspace-generation-changed",
+                                    "new-evidence",
+                                    "replan-or-cancel"
+                                ],
+                                "description": "The condition shape."
+                            },
+                            "task_ids": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "For event-resolved: wake when every listed task id has settled (no longer pending/running)."
+                            },
+                            "event_kinds": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "For new-evidence: wake when a whiteboard event of one of these kinds is appended after the wait began (e.g. review-state, finding)."
+                            }
+                        },
+                        "required": ["type"]
+                    },
+                    "description": "Up to 4 declarative conditions that wake the wait early. A wait must carry at least one condition or a deadline."
+                },
+                "deadline_ms": {
+                    "type": "integer",
+                    "description": "Optional absolute UNIX-ms deadline. Crossing it yields an expired outcome even when no condition tripped."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify this wait. Fabricated ids are rejected."
+                },
+                "affected_task_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional task ids this wait is parked on (informational; also the resolution targets of event-resolved)."
+                },
+                "affected_resource_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional workspace-root-relative artifact paths this wait is parked on (informational — the wait itself performs no I/O)."
+                }
+            },
+            "required": ["reason"]
+        }),
+    }
+}
+
+/// Parsed arguments of one `wait` tool call (issue #63).
+#[derive(Debug, Clone)]
+pub(crate) struct WaitArgs {
+    pub(crate) reason: String,
+    pub(crate) conditions: Vec<WakeCondition>,
+    pub(crate) deadline_ms: Option<i64>,
+    pub(crate) supporting_evidence_ids: Vec<String>,
+    pub(crate) affected_task_ids: Vec<TaskId>,
+    pub(crate) affected_resource_ids: Vec<String>,
+}
+
+impl WaitArgs {
+    /// Parse the tool-call arguments into typed wait fields.
+    ///
+    /// Condition shapes mirror [`WakeCondition`]'s serde vocabulary
+    /// (`type` tagged, kebab-case): `event-resolved`, `new-evidence`,
+    /// `workspace-generation-changed`, `replan-or-cancel`. An unknown shape
+    /// or a malformed task id rejects the whole call — never a partial wait.
+    pub(crate) fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let reason = arguments
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(str::to_owned)?;
+        // `workspace-generation-changed` never carries a generation from the
+        // model: the executor stamps the generation at wait start.
+        let conditions = match arguments.get("conditions").and_then(serde_json::Value::as_array) {
+            None => Vec::new(),
+            Some(values) => {
+                // Structural bounds are parse failures (no partial wait).
+                if values.len() > MAX_WAIT_CONDITIONS {
+                    return None;
+                }
+                values.iter().map(parse_condition).collect::<Option<Vec<_>>>()?
+            }
+        };
+        let deadline_ms = arguments
+            .get("deadline_ms")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|deadline| *deadline > 0);
+        let supporting_evidence_ids =
+            crate::coordinator::parse_string_array(arguments, "supporting_evidence_ids");
+        let affected_task_ids =
+            crate::coordinator::parse_string_array(arguments, "affected_task_ids")
+                .into_iter()
+                .map(|id| Ulid::from_string(&id).map(TaskId).ok())
+                .collect::<Option<Vec<_>>>()?;
+        let affected_resource_ids =
+            crate::coordinator::parse_string_array(arguments, "affected_resource_ids");
+        Some(Self {
+            reason,
+            conditions,
+            deadline_ms,
+            supporting_evidence_ids,
+            affected_task_ids,
+            affected_resource_ids,
+        })
+    }
+}
+
+/// Parse one JSON condition object into a [`WakeCondition`], mirroring the
+/// serde tag vocabulary. `workspace-generation-changed` is stamped by the
+/// executor at wait start (`generation_at_wait`), never by the model.
+fn parse_condition(value: &serde_json::Value) -> Option<WakeCondition> {
+    let kind = value.get("type").and_then(serde_json::Value::as_str)?;
+    match kind {
+        "event-resolved" => {
+            let task_ids = crate::coordinator::parse_string_array(value, "task_ids")
+                .into_iter()
+                .map(|id| Ulid::from_string(&id).map(TaskId).ok())
+                .collect::<Option<Vec<_>>>()?;
+            if task_ids.is_empty() {
+                return None;
+            }
+            Some(WakeCondition::EventResolved { task_ids })
+        }
+        "workspace-generation-changed" => {
+            Some(WakeCondition::WorkspaceGenerationChanged { generation_at_wait: None })
+        }
+        "new-evidence" => {
+            let event_kinds = crate::coordinator::parse_string_array(value, "event_kinds");
+            if event_kinds.is_empty() || event_kinds.len() > MAX_WAIT_EVIDENCE_KINDS {
+                return None;
+            }
+            Some(WakeCondition::NewEvidence { event_kinds })
+        }
+        "replan-or-cancel" => Some(WakeCondition::ReplanOrCancel),
+        _ => None,
+    }
+}
+
+/// Stable kebab-case label for a wake reason (the tool-result payload and
+/// the journaled transition reason read the same vocabulary).
+pub(crate) fn wake_reason_label(reason: WakeReason) -> &'static str {
+    match reason {
+        WakeReason::EventResolved => "event-resolved",
+        WakeReason::WorkspaceGenerationChanged => "workspace-generation-changed",
+        WakeReason::NewEvidence => "new-evidence",
+        WakeReason::ReplanOrCancel => "replan-or-cancel",
+        WakeReason::Cancelled => "cancelled",
     }
 }
 
@@ -667,5 +856,120 @@ mod tests {
         .await;
         assert_eq!(outcome, WakeOutcome::Woken(WakeReason::Cancelled));
         assert!(started.elapsed().as_millis() < 1_000, "pre-cancelled wait slept");
+    }
+
+    // ---- wire surface (tool definition + parser) -------------------------
+
+    #[test]
+    fn wait_tool_definition_exposes_declarative_schema() {
+        let def = wait_tool_definition();
+        assert_eq!(def.name, WAIT_TOOL);
+        let required = def.parameters["required"].as_array().expect("required list");
+        assert_eq!(required, &[serde_json::json!("reason")]);
+        let condition_types = def.parameters["properties"]["conditions"]["items"]["properties"]
+            ["type"]["enum"]
+            .as_array()
+            .expect("condition enum");
+        assert!(condition_types.contains(&serde_json::json!("event-resolved")));
+        assert!(condition_types.contains(&serde_json::json!("new-evidence")));
+    }
+
+    #[test]
+    fn wait_args_parse_all_condition_shapes() {
+        let args_json = serde_json::json!({
+            "reason": "  waiting for the review gate  ",
+            "conditions": [
+                { "type": "event-resolved", "task_ids": [task("T1").0.to_string()] },
+                { "type": "workspace-generation-changed" },
+                { "type": "new-evidence", "event_kinds": ["review-state", "finding"] },
+                { "type": "replan-or-cancel" }
+            ],
+            "deadline_ms": 9_999_999_999_i64,
+            "supporting_evidence_ids": ["ev-1"],
+            "affected_task_ids": [task("T1").0.to_string()],
+            "affected_resource_ids": ["src/lib.rs"]
+        });
+        let args = WaitArgs::parse(&args_json).expect("parses");
+        assert_eq!(args.reason, "waiting for the review gate");
+        assert_eq!(args.conditions.len(), 4);
+        assert_eq!(args.conditions[0], WakeCondition::EventResolved { task_ids: vec![task("T1")] });
+        assert_eq!(
+            args.conditions[2],
+            WakeCondition::NewEvidence {
+                event_kinds: vec!["review-state".into(), "finding".into()]
+            }
+        );
+        assert_eq!(args.deadline_ms, Some(9_999_999_999));
+        assert_eq!(args.supporting_evidence_ids, vec!["ev-1".to_string()]);
+        assert_eq!(args.affected_task_ids, vec![task("T1")]);
+        assert_eq!(args.affected_resource_ids, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn wait_args_missing_reason_rejected() {
+        assert!(WaitArgs::parse(&serde_json::json!({})).is_none());
+        assert!(WaitArgs::parse(&serde_json::json!({ "reason": "  " })).is_none());
+    }
+
+    #[test]
+    fn wait_args_unknown_condition_shape_rejected() {
+        let args_json = serde_json::json!({
+            "reason": "wait",
+            "conditions": [{ "type": "moon-phase" }]
+        });
+        assert!(WaitArgs::parse(&args_json).is_none());
+    }
+
+    #[test]
+    fn wait_args_malformed_task_id_rejected() {
+        let args_json = serde_json::json!({
+            "reason": "wait",
+            "conditions": [{ "type": "event-resolved", "task_ids": ["T1"] }]
+        });
+        assert!(WaitArgs::parse(&args_json).is_none());
+    }
+
+    #[test]
+    fn wait_args_empty_event_resolved_rejected() {
+        let args_json = serde_json::json!({
+            "reason": "wait",
+            "conditions": [{ "type": "event-resolved", "task_ids": [] }]
+        });
+        assert!(WaitArgs::parse(&args_json).is_none());
+    }
+
+    #[test]
+    fn wait_args_too_many_conditions_rejected() {
+        let mut conditions = Vec::new();
+        for _ in 0..=MAX_WAIT_CONDITIONS {
+            conditions.push(serde_json::json!({ "type": "replan-or-cancel" }));
+        }
+        let args_json = serde_json::json!({ "reason": "wait", "conditions": conditions });
+        assert!(WaitArgs::parse(&args_json).is_none());
+    }
+
+    #[test]
+    fn wait_args_degenerate_count_bounds_rejected_by_parse_bounds() {
+        // An over-limit evidence-kind list is a parse error (structural
+        // bound), not a handler rejection.
+        let kinds: Vec<serde_json::Value> =
+            (0..=MAX_WAIT_EVIDENCE_KINDS).map(|i| serde_json::json!(format!("kind-{i}"))).collect();
+        let args_json = serde_json::json!({
+            "reason": "wait",
+            "conditions": [{ "type": "new-evidence", "event_kinds": kinds }]
+        });
+        assert!(WaitArgs::parse(&args_json).is_none());
+    }
+
+    #[test]
+    fn wake_reason_label_is_stable_kebab_case() {
+        assert_eq!(wake_reason_label(WakeReason::EventResolved), "event-resolved");
+        assert_eq!(
+            wake_reason_label(WakeReason::WorkspaceGenerationChanged),
+            "workspace-generation-changed"
+        );
+        assert_eq!(wake_reason_label(WakeReason::NewEvidence), "new-evidence");
+        assert_eq!(wake_reason_label(WakeReason::ReplanOrCancel), "replan-or-cancel");
+        assert_eq!(wake_reason_label(WakeReason::Cancelled), "cancelled");
     }
 }
