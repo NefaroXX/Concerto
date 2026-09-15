@@ -35,6 +35,7 @@ fn status_label(status: DecisionStatus) -> &'static str {
         DecisionStatus::Dispatched => "dispatched",
         DecisionStatus::Settled => "settled",
         DecisionStatus::Rejected => "rejected",
+        DecisionStatus::Superseded => "superseded",
     }
 }
 
@@ -53,6 +54,7 @@ fn kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::TransferOwnership => "transfer-ownership",
         DecisionKind::Investigate => "investigate",
         DecisionKind::Wait => "wait",
+        DecisionKind::Reconsider => "reconsider",
     }
 }
 
