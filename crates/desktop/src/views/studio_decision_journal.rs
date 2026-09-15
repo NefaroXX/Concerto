@@ -52,6 +52,7 @@ fn kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Consult => "consult",
         DecisionKind::TransferOwnership => "transfer-ownership",
         DecisionKind::Investigate => "investigate",
+        DecisionKind::Wait => "wait",
     }
 }
 
@@ -123,6 +124,7 @@ mod tests {
             expected_artifacts: Vec::new(),
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: OffsetDateTime::now_utc(),
             status,
         }
