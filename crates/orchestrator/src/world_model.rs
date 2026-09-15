@@ -351,6 +351,10 @@ pub struct WorldModelInput<'a> {
     /// The question ledger carried from the previous model (lifecycle,
     /// Q-PERSIST).
     pub previous_questions: Vec<UnresolvedQuestion>,
+    /// Issue #65: the run's explicit external-workspace-change records
+    /// detected so far (live wait scan + F3 resume reconciliation), each
+    /// scoped to one affected path.
+    pub external_changes: &'a [crate::external_change::ExternalChangeRecord],
     /// The build clock (injected so builds stay deterministic in tests).
     pub now_ms: i64,
 }
@@ -759,6 +763,29 @@ impl WorldModel {
                     )),
                     &mut risks,
                 );
+            }
+        }
+        // Issue #65: explicit external workspace changes are first-class
+        // decision risks — one per affected path, naming the disposition the
+        // Coordinator must choose (re-read/reconcile for unrelated changes;
+        // preserve/escalate for changes that conflict with held or planned
+        // work).
+        for change in input.external_changes {
+            for path in &change.affected_paths {
+                let label = if change.conflicts_with_coordinator_work() {
+                    let owner = change.known_owner.as_deref().unwrap_or("held");
+                    bounded(format!(
+                        "external change on {} conflicts with {} work — re-read, reconcile, preserve, or escalate before writing it",
+                        path,
+                        owner
+                    ))
+                } else {
+                    bounded(format!(
+                        "external change on {} — re-read or reconcile before relying on its state",
+                        path
+                    ))
+                };
+                push_risk(path.clone(), label, &mut risks);
             }
         }
         risks.truncate(MAX_WORLD_RISKS);
@@ -1298,6 +1325,7 @@ mod tests {
             pending: None,
             pending_stale: false,
             previous_questions: previous,
+            external_changes: &[],
             now_ms: NOW_MS,
         }
     }
@@ -1600,5 +1628,57 @@ mod tests {
             "the objective is independently bounded"
         );
         assert!(objective.ends_with('…'), "the objective truncates with a mark");
+    }
+
+    /// Issue #65: explicit external-change records surface as decision risks —
+    /// a conflict-flagged record names the escalation path, an unrelated one
+    /// merely asks the Coordinator to re-read/reconcile before relying on the
+    /// path's state.
+    #[test]
+    fn external_changes_surface_as_decision_risks() {
+        use crate::external_change::ExternalChangeRecord;
+
+        let conflicting = ExternalChangeRecord::new(
+            vec!["src/held.rs".to_owned()],
+            Some("gen-a".to_owned()),
+            Some("gen-b".to_owned()),
+            Some("coder".to_owned()),
+            Some("task-1".to_owned()),
+            true,
+            1_000,
+        );
+        let unrelated = ExternalChangeRecord::new(
+            vec!["docs/notes.md".to_owned()],
+            Some("gen-a".to_owned()),
+            Some("gen-b".to_owned()),
+            None,
+            None,
+            false,
+            1_000,
+        );
+        let records = vec![conflicting, unrelated];
+        let mut base = input(&[], Vec::new(), &[], &[], Vec::new());
+        base.external_changes = &records;
+
+        let model = WorldModel::build(&base);
+        let labels: Vec<&str> = model.risks.iter().map(|risk| risk.label.as_str()).collect();
+        let held = labels
+            .iter()
+            .find(|label| label.contains("src/held.rs"))
+            .expect("the conflicting change is a risk");
+        assert!(
+            held.contains("conflicts") && held.contains("coder"),
+            "a held path names the owner and the escalation disposition: {held}"
+        );
+        let notes = labels
+            .iter()
+            .find(|label| label.contains("docs/notes.md"))
+            .expect("the unrelated change is a risk");
+        assert!(
+            notes.contains("re-read or reconcile") && !notes.contains("conflicts"),
+            "an unrelated change asks for re-read/reconcile only: {notes}"
+        );
+        let rendered = model.render();
+        assert!(rendered.contains("risks:"), "risks render into the decision block");
     }
 }

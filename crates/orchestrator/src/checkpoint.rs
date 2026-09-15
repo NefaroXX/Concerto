@@ -229,6 +229,13 @@ pub struct CheckpointContext {
     /// instead of silently dropping the wait or re-entering the sleep loop.
     /// Old checkpoints default it empty (serde default) — additive, no bump.
     pub active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the run's explicit external-workspace-change records
+    /// detected so far (live wait scan + F3 resume reconciliation), each
+    /// scoped to one affected path. Captured at save time so a resume keeps
+    /// reconciling the SAME changes instead of dropping them with the
+    /// one-shot verdict. Old checkpoints default it empty (serde default) —
+    /// additive, no bump.
+    pub external_changes: Vec<crate::external_change::ExternalChangeRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +406,12 @@ pub struct GraphCheckpoint {
     /// key.
     #[serde(default)]
     pub active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the explicit external-workspace-change records (see
+    /// [`CheckpointContext::external_changes`]). Additive only: absent on
+    /// older records (serde default = no recorded changes); old readers
+    /// ignore the key.
+    #[serde(default)]
+    pub external_changes: Vec<crate::external_change::ExternalChangeRecord>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -621,6 +634,9 @@ pub fn build_checkpoint(
         // Issue #63: additive — the in-flight WAIT record rides
         // independently; old readers treat this key as opaque.
         active_wait: context.active_wait.clone(),
+        // Issue #65: additive — the explicit external-workspace-change
+        // records ride independently; old readers treat this key as opaque.
+        external_changes: context.external_changes.clone(),
     }
 }
 
@@ -1447,6 +1463,7 @@ mod tests {
                     ],
                 },
                 active_wait: None,
+                external_changes: vec![],
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -1720,6 +1737,7 @@ mod tests {
                 progress_tracker: crate::progress::ProgressTrackerState::default(),
                 ownership: crate::ownership::OwnershipState::default(),
                 active_wait: None,
+                external_changes: vec![],
             },
         );
 
@@ -2269,6 +2287,64 @@ mod tests {
         assert_eq!(restored.conditions, record.conditions);
         assert_eq!(restored.affected_task_ids, record.affected_task_ids);
         assert_eq!(restored.affected_resource_ids, record.affected_resource_ids);
+    }
+
+    /// Issue #65: the explicit external-workspace-change records round-trip
+    /// through checkpoint JSON — reconcilable state survives a resume
+    /// additively (legacy checkpoints carry none, so they load empty).
+    #[test]
+    fn external_changes_survive_checkpoint_json() {
+        // Direction 1: a legacy-shape checkpoint has no external changes.
+        let legacy = serde_json::json!({
+            "schema_version": 3,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+        })
+        .to_string();
+        assert!(
+            !legacy.contains("external_changes"),
+            "a legacy checkpoint predates the external-change field"
+        );
+        let migrated = GraphCheckpoint::from_json(&legacy).expect("legacy loads");
+        assert!(
+            migrated.external_changes.is_empty(),
+            "additive default = no external changes recorded"
+        );
+
+        // Direction 2: records survive the build → JSON → load path.
+        let graph = TaskGraph::new();
+        let record = crate::external_change::ExternalChangeRecord::new(
+            vec!["src/lib.rs".to_owned()],
+            Some("gen-a".to_owned()),
+            Some("gen-b".to_owned()),
+            Some("coder".to_owned()),
+            Some("task-1".to_owned()),
+            true,
+            1_000,
+        );
+        let context = CheckpointContext {
+            external_changes: vec![record.clone()],
+            ..CheckpointContext::default()
+        };
+        let cp = build_minimal_checkpoint_with_context(&graph, &context);
+        let json = serde_json::to_string(&cp).expect("the checkpoint serializes");
+        let loaded = GraphCheckpoint::from_json(&json).expect("the checkpoint loads");
+        let restored =
+            loaded.external_changes.first().expect("the external change survives the round trip");
+        assert_eq!(restored.affected_paths, record.affected_paths);
+        assert_eq!(restored.previous_generation, Some("gen-a".to_owned()));
+        assert_eq!(restored.current_generation, Some("gen-b".to_owned()));
+        assert_eq!(restored.known_owner.as_deref(), Some("coder"));
+        assert_eq!(restored.known_task.as_deref(), Some("task-1"));
+        assert!(restored.conflicts_with_coordinator_work);
     }
 
     /// Issue #60: the suitability record round-trips through checkpoint

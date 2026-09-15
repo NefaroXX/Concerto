@@ -925,11 +925,12 @@ struct CoordinatorWakeRefiner<'a> {
     graph: &'a TaskGraph,
     session_id: Ulid,
     record: &'a WaitingRecord,
+    cancel: CancellationToken,
 }
 
 impl WakeRefiner for CoordinatorWakeRefiner<'_> {
     async fn refine(&self) -> WakeView {
-        self.coordinator.wake_view_for(self.graph, self.session_id, self.record).await
+        self.coordinator.wake_view_for(self.graph, self.session_id, self.record, &self.cancel).await
     }
 }
 
@@ -1198,6 +1199,12 @@ pub struct CoordinatorAgent {
     /// reports the outcome (woken/expired/still-waiting) to the model —
     /// never silently dropped, never re-entering the sleep loop.
     active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the explicit external-workspace-change records detected
+    /// this run — from the live wait wake (`workspace-generation-changed`)
+    /// or the F3 resume reconciliation. Persisted additively in every
+    /// checkpoint so a resume keeps reconciling the SAME changes; surfaced
+    /// to the world model as decision risks.
+    external_changes: Vec<crate::external_change::ExternalChangeRecord>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1827,6 +1834,10 @@ impl CoordinatorAgent {
             // Issue #63: no wait is parked at startup; the field is set only
             // by the WAIT handler (and restored from checkpoints on resume).
             active_wait: None,
+            // Issue #65: no external changes are recorded at startup; the
+            // field grows only through detection (live wait scan + F3
+            // resume reconciliation) and is restored from checkpoints.
+            external_changes: Vec::new(),
         }
     }
 
@@ -1992,6 +2003,7 @@ impl CoordinatorAgent {
                 pending: pending.as_ref(),
                 pending_stale,
                 previous_questions,
+                external_changes: &self.external_changes,
                 now_ms,
             });
         tracing::debug!(
@@ -2719,6 +2731,242 @@ impl CoordinatorAgent {
         self.workspace_snapshot.as_ref().map(|snapshot| snapshot.generation.clone())
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #65: live external-workspace-change detection.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Captures the CURRENT workspace inventory plus its content-addressed
+    /// generation, off the decision-loop thread (the walk is blocking I/O).
+    /// `None` on cancellation or when no snapshot was captured — the caller
+    /// degrades fail-soft.
+    async fn capture_fresh_workspace(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Option<(String, Vec<concerto_sessions::SnapshotEntry>)> {
+        let snapshot = self.workspace_snapshot.as_ref()?;
+        let root = snapshot.project_root.clone();
+        let capture_cancel = cancel.clone();
+        let entries: Vec<concerto_sessions::SnapshotEntry> =
+            tokio::task::spawn_blocking(move || {
+                crate::workspace_snapshot::capture_workspace_snapshot(
+                    root.as_std_path(),
+                    &capture_cancel,
+                )
+            })
+            .await
+            .ok()?;
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let generation = crate::workspace_snapshot::generation_for(&entries);
+        Some((generation, entries))
+    }
+
+    /// The fresh-generation half of [`Self::capture_fresh_workspace`] — the
+    /// only half `wake_view_for` needs for a live `workspace-generation`
+    /// condition.
+    async fn capture_fresh_generation(&self, cancel: &CancellationToken) -> Option<String> {
+        self.capture_fresh_workspace(cancel).await.map(|(generation, _)| generation)
+    }
+
+    /// Canonical workspace-relative set of every path named as a planned or
+    /// expected artifact — the conflict half of an external-change record
+    /// (a change hitting a path this run has decided to produce is a conflict
+    /// the Coordinator must reconcile before it can rely on that artifact).
+    fn expected_artifact_paths(&self) -> std::collections::HashSet<String> {
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let Some(root) =
+            self.workspace_snapshot.as_ref().map(|snapshot| snapshot.project_root.as_std_path())
+        else {
+            return expected;
+        };
+        for paths in self.expected_artifacts_snapshot().values() {
+            for path in paths {
+                if let Some(canonical) =
+                    crate::tool_facts::canonical_project_path(root, path.as_str())
+                {
+                    expected.insert(canonical);
+                }
+            }
+        }
+        expected
+    }
+
+    /// Issue #65 (live scan): diff the CURRENT workspace against the run-
+    /// start snapshot and classify every changed path the run's OWN writes
+    /// do not explain into one explicit [`ExternalChangeRecord`] per path.
+    ///
+    /// - `own_written`: canonical paths the run itself wrote (the live
+    ///   ledger's `all_files` plus every completed result's `files_modified`)
+    ///   — never classified external (mirrors the F3 exclusion).
+    /// - `expected`: canonical planned/expected artifact paths — a change
+    ///   there is a conflict.
+    ///
+    /// The write-gate ownership table is consulted FIRST: a held path that
+    /// changed externally is flagged with its owner and marked stale, so the
+    /// model must re-read/preserve/escalate before the next write. Fail-soft:
+    /// no snapshot or a cancelled capture yields no records (a wait only
+    /// re-evaluates after a fresh capture succeeded).
+    async fn scan_external_changes(
+        &self,
+        graph: &TaskGraph,
+        own_written: &std::collections::HashSet<String>,
+        expected: &std::collections::HashSet<String>,
+        cancel: &CancellationToken,
+    ) -> Vec<crate::external_change::ExternalChangeRecord> {
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let Some((current_generation, captured)) = self.capture_fresh_workspace(cancel).await
+        else {
+            return Vec::new();
+        };
+        let changed = crate::external_change::diff_workspace_entries(&snapshot.entries, &captured);
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let root = snapshot.project_root.as_std_path();
+        let previous_generation = snapshot.generation.clone();
+        let detected_at_ms = crate::tool_facts::unix_ms();
+        let gate = self.write_gate.as_ref();
+        let mut records: Vec<crate::external_change::ExternalChangeRecord> = Vec::new();
+        for path in &changed {
+            let Some(canonical) = crate::tool_facts::canonical_project_path(root, path) else {
+                continue;
+            };
+            if own_written.contains(&canonical) {
+                // The run's own writes explain this path — not external.
+                continue;
+            }
+            // Ownership table first: a held path that changed is an external
+            // change CONFLICTING with in-flight work (the holder re-reads or
+            // transfers before relying on it).
+            let known_owner = gate.and_then(|gate| gate.ownership_owner(&canonical));
+            let known_task = known_owner.as_deref().and_then(|owner| {
+                graph
+                    .all_tasks()
+                    .into_iter()
+                    .find(|task| task.role.as_str() == owner)
+                    .map(|task| task.id.to_string())
+            });
+            if known_owner.is_some() {
+                if let Some(gate) = gate {
+                    if let Err(error) =
+                        gate.mark_artifact_stale(&canonical, "external-change-scan").await
+                    {
+                        warn!(
+                            %error,
+                            path = %canonical,
+                            "external change scan: stale mark failed; the record still surfaces \
+                             the change"
+                        );
+                    }
+                }
+            }
+            let conflicts = known_owner.is_some() || expected.contains(&canonical);
+            records.push(crate::external_change::ExternalChangeRecord::new(
+                vec![canonical],
+                Some(previous_generation.clone()),
+                Some(current_generation.clone()),
+                known_owner,
+                known_task,
+                conflicts,
+                detected_at_ms,
+            ));
+        }
+        records.sort_by(|a, b| a.first_path().cmp(&b.first_path()));
+        records
+    }
+
+    /// Upserts one record: an existing record for the same path AND previous
+    /// generation is replaced (a re-detection of the same change), otherwise
+    /// the record is appended. The list is bounded to the newest
+    /// [`MAX_EXTERNAL_CHANGE_RECORDS`](crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS).
+    fn upsert_external_change(&mut self, record: crate::external_change::ExternalChangeRecord) {
+        self.external_changes.retain(|existing| {
+            !(existing.first_path() == record.first_path()
+                && existing.previous_generation == record.previous_generation)
+        });
+        self.external_changes.push(record);
+        if self.external_changes.len() > crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS {
+            let excess =
+                self.external_changes.len() - crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS;
+            self.external_changes.drain(0..excess);
+        }
+    }
+
+    /// Issue #65 (resume path): the F3 reconciliation's external evidence —
+    /// paths the run's OWN writes do not explain — becomes explicit records
+    /// (ownership-aware, conflict-flagged, checkpoint-persisted) instead of a
+    /// one-shot verdict the model can only read once. A re-detection of the
+    /// same change (path + previous generation) simply re-upserts.
+    async fn record_resume_external_changes(
+        &mut self,
+        change: &resume::WorkspaceChange,
+        graph: &TaskGraph,
+        previous_generation: Option<String>,
+        cancel: &CancellationToken,
+    ) {
+        if change.externally_changed.is_empty() {
+            return;
+        }
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else {
+            return;
+        };
+        // Owned snapshots of everything the loop needs — `self` is mutated
+        // per record (upsert), so no borrow of `self` may span the loop.
+        let root = snapshot.project_root.clone();
+        let current_generation =
+            self.capture_fresh_generation(cancel).await.or_else(|| self.snapshot_generation());
+        let detected_at_ms = crate::tool_facts::unix_ms();
+        let expected = self.expected_artifact_paths();
+        // Borrow-free snapshot of the gate: ownership lookups below must not
+        // hold a borrow across the per-path `&mut self` upsert.
+        let gate = self.write_gate.clone();
+        for (path, _last_event_id) in &change.externally_changed {
+            let Some(canonical) =
+                crate::tool_facts::canonical_project_path(root.as_std_path(), path)
+            else {
+                continue;
+            };
+            // Ownership table first: a held path that changed externally is
+            // an ownership-hopeful conflict the Coordinator must reconcile.
+            let known_owner = gate.as_ref().and_then(|gate| gate.ownership_owner(&canonical));
+            let known_task = known_owner.as_deref().and_then(|owner| {
+                graph
+                    .all_tasks()
+                    .into_iter()
+                    .find(|task| task.role.as_str() == owner)
+                    .map(|task| task.id.to_string())
+            });
+            if known_owner.is_some() {
+                if let Some(gate) = gate.as_ref() {
+                    if let Err(error) =
+                        gate.mark_artifact_stale(&canonical, "external-change-resume").await
+                    {
+                        warn!(
+                            %error,
+                            path = %canonical,
+                            "external change resume: stale mark failed; the record still \
+                             surfaces the change"
+                        );
+                    }
+                }
+            }
+            let conflicts = known_owner.is_some() || expected.contains(&canonical);
+            let record = crate::external_change::ExternalChangeRecord::new(
+                vec![canonical],
+                previous_generation.clone(),
+                current_generation.clone(),
+                known_owner,
+                known_task,
+                conflicts,
+                detected_at_ms,
+            );
+            self.upsert_external_change(record);
+        }
+    }
+
     /// Attach the session's skills instructions (ADR-43, Task 4), injected
     /// into every planner prompt. Pass an empty string to omit them.
     pub fn with_skills_section(mut self, skills_section: String) -> Self {
@@ -2954,6 +3202,10 @@ impl CoordinatorAgent {
             // mid-wait resumes by re-evaluating the record once (additive
             // checkpoint field).
             active_wait: self.active_wait.clone(),
+            // Issue #65: the explicit external-workspace-change records ride
+            // every persist so a resume reconciles the SAME changes
+            // (additive checkpoint field).
+            external_changes: self.external_changes.clone(),
         }
     }
 
@@ -3777,6 +4029,13 @@ impl CoordinatorAgent {
         // it ONCE at the start of the next loop and reports the outcome to
         // the model; resume never re-enters the park loop.
         self.active_wait = cp.active_wait.clone();
+        // Issue #65: restore the explicit external-workspace-change records
+        // additively (old checkpoints carry the empty default). The resumed
+        // run keeps reconciling the SAME recorded changes — they ride into
+        // the world model as decision risks — and the F3 verdict below
+        // re-detects anything new (upsert-deduped by path + generation).
+        self.external_changes = cp.external_changes.clone();
+        self.external_changes.truncate(crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS);
         self.workspace_changed_since_checkpoint =
             match (&cp.snapshot_generation, self.snapshot_generation()) {
                 (Some(recorded), Some(current)) => recorded.as_str() != current.as_str(),
@@ -4161,6 +4420,16 @@ impl CoordinatorAgent {
         let change = self
             .workspace_change_verdict(checkpoint_snapshot_generation, &own_written, cancel)
             .await;
+        // Issue #65: the F3 external evidence becomes explicit, reconcilable
+        // records (ownership-aware, conflict-flagged, checkpoint-persisted)
+        // instead of a one-shot verdict the model reads once and loses.
+        self.record_resume_external_changes(
+            &change,
+            graph,
+            checkpoint_snapshot_generation.map(str::to_owned),
+            cancel,
+        )
+        .await;
         let outcome = resume::evaluate(&resume::ResumeInput {
             blocked_step: blocked.as_ref(),
             replacement_candidates: &candidates,
@@ -7617,7 +7886,7 @@ impl CoordinatorAgent {
         // dispatch message, so it can continue (woken), re-decide (expired /
         // still-waiting), or abort (cancelled).
         if let Some(record) = self.active_wait.take() {
-            let view = self.wake_view_for(graph, task.session_id, &record).await;
+            let view = self.wake_view_for(graph, task.session_id, &record, cancel).await;
             let outcome = check_wake(&record, &WakeState::from_view(&view));
             let (status, outcome_text) = match outcome {
                 WakeOutcome::Woken(WakeReason::Cancelled) => {
@@ -9937,6 +10206,7 @@ impl CoordinatorAgent {
         graph: &TaskGraph,
         session_id: Ulid,
         record: &WaitingRecord,
+        cancel: &CancellationToken,
     ) -> WakeView {
         let resolved_task_ids: HashSet<TaskId> = graph
             .all_tasks()
@@ -9944,7 +10214,21 @@ impl CoordinatorAgent {
             .filter(|subtask| task_is_resolved(&subtask.status))
             .map(|subtask| subtask.id)
             .collect();
-        let workspace_generation = self.snapshot_generation();
+        // Issue #65: a `workspace-generation-changed` wait is evaluated
+        // against a FRESH generation capture — the run-start generation is
+        // static, so without this the condition could only ever trip across
+        // a resume. The capture is paid only when the wait actually watches
+        // the workspace, never per-slice for other conditions. Fail-soft: a
+        // capture failure degrades to the static generation — no detectable
+        // change, so no spurious wake and no drift from today's behavior.
+        let workspace_generation =
+            if record.conditions.iter().any(|condition| {
+                matches!(condition, WakeCondition::WorkspaceGenerationChanged { .. })
+            }) {
+                self.capture_fresh_generation(cancel).await.or_else(|| self.snapshot_generation())
+            } else {
+                self.snapshot_generation()
+            };
 
         let mut new_evidence_kinds: Vec<String> = Vec::new();
         if let Some(pool) = self.review_store.as_ref() {
@@ -10266,6 +10550,7 @@ impl CoordinatorAgent {
                 graph: &*graph,
                 session_id: task.session_id,
                 record: &record,
+                cancel: cancel.clone(),
             };
             execute_wait(&record, &refiner, &WaitConfig::default(), cancel).await
         };
@@ -10281,15 +10566,50 @@ impl CoordinatorAgent {
             WakeOutcome::Woken(reason) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
-                serde_json::json!({
+                let label = wake_reason_label(reason);
+                let mut payload = serde_json::json!({
                     "outcome": "woken",
-                    "reason": wake_reason_label(reason),
+                    "reason": label,
                     "decision_id": decision_id,
                     "message": format!(
-                        "the wait cleared: {} — continue the work that was parked",
-                        wake_reason_label(reason),
+                        "the wait cleared: {label} — continue the work that was parked",
                     ),
-                })
+                });
+                // Issue #65: a workspace-generation-changed wake is the LIVE
+                // detection vector — capture the diff now and record every
+                // changed path the run cannot explain (own writes excluded,
+                // ownership table first). Fail-soft: a failed scan adds no
+                // records; the wait decision is already settled.
+                if reason == WakeReason::WorkspaceGenerationChanged {
+                    let own_written = own_write_paths(
+                        &ledger.all_files,
+                        &ledger.completed_results,
+                        &[],
+                        &base_ctx.session.project_dir,
+                    );
+                    let expected = self.expected_artifact_paths();
+                    let records =
+                        self.scan_external_changes(graph, &own_written, &expected, cancel).await;
+                    if !records.is_empty() {
+                        let listed: Vec<serde_json::Value> = records
+                            .iter()
+                            .map(|record| {
+                                serde_json::json!({
+                                    "path": record.first_path(),
+                                    "known_owner": record.known_owner,
+                                    "known_task": record.known_task,
+                                    "conflicts_with_coordinator_work":
+                                        record.conflicts_with_coordinator_work,
+                                })
+                            })
+                            .collect();
+                        for record in records {
+                            self.upsert_external_change(record);
+                        }
+                        payload["external_changes"] = serde_json::Value::Array(listed);
+                    }
+                }
+                payload
             }
             WakeOutcome::Expired => {
                 self.decision_journal
@@ -22338,6 +22658,305 @@ mod tests {
             .expect("the denied decision is still journaled");
         assert_eq!(last.status, crate::decisions::DecisionStatus::Rejected);
         assert!(coordinator.active_wait.is_none(), "a denied wait never parks");
+    }
+
+    // ── Issue #65: external workspace changes ─────────────────────────────
+
+    /// A real captured workspace: four files that exist at run start, so
+    /// each test's snapshot barrier captures a truthful invoice
+    /// (mtime/size/hash) to diff later edits against.
+    fn external_change_fixture(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/owned.rs"), b"v1\n").expect("owned.rs at start");
+        std::fs::write(root.join("src/held.rs"), b"v1\n").expect("held.rs at start");
+        std::fs::write(root.join("src/expected.rs"), b"v1\n").expect("expected.rs at start");
+        std::fs::write(root.join("src/unrelated.rs"), b"v1\n").expect("unrelated.rs at start");
+    }
+
+    /// Requirement (a/c/d): the live scan detects edits made DURING an
+    /// execution, excludes the run's own writes, and flags a gate-held path
+    /// or a planned artifact as a conflict while unrelated changes surface
+    /// conflict-free.
+    #[tokio::test]
+    async fn external_change_scan_detects_edits_during_execution_and_excludes_own_writes() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let cancel = CancellationToken::new();
+        external_change_fixture(workspace.path());
+
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+        // A path HOLD owned from a previous run (ownership is checkpointed):
+        // the gate owns it, but THIS run never wrote it.
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/held.rs".to_owned(),
+                owner: "coder".to_owned(),
+                acquiring_event_id: "ev-held".to_owned(),
+                acquired_at_ms: 1,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_workspace_snapshot(
+            crate::workspace_snapshot::run_snapshot_barrier(
+                None,
+                workspace.path(),
+                &Ulid::new().to_string(),
+                &cancel,
+            )
+            .await
+            .expect("snapshot re-captures for the coordinator"),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        // A graph whose coder role matches the held path's owner — the record
+        // attributes the conflict to the in-flight task.
+        let task_id = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: task_id,
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "held work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: Some("src/held.rs".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        // The run's own write set + a planned-artifact set.
+        let mut own_written: std::collections::HashSet<String> = std::collections::HashSet::new();
+        own_written.insert(
+            crate::tool_facts::canonical_project_path(workspace.path(), "src/owned.rs")
+                .expect("owned.rs canonicalizes"),
+        );
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        expected.insert(
+            crate::tool_facts::canonical_project_path(workspace.path(), "src/expected.rs")
+                .expect("expected.rs canonicalizes"),
+        );
+
+        // The user edits while the run is executing: the held path, an
+        // unrelated path, a planned artifact, and (invisibly to the run's
+        // write set accounting) a path the run DID write.
+        std::fs::write(workspace.path().join("src/held.rs"), b"v2 user edit on held\n")
+            .expect("external edit on held");
+        std::fs::write(workspace.path().join("src/unrelated.rs"), b"v2 unrelated edit\n")
+            .expect("external edit on unrelated");
+        std::fs::write(workspace.path().join("src/expected.rs"), b"v2 expected edit\n")
+            .expect("external edit on expected");
+        std::fs::write(workspace.path().join("src/owned.rs"), b"v2 owned edit\n")
+            .expect("edit on the run's own path");
+
+        let records =
+            coordinator.scan_external_changes(&graph, &own_written, &expected, &cancel).await;
+        let paths: Vec<&str> = records.iter().filter_map(|record| record.first_path()).collect();
+
+        assert_eq!(paths.len(), 3, "three external changes detected: {paths:?}");
+        assert!(
+            !paths.contains(&"src/owned.rs"),
+            "the run's OWN write is never classified external: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/expected.rs"),
+            "planned artifact change is external: {paths:?}"
+        );
+
+        let held = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/held.rs"))
+            .expect("the held path is recorded");
+        assert_eq!(held.known_owner.as_deref(), Some("coder"));
+        assert_eq!(held.known_task.as_deref(), Some(task_id.to_string().as_str()));
+        assert!(
+            held.conflicts_with_coordinator_work(),
+            "a held artifact changed externally conflicts"
+        );
+
+        let expected_record = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/expected.rs"))
+            .expect("the planned artifact is recorded");
+        assert_eq!(expected_record.known_owner, None);
+        assert!(
+            expected_record.conflicts_with_coordinator_work(),
+            "a planned artifact changed externally conflicts even without an owner"
+        );
+
+        let unrelated = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/unrelated.rs"))
+            .expect("the unrelated change is recorded");
+        assert_eq!(unrelated.known_owner, None);
+        assert_eq!(unrelated.known_task, None);
+        assert!(
+            !unrelated.conflicts_with_coordinator_work(),
+            "an unrelated external change never conflicts"
+        );
+
+        // The upsert side: the scan's records land in coordinator state, the
+        // checkpoint projection carries them, and the world model surfaces
+        // them as risks.
+        for record in records {
+            coordinator.upsert_external_change(record);
+        }
+        assert_eq!(coordinator.external_changes.len(), 3);
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        assert_eq!(context.external_changes.len(), 3, "records ride the checkpoint context");
+    }
+
+    /// Requirement (b): the F3 resume reconciliation's external evidence
+    /// becomes explicit, conflict-flagged records instead of a one-shot
+    /// verdict — and re-detection of the same change upserts, not duplicates.
+    #[tokio::test]
+    async fn resume_f3_evidence_becomes_explicit_reconcilable_records() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let cancel = CancellationToken::new();
+        external_change_fixture(workspace.path());
+
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/held-resume.rs".to_owned(),
+                owner: "coder".to_owned(),
+                acquiring_event_id: "ev-held-resume".to_owned(),
+                acquired_at_ms: 1,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_workspace_snapshot(
+            crate::workspace_snapshot::run_snapshot_barrier(
+                None,
+                workspace.path(),
+                &Ulid::new().to_string(),
+                &cancel,
+            )
+            .await
+            .expect("snapshot re-captures for the coordinator"),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        let task_id = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: task_id,
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "held work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: Some("src/held-resume.rs".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        let change = resume::WorkspaceChange {
+            generation_mismatch: true,
+            externally_changed: vec![
+                ("src/held-resume.rs".to_owned(), Some("ev-1".to_owned())),
+                ("src/other.rs".to_owned(), None),
+            ],
+        };
+        coordinator
+            .record_resume_external_changes(
+                &change,
+                &graph,
+                Some("gen-checkpoint".to_owned()),
+                &cancel,
+            )
+            .await;
+
+        let held = coordinator
+            .external_changes
+            .iter()
+            .find(|record| record.first_path() == Some("src/held-resume.rs"))
+            .expect("the F3 evidence for the held path becomes a record");
+        assert_eq!(held.known_owner.as_deref(), Some("coder"));
+        assert_eq!(held.known_task.as_deref(), Some(task_id.to_string().as_str()));
+        assert!(held.conflicts_with_coordinator_work(), "held + changed externally conflicts");
+        assert_eq!(held.previous_generation.as_deref(), Some("gen-checkpoint"));
+
+        let other = coordinator
+            .external_changes
+            .iter()
+            .find(|record| record.first_path() == Some("src/other.rs"))
+            .expect("the unrelated F3 evidence becomes a record");
+        assert_eq!(other.known_owner, None);
+        assert!(!other.conflicts_with_coordinator_work(), "unrelated change never conflicts");
+
+        assert_eq!(coordinator.external_changes.len(), 2);
+
+        // A resumed run re-detects the SAME evidence (same previous
+        // generation): upsert dedups instead of accumulating duplicates.
+        coordinator
+            .record_resume_external_changes(
+                &change,
+                &graph,
+                Some("gen-checkpoint".to_owned()),
+                &cancel,
+            )
+            .await;
+        assert_eq!(
+            coordinator.external_changes.len(),
+            2,
+            "re-detecting the same change upserts, never duplicates"
+        );
+
+        // And the records ride the checkpoint projection (requirement 5).
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        assert_eq!(context.external_changes.len(), 2);
+        let checkpoint = crate::checkpoint::build_checkpoint(
+            &checkpoint::CheckpointScope {
+                run_id: Ulid::new(),
+                session_id: Ulid::new(),
+                root_task_id: TaskId::new(),
+                project_id: "test".into(),
+                objective: "test objective".into(),
+                objective_hash: "hash".into(),
+                source_revision: None,
+                sequence_num: 0,
+            },
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &concerto_core::memory::WorkingMemorySnapshot {
+                id: Ulid::new(),
+                session_id: Ulid::new(),
+                decisions: vec![],
+                task_tree: vec![],
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            &graph,
+            &HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &context,
+        );
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let restored =
+            crate::checkpoint::GraphCheckpoint::from_json(&json).expect("checkpoint loads");
+        assert_eq!(restored.external_changes.len(), 2, "records survive the checkpoint JSON");
     }
 
     // ── Issue #64: reconsider — supersede a decision + freeze its pending ──
