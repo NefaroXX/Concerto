@@ -766,11 +766,29 @@ fn list_segments(tokens: &[String]) -> Vec<ListSegment> {
     segments
 }
 
-/// Whether `lead` names the `xargs` utility: the exact token or any path form
-/// whose basename is `xargs` (`/usr/bin/xargs`, `./xargs`). Flag positions
-/// (`xargs -0 rm`) do not change the lead, so the bare-name match covers them.
-fn is_xargs_lead(lead: &str) -> bool {
-    lead.rsplit(['/', '\\']).next() == Some("xargs")
+/// Whether `lead` names the `xargs` utility (2026-09-15 sweep). Three
+/// obfuscations used to defeat the exact-basename match, all fail-closed
+/// over:
+///
+/// - **Glued redirect inside the same token** (`xargs>f`, `'xargs'>f`): the
+///   content section carries `xargs` between redirect operators, so the
+///   section text is split on `>`/`<` and every piece's basename is tested.
+/// - **Quote-concatenation** (`x''args`, `x""args`): the shell joins the
+///   quoted fragments into one word, so quote characters are stripped before
+///   the basename compare.
+/// - **Backslash-escape** (`x\args`): `\a` expands to `a`, so backslashes are
+///   stripped the same way.
+///
+/// Only this detection path normalizes — general tokenization
+/// (`flat_tokens`) and the redirect scans are untouched, so legitimately
+/// quoted arguments elsewhere keep their original pass/block behavior. Path
+/// forms route through the same compare (`/usr/bin/xargs`, `./xargs`).
+/// Conservative over-triggers cost a rejection at most: any path component
+/// spelled `xargs` (e.g. `rm /root/xargs/backup`) arms the pipeline-wide
+/// suspicion, never grants anything.
+fn is_xargs_lead(section: &str) -> bool {
+    let normalized: String = section.replace(['\'', '"', '\\'], "");
+    normalized.split(['>', '<', '/']).any(|piece| piece == "xargs")
 }
 
 /// N-4 (2026-09-14): `xargs` consumes the WHOLE pipeline's stdout as argv
@@ -1478,6 +1496,65 @@ mod tests {
             .expect("read-only pipeline with outside read arg stays free");
         // `~+`/`~-` and heredoc bodies are documented-only v1 limitations; no
         // behavior change is asserted here beyond the free pipeline above.
+    }
+
+    #[test]
+    fn xargs_glued_into_redirect_tokens_detected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15: `xargs` glued inside a redirect-carrying token was
+        // invisible to the basename match — the section text carries `xargs`
+        // between `>`/`<` operators. A redirect-glued command lead still
+        // executes `xargs` (with the pipeline's stdout as argv), so the
+        // pipeline-wide suspension must arm for these spellings too.
+        for command in ["echo /etc/shadow | xargs>f rm", "echo /etc/shadow |'xargs'>f rm"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: xargs glued into redirect tokens, got: {err}"
+            );
+        }
+        // Preserved pin: redirect glue without any xargs spelling keeps
+        // resolving targets in-root as before — and `>xargs` as a redirect
+        // TARGET (a file literally named `xargs`) is redirected output, not
+        // an xargs execution, so a fully read-only segment stays passable.
+        contain_shell_command(&root, &root, "echo hi >out.txt>notes.txt", &[])
+            .expect("xargs-free double write glue unchanged");
+        contain_shell_command(&root, &root, "cat notes.txt >xargs>f", &[])
+            .expect("redirect into files named xargs/f stays free (no xargs command)");
+        contain_shell_command(&root, &root, "cat notes.txt >out.xargs.log", &[])
+            .expect("filename merely spelling 'xargs' in a suffix stays free");
+    }
+
+    #[test]
+    fn xargs_quote_concat_and_backslash_escapes_detected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15: quote-concatenation (`x''args`, `x""args`) and
+        // backslash-escaping (`x\args`) re-form the word `xargs` in the shell
+        // while defeating the exact basename match. The detection strips
+        // quote characters and backslashes before comparing.
+        for command in [
+            "echo /etc/shadow | x''args rm",
+            "echo /etc/shadow | x\"\"args rm",
+            "echo /etc/shadow | x\\args rm",
+            "echo /etc/shadow | x'a'rgs rm",
+            "echo /etc/shadow | ./x\\args rm",
+            "echo /etc/shadow | /usr/bin/x''args rm",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: quote/backslash-obfuscated xargs, got: {err}"
+            );
+        }
+        // Preserved pin: no normalization outside the xargs detection path.
+        contain_shell_command(&root, &root, "echo x\nargs notes.txt", &[])
+            .expect("fragmented non-xargs command stays free");
+        contain_shell_command(&root, &root, "cat notes.txt | grep xargs | head", &[])
+            .expect("grep xargs pattern in read-only pipeline stays free");
+        contain_shell_command(&root, &root, "echo /etc/shadow | xargs-y rm", &[])
+            .expect("affix-bearing lookalike is not the xargs utility");
     }
 
     #[test]
