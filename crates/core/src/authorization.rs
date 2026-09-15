@@ -275,6 +275,18 @@ const SHELL_READ_VERBS: &[&str] = &[
 const INPLACE_WRITE_FLAGS: &[(&str, &[&str])] =
     &[("sed", &["-i", "--in-place"]), ("grep", &["-w"]), ("awk", &["-i", "--in-place", "-w"])];
 
+/// awk program-text execution primitives (2026-09-15, tight set; mirrored in
+/// the containment module's program-body detection
+/// `crates/tools/src/containment.rs`). An `awk` invocation whose program text
+/// carries any of these executes code no token scan can see into, so the
+/// invocation demotes from read-only: `system("cmd")` (shell-out builtin),
+/// `"cmd" | getline` / `|getline` (the shell runs the left side),
+/// `|&` (coprocess), and `print … | "cmd"` / `print|"cmd"` (the quoted
+/// command is executed by the executor). Conservative: a program that merely
+/// PRINTS such a literal costs an approval prompt, never grants. `awk -f`
+/// script-file bodies remain invisible (documented residual).
+const AWK_EXEC_PRIMITIVES: &[&str] = &["system(", "|&", "|getline", "| getline", "| \"", "|\""];
+
 /// Shell verbs that destroy or overwrite data (v1 set).
 const SHELL_DESTRUCTIVE_VERBS: &[&str] =
     &["rm", "rmdir", "shred", "dd", "mkfs", "truncate", "unlink"];
@@ -516,6 +528,13 @@ fn shell_is_observe(action: &PolicyAction<'_>) -> bool {
         return false;
     };
     let lower = text.to_ascii_lowercase();
+    // Process substitution (2026-09-15): the shell executes the `>(…)` /
+    // `<(…)` body as a command in its own right, so a mutating inner verb
+    // (`echo hi >(rm ~/x)`) forces the approval path — never free Observe.
+    // Only ever moves a verdict away from Observe.
+    if process_substitution_mutates(&lower) {
+        return false;
+    }
     // Pipe modeling (F5): the shell Sequences pipe segments as independent
     // commands — `cat secret | tee /data` writes outside the scanner's mental
     // model of `cat`. The invocation observes only when EVERY
@@ -539,6 +558,40 @@ fn shell_is_observe(action: &PolicyAction<'_>) -> bool {
     saw_segment
 }
 
+/// Whether ANY `>(…)`/`<(…)` process substitution shells out a non-read-only
+/// command (2026-09-15, the bounded minimal fallback — not a full parser
+/// recursion into the substitution body): for each adjacent `>(`/`<(`
+/// occurrence the inner text is bounded by the NEXT `)`, split on the
+/// [`SHELL_SEGMENT_SEPARATORS`] set, and every inner segment must be a
+/// read-only invocation — `echo hi >(rm ~/x)` therefore never classifies as
+/// Observe even though the flattened text carries no `rm` segment lead.
+///
+/// Bounded and conservative: quoted interpreter bodies with `>(` over-trigger
+/// (cost: an approval prompt); nested substitutions bound at the first `)`
+/// may over-invalidate an inner read (cost: prompt); a bare `>`/`<` without
+/// an adjacent `(` is a plain redirect, not a substitution (the shell
+/// requires adjacency), so redirect handling is untouched. Only ever moves a
+/// verdict away from Observe.
+fn process_substitution_mutates(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for pos in 0..text.len().saturating_sub(1) {
+        if (bytes[pos] != b'>' && bytes[pos] != b'<') || bytes[pos + 1] != b'(' {
+            continue;
+        }
+        let inner_end = text[pos + 2..].find(')').map(|rel| pos + 2 + rel).unwrap_or(text.len());
+        for segment in command_segments(&text[pos + 2..inner_end]) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            if !segment_is_read_only_observe(&tokens) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Observe verdict of one whitespace-tokenized [`command_segments`] segment:
 /// either a git read-word form (ADR-55 §2), or a read-only verb invocation
 /// ([`is_read_only_verb_invocation`]). Every other first verb — `tee`, a
@@ -560,8 +613,20 @@ fn segment_is_read_only_observe(tokens: &[&str]) -> bool {
 /// Escaped redirects and `cd` climbs were already classified Consequential, so
 /// a read-only verb with only in-root arguments and no redirect is genuinely
 /// read-only.
+///
+/// Interpreter program bodies (2026-09-15): an `awk`/`sed` invocation whose
+/// program text carries code-execution primitives (`awk`'s `system()`/
+/// shell pipes, `sed`'s `s///e` flag or standalone `e` command) executes
+/// code the scan cannot see into — the invocation demotes to non-observe
+/// (lands on MutateLocal, which is never blanket-grantable for shell) and
+/// the ONLY direction this check can move a verdict is away from Observe.
+/// Plain `awk '{print $1}'` / `sed 's/a/b/'` are matched by no primitive and
+/// stay Observe.
 fn is_read_only_verb_invocation(verb: &str, trailing: &[&str]) -> bool {
     if !SHELL_READ_VERBS.contains(&verb) {
+        return false;
+    }
+    if interpreter_program_executes(verb, trailing) {
         return false;
     }
     if has_write_redirect(trailing) {
@@ -572,6 +637,98 @@ fn is_read_only_verb_invocation(verb: &str, trailing: &[&str]) -> bool {
     };
     !trailing.iter().any(|arg| {
         write_flags.iter().any(|flag| *arg == *flag || (flag.len() > 1 && arg.starts_with(flag)))
+    })
+}
+
+/// Whether an `awk`/`sed` invocation's trailing tokens (its program text, or
+/// arguments that carry it) contain code-execution primitives. A bounded,
+/// conservative substring scan — NOT an awk/sed parser:
+///
+/// - `awk`: any trailing token carrying an [`AWK_EXEC_PRIMITIVES`] member
+///   (`system(`, `|&`, `|getline`, `| getline`, `| "`, `|"`).
+/// - `sed`: the `s///e` flag (the replacement is executed as a shell
+///   command) and the standalone `e` command ([`sed_program_executes`] —
+///   bounded delimiter walk, not a parser).
+///
+/// A false positive (a program that merely prints such a literal) costs at
+/// most an approval prompt; it can only ever move a verdict toward the
+/// approval path, never toward Allow. `awk -f` / `sed -f` script-file bodies
+/// stay invisible (documented residual).
+fn interpreter_program_executes(verb: &str, trailing: &[&str]) -> bool {
+    match verb {
+        "awk" => trailing
+            .iter()
+            .any(|token| AWK_EXEC_PRIMITIVES.iter().any(|primitive| token.contains(primitive))),
+        "sed" => trailing.iter().any(|token| sed_program_executes(token)),
+        _ => false,
+    }
+}
+
+/// Whether a `sed` program text executes shell code (2026-09-15, tight set):
+/// the `e` flag on a substitute command (`s/a/b/e` — the replacement
+/// `b/e`-payload runs as a shell command) and the standalone `e` command
+/// (`sed 'e'`, `sed 's/x/y/;e ls'`). Bounded scan:
+///
+/// - For each plausible substitute-command start (`s` followed by a
+///   non-alphanumeric delimiter), the next two same-delimiter occurrences
+///   bound pattern/replacement, and the characters after the third
+///   delimiter up to whitespace/`;`/newline are the flag run — an `e`
+///   among them marks execution. A word containing `s<delim>` may be
+///   misread as a substitute command (over-block, prompt only).
+/// - `;`/newline-separated chunks whose first character is `e` followed by
+///   end/space/tab mark the standalone `e` command.
+fn sed_program_executes(script: &str) -> bool {
+    sed_substitute_e_flag(script) || sed_standalone_exec_command(script)
+}
+
+/// Bounded `s<delim>…<delim>…<delim><flags>` walk: returns whether ANY
+/// substitute command's flag run contains the `e` flag.
+fn sed_substitute_e_flag(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let Some(&delim) = chars.get(i + 1) else {
+            break;
+        };
+        if c != 's' || delim.is_alphanumeric() {
+            continue;
+        }
+        // The delimiter at i+1 is occurrence one; the next two occurrences
+        // bound pattern and replacement.
+        let mut seen = 1usize;
+        for (j, &c2) in chars.iter().enumerate().skip(i + 2) {
+            if c2 != delim {
+                continue;
+            }
+            seen += 1;
+            if seen != 3 {
+                continue;
+            }
+            // Flag run: characters after the third delimiter until a
+            // whitespace/separator boundary; `e` there is the execute flag.
+            if chars.get(j + 1..).is_some_and(|tail| {
+                tail.iter()
+                    .copied()
+                    .take_while(|c2| {
+                        !c2.is_whitespace() && !matches!(c2, ';' | '\n' | '\r' | '&' | '|')
+                    })
+                    .any(|c2| c2 == 'e')
+            }) {
+                return true;
+            }
+            // One flag run per substitute command; keep scanning for the
+            // NEXT `s<delim>` command.
+            break;
+        }
+    }
+    false
+}
+
+/// Bounded standalone-`e`-command walk: `;`/newline-separated chunks whose
+/// first character is `e` followed by end/space/tab execute code.
+fn sed_standalone_exec_command(script: &str) -> bool {
+    script.split([';', '\n', '\r']).any(|chunk| {
+        let chunk = chunk.trim_start();
+        chunk.starts_with('e') && (chunk.len() == 1 || chunk[1..].starts_with([' ', '\t']))
     })
 }
 
@@ -1304,6 +1461,133 @@ mod tests {
             tier("shell", serde_json::json!({"command": command})),
             IntentTier::Observe,
             "quoted-arg pipes split the command conservatively—must not stay Observe"
+        );
+    }
+
+    #[test]
+    fn interpreter_program_text_executes_never_free_observe() {
+        // 2026-09-15: awk/sed program bodies execute code no token scan can
+        // see into; their invocations must demote from Observe. The only
+        // allowed direction: toward the approval path.
+        assert_ne!(
+            tier(
+                "shell",
+                serde_json::json!({"command": "awk", "args": ["'{begin{system(\"rm ~/.bashrc\")}'}"]})
+            ),
+            IntentTier::Observe,
+            "awk system() body is never free Observe"
+        );
+        assert_ne!(
+            tier("shell", serde_json::json!({"command": "awk", "args": ["'{cmd | getline}'"]})),
+            IntentTier::Observe,
+            "awk pipe-to-getline body is never free Observe"
+        );
+        assert_ne!(
+            tier("shell", serde_json::json!({"command": "sed", "args": ["s/a/b/e", "f"]})),
+            IntentTier::Observe,
+            "sed s///e executes the replacement"
+        );
+        assert_ne!(
+            tier("shell", serde_json::json!({"command": "sed", "args": ["s/x/y/;e ls", "f"]})),
+            IntentTier::Observe,
+            "sed standalone e command executes code"
+        );
+        // The primitive menagerie: each awk alternative demotes.
+        // Preserved pins: plain program bodies stay Observe.
+        assert_eq!(
+            tier(
+                "shell",
+                serde_json::json!({"command": "awk", "args": ["'{print $1}'", "build.log"]})
+            ),
+            IntentTier::Observe,
+            "plain awk program body stays Observe"
+        );
+        assert_eq!(
+            tier("shell", serde_json::json!({"command": "sed", "args": ["s/a/b/", "f"]})),
+            IntentTier::Observe,
+            "plain sed 's/a/b/' stays Observe"
+        );
+        assert_eq!(
+            tier(
+                "shell",
+                serde_json::json!({"command": "awk", "args": ["-F", ":", "'{print $1}'", "/etc/os-release"]})
+            ),
+            IntentTier::Observe,
+            "plain awk with flags and an absolute read target stays Observe"
+        );
+        assert_eq!(
+            tier("shell", serde_json::json!({"command": "sed", "args": ["-n", "1p", "build.log"]})),
+            IntentTier::Observe,
+            "plain sed -n print stays Observe"
+        );
+        // The primitive menagerie: each awk alternative demotes.
+        for body in ["'{print | \"sort\"}'", "'{ \"ps -ef\" | getline }'", "'{cmd|& getline}'"] {
+            assert_ne!(
+                tier("shell", serde_json::json!({"command": "awk", "args": [body]})),
+                IntentTier::Observe,
+                "awk program body executes code — must not be Observe: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_substitution_mutating_inner_never_free_observe() {
+        // 2026-09-15 (bounded minimal fallback): the shell executes the
+        // `>(…)`/`<(…)` body as a command; a mutating inner verb forces the
+        // approval path — never free Observe.
+        assert_ne!(
+            tier("shell", serde_json::json!({"command": "echo", "args": ["hi", ">(rm ~/x)"]})),
+            IntentTier::Observe,
+            "process-substituted rm inside an echo pipe is never free Observe"
+        );
+        assert_ne!(
+            tier("shell", serde_json::json!({"command": "echo", "args": ["hi", ">(rm -rf /etc)"]})),
+            IntentTier::Observe,
+            "process-substituted rm with an out-of-root target is never free Observe"
+        );
+        assert_ne!(
+            tier(
+                "shell",
+                serde_json::json!({"command": "echo", "args": ["hi", ">(tee /mine)", ">(rm ./y)"]})
+            ),
+            IntentTier::Observe,
+            "tee/rm inner segments must leave Observe"
+        );
+        // The `<(` input form was the real free-Observe hole: `<(` carries no
+        // `>` and the `echo` lead's read-only exemption covers the token, yet
+        // the shell still EXECUTES the inner command.
+        assert_ne!(
+            tier("shell", serde_json::json!({"command": "echo", "args": ["hi", "<(rm ~/x)"]})),
+            IntentTier::Observe,
+            "process-substituted rm behind <( is never free Observe"
+        );
+        // Preserved pins: read-only inner verbs stay Observe — process
+        // substitution itself is not banned. The `>(`-prefixed read-only
+        // inner already demotes via the pre-existing glued-`>` redirect
+        // rule; that behavior is unchanged here, so pin the `<(` side which
+        // this check governs.
+        assert_eq!(
+            tier(
+                "shell",
+                serde_json::json!({"command": "echo", "args": ["hi", "<(wc -l notes.txt)"]})
+            ),
+            IntentTier::Observe,
+            "read-only inner command stays Observe"
+        );
+        assert_eq!(
+            tier(
+                "shell",
+                serde_json::json!({"command": "cat", "args": ["<(grep error build.log)"]})
+            ),
+            IntentTier::Observe,
+            "cat reading a read-only process substitution stays Observe"
+        );
+        // A bare `>`/`<` without the adjacent `(` is a plain redirect, not a
+        // substitution — untouched by this check (redirect rules own it).
+        assert_eq!(
+            tier("shell", serde_json::json!({"command": "cat", "args": ["<", "build.log"]})),
+            IntentTier::Observe,
+            "plain input redirect is not process substitution"
         );
     }
 
