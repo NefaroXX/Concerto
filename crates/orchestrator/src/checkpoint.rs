@@ -2052,6 +2052,7 @@ mod tests {
             expected_artifacts: vec!["src/main.rs".to_owned()],
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             status: crate::decisions::DecisionStatus::Settled,
         };

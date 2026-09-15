@@ -371,6 +371,8 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::TransferOwnership => "transfer-ownership",
         // Issue #62 speculative investigation.
         DecisionKind::Investigate => "investigate",
+        // Issue #63 explicit wait.
+        DecisionKind::Wait => "wait",
     }
 }
 

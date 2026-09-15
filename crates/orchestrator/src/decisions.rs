@@ -91,6 +91,15 @@ pub enum DecisionKind {
     /// no target (it names hypotheses, not a single specialist) and carries
     /// no task description (the hypotheses themselves are the work text).
     Investigate,
+    /// Issue #63: explicit WAIT. The Coordinator parks the decision loop on
+    /// an external condition instead of burning turns or being misread as
+    /// stalled. The model supplies a reason (recorded as the task
+    /// description), optional wake conditions, an optional deadline, and
+    /// cited evidence. The handler validates and journals the decision, then
+    /// parks the loop via `active_wait`; the wait executes inside ONE tool
+    /// call in `execute_graph` (so the #53 no-progress tracker is never
+    /// invoked during the wait).
+    Wait,
 }
 
 impl DecisionKind {
@@ -119,6 +128,7 @@ impl DecisionKind {
                 | DecisionKind::Replan
                 | DecisionKind::Split
                 | DecisionKind::Merge
+                | DecisionKind::Wait
         )
     }
 
@@ -126,7 +136,10 @@ impl DecisionKind {
     pub fn requires_task(self) -> bool {
         matches!(
             self,
-            DecisionKind::DispatchSpecialist | DecisionKind::Retry | DecisionKind::Consult
+            DecisionKind::DispatchSpecialist
+                | DecisionKind::Retry
+                | DecisionKind::Consult
+                | DecisionKind::Wait // the WAIT reason rides the task text
         )
     }
 }
@@ -181,6 +194,15 @@ pub struct CoordinatorDecision {
     /// so old journal entries and old checkpoints (no field) still load.
     #[serde(default)]
     pub max_tool_calls: Option<u32>,
+    /// Issue #63: the waiting-record payload for the `Wait` kind. `None` for
+    /// every non-wait kind. Additive serde (`default`), so old journal
+    /// entries and old checkpoints (no field) still load. Attached by the
+    /// coordinator handler AFTER structural validation — the record's own
+    /// shape (condition count, affected-id bounds, deadline sanity) is
+    /// validated at the handler for the same reason the transform payload is
+    /// validated by the task-transform machinery against real graph state.
+    #[serde(default)]
+    pub wait_record: Option<crate::wait::WaitingRecord>,
     pub created_at: time::OffsetDateTime,
     pub status: DecisionStatus,
 }
@@ -375,6 +397,10 @@ impl<'a> DecisionValidator<'a> {
             // handler AFTER structural validation (issue #59), the same
             // way the transform payload is.
             max_tool_calls: None,
+            // The WAIT record is attached by the coordinator handler AFTER
+            // structural validation (issue #63), the same way the transform
+            // payload and effort cap are.
+            wait_record: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Validated,
         })
@@ -422,6 +448,7 @@ impl<'a> DecisionValidator<'a> {
             expected_artifacts: Vec::new(),
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -449,6 +476,7 @@ impl<'a> DecisionValidator<'a> {
             expected_artifacts: Vec::new(),
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -936,5 +964,71 @@ mod tests {
         assert_eq!(back, decision);
         assert!(json.contains("\"dispatch-specialist\""), "kebab-case kind: {json}");
         assert!(json.contains("\"validated\""), "kebab-case status: {json}");
+    }
+
+    // ── Issue #63: the Wait decision kind ──────────────────────────────
+
+    #[test]
+    fn wait_decision_validates_with_reason_and_evidence() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&["ev-0001"]);
+        let decision = validator(&roster_ids, &known, None)
+            .validate(
+                DecisionKind::Wait,
+                None, // Wait never names a target.
+                "parked on upstream PR merge",
+                Some("non-blocking advisory"),
+                &["ev-0001".to_owned()],
+                &[],
+            )
+            .expect("a grounded wait validates");
+        assert_eq!(decision.kind, DecisionKind::Wait);
+        assert_eq!(decision.target_agent, None, "Wait never names a target");
+        assert_eq!(
+            decision.task_description, "parked on upstream PR merge",
+            "the reason rides the task text"
+        );
+        assert_eq!(decision.supporting_evidence_ids, vec!["ev-0001"]);
+        assert_eq!(decision.wait_record, None, "the record is attached by the handler");
+        assert!(DecisionKind::Wait.rejects_target());
+        assert!(DecisionKind::Wait.requires_task());
+    }
+
+    #[test]
+    fn wait_with_empty_reason_rejects() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&[]);
+        let error = validator(&roster_ids, &known, None)
+            .validate(DecisionKind::Wait, None, "  ", None, &[], &[])
+            .expect_err("wait requires a non-empty reason");
+        assert_eq!(error.code, "incomplete_decision");
+    }
+
+    #[test]
+    fn wait_with_target_rejects() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&[]);
+        let error = validator(&roster_ids, &known, None)
+            .validate(DecisionKind::Wait, Some("coder"), "parked", None, &[], &[])
+            .expect_err("wait rejects a target");
+        assert_eq!(error.code, "conflicting_decision");
+    }
+
+    #[test]
+    fn wait_round_trips_and_old_entries_default_wait_record() {
+        let decision = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::Wait, None, "waiting for CI", None, &[], &[])
+            .expect("valid");
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(json.contains("\"wait\""), "kebab-case wait kind: {json}");
+        let back: CoordinatorDecision = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, decision);
+
+        // A pre-#63 entry: no `wait_record` key → additive default None.
+        let mut value = serde_json::to_value(&back).expect("serialize");
+        assert!(value.get("wait_record").is_some(), "current entries carry the key");
+        value.as_object_mut().expect("an object").remove("wait_record");
+        let old: CoordinatorDecision = serde_json::from_value(value).expect("an old entry loads");
+        assert_eq!(old.wait_record, None, "the additive wait_record defaults");
     }
 }

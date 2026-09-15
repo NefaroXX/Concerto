@@ -1972,6 +1972,7 @@ impl CoordinatorAgent {
             expected_artifacts: Vec::new(),
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: crate::decisions::DecisionStatus::Validated,
         };

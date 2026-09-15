@@ -646,6 +646,7 @@ mod tests {
                 children: vec![child_spec("part one", vec![]), child_spec("part two", vec![])],
             }),
             max_tool_calls: None,
+            wait_record: None,
             created_at: now(),
             status: crate::decisions::DecisionStatus::Settled,
         };
