@@ -127,6 +127,16 @@ pub(crate) const DRAFT_PLAN_TOOL: &str = "draft_plan";
 pub(crate) const SPLIT_TASK_TOOL: &str = "split_task";
 pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 
+/// Issue #64: the explicit reconsideration surface. The Coordinator's model
+/// supersedes a decision whose assumptions proved wrong by marking it
+/// `Superseded` in the decision journal and freezing ONLY the affected
+/// pending tasks (deterministic `Freeze` transform). Completed work, valid
+/// evidence, and accepted artifacts are never touched; the loop returns to
+/// strategy selection from the current world state after the tool result.
+/// Like split/merge it dispatches no agents and touches no tools, so it
+/// applies no policy gate (there is nothing to gate).
+pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -170,6 +180,10 @@ Waiting on external reality (issue #63):
 - wait suspends the decision loop on a declarative condition or a hard deadline — no model turns, no dispatch, no stall flag. Use it when the next step is genuinely blocked on something outside this loop: tasks you are waiting to settle (event-resolved), a workspace that must change first (workspace-generation-changed), a review or finding event you expect to land (new-evidence), or simply a wall-clock deadline.
 - The loop re-evaluates in bounded, cancellable slices and the tool returns why the wait ended: woken (a condition tripped), expired (the deadline passed), or still-waiting (the internal cap was reached). Decide the next step from that result — re-wait, proceed, or give up.
 - A wait must declare at least one condition or a deadline; fabricated evidence ids are rejected exactly like everywhere else.
+
+Superseding a decision whose assumptions proved wrong (issue #64):
+- reconsider marks one of this run's journaled decisions Superseded and freezes ONLY the affected PENDING tasks whose plans it stood behind. Use it when new evidence or a settlement shows a decision's assumptions no longer hold. Name the real decision id, the pending task ids, and cite the evidence that changed your mind.
+- Completed work, valid evidence, and accepted artifacts are never touched; frozen tasks never re-dispatch on their own. Re-plan the frozen work yourself, under fresh decisions, from the current world state. An unknown or already-rejected decision id is a structured rejection you can read and fix.
 
 Artifact ownership (issue #61):
 - A write by a non-owner to an OWNED artifact is refused; the refusal names the owner and its acquiring event. To hand an owned artifact over to another agent, call transfer_ownership — the mediated handover is the only lawful way; ownership is never stolen.
@@ -366,6 +380,60 @@ fn merge_tasks_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["task_ids", "merged_description"]
+        }),
+    }
+}
+
+/// Issue #64: argument schema for `reconsider` — supersede a decision whose
+/// assumptions proved wrong and freeze only the pending tasks that stood
+/// behind it. Completed work, valid evidence, and accepted artifacts are
+/// never touched; the affected tasks never re-enter the ready queue on
+/// their own.
+fn reconsider_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: RECONSIDER_TOOL.to_string(),
+        description: "Supersede a decision whose assumptions proved wrong (issue #64): \
+                      mark the cited decision Superseded in the run's journal and freeze \
+                      ONLY the affected PENDING tasks (they become blocked and never \
+                      re-dispatch on their own). Completed work, valid evidence, and \
+                      accepted artifacts are untouched. You re-plan the frozen work \
+                      yourself, under fresh decisions, from the current world state."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision_id": {
+                    "type": "string",
+                    "description": "The id of a decision recorded in this run's journal (from the \
+                                    context) whose assumptions you are superseding. Unknown ids and \
+                                    already-rejected decisions are rejected."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the decision's assumptions no longer hold; recorded as the \
+                                    reconsideration decision's reason."
+                },
+                "affected_task_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 48,
+                    "items": { "type": "string" },
+                    "description": "The PENDING task ids whose plans that decision stood behind, to \
+                                    freeze. Completed/running/failed tasks are rejected — freeze only \
+                                    pending work."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional extra guidance, recorded in the decision notes."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the reconsideration. \
+                                    Fabricated ids are rejected."
+                }
+            },
+            "required": ["decision_id", "reason", "affected_task_ids"]
         }),
     }
 }
@@ -1511,6 +1579,35 @@ impl MergeTaskArgs {
             task_ids,
             merged_description: merged_description.to_owned(),
             merged_artifacts: parse_string_array(arguments, "merged_artifacts"),
+            notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
+            supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
+        })
+    }
+}
+
+/// Issue #64: `reconsider` tool arguments — the superseded decision id,
+/// the reason (rides the decision's task text), the pending task ids to
+/// freeze, optional notes, and supporting evidence.
+struct ReconsiderArgs {
+    decision_id: String,
+    reason: String,
+    affected_task_ids: Vec<String>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl ReconsiderArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let decision_id = arguments.get("decision_id").and_then(serde_json::Value::as_str)?;
+        let reason = arguments.get("reason").and_then(serde_json::Value::as_str)?;
+        let affected_task_ids = parse_string_array(arguments, "affected_task_ids");
+        if affected_task_ids.is_empty() {
+            return None;
+        }
+        Some(Self {
+            decision_id: decision_id.to_owned(),
+            reason: reason.to_owned(),
+            affected_task_ids,
             notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
             supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
         })
@@ -7480,6 +7577,9 @@ impl CoordinatorAgent {
             // Issue #63: the declarative wait surface — parks the decision
             // loop on conditions/deadline with zero model turns.
             tool_defs.push(wait_tool_definition());
+            // Issue #64: the reconsideration surface — supersede a decision
+            // and freeze only its affected pending tasks.
+            tool_defs.push(reconsider_tool_definition());
             // Issue #61: the mediated ownership-transfer surface — only
             // lawful when a write gate is attached to the run.
             if self.write_gate.is_some() {
@@ -7750,6 +7850,23 @@ impl CoordinatorAgent {
                             cancel,
                             scope,
                             ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #64: the explicit reconsideration surface — the
+                    // model supersedes a decision and freezes ONLY its
+                    // affected pending tasks (a deterministic transform,
+                    // like split/merge). Completed work is never touched.
+                    RECONSIDER_TOOL if dispatching => {
+                        self.handle_reconsider(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
                             &tool_call.arguments,
                         )
                         .await
@@ -10295,7 +10412,10 @@ impl CoordinatorAgent {
             time::OffsetDateTime::now_utc(),
         ) {
             Ok(crate::task_transform::TransformOutcome::Split(outcome)) => outcome.children,
-            Ok(crate::task_transform::TransformOutcome::Merge(_)) => {
+            Ok(
+                crate::task_transform::TransformOutcome::Merge(_)
+                | crate::task_transform::TransformOutcome::Freeze(_),
+            ) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
                 return serde_json::json!({
@@ -10484,7 +10604,10 @@ impl CoordinatorAgent {
             Ok(crate::task_transform::TransformOutcome::Merge(outcome)) => {
                 (outcome.survivor, outcome.removed)
             }
-            Ok(crate::task_transform::TransformOutcome::Split(_)) => {
+            Ok(
+                crate::task_transform::TransformOutcome::Split(_)
+                | crate::task_transform::TransformOutcome::Freeze(_),
+            ) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
                 return serde_json::json!({
@@ -10584,6 +10707,210 @@ impl CoordinatorAgent {
             "outcome": "merged",
             "survivor": survivor.to_string(),
             "removed": removed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Issue #64: handle ONE `reconsider` tool call — supersede a decision
+    /// whose assumptions proved wrong and freeze only the affected pending
+    /// tasks. Same failure discipline as the sibling decision surfaces:
+    /// parse → journal lookup → decision validation → proof-and-apply the
+    /// deterministic `Freeze` against the REAL graph → trail (the new
+    /// decision settles, the superseded decision is marked `Superseded`)
+    /// → structured result. Completed work, valid evidence, and accepted
+    /// artifacts are never touched; the frozen tasks never re-enter the
+    /// ready queue on their own, so the next strategy decision comes from
+    /// the model against the current world state.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_reconsider(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial reconsideration) ─────────────────────────
+        let Some(args) = ReconsiderArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider requires a non-empty decision_id (a decision from this \
+                            run's journal), a non-empty reason, and at least one affected \
+                            pending task id",
+            });
+        };
+        let decision_id = args.decision_id.trim();
+        if decision_id.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider requires a non-empty decision_id",
+            });
+        }
+
+        // ── 2. The superseded decision must exist in the journal; a
+        //       rejected decision has nothing in operation to void ────────
+        let target_status =
+            match self.decision_journal.entries().iter().find(|entry| entry.id == decision_id) {
+                Some(entry) => entry.status,
+                None => {
+                    return serde_json::json!({
+                        "error": "unknown_decision",
+                        "message": format!(
+                            "no decision {decision_id} exists in this run's journal; cite a real \
+                             decision id from the context"
+                        ),
+                    });
+                }
+            };
+        if target_status == crate::decisions::DecisionStatus::Rejected {
+            return serde_json::json!({
+                "error": "decision_not_reconsiderable",
+                "message": format!(
+                    "decision {decision_id} is already rejected — it has nothing in operation \
+                     to supersede"
+                ),
+            });
+        }
+        // A Superseded target is allowed: re-reconsidering is idempotent (the
+        // journal re-mark is a forward-only no-op).
+
+        // ── 3. affected_task_ids parse as ULIDs (deduplicated) ─────────────
+        let mut affected: Vec<TaskId> = Vec::new();
+        for raw in &args.affected_task_ids {
+            let Ok(id) = Ulid::from_string(raw).map(TaskId) else {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": format!(
+                        "affected_task_ids entries must be task ULIDs; {raw:?} is not"
+                    ),
+                });
+            };
+            if !affected.contains(&id) {
+                affected.push(id);
+            }
+        }
+        if affected.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider must name at least one affected pending task id",
+            });
+        }
+
+        // ── 4. Decision validation (Reconsider rejects a target; the reason
+        //       rides the task text; fabricated evidence is rejected). The
+        //       Freeze payload is attached here, validated against the REAL
+        //       graph by the next step. ─────────────────────────────────────
+        // The model's `reason` becomes the decision's task text (like the
+        // WAIT reason); the superseded decision id lives in the freeze
+        // payload so the journal entry is fully self-describing.
+        let summary = args.reason.trim();
+        let transform_spec = crate::task_transform::TaskTransformSpec::Freeze {
+            decision_id: decision_id.to_owned(),
+            task_ids: affected.clone(),
+        };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Reconsider,
+                Some(transform_spec.clone()),
+                summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &[],
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id_new = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── 5. Deterministic freeze against the REAL graph ────────────────
+        let frozen = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Freeze(outcome)) => outcome.frozen,
+            Ok(
+                crate::task_transform::TransformOutcome::Split(_)
+                | crate::task_transform::TransformOutcome::Merge(_),
+            ) => {
+                self.decision_journal
+                    .transition(&decision_id_new, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the reconsider decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id_new, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    %decision_id,
+                    "reconsider rejected by the deterministic freeze validation"
+                );
+                ledger
+                    .notes
+                    .push(format!("Reconsider of {decision_id} rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── 6. The trail: the reconsideration settles, the superseded
+        //       decision is marked Superseded (forward-only, idempotent);
+        //       whiteboard Decision record; ledger row. ────────────────────
+        self.decision_journal
+            .transition(&decision_id_new, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal
+            .transition(&decision_id_new, crate::decisions::DecisionStatus::Settled);
+        self.decision_journal.transition(decision_id, crate::decisions::DecisionStatus::Superseded);
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "reconsidered".into(),
+            task_id: None, // the freeze spans tasks; the decision's entry names them
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            None, // a reconsideration leaves no per-node continuation behind
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // A chain frontier that froze the chain head resets: the frozen node
+        // never re-enters via the chain-parent slot.
+        if state.last_node.is_some_and(|head| frozen.contains(&head)) {
+            state.last_node = None;
+        }
+        // A pending dispatch continuation must not stand behind a frozen
+        // task (ADR-65 §7: nothing to continue behind anymore).
+        if self
+            .last_dispatch_decision
+            .as_ref()
+            .and_then(|pending| pending.task_id)
+            .is_some_and(|pending_task| frozen.contains(&pending_task))
+        {
+            self.last_dispatch_decision = None;
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "reconsidered",
+            "decision_id": decision_id_new,
+            "superseded_decision_id": decision_id,
+            "frozen": frozen.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "message": format!(
+                "superseded decision {decision_id} and froze {} pending task(s); re-plan the \
+                 frozen work under fresh decisions",
+                frozen.len()
+            ),
         })
     }
 
@@ -22011,6 +22338,405 @@ mod tests {
             .expect("the denied decision is still journaled");
         assert_eq!(last.status, crate::decisions::DecisionStatus::Rejected);
         assert!(coordinator.active_wait.is_none(), "a denied wait never parks");
+    }
+
+    // ── Issue #64: reconsider — supersede a decision + freeze its pending ──
+
+    /// A settled dispatch decision the model supersedes in these tests — the
+    /// journal is seeded before the handler runs so the call can cite a real
+    /// decision id deterministically.
+    fn settled_reconsider_target() -> crate::decisions::CoordinatorDecision {
+        crate::decisions::CoordinatorDecision {
+            id: "d-design".to_owned(),
+            kind: crate::decisions::DecisionKind::DispatchSpecialist,
+            target_agent: Some(AgentId::new("coder")),
+            task_description: "implement the design".to_owned(),
+            notes: None,
+            supporting_evidence_ids: vec![],
+            expected_artifacts: vec![],
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            status: crate::decisions::DecisionStatus::Settled,
+        }
+    }
+
+    /// Issue #64 acceptance: a reconsideration supersedes the seeded decision
+    /// and deterministically freezes ONLY the named pending task; completed
+    /// work stays byte-identical and the chain frontier resets.
+    #[tokio::test]
+    async fn reconsider_supersedes_a_decision_and_freezes_only_pending_tasks() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_reconsider_target());
+
+        let pending = TaskId::new();
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work under the superseded decision".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("reviewer"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled work".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(pending) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "the settle showed the API assumption no longer holds",
+                    "affected_task_ids": [pending.to_string()],
+                    "notes": "re-plan under fresh decisions",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "reconsidered", "structured success: {result}");
+        assert_eq!(result["superseded_decision_id"], "d-design");
+        assert_eq!(result["frozen"][0], pending.to_string(), "{result}");
+        // The pending task is frozen (Blocked + tombstone); completed work
+        // and its deliverable are untouched.
+        let frozen = graph.get(&pending).expect("the frozen task stays in the graph");
+        assert_eq!(frozen.status, SubTaskStatus::Blocked, "frozen pending work is Blocked");
+        assert!(frozen.completed_at.is_some(), "a Blocked task carries a tombstone");
+        let settled = graph.get(&done).expect("the completed task is not touched");
+        assert_eq!(settled.status, SubTaskStatus::Completed);
+        assert_eq!(settled.deliverable.as_deref(), Some("settled work"));
+        assert!(TaskGraphValidator::validate(&graph).is_ok(), "the DAG stays valid");
+        // The trail: target decision Superseded, the reconsider decision
+        // settles, and the ledger records the reconsideration.
+        let entries = coordinator.decision_journal.entries();
+        let superseded = entries.iter().find(|entry| entry.id == "d-design").expect("target entry");
+        assert_eq!(superseded.status, crate::decisions::DecisionStatus::Superseded);
+        let reconsider = entries.last().expect("the reconsider decision is journaled");
+        assert!(matches!(reconsider.kind, crate::decisions::DecisionKind::Reconsider));
+        assert!(matches!(
+            reconsider.transform,
+            Some(crate::task_transform::TaskTransformSpec::Freeze { .. })
+        ));
+        assert_eq!(reconsider.status, crate::decisions::DecisionStatus::Settled);
+        assert!(
+            ledger.action_ledger.iter().any(|action| action.kind == "reconsidered"),
+            "the ledger mirrors the reconsideration: {ledger:?}"
+        );
+        // The frontier that pointed at a frozen task resets — the frozen node
+        // is never the chain parent of the next dispatch.
+        assert_eq!(state.last_node, None);
+    }
+
+    /// Issue #64: the structured rejections — absence of the cited decision,
+    /// an already-rejected target, and malformed arguments. Every rejection
+    /// journals nothing and mutates nothing.
+    #[tokio::test]
+    async fn reconsider_rejects_unknown_rejected_and_malformed_inputs() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let mut graph = TaskGraph::new();
+        let pending = TaskId::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        // Unknown decision id: nothing in this run's journal, structured
+        // rejection, nothing journaled, nothing mutated.
+        let unknown = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "no-such-decision",
+                    "reason": "reconsider",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_decision", "{unknown}");
+        assert_eq!(coordinator.decision_journal.entries().len(), 0, "rejections journal nothing");
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Pending);
+
+        // An already-rejected target has nothing in operation to supersede.
+        let mut rejected = settled_reconsider_target();
+        rejected.status = crate::decisions::DecisionStatus::Rejected;
+        coordinator.decision_journal.record(rejected);
+        let not_reconsiderable = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider anyway",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+        assert_eq!(
+            not_reconsiderable["error"], "decision_not_reconsiderable",
+            "{not_reconsiderable}"
+        );
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            1,
+            "rejections journal nothing beyond the seeded entry"
+        );
+
+        // A second, still-operational target: the purely-malformed cases must
+        // fail on the arguments themselves, not on the journal lookup.
+        let mut operational = settled_reconsider_target();
+        operational.id = "d-other".to_owned();
+        coordinator.decision_journal.record(operational);
+
+        // Malformed arguments: missing reason / no affected ids / non-ULID.
+        for arguments in [
+            serde_json::json!({ "decision_id": "d-other", "affected_task_ids": [pending.to_string()] }),
+            serde_json::json!({ "decision_id": "d-other", "reason": "reconsider" }),
+            serde_json::json!({
+                "decision_id": "d-other",
+                "reason": "reconsider",
+                "affected_task_ids": ["not-a-ulid"],
+            }),
+        ] {
+            let malformed = coordinator
+                .handle_reconsider(
+                    &mut graph,
+                    &task,
+                    &context,
+                    &CancellationToken::new(),
+                    &mut scope,
+                    &mut ledger,
+                    &mut state,
+                    &arguments,
+                )
+                .await;
+            assert_eq!(malformed["error"], "invalid_arguments", "{malformed}");
+        }
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            2,
+            "malformed calls never reach validation"
+        );
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Pending);
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    /// Issue #64: freezing completed work is a deterministic rejection — the
+    /// reconsider decision records as Rejected and no task state changes.
+    #[tokio::test]
+    async fn reconsider_rejects_freezing_completed_work() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_reconsider_target());
+
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled work".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider",
+                    "affected_task_ids": [done.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "not_freezeable", "structured rejection: {result}");
+        // The completed task is untouched — the freeze never fires.
+        let settled = graph.get(&done).expect("the completed task stays");
+        assert_eq!(settled.status, SubTaskStatus::Completed);
+        assert_eq!(settled.deliverable.as_deref(), Some("settled work"));
+        // The rejected reconsider decision is journaled as Rejected; the
+        // target decision keeps its status (nothing was superseded).
+        let entries = coordinator.decision_journal.entries();
+        assert_eq!(entries.len(), 2);
+        let reconsider = entries.last().expect("the reconsider decision is journaled");
+        assert_eq!(reconsider.status, crate::decisions::DecisionStatus::Rejected);
+        assert!(ledger.action_ledger.is_empty(), "a rejected freeze mutates no ledger");
+    }
+
+    /// Issue #64: re-reconsidering an already-superseded decision is
+    /// idempotent — the re-mark is a forward-only no-op and freezing the
+    /// already-frozen task re-applies harmlessly.
+    #[tokio::test]
+    async fn reconsider_is_idempotent_on_an_already_superseded_target() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut target = settled_reconsider_target();
+        target.status = crate::decisions::DecisionStatus::Superseded;
+        coordinator.decision_journal.record(target);
+
+        let pending = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider again",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            result["outcome"], "reconsidered",
+            "a repeated reconsider is not an error: {result}"
+        );
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Blocked);
+        assert_eq!(
+            coordinator
+                .decision_journal
+                .entries()
+                .iter()
+                .find(|entry| entry.id == "d-design")
+                .expect("target entry")
+                .status,
+            crate::decisions::DecisionStatus::Superseded,
+            "the Superseded mark is stable"
+        );
     }
 
     // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────
