@@ -95,6 +95,18 @@ const READ_ONLY_VERBS: &[&str] = &[
 const INPLACE_WRITE_FLAGS: &[(&str, &[&str])] =
     &[("sed", &["-i", "--in-place"]), ("grep", &["-w"]), ("awk", &["-i", "--in-place", "-w"])];
 
+/// awk program-text execution primitives (2026-09-15, tight set; mirrored in
+/// core's `AWK_EXEC_PRIMITIVES`, `crates/core/src/authorization.rs`). An
+/// `awk` invocation whose program text carries any of these executes code no
+/// token scan can see into, so the invocation demotes from read-only:
+/// `system("cmd")` (shell-out builtin), `"cmd" | getline` / `|getline` (the
+/// shell runs the left side), `|&` (coprocess), and `print … | "cmd"` /
+/// `print|"cmd"` (the quoted command is executed). Conservative: a program
+/// that merely prints such a literal loses its read-only exemption (a
+/// rejection at most). `awk -f` script-file bodies remain invisible
+/// (documented residual).
+const AWK_EXEC_PRIMITIVES: &[&str] = &["system(", "|&", "|getline", "| getline", "| \"", "|\""];
+
 /// Write-redirect operators whose target is contained regardless of the verb.
 const WRITE_REDIRECT_OPERATORS: &[&str] = &[">", ">>", "2>", "2>>", "&>", "&>>", ">|"];
 
@@ -162,6 +174,16 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
     if !READ_ONLY_VERBS.contains(&verb) {
         return false;
     }
+    // Interpreter program bodies (2026-09-15): an `awk`/`sed` invocation
+    // whose program text carries code-execution primitives (`awk`'s
+    // `system()`/shell-pipe forms, `sed`'s `s///e` flag or standalone `e`
+    // command) is NOT read-only — the exemption must not free its tokens.
+    // Plain `awk '{print $1}'` / `sed 's/a/b/'` match no primitive and keep
+    // the exemption. Mirror of core's tier check
+    // (`is_read_only_verb_invocation` for Observe): only ever demotes.
+    if interpreter_program_executes(verb, trailing) {
+        return false;
+    }
     let Some(write_flags) = INPLACE_WRITE_FLAGS.iter().find(|(v, _)| *v == verb) else {
         return true;
     };
@@ -172,6 +194,89 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
     // stays a read.
     !trailing.iter().any(|arg| {
         write_flags.iter().any(|flag| arg == *flag || (flag.len() > 1 && arg.starts_with(flag)))
+    })
+}
+
+/// Whether an `awk`/`sed` invocation's trailing tokens (its program text, or
+/// arguments carrying it) contain code-execution primitives. A bounded,
+/// conservative scan — NOT an awk/sed parser; mirror of core's
+/// [`interpreter_program_executes`-analog in `authorization.rs`]
+/// (`interpreter_program_executes`):
+///
+/// - `awk`: any trailing token carrying an [`AWK_EXEC_PRIMITIVES`] member.
+/// - `sed`: the `s///e` execute flag and the standalone `e` command
+///   ([`sed_program_executes`] — bounded delimiter walk).
+///
+/// A false positive costs the read-only exemption (a rejection at most); it
+/// can only ever NARROW the exemption, never widen it.
+fn interpreter_program_executes(verb: &str, trailing: &[String]) -> bool {
+    match verb {
+        "awk" => trailing
+            .iter()
+            .any(|token| AWK_EXEC_PRIMITIVES.iter().any(|primitive| token.contains(primitive))),
+        "sed" => trailing.iter().any(|token| sed_program_executes(token)),
+        _ => false,
+    }
+}
+
+/// Whether a `sed` program text executes shell code (2026-09-15, tight set):
+/// the `s///e` flag (the replacement runs as a shell command) and the
+/// standalone `e` command (`sed 'e'`, `sed 's/x/y/;e ls'`). Bounded walk in
+/// [`sed_substitute_e_flag`]; the standalone command is detected on
+/// `;`/newline chunks whose first character is `e` followed by end/space/tab.
+fn sed_program_executes(script: &str) -> bool {
+    sed_substitute_e_flag(script) || sed_standalone_exec_command(script)
+}
+
+/// Bounded `s<delim>…<delim>…<delim><flags>` walk: returns whether ANY
+/// substitute command's flag run contains the `e` flag. A word containing
+/// `s<delim>` may be misread as a substitute command (over-block only).
+fn sed_substitute_e_flag(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let Some(&delim) = chars.get(i + 1) else {
+            break;
+        };
+        if c != 's' || delim.is_alphanumeric() {
+            continue;
+        }
+        // The delimiter at i+1 is occurrence one; the next two occurrences
+        // bound pattern and replacement.
+        let mut seen = 1usize;
+        for (j, &c2) in chars.iter().enumerate().skip(i + 2) {
+            if c2 != delim {
+                continue;
+            }
+            seen += 1;
+            if seen != 3 {
+                continue;
+            }
+            // Flag run: characters after the third delimiter until a
+            // whitespace/separator boundary; `e` there is the execute flag.
+            if chars.get(j + 1..).is_some_and(|tail| {
+                tail.iter()
+                    .copied()
+                    .take_while(|c2| {
+                        !c2.is_whitespace() && !matches!(c2, ';' | '\n' | '\r' | '&' | '|')
+                    })
+                    .any(|c2| c2 == 'e')
+            }) {
+                return true;
+            }
+            // One flag run per substitute command; keep scanning for the
+            // NEXT `s<delim>` command.
+            break;
+        }
+    }
+    false
+}
+
+/// Bounded standalone-`e`-command walk: `;`/newline-separated chunks whose
+/// first character is `e` followed by end/space/tab execute code.
+fn sed_standalone_exec_command(script: &str) -> bool {
+    script.split([';', '\n', '\r']).any(|chunk| {
+        let chunk = chunk.trim_start();
+        chunk.starts_with('e') && (chunk.len() == 1 || chunk[1..].starts_with([' ', '\t']))
     })
 }
 
@@ -766,11 +871,29 @@ fn list_segments(tokens: &[String]) -> Vec<ListSegment> {
     segments
 }
 
-/// Whether `lead` names the `xargs` utility: the exact token or any path form
-/// whose basename is `xargs` (`/usr/bin/xargs`, `./xargs`). Flag positions
-/// (`xargs -0 rm`) do not change the lead, so the bare-name match covers them.
-fn is_xargs_lead(lead: &str) -> bool {
-    lead.rsplit(['/', '\\']).next() == Some("xargs")
+/// Whether `lead` names the `xargs` utility (2026-09-15 sweep). Three
+/// obfuscations used to defeat the exact-basename match, all fail-closed
+/// over:
+///
+/// - **Glued redirect inside the same token** (`xargs>f`, `'xargs'>f`): the
+///   content section carries `xargs` between redirect operators, so the
+///   section text is split on `>`/`<` and every piece's basename is tested.
+/// - **Quote-concatenation** (`x''args`, `x""args`): the shell joins the
+///   quoted fragments into one word, so quote characters are stripped before
+///   the basename compare.
+/// - **Backslash-escape** (`x\args`): `\a` expands to `a`, so backslashes are
+///   stripped the same way.
+///
+/// Only this detection path normalizes — general tokenization
+/// (`flat_tokens`) and the redirect scans are untouched, so legitimately
+/// quoted arguments elsewhere keep their original pass/block behavior. Path
+/// forms route through the same compare (`/usr/bin/xargs`, `./xargs`).
+/// Conservative over-triggers cost a rejection at most: any path component
+/// spelled `xargs` (e.g. `rm /root/xargs/backup`) arms the pipeline-wide
+/// suspicion, never grants anything.
+fn is_xargs_lead(section: &str) -> bool {
+    let normalized: String = section.replace(['\'', '"', '\\'], "");
+    normalized.split(['>', '<', '/']).any(|piece| piece == "xargs")
 }
 
 /// N-4 (2026-09-14): `xargs` consumes the WHOLE pipeline's stdout as argv
@@ -814,6 +937,37 @@ fn scan_xargs_pipeline(
         }
     }
     Ok(())
+}
+
+/// Whether any `>(`/`<(` inside `token` opens a process substitution whose
+/// inner command contains a non-read-only verb (2026-09-15, bounded minimal
+/// fallback — not a recursive re-parse): the inner text is bounded by the
+/// NEXT `)` inside the token (or the token end when the argv spans tokens),
+/// split on the separator set, and every inner segment chunk's LEAD must be
+/// a [`READ_ONLY_VERBS`] member. `>(tee out`)` trips (tee writes); `<(grep
+/// root /etc/os-release)` passes (read-only inner). Conservative: a
+/// chunk-lead not in the table (`env cmd`) already triggers — cost at most
+/// a rejection; only ever narrows.
+fn process_substitution_mutates(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    for pos in 0..token.len().saturating_sub(1) {
+        if (bytes[pos] != b'>' && bytes[pos] != b'<') || bytes[pos + 1] != b'(' {
+            continue;
+        }
+        let inner_end = token[pos + 2..].find(')').map(|rel| pos + 2 + rel).unwrap_or(token.len());
+        let inner = &token[pos + 2..inner_end];
+        for chunk in inner.split(['|', '&', ';']) {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+            let lead = chunk.split_whitespace().next().unwrap_or(chunk);
+            if !READ_ONLY_VERBS.contains(&lead) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// General path-argument containment: for mutation-capable leads, any
@@ -867,6 +1021,20 @@ fn scan_path_arguments(
         .iter()
         .any(|segment| segment.sections.iter().any(|(_, section)| is_xargs_lead(section)));
     if xargs_anywhere && !fully_read_only {
+        for flag in all_read_only.iter_mut() {
+            *flag = false;
+        }
+    }
+    // Process substitution (2026-09-15): `>(…)`/`<(…)` bodies execute as
+    // commands whose flattened-token argv containment cannot cleanly
+    // reassemble (`echo hi >(rm ~/x)` used to pass inside the read-only
+    // `echo` segment exemption — the inner `rm ~/x` argv spans the tokens
+    // after the paren). A mutating inner verb suspends the exemption
+    // pipeline-wide (same fail-closed shape as the `xargs` arm): a trigger
+    // only ever NARROWS the exemption, never widens it. No
+    // `fully_read_only` gate: the inner mutating command IS the pipeline's
+    // mutation, in whatever token the shell ate it.
+    if tokens.iter().any(|token| process_substitution_mutates(token)) {
         for flag in all_read_only.iter_mut() {
             *flag = false;
         }
@@ -1225,6 +1393,81 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn awk_sed_program_bodies_lift_read_only_exemption() {
+        let (root, _dir) = temp_root();
+        // 2026-09-15: awk/sed program bodies execute code no token scan can
+        // see into (`system()`, pipes into getline, `s///e`, standalone `e`),
+        // so their invocations must NOT keep the read-only exemption — an
+        // out-of-root path argument is resolved like any mutating segment.
+        for command in [
+            "awk '{system(\"rm /etc/hosts\")}' /etc/passwd",
+            "awk '{cmd | getline}' /etc/hosts",
+            "awk '{cmd|& getline}' /etc/hosts",
+            "sed 's/x/y/e' /etc/hosts",
+            "sed 's/x/y/;e cat /etc/hosts' f",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: executing program body lifts the exemption, got: {err}"
+            );
+        }
+        // In-root versions of the same bodies stay passable (paths resolve).
+        contain_shell_command(&root, &root, "awk '{system(\"rm notes.txt\")}' notes.txt", &[])
+            .expect("in-root awk system body allowed");
+        contain_shell_command(&root, &root, "sed 's/x/y/e' notes.txt", &[])
+            .expect("in-root sed s///e allowed");
+        // Preserved pins: plain program bodies keep the read-only exemption
+        // (including against absolute read targets).
+        contain_shell_command(&root, &root, "awk '{print $1}' /etc/os-release", &[])
+            .expect("plain awk '{print $1}' stays free");
+        contain_shell_command(&root, &root, "awk -F: '{print $NF}' /etc/os-release", &[])
+            .expect("plain awk with field flags stays free");
+        contain_shell_command(&root, &root, "sed 's/a/b/' /etc/hosts", &[])
+            .expect("plain sed stays free");
+        contain_shell_command(&root, &root, "sed 's/x/y/I' /etc/hosts", &[])
+            .expect("sed with other flags (I) stays free");
+        // Documented residual: the `-f`/`--file` script-file bodies stay
+        // invisible to this scan; the flag path is unchanged.
+        contain_shell_command(&root, &root, "awk", &["-f".into(), "s.awk".into(), "f".into()])
+            .expect("awk -f path shape unchanged (script bodies remain a residual)");
+    }
+
+    #[test]
+    fn process_substitution_mutating_inner_resolves_inner_argv() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15 (bounded minimal fallback): the shell executes the
+        // `>(…)`/`<(…)` body as a command whose argv spans the tokens after
+        // the paren; the read-only `echo` segment used to exempt them all.
+        // A mutating inner verb suspends the exemption pipeline-wide, so the
+        // inner argv resolves like any mutating segment's targets.
+        for command in [
+            "echo hi >(rm /etc/shadow)",
+            "echo hi <(rm /etc/shadow)",
+            "echo hi >(rm /etc/shadow extra)",
+            "echo hi | xargs <(rm /etc/shadow)",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: mutating process substitution content, got: {err}"
+            );
+        }
+        // In-root mutating inner content stays passable, and read-only inner
+        // verbs (including readers of outside files, like `cat` itself) keep
+        // their exemption.
+        contain_shell_command(&root, &root, "echo hi >(rm -rf notes.txt)", &[])
+            .expect("in-root process substitution allowed");
+        contain_shell_command(&root, &root, "echo hi <(wc -l notes.txt)", &[])
+            .expect("read-only inner command stays free");
+        contain_shell_command(&root, &root, "cat <(grep root /etc/os-release) | head", &[])
+            .expect("cat reading a read-only substitution stays free");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("bare > redirect untouched by the substitution check");
+    }
+
     // -----------------------------------------------------------------------
     // Redirect writes.
     // -----------------------------------------------------------------------
@@ -1478,6 +1721,65 @@ mod tests {
             .expect("read-only pipeline with outside read arg stays free");
         // `~+`/`~-` and heredoc bodies are documented-only v1 limitations; no
         // behavior change is asserted here beyond the free pipeline above.
+    }
+
+    #[test]
+    fn xargs_glued_into_redirect_tokens_detected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15: `xargs` glued inside a redirect-carrying token was
+        // invisible to the basename match — the section text carries `xargs`
+        // between `>`/`<` operators. A redirect-glued command lead still
+        // executes `xargs` (with the pipeline's stdout as argv), so the
+        // pipeline-wide suspension must arm for these spellings too.
+        for command in ["echo /etc/shadow | xargs>f rm", "echo /etc/shadow |'xargs'>f rm"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: xargs glued into redirect tokens, got: {err}"
+            );
+        }
+        // Preserved pin: redirect glue without any xargs spelling keeps
+        // resolving targets in-root as before — and `>xargs` as a redirect
+        // TARGET (a file literally named `xargs`) is redirected output, not
+        // an xargs execution, so a fully read-only segment stays passable.
+        contain_shell_command(&root, &root, "echo hi >out.txt>notes.txt", &[])
+            .expect("xargs-free double write glue unchanged");
+        contain_shell_command(&root, &root, "cat notes.txt >xargs>f", &[])
+            .expect("redirect into files named xargs/f stays free (no xargs command)");
+        contain_shell_command(&root, &root, "cat notes.txt >out.xargs.log", &[])
+            .expect("filename merely spelling 'xargs' in a suffix stays free");
+    }
+
+    #[test]
+    fn xargs_quote_concat_and_backslash_escapes_detected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15: quote-concatenation (`x''args`, `x""args`) and
+        // backslash-escaping (`x\args`) re-form the word `xargs` in the shell
+        // while defeating the exact basename match. The detection strips
+        // quote characters and backslashes before comparing.
+        for command in [
+            "echo /etc/shadow | x''args rm",
+            "echo /etc/shadow | x\"\"args rm",
+            "echo /etc/shadow | x\\args rm",
+            "echo /etc/shadow | x'a'rgs rm",
+            "echo /etc/shadow | ./x\\args rm",
+            "echo /etc/shadow | /usr/bin/x''args rm",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: quote/backslash-obfuscated xargs, got: {err}"
+            );
+        }
+        // Preserved pin: no normalization outside the xargs detection path.
+        contain_shell_command(&root, &root, "echo x\nargs notes.txt", &[])
+            .expect("fragmented non-xargs command stays free");
+        contain_shell_command(&root, &root, "cat notes.txt | grep xargs | head", &[])
+            .expect("grep xargs pattern in read-only pipeline stays free");
+        contain_shell_command(&root, &root, "echo /etc/shadow | xargs-y rm", &[])
+            .expect("affix-bearing lookalike is not the xargs utility");
     }
 
     #[test]
