@@ -357,6 +357,7 @@ mod tests {
             expected_artifacts: vec!["src/panel.rs".into()],
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: OffsetDateTime::now_utc(),
             status,
         }

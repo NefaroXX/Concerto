@@ -49,14 +49,23 @@
 //!   fold because they do compatible work. Roles differ ⇒ the coordinator
 //!   must first choose WHO does the merged work, which is a dispatch
 //!   decision, not a transform.
+//! - **Freezable** (issue #64): 1..=[`MAX_FREEZE_TASK_IDS`] distinct tasks,
+//!   all present, ALL status `Pending`. A freeze marks each task `Blocked`
+//!   (with a `completed_at` tombstone) so it never re-enters the ready
+//!   queue on its own; the handler pairs the freeze with marking the
+//!   superseded decision [`crate::decisions::DecisionStatus::Superseded`].
+//!   Completed work is untouched — a running/completed/failed task is never
+//!   refrozen, and dependents of a frozen task become unready naturally
+//!   (`blocked_on` filters non-Completed dependencies), never by a cascade
+//!   rewrite.
 //!
 //! # Determinism
 //!
 //! The merge survivor is the LOWEST task id (ULID order); removed members
-//! are reported ascending. The same input spec against the same graph
-//! always produces the same survivor, spec, and edge set (a split's child
-//! ids are fresh ULIDs by design — the graph structure is what is
-//! deterministic).
+//! are reported ascending. A freeze reports the frozen ids ascending. The
+//! same input spec against the same graph always produces the same survivor,
+//! spec, and edge set (a split's child ids are fresh ULIDs by design — the
+//! graph structure is what is deterministic).
 //!
 //! A rejected transform is a structured [`TransformRejection`] — no state
 //! mutation, no coordinator crash, mirroring the issue-#52 decision
@@ -73,6 +82,16 @@ pub const MAX_SPLIT_CHILDREN: usize = 8;
 
 /// Maximum number of tasks one merge may fold (including the survivor).
 pub const MAX_MERGE_TASK_IDS: usize = 16;
+
+/// Issue #64: maximum number of pending tasks one reconsideration may
+/// freeze (the affected-task bound is per-decision, so a larger scope is
+/// frozen in stages across multiple decisions).
+pub const MAX_FREEZE_TASK_IDS: usize = 48;
+
+/// Issue #64: the longest accepted superseded-decision id. Real decision
+/// ids are ULIDs (~26 chars); the cap is generous defense-in-depth so a
+/// model cannot stuff an unbounded "reference" into a freeze payload.
+pub const MAX_FREEZE_DECISION_ID_CHARS: usize = 64;
 
 /// Maximum characters accepted for a merge's merged task description.
 pub const MAX_MERGE_DESCRIPTION_CHARS: usize = crate::decisions::MAX_DECISION_TASK_CHARS;
@@ -141,6 +160,20 @@ pub enum TaskTransformSpec {
         #[serde(default)]
         merged_artifacts: Vec<String>,
     },
+    /// Issue #64: freeze the pending tasks that stood behind a superseded
+    /// decision. Each affected task becomes `Blocked` (with a
+    /// `completed_at` tombstone) so it never re-enters the ready queue on
+    /// its own; dependent tasks become unready naturally through the
+    /// graph's `blocked_on` predicate — no cascade rewrite.
+    Freeze {
+        /// The decision being superseded (the reason this freeze exists).
+        /// Referenced by the handler to mark the journal entry
+        /// `Superseded`.
+        decision_id: String,
+        /// The pending tasks whose plans the superseded decision stood
+        /// behind (deduplicated; reported ascending by id).
+        task_ids: Vec<TaskId>,
+    },
 }
 
 /// The outcome of one committed transform.
@@ -151,6 +184,9 @@ pub enum TransformOutcome {
     Split(SplitOutcome),
     /// The survivor and the removed members (ascending by id).
     Merge(MergeOutcome),
+    /// Issue #64: the superseded decision id and the frozen task ids
+    /// (ascending by id).
+    Freeze(FreezeOutcome),
 }
 
 /// The outcome of one committed split.
@@ -166,6 +202,14 @@ pub struct SplitOutcome {
 pub struct MergeOutcome {
     pub survivor: TaskId,
     pub removed: Vec<TaskId>,
+}
+
+/// Issue #64: the outcome of one committed freeze — the superseded
+/// decision id and the tasks frozen (ascending by id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreezeOutcome {
+    pub decision_id: String,
+    pub frozen: Vec<TaskId>,
 }
 
 /// Prove a split/merge payload against a THROWAWAY COPY of the graph (so an
@@ -219,6 +263,9 @@ fn apply_spec(
             apply_split(graph, spec, now).map(TransformOutcome::Split)
         }
         TaskTransformSpec::Merge { .. } => apply_merge(graph, spec).map(TransformOutcome::Merge),
+        TaskTransformSpec::Freeze { .. } => {
+            apply_freeze(graph, spec, now).map(TransformOutcome::Freeze)
+        }
     }
 }
 
@@ -487,6 +534,90 @@ pub fn apply_merge(
     Ok(MergeOutcome { survivor, removed })
 }
 
+/// Issue #64: apply FREEZE mutably (the proof runner calls it on a copy
+/// first; tests may call it directly on a scratch graph). Validation happens
+/// in full on every call and mutates NOTHING on rejection — a reconsideration
+/// that names completed or running work is a structured error, never a
+/// silent re-block.
+pub fn apply_freeze(
+    graph: &mut TaskGraph,
+    spec: &TaskTransformSpec,
+    now: OffsetDateTime,
+) -> Result<FreezeOutcome, TransformRejection> {
+    let TaskTransformSpec::Freeze { decision_id, task_ids } = spec else {
+        return Err(mismatched_payload());
+    };
+
+    // ── Shape: a referenced (non-empty, bounded) decision and a deduped
+    //    group of ≥ 1 affected tasks ─────────────────────────────────────
+    let decision_id = decision_id.trim();
+    if decision_id.is_empty() {
+        return Err(reject(
+            "incomplete_decision",
+            "reconsider: the freeze needs the non-empty decision id it supersedes".to_owned(),
+        ));
+    }
+    if decision_id.chars().count() > MAX_FREEZE_DECISION_ID_CHARS {
+        return Err(reject(
+            "decision_id_too_long",
+            "reconsider: the superseded decision id exceeds the id length cap; \
+             cite the real short decision id"
+                .to_owned(),
+        ));
+    }
+    let mut seen: HashSet<TaskId> = HashSet::new();
+    let group: Vec<TaskId> = task_ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    if group.is_empty() {
+        return Err(reject(
+            "freeze_empty",
+            "reconsider: name at least one affected pending task id to freeze".to_owned(),
+        ));
+    }
+    if group.len() > MAX_FREEZE_TASK_IDS {
+        return Err(reject(
+            "freeze_too_many",
+            format!(
+                "reconsider: freeze at most {MAX_FREEZE_TASK_IDS} pending tasks per decision \
+                 (got {}); freeze in stages",
+                group.len()
+            ),
+        ));
+    }
+
+    // ── Eligibility: every task exists and is Pending ──────────────────
+    for id in &group {
+        let Some(task) = graph.get(id) else {
+            return Err(reject(
+                "unknown_task",
+                format!("reconsider: no task {id} in the graph; freeze PENDING task ids"),
+            ));
+        };
+        if task.status != SubTaskStatus::Pending {
+            return Err(reject(
+                "not_freezeable",
+                format!(
+                    "reconsider: task {id} is {:?}; only Pending tasks freeze — completed, \
+                     failed, running, or already-blocked work is never refrozen",
+                    task.status
+                ),
+            ));
+        }
+    }
+
+    // ── Commit: mark blocked (the settle-unresolved tombstone pattern) ──
+    // Completed work stays untouched; the freeze is a status rewrite only.
+    let mut frozen: Vec<TaskId> = group.clone();
+    frozen.sort_by_key(|id| id.0); // ascending report, deterministic
+    for id in &frozen {
+        graph.mark_blocked(id);
+        if let Some(task) = graph.get_mut(id) {
+            task.completed_at = Some(now);
+        }
+    }
+
+    Ok(FreezeOutcome { decision_id: decision_id.to_owned(), frozen })
+}
+
 fn is_splittable_status(status: SubTaskStatus) -> bool {
     matches!(status, SubTaskStatus::Pending | SubTaskStatus::Running)
 }
@@ -646,6 +777,7 @@ mod tests {
                 children: vec![child_spec("part one", vec![]), child_spec("part two", vec![])],
             }),
             max_tool_calls: None,
+            wait_record: None,
             created_at: now(),
             status: crate::decisions::DecisionStatus::Settled,
         };
@@ -1145,6 +1277,109 @@ mod tests {
         assert_eq!(
             survivor.survivor,
             split_children.iter().min_by_key(|id| id.0).copied().unwrap()
+        );
+    }
+
+    // ── Issue #64: the Freeze transform ─────────────────────────────────
+
+    /// Freeze marks pending tasks Blocked (with a completed_at tombstone),
+    /// reports them ascending, and leaves completed work untouched.
+    #[test]
+    fn freeze_blocks_pending_tasks_and_reports_ascending() {
+        let mut graph = base_graph(); // 1 Completed, 2+3 Pending.
+        let when = now();
+        let spec = TaskTransformSpec::Freeze {
+            decision_id: "d-reconsider".to_owned(),
+            task_ids: vec![fixed(3), fixed(2), fixed(3)], // unsorted + duplicate
+        };
+        let outcome = apply_transform(&mut graph, &spec, when).expect("freeze");
+        let TransformOutcome::Freeze(outcome) = outcome else {
+            panic!("wrong outcome");
+        };
+        assert_eq!(outcome.decision_id, "d-reconsider");
+        assert_eq!(outcome.frozen, vec![fixed(2), fixed(3)], "ascending, deduplicated");
+        assert_eq!(graph.get(&fixed(2)).expect("task 2").status, SubTaskStatus::Blocked);
+        assert_eq!(graph.get(&fixed(3)).expect("task 3").status, SubTaskStatus::Blocked);
+        assert_eq!(
+            graph.get(&fixed(2)).expect("task 2").completed_at,
+            Some(when),
+            "the freeze tombstones completed_at like settle-unresolved"
+        );
+        assert_eq!(
+            graph.get(&fixed(1)).expect("task 1").status,
+            SubTaskStatus::Completed,
+            "completed work is never touched"
+        );
+        assert!(
+            graph.ready_tasks().iter().all(|task| task.status != SubTaskStatus::Pending),
+            "frozen tasks never re-enter the ready queue"
+        );
+        assert!(TaskGraphValidator::validate(&graph).is_ok(), "a freeze keeps the DAG valid");
+    }
+
+    /// A freeze is deterministic: the same spec against the same graph
+    /// produces the same frozen set regardless of input order.
+    #[test]
+    fn freeze_is_deterministic_across_input_orders() {
+        let mut first = base_graph();
+        let mut second = base_graph();
+        let spec = |ids: Vec<TaskId>| TaskTransformSpec::Freeze {
+            decision_id: "d-1".to_owned(),
+            task_ids: ids,
+        };
+        let a = apply_freeze(&mut first, &spec(vec![fixed(3), fixed(2)]), now()).expect("freeze a");
+        let b =
+            apply_freeze(&mut second, &spec(vec![fixed(2), fixed(3)]), now()).expect("freeze b");
+        assert_eq!(a.frozen, b.frozen, "input order never changes the frozen set");
+    }
+
+    /// Only Pending tasks freeze — naming completed or running work is a
+    /// structured rejection, never a state mutation.
+    #[test]
+    fn freeze_rejects_completed_and_unknown_tasks() {
+        let mut graph = base_graph();
+        let spec = TaskTransformSpec::Freeze {
+            decision_id: "d-1".to_owned(),
+            task_ids: vec![fixed(1)], // Completed
+        };
+        let error =
+            apply_freeze(&mut graph, &spec, now()).expect_err("completed work never refreezes");
+        assert_eq!(error.code, "not_freezeable");
+        assert_eq!(graph.get(&fixed(1)).expect("task 1").status, SubTaskStatus::Completed);
+
+        let spec = TaskTransformSpec::Freeze {
+            decision_id: "d-1".to_owned(),
+            task_ids: vec![fixed(99)], // absent
+        };
+        let error = apply_freeze(&mut graph, &spec, now()).expect_err("unknown task");
+        assert_eq!(error.code, "unknown_task");
+    }
+
+    /// A freeze with an empty id, no tasks, or too many tasks is rejected
+    /// before any mutation.
+    #[test]
+    fn freeze_rejects_bad_shape() {
+        let mut graph = base_graph();
+        let empty_id =
+            TaskTransformSpec::Freeze { decision_id: "   ".to_owned(), task_ids: vec![fixed(2)] };
+        assert_eq!(
+            apply_freeze(&mut graph, &empty_id, now()).unwrap_err().code,
+            "incomplete_decision"
+        );
+
+        let no_tasks =
+            TaskTransformSpec::Freeze { decision_id: "d-1".to_owned(), task_ids: Vec::new() };
+        assert_eq!(apply_freeze(&mut graph, &no_tasks, now()).unwrap_err().code, "freeze_empty");
+
+        let too_many = TaskTransformSpec::Freeze {
+            decision_id: "d-1".to_owned(),
+            task_ids: (1..=MAX_FREEZE_TASK_IDS as u128 + 1).map(fixed).collect(),
+        };
+        assert_eq!(apply_freeze(&mut graph, &too_many, now()).unwrap_err().code, "freeze_too_many");
+        assert_eq!(
+            graph.get(&fixed(2)).expect("task 2").status,
+            SubTaskStatus::Pending,
+            "rejections mutate nothing"
         );
     }
 }

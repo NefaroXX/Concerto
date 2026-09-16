@@ -169,6 +169,15 @@ fn compute_generation(entries: &[SnapshotEntry]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Issue #65: deterministic content-addressed generation id for an arbitrary
+/// captured inventory (identical to [`compute_generation`]). Exposed so
+/// detection paths OUTSIDE the persistence barrier — the live wait wake and
+/// the external-change scan — can compare generations and diff inventories
+/// without re-running the barrier's whiteboard/fact side effects.
+pub fn generation_for(entries: &[SnapshotEntry]) -> String {
+    compute_generation(entries)
+}
+
 /// Deterministic, language-agnostic inventory walk over `project_dir`:
 ///
 /// - files only (directories are never recorded as entries),
@@ -741,5 +750,49 @@ mod tests {
             !dir_component_is_skipped(Path::new("/project/build.rs")),
             "a *file* named build.rs is not on the skip list"
         );
+    }
+
+    /// Issue #65: `generation_for` is the barrier-free content-addressed id —
+    /// deterministic, order-independent, and stable across holds of the same
+    /// inventory (the live wake/scan uses it against `compute_generation`).
+    #[test]
+    fn generation_for_is_deterministic_and_order_independent() {
+        let entries = vec![
+            SnapshotEntry {
+                path: "src/b.rs".to_owned(),
+                size_bytes: Some(20),
+                mtime_ms: Some(2),
+                content_hash: Some("h2".to_owned()),
+            },
+            SnapshotEntry {
+                path: "src/a.rs".to_owned(),
+                size_bytes: Some(10),
+                mtime_ms: Some(1),
+                content_hash: Some("h1".to_owned()),
+            },
+        ];
+        let again = vec![
+            SnapshotEntry {
+                path: "src/a.rs".to_owned(),
+                size_bytes: Some(10),
+                mtime_ms: Some(1),
+                content_hash: Some("h1".to_owned()),
+            },
+            SnapshotEntry {
+                path: "src/b.rs".to_owned(),
+                size_bytes: Some(20),
+                mtime_ms: Some(2),
+                content_hash: Some("h2".to_owned()),
+            },
+        ];
+        assert_eq!(generation_for(&entries), generation_for(&again));
+        assert_eq!(generation_for(&entries), compute_generation(&entries));
+        let touched = vec![SnapshotEntry {
+            path: "src/a.rs".to_owned(),
+            size_bytes: Some(10),
+            mtime_ms: Some(99),
+            content_hash: Some("h1".to_owned()),
+        }];
+        assert_ne!(generation_for(&entries), generation_for(&touched));
     }
 }

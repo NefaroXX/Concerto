@@ -36,7 +36,7 @@ use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
 use concerto_sessions::whiteboard::append_whiteboard_event;
-use concerto_sessions::whiteboard::{load_whiteboard_events, WhiteboardLoadOpts};
+use concerto_sessions::whiteboard::{latest_gate_seq, load_whiteboard_events, WhiteboardLoadOpts};
 use concerto_sessions::{
     NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
     SessionStore, WhiteboardEvent, WhiteboardKind,
@@ -70,6 +70,11 @@ use crate::speculation::{
     MIN_SPECULATIVE_HYPOTHESES,
 };
 use crate::state::OrchestratorState;
+use crate::wait::{
+    check_wake, execute_wait, task_is_resolved, wait_tool_definition, wake_reason_label, WaitArgs,
+    WaitConfig, WaitingRecord, WakeCondition, WakeOutcome, WakeReason, WakeRefiner, WakeState,
+    WakeView, MAX_WAIT_AFFECTED_IDS, WAIT_TOOL,
+};
 use tracing::warn;
 
 /// Default dispatch-attempt ceiling per subtask before the fallback ladder
@@ -122,6 +127,16 @@ pub(crate) const DRAFT_PLAN_TOOL: &str = "draft_plan";
 pub(crate) const SPLIT_TASK_TOOL: &str = "split_task";
 pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 
+/// Issue #64: the explicit reconsideration surface. The Coordinator's model
+/// supersedes a decision whose assumptions proved wrong by marking it
+/// `Superseded` in the decision journal and freezing ONLY the affected
+/// pending tasks (deterministic `Freeze` transform). Completed work, valid
+/// evidence, and accepted artifacts are never touched; the loop returns to
+/// strategy selection from the current world state after the tool result.
+/// Like split/merge it dispatches no agents and touches no tools, so it
+/// applies no policy gate (there is nothing to gate).
+pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -160,6 +175,15 @@ Speculative investigation (read-only, for conflicting hypotheses):
 - investigate_hypotheses runs 2–4 bounded consultations in parallel. Each hypothesis is a distinct question to a named specialist under the same read-only contract as consult_specialist.
 - Findings are advisory only; the comparator ranks them (completed-with-evidence first) and returns a recommended hypothesis. No hypothesis is auto-promoted to verified — a separate explicit verification step is required before promoting any finding.
 - Use this when a decision is ambiguous and you want competing advisory answers before committing to a dispatch. Verify the recommended hypothesis (or reconcile conflicting findings) before acting on it.
+
+Waiting on external reality (issue #63):
+- wait suspends the decision loop on a declarative condition or a hard deadline — no model turns, no dispatch, no stall flag. Use it when the next step is genuinely blocked on something outside this loop: tasks you are waiting to settle (event-resolved), a workspace that must change first (workspace-generation-changed), a review or finding event you expect to land (new-evidence), or simply a wall-clock deadline.
+- The loop re-evaluates in bounded, cancellable slices and the tool returns why the wait ended: woken (a condition tripped), expired (the deadline passed), or still-waiting (the internal cap was reached). Decide the next step from that result — re-wait, proceed, or give up.
+- A wait must declare at least one condition or a deadline; fabricated evidence ids are rejected exactly like everywhere else.
+
+Superseding a decision whose assumptions proved wrong (issue #64):
+- reconsider marks one of this run's journaled decisions Superseded and freezes ONLY the affected PENDING tasks whose plans it stood behind. Use it when new evidence or a settlement shows a decision's assumptions no longer hold. Name the real decision id, the pending task ids, and cite the evidence that changed your mind.
+- Completed work, valid evidence, and accepted artifacts are never touched; frozen tasks never re-dispatch on their own. Re-plan the frozen work yourself, under fresh decisions, from the current world state. An unknown or already-rejected decision id is a structured rejection you can read and fix.
 
 Artifact ownership (issue #61):
 - A write by a non-owner to an OWNED artifact is refused; the refusal names the owner and its acquiring event. To hand an owned artifact over to another agent, call transfer_ownership — the mediated handover is the only lawful way; ownership is never stolen.
@@ -356,6 +380,60 @@ fn merge_tasks_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["task_ids", "merged_description"]
+        }),
+    }
+}
+
+/// Issue #64: argument schema for `reconsider` — supersede a decision whose
+/// assumptions proved wrong and freeze only the pending tasks that stood
+/// behind it. Completed work, valid evidence, and accepted artifacts are
+/// never touched; the affected tasks never re-enter the ready queue on
+/// their own.
+fn reconsider_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: RECONSIDER_TOOL.to_string(),
+        description: "Supersede a decision whose assumptions proved wrong (issue #64): \
+                      mark the cited decision Superseded in the run's journal and freeze \
+                      ONLY the affected PENDING tasks (they become blocked and never \
+                      re-dispatch on their own). Completed work, valid evidence, and \
+                      accepted artifacts are untouched. You re-plan the frozen work \
+                      yourself, under fresh decisions, from the current world state."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision_id": {
+                    "type": "string",
+                    "description": "The id of a decision recorded in this run's journal (from the \
+                                    context) whose assumptions you are superseding. Unknown ids and \
+                                    already-rejected decisions are rejected."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the decision's assumptions no longer hold; recorded as the \
+                                    reconsideration decision's reason."
+                },
+                "affected_task_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 48,
+                    "items": { "type": "string" },
+                    "description": "The PENDING task ids whose plans that decision stood behind, to \
+                                    freeze. Completed/running/failed tasks are rejected — freeze only \
+                                    pending work."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional extra guidance, recorded in the decision notes."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the reconsideration. \
+                                    Fabricated ids are rejected."
+                }
+            },
+            "required": ["decision_id", "reason", "affected_task_ids"]
         }),
     }
 }
@@ -836,6 +914,26 @@ struct DispatchLedger {
     notes: Vec<String>,
 }
 
+/// Issue #63: the coordinator's live-world refiner for one parked wait.
+///
+/// Holds immutable reborrows of the coordinator, the graph, and the wait
+/// record for the duration of a single [`execute_wait`] call. The borrow is
+/// scoped to [`CoordinatorAgent::handle_wait`]'s park block, so `&mut self`
+/// resumes afterwards for settling and checkpointing.
+struct CoordinatorWakeRefiner<'a> {
+    coordinator: &'a CoordinatorAgent,
+    graph: &'a TaskGraph,
+    session_id: Ulid,
+    record: &'a WaitingRecord,
+    cancel: CancellationToken,
+}
+
+impl WakeRefiner for CoordinatorWakeRefiner<'_> {
+    async fn refine(&self) -> WakeView {
+        self.coordinator.wake_view_for(self.graph, self.session_id, self.record, &self.cancel).await
+    }
+}
+
 /// ADR-65 §7: the outcome of a resume evaluation applied to the restored
 /// state. `Replan` returns no ledger — the caller falls through to fresh
 /// decomposition (the Phase-6 scheduler governs the new planning; the
@@ -1094,6 +1192,19 @@ pub struct CoordinatorAgent {
     /// (computed once at restore time). While set, the world model marks
     /// log-derived facts stale and answers no verified-clean queries.
     workspace_changed_since_checkpoint: bool,
+    /// Issue #63: the in-flight WAIT record — set just before `execute_wait`
+    /// parks the decision loop, cleared when the wait settles. Captured into
+    /// every checkpoint (additive) so a crash mid-wait is resumable: a
+    /// resume re-evaluates the wait against the CURRENT world once and
+    /// reports the outcome (woken/expired/still-waiting) to the model —
+    /// never silently dropped, never re-entering the sleep loop.
+    active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the explicit external-workspace-change records detected
+    /// this run — from the live wait wake (`workspace-generation-changed`)
+    /// or the F3 resume reconciliation. Persisted additively in every
+    /// checkpoint so a resume keeps reconciling the SAME changes; surfaced
+    /// to the world model as decision risks.
+    external_changes: Vec<crate::external_change::ExternalChangeRecord>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1481,6 +1592,35 @@ impl MergeTaskArgs {
     }
 }
 
+/// Issue #64: `reconsider` tool arguments — the superseded decision id,
+/// the reason (rides the decision's task text), the pending task ids to
+/// freeze, optional notes, and supporting evidence.
+struct ReconsiderArgs {
+    decision_id: String,
+    reason: String,
+    affected_task_ids: Vec<String>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl ReconsiderArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let decision_id = arguments.get("decision_id").and_then(serde_json::Value::as_str)?;
+        let reason = arguments.get("reason").and_then(serde_json::Value::as_str)?;
+        let affected_task_ids = parse_string_array(arguments, "affected_task_ids");
+        if affected_task_ids.is_empty() {
+            return None;
+        }
+        Some(Self {
+            decision_id: decision_id.to_owned(),
+            reason: reason.to_owned(),
+            affected_task_ids,
+            notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
+            supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
+        })
+    }
+}
+
 /// Read an optional JSON array-of-strings field, dropping non-string
 /// entries (absent/non-array ⇒ empty). `pub(crate)`: the consultation
 /// machinery (issue #59) parses its evidence list with the same shape.
@@ -1691,6 +1831,13 @@ impl CoordinatorAgent {
             // the checkpoint and this resume (the F3 generation verdict);
             // the world-model builder consumes it for the V-CHANGE rule.
             workspace_changed_since_checkpoint: false,
+            // Issue #63: no wait is parked at startup; the field is set only
+            // by the WAIT handler (and restored from checkpoints on resume).
+            active_wait: None,
+            // Issue #65: no external changes are recorded at startup; the
+            // field grows only through detection (live wait scan + F3
+            // resume reconciliation) and is restored from checkpoints.
+            external_changes: Vec::new(),
         }
     }
 
@@ -1856,6 +2003,7 @@ impl CoordinatorAgent {
                 pending: pending.as_ref(),
                 pending_stale,
                 previous_questions,
+                external_changes: &self.external_changes,
                 now_ms,
             });
         tracing::debug!(
@@ -1972,6 +2120,7 @@ impl CoordinatorAgent {
             expected_artifacts: Vec::new(),
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: crate::decisions::DecisionStatus::Validated,
         };
@@ -2582,6 +2731,242 @@ impl CoordinatorAgent {
         self.workspace_snapshot.as_ref().map(|snapshot| snapshot.generation.clone())
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #65: live external-workspace-change detection.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Captures the CURRENT workspace inventory plus its content-addressed
+    /// generation, off the decision-loop thread (the walk is blocking I/O).
+    /// `None` on cancellation or when no snapshot was captured — the caller
+    /// degrades fail-soft.
+    async fn capture_fresh_workspace(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Option<(String, Vec<concerto_sessions::SnapshotEntry>)> {
+        let snapshot = self.workspace_snapshot.as_ref()?;
+        let root = snapshot.project_root.clone();
+        let capture_cancel = cancel.clone();
+        let entries: Vec<concerto_sessions::SnapshotEntry> =
+            tokio::task::spawn_blocking(move || {
+                crate::workspace_snapshot::capture_workspace_snapshot(
+                    root.as_std_path(),
+                    &capture_cancel,
+                )
+            })
+            .await
+            .ok()?;
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let generation = crate::workspace_snapshot::generation_for(&entries);
+        Some((generation, entries))
+    }
+
+    /// The fresh-generation half of [`Self::capture_fresh_workspace`] — the
+    /// only half `wake_view_for` needs for a live `workspace-generation`
+    /// condition.
+    async fn capture_fresh_generation(&self, cancel: &CancellationToken) -> Option<String> {
+        self.capture_fresh_workspace(cancel).await.map(|(generation, _)| generation)
+    }
+
+    /// Canonical workspace-relative set of every path named as a planned or
+    /// expected artifact — the conflict half of an external-change record
+    /// (a change hitting a path this run has decided to produce is a conflict
+    /// the Coordinator must reconcile before it can rely on that artifact).
+    fn expected_artifact_paths(&self) -> std::collections::HashSet<String> {
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let Some(root) =
+            self.workspace_snapshot.as_ref().map(|snapshot| snapshot.project_root.as_std_path())
+        else {
+            return expected;
+        };
+        for paths in self.expected_artifacts_snapshot().values() {
+            for path in paths {
+                if let Some(canonical) =
+                    crate::tool_facts::canonical_project_path(root, path.as_str())
+                {
+                    expected.insert(canonical);
+                }
+            }
+        }
+        expected
+    }
+
+    /// Issue #65 (live scan): diff the CURRENT workspace against the run-
+    /// start snapshot and classify every changed path the run's OWN writes
+    /// do not explain into one explicit [`ExternalChangeRecord`] per path.
+    ///
+    /// - `own_written`: canonical paths the run itself wrote (the live
+    ///   ledger's `all_files` plus every completed result's `files_modified`)
+    ///   — never classified external (mirrors the F3 exclusion).
+    /// - `expected`: canonical planned/expected artifact paths — a change
+    ///   there is a conflict.
+    ///
+    /// The write-gate ownership table is consulted FIRST: a held path that
+    /// changed externally is flagged with its owner and marked stale, so the
+    /// model must re-read/preserve/escalate before the next write. Fail-soft:
+    /// no snapshot or a cancelled capture yields no records (a wait only
+    /// re-evaluates after a fresh capture succeeded).
+    async fn scan_external_changes(
+        &self,
+        graph: &TaskGraph,
+        own_written: &std::collections::HashSet<String>,
+        expected: &std::collections::HashSet<String>,
+        cancel: &CancellationToken,
+    ) -> Vec<crate::external_change::ExternalChangeRecord> {
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let Some((current_generation, captured)) = self.capture_fresh_workspace(cancel).await
+        else {
+            return Vec::new();
+        };
+        let changed = crate::external_change::diff_workspace_entries(&snapshot.entries, &captured);
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let root = snapshot.project_root.as_std_path();
+        let previous_generation = snapshot.generation.clone();
+        let detected_at_ms = crate::tool_facts::unix_ms();
+        let gate = self.write_gate.as_ref();
+        let mut records: Vec<crate::external_change::ExternalChangeRecord> = Vec::new();
+        for path in &changed {
+            let Some(canonical) = crate::tool_facts::canonical_project_path(root, path) else {
+                continue;
+            };
+            if own_written.contains(&canonical) {
+                // The run's own writes explain this path — not external.
+                continue;
+            }
+            // Ownership table first: a held path that changed is an external
+            // change CONFLICTING with in-flight work (the holder re-reads or
+            // transfers before relying on it).
+            let known_owner = gate.and_then(|gate| gate.ownership_owner(&canonical));
+            let known_task = known_owner.as_deref().and_then(|owner| {
+                graph
+                    .all_tasks()
+                    .into_iter()
+                    .find(|task| task.role.as_str() == owner)
+                    .map(|task| task.id.to_string())
+            });
+            if known_owner.is_some() {
+                if let Some(gate) = gate {
+                    if let Err(error) =
+                        gate.mark_artifact_stale(&canonical, "external-change-scan").await
+                    {
+                        warn!(
+                            %error,
+                            path = %canonical,
+                            "external change scan: stale mark failed; the record still surfaces \
+                             the change"
+                        );
+                    }
+                }
+            }
+            let conflicts = known_owner.is_some() || expected.contains(&canonical);
+            records.push(crate::external_change::ExternalChangeRecord::new(
+                vec![canonical],
+                Some(previous_generation.clone()),
+                Some(current_generation.clone()),
+                known_owner,
+                known_task,
+                conflicts,
+                detected_at_ms,
+            ));
+        }
+        records.sort_by(|a, b| a.first_path().cmp(&b.first_path()));
+        records
+    }
+
+    /// Upserts one record: an existing record for the same path AND previous
+    /// generation is replaced (a re-detection of the same change), otherwise
+    /// the record is appended. The list is bounded to the newest
+    /// [`MAX_EXTERNAL_CHANGE_RECORDS`](crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS).
+    fn upsert_external_change(&mut self, record: crate::external_change::ExternalChangeRecord) {
+        self.external_changes.retain(|existing| {
+            !(existing.first_path() == record.first_path()
+                && existing.previous_generation == record.previous_generation)
+        });
+        self.external_changes.push(record);
+        if self.external_changes.len() > crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS {
+            let excess =
+                self.external_changes.len() - crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS;
+            self.external_changes.drain(0..excess);
+        }
+    }
+
+    /// Issue #65 (resume path): the F3 reconciliation's external evidence —
+    /// paths the run's OWN writes do not explain — becomes explicit records
+    /// (ownership-aware, conflict-flagged, checkpoint-persisted) instead of a
+    /// one-shot verdict the model can only read once. A re-detection of the
+    /// same change (path + previous generation) simply re-upserts.
+    async fn record_resume_external_changes(
+        &mut self,
+        change: &resume::WorkspaceChange,
+        graph: &TaskGraph,
+        previous_generation: Option<String>,
+        cancel: &CancellationToken,
+    ) {
+        if change.externally_changed.is_empty() {
+            return;
+        }
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else {
+            return;
+        };
+        // Owned snapshots of everything the loop needs — `self` is mutated
+        // per record (upsert), so no borrow of `self` may span the loop.
+        let root = snapshot.project_root.clone();
+        let current_generation =
+            self.capture_fresh_generation(cancel).await.or_else(|| self.snapshot_generation());
+        let detected_at_ms = crate::tool_facts::unix_ms();
+        let expected = self.expected_artifact_paths();
+        // Borrow-free snapshot of the gate: ownership lookups below must not
+        // hold a borrow across the per-path `&mut self` upsert.
+        let gate = self.write_gate.clone();
+        for (path, _last_event_id) in &change.externally_changed {
+            let Some(canonical) =
+                crate::tool_facts::canonical_project_path(root.as_std_path(), path)
+            else {
+                continue;
+            };
+            // Ownership table first: a held path that changed externally is
+            // an ownership-hopeful conflict the Coordinator must reconcile.
+            let known_owner = gate.as_ref().and_then(|gate| gate.ownership_owner(&canonical));
+            let known_task = known_owner.as_deref().and_then(|owner| {
+                graph
+                    .all_tasks()
+                    .into_iter()
+                    .find(|task| task.role.as_str() == owner)
+                    .map(|task| task.id.to_string())
+            });
+            if known_owner.is_some() {
+                if let Some(gate) = gate.as_ref() {
+                    if let Err(error) =
+                        gate.mark_artifact_stale(&canonical, "external-change-resume").await
+                    {
+                        warn!(
+                            %error,
+                            path = %canonical,
+                            "external change resume: stale mark failed; the record still \
+                             surfaces the change"
+                        );
+                    }
+                }
+            }
+            let conflicts = known_owner.is_some() || expected.contains(&canonical);
+            let record = crate::external_change::ExternalChangeRecord::new(
+                vec![canonical],
+                previous_generation.clone(),
+                current_generation.clone(),
+                known_owner,
+                known_task,
+                conflicts,
+                detected_at_ms,
+            );
+            self.upsert_external_change(record);
+        }
+    }
+
     /// Attach the session's skills instructions (ADR-43, Task 4), injected
     /// into every planner prompt. Pass an empty string to omit them.
     pub fn with_skills_section(mut self, skills_section: String) -> Self {
@@ -2813,6 +3198,14 @@ impl CoordinatorAgent {
             // artifact-ownership state survives a resume (additive
             // checkpoint field).
             ownership: self.ownership_state(),
+            // Issue #63: the in-flight WAIT rides every persist so a crash
+            // mid-wait resumes by re-evaluating the record once (additive
+            // checkpoint field).
+            active_wait: self.active_wait.clone(),
+            // Issue #65: the explicit external-workspace-change records ride
+            // every persist so a resume reconciles the SAME changes
+            // (additive checkpoint field).
+            external_changes: self.external_changes.clone(),
         }
     }
 
@@ -3631,6 +4024,18 @@ impl CoordinatorAgent {
         // gate is the live read when attached; old checkpoints carry the
         // empty default — ownership re-derives from the log then).
         self.restore_ownership_state(&cp.ownership);
+        // Issue #63: restore the in-flight WAIT additively (old checkpoints
+        // carry the empty default). The resumed dispatch session re-evaluates
+        // it ONCE at the start of the next loop and reports the outcome to
+        // the model; resume never re-enters the park loop.
+        self.active_wait = cp.active_wait.clone();
+        // Issue #65: restore the explicit external-workspace-change records
+        // additively (old checkpoints carry the empty default). The resumed
+        // run keeps reconciling the SAME recorded changes — they ride into
+        // the world model as decision risks — and the F3 verdict below
+        // re-detects anything new (upsert-deduped by path + generation).
+        self.external_changes = cp.external_changes.clone();
+        self.external_changes.truncate(crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS);
         self.workspace_changed_since_checkpoint =
             match (&cp.snapshot_generation, self.snapshot_generation()) {
                 (Some(recorded), Some(current)) => recorded.as_str() != current.as_str(),
@@ -4015,6 +4420,16 @@ impl CoordinatorAgent {
         let change = self
             .workspace_change_verdict(checkpoint_snapshot_generation, &own_written, cancel)
             .await;
+        // Issue #65: the F3 external evidence becomes explicit, reconcilable
+        // records (ownership-aware, conflict-flagged, checkpoint-persisted)
+        // instead of a one-shot verdict the model reads once and loses.
+        self.record_resume_external_changes(
+            &change,
+            graph,
+            checkpoint_snapshot_generation.map(str::to_owned),
+            cancel,
+        )
+        .await;
         let outcome = resume::evaluate(&resume::ResumeInput {
             blocked_step: blocked.as_ref(),
             replacement_candidates: &candidates,
@@ -7428,6 +7843,12 @@ impl CoordinatorAgent {
             // Issue #62: the speculative investigation surface — concurrent
             // bounded read-only consultations; findings are advisory.
             tool_defs.push(investigate_tool_definition());
+            // Issue #63: the declarative wait surface — parks the decision
+            // loop on conditions/deadline with zero model turns.
+            tool_defs.push(wait_tool_definition());
+            // Issue #64: the reconsideration surface — supersede a decision
+            // and freeze only its affected pending tasks.
+            tool_defs.push(reconsider_tool_definition());
             // Issue #61: the mediated ownership-transfer surface — only
             // lawful when a write gate is attached to the run.
             if self.write_gate.is_some() {
@@ -7458,6 +7879,52 @@ impl CoordinatorAgent {
             tokens_in: None,
             tokens_out: None,
         }];
+        // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
+        // A checkpoint-restored in-flight wait is NEVER re-entered into the
+        // park loop; instead it is re-evaluated exactly once against the
+        // current world and the outcome is handed to the model as the first
+        // dispatch message, so it can continue (woken), re-decide (expired /
+        // still-waiting), or abort (cancelled).
+        if let Some(record) = self.active_wait.take() {
+            let view = self.wake_view_for(graph, task.session_id, &record, cancel).await;
+            let outcome = check_wake(&record, &WakeState::from_view(&view));
+            let (status, outcome_text) = match outcome {
+                WakeOutcome::Woken(WakeReason::Cancelled) => {
+                    (crate::decisions::DecisionStatus::Rejected, "cancelled".to_owned())
+                }
+                WakeOutcome::Woken(reason) => (
+                    crate::decisions::DecisionStatus::Settled,
+                    format!("woken: {}", wake_reason_label(reason)),
+                ),
+                WakeOutcome::Expired => (
+                    crate::decisions::DecisionStatus::Rejected,
+                    "expired (deadline passed unmet)".to_owned(),
+                ),
+                WakeOutcome::StillWaiting => (
+                    crate::decisions::DecisionStatus::Rejected,
+                    "still_waiting (internal cap reached without a tripped condition)".to_owned(),
+                ),
+            };
+            self.decision_journal.transition(&record.decision_id, status);
+            // The resumed session's next persist clears `active_wait` (it was
+            // taken above); a crash before that persist re-runs this one-shot
+            // review, which is idempotent via the forward-only journal guard.
+            messages.push(Message {
+                role: Role::User,
+                content: format!(
+                    "The wait '{reason}' that parked the previous dispatch session was \
+                     re-evaluated against the current world: {outcome_text}. Its decision is \
+                     journaled {status:?}. Continue the work it was parked for, re-decide, or \
+                     abort.",
+                    reason = record.reason,
+                ),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            });
+        }
         let mut summary = String::new();
         let mut advisory_plan: Option<PlanArtifact> = None;
         // Whether the loop ran out of iterations (as opposed to stopping in
@@ -7635,6 +8102,40 @@ impl CoordinatorAgent {
                             cancel,
                             scope,
                             ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #63: the declarative wait surface. A typed,
+                    // validated decision; the loop parks inside the handler
+                    // (bounded, cancellable slices — no model turns while
+                    // parked), so the #53 progress guard never sees an
+                    // in-flight wait as a no-progress cycle.
+                    WAIT_TOOL if dispatching => {
+                        self.handle_wait(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #64: the explicit reconsideration surface — the
+                    // model supersedes a decision and freezes ONLY its
+                    // affected pending tasks (a deterministic transform,
+                    // like split/merge). Completed work is never touched.
+                    RECONSIDER_TOOL if dispatching => {
+                        self.handle_reconsider(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
                             &tool_call.arguments,
                         )
                         .await
@@ -9691,6 +10192,451 @@ impl CoordinatorAgent {
         }
     }
 
+    /// Issue #63: build the world snapshot one wait re-evaluation consumes.
+    ///
+    /// All inputs are injected from the caller's live state — the graph's
+    /// current task statuses, the workspace-digest generation, whiteboard
+    /// events appended after the wait's cursor, and the decision journal's
+    /// superseding `Replan`s — so both the park loop and a resume
+    /// re-evaluation read the same view. `new-evidence` reads events appended
+    /// STRICTLY after the wait's own Decision marker (`start_gate_seq`), so
+    /// the marker can never self-trigger.
+    async fn wake_view_for(
+        &self,
+        graph: &TaskGraph,
+        session_id: Ulid,
+        record: &WaitingRecord,
+        cancel: &CancellationToken,
+    ) -> WakeView {
+        let resolved_task_ids: HashSet<TaskId> = graph
+            .all_tasks()
+            .into_iter()
+            .filter(|subtask| task_is_resolved(&subtask.status))
+            .map(|subtask| subtask.id)
+            .collect();
+        // Issue #65: a `workspace-generation-changed` wait is evaluated
+        // against a FRESH generation capture — the run-start generation is
+        // static, so without this the condition could only ever trip across
+        // a resume. The capture is paid only when the wait actually watches
+        // the workspace, never per-slice for other conditions. Fail-soft: a
+        // capture failure degrades to the static generation — no detectable
+        // change, so no spurious wake and no drift from today's behavior.
+        let workspace_generation =
+            if record.conditions.iter().any(|condition| {
+                matches!(condition, WakeCondition::WorkspaceGenerationChanged { .. })
+            }) {
+                self.capture_fresh_generation(cancel).await.or_else(|| self.snapshot_generation())
+            } else {
+                self.snapshot_generation()
+            };
+
+        let mut new_evidence_kinds: Vec<String> = Vec::new();
+        if let Some(pool) = self.review_store.as_ref() {
+            let after_gate_seq = record.start_gate_seq.unwrap_or(0);
+            match load_whiteboard_events(
+                pool,
+                &WhiteboardLoadOpts {
+                    after_gate_seq,
+                    session_id: Some(session_id.to_string()),
+                    scope: None,
+                    limit: 500,
+                },
+            )
+            .await
+            {
+                Ok(events) => {
+                    for event in events {
+                        let kind = event.kind.as_str().to_owned();
+                        if !new_evidence_kinds.contains(&kind) {
+                            new_evidence_kinds.push(kind);
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "issue #63: wait evidence-cursor read failed; \
+                         new-evidence conditions see no fresh events this slice");
+                }
+            }
+        }
+
+        // A `Replan` recorded AFTER the wait supersedes it; the wait's own
+        // entry is never a superseding signal.
+        let entries = self.decision_journal.entries();
+        let wait_index = entries.iter().position(|entry| entry.id == record.decision_id);
+        let replan_signaled = wait_index
+            .map(|start| {
+                entries
+                    .iter()
+                    .skip(start.saturating_add(1))
+                    .any(|entry| entry.kind == crate::decisions::DecisionKind::Replan)
+            })
+            .unwrap_or(false);
+
+        WakeView {
+            resolved_task_ids,
+            workspace_generation,
+            new_evidence_kinds,
+            replan_signaled,
+            now_ms: crate::tool_facts::unix_ms(),
+        }
+    }
+
+    /// Issue #63: the whiteboard `Decision` record for one WAIT. Written
+    /// directly (never via [`Self::append_dispatch_decision`], which drives
+    /// the ADR-65 §7 pending-dispatch continuation — a wait dispatches
+    /// nothing to continue behind). Returns the stored marker's `gate_seq`
+    /// (the wait's evidence cursor) or `None` when no log is wired or the
+    /// append ultimately fails. Fail-soft: a rejected citation set is
+    /// re-appended without its citations so the record always lands.
+    async fn append_wait_decision(
+        &mut self,
+        session_id: Ulid,
+        reason: &str,
+        supporting_evidence_ids: &[String],
+        affected_task_ids: &[TaskId],
+        affected_resource_ids: &[String],
+        deadline_ms: Option<i64>,
+    ) -> Option<u64> {
+        let pool = self.review_store.as_ref()?;
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": "coordinator",
+                "decision_kind": "wait",
+                "reason": reason,
+                "required_output": reason,
+                "supporting_evidence_ids": evidence_ids,
+                "wait_deadline_ms": deadline_ms,
+                "affected_task_ids": affected_task_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<String>>(),
+                "affected_resource_ids": affected_resource_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        match append_whiteboard_event(pool, &event(supporting_evidence_ids)).await {
+            Ok(stored) => Some(stored.gate_seq),
+            Err(err) => {
+                warn!(%err, "issue #63: wait decision append failed (fail-soft)");
+                // Re-append without citations: evidence references are
+                // validated inside the append transaction; a citation set
+                // rejected there must not lose the decision record.
+                match append_whiteboard_event(pool, &event(&[])).await {
+                    Ok(stored) => Some(stored.gate_seq),
+                    Err(err) => {
+                        warn!(%err, "issue #63: wait decision re-append without citations failed");
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #63: handle ONE `wait` tool call — parse → exit-bounds checks →
+    /// decision validation (Wait rejects a target and requires the reason via
+    /// the task text) → journal → policy gate → whiteboard `Decision` event
+    /// → park the decision loop in bounded, cancellable slices
+    /// ([`execute_wait`]) → settle the journaled decision from the outcome.
+    ///
+    /// The wait parks INSIDE this single tool call: the #53 no-progress
+    /// tracker only observes between tool-call loops, so the park is never
+    /// flagged as a stalled turn and consumes zero model turns.
+    ///
+    /// A crash mid-wait is resumable: `active_wait` is checkpointed BEFORE
+    /// the sleep loop starts and cleared after it settles; a resumed dispatch
+    /// session re-evaluates the restored record once against the current
+    /// world.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_wait(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse + exit-bounds checks (no partial wait) ───────────────
+        let Some(args) = WaitArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "wait requires a non-empty reason and well-formed conditions \
+                            (event-resolved / workspace-generation-changed / new-evidence / \
+                            replan-or-cancel)",
+            });
+        };
+        // A wait with no condition and no deadline can only run to the
+        // internal cap and then report still-waiting — a self-contradictory
+        // park, rejected before any state mutation.
+        if args.conditions.is_empty() && args.deadline_ms.is_none() {
+            return serde_json::json!({
+                "error": "degenerate_wait",
+                "message": "a wait must declare at least one wake condition or a deadline; \
+                            name what you are waiting for and re-decide",
+            });
+        }
+        let affected_id_count =
+            args.affected_task_ids.len().saturating_add(args.affected_resource_ids.len());
+        if affected_id_count > MAX_WAIT_AFFECTED_IDS {
+            return serde_json::json!({
+                "error": "too_many_affected_ids",
+                "message": format!(
+                    "a wait may name at most {MAX_WAIT_AFFECTED_IDS} affected task/resource \
+                     ids (got {affected_id_count}); trim and re-decide",
+                ),
+            });
+        }
+
+        // ── 2. Decision validation (Wait rejects a target; the reason rides
+        //       the task text; cited evidence is verified like any decision) ─
+        let missing = self.missing_evidence_ids(&args.supporting_evidence_ids, cancel).await;
+        let known_ids: HashSet<String> = args
+            .supporting_evidence_ids
+            .iter()
+            .filter(|id| !missing.contains(id))
+            .cloned()
+            .collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_ids,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut decision = match validator.validate(
+            crate::decisions::DecisionKind::Wait,
+            None,
+            &args.reason,
+            Some(&args.reason),
+            &args.supporting_evidence_ids,
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => return rejection.tool_value(),
+        };
+        let decision_id = decision.id.clone();
+        let started_at_ms = crate::tool_facts::unix_ms();
+        let reference_generation = self.snapshot_generation();
+        // `workspace-generation-changed` never wears a model-supplied
+        // generation: the executor stamps the CURRENT one at wait start so
+        // the park and a resume re-evaluate against the same boundary.
+        let WaitArgs {
+            reason,
+            conditions,
+            deadline_ms,
+            supporting_evidence_ids,
+            affected_task_ids,
+            affected_resource_ids,
+        } = args;
+        let conditions: Vec<WakeCondition> = conditions
+            .into_iter()
+            .map(|condition| match condition {
+                WakeCondition::WorkspaceGenerationChanged { .. } => {
+                    WakeCondition::WorkspaceGenerationChanged {
+                        generation_at_wait: reference_generation.clone(),
+                    }
+                }
+                other => other,
+            })
+            .collect();
+        let mut record = WaitingRecord {
+            decision_id: decision_id.clone(),
+            reason: reason.clone(),
+            supporting_evidence_ids: supporting_evidence_ids.clone(),
+            conditions,
+            affected_task_ids: affected_task_ids.clone(),
+            affected_resource_ids: affected_resource_ids.clone(),
+            started_at_ms,
+            deadline_ms,
+            start_gate_seq: None,
+        };
+        decision.wait_record = Some(record.clone());
+        self.decision_journal.record(decision);
+
+        // ── 3. Policy gate ────────────────────────────────────────────────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; the wait decision is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: WAIT_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this wait decision",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── 4. Dispatched + whiteboard Decision event ─────────────────────
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        // The stored marker's own gate_seq is the wait's evidence cursor, so
+        // `new-evidence` conditions read events appended STRICTLY after the
+        // wait began and the marker can never self-trigger.
+        let marker_gate_seq = self
+            .append_wait_decision(
+                task.session_id,
+                &reason,
+                &supporting_evidence_ids,
+                &affected_task_ids,
+                &affected_resource_ids,
+                deadline_ms,
+            )
+            .await;
+        record.start_gate_seq = match marker_gate_seq {
+            Some(seq) => Some(seq),
+            None => match self.review_store.as_ref() {
+                Some(pool) => match latest_gate_seq(pool).await {
+                    Ok(seq) => Some(seq),
+                    Err(error) => {
+                        warn!(%error, "issue #63: gate-seq read failed at wait start; the wait's \
+                             evidence cursor degrades to None (conservative)");
+                        None
+                    }
+                },
+                None => None,
+            },
+        };
+        self.active_wait = Some(record.clone());
+
+        // ── 5. Crash-safe checkpoint BEFORE the park ──────────────────────
+        // If the process dies mid-wait, a resumed run re-evaluates this
+        // record once instead of losing the park.
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        // ── 6. Park the loop (bounded, cancellable slices) ────────────────
+        let outcome = {
+            // Reborrow `&self` and `graph` immutably for the wait duration;
+            // the block ends and the borrows drop before `&mut self` resumes
+            // for the settle + checkpoint below.
+            let refiner = CoordinatorWakeRefiner {
+                coordinator: &*self,
+                graph: &*graph,
+                session_id: task.session_id,
+                record: &record,
+                cancel: cancel.clone(),
+            };
+            execute_wait(&record, &refiner, &WaitConfig::default(), cancel).await
+        };
+
+        // ── 7. Settle: clear the park, journal, checkpoint ────────────────
+        self.active_wait = None;
+        let result = match outcome {
+            WakeOutcome::Woken(WakeReason::Cancelled) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({ "error": "cancelled" })
+            }
+            WakeOutcome::Woken(reason) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+                let label = wake_reason_label(reason);
+                let mut payload = serde_json::json!({
+                    "outcome": "woken",
+                    "reason": label,
+                    "decision_id": decision_id,
+                    "message": format!(
+                        "the wait cleared: {label} — continue the work that was parked",
+                    ),
+                });
+                // Issue #65: a workspace-generation-changed wake is the LIVE
+                // detection vector — capture the diff now and record every
+                // changed path the run cannot explain (own writes excluded,
+                // ownership table first). Fail-soft: a failed scan adds no
+                // records; the wait decision is already settled.
+                if reason == WakeReason::WorkspaceGenerationChanged {
+                    let own_written = own_write_paths(
+                        &ledger.all_files,
+                        &ledger.completed_results,
+                        &[],
+                        &base_ctx.session.project_dir,
+                    );
+                    let expected = self.expected_artifact_paths();
+                    let records =
+                        self.scan_external_changes(graph, &own_written, &expected, cancel).await;
+                    if !records.is_empty() {
+                        let listed: Vec<serde_json::Value> = records
+                            .iter()
+                            .map(|record| {
+                                serde_json::json!({
+                                    "path": record.first_path(),
+                                    "known_owner": record.known_owner,
+                                    "known_task": record.known_task,
+                                    "conflicts_with_coordinator_work":
+                                        record.conflicts_with_coordinator_work,
+                                })
+                            })
+                            .collect();
+                        for record in records {
+                            self.upsert_external_change(record);
+                        }
+                        payload["external_changes"] = serde_json::Value::Array(listed);
+                    }
+                }
+                payload
+            }
+            WakeOutcome::Expired => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({
+                    "outcome": "expired",
+                    "decision_id": decision_id,
+                    "message": "the wait's deadline passed unmet — re-decide: the condition \
+                                never held, so defer, retry, or re-wait with updated assumptions",
+                })
+            }
+            WakeOutcome::StillWaiting => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({
+                    "outcome": "still_waiting",
+                    "decision_id": decision_id,
+                    "message": "the wait hit the absolute internal cap without a condition \
+                                tripping or a deadline passing — re-decide or re-wait with a \
+                                deadline",
+                })
+            }
+        };
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+        result
+    }
+
     /// Issue #57: handle ONE `split_task` tool call — parse → decision
     /// validation (no target; evidence-backed) → transform proof-and-apply
     /// against the REAL graph (a proof COPY takes any rejection; never the
@@ -9786,7 +10732,10 @@ impl CoordinatorAgent {
             time::OffsetDateTime::now_utc(),
         ) {
             Ok(crate::task_transform::TransformOutcome::Split(outcome)) => outcome.children,
-            Ok(crate::task_transform::TransformOutcome::Merge(_)) => {
+            Ok(
+                crate::task_transform::TransformOutcome::Merge(_)
+                | crate::task_transform::TransformOutcome::Freeze(_),
+            ) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
                 return serde_json::json!({
@@ -9975,7 +10924,10 @@ impl CoordinatorAgent {
             Ok(crate::task_transform::TransformOutcome::Merge(outcome)) => {
                 (outcome.survivor, outcome.removed)
             }
-            Ok(crate::task_transform::TransformOutcome::Split(_)) => {
+            Ok(
+                crate::task_transform::TransformOutcome::Split(_)
+                | crate::task_transform::TransformOutcome::Freeze(_),
+            ) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
                 return serde_json::json!({
@@ -10075,6 +11027,210 @@ impl CoordinatorAgent {
             "outcome": "merged",
             "survivor": survivor.to_string(),
             "removed": removed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Issue #64: handle ONE `reconsider` tool call — supersede a decision
+    /// whose assumptions proved wrong and freeze only the affected pending
+    /// tasks. Same failure discipline as the sibling decision surfaces:
+    /// parse → journal lookup → decision validation → proof-and-apply the
+    /// deterministic `Freeze` against the REAL graph → trail (the new
+    /// decision settles, the superseded decision is marked `Superseded`)
+    /// → structured result. Completed work, valid evidence, and accepted
+    /// artifacts are never touched; the frozen tasks never re-enter the
+    /// ready queue on their own, so the next strategy decision comes from
+    /// the model against the current world state.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_reconsider(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial reconsideration) ─────────────────────────
+        let Some(args) = ReconsiderArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider requires a non-empty decision_id (a decision from this \
+                            run's journal), a non-empty reason, and at least one affected \
+                            pending task id",
+            });
+        };
+        let decision_id = args.decision_id.trim();
+        if decision_id.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider requires a non-empty decision_id",
+            });
+        }
+
+        // ── 2. The superseded decision must exist in the journal; a
+        //       rejected decision has nothing in operation to void ────────
+        let target_status =
+            match self.decision_journal.entries().iter().find(|entry| entry.id == decision_id) {
+                Some(entry) => entry.status,
+                None => {
+                    return serde_json::json!({
+                        "error": "unknown_decision",
+                        "message": format!(
+                            "no decision {decision_id} exists in this run's journal; cite a real \
+                             decision id from the context"
+                        ),
+                    });
+                }
+            };
+        if target_status == crate::decisions::DecisionStatus::Rejected {
+            return serde_json::json!({
+                "error": "decision_not_reconsiderable",
+                "message": format!(
+                    "decision {decision_id} is already rejected — it has nothing in operation \
+                     to supersede"
+                ),
+            });
+        }
+        // A Superseded target is allowed: re-reconsidering is idempotent (the
+        // journal re-mark is a forward-only no-op).
+
+        // ── 3. affected_task_ids parse as ULIDs (deduplicated) ─────────────
+        let mut affected: Vec<TaskId> = Vec::new();
+        for raw in &args.affected_task_ids {
+            let Ok(id) = Ulid::from_string(raw).map(TaskId) else {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": format!(
+                        "affected_task_ids entries must be task ULIDs; {raw:?} is not"
+                    ),
+                });
+            };
+            if !affected.contains(&id) {
+                affected.push(id);
+            }
+        }
+        if affected.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider must name at least one affected pending task id",
+            });
+        }
+
+        // ── 4. Decision validation (Reconsider rejects a target; the reason
+        //       rides the task text; fabricated evidence is rejected). The
+        //       Freeze payload is attached here, validated against the REAL
+        //       graph by the next step. ─────────────────────────────────────
+        // The model's `reason` becomes the decision's task text (like the
+        // WAIT reason); the superseded decision id lives in the freeze
+        // payload so the journal entry is fully self-describing.
+        let summary = args.reason.trim();
+        let transform_spec = crate::task_transform::TaskTransformSpec::Freeze {
+            decision_id: decision_id.to_owned(),
+            task_ids: affected.clone(),
+        };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Reconsider,
+                Some(transform_spec.clone()),
+                summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &[],
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id_new = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── 5. Deterministic freeze against the REAL graph ────────────────
+        let frozen = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Freeze(outcome)) => outcome.frozen,
+            Ok(
+                crate::task_transform::TransformOutcome::Split(_)
+                | crate::task_transform::TransformOutcome::Merge(_),
+            ) => {
+                self.decision_journal
+                    .transition(&decision_id_new, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the reconsider decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id_new, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    %decision_id,
+                    "reconsider rejected by the deterministic freeze validation"
+                );
+                ledger
+                    .notes
+                    .push(format!("Reconsider of {decision_id} rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── 6. The trail: the reconsideration settles, the superseded
+        //       decision is marked Superseded (forward-only, idempotent);
+        //       whiteboard Decision record; ledger row. ────────────────────
+        self.decision_journal
+            .transition(&decision_id_new, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal
+            .transition(&decision_id_new, crate::decisions::DecisionStatus::Settled);
+        self.decision_journal.transition(decision_id, crate::decisions::DecisionStatus::Superseded);
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "reconsidered".into(),
+            task_id: None, // the freeze spans tasks; the decision's entry names them
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            None, // a reconsideration leaves no per-node continuation behind
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // A chain frontier that froze the chain head resets: the frozen node
+        // never re-enters via the chain-parent slot.
+        if state.last_node.is_some_and(|head| frozen.contains(&head)) {
+            state.last_node = None;
+        }
+        // A pending dispatch continuation must not stand behind a frozen
+        // task (ADR-65 §7: nothing to continue behind anymore).
+        if self
+            .last_dispatch_decision
+            .as_ref()
+            .and_then(|pending| pending.task_id)
+            .is_some_and(|pending_task| frozen.contains(&pending_task))
+        {
+            self.last_dispatch_decision = None;
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "reconsidered",
+            "decision_id": decision_id_new,
+            "superseded_decision_id": decision_id,
+            "frozen": frozen.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "message": format!(
+                "superseded decision {decision_id} and froze {} pending task(s); re-plan the \
+                 frozen work under fresh decisions",
+                frozen.len()
+            ),
         })
     }
 
@@ -21271,6 +22427,935 @@ mod tests {
             "the advisory names the world-model basis"
         );
         assert!(advisory.contains("src/main.rs"), "the advisory names the verified-clean artifact");
+    }
+
+    // ── Issue #63: declarative WAIT decisions ────────────────────────
+
+    /// Issue #63 acceptance (handler level): a wait whose `event-resolved`
+    /// condition ALREADY holds wakes with zero sleep. The tool result names
+    /// `outcome: woken`, the journaled Wait decision settles, the park
+    /// clears, and the wait's Decision record lands on the whiteboard as
+    /// real evidence (with its own gate_seq as the evidence cursor).
+    #[tokio::test]
+    async fn wait_handler_wakes_immediately_when_condition_holds() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        // The whiteboard log the wait's Decision record is written to (the
+        // checkpoint store from `coordinator_with_store` is a separate
+        // in-memory DB; the review store is the resume log pool).
+        let (_dir, pool) = resume_log_pool().await;
+        coordinator = coordinator.with_review_store(Some(pool.clone()));
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // The wait's target: an ALREADY-resolved subtask, so the first
+        // refine (before any sleep) trips the condition.
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("the artifact".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "review gate pending",
+                    "conditions": [{ "type": "event-resolved", "task_ids": [done.to_string()] }],
+                    "affected_task_ids": [done.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "woken", "immediate satisfaction wakes: {result}");
+        assert_eq!(result["reason"], "event-resolved", "the tripped condition is named: {result}");
+        let decision_id = result["decision_id"].as_str().expect("the result names the decision id");
+        let entry = coordinator
+            .decision_journal
+            .entries()
+            .iter()
+            .find(|entry| entry.id == decision_id)
+            .expect("the wait decision is journaled");
+        assert_eq!(entry.kind, crate::decisions::DecisionKind::Wait);
+        assert_eq!(entry.status, crate::decisions::DecisionStatus::Settled, "a woken wait settles");
+        assert!(coordinator.active_wait.is_none(), "the park clears after settle");
+
+        // The wait's Decision record is real evidence on the whiteboard.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("the whiteboard loads");
+        let wait = logged
+            .iter()
+            .find(|event| event.payload["decision_kind"] == serde_json::json!("wait"))
+            .expect("a wait Decision event is recorded");
+        assert_eq!(wait.payload["reason"], "review gate pending");
+        assert_eq!(
+            wait.payload["affected_task_ids"],
+            serde_json::json!([done.to_string()]),
+            "wait payload mismatch: {}",
+            serde_json::to_string_pretty(&wait.payload).expect("payload is json")
+        );
+        // The marker's own gate_seq is the evidence cursor: the wait's
+        // Decision event is never counted as new evidence.
+        assert!(wait.gate_seq > 0, "the whiteboard stamps a positive gate_seq on the wait record");
+    }
+
+    /// Issue #63 acceptance (argument discipline): waits that cannot make
+    /// progress are rejected before ANY state mutation — no journal entry,
+    /// no ledger writes, no whiteboard record, no parked wait.
+    #[tokio::test]
+    async fn wait_handler_rejects_self_contradictory_and_over_bounded_waits() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let journal_before = coordinator.decision_journal.entries().len();
+
+        // No condition, no deadline: a park that can only run to the cap and
+        // then still-wait — self-contradictory, rejected before mutation.
+        let degenerate = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "reason": "waiting" }),
+            )
+            .await;
+        assert_eq!(degenerate["error"], "degenerate_wait", "{degenerate}");
+
+        // 33 affected ids (32 max): bounded, trimmed, re-decided.
+        let too_many: Vec<String> = (0..33).map(|_| Ulid::new().to_string()).collect();
+        let over_bounded = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "experimental wait",
+                    "conditions": [{ "type": "replan-or-cancel" }],
+                    "affected_task_ids": too_many,
+                }),
+            )
+            .await;
+        assert_eq!(
+            over_bounded["error"], "too_many_affected_ids",
+            "a wait may name at most {MAX_WAIT_AFFECTED_IDS} ids: {over_bounded}"
+        );
+
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            journal_before,
+            "rejected waits journal nothing"
+        );
+        assert!(coordinator.active_wait.is_none(), "rejected waits never park");
+        assert!(ledger.action_ledger.is_empty(), "rejected waits mutate no ledger: {ledger:?}");
+    }
+
+    /// Issue #63 acceptance (policy): the wait decision passes through the
+    /// run's policy engine exactly like any other coordinator operation —
+    /// a denial rejects the decision and never parks.
+    #[tokio::test]
+    async fn wait_handler_respects_policy_denial() {
+        let deny: Arc<dyn concerto_core::traits::policy::PolicyEngine> =
+            Arc::new(SimplePolicyEngine::new(
+                vec![PolicyRule::RequireApproval(Condition::Always)],
+                Arc::new(TestAudit),
+            ));
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let mut coordinator = coordinator_with_turns_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            deny,
+        );
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "policy-gated wait",
+                    "conditions": [{ "type": "replan-or-cancel" }],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "policy_denied", "denials are structured: {result}");
+        let last = coordinator
+            .decision_journal
+            .entries()
+            .last()
+            .expect("the denied decision is still journaled");
+        assert_eq!(last.status, crate::decisions::DecisionStatus::Rejected);
+        assert!(coordinator.active_wait.is_none(), "a denied wait never parks");
+    }
+
+    // ── Issue #65: external workspace changes ─────────────────────────────
+
+    /// A real captured workspace: four files that exist at run start, so
+    /// each test's snapshot barrier captures a truthful invoice
+    /// (mtime/size/hash) to diff later edits against.
+    fn external_change_fixture(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/owned.rs"), b"v1\n").expect("owned.rs at start");
+        std::fs::write(root.join("src/held.rs"), b"v1\n").expect("held.rs at start");
+        std::fs::write(root.join("src/expected.rs"), b"v1\n").expect("expected.rs at start");
+        std::fs::write(root.join("src/unrelated.rs"), b"v1\n").expect("unrelated.rs at start");
+    }
+
+    /// Requirement (a/c/d): the live scan detects edits made DURING an
+    /// execution, excludes the run's own writes, and flags a gate-held path
+    /// or a planned artifact as a conflict while unrelated changes surface
+    /// conflict-free.
+    #[tokio::test]
+    async fn external_change_scan_detects_edits_during_execution_and_excludes_own_writes() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let cancel = CancellationToken::new();
+        external_change_fixture(workspace.path());
+
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+        // A path HOLD owned from a previous run (ownership is checkpointed):
+        // the gate owns it, but THIS run never wrote it.
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/held.rs".to_owned(),
+                owner: "coder".to_owned(),
+                acquiring_event_id: "ev-held".to_owned(),
+                acquired_at_ms: 1,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_workspace_snapshot(
+            crate::workspace_snapshot::run_snapshot_barrier(
+                None,
+                workspace.path(),
+                &Ulid::new().to_string(),
+                &cancel,
+            )
+            .await
+            .expect("snapshot re-captures for the coordinator"),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        // A graph whose coder role matches the held path's owner — the record
+        // attributes the conflict to the in-flight task.
+        let task_id = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: task_id,
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "held work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: Some("src/held.rs".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        // The run's own write set + a planned-artifact set.
+        let mut own_written: std::collections::HashSet<String> = std::collections::HashSet::new();
+        own_written.insert(
+            crate::tool_facts::canonical_project_path(workspace.path(), "src/owned.rs")
+                .expect("owned.rs canonicalizes"),
+        );
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        expected.insert(
+            crate::tool_facts::canonical_project_path(workspace.path(), "src/expected.rs")
+                .expect("expected.rs canonicalizes"),
+        );
+
+        // The user edits while the run is executing: the held path, an
+        // unrelated path, a planned artifact, and (invisibly to the run's
+        // write set accounting) a path the run DID write.
+        std::fs::write(workspace.path().join("src/held.rs"), b"v2 user edit on held\n")
+            .expect("external edit on held");
+        std::fs::write(workspace.path().join("src/unrelated.rs"), b"v2 unrelated edit\n")
+            .expect("external edit on unrelated");
+        std::fs::write(workspace.path().join("src/expected.rs"), b"v2 expected edit\n")
+            .expect("external edit on expected");
+        std::fs::write(workspace.path().join("src/owned.rs"), b"v2 owned edit\n")
+            .expect("edit on the run's own path");
+
+        let records =
+            coordinator.scan_external_changes(&graph, &own_written, &expected, &cancel).await;
+        let paths: Vec<&str> = records.iter().filter_map(|record| record.first_path()).collect();
+
+        assert_eq!(paths.len(), 3, "three external changes detected: {paths:?}");
+        assert!(
+            !paths.contains(&"src/owned.rs"),
+            "the run's OWN write is never classified external: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/expected.rs"),
+            "planned artifact change is external: {paths:?}"
+        );
+
+        let held = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/held.rs"))
+            .expect("the held path is recorded");
+        assert_eq!(held.known_owner.as_deref(), Some("coder"));
+        assert_eq!(held.known_task.as_deref(), Some(task_id.to_string().as_str()));
+        assert!(
+            held.conflicts_with_coordinator_work(),
+            "a held artifact changed externally conflicts"
+        );
+
+        let expected_record = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/expected.rs"))
+            .expect("the planned artifact is recorded");
+        assert_eq!(expected_record.known_owner, None);
+        assert!(
+            expected_record.conflicts_with_coordinator_work(),
+            "a planned artifact changed externally conflicts even without an owner"
+        );
+
+        let unrelated = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/unrelated.rs"))
+            .expect("the unrelated change is recorded");
+        assert_eq!(unrelated.known_owner, None);
+        assert_eq!(unrelated.known_task, None);
+        assert!(
+            !unrelated.conflicts_with_coordinator_work(),
+            "an unrelated external change never conflicts"
+        );
+
+        // The upsert side: the scan's records land in coordinator state, the
+        // checkpoint projection carries them, and the world model surfaces
+        // them as risks.
+        for record in records {
+            coordinator.upsert_external_change(record);
+        }
+        assert_eq!(coordinator.external_changes.len(), 3);
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        assert_eq!(context.external_changes.len(), 3, "records ride the checkpoint context");
+    }
+
+    /// Requirement (b): the F3 resume reconciliation's external evidence
+    /// becomes explicit, conflict-flagged records instead of a one-shot
+    /// verdict — and re-detection of the same change upserts, not duplicates.
+    #[tokio::test]
+    async fn resume_f3_evidence_becomes_explicit_reconcilable_records() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let cancel = CancellationToken::new();
+        external_change_fixture(workspace.path());
+
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/held-resume.rs".to_owned(),
+                owner: "coder".to_owned(),
+                acquiring_event_id: "ev-held-resume".to_owned(),
+                acquired_at_ms: 1,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_workspace_snapshot(
+            crate::workspace_snapshot::run_snapshot_barrier(
+                None,
+                workspace.path(),
+                &Ulid::new().to_string(),
+                &cancel,
+            )
+            .await
+            .expect("snapshot re-captures for the coordinator"),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        let task_id = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: task_id,
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "held work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: Some("src/held-resume.rs".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        let change = resume::WorkspaceChange {
+            generation_mismatch: true,
+            externally_changed: vec![
+                ("src/held-resume.rs".to_owned(), Some("ev-1".to_owned())),
+                ("src/other.rs".to_owned(), None),
+            ],
+        };
+        coordinator
+            .record_resume_external_changes(
+                &change,
+                &graph,
+                Some("gen-checkpoint".to_owned()),
+                &cancel,
+            )
+            .await;
+
+        let held = coordinator
+            .external_changes
+            .iter()
+            .find(|record| record.first_path() == Some("src/held-resume.rs"))
+            .expect("the F3 evidence for the held path becomes a record");
+        assert_eq!(held.known_owner.as_deref(), Some("coder"));
+        assert_eq!(held.known_task.as_deref(), Some(task_id.to_string().as_str()));
+        assert!(held.conflicts_with_coordinator_work(), "held + changed externally conflicts");
+        assert_eq!(held.previous_generation.as_deref(), Some("gen-checkpoint"));
+
+        let other = coordinator
+            .external_changes
+            .iter()
+            .find(|record| record.first_path() == Some("src/other.rs"))
+            .expect("the unrelated F3 evidence becomes a record");
+        assert_eq!(other.known_owner, None);
+        assert!(!other.conflicts_with_coordinator_work(), "unrelated change never conflicts");
+
+        assert_eq!(coordinator.external_changes.len(), 2);
+
+        // A resumed run re-detects the SAME evidence (same previous
+        // generation): upsert dedups instead of accumulating duplicates.
+        coordinator
+            .record_resume_external_changes(
+                &change,
+                &graph,
+                Some("gen-checkpoint".to_owned()),
+                &cancel,
+            )
+            .await;
+        assert_eq!(
+            coordinator.external_changes.len(),
+            2,
+            "re-detecting the same change upserts, never duplicates"
+        );
+
+        // And the records ride the checkpoint projection (requirement 5).
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        assert_eq!(context.external_changes.len(), 2);
+        let checkpoint = crate::checkpoint::build_checkpoint(
+            &checkpoint::CheckpointScope {
+                run_id: Ulid::new(),
+                session_id: Ulid::new(),
+                root_task_id: TaskId::new(),
+                project_id: "test".into(),
+                objective: "test objective".into(),
+                objective_hash: "hash".into(),
+                source_revision: None,
+                sequence_num: 0,
+            },
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &concerto_core::memory::WorkingMemorySnapshot {
+                id: Ulid::new(),
+                session_id: Ulid::new(),
+                decisions: vec![],
+                task_tree: vec![],
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            &graph,
+            &HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &context,
+        );
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let restored =
+            crate::checkpoint::GraphCheckpoint::from_json(&json).expect("checkpoint loads");
+        assert_eq!(restored.external_changes.len(), 2, "records survive the checkpoint JSON");
+    }
+
+    // ── Issue #64: reconsider — supersede a decision + freeze its pending ──
+
+    /// A settled dispatch decision the model supersedes in these tests — the
+    /// journal is seeded before the handler runs so the call can cite a real
+    /// decision id deterministically.
+    fn settled_reconsider_target() -> crate::decisions::CoordinatorDecision {
+        crate::decisions::CoordinatorDecision {
+            id: "d-design".to_owned(),
+            kind: crate::decisions::DecisionKind::DispatchSpecialist,
+            target_agent: Some(AgentId::new("coder")),
+            task_description: "implement the design".to_owned(),
+            notes: None,
+            supporting_evidence_ids: vec![],
+            expected_artifacts: vec![],
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            status: crate::decisions::DecisionStatus::Settled,
+        }
+    }
+
+    /// Issue #64 acceptance: a reconsideration supersedes the seeded decision
+    /// and deterministically freezes ONLY the named pending task; completed
+    /// work stays byte-identical and the chain frontier resets.
+    #[tokio::test]
+    async fn reconsider_supersedes_a_decision_and_freezes_only_pending_tasks() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_reconsider_target());
+
+        let pending = TaskId::new();
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work under the superseded decision".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("reviewer"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled work".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(pending) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "the settle showed the API assumption no longer holds",
+                    "affected_task_ids": [pending.to_string()],
+                    "notes": "re-plan under fresh decisions",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "reconsidered", "structured success: {result}");
+        assert_eq!(result["superseded_decision_id"], "d-design");
+        assert_eq!(result["frozen"][0], pending.to_string(), "{result}");
+        // The pending task is frozen (Blocked + tombstone); completed work
+        // and its deliverable are untouched.
+        let frozen = graph.get(&pending).expect("the frozen task stays in the graph");
+        assert_eq!(frozen.status, SubTaskStatus::Blocked, "frozen pending work is Blocked");
+        assert!(frozen.completed_at.is_some(), "a Blocked task carries a tombstone");
+        let settled = graph.get(&done).expect("the completed task is not touched");
+        assert_eq!(settled.status, SubTaskStatus::Completed);
+        assert_eq!(settled.deliverable.as_deref(), Some("settled work"));
+        assert!(TaskGraphValidator::validate(&graph).is_ok(), "the DAG stays valid");
+        // The trail: target decision Superseded, the reconsider decision
+        // settles, and the ledger records the reconsideration.
+        let entries = coordinator.decision_journal.entries();
+        let superseded = entries.iter().find(|entry| entry.id == "d-design").expect("target entry");
+        assert_eq!(superseded.status, crate::decisions::DecisionStatus::Superseded);
+        let reconsider = entries.last().expect("the reconsider decision is journaled");
+        assert!(matches!(reconsider.kind, crate::decisions::DecisionKind::Reconsider));
+        assert!(matches!(
+            reconsider.transform,
+            Some(crate::task_transform::TaskTransformSpec::Freeze { .. })
+        ));
+        assert_eq!(reconsider.status, crate::decisions::DecisionStatus::Settled);
+        assert!(
+            ledger.action_ledger.iter().any(|action| action.kind == "reconsidered"),
+            "the ledger mirrors the reconsideration: {ledger:?}"
+        );
+        // The frontier that pointed at a frozen task resets — the frozen node
+        // is never the chain parent of the next dispatch.
+        assert_eq!(state.last_node, None);
+    }
+
+    /// Issue #64: the structured rejections — absence of the cited decision,
+    /// an already-rejected target, and malformed arguments. Every rejection
+    /// journals nothing and mutates nothing.
+    #[tokio::test]
+    async fn reconsider_rejects_unknown_rejected_and_malformed_inputs() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let mut graph = TaskGraph::new();
+        let pending = TaskId::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        // Unknown decision id: nothing in this run's journal, structured
+        // rejection, nothing journaled, nothing mutated.
+        let unknown = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "no-such-decision",
+                    "reason": "reconsider",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_decision", "{unknown}");
+        assert_eq!(coordinator.decision_journal.entries().len(), 0, "rejections journal nothing");
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Pending);
+
+        // An already-rejected target has nothing in operation to supersede.
+        let mut rejected = settled_reconsider_target();
+        rejected.status = crate::decisions::DecisionStatus::Rejected;
+        coordinator.decision_journal.record(rejected);
+        let not_reconsiderable = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider anyway",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+        assert_eq!(
+            not_reconsiderable["error"], "decision_not_reconsiderable",
+            "{not_reconsiderable}"
+        );
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            1,
+            "rejections journal nothing beyond the seeded entry"
+        );
+
+        // A second, still-operational target: the purely-malformed cases must
+        // fail on the arguments themselves, not on the journal lookup.
+        let mut operational = settled_reconsider_target();
+        operational.id = "d-other".to_owned();
+        coordinator.decision_journal.record(operational);
+
+        // Malformed arguments: missing reason / no affected ids / non-ULID.
+        for arguments in [
+            serde_json::json!({ "decision_id": "d-other", "affected_task_ids": [pending.to_string()] }),
+            serde_json::json!({ "decision_id": "d-other", "reason": "reconsider" }),
+            serde_json::json!({
+                "decision_id": "d-other",
+                "reason": "reconsider",
+                "affected_task_ids": ["not-a-ulid"],
+            }),
+        ] {
+            let malformed = coordinator
+                .handle_reconsider(
+                    &mut graph,
+                    &task,
+                    &context,
+                    &CancellationToken::new(),
+                    &mut scope,
+                    &mut ledger,
+                    &mut state,
+                    &arguments,
+                )
+                .await;
+            assert_eq!(malformed["error"], "invalid_arguments", "{malformed}");
+        }
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            2,
+            "malformed calls never reach validation"
+        );
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Pending);
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    /// Issue #64: freezing completed work is a deterministic rejection — the
+    /// reconsider decision records as Rejected and no task state changes.
+    #[tokio::test]
+    async fn reconsider_rejects_freezing_completed_work() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_reconsider_target());
+
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled work".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider",
+                    "affected_task_ids": [done.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "not_freezeable", "structured rejection: {result}");
+        // The completed task is untouched — the freeze never fires.
+        let settled = graph.get(&done).expect("the completed task stays");
+        assert_eq!(settled.status, SubTaskStatus::Completed);
+        assert_eq!(settled.deliverable.as_deref(), Some("settled work"));
+        // The rejected reconsider decision is journaled as Rejected; the
+        // target decision keeps its status (nothing was superseded).
+        let entries = coordinator.decision_journal.entries();
+        assert_eq!(entries.len(), 2);
+        let reconsider = entries.last().expect("the reconsider decision is journaled");
+        assert_eq!(reconsider.status, crate::decisions::DecisionStatus::Rejected);
+        assert!(ledger.action_ledger.is_empty(), "a rejected freeze mutates no ledger");
+    }
+
+    /// Issue #64: re-reconsidering an already-superseded decision is
+    /// idempotent — the re-mark is a forward-only no-op and freezing the
+    /// already-frozen task re-applies harmlessly.
+    #[tokio::test]
+    async fn reconsider_is_idempotent_on_an_already_superseded_target() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut target = settled_reconsider_target();
+        target.status = crate::decisions::DecisionStatus::Superseded;
+        coordinator.decision_journal.record(target);
+
+        let pending = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider again",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            result["outcome"], "reconsidered",
+            "a repeated reconsider is not an error: {result}"
+        );
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Blocked);
+        assert_eq!(
+            coordinator
+                .decision_journal
+                .entries()
+                .iter()
+                .find(|entry| entry.id == "d-design")
+                .expect("target entry")
+                .status,
+            crate::decisions::DecisionStatus::Superseded,
+            "the Superseded mark is stable"
+        );
     }
 
     // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────

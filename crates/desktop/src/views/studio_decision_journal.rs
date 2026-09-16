@@ -35,6 +35,7 @@ fn status_label(status: DecisionStatus) -> &'static str {
         DecisionStatus::Dispatched => "dispatched",
         DecisionStatus::Settled => "settled",
         DecisionStatus::Rejected => "rejected",
+        DecisionStatus::Superseded => "superseded",
     }
 }
 
@@ -52,6 +53,8 @@ fn kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Consult => "consult",
         DecisionKind::TransferOwnership => "transfer-ownership",
         DecisionKind::Investigate => "investigate",
+        DecisionKind::Wait => "wait",
+        DecisionKind::Reconsider => "reconsider",
     }
 }
 
@@ -123,6 +126,7 @@ mod tests {
             expected_artifacts: Vec::new(),
             transform: None,
             max_tool_calls: None,
+            wait_record: None,
             created_at: OffsetDateTime::now_utc(),
             status,
         }
