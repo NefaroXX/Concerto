@@ -7037,7 +7037,26 @@ impl CoordinatorAgent {
             }
             graph.mark_done(&review_task_id);
 
-            self.review_cycles.next_cycle(task_id)?;
+            // ADR-35 amendment (2026-09-16 §2): an exceeded review-cycle
+            // count is informational evidence, never a terminal stop. Publish
+            // the escalation event and return the reviewer's verdict as a
+            // recoverable result so the Coordinator decides the next move
+            // (re-dispatch, re-plan, or request_user_input).
+            if self.review_cycles.next_cycle(task_id).is_err() {
+                let _ = self.bus.publish_for_session(
+                    session_id,
+                    task_id.0,
+                    EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                );
+                let mut escalated = result;
+                escalated.cost_usd += revision_cost;
+                escalated.tool_call_count =
+                    escalated.tool_call_count.saturating_add(revision_tool_calls);
+                escalated.files_modified.extend(revision_files);
+                escalated.tokens_in = escalated.tokens_in.saturating_add(revision_tokens_in);
+                escalated.tokens_out = escalated.tokens_out.saturating_add(revision_tokens_out);
+                return Ok(escalated);
+            }
 
             match &result.outcome {
                 AgentOutcome::Success => {
@@ -7498,8 +7517,24 @@ impl CoordinatorAgent {
                 task.id.0,
                 EventKind::ValidationCycleStarted { task_id: task.id, cycle_num: cycle },
             );
-            // Advance validation cycle counter
-            self.validation_cycles.next_cycle(task.id)?;
+            // ADR-35 amendment (2026-09-16 §2): an exceeded validation-cycle
+            // count is informational evidence, never a terminal stop. Publish
+            // the escalation event and return a recoverable Failed verdict so
+            // the Coordinator decides the next move.
+            if self.validation_cycles.next_cycle(task.id).is_err() {
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    task.id.0,
+                    EventKind::ValidationEscalated { task_id: task.id, max_cycles },
+                );
+                return Ok(acceptance_failure_result(
+                    task,
+                    format!(
+                        "Validation cycle ceiling ({max_cycles}) reached; escalation is \
+                         informational per ADR-35 amendment (2026-09-16 §2)."
+                    ),
+                ));
+            }
 
             // Use the validation-stage agent to run the test suite
             let agent = self.registry.get(&validator_role).ok_or_else(|| {
