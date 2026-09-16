@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use crate::approval::{
     ApprovalPrompt, CliApprovalSink, CliApprovalState, IntentPrompt, PlanPrompt,
 };
-use crate::ui;
+use crate::ui::{self, chat_line, ChatRole};
 use concerto_config::{
     AgentModelAssignment, AppConfig, ConditionDef, ModelSettings, MultiAgentConfig, PolicyConfig,
     PolicyRuleDef,
@@ -531,13 +531,18 @@ impl App {
         self.session_id = Some(session.session_id);
         if !history.is_empty() {
             self.messages.push(Line::from(format!("Resumed session {}", session.session_id)));
+            let styling = styling_enabled();
             for message in history {
                 match message.role {
                     concerto_core::types::Role::User => {
-                        self.messages.push(Line::from(format!("> {}", message.content)));
+                        self.messages.push(chat_line(ChatRole::User, &message.content, styling));
                     }
                     concerto_core::types::Role::Assistant if !message.content.trim().is_empty() => {
-                        self.messages.push(Line::from(message.content));
+                        self.messages.push(chat_line(
+                            ChatRole::Assistant,
+                            &message.content,
+                            styling,
+                        ));
                     }
                     _ => {}
                 }
@@ -866,7 +871,7 @@ impl App {
             }
         };
 
-        self.push_line(Line::from(format!("> {input}")));
+        self.push_line(chat_line(ChatRole::User, &input, styling_enabled()));
         self.running = true;
         // Fresh run boundary: no stale stage from a previous run may show in
         // the status bar (the chip re-appears once a stage event lands).
@@ -952,14 +957,20 @@ impl App {
                 // `push_line`) so its slot is materialized before we push the
                 // replacement slot below.
                 self.cancel_reveal();
+                let styling = styling_enabled();
+                // Reduced-motion: instant — the full markdown-lite + gutter
+                // line lands at once, no reveal state, no bold/hold extension.
+                if self.reduced_motion {
+                    self.messages.push(chat_line(ChatRole::Assistant, &full, styling));
+                    self.reveal = None;
+                    return;
+                }
                 // Wipe analog (Score prototype #7): a horizontal rule above
                 // each new assistant turn — the desktop canvas line-wipe has
                 // no TUI equivalent. Skipped under reduced-motion (same gate
                 // as desktop); dimmed only on a color TTY.
-                if !self.reduced_motion {
-                    self.messages.push(wipe_rule_line(styling_enabled()));
-                }
-                self.messages.push(Line::from(prefix(&full, 0)));
+                self.messages.push(wipe_rule_line(styling));
+                self.messages.push(chat_line(ChatRole::Assistant, "", styling));
                 self.reveal = Some(RevealState { full, shown: 0, ticks: 0, hold: 0 });
             }
         }
@@ -990,6 +1001,10 @@ impl App {
     /// per-agent digest (latest headline each) and suppresses future
     /// `Detail` lines; expand-all replays exactly the suppressed lines.
     fn toggle_thinking(&mut self) {
+        // Policy-gutter (`‖`, yellow on a color TTY) for the digest lines;
+        // the text stays byte-identical to the V2 accordion contract — only
+        // the gutter color is new, and plain (symbols only) off-TTY.
+        let styling = styling_enabled();
         self.thinking_expanded = !self.thinking_expanded;
         if self.thinking_expanded {
             let replay: Vec<(String, String)> = self
@@ -1004,7 +1019,7 @@ impl App {
             for (agent, content) in replay {
                 self.push_line(Line::from(format!("· [{agent}] {content}")));
             }
-            self.push_line(Line::from("‖ thinking expanded"));
+            self.push_line(chat_line(ChatRole::Policy, "thinking expanded", styling));
         } else {
             let mut order: Vec<String> = Vec::new();
             let mut latest: std::collections::HashMap<String, String> =
@@ -1020,10 +1035,18 @@ impl App {
             for agent in &order {
                 if let Some(headline) = latest.get(agent) {
                     let first = headline.lines().next().unwrap_or("").trim();
-                    self.push_line(Line::from(format!("‖ [{agent}] {first}")));
+                    self.push_line(chat_line(
+                        ChatRole::Policy,
+                        &format!("[{agent}] {first}"),
+                        styling,
+                    ));
                 }
             }
-            self.push_line(Line::from("‖ thinking collapsed — /thinking to expand"));
+            self.push_line(chat_line(
+                ChatRole::Policy,
+                "thinking collapsed — /thinking to expand",
+                styling,
+            ));
         }
     }
 
@@ -1094,7 +1117,9 @@ impl App {
     fn cancel_reveal(&mut self) {
         if let Some(reveal) = self.reveal.take() {
             if let Some(last) = self.messages.last_mut() {
-                *last = Line::from(reveal.full);
+                // Settle to the final markdown-lite + gutter rendering, not
+                // plain text, so the abandoned slot matches a completed line.
+                *last = chat_line(ChatRole::Assistant, &reveal.full, styling_enabled());
             }
         }
     }
@@ -1456,13 +1481,14 @@ impl App {
             };
         self.messages.clear();
         self.push_line(Line::from(format!("Resumed session {session_id}")));
+        let styling = styling_enabled();
         for message in &history {
             match message.role {
                 concerto_core::types::Role::User => {
-                    self.push_line(Line::from(format!("> {}", message.content)));
+                    self.push_line(chat_line(ChatRole::User, &message.content, styling));
                 }
                 concerto_core::types::Role::Assistant if !message.content.trim().is_empty() => {
-                    self.push_line(Line::from(message.content.clone()));
+                    self.push_line(chat_line(ChatRole::Assistant, &message.content, styling));
                 }
                 _ => {}
             }
@@ -1772,11 +1798,13 @@ fn styling_enabled() -> bool {
     std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal()
 }
 
-/// Styled reveal line for the assistant typewriter: `full[..shown]` with the
-/// Score motion cues — a bold first word while `emphasis` (first-token
-/// emphasis, prototype #6), a dim whole line while `holding` (paragraph
-/// handoff, prototype #5). Plain text when `styling` is false
-/// (`NO_COLOR`/off-TTY, see `styling_enabled`).
+/// Styled reveal line for the assistant typewriter: the `full[..shown]`
+/// prefix rendered as markdown-lite (`ui::markdown_spans`) behind the role
+/// gutter (`♪`, green on a color TTY), with the Score motion cues layered on
+/// top — a bold first word while `emphasis` (first-token emphasis, prototype
+/// #6), a dim whole line while `holding` (paragraph handoff, prototype #5).
+/// Plain (symbols only) when `styling` is false (`NO_COLOR`/off-TTY, see
+/// `styling_enabled`).
 fn reveal_line(
     full: &str,
     shown: usize,
@@ -1784,31 +1812,48 @@ fn reveal_line(
     holding: bool,
     styling: bool,
 ) -> Line<'static> {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     let text = prefix(full, shown);
+    let mut line = chat_line(ChatRole::Assistant, &text, styling);
     if !styling {
-        return Line::from(text);
+        return line;
     }
     if holding {
-        return Line::from(Span::styled(text, Style::default().add_modifier(Modifier::DIM)));
+        for span in line.spans.iter_mut() {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+        return line;
     }
     if emphasis {
-        // First-token emphasis: split the revealed prefix at the first
-        // whitespace boundary. The leading word renders bold; the remainder
-        // continues normal. A prefix with no whitespace yet is one token —
-        // bold it all (mirrors the desktop truncated-reveal path).
-        if let Some(space) = text.find(char::is_whitespace) {
-            return Line::from(vec![
-                Span::styled(
-                    text[..space].to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(text[space..].to_string()),
-            ]);
-        }
-        return Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)));
+        bold_first_token(&mut line);
     }
-    Line::from(text)
+    line
+}
+
+/// Bold the first whitespace-delimited token of the body (every span past
+/// the gutter at index 0), splitting the span that holds the boundary.
+/// A prefix with no whitespace yet is one token — bold it all (mirrors the
+/// desktop truncated-reveal path). Markdown-lite spans underneath keep
+/// their own styles; this only adds `BOLD`.
+fn bold_first_token(line: &mut Line<'static>) {
+    use ratatui::style::Modifier;
+    for index in 1..line.spans.len() {
+        let content = line.spans[index].content.to_string();
+        if let Some(pos) = content.find(char::is_whitespace) {
+            let (head, tail) = content.split_at(pos);
+            let base = line.spans[index].style;
+            line.spans[index] =
+                ratatui::text::Span::styled(head.to_string(), base.add_modifier(Modifier::BOLD));
+            line.spans.insert(index + 1, ratatui::text::Span::styled(tail.to_string(), base));
+            for span in line.spans.iter_mut().skip(1).take(index - 1) {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+            }
+            return;
+        }
+    }
+    for span in line.spans.iter_mut().skip(1) {
+        span.style = span.style.add_modifier(Modifier::BOLD);
+    }
 }
 
 /// Wipe-analog rule above each new assistant turn (Score prototype #7).
@@ -1996,10 +2041,15 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
         TranscriptToolStatus::Cancelled => "cancelled",
     };
     let mut lines = Vec::with_capacity(entries.len());
+    // Restored lines carry the same role gutters + markdown-lite as live
+    // chat (plain symbols off-TTY so tests and pipes stay stable).
+    let styling = styling_enabled();
     for entry in entries {
         let line = match entry {
-            TranscriptEntry::User { content } => Line::from(format!("> {content}")),
-            TranscriptEntry::Assistant { content } => Line::from(content.clone()),
+            TranscriptEntry::User { content } => chat_line(ChatRole::User, content, styling),
+            TranscriptEntry::Assistant { content } => {
+                chat_line(ChatRole::Assistant, content, styling)
+            }
             TranscriptEntry::Thinking { agent, content } => {
                 let text =
                     if agent.is_empty() { content.clone() } else { format!("[{agent}] {content}") };
@@ -2710,14 +2760,15 @@ mod tests {
         ];
         let lines = transcript_lines(&entries);
 
-        // Line text — mirrors the restore loop / live event_line formatting.
-        assert_eq!(line_text(&lines[0]), "> build the widget");
+        // Line text — mirrors the restore loop / live event_line formatting,
+        // now behind the role gutters (`›` user, `♪` assistant).
+        assert_eq!(line_text(&lines[0]), "› build the widget");
         assert_eq!(line_text(&lines[1]), "[coder] step one");
         assert_eq!(line_text(&lines[2]), "· fs_write: write main.rs (completed)");
         assert_eq!(line_text(&lines[3]), "· shell: allowed");
         assert_eq!(line_text(&lines[4]), "· net: failed");
         assert_eq!(line_text(&lines[5]), "[Coordinator] Delegated subtask T1 to coder");
-        assert_eq!(line_text(&lines[6]), "the fix is in");
+        assert_eq!(line_text(&lines[6]), "♪ the fix is in");
         assert_eq!(line_text(&lines[7]), "error: boom");
         assert_eq!(line_text(&lines[8]), "[context] context compacted");
         assert_eq!(line_text(&lines[9]), "Run multi-agent (complete) — files: main.rs, lib.rs");
@@ -3053,10 +3104,10 @@ mod tests {
         let mut app = App::new();
         let before = app.messages.len();
         app.ingest_ui_line(UiLine::Assistant("hello world".to_string()));
-        // Wipe-analog rule + the empty reveal slot.
+        // Wipe-analog rule + the empty reveal slot (assistant gutter only).
         assert_eq!(app.messages.len(), before + 2);
         assert_eq!(line_text(&app.messages[app.messages.len() - 2]), WIPE_RULE);
-        assert_eq!(line_text(app.messages.last().unwrap()), "");
+        assert_eq!(line_text(app.messages.last().unwrap()), "♪ ");
         let reveal = app.reveal.as_ref().unwrap();
         assert_eq!(reveal.full, "hello world");
         assert_eq!(reveal.shown, 0);
@@ -3074,10 +3125,13 @@ mod tests {
             ticks += 1;
             let shown = app.reveal.as_ref().map(|r| r.shown).unwrap_or(32);
             assert_eq!(shown, ticks * REVEAL_CHARS_PER_TICK, "each tick adds exactly 8 chars");
-            assert_eq!(line_text(app.messages.last().unwrap()), prefix(&full, shown));
+            assert_eq!(
+                line_text(app.messages.last().unwrap()),
+                format!("♪ {}", prefix(&full, shown))
+            );
         }
         assert_eq!(ticks, 4);
-        assert_eq!(line_text(app.messages.last().unwrap()), full);
+        assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
         assert!(app.reveal.is_none(), "reveal is cleared once the full text is shown");
     }
 
@@ -3088,7 +3142,7 @@ mod tests {
         assert!(app.reveal.is_some());
         // 5 chars on an 8-char tick reveals everything at once.
         app.advance_reveal();
-        assert_eq!(line_text(app.messages.last().unwrap()), "short");
+        assert_eq!(line_text(app.messages.last().unwrap()), "♪ short");
         assert!(app.reveal.is_none(), "reveal completes as soon as the full text is shown");
     }
 
@@ -3100,11 +3154,11 @@ mod tests {
         while app.reveal.is_some() {
             app.advance_reveal();
             let shown = app.reveal.as_ref().map(|r| r.shown).unwrap_or(full.chars().count());
-            let expected = prefix(full, shown);
+            let expected = format!("♪ {}", prefix(full, shown));
             assert_eq!(line_text(app.messages.last().unwrap()), expected);
-            assert!(expected.is_char_boundary(expected.len()));
+            assert!(prefix(full, shown).is_char_boundary(prefix(full, shown).len()));
         }
-        assert_eq!(line_text(app.messages.last().unwrap()), full);
+        assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
     }
 
     #[test]
@@ -3119,11 +3173,11 @@ mod tests {
         app.ingest_ui_line(UiLine::Text("· tool finished".to_string()));
         assert_eq!(app.messages.len(), before + 1);
         assert!(app.reveal.is_none(), "a plain line must cancel any active reveal");
-        // The abandoned reveal slot materializes its full text before the new
-        // line is appended.
+        // The abandoned reveal slot materializes its full guttered text
+        // before the new line is appended.
         assert_eq!(
             line_text(&app.messages[app.messages.len() - 2]),
-            "long enough to still be revealing"
+            "♪ long enough to still be revealing"
         );
         assert_eq!(line_text(app.messages.last().unwrap()), "· tool finished");
     }
@@ -3135,8 +3189,8 @@ mod tests {
         assert!(app.reveal.is_some());
         app.push_line(Line::from("> new question"));
         assert!(app.reveal.is_none(), "any direct push must cancel the reveal");
-        // The reveal slot renders its full text (it was cancelled, not lost).
-        assert_eq!(line_text(&app.messages[app.messages.len() - 2]), "abcdefgh");
+        // The reveal slot renders its full guttered text (it was cancelled, not lost).
+        assert_eq!(line_text(&app.messages[app.messages.len() - 2]), "♪ abcdefgh");
         assert_eq!(line_text(app.messages.last().unwrap()), "> new question");
     }
 
@@ -3148,7 +3202,7 @@ mod tests {
         assert!(app.reveal.is_some());
 
         app.ingest_ui_line(UiLine::Assistant("second".to_string()));
-        assert_eq!(line_text(app.messages.last().unwrap()), "");
+        assert_eq!(line_text(app.messages.last().unwrap()), "♪ ");
         let reveal = app.reveal.as_ref().unwrap();
         assert_eq!(reveal.full, "second");
         assert_eq!(reveal.shown, 0);
@@ -3164,19 +3218,21 @@ mod tests {
     fn reveal_line_bolds_first_token_only_while_emphasis_holds() {
         use ratatui::style::Modifier;
         let line = reveal_line("hello world here", 16, true, false, true);
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].content.as_ref(), "hello");
-        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(line.spans[1].content.as_ref(), " world here");
-        assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        // Gutter + bold first token + plain remainder.
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content.as_ref(), "♪ ");
+        assert_eq!(line.spans[1].content.as_ref(), "hello");
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[2].content.as_ref(), " world here");
+        assert!(!line.spans[2].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn reveal_line_bolds_whole_prefix_before_first_space() {
         use ratatui::style::Modifier;
         let line = reveal_line("hello", 5, true, false, true);
-        assert_eq!(line.spans.len(), 1);
-        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans.len(), 2);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -3185,11 +3241,17 @@ mod tests {
         let held = reveal_line("hello world", 11, false, true, true);
         assert!(held.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)));
         let settled = reveal_line("hello world", 11, false, false, true);
-        assert!(settled.spans.iter().all(|span| !span.style.add_modifier.contains(Modifier::BOLD)));
-        // NO_COLOR/off-TTY: no modifiers at all.
+        // Body settles plain (no emphasis BOLD); span 0 is the role gutter,
+        // which keeps its `chat_line` role color + BOLD by contract.
+        assert!(settled
+            .spans
+            .iter()
+            .skip(1)
+            .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)));
+        // NO_COLOR/off-TTY: gutter symbols only, no modifiers.
         let plain = reveal_line("hello world", 11, true, false, false);
-        assert_eq!(line_text(&plain), "hello world");
-        assert_eq!(plain.spans.len(), 1);
+        assert_eq!(line_text(&plain), "♪ hello world");
+        assert_eq!(plain.spans.len(), 2);
     }
 
     #[test]
@@ -3255,20 +3317,16 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_skips_rule_hold_and_emphasis() {
+    fn reduced_motion_renders_assistant_instant_with_no_hold_or_rule() {
         let mut app = App::new();
         app.set_reduced_motion(true);
         let before = app.messages.len();
-        app.ingest_ui_line(UiLine::Assistant(
-            "01234567\n\nrest of second paragraph here".to_string(),
-        ));
-        // No wipe-analog rule: just the reveal slot.
+        let full = "01234567\n\nrest of second paragraph here".to_string();
+        app.ingest_ui_line(UiLine::Assistant(full.clone()));
+        // No wipe-analog rule and no reveal state: the full guttered line
+        // lands at once.
         assert_eq!(app.messages.len(), before + 1);
-        // Drive the whole reveal: the frontier crosses the boundary with no
-        // hold ever opening.
-        while app.reveal.is_some() {
-            app.advance_reveal();
-            assert_eq!(app.reveal.as_ref().map(|r| r.hold).unwrap_or(0), 0);
-        }
+        assert!(app.reveal.is_none(), "reduced-motion never opens a reveal");
+        assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
     }
 }

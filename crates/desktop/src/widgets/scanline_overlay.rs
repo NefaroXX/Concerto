@@ -153,25 +153,19 @@ pub fn view<'a, Message: 'a>(
 mod tests {
     use super::*;
 
+    // Compile-time guardrails: retuning these constants must preserve the
+    // documented relations, so violations fail the build instead of a test
+    // run (clippy::assertions_on_constants).
+    const _: () = assert!(MIN_ALPHA > 0.0 && MIN_ALPHA < 1.0);
+    const _: () = assert!(MAX_ALPHA > MIN_ALPHA && MAX_ALPHA <= 1.0);
+    const _: () = assert!(GRID_ALPHA > 0.0 && GRID_ALPHA < 0.1);
+    const _: () = assert!(LINE_SPACING > 0.0);
+    const _: () = assert!(GRID_SPACING > LINE_SPACING);
+
     #[test]
     fn progress_step_matches_tick_ms() {
         let expected = (TICK_MS as f32) / 1000.0 / PULSE_PERIOD_SECS;
         assert!((PROGRESS_STEP - expected).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn alpha_range_is_sensible() {
-        const {
-            assert!(MIN_ALPHA > 0.0 && MIN_ALPHA < 1.0);
-            assert!(MAX_ALPHA > MIN_ALPHA && MAX_ALPHA <= 1.0);
-        }
-    }
-
-    #[test]
-    fn grid_alpha_is_subtle() {
-        const {
-            assert!(GRID_ALPHA > 0.0 && GRID_ALPHA < 0.1);
-        }
     }
 
     #[test]
@@ -201,13 +195,5 @@ mod tests {
         assert!(overlay.is_streaming);
         assert!(!overlay.reduced_motion);
         assert!(overlay.show_grid);
-    }
-
-    #[test]
-    fn line_spacing_and_grid_spacing_are_positive() {
-        const {
-            assert!(LINE_SPACING > 0.0);
-            assert!(GRID_SPACING > LINE_SPACING);
-        }
     }
 }

@@ -591,6 +591,164 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .max(1)
 }
 
+// ---------------------------------------------------------------------------
+// Chat role gutters + markdown-lite (Score signature, CLI slice)
+// ---------------------------------------------------------------------------
+
+/// Chat-line role: one stable gutter symbol + ANSI color each, mirroring the
+/// desktop `agent_roles` palette-map contract (one stable color per bucket).
+/// Under `NO_COLOR`/off-TTY the symbols render plain (no ANSI) so nothing
+/// leaks into pipes — the same contract as `thinking_header`/`reveal_line`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatRole {
+    User,
+    Assistant,
+    Policy,
+}
+
+impl ChatRole {
+    pub(crate) fn gutter(self) -> &'static str {
+        match self {
+            ChatRole::User => "› ",
+            ChatRole::Assistant => "♪ ",
+            ChatRole::Policy => "‖ ",
+        }
+    }
+
+    pub(crate) fn color(self) -> Color {
+        match self {
+            ChatRole::User => Color::Cyan,
+            ChatRole::Assistant => Color::Green,
+            ChatRole::Policy => Color::Yellow,
+        }
+    }
+}
+
+/// A chat line: role gutter + markdown-lite body. Plain (symbols only) when
+/// `styling` is false (`NO_COLOR`/off-TTY, caller-gated via
+/// `styling_enabled`); gutter color + markdown spans otherwise.
+pub(crate) fn chat_line(role: ChatRole, body: &str, styling: bool) -> Line<'static> {
+    if !styling {
+        return Line::from(vec![Span::raw(role.gutter().to_string()), Span::raw(body.to_string())]);
+    }
+    let mut spans = vec![Span::styled(
+        role.gutter().to_string(),
+        Style::default().fg(role.color()).add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(markdown_spans(body, true));
+    Line::from(spans)
+}
+
+/// Markdown-lite spans for assistant/user bodies: `**bold**`, `` `code` ``
+/// (reversed + dim), `#` headings (bold whole line), fenced blocks (indented
+/// `  │ ` gutter in `DarkGray`, dimmed body). Unclosed markers and fences
+/// render literally so a mid-reveal prefix never panics or drops text.
+pub(crate) fn markdown_spans(text: &str, styling: bool) -> Vec<Span<'static>> {
+    if !styling {
+        return vec![Span::raw(text.to_string())];
+    }
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    let lines: Vec<&str> = text.split('\n').collect();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push(Span::raw("\n".to_string()));
+        }
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push(Span::styled(
+                (*line).to_string(),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ));
+            continue;
+        }
+        if in_fence {
+            out.push(Span::styled("  │ ".to_string(), Style::default().fg(Color::DarkGray)));
+            out.push(Span::styled(
+                (*line).to_string(),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ));
+            continue;
+        }
+        out.extend(inline_spans(line, is_heading(line)));
+    }
+    out
+}
+
+/// A `#` heading: 1–6 `#` followed by a space (leading whitespace allowed).
+fn is_heading(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    (1..=6).contains(&hashes) && trimmed.chars().nth(hashes).is_some_and(|c| c == ' ')
+}
+
+/// Inline `**bold**` / `` `code` `` spans for one fence-free line. Looks for
+/// a closing marker before consuming an opener, so unclosed markers stay
+/// literal. `force_bold` (headings) bolds the whole line.
+fn inline_spans(segment: &str, force_bold: bool) -> Vec<Span<'static>> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut index = 0;
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
+        if buf.is_empty() {
+            return;
+        }
+        let text = std::mem::take(buf);
+        if force_bold {
+            spans.push(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)));
+        } else {
+            spans.push(Span::raw(text));
+        }
+    };
+    while index < chars.len() {
+        if chars[index] == '*'
+            && index + 1 < chars.len()
+            && chars[index + 1] == '*'
+            && closes(&chars, index + 2, "**")
+        {
+            flush(&mut buf, &mut spans);
+            let inner: String = chars[index + 2..].iter().collect();
+            let end = inner.find("**").expect("closing marker checked above");
+            let end_chars = inner[..end].chars().count();
+            let content: String = chars[index + 2..index + 2 + end_chars].iter().collect();
+            let mut style = Style::default().add_modifier(Modifier::BOLD);
+            if force_bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(content, style));
+            index += 2 + end_chars + 2;
+        } else if chars[index] == '`' && closes(&chars, index + 1, "`") {
+            flush(&mut buf, &mut spans);
+            let rest: String = chars[index + 1..].iter().collect();
+            let end = rest.find('`').expect("closing backtick checked above");
+            let end_chars = rest[..end].chars().count();
+            let content: String = chars[index + 1..index + 1 + end_chars].iter().collect();
+            let style =
+                Style::default().add_modifier(Modifier::REVERSED).add_modifier(Modifier::DIM);
+            spans.push(Span::styled(content, style));
+            index += 1 + end_chars + 1;
+        } else {
+            buf.push(chars[index]);
+            index += 1;
+        }
+    }
+    flush(&mut buf, &mut spans);
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
+/// Whether `marker` closes later in `chars` from `from` (char index).
+fn closes(chars: &[char], from: usize, marker: &str) -> bool {
+    if from > chars.len() {
+        return false;
+    }
+    let rest: String = chars[from..].iter().collect();
+    rest.contains(marker)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +933,67 @@ mod tests {
         // separate; the field-level contract is what the status line reads).
         app.run_stage = None;
         assert!(!status_line(&app).contains("stage:"));
+    }
+
+    // ------------------------------------------------------------------
+    // Role gutters + markdown-lite
+    // ------------------------------------------------------------------
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|span| span.content.to_string()).collect()
+    }
+
+    #[test]
+    fn chat_line_plain_is_symbols_only() {
+        assert_eq!(line_text(&chat_line(ChatRole::User, "hi", false)), "› hi");
+        assert_eq!(line_text(&chat_line(ChatRole::Assistant, "hi", false)), "♪ hi");
+        assert_eq!(line_text(&chat_line(ChatRole::Policy, "hi", false)), "‖ hi");
+        for line in
+            [chat_line(ChatRole::User, "hi", false), chat_line(ChatRole::Assistant, "hi", false)]
+        {
+            assert!(line.spans.iter().all(|span| span.style.add_modifier.is_empty()));
+        }
+    }
+
+    #[test]
+    fn chat_line_styled_carries_role_colors() {
+        let user = chat_line(ChatRole::User, "hi", true);
+        assert_eq!(user.spans[0].content.as_ref(), "› ");
+        assert_eq!(user.spans[0].style.fg, Some(Color::Cyan));
+        let assistant = chat_line(ChatRole::Assistant, "hi", true);
+        assert_eq!(assistant.spans[0].style.fg, Some(Color::Green));
+        let policy = chat_line(ChatRole::Policy, "hi", true);
+        assert_eq!(policy.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn markdown_bold_and_code_spans() {
+        let spans = markdown_spans("a **bold** and `code` end", true);
+        let text: String = spans.iter().map(|span| span.content.to_string()).collect();
+        assert_eq!(text, "a bold and code end");
+        assert!(spans.iter().any(|span| span.content.as_ref() == "bold"
+            && span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(spans.iter().any(|span| span.content.as_ref() == "code"
+            && span.style.add_modifier.contains(Modifier::REVERSED)
+            && span.style.add_modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn markdown_unclosed_markers_stay_literal() {
+        assert_eq!(
+            line_text(&Line::from(markdown_spans("a **dangling and `tick", true))),
+            "a **dangling and `tick"
+        );
+    }
+
+    #[test]
+    fn markdown_heading_is_bold_and_fence_gets_gutter() {
+        let head = Line::from(markdown_spans("# Title", true));
+        assert_eq!(line_text(&head), "# Title");
+        assert!(head.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+        let fence = Line::from(markdown_spans("```\nlet x = 1;\n```", true));
+        let text = line_text(&fence);
+        assert!(text.contains("  │ "), "fenced body carries the │ gutter: {text:?}");
+        assert!(text.contains("let x = 1;"));
     }
 }

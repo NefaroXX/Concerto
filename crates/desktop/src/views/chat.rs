@@ -2494,14 +2494,14 @@ mod tests {
             Some(ChatEntry::Assistant { id, .. }) => *id,
             _ => panic!("expected an assistant entry"),
         };
-        assert_eq!(state.line_wipe_ticks.get(&id), Some(&0));
+        assert_eq!(state.line_wipe_step(id), Some(0));
 
         // Deterministic: exactly `LINE_WIPE_TICKS` ticks, then the wipe is
         // dropped (the rule settles away, like the other entrance cues).
         for expected in 1..=LINE_WIPE_TICKS {
             let _ = state.update(Message::TypingTick);
             if expected < LINE_WIPE_TICKS {
-                assert_eq!(state.line_wipe_ticks.get(&id), Some(&expected));
+                assert_eq!(state.line_wipe_step(id), Some(expected));
             } else {
                 assert!(!state.line_wipe_ticks.contains_key(&id));
             }
