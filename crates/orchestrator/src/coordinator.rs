@@ -6429,11 +6429,42 @@ impl CoordinatorAgent {
             );
         }
 
-        let completion_status = if recoverable_notes.is_empty() {
+        let mut completion_status = if recoverable_notes.is_empty() {
             concerto_core::types::AgentCompletionStatus::Completed
         } else {
             concerto_core::types::AgentCompletionStatus::Partial
         };
+        // ── C-06 completion-time acceptance gate ─────────────────────────
+        // ADR-35 amendment (2026-09-16 §5): acceptance is Coordinator-Owned;
+        // with the auto-validation pipeline gate removed, the run may only
+        // report Completed when the Coordinator actually recorded an accepted
+        // verification decision on the checkpoint action ledger. A build-task
+        // run (implement-stage subtask present) whose ledger carries no
+        // accepted verification (kind "accepted" with verification_passed)
+        // is downgraded to Partial with a recoverable note — the exit must
+        // not claim Completed without acceptance evidence.
+        let build_task = graph.all_tasks().iter().any(|subtask| {
+            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
+        });
+        let has_accepted_verification = action_ledger.iter().any(|action| {
+            action.kind == "accepted"
+                && action
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.verification_passed)
+        });
+        if build_task
+            && completion_status == concerto_core::types::AgentCompletionStatus::Completed
+            && !has_accepted_verification
+        {
+            completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+            recoverable_notes.push(
+                "Acceptance gate C-06: the run contained implement-stage work but no accepted \
+                 verification decision (kind \"accepted\" with verification passed) was recorded \
+                 on the action ledger; the completion claim is reported Partial."
+                    .to_owned(),
+            );
+        }
         // ── Run-continuity Phase 1: stall gate at the final exit ────────
         // A stalled run (declared-Completion false, declared deliverables
         // unproduced, or a Failed/Blocked subtask) KEEPS its resumable
