@@ -161,13 +161,17 @@ mod tests {
 
     #[test]
     fn alpha_range_is_sensible() {
-        assert!(MIN_ALPHA > 0.0 && MIN_ALPHA < 1.0);
-        assert!(MAX_ALPHA > MIN_ALPHA && MAX_ALPHA <= 1.0);
+        const {
+            assert!(MIN_ALPHA > 0.0 && MIN_ALPHA < 1.0);
+            assert!(MAX_ALPHA > MIN_ALPHA && MAX_ALPHA <= 1.0);
+        }
     }
 
     #[test]
     fn grid_alpha_is_subtle() {
-        assert!(GRID_ALPHA > 0.0 && GRID_ALPHA < 0.1);
+        const {
+            assert!(GRID_ALPHA > 0.0 && GRID_ALPHA < 0.1);
+        }
     }
 
     #[test]
@@ -201,7 +205,9 @@ mod tests {
 
     #[test]
     fn line_spacing_and_grid_spacing_are_positive() {
-        assert!(LINE_SPACING > 0.0);
-        assert!(GRID_SPACING > LINE_SPACING);
+        const {
+            assert!(LINE_SPACING > 0.0);
+            assert!(GRID_SPACING > LINE_SPACING);
+        }
     }
 }

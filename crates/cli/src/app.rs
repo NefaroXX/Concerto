@@ -43,6 +43,11 @@ pub struct RunFlags {
     /// Explicit `--fast`/`-f`, likewise. There is no config key for fast, so
     /// absent means `false`.
     pub fast: Option<bool>,
+    /// Explicit `--reduced-motion`. `Some(true)` when the flag was passed
+    /// (there is no `--no-reduced-motion`); `None` follows
+    /// `CONCERTO_REDUCED_MOTION` env, then the config file — see
+    /// `concerto_config::resolve_reduced_motion`.
+    pub reduced_motion: Option<bool>,
 }
 
 /// Per-run preferences resolved from the effective config plus the remembered
@@ -51,6 +56,7 @@ pub struct RunFlags {
 struct ResolvedRunPrefs {
     multi_agent: bool,
     fast: bool,
+    reduced_motion: bool,
     selected_model: String,
     model_choices: Vec<String>,
     agent_assignments: Vec<AgentModelAssignment>,
@@ -161,10 +167,14 @@ pub(crate) enum UiLine {
 
 /// In-progress typewriter reveal of the assistant's final message. The last
 /// `messages` line holds the revealed prefix; `shown` is how many characters
-/// are visible so far.
+/// are visible so far. `ticks` counts elapsed reveal ticks (16 ms cadence)
+/// for the first-token emphasis window; `hold` counts down the paragraph
+/// handoff hold while the frontier stays frozen at a blank-line boundary.
 struct RevealState {
     full: String,
     shown: usize,
+    ticks: u8,
+    hold: u8,
 }
 
 /// One tiered thought in the current movement's log (V2 score accordion).
@@ -184,6 +194,21 @@ pub(crate) struct ThoughtRecord {
 const REVEAL_CHARS_PER_TICK: usize = 8;
 /// Milliseconds between reveal advances while a reveal is active.
 const REVEAL_TICK_MS: u64 = 16;
+/// First-token emphasis window (Score signature, prototype #6): 12 ticks at
+/// the 16 ms cadence ≈ 200 ms, matching the desktop
+/// `FIRST_TOKEN_EMPHASIS_TICKS`. The first word of each assistant turn
+/// renders bold for this long, then settles to normal weight.
+const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 12;
+/// Paragraph handoff hold (Baton cue, prototype #5): 3 ticks at the 16 ms
+/// cadence ≈ 50 ms, matching the desktop `HANDOFF_HOLD_TICKS`. The reveal
+/// frontier freezes at the blank-line boundary and the line dims while the
+/// hold counts down, then the 8ch@16ms cadence resumes exactly where it
+/// paused.
+const HANDOFF_HOLD_TICKS: u8 = 3;
+/// Wipe-analog rule drawn above each new assistant turn. The desktop canvas
+/// line-wipe has no TUI equivalent, so a static horizontal rule marks the
+/// same turn boundary. Skipped under reduced-motion (caller gate).
+const WIPE_RULE: &str = "───";
 /// ADR-60 D7 (interrupt-safe resume): how long a quit with a run still in
 /// flight waits for the cancelled run to unwind and persist its interrupted
 /// checkpoint before the process tears down. Bounded so the exit is never a
@@ -263,6 +288,10 @@ pub struct App {
     /// historical show-everything behavior; `/thinking` toggles it per
     /// movement. `Headline` thoughts always render.
     pub(crate) thinking_expanded: bool,
+    /// Reduced-motion override (same gate as desktop): skips first-token
+    /// bold, the handoff hold/dim, and the wipe-analog rule — reveals render
+    /// plain and instant. Off by default; set via `set_reduced_motion`.
+    pub(crate) reduced_motion: bool,
 }
 
 impl Default for App {
@@ -278,10 +307,14 @@ impl App {
         let approval_sink = Arc::new(CliApprovalSink::with_state(approval_state.clone()));
         Self {
             bus: EventBus::default(),
-            messages: vec![
-                Line::from("Concerto CLI — type a message and press Enter"),
-                Line::from("Esc: commands/settings  [l] sessions  [t] log  [n] new  [p] project  Ctrl+C: cancel or quit"),
-            ],
+            messages: {
+                let mut initial = startup_signature_lines(styling_enabled());
+                initial.push(Line::from("Concerto CLI — type a message and press Enter"));
+                initial.push(Line::from(
+                    "Esc: commands/settings  [l] sessions  [t] log  [n] new  [p] project  Ctrl+C: cancel or quit",
+                ));
+                initial
+            },
             reveal: None,
             input: String::new(),
             scroll: 0,
@@ -320,6 +353,7 @@ impl App {
             current_agent: None,
             thought_log: Vec::new(),
             thinking_expanded: true,
+            reduced_motion: false,
         }
     }
 
@@ -383,6 +417,7 @@ impl App {
     fn apply_run_prefs(&mut self, prefs: ResolvedRunPrefs) {
         self.multi_agent = prefs.multi_agent;
         self.fast = prefs.fast;
+        self.set_reduced_motion(prefs.reduced_motion);
         self.selected_model = prefs.selected_model;
         self.model_choices = prefs.model_choices;
         self.agent_assignments = prefs.agent_assignments;
@@ -520,6 +555,13 @@ impl App {
 
     pub fn plan_prompt(&self) -> Option<PlanPrompt> {
         self.approval_state.plan_prompt()
+    }
+
+    /// Reduced-motion override (same gate as desktop): when true the reveal
+    /// renders plain — no first-token bold, no handoff hold/dim, no
+    /// wipe-analog rule. Mirrors the desktop `set_reduced_motion` contract.
+    pub fn set_reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
     }
 
     pub fn model_label(&self) -> &str {
@@ -910,8 +952,15 @@ impl App {
                 // `push_line`) so its slot is materialized before we push the
                 // replacement slot below.
                 self.cancel_reveal();
+                // Wipe analog (Score prototype #7): a horizontal rule above
+                // each new assistant turn — the desktop canvas line-wipe has
+                // no TUI equivalent. Skipped under reduced-motion (same gate
+                // as desktop); dimmed only on a color TTY.
+                if !self.reduced_motion {
+                    self.messages.push(wipe_rule_line(styling_enabled()));
+                }
                 self.messages.push(Line::from(prefix(&full, 0)));
-                self.reveal = Some(RevealState { full, shown: 0 });
+                self.reveal = Some(RevealState { full, shown: 0, ticks: 0, hold: 0 });
             }
         }
     }
@@ -978,18 +1027,53 @@ impl App {
         }
     }
 
-    /// Advance the typewriter reveal one tick: grow `shown` by
-    /// `REVEAL_CHARS_PER_TICK` (clamped to the message length), rewrite the
-    /// last message line with the revealed prefix, and clear the state once
-    /// the full text is shown. No-op when no reveal is active.
+    /// Advance the typewriter reveal one tick at the 8ch@16ms parity cadence.
+    /// Each tick the emphasis clock advances; while a paragraph handoff hold
+    /// is open the frontier stays frozen and the line renders dim instead of
+    /// growing. Crossing a blank-line boundary opens a fresh
+    /// `HANDOFF_HOLD_TICKS` hold (skipped under reduced-motion). The finished
+    /// line always settles to normal weight, and the state clears once the
+    /// full text is shown. No-op when no reveal is active.
     fn advance_reveal(&mut self) {
+        let reduced = self.reduced_motion;
+        let styling = styling_enabled();
         let Some(state) = self.reveal.as_mut() else { return };
+        // The emphasis clock runs on every tick — including hold ticks, like
+        // the desktop `advance_first_token_ticks` — so a handoff never
+        // stretches the bold window.
+        state.ticks = state.ticks.saturating_add(1);
+        if state.hold > 0 {
+            state.hold -= 1;
+            let line = reveal_line(&state.full, state.shown, false, true, styling);
+            if let Some(last) = self.messages.last_mut() {
+                *last = line;
+            }
+            return;
+        }
         let total = state.full.chars().count();
-        state.shown = state.shown.saturating_add(REVEAL_CHARS_PER_TICK).min(total);
-        let done = state.shown >= total;
-        let prefix_text = prefix(&state.full, state.shown);
+        let from = state.shown;
+        let next = from.saturating_add(REVEAL_CHARS_PER_TICK).min(total);
+        // Paragraph handoff cue (Baton prototype #5): when the frontier
+        // crosses a blank-line boundary mid-reveal, freeze it and hold the
+        // dimmed line for `HANDOFF_HOLD_TICKS` before resuming. A finishing
+        // tick never opens a hold; single-paragraph content never triggers.
+        if next != total && !reduced && crosses_paragraph_boundary(&state.full, from, next) {
+            state.shown = next;
+            state.hold = HANDOFF_HOLD_TICKS;
+            let line = reveal_line(&state.full, next, false, true, styling);
+            if let Some(last) = self.messages.last_mut() {
+                *last = line;
+            }
+            return;
+        }
+        state.shown = next;
+        let done = next >= total;
+        // The completed line settles to normal weight even inside the
+        // emphasis window — a one-tick reveal must not linger bold.
+        let emphasis = !done && !reduced && state.ticks < FIRST_TOKEN_EMPHASIS_TICKS;
+        let line = reveal_line(&state.full, next, emphasis, false, styling);
         if let Some(last) = self.messages.last_mut() {
-            *last = Line::from(prefix_text);
+            *last = line;
         }
         if done {
             self.reveal = None;
@@ -1583,6 +1667,11 @@ fn resolve_run_prefs(effective: &AppConfig, flags: &RunFlags) -> ResolvedRunPref
     // `fast` has no config key: absent flag means off (matches the pre-reload
     // startup derivation).
     let fast = flags.fast.unwrap_or(false);
+    // Reduced-motion precedence: explicit flag > CONCERTO_REDUCED_MOTION env
+    // > config file > default (false). The CLI has no scan-line; this flag
+    // gates the bold/hold/rule cues (all already respect it). NO_COLOR stays
+    // independent (`styling_enabled` is untouched).
+    let reduced_motion = concerto_config::resolve_reduced_motion(flags.reduced_motion, effective);
     let selected_model = default_model(effective);
     let model_choices = available_models(effective);
     let agent_assignments = effective
@@ -1590,7 +1679,14 @@ fn resolve_run_prefs(effective: &AppConfig, flags: &RunFlags) -> ResolvedRunPref
         .as_ref()
         .map(|settings| settings.agent_assignments.clone())
         .unwrap_or_default();
-    ResolvedRunPrefs { multi_agent, fast, selected_model, model_choices, agent_assignments }
+    ResolvedRunPrefs {
+        multi_agent,
+        fast,
+        reduced_motion,
+        selected_model,
+        model_choices,
+        agent_assignments,
+    }
 }
 
 /// Decide the outcome of a per-run reload (ADR-57 D5). The equality
@@ -1640,6 +1736,118 @@ fn permissive_policy() -> PolicyConfig {
 /// the middle of a code point.
 fn prefix(full: &str, shown: usize) -> String {
     full.chars().take(shown).collect()
+}
+
+/// Startup signature staff: 2 static lines (≤3) printed as the first chat
+/// lines in `App::new` — an ASCII staff plus the version/tagline. Static
+/// text (reduced-motion irrelevant). Styled on a color TTY; plain ASCII
+/// (no symbol beyond `-`) under `NO_COLOR`/off-TTY so nothing non-ASCII
+/// leaks into pipes. `styling` is a parameter (like `reveal_line`) so the
+/// plain side stays unit-testable off-TTY.
+fn startup_signature_lines(styling: bool) -> Vec<Line<'static>> {
+    use ratatui::style::{Modifier, Style};
+    let version = env!("CARGO_PKG_VERSION");
+    if styling {
+        vec![
+            Line::from(Span::styled(
+                "♪ ─── ♪ ─── ♪",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("CONCERTO v{version} — local-first • policy-governed")),
+        ]
+    } else {
+        vec![
+            Line::from("- - - CONCERTO - - -"),
+            Line::from(format!("CONCERTO v{version} - local-first - policy-governed")),
+        ]
+    }
+}
+/// Styling gate for the CLI motion cues (bold first token, dim handoff,
+/// dimmed wipe rule): cues render only on a color TTY. Under `NO_COLOR` or
+/// off-TTY every line stays plain so no ANSI escapes leak into pipes — the
+/// same contract as `thinking_header`. A parameter at the call boundary (not
+/// read inside `reveal_line`) so the cues stay unit-testable off-TTY.
+fn styling_enabled() -> bool {
+    use std::io::IsTerminal as _;
+    std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal()
+}
+
+/// Styled reveal line for the assistant typewriter: `full[..shown]` with the
+/// Score motion cues — a bold first word while `emphasis` (first-token
+/// emphasis, prototype #6), a dim whole line while `holding` (paragraph
+/// handoff, prototype #5). Plain text when `styling` is false
+/// (`NO_COLOR`/off-TTY, see `styling_enabled`).
+fn reveal_line(
+    full: &str,
+    shown: usize,
+    emphasis: bool,
+    holding: bool,
+    styling: bool,
+) -> Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    let text = prefix(full, shown);
+    if !styling {
+        return Line::from(text);
+    }
+    if holding {
+        return Line::from(Span::styled(text, Style::default().add_modifier(Modifier::DIM)));
+    }
+    if emphasis {
+        // First-token emphasis: split the revealed prefix at the first
+        // whitespace boundary. The leading word renders bold; the remainder
+        // continues normal. A prefix with no whitespace yet is one token —
+        // bold it all (mirrors the desktop truncated-reveal path).
+        if let Some(space) = text.find(char::is_whitespace) {
+            return Line::from(vec![
+                Span::styled(
+                    text[..space].to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text[space..].to_string()),
+            ]);
+        }
+        return Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)));
+    }
+    Line::from(text)
+}
+
+/// Wipe-analog rule above each new assistant turn (Score prototype #7).
+/// Dimmed on a color TTY, plain under `NO_COLOR`/off-TTY. The reduced-motion
+/// gate lives with the caller (`ingest_ui_line`), which skips the rule.
+fn wipe_rule_line(styling: bool) -> Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    if styling {
+        Line::from(Span::styled(WIPE_RULE, Style::default().add_modifier(Modifier::DIM)))
+    } else {
+        Line::from(WIPE_RULE)
+    }
+}
+
+/// Whether the reveal frontier crossed a paragraph boundary between `from`
+/// (exclusive) and `to` (inclusive), measured in characters. Same contract
+/// as the desktop Baton cue: a boundary is a blank line — an empty or
+/// whitespace-only line terminated by `\n` with more content following it —
+/// covering `\n\n`, `\r\n\r\n`, and whitespace-only separator lines.
+/// Single-paragraph text (and a trailing newline run with no content after
+/// it) yields `false`, so the handoff cue falls back to no cue.
+fn crosses_paragraph_boundary(content: &str, from: usize, to: usize) -> bool {
+    if to <= from {
+        return false;
+    }
+    let mut offset: usize = 0;
+    let mut lines = content.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line_len = line.chars().count();
+        let line_end = offset.saturating_add(line_len);
+        // Only a newline-terminated blank line with content after it marks a
+        // "continuing" handoff; a final newline run is just the message end.
+        let is_separator = line.contains('\n') && line.trim().is_empty() && lines.peek().is_some();
+        if is_separator && line_end > from && line_end <= to {
+            return true;
+        }
+        offset = line_end;
+    }
+    false
 }
 
 /// ANSI counterpart of the desktop `agent_roles` palette map: one stable
@@ -2215,10 +2423,26 @@ mod tests {
     fn resolve_run_prefs_flags_override_config() {
         // The file says multi-agent off, but an explicit -m -f must win.
         let config = config_with_multi_agent(false);
-        let flags = RunFlags { multi_agent: Some(true), fast: Some(true) };
+        let flags =
+            RunFlags { multi_agent: Some(true), fast: Some(true), reduced_motion: Some(true) };
         let prefs = resolve_run_prefs(&config, &flags);
         assert!(prefs.multi_agent, "an explicit -m must clobber a config default_enabled=false");
         assert!(prefs.fast, "an explicit -f must set fast");
+        assert!(prefs.reduced_motion, "an explicit --reduced-motion must set reduced_motion");
+    }
+
+    #[test]
+    fn resolve_run_prefs_reduced_motion_follows_config() {
+        let mut config = config_with_multi_agent(false);
+        assert!(
+            !resolve_run_prefs(&config, &RunFlags::default()).reduced_motion,
+            "default config must leave reduced_motion off"
+        );
+        config.display.reduced_motion = true;
+        assert!(
+            resolve_run_prefs(&config, &RunFlags::default()).reduced_motion,
+            "config display.reduced_motion must flow into run prefs with no flag"
+        );
     }
 
     #[test]
@@ -2401,6 +2625,42 @@ mod tests {
         assert!(matches!(app.handle_agent_assignments_key(KeyCode::Left), Action::None));
         // Also verify that agent_assignment_index is unchanged.
         assert_eq!(app.agent_assignment_index, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Startup signature staff (static, ≤3 lines, NO_COLOR/off-TTY plain).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn startup_signature_plain_is_ascii_and_versioned() {
+        let lines = startup_signature_lines(false);
+        assert!(lines.len() <= 3, "signature must stay within 3 lines");
+        assert!(!lines.is_empty());
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("CONCERTO"), "wordmark present: {joined}");
+        assert!(joined.contains(env!("CARGO_PKG_VERSION")), "version present: {joined}");
+        for line in &lines {
+            let text = line_text(line);
+            assert!(text.is_ascii(), "plain signature must be ASCII-only: {text:?}");
+            assert!(
+                text.chars().all(|c| c.is_alphanumeric() || c == '-' || c == ' ' || c == '.'),
+                "plain signature uses no symbol beyond '-': {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_signature_styled_carries_staff_and_new_app_leads_with_it() {
+        let styled = startup_signature_lines(true);
+        let joined = styled.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("CONCERTO"), "wordmark present: {joined}");
+        assert!(joined.contains(env!("CARGO_PKG_VERSION")), "version present: {joined}");
+        // Off-TTY tests get the plain side; the app must still lead with it.
+        let app = App::new();
+        let plain = startup_signature_lines(false);
+        for (index, expected) in plain.iter().enumerate() {
+            assert_eq!(line_text(&app.messages[index]), line_text(expected));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2793,7 +3053,9 @@ mod tests {
         let mut app = App::new();
         let before = app.messages.len();
         app.ingest_ui_line(UiLine::Assistant("hello world".to_string()));
-        assert_eq!(app.messages.len(), before + 1);
+        // Wipe-analog rule + the empty reveal slot.
+        assert_eq!(app.messages.len(), before + 2);
+        assert_eq!(line_text(&app.messages[app.messages.len() - 2]), WIPE_RULE);
         assert_eq!(line_text(app.messages.last().unwrap()), "");
         let reveal = app.reveal.as_ref().unwrap();
         assert_eq!(reveal.full, "hello world");
@@ -2890,5 +3152,123 @@ mod tests {
         let reveal = app.reveal.as_ref().unwrap();
         assert_eq!(reveal.full, "second");
         assert_eq!(reveal.shown, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Signature text motion parity (Score first-token + Baton handoff +
+    // wipe analog). `styling` is passed explicitly so the cues are
+    // assertable off-TTY, where `styling_enabled()` is false.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reveal_line_bolds_first_token_only_while_emphasis_holds() {
+        use ratatui::style::Modifier;
+        let line = reveal_line("hello world here", 16, true, false, true);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "hello");
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[1].content.as_ref(), " world here");
+        assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn reveal_line_bolds_whole_prefix_before_first_space() {
+        use ratatui::style::Modifier;
+        let line = reveal_line("hello", 5, true, false, true);
+        assert_eq!(line.spans.len(), 1);
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn reveal_line_dims_while_holding_and_settles_plain() {
+        use ratatui::style::Modifier;
+        let held = reveal_line("hello world", 11, false, true, true);
+        assert!(held.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)));
+        let settled = reveal_line("hello world", 11, false, false, true);
+        assert!(settled.spans.iter().all(|span| !span.style.add_modifier.contains(Modifier::BOLD)));
+        // NO_COLOR/off-TTY: no modifiers at all.
+        let plain = reveal_line("hello world", 11, true, false, false);
+        assert_eq!(line_text(&plain), "hello world");
+        assert_eq!(plain.spans.len(), 1);
+    }
+
+    #[test]
+    fn handoff_hold_freezes_reveal_three_ticks_then_resumes() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Assistant(
+            "01234567\n\nrest of second paragraph here".to_string(),
+        ));
+        // First tick reveals 8 chars; the boundary end (char 10) is still
+        // out of reach, so no cue yet.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 8);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+
+        // Second tick (8→16) crosses the blank-line boundary: the frontier
+        // lands and a 3-tick hold opens.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, HANDOFF_HOLD_TICKS);
+
+        // The frontier stays frozen while the hold counts down, one per tick.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 2);
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 1);
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+
+        // Next tick resumes the 8ch@16ms cadence exactly where it paused.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 24);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+    }
+
+    #[test]
+    fn single_paragraph_reveal_never_holds() {
+        // 32 chars → 3 ticks of 8 stay mid-reveal, so `hold` is readable.
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Assistant("0123456789abcdefghij0123456789AB".to_string()));
+        for _ in 0..3 {
+            app.advance_reveal();
+            assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+        }
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 24);
+    }
+
+    #[test]
+    fn paragraph_boundary_detection_covers_separator_shapes() {
+        assert!(!crosses_paragraph_boundary("just one paragraph", 0, 18));
+        let two = "01234567\n\nrest";
+        assert!(crosses_paragraph_boundary(two, 8, 16));
+        assert!(!crosses_paragraph_boundary(two, 0, 8));
+        assert!(!crosses_paragraph_boundary(two, 10, 16));
+        assert!(crosses_paragraph_boundary("01234567\n   \nrest", 8, 16));
+        assert!(crosses_paragraph_boundary("01234567\r\n\r\nrest", 8, 16));
+        assert!(!crosses_paragraph_boundary("0123456789\n\n", 0, 12));
+        assert!(!crosses_paragraph_boundary("0123456789\n", 0, 11));
+        assert!(!crosses_paragraph_boundary("", 0, 0));
+        assert!(!crosses_paragraph_boundary("a\n\nb", 4, 4));
+    }
+
+    #[test]
+    fn reduced_motion_skips_rule_hold_and_emphasis() {
+        let mut app = App::new();
+        app.set_reduced_motion(true);
+        let before = app.messages.len();
+        app.ingest_ui_line(UiLine::Assistant(
+            "01234567\n\nrest of second paragraph here".to_string(),
+        ));
+        // No wipe-analog rule: just the reveal slot.
+        assert_eq!(app.messages.len(), before + 1);
+        // Drive the whole reveal: the frontier crosses the boundary with no
+        // hold ever opening.
+        while app.reveal.is_some() {
+            app.advance_reveal();
+            assert_eq!(app.reveal.as_ref().map(|r| r.hold).unwrap_or(0), 0);
+        }
     }
 }

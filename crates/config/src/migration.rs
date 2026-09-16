@@ -89,6 +89,8 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         retry: config.retry,
         // Memory config is additive and defaults during deserialization.
         memory: config.memory,
+        // [display] is additive and defaults during deserialization.
+        display: config.display,
         // v4 adds shell_settings (default filled by migrate_v3_to_v4).
         shell_settings: None,
         // v4 adds project_roots (ADR-44); preserve any deserialized value.
@@ -131,6 +133,8 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         retry: config.retry,
         // Memory config is additive and defaults during deserialization.
         memory: config.memory,
+        // [display] is additive and defaults during deserialization.
+        display: config.display,
         // v4 adds shell_settings (default filled below).
         shell_settings: None,
         // v4 adds project_roots (ADR-44); preserve any deserialized value.
@@ -197,7 +201,7 @@ fn migrate_v6_to_v7(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{MemoryConfig, RetryConfig};
+    use crate::schema::{DisplayConfig, MemoryConfig, RetryConfig};
 
     /// A minimal v1 config fixture — has schema_version: 1 and no
     /// observability field.
@@ -220,6 +224,7 @@ mod tests {
             updates: None,
             retry: RetryConfig::default(),
             memory: MemoryConfig::default(),
+            display: DisplayConfig::default(),
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
@@ -249,6 +254,7 @@ mod tests {
             updates: None,
             retry: RetryConfig::default(),
             memory: MemoryConfig::default(),
+            display: DisplayConfig::default(),
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
@@ -298,6 +304,7 @@ mod tests {
             updates: None,
             retry: RetryConfig::default(),
             memory: MemoryConfig::default(),
+            display: DisplayConfig::default(),
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,

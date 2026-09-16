@@ -6,6 +6,11 @@ use super::{PolicyActionChoice, PolicyConditionChoice, WorkingDirBehaviorChoice}
 pub enum Message {
     ThemeSelected(&'static str),
     FontSizeChanged(f32),
+    /// Toggle reduced-motion (`display.reduced_motion`): skips scan-line
+    /// pulse, first-token emphasis, handoff hold, and line wipe.
+    ReducedMotionToggled(bool),
+    /// Toggle the scan-line overlay (`display.scanline_overlay_enabled`).
+    ScanlineOverlayToggled(bool),
 
     // Legacy single-provider messages (kept for backward compat)
     ProviderSelected(&'static str),

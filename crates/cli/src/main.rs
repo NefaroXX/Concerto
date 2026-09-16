@@ -4,12 +4,13 @@ struct CliConfig {
     multi_agent: bool,
     fast: bool,
     reconfigure: bool,
+    reduced_motion: Option<bool>,
 }
 
 fn parse_args() -> CliConfig {
-    let (multi_agent, fast, reconfigure, _remaining) =
+    let (multi_agent, fast, reconfigure, reduced_motion, _remaining) =
         concerto_cli::parse_cli_args(std::env::args().skip(1).collect::<Vec<_>>().iter());
-    CliConfig { multi_agent, fast, reconfigure }
+    CliConfig { multi_agent, fast, reconfigure, reduced_motion }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -19,5 +20,5 @@ fn main() -> anyhow::Result<()> {
         tracing::info!("multi-agent mode enabled");
     }
 
-    run_cli(config.multi_agent, config.fast, config.reconfigure)
+    run_cli(config.multi_agent, config.fast, config.reconfigure, config.reduced_motion)
 }

@@ -296,7 +296,15 @@ pub struct App {
     pub circuit_progress: f32,
     /// Scanline overlay: default-off feature flag. When true a faint
     /// horizontal scan-line pattern renders behind the chat column.
+    /// Derived from `display.scanline_overlay_enabled` (see
+    /// `reconcile_config_from_reload`); toggled in Settings → Display.
     pub scanline_overlay_enabled: bool,
+    /// Reduced-motion override (`display.reduced_motion`, default false).
+    /// Mirrored into the chat view (skips scan-line pulse, first-token
+    /// emphasis, handoff hold, line wipe) and the scan-line overlay
+    /// (static when true). Toggled in Settings → Display; the system
+    /// a11y API hookup lands later.
+    pub reduced_motion: bool,
     /// Phase accumulator (wraps in `[0.0, 1.0)`) driving the scanline
     /// overlay breathing animation. Advanced by `ScanlineTick` while the
     /// overlay is enabled and the Chat page is active.
@@ -742,6 +750,8 @@ impl App {
             .map(|settings| settings.default_enabled)
             .unwrap_or(false);
         let initial_session_cap = initial_config.session_spend_cap_usd;
+        let initial_scanline_overlay = initial_config.display.scanline_overlay_enabled;
+        let initial_reduced_motion = initial_config.display.reduced_motion;
         let mut app = Self {
             page: Page::Chat,
             current_theme: theme,
@@ -778,7 +788,8 @@ impl App {
             run_status: RunStatus::Idle,
             run_stage: None,
             circuit_progress: 0.0,
-            scanline_overlay_enabled: false,
+            scanline_overlay_enabled: initial_scanline_overlay,
+            reduced_motion: initial_reduced_motion,
             scanline_progress: 0.0,
             vfs: Arc::new(Mutex::new(VirtualFs::new())),
             session_manager: Arc::new(Mutex::new(None)),
@@ -847,6 +858,10 @@ impl App {
         }
         app.sync_chat_model_options();
         app.sync_memory_configuration();
+        // Mirror the configured motion override into the chat view so the
+        // already-gated cues (scan-line pulse, first-token emphasis, handoff
+        // hold, line wipe) follow Settings → Display without a restart.
+        app.chat.set_reduced_motion(app.reduced_motion);
 
         // Auto-discover models for every credentialed, discoverable provider at
         // startup so the unified picker (and per-provider lists) are populated
@@ -2700,6 +2715,12 @@ impl App {
         // Re-derive run-mode flags — the file is truth (ADR-57 §6).
         self.multi_agent =
             reloaded.multi_agent.as_ref().map(|settings| settings.default_enabled).unwrap_or(false);
+        // Re-derive the Display motion toggles — the file is truth. The chat
+        // setter settles any in-flight wipe instantly when reduced-motion
+        // turns on mid-animation.
+        self.scanline_overlay_enabled = reloaded.display.scanline_overlay_enabled;
+        self.reduced_motion = reloaded.display.reduced_motion;
+        self.chat.set_reduced_motion(self.reduced_motion);
         (self.active_provider_id, self.active_model) = configured_default_route(&reloaded);
         self.sync_chat_model_options();
         self.sync_session_cap_from_config();
@@ -2728,6 +2749,7 @@ impl App {
         // are ever rebuilt against in-flight edits.
         self.settings.sync_providers_from_config(&reloaded);
         self.settings.refresh_provider_cache_from_config(&reloaded);
+        self.settings.sync_display_from_config(&reloaded);
         self.orchestration_studio.sync_models(self.settings.cached_models_by_provider());
         self.refresh_effective_roots_from_config();
     }
@@ -3666,7 +3688,7 @@ impl App {
             let scanline_bg = scanline_overlay::view(
                 self.scanline_progress,
                 self.chat.is_streaming(),
-                false, // reduced_motion — hard false until Iced exposes a11y API
+                self.reduced_motion,
                 false, // show_grid — off for chat
                 self.current_theme.palette.surface,
                 self.current_theme.palette.border,

@@ -301,6 +301,42 @@ impl IntentConfig {
     }
 }
 
+/// `[display]` — frontend motion/accessibility controls shared by desktop
+/// and CLI. Additive serde-default only: a missing section (or missing knob)
+/// keeps both motion cues fully enabled, matching pre-section behavior. No
+/// schema migration is required.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DisplayConfig {
+    /// Skip scan-line pulse, first-token emphasis, paragraph handoff hold,
+    /// and line wipe (desktop) / bold, hold, and wipe-analog rule (CLI).
+    /// Default false; the system a11y API hookup lands later.
+    #[serde(default)]
+    pub reduced_motion: bool,
+    /// Faint horizontal scan-line pattern behind the desktop chat column
+    /// (desktop only; the CLI has no scan-line). Default false.
+    #[serde(default)]
+    pub scanline_overlay_enabled: bool,
+}
+
+/// Resolve the effective reduced-motion flag.
+///
+/// Precedence: explicit CLI flag > `CONCERTO_REDUCED_MOTION` env > config
+/// file > default (false). The env var is truthy for `1`/`true`/`yes`/`on`
+/// (case-insensitive); unset or any other value means "not set". `NO_COLOR`
+/// is orthogonal: `styling_enabled` stays independent of this flag.
+pub fn resolve_reduced_motion(explicit: Option<bool>, config: &AppConfig) -> bool {
+    if let Some(flag) = explicit {
+        return flag;
+    }
+    if let Ok(raw) = std::env::var("CONCERTO_REDUCED_MOTION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            _ => {}
+        }
+    }
+    config.display.reduced_motion
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub schema_version: u32,
@@ -366,6 +402,12 @@ pub struct AppConfig {
     /// Shared project-memory behavior for every frontend.
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// Frontend motion/accessibility controls shared by desktop and CLI.
+    /// Absent in older configs defaults to [`DisplayConfig::default`]
+    /// (both cues off-disabled, i.e. full motion).
+    #[serde(default)]
+    pub display: DisplayConfig,
 
     /// Shell profile and toolchain configuration (ADR-28/ADR-30).
     /// `None` = detect installed host shells. Additive since v4.
@@ -461,6 +503,7 @@ impl PartialEq for AppConfig {
             && self.updates == other.updates
             && self.retry == other.retry
             && self.memory == other.memory
+            && self.display == other.display
             && self.shell_settings == other.shell_settings
             && self.project_roots == other.project_roots
             && self.context == other.context
@@ -490,6 +533,7 @@ impl Default for AppConfig {
             updates: None,
             retry: RetryConfig::default(),
             memory: MemoryConfig::default(),
+            display: DisplayConfig::default(),
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
@@ -2868,6 +2912,53 @@ mod tests {
             None,
             "an explicitly-None multi_agent default must not resolve anything",
         );
+    }
+
+    // ------------------------------------------------------------------
+    // DisplayConfig defaults + resolve_reduced_motion precedence
+    // (flag > CONCERTO_REDUCED_MOTION env > config > default false)
+    // ------------------------------------------------------------------
+
+    /// Serializes the `CONCERTO_REDUCED_MOTION`-mutating tests against each
+    /// other (cargo runs tests in parallel threads and env is process-global).
+    static REDUCED_MOTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn display_defaults_to_full_motion() {
+        let config = AppConfig::default();
+        assert!(!config.display.reduced_motion);
+        assert!(!config.display.scanline_overlay_enabled);
+    }
+
+    #[test]
+    fn resolve_reduced_motion_flag_beats_config() {
+        let _lock = REDUCED_MOTION_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = EnvVarGuard("CONCERTO_REDUCED_MOTION");
+        let mut config = AppConfig::default();
+        config.display.reduced_motion = true;
+        assert!(resolve_reduced_motion(None, &config));
+        assert!(
+            !resolve_reduced_motion(Some(false), &config),
+            "explicit flag off must beat config on"
+        );
+        config.display.reduced_motion = false;
+        assert!(resolve_reduced_motion(Some(true), &config));
+        assert!(!resolve_reduced_motion(None, &config));
+    }
+
+    #[test]
+    fn resolve_reduced_motion_env_beats_config() {
+        let _lock = REDUCED_MOTION_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = EnvVarGuard("CONCERTO_REDUCED_MOTION");
+        let config = AppConfig::default();
+        std::env::set_var("CONCERTO_REDUCED_MOTION", "1");
+        assert!(resolve_reduced_motion(None, &config));
+        assert!(
+            !resolve_reduced_motion(Some(false), &config),
+            "explicit flag off must beat env on"
+        );
+        std::env::set_var("CONCERTO_REDUCED_MOTION", "0");
+        assert!(!resolve_reduced_motion(None, &config), "unrecognized env value means not set");
     }
 
     // ------------------------------------------------------------------

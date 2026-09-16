@@ -294,6 +294,13 @@ pub struct State {
     /// (12 ticks × 16 ms), then settles. Transient view state — never
     /// serialized.
     first_token_ticks: HashMap<EntryId, u8>,
+    /// Paragraph handoff hold (Baton seasoning, prototype #5): `Some((id,
+    /// remaining))` while the typewriter reveal pauses at a blank-line
+    /// paragraph boundary to signal "continuing". Counts down one per
+    /// `TypingTick`; the reveal frontier stays frozen and the streaming
+    /// cursor holds visible until it clears. Transient view state — never
+    /// serialized.
+    handoff_hold: Option<(EntryId, u8)>,
     /// Reduced-motion override: when true, first-token emphasis is skipped
     /// (entries render at normal weight immediately). Iced exposes no system
     /// a11y API (see the scanline_overlay call site in `app.rs`), so this
@@ -313,6 +320,11 @@ pub struct State {
     /// `id -> tick count since insertion`, capped at `ENTRANCE_TICKS` (then
     /// removed). Transient view state — never serialized.
     entrance_ticks: HashMap<EntryId, u8>,
+    /// Line-wipe progress for new assistant entries (Score seasoning,
+    /// prototype #7): `id -> tick count since insertion`, capped at
+    /// `LINE_WIPE_TICKS` (then removed). Transient view state — never
+    /// serialized.
+    line_wipe_ticks: HashMap<EntryId, u8>,
     /// Free-running 16 ms tick counter driving the subtle shimmer color pulse
     /// on open thinking entries. Transient view state — never serialized.
     shimmer_phase: u32,
@@ -337,10 +349,19 @@ const REVEAL_CHARS_PER_TICK: usize = 8;
 const THINKING_REVEAL_CHARS_PER_TICK: usize = 64;
 /// Number of `TypingTick`s an entrance fade runs for (~128 ms at 16 ms/tick).
 const ENTRANCE_TICKS: u8 = 8;
+/// Number of `TypingTick`s the paragraph handoff cue holds (~48 ms at
+/// 16 ms/tick). The reveal frontier freezes at the blank-line boundary and
+/// the streaming cursor holds visible, then the reveal resumes — the Baton
+/// seasoning (prototype #5). Deterministic: always exactly this many ticks.
+const HANDOFF_HOLD_TICKS: u8 = 3;
 /// Number of `TypingTick`s the first-token emphasis holds (~200 ms at 16 ms/tick).
 /// The first word of each assistant turn renders slightly bolder/larger for this
 /// duration, then settles to normal weight — the Score signature text (prototype #6).
 const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 12;
+/// Number of `TypingTick`s a new assistant entry's top rule wipes 0→full
+/// width over (~128 ms at 16 ms/tick) — the Score line-wipe entrance
+/// (prototype #7). Deterministic: always exactly this many ticks.
+const LINE_WIPE_TICKS: u8 = 8;
 /// Period (in ticks) of the subtle thinking shimmer pulse: the color
 /// interpolates from muted to text over `SHIMMER_PERIOD` ticks and back.
 const SHIMMER_PERIOD: u32 = 8;
@@ -387,6 +408,8 @@ impl State {
             md_docs: HashMap::new(),
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
+            line_wipe_ticks: HashMap::new(),
+            handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
             spend_log_loaded: false,
@@ -435,6 +458,8 @@ impl State {
             md_docs,
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
+            line_wipe_ticks: HashMap::new(),
+            handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
             spend_log_loaded: false,
@@ -523,6 +548,8 @@ impl State {
             self.thinking_reveals.clear();
             self.entrance_ticks.clear();
             self.first_token_ticks.clear();
+            self.line_wipe_ticks.clear();
+            self.handoff_hold = None;
         }
     }
 
@@ -773,11 +800,13 @@ impl State {
         if assistant_revealing {
             return true;
         }
-        // Thinking-preview reveal, entrance fade, or first-token emphasis
-        // still animating.
+        // Thinking-preview reveal, entrance fade, first-token emphasis,
+        // line wipe, or paragraph handoff hold still animating.
         if !self.thinking_reveals.is_empty()
             || !self.entrance_ticks.is_empty()
             || !self.first_token_ticks.is_empty()
+            || !self.line_wipe_ticks.is_empty()
+            || self.handoff_hold.is_some()
         {
             return true;
         }
@@ -789,11 +818,31 @@ impl State {
     }
 
     /// Advance the typewriter reveal one tick on the live streaming assistant
-    /// entry (the tracked entry id must still be the streaming tail). No-op
-    /// when no reveal is in progress; resets the window to `None` when the
-    /// tracked id no longer matches the live streaming entry, so a stale
-    /// window can never drive a completed entry.
+    /// entry (the tracked entry id must still be the streaming tail). While a
+    /// paragraph handoff hold is open the frontier freezes and the hold counts
+    /// down instead of advancing. No-op when no reveal is in progress; resets
+    /// the window to `None` when the tracked id no longer matches the live
+    /// streaming entry, so a stale window can never drive a completed entry.
     fn advance_reveal(&mut self) {
+        // Handoff hold (Baton prototype #5): freeze the frontier at the
+        // paragraph boundary while the cue counts down, one tick at a time.
+        // A stale hold (entry gone or no longer the streaming tail) clears.
+        if let Some((hold_id, remaining)) = self.handoff_hold {
+            let live = matches!(
+                self.entries.last(),
+                Some(ChatEntry::Assistant { id: entry_id, streaming: true, .. })
+                    if *entry_id == hold_id
+            );
+            if live {
+                if remaining <= 1 {
+                    self.handoff_hold = None;
+                } else {
+                    self.handoff_hold = Some((hold_id, remaining - 1));
+                }
+                return;
+            }
+            self.handoff_hold = None;
+        }
         let Some((id, revealed)) = self.revealed_chars else {
             return;
         };
@@ -813,12 +862,25 @@ impl State {
                     }
                     self.revealed_chars = None;
                     self.reveal_autofinish = false;
+                    self.handoff_hold = None;
                 } else {
+                    // Paragraph handoff cue (Baton prototype #5): when the
+                    // frontier crosses a blank-line boundary mid-reveal, hold
+                    // the cursor for `HANDOFF_HOLD_TICKS` before resuming.
+                    // Single-paragraph content never triggers (fallback: no
+                    // cue); reduced-motion skips the cue entirely.
+                    if next != len
+                        && !self.reduced_motion
+                        && crosses_paragraph_boundary(content, revealed, next)
+                    {
+                        self.handoff_hold = Some((id, HANDOFF_HOLD_TICKS));
+                    }
                     self.revealed_chars = Some((id, next));
                 }
             }
             _ => {
                 self.revealed_chars = None;
+                self.handoff_hold = None;
             }
         }
     }
@@ -878,9 +940,46 @@ impl State {
         !self.reduced_motion && self.first_token_ticks.contains_key(&id)
     }
 
-    /// Set the reduced-motion override (skips first-token emphasis).
+    /// Advance every in-flight line wipe one tick, dropping entries whose
+    /// wipe completed and any stale ids (entry evicted or no longer an
+    /// assistant entry) so a dead wipe can never hold the tick alive.
+    fn advance_line_wipe_ticks(&mut self) {
+        // Ids are snapshotted first: the wipe map is mutated below, so the
+        // entries borrow cannot stay live across the updates.
+        let live: HashSet<EntryId> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Assistant { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        self.line_wipe_ticks.retain(|id, ticks| {
+            if !live.contains(id) {
+                return false;
+            }
+            *ticks = ticks.saturating_add(1);
+            *ticks < LINE_WIPE_TICKS
+        });
+    }
+
+    /// Current line-wipe step for an assistant entry: `Some(elapsed)` while
+    /// the wipe is animating, `None` once done or when reduced-motion skips
+    /// the cue (the entry renders instantly with no rule).
+    fn line_wipe_step(&self, id: EntryId) -> Option<u8> {
+        if self.reduced_motion {
+            return None;
+        }
+        self.line_wipe_ticks.get(&id).copied()
+    }
+
+    /// Set the reduced-motion override (skips first-token emphasis and the
+    /// line-wipe cue; any in-flight wipe settles instantly).
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
+        if reduced {
+            self.line_wipe_ticks.clear();
+        }
     }
 
     /// Update the latest assistant entry with streaming content.
@@ -917,10 +1016,17 @@ impl State {
             // than auto-finalizing (`reveal_autofinish` stays false).
             self.revealed_chars = Some((id, 0));
             self.reveal_autofinish = false;
+            self.handoff_hold = None;
             // Seed first-token emphasis for the new turn (prototype #6):
             // elapsed-tick counter starts at 0 and expires after
             // `FIRST_TOKEN_EMPHASIS_TICKS` TypingTicks (~200 ms).
             self.first_token_ticks.insert(id, 0);
+            // Seed the line-wipe entrance cue for the new turn (prototype #7):
+            // the top rule wipes 0→full over `LINE_WIPE_TICKS` TypingTicks.
+            // Reduced-motion skips the cue (no seed → instant render).
+            if !self.reduced_motion {
+                self.line_wipe_ticks.insert(id, 0);
+            }
             self.md_docs.insert(id, doc);
             self.trim_entries();
         }
@@ -942,6 +1048,8 @@ impl State {
         self.revealed_chars = None;
         self.reveal_autofinish = false;
         self.first_token_ticks.clear();
+        self.line_wipe_ticks.clear();
+        self.handoff_hold = None;
     }
 
     /// Finalize a run: mark the last assistant entry as non-streaming (same
@@ -959,6 +1067,8 @@ impl State {
         self.revealed_chars = None;
         self.reveal_autofinish = false;
         self.first_token_ticks.clear();
+        self.line_wipe_ticks.clear();
+        self.handoff_hold = None;
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -1003,9 +1113,16 @@ impl State {
                     // the entry auto-finalizes itself.
                     self.revealed_chars = Some((id, 0));
                     self.reveal_autofinish = true;
+                    self.handoff_hold = None;
                     // Seed first-token emphasis for the new turn (prototype #6):
                     // elapsed-tick counter starts at 0 (≈200 ms of emphasis).
                     self.first_token_ticks.insert(id, 0);
+                    // Seed the line-wipe entrance cue (prototype #7), same
+                    // cadence contract as the other entrance ticks. Reduced
+                    // motion skips it (no seed → instant render).
+                    if !self.reduced_motion {
+                        self.line_wipe_ticks.insert(id, 0);
+                    }
                 }
                 // An empty final message must never linger as a `streaming`
                 // entry: without a reveal window it would blink a cursor and
@@ -1034,6 +1151,7 @@ impl State {
                 self.advance_thinking_reveals();
                 self.advance_entrance_ticks();
                 self.advance_first_token_ticks();
+                self.advance_line_wipe_ticks();
                 self.shimmer_phase = self.shimmer_phase.wrapping_add(1);
             }
             Message::UsePrompt(prompt) => {
@@ -1168,19 +1286,33 @@ impl State {
                 };
                 // Blinking cursor on the live entry, as before — suppressed
                 // once the reveal window has fully consumed the content, so it
-                // never sits after the complete message.
+                // never sits after the complete message. During a paragraph
+                // handoff hold (Baton prototype #5) the cursor holds visible
+                // regardless of the 500 ms blink phase: the brief hold is the
+                // "continuing" cue between paragraphs.
                 let reveal_complete =
                     self.revealed_chars.is_some_and(|(rid, n)| rid == *id && n >= char_count);
-                let body: Element<'a, Message> =
-                    if *streaming && self.streaming_cursor_visible && !reveal_complete {
-                        row![md, text("▌").size(14).color(palette.text_muted)].spacing(2).into()
-                    } else {
-                        md
-                    };
+                let in_handoff = self.handoff_hold.is_some_and(|(hold_id, _)| hold_id == *id);
+                let body: Element<'a, Message> = if *streaming
+                    && (self.streaming_cursor_visible || in_handoff)
+                    && !reveal_complete
+                {
+                    row![md, text("▌").size(14).color(palette.text_muted)].spacing(2).into()
+                } else {
+                    md
+                };
                 // Compact timestamp below the assistant message block. Shown
                 // immediately for a streaming entry (timestamped at its first
                 // chunk), not hidden while the reveal is running.
-                let mut block = column![body].spacing(4).width(Length::Fill);
+                let mut block = column![].spacing(4).width(Length::Fill);
+                // Line-wipe entrance cue (Score prototype #7): a 2px rule at
+                // the top of each new assistant entry wipes 0→full width over
+                // `LINE_WIPE_TICKS` TypingTicks (~128 ms). Reduced-motion
+                // skips the cue entirely (no rule, instant render).
+                if let Some(step) = self.line_wipe_step(*id) {
+                    block = block.push(line_wipe_rule(step, palette));
+                }
+                block = block.push(body);
                 if let Some(ts_line) = compact_timestamp_line(created_at, palette) {
                     block = block.push(ts_line);
                 }
@@ -1388,6 +1520,14 @@ impl State {
 
             container(
                 column![
+                    // Startup signature wordmark: letterspaced via spaces (Iced
+                    // has no letter-spacing), TypeScale display + palette.text;
+                    // subline in text_muted. Static text — no entrance ticks,
+                    // so reduced-motion renders identically (no fade to skip).
+                    text("C O N C E R T O").size(theme.type_scale.display).color(palette.text),
+                    text("local-first • policy-governed")
+                        .size(theme.type_scale.caption)
+                        .color(palette.text_muted),
                     text("✦").size(28).color(palette.text_muted),
                     text("Start building").size(18).color(palette.text),
                     text("Describe what you want built, or start from a quick action.")
@@ -2071,6 +2211,70 @@ fn entrance_alpha(ticks: Option<u8>) -> f32 {
     }
 }
 
+/// Alpha for the line-wipe rule at `step` (0-based elapsed ticks): ramps in
+/// equal per-tick increments from faint to near-opaque, always low alpha.
+/// This is the fade-in fallback — even if the width layout is ever
+/// constrained, the cue still reads as an alpha-step fade. Palette colors
+/// only; alpha modulation only, no transform.
+fn line_wipe_alpha(step: u8) -> f32 {
+    let done = f32::from(step.min(LINE_WIPE_TICKS.saturating_sub(1))) + 1.0;
+    0.25 + 0.55 * (done / f32::from(LINE_WIPE_TICKS))
+}
+
+/// Top-rule element for the new-assistant line-wipe cue (prototype #7):
+/// `step` is the elapsed tick count (0-based) since the entry was inserted.
+/// The visible 2px segment grows 1/`LINE_WIPE_TICKS` → full width via
+/// `FillPortion` layout only (no transform), while its color lerps
+/// `palette.border` → `palette.accent` at the fallback alpha ramp.
+fn line_wipe_rule<'a>(step: u8, palette: &'a crate::theme::Palette) -> Element<'a, Message> {
+    let total = u16::from(LINE_WIPE_TICKS);
+    let done = u16::from(step.min(LINE_WIPE_TICKS.saturating_sub(1))) + 1;
+    let progress = f32::from(done) / f32::from(total);
+    let color =
+        with_alpha(lerp_color(palette.border, palette.accent, progress), line_wipe_alpha(step));
+    let bar = container(iced::widget::space::horizontal())
+        .width(Length::FillPortion(done))
+        .height(Length::Fixed(2.0))
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(color)),
+            ..container::Style::default()
+        });
+    if done >= total {
+        row![bar].width(Length::Fill).into()
+    } else {
+        let gap = container(iced::widget::space::horizontal())
+            .width(Length::FillPortion(total - done))
+            .height(Length::Fixed(2.0));
+        row![bar, gap].width(Length::Fill).spacing(0).into()
+    }
+}
+
+/// Whether the reveal frontier crossed a paragraph boundary between `from`
+/// (exclusive) and `to` (inclusive), measured in characters. A boundary is a
+/// blank line — an empty or whitespace-only line terminated by `\n` with more
+/// content following it — which covers `\n\n`, `\r\n\r\n`, and whitespace-only
+/// separator lines. Single-paragraph text (and a trailing newline run with no
+/// content after it) yields `false`, so the handoff cue falls back to no cue.
+fn crosses_paragraph_boundary(content: &str, from: usize, to: usize) -> bool {
+    if to <= from {
+        return false;
+    }
+    let mut offset: usize = 0;
+    let mut lines = content.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line_len = line.chars().count();
+        let line_end = offset.saturating_add(line_len);
+        // Only a newline-terminated blank line with content after it marks a
+        // "continuing" handoff; a final newline run is just the message end.
+        let is_separator = line.contains('\n') && line.trim().is_empty() && lines.peek().is_some();
+        if is_separator && line_end > from && line_end <= to {
+            return true;
+        }
+        offset = line_end;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn input_bar<'a>(
     input: &'a str,
@@ -2280,6 +2484,67 @@ mod tests {
         state.finalize_streaming();
 
         assert!(!state.is_streaming());
+    }
+
+    #[test]
+    fn line_wipe_seeds_and_completes_over_eight_ticks() {
+        let mut state = State::new();
+        let _ = state.update(Message::AddAssistant("hello".into()));
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        assert_eq!(state.line_wipe_ticks.get(&id), Some(&0));
+
+        // Deterministic: exactly `LINE_WIPE_TICKS` ticks, then the wipe is
+        // dropped (the rule settles away, like the other entrance cues).
+        for expected in 1..=LINE_WIPE_TICKS {
+            let _ = state.update(Message::TypingTick);
+            if expected < LINE_WIPE_TICKS {
+                assert_eq!(state.line_wipe_ticks.get(&id), Some(&expected));
+            } else {
+                assert!(!state.line_wipe_ticks.contains_key(&id));
+            }
+        }
+    }
+
+    #[test]
+    fn line_wipe_seeds_on_live_streaming_entry() {
+        let mut state = State::new();
+        state.update_last_assistant("streaming".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        assert_eq!(state.line_wipe_step(id), Some(0));
+    }
+
+    #[test]
+    fn line_wipe_reduced_motion_skips_instantly() {
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        let _ = state.update(Message::AddAssistant("hello".into()));
+        assert!(state.line_wipe_ticks.is_empty());
+        // Enabling mid-wipe also settles instantly.
+        let mut live = State::new();
+        live.update_last_assistant("streaming".to_string());
+        assert!(!live.line_wipe_ticks.is_empty());
+        live.set_reduced_motion(true);
+        assert!(live.line_wipe_ticks.is_empty());
+    }
+
+    #[test]
+    fn line_wipe_alpha_ramps_monotonically_within_bounds() {
+        // Fallback fade-in contract: equal alpha steps, always low alpha.
+        let mut prev = 0.0;
+        for step in 0..LINE_WIPE_TICKS {
+            let alpha = line_wipe_alpha(step);
+            assert!(
+                alpha > prev && (0.0..=1.0).contains(&alpha),
+                "step {step} alpha {alpha} must increase within 0..=1"
+            );
+            prev = alpha;
+        }
     }
 
     #[test]
@@ -2916,5 +3181,110 @@ mod tests {
         assert_eq!(state.entries().len(), before, "mute is view-only; entries stay");
         let _ = state.update(Message::ToggleMuteAgent("coder".to_string()));
         assert!(!state.muted_agents.contains("coder"));
+    }
+
+    #[test]
+    fn paragraph_boundary_detection_covers_separator_shapes() {
+        // Single paragraph: no boundary anywhere — the handoff falls back to
+        // no cue.
+        assert!(!crosses_paragraph_boundary("just one paragraph", 0, 18));
+        // Plain blank-line separator: boundary end (char 10) is crossed.
+        let two = "01234567\n\nrest";
+        assert!(crosses_paragraph_boundary(two, 8, 16));
+        assert!(!crosses_paragraph_boundary(two, 0, 8), "boundary end sits past the window");
+        assert!(!crosses_paragraph_boundary(two, 10, 16), "window starts at the boundary end");
+        // Whitespace-only separator line still counts as a blank line.
+        assert!(crosses_paragraph_boundary("01234567\n   \nrest", 8, 16));
+        // CRLF separators count too.
+        assert!(crosses_paragraph_boundary("01234567\r\n\r\nrest", 8, 16));
+        // Trailing newlines with no content after them are the message end,
+        // not a "continuing" handoff.
+        assert!(!crosses_paragraph_boundary("0123456789\n\n", 0, 12));
+        assert!(!crosses_paragraph_boundary("0123456789\n", 0, 11));
+        // Empty content and empty windows never trigger.
+        assert!(!crosses_paragraph_boundary("", 0, 0));
+        assert!(!crosses_paragraph_boundary("a\n\nb", 4, 4));
+    }
+
+    #[test]
+    fn handoff_hold_freezes_reveal_for_three_ticks_then_resumes() {
+        let mut state = State::new();
+        state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("Expected an assistant entry"),
+        };
+
+        // First tick reveals 8 chars; the boundary end (char 10) is still out
+        // of reach, so no cue yet.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 8)));
+        assert_eq!(state.handoff_hold, None);
+
+        // Second tick (8→16) crosses the blank-line boundary: the frontier
+        // lands and a 3-tick cursor hold opens.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        assert_eq!(state.handoff_hold, Some((id, HANDOFF_HOLD_TICKS)));
+        assert!(state.is_revealing(), "an open hold keeps the 16 ms tick alive");
+
+        // The frontier stays frozen while the hold counts down, one per tick.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        assert_eq!(state.handoff_hold, Some((id, 2)));
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        assert_eq!(state.handoff_hold, Some((id, 1)));
+
+        // Clearing tick: the hold drops but the frontier has not moved yet.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.handoff_hold, None);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+
+        // Next tick resumes the 8ch@16ms cadence exactly where it paused.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 24)));
+        assert_eq!(state.handoff_hold, None);
+    }
+
+    #[test]
+    fn single_paragraph_reveal_never_holds() {
+        let mut state = State::new();
+        state.update_last_assistant("0123456789abcdefghij".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("Expected an assistant entry"),
+        };
+        for tick in 1..=3 {
+            let _ = state.update(Message::TypingTick);
+            assert_eq!(state.handoff_hold, None, "no cue without a paragraph boundary");
+            let expected = (REVEAL_CHARS_PER_TICK * tick).min(20);
+            assert_eq!(state.revealed_chars, Some((id, expected)));
+        }
+    }
+
+    #[test]
+    fn reduced_motion_skips_handoff_hold() {
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
+        // Drive the whole reveal: the frontier must cross the boundary with
+        // no hold ever opening.
+        for _ in 0..10 {
+            let _ = state.update(Message::TypingTick);
+            assert_eq!(state.handoff_hold, None, "reduced-motion renders without the cue");
+        }
+    }
+
+    #[test]
+    fn finalize_run_clears_handoff_hold() {
+        let mut state = State::new();
+        state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
+        let _ = state.update(Message::TypingTick);
+        let _ = state.update(Message::TypingTick);
+        assert!(state.handoff_hold.is_some(), "hold must be open before finalizing");
+        state.finalize_run();
+        assert_eq!(state.handoff_hold, None);
+        assert_eq!(state.revealed_chars, None);
     }
 }
