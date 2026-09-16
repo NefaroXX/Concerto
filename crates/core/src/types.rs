@@ -911,6 +911,9 @@ pub struct AgentOutput {
 pub enum AgentCompletionStatus {
     Completed,
     Partial,
+    /// The Coordinator requested human input before continuing. Check
+    /// `final_message` for the question.
+    AwaitingUser,
 }
 
 /// One structured record of a single tool execution.
@@ -975,6 +978,9 @@ impl AgentOutput {
         let mut s = match self.completion_status {
             AgentCompletionStatus::Completed => String::from("Completed.\n\n"),
             AgentCompletionStatus::Partial => String::from("Partial progress preserved.\n\n"),
+            AgentCompletionStatus::AwaitingUser => {
+                return self.final_message.clone();
+            }
         };
         s.push_str("Files changed:\n");
         for p in &self.files_modified {

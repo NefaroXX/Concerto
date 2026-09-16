@@ -137,6 +137,16 @@ pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 /// applies no policy gate (there is nothing to gate).
 pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 
+/// ADR-35 amendment (2026-09-16 §2): the explicit human-input request
+/// surface — the Coordinator side of the operator consent/interaction gate.
+/// The model calls it with a reason; the decision loop then unwinds and the
+/// run ends `AwaitingUser` with the reason as the final message and a
+/// preserved checkpoint, so the interactive answer channel (TODO #22/#23)
+/// can resume it after the operator answers. Dispatches no agents, touches
+/// no tools; unlike the other surfaces it applies no policy gate because it
+/// is the human-in-the-loop consent path itself, not a workspace mutation.
+pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -434,6 +444,33 @@ fn reconsider_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["decision_id", "reason", "affected_task_ids"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `request_user_input` tool (ADR-35
+/// amendment 2026-09-16 §2): the operator-consent surface that stops the run
+/// with a preserved checkpoint, awaiting the operator's answer (TODO #22/#23
+/// is the interactive answer channel that resumes it).
+fn request_user_input_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REQUEST_USER_INPUT_TOOL.to_string(),
+        description: "Stop the run and request human input. The run ends with \
+                      AwaitingUser status, the checkpoint is preserved, and the \
+                      operator is shown your reason. Use this ONLY when the next \
+                      step genuinely requires the operator's answer — consent, a \
+                      choice, a credential, or a decision only they can make."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "The complete, self-contained question or reason the operator must \
+                                    answer before the run can continue."
+                }
+            },
+            "required": ["reason"]
         }),
     }
 }
@@ -892,6 +929,12 @@ struct DecomposeResult {
     /// empty dispatch session on an action-required run, cap/iteration-bound
     /// stops). Consumed by `execute_graph`'s tail. Empty on a restore.
     loop_notes: Vec<String>,
+    /// ADR-35 amendment (2026-09-16 §2): the reason the Coordinator requested
+    /// human input in its decision loop. Threaded to `execute_graph` so the
+    /// run ends `AwaitingUser` with the reason as the final message and a
+    /// preserved checkpoint. `None` on a checkpoint restore (the resume
+    /// re-decides) and on any run that never asked.
+    requested_user_input: Option<String>,
 }
 
 /// State accumulated by the Coordinator's decision loop (each
@@ -1205,6 +1248,15 @@ pub struct CoordinatorAgent {
     /// checkpoint so a resume keeps reconciling the SAME changes; surfaced
     /// to the world model as decision risks.
     external_changes: Vec<crate::external_change::ExternalChangeRecord>,
+    /// ADR-35 amendment (2026-09-16 §2): the reason the Coordinator requested
+    /// human input via the `request_user_input` tool. Set by the decision-loop
+    /// handler; the loop unwinds on it and `execute_graph` returns an
+    /// `AwaitingUser` output with this text as the final message and a
+    /// preserved checkpoint. `None` when no input was requested (the common
+    /// case); reset at the start of each `run` and never checkpointed — the
+    /// request either surfaces as the run's outcome or, on a later resume,
+    /// the Coordinator re-decides from the restored world.
+    requested_user_input: Option<String>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1838,6 +1890,10 @@ impl CoordinatorAgent {
             // field grows only through detection (live wait scan + F3
             // resume reconciliation) and is restored from checkpoints.
             external_changes: Vec::new(),
+            // ADR-35 amendment (2026-09-16 §2): no pending human-input
+            // request at startup; set only by the request_user_input tool
+            // in the decision loop.
+            requested_user_input: None,
         }
     }
 
@@ -3883,6 +3939,7 @@ impl CoordinatorAgent {
                 action_ledger: Vec::new(),
                 dispatch_summary: String::new(),
                 loop_notes: Vec::new(),
+                requested_user_input: None,
                 objective: task.description.clone(),
                 objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
             });
@@ -3900,6 +3957,7 @@ impl CoordinatorAgent {
             action_ledger: ledger.action_ledger,
             dispatch_summary: summary,
             loop_notes: ledger.notes,
+            requested_user_input: self.requested_user_input.take(),
             objective: task.description.clone(),
             objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
         })
@@ -4131,6 +4189,7 @@ impl CoordinatorAgent {
             action_ledger,
             dispatch_summary: String::new(),
             loop_notes: Vec::new(),
+            requested_user_input: None,
             objective,
             objective_hash,
         }))
@@ -4549,6 +4608,7 @@ impl CoordinatorAgent {
         run_objective: String,
         run_objective_hash: String,
         loop_notes: Vec<String>,
+        requested_user_input: Option<String>,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
         // ADR-52: the run-wide dispatch cap is counted across the whole `run`
         // invocation (the Coordinator decision loop + this graph loop share
@@ -4644,6 +4704,46 @@ impl CoordinatorAgent {
             &self.checkpoint_context(&model_assignments, &action_ledger),
         );
         self.persist_checkpoint(&mut initial_execution_checkpoint).await;
+
+        // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
+        // The Coordinator requested human input during its decision loop
+        // (`request_user_input`). The run stops HERE — before any further
+        // graph dispatch — with the execution checkpoint preserved so a
+        // resume can continue after the operator answers (the interactive
+        // answer channel is TODO #22/#23). The reason rides the final
+        // message; the status is `AwaitingUser`.
+        if let Some(reason) = requested_user_input {
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
+            );
+            let checkpoint_json = serde_json::to_string(&initial_execution_checkpoint).ok();
+            // Exact-reset the settled mirror like the success tail: the
+            // output's vec is the single source of truth.
+            self.settled_metrics.clear();
+            self.settled_metrics.extend(provider_metrics.iter().cloned());
+            return Ok((
+                AgentOutput {
+                    task_id: task.id,
+                    session_id: task.session_id,
+                    final_message: reason,
+                    files_modified: crate::tool_facts::sanitize_files_modified(
+                        &context.session.project_dir,
+                        &all_files,
+                    ),
+                    tool_call_count: total_tool_calls,
+                    eval_result: None,
+                    tool_events: Vec::new(),
+                    verification: Vec::new(),
+                    project_root: None,
+                    completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
+                    provider_metrics,
+                    checkpoint_json,
+                },
+                recoverable_notes,
+            ));
+        }
 
         // ADR-35 §5: lifecycle stages are resolved from the registry rather
         // than hardcoded role ids. A pipeline without a design-stage agent
@@ -6468,6 +6568,8 @@ impl CoordinatorAgent {
     ) -> Result<AgentOutput, OrchestratorError> {
         // Fresh run: forget settlements from any prior run on this instance.
         self.settled_metrics.clear();
+        // Fresh run: no pending human-input request carries across runs.
+        self.requested_user_input = None;
         // ADR-52: the run-wide dispatch cap is per `run` invocation (a fresh
         // run or a resume restarts the counter). The Coordinator's decision
         // loop counts toward it too, so loop + graph dispatches share one
@@ -6490,6 +6592,7 @@ impl CoordinatorAgent {
             action_ledger,
             dispatch_summary,
             loop_notes,
+            requested_user_input,
             objective: run_objective,
             objective_hash: run_objective_hash,
         } = match self.decompose_or_restore(&task, &context, &cancel, resume_checkpoint_json).await
@@ -6570,6 +6673,7 @@ impl CoordinatorAgent {
             run_objective,
             run_objective_hash,
             loop_notes,
+            requested_user_input,
         )
         .await
         .map(|(output, _notes)| output)
@@ -7787,6 +7891,7 @@ impl CoordinatorAgent {
             action_ledger: ledger.action_ledger,
             dispatch_summary: summary,
             loop_notes: ledger.notes,
+            requested_user_input: self.requested_user_input.take(),
             objective: seed.plan_text,
             objective_hash: seed.objective_hash,
         })
@@ -7846,6 +7951,9 @@ impl CoordinatorAgent {
             // Issue #63: the declarative wait surface — parks the decision
             // loop on conditions/deadline with zero model turns.
             tool_defs.push(wait_tool_definition());
+            // ADR-35 amendment (2026-09-16 §2): the human-input request
+            // surface — stops the run AwaitingUser for the operator's answer.
+            tool_defs.push(request_user_input_tool_definition());
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
@@ -8123,6 +8231,15 @@ impl CoordinatorAgent {
                         )
                         .await
                     }
+                    // ADR-35 amendment (2026-09-16 §2): the human-input
+                    // request surface. The handler records the reason and the
+                    // loop unwinds (inner and outer breaks below); the run
+                    // ends AwaitingUser with the reason and a preserved
+                    // checkpoint. Dispatches nothing, touches no tools — the
+                    // operator-consent path itself applies no policy gate.
+                    REQUEST_USER_INPUT_TOOL if dispatching => {
+                        self.handle_request_user_input(&tool_call.arguments).await
+                    }
                     // Issue #64: the explicit reconsideration surface — the
                     // model supersedes a decision and freezes ONLY its
                     // affected pending tasks (a deterministic transform,
@@ -8221,6 +8338,22 @@ impl CoordinatorAgent {
                     tokens_in: None,
                     tokens_out: None,
                 });
+                // ADR-35 amendment (2026-09-16 §2): the tool result was just
+                // delivered and the Coordinator requested human input — stop
+                // this batch's remaining tool calls; the outer break below
+                // ends the loop.
+                if self.requested_user_input.is_some() {
+                    break;
+                }
+            }
+
+            // ── ADR-35 amendment (2026-09-16 §2): the Coordinator asked the
+            //       operator a question — the decision loop ends here. This is
+            //       a deliberate stop (not the iteration bound), so the tail's
+            //       structural-bound note is suppressed below.
+            if self.requested_user_input.is_some() {
+                hit_iteration_bound = false;
+                break;
             }
 
             // ── Issue #53: progress-aware stall detection ──────────────
@@ -11027,6 +11160,38 @@ impl CoordinatorAgent {
             "outcome": "merged",
             "survivor": survivor.to_string(),
             "removed": removed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// ADR-35 amendment (2026-09-16 §2): handle ONE `request_user_input`
+    /// tool call. The Coordinator asks the operator a question — the reason
+    /// is recorded and the decision loop unwinds on it (the inner/outer
+    /// breaks in `run_dispatch_session`), so `execute_graph` returns an
+    /// `AwaitingUser` output with the reason as the final message and a
+    /// preserved checkpoint. No policy gate: this is the human-in-the-loop
+    /// consent path itself, not a workspace mutation, and no agent is named
+    /// or dispatched. Touches no graph, journal, or ledger state — the
+    /// run-level outcome (status + message + checkpoint) is the record.
+    async fn handle_request_user_input(
+        &mut self,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial request) ────────────────────────────────
+        let Some(reason) = arguments
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "request_user_input requires a non-empty string reason",
+            });
+        };
+        self.requested_user_input = Some(reason.to_string());
+        serde_json::json!({
+            "status": "awaiting_human_input",
+            "message": "The run is paused awaiting your input.",
         })
     }
 
@@ -14362,6 +14527,7 @@ mod tests {
                 "build the thing".to_string(),
                 blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
                 Vec::new(), // loop_notes
+                None,        // requested_user_input
             )
             .await
             .expect("execute_graph returns");
@@ -15143,6 +15309,7 @@ mod tests {
                 run_objective,
                 run_objective_hash,
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await;
 
@@ -15417,6 +15584,7 @@ mod tests {
                 "test task".to_string(),
                 blake3::hash("test task".as_bytes()).to_hex().to_string(),
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await
             .expect("execute_graph should succeed");
@@ -17251,6 +17419,7 @@ mod tests {
                 run_objective,
                 run_objective_hash,
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await;
 
