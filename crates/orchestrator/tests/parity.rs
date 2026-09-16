@@ -383,6 +383,7 @@ fn registry_staffing_matches_resolved_blueprint_on_standard() {
         "",
         true,
         None, // no fact-writer pool in this test
+        None, // no shell profile in this test
     );
 
     // Both directions: every blueprint stage's `def.agents` must be exactly

@@ -212,6 +212,8 @@ fn dispatch_call(agent_id: &str, task: &str) -> ToolCall {
         id: format!("call-{agent_id}-{task}"),
         name: CALL_SPECIALIST_TOOL.to_owned(),
         arguments: serde_json::json!({ "agent_id": agent_id, "task": task }),
+
+        ..Default::default()
     }
 }
 
@@ -1384,10 +1386,11 @@ async fn reviewer_disagreement_sends_revision_and_completes() {
     assert!(report.ledger_state_is_coherent(), "{report:?}");
 }
 /// Scenario 14 — validator unavailable: the validation-stage agent
-/// crashes ("validation disabled"). Acceptance semantics (audit C-06): a
-/// build task's verification did not run, so its completion is REJECTED,
-/// never silently accepted — the run exits with the explicit rejection
-/// note and its preserved progress (Partial).
+/// crashes ("validation disabled"). Acceptance semantics (audit C-06 + the
+/// 2026-09-16 amendment): a build task whose validator dispatch FAILS is
+/// never silently accepted as Completed — the exhausted dispatch blocks the
+/// subtask at the attempt ceiling and the run ends Partial with its
+/// preserved progress.
 #[tokio::test]
 async fn validator_unavailable_never_silently_accepts() {
     let bus = EventBus::new(256);
@@ -1406,9 +1409,16 @@ async fn validator_unavailable_never_silently_accepts() {
             ))],
         ),
     ];
-    // A planned run (research → coder over a design doc), so the run IS a
-    // build task with expected artifacts — the acceptance gate's scope.
-    let model = ScriptedCoordModel::scripted(vec![Turn::Text(PLAN_RESEARCH_CODER.into())]);
+    // A planned build task (architect + coder), then the coordinator's OWN
+    // dispatch of the validator: the fault hits on the verification dispatch.
+    let model = ScriptedCoordModel::scripted(vec![
+        Turn::Calls(vec![
+            dispatch_call("architect", "design it"),
+            dispatch_call("coder", "implement"),
+        ]),
+        Turn::Calls(vec![dispatch_call("validator", "run verification")]),
+        Turn::Text("done".into()),
+    ]);
     let registry = AgentRegistry::from_mocks(mocks);
     let mut registry = registry;
     registry.attach_configs_for_test(
@@ -1419,20 +1429,23 @@ async fn validator_unavailable_never_silently_accepts() {
     let (outcome, events, _dir) = run_coordinator(coordinator, &bus).await;
     let report = RunReport::build(&outcome, &events, &model);
 
-    // RECOVERY OUTCOME: no silent acceptance. An unavailable validator
-    // means "verification did not run", which is an acceptance rejection
-    // — the run surfaces Partial with preserved work, not Completed.
+    // RECOVERY OUTCOME: no silent acceptance. The unavailable validator is
+    // retried to the attempt ceiling, the subtask blocks, and the run ends
+    // Partial — never Completed.
     assert!(
-        outcome.is_err()
-            || report.final_message.contains("Acceptance rejected: verification did not run"),
-        "an unavailable validator must reject the silent acceptance: {:?} / {}",
-        outcome.as_ref().err(),
+        !matches!(report.completion_status, Some(AgentCompletionStatus::Completed)),
+        "an unverified build task must never end Completed: {:?} — {}\n{report:#?}",
+        report.completion_status,
         report.final_message
     );
     assert!(
-        !matches!(report.completion_status, Some(AgentCompletionStatus::Completed)),
-        "an unverified build task must never end Completed: {:?} — {}",
-        report.completion_status,
+        report.final_message.contains("paused after exhausting recovery attempts"),
+        "the unavailable validator must surface as an exhausted, blocked dispatch: {}",
+        report.final_message
+    );
+    assert!(
+        report.final_message.contains("remained blocked after 3 attempts"),
+        "the validator subtask must block at the attempt ceiling: {}",
         report.final_message
     );
     let _ = events;
@@ -1442,10 +1455,6 @@ async fn validator_unavailable_never_silently_accepts() {
 /// fixture the coordinator's own C-06 tests use).
 const DESIGN_DOC_JSON: &str =
     r#"{"goals":["do the thing"],"proposed_files":["src/a.rs"],"interface_sketch":"s"}"#;
-const PLAN_RESEARCH_CODER: &str = r#"[
-        {"role":"Researcher","description":"inspect","depends_on":[]},
-        {"role":"Coder","description":"implement","depends_on":[0]}
-    ]"#;
 
 /// A DesignDoc-mode design-stage agent config (mirrors the coordinator's
 /// own fixture) — routes the architect call through the ADR-65 §5 verifier

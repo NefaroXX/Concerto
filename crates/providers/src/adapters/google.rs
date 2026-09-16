@@ -90,12 +90,21 @@ impl Dialect for GeminiChatDialect {
                         let tool_calls: Vec<serde_json::Value> = tcs
                             .iter()
                             .map(|tc| {
-                                serde_json::json!({
-                                    "functionCall": {
-                                        "name": tc.name,
-                                        "args": tc.arguments
-                                    }
-                                })
+                                let mut function_call = serde_json::json!({
+                                    "name": tc.name,
+                                    "args": tc.arguments
+                                });
+                                // Gemini 3.x echoes an opaque
+                                // `thought_signature` on functionCall parts;
+                                // Google requires it be replayed verbatim when
+                                // the call is re-sent. Emit it only when the
+                                // call carries one so signature-less calls keep
+                                // the exact legacy wire shape.
+                                if let Some(signature) = &tc.thought_signature {
+                                    function_call["thought_signature"] =
+                                        serde_json::json!(signature);
+                                }
+                                serde_json::json!({ "functionCall": function_call })
                             })
                             .collect();
                         entry["parts"] = serde_json::json!(tool_calls);
@@ -572,6 +581,8 @@ mod tests {
                         id: "call_1".into(),
                         name: "shell".into(),
                         arguments: serde_json::json!({"command": "ls"}),
+
+                        ..Default::default()
                     }]),
                     tool_results: None,
                     reasoning_content: Some("I'll list the files.".into()),
@@ -690,6 +701,80 @@ mod tests {
                     "args": {"command": "ls"}
                 }
             }])
+        );
+    }
+
+    /// Gemini 3.x replay: a tool call carrying the model's opaque
+    /// `thought_signature` must echo it back verbatim inside the
+    /// `functionCall` part — omitting it makes Google reject the request
+    /// (`400 INVALID_ARGUMENT: Function call is missing a thought_signature`).
+    #[test]
+    fn assistant_tool_call_replays_thought_signature() {
+        let request = CompletionRequest {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                    thought_signature: Some("sig-9f2a".into()),
+                }]),
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..Default::default()
+        };
+        let body = render(&request);
+        assert_eq!(
+            body["contents"][0]["parts"],
+            serde_json::json!([{
+                "functionCall": {
+                    "name": "shell",
+                    "args": {"command": "ls"},
+                    "thought_signature": "sig-9f2a"
+                }
+            }])
+        );
+    }
+
+    /// Replay of a tool call without a signature emits exactly the wire shape
+    /// produced before the field existed: not even a `thought_signature` key.
+    #[test]
+    fn assistant_tool_call_without_signature_omits_thought_signature_key() {
+        let request = CompletionRequest {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                    thought_signature: None,
+                }]),
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..Default::default()
+        };
+        let body = render(&request);
+        assert_eq!(
+            body["contents"][0]["parts"],
+            serde_json::json!([{
+                "functionCall": {
+                    "name": "shell",
+                    "args": {"command": "ls"}
+                }
+            }])
+        );
+        let serialized = serde_json::to_string(&body).expect("body serializes");
+        assert!(
+            !serialized.contains("thought_signature"),
+            "None must emit no signature key on the wire: {serialized}"
         );
     }
 

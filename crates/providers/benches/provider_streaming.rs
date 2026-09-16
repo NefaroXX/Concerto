@@ -31,12 +31,14 @@ fn build_request(n: usize, tool_calls: bool) -> CompletionRequest {
                             id: format!("call_{i}_a"),
                             name: "read_file".into(),
                             arguments: serde_json::json!({"path": "/src/main.rs"}),
-                        },
+
+                        ..Default::default()},
                         ToolCall {
                             id: format!("call_{i}_b"),
                             name: "write_file".into(),
                             arguments: serde_json::json!({"path": "/src/lib.rs", "content": "pub fn hello() {}"}),
-                        },
+
+                        ..Default::default()},
                     ])
                 } else {
                     None

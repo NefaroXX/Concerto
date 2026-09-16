@@ -184,7 +184,12 @@ impl AnthropicStreamState {
                     self.pending.push_back(Ok(CompletionChunk {
                         reasoning: None,
                         delta: String::new(),
-                        tool_call: Some(ToolCall { id, name, arguments: args_json }),
+                        tool_call: Some(ToolCall {
+                            id,
+                            name,
+                            arguments: args_json,
+                            ..Default::default()
+                        }),
                         is_final: false,
                         usage: None,
                     }));

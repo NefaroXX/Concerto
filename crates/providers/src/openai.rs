@@ -177,7 +177,12 @@ impl OpenAiStreamState {
             self.pending.push_back(Ok(CompletionChunk {
                 delta: String::new(),
                 reasoning: None,
-                tool_call: Some(ToolCall { id: ptc.id, name: ptc.name, arguments: args }),
+                tool_call: Some(ToolCall {
+                    id: ptc.id,
+                    name: ptc.name,
+                    arguments: args,
+                    ..Default::default()
+                }),
                 is_final: false,
                 usage: None,
             }));

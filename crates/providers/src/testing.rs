@@ -58,6 +58,8 @@ impl ScriptedProvider {
                 id: "call_scripted".to_string(),
                 name: name.to_string(),
                 arguments,
+
+                ..Default::default()
             }),
             ScriptedResponse::Done,
         ])

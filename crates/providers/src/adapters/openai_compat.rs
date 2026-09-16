@@ -307,6 +307,8 @@ mod tests {
                     id: "call_123".into(),
                     name: "test_tool".into(),
                     arguments: serde_json::json!({"input": "hello"}),
+
+                    ..Default::default()
                 }]),
                 None,
             )],
@@ -473,6 +475,8 @@ mod tests {
                     id: "call_empty".into(),
                     name: "no_arg_tool".into(),
                     arguments: serde_json::json!({}),
+
+                    ..Default::default()
                 }]),
                 None,
             )],
@@ -498,6 +502,8 @@ mod tests {
                     id: "call_null".into(),
                     name: "no_arg_tool".into(),
                     arguments: serde_json::Value::Null,
+
+                    ..Default::default()
                 }]),
                 None,
             )],
@@ -687,6 +693,8 @@ mod tests {
                     id: "call_1".into(),
                     name: "some_tool".into(),
                     arguments: serde_json::json!({}),
+
+                    ..Default::default()
                 }]),
                 Some("reasoning".into()),
             )],
@@ -712,6 +720,8 @@ mod tests {
                         id: "call_1".into(),
                         name: "shell".into(),
                         arguments: serde_json::json!({"command": "ls"}),
+
+                        ..Default::default()
                     }]),
                     None,
                 ),
@@ -774,11 +784,15 @@ mod tests {
                             id: "call_a".into(),
                             name: "tool_a".into(),
                             arguments: serde_json::json!({"input": "a"}),
+
+                            ..Default::default()
                         },
                         ToolCall {
                             id: "call_b".into(),
                             name: "tool_b".into(),
                             arguments: serde_json::json!({"input": "b"}),
+
+                            ..Default::default()
                         },
                     ]),
                     None,

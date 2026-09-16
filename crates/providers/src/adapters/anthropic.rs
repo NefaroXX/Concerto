@@ -267,6 +267,8 @@ mod tests {
                         id: "call_1".into(),
                         name: "shell".into(),
                         arguments: serde_json::json!({"command": "ls"}),
+
+                        ..Default::default()
                     }]),
                     tool_results: None,
                     reasoning_content: Some("I'll list the files.".into()),

@@ -230,6 +230,8 @@ mod tests {
                 id: "call_1".into(),
                 name: "test".into(),
                 arguments: serde_json::json!({}),
+
+                ..Default::default()
             }]),
             tool_results: Some(vec![ToolResult {
                 id: "call_1".into(),

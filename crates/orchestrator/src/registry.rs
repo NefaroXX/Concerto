@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use concerto_config::{
     builtin_agent_seeds, AgentCapabilities, BlueprintFacade, CustomAgentConfig, PromptSections,
-    StageKind,
+    ShellProfileConfig, StageKind,
 };
 use concerto_core::event::EventBus;
 use concerto_core::executor::ToolExecutor;
@@ -139,6 +139,10 @@ fn register_seeded_agents(
     // ADR-65 §3: the session-DB pool backing every registered specialist's
     // tool-evidence writer; `None` (tests, pools unavailable) disables it.
     fact_pool: Option<sqlx::SqlitePool>,
+    // Custom-ai-shell plan (Phase C): the shell profile driving the
+    // validator's eval engine (build/validation commands); `None` on
+    // manual/test construction paths keeps runner detection unprofiled.
+    shell_profile: Option<ShellProfileConfig>,
 ) {
     for (id, cfg) in merged {
         if cfg.disabled || id.as_str() == "coordinator" {
@@ -194,6 +198,7 @@ fn register_seeded_agents(
         let retry_policy_owned = retry_policy.clone();
         let eval_root_owned = eval_root.to_path_buf();
         let fact_pool_owned = fact_pool.clone();
+        let shell_profile_owned = shell_profile.clone();
         let factory_id = id_owned.clone();
         let build = move |provider: Arc<dyn LlmProvider>| -> Arc<dyn ExpertAgent> {
             // ADR-65 §3: stamp the shared pool onto this specific agent's
@@ -216,7 +221,18 @@ fn register_seeded_agents(
                 let eval = capabilities
                     .effective()
                     .eval
-                    .then(|| Arc::new(concerto_eval::EvalEngine::new(&eval_root_owned)));
+                    // Custom-ai-shell plan (Phase C): run the validator's
+                    // eval suite through the resolved shell profile when one
+                    // is configured (identical to the single-agent and
+                    // coordinator eval-engine paths); `None` keeps the
+                    // detected-runner default.
+                    .then(|| {
+                        let engine = concerto_eval::EvalEngine::new(&eval_root_owned);
+                        Arc::new(match &shell_profile_owned {
+                            Some(profile) => engine.with_shell_profile(profile.clone()),
+                            None => engine,
+                        })
+                    });
                 return Arc::new(
                     GenericSpecialistAgent::new(
                         id_owned.clone(),
@@ -413,6 +429,7 @@ impl AgentRegistry {
             "",
             None,
             None, // Adr-65 §3: no fact-writer pool on the default construction path
+            None, // Custom-ai-shell plan: no shell profile on the default path
         );
         // Retain the merged configs so the planner roster can describe each
         // role (ADR-35 phase 4, roster enrichment).
@@ -465,6 +482,8 @@ impl AgentRegistry {
             "",
             None,
             fact_pool,
+            // Custom-ai-shell plan: no shell profile on this path.
+            None,
         )
     }
 
@@ -486,6 +505,9 @@ impl AgentRegistry {
         environment_card: &str,
         facade: Option<&BlueprintFacade>,
         fact_pool: Option<sqlx::SqlitePool>,
+        // Custom-ai-shell plan (Phase C): the resolved shell profile driving
+        // the validator's eval engine; `None` keeps runner detection.
+        shell_profile: Option<ShellProfileConfig>,
     ) -> Self {
         let get_provider = |id: &AgentId| -> Arc<dyn LlmProvider> {
             role_providers.get(id).cloned().unwrap_or_else(|| default_provider.clone())
@@ -504,6 +526,7 @@ impl AgentRegistry {
             environment_card,
             facade,
             fact_pool,
+            shell_profile,
         );
         // Retain the merged configs so the planner roster can describe each
         // role (ADR-35 phase 4, roster enrichment). Covers
@@ -531,6 +554,9 @@ impl AgentRegistry {
         skills_section: &str,
         merge_seeds: bool,
         fact_pool: Option<sqlx::SqlitePool>,
+        // Custom-ai-shell plan (Phase C): the resolved shell profile driving
+        // the validator's eval engine; `None` keeps runner detection.
+        shell_profile: Option<ShellProfileConfig>,
     ) -> Self {
         Self::build_with_roles_for_project_with_facade(
             role_providers,
@@ -546,6 +572,7 @@ impl AgentRegistry {
             None,
             merge_seeds,
             fact_pool,
+            shell_profile,
         )
     }
 
@@ -580,6 +607,9 @@ impl AgentRegistry {
         facade: Option<&BlueprintFacade>,
         merge_seeds: bool,
         fact_pool: Option<sqlx::SqlitePool>,
+        // Custom-ai-shell plan (Phase C): the resolved shell profile driving
+        // the validator's eval engine; `None` keeps runner detection.
+        shell_profile: Option<ShellProfileConfig>,
     ) -> Self {
         // Audit §3.2: `memory` was threaded in only to be forwarded to
         // `build_with_roles`, which itself ignored it (underscore-prefixed).
@@ -602,6 +632,7 @@ impl AgentRegistry {
             environment_card,
             facade,
             fact_pool,
+            shell_profile,
         )
     }
 }
@@ -1098,6 +1129,7 @@ mod tests {
             "",
             true,
             None, // no fact-writer pool in this test
+            None, // no shell profile in this test
         );
 
         let validator =
@@ -1173,6 +1205,7 @@ mod tests {
             Some(&facade),
             true,
             None, // no fact-writer pool in this test
+            None, // no shell profile in this test
         );
 
         let validator =

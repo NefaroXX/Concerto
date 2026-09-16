@@ -180,6 +180,8 @@ mod tests {
                 id: "call-1".to_owned(),
                 name: "write_file".to_owned(),
                 arguments: json!({ "path": "note.md" }),
+
+                ..Default::default()
             }),
             is_final: false,
             usage: None,

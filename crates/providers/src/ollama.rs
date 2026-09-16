@@ -326,6 +326,8 @@ fn ollama_line_to_chunks(
                                 id,
                                 name: name.to_string(),
                                 arguments: args,
+
+                                ..Default::default()
                             }),
                             is_final: false,
                             usage: None,

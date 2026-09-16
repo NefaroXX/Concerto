@@ -137,6 +137,16 @@ pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 /// applies no policy gate (there is nothing to gate).
 pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 
+/// ADR-35 amendment (2026-09-16 §2): the explicit human-input request
+/// surface — the Coordinator side of the operator consent/interaction gate.
+/// The model calls it with a reason; the decision loop then unwinds and the
+/// run ends `AwaitingUser` with the reason as the final message and a
+/// preserved checkpoint, so the interactive answer channel (TODO #22/#23)
+/// can resume it after the operator answers. Dispatches no agents, touches
+/// no tools; unlike the other surfaces it applies no policy gate because it
+/// is the human-in-the-loop consent path itself, not a workspace mutation.
+pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -434,6 +444,33 @@ fn reconsider_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["decision_id", "reason", "affected_task_ids"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `request_user_input` tool (ADR-35
+/// amendment 2026-09-16 §2): the operator-consent surface that stops the run
+/// with a preserved checkpoint, awaiting the operator's answer (TODO #22/#23
+/// is the interactive answer channel that resumes it).
+fn request_user_input_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REQUEST_USER_INPUT_TOOL.to_string(),
+        description: "Stop the run and request human input. The run ends with \
+                      AwaitingUser status, the checkpoint is preserved, and the \
+                      operator is shown your reason. Use this ONLY when the next \
+                      step genuinely requires the operator's answer — consent, a \
+                      choice, a credential, or a decision only they can make."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "The complete, self-contained question or reason the operator must \
+                                    answer before the run can continue."
+                }
+            },
+            "required": ["reason"]
         }),
     }
 }
@@ -892,6 +929,12 @@ struct DecomposeResult {
     /// empty dispatch session on an action-required run, cap/iteration-bound
     /// stops). Consumed by `execute_graph`'s tail. Empty on a restore.
     loop_notes: Vec<String>,
+    /// ADR-35 amendment (2026-09-16 §2): the reason the Coordinator requested
+    /// human input in its decision loop. Threaded to `execute_graph` so the
+    /// run ends `AwaitingUser` with the reason as the final message and a
+    /// preserved checkpoint. `None` on a checkpoint restore (the resume
+    /// re-decides) and on any run that never asked.
+    requested_user_input: Option<String>,
 }
 
 /// State accumulated by the Coordinator's decision loop (each
@@ -1205,6 +1248,15 @@ pub struct CoordinatorAgent {
     /// checkpoint so a resume keeps reconciling the SAME changes; surfaced
     /// to the world model as decision risks.
     external_changes: Vec<crate::external_change::ExternalChangeRecord>,
+    /// ADR-35 amendment (2026-09-16 §2): the reason the Coordinator requested
+    /// human input via the `request_user_input` tool. Set by the decision-loop
+    /// handler; the loop unwinds on it and `execute_graph` returns an
+    /// `AwaitingUser` output with this text as the final message and a
+    /// preserved checkpoint. `None` when no input was requested (the common
+    /// case); reset at the start of each `run` and never checkpointed — the
+    /// request either surfaces as the run's outcome or, on a later resume,
+    /// the Coordinator re-decides from the restored world.
+    requested_user_input: Option<String>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -1838,6 +1890,10 @@ impl CoordinatorAgent {
             // field grows only through detection (live wait scan + F3
             // resume reconciliation) and is restored from checkpoints.
             external_changes: Vec::new(),
+            // ADR-35 amendment (2026-09-16 §2): no pending human-input
+            // request at startup; set only by the request_user_input tool
+            // in the decision loop.
+            requested_user_input: None,
         }
     }
 
@@ -3883,6 +3939,7 @@ impl CoordinatorAgent {
                 action_ledger: Vec::new(),
                 dispatch_summary: String::new(),
                 loop_notes: Vec::new(),
+                requested_user_input: None,
                 objective: task.description.clone(),
                 objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
             });
@@ -3900,6 +3957,7 @@ impl CoordinatorAgent {
             action_ledger: ledger.action_ledger,
             dispatch_summary: summary,
             loop_notes: ledger.notes,
+            requested_user_input: self.requested_user_input.take(),
             objective: task.description.clone(),
             objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
         })
@@ -4131,6 +4189,7 @@ impl CoordinatorAgent {
             action_ledger,
             dispatch_summary: String::new(),
             loop_notes: Vec::new(),
+            requested_user_input: None,
             objective,
             objective_hash,
         }))
@@ -4549,6 +4608,7 @@ impl CoordinatorAgent {
         run_objective: String,
         run_objective_hash: String,
         loop_notes: Vec<String>,
+        requested_user_input: Option<String>,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
         // ADR-52: the run-wide dispatch cap is counted across the whole `run`
         // invocation (the Coordinator decision loop + this graph loop share
@@ -4644,6 +4704,46 @@ impl CoordinatorAgent {
             &self.checkpoint_context(&model_assignments, &action_ledger),
         );
         self.persist_checkpoint(&mut initial_execution_checkpoint).await;
+
+        // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
+        // The Coordinator requested human input during its decision loop
+        // (`request_user_input`). The run stops HERE — before any further
+        // graph dispatch — with the execution checkpoint preserved so a
+        // resume can continue after the operator answers (the interactive
+        // answer channel is TODO #22/#23). The reason rides the final
+        // message; the status is `AwaitingUser`.
+        if let Some(reason) = requested_user_input {
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
+            );
+            let checkpoint_json = serde_json::to_string(&initial_execution_checkpoint).ok();
+            // Exact-reset the settled mirror like the success tail: the
+            // output's vec is the single source of truth.
+            self.settled_metrics.clear();
+            self.settled_metrics.extend(provider_metrics.iter().cloned());
+            return Ok((
+                AgentOutput {
+                    task_id: task.id,
+                    session_id: task.session_id,
+                    final_message: reason,
+                    files_modified: crate::tool_facts::sanitize_files_modified(
+                        &context.session.project_dir,
+                        &all_files,
+                    ),
+                    tool_call_count: total_tool_calls,
+                    eval_result: None,
+                    tool_events: Vec::new(),
+                    verification: Vec::new(),
+                    project_root: None,
+                    completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
+                    provider_metrics,
+                    checkpoint_json,
+                },
+                recoverable_notes,
+            ));
+        }
 
         // ADR-35 §5: lifecycle stages are resolved from the registry rather
         // than hardcoded role ids. A pipeline without a design-stage agent
@@ -5784,36 +5884,6 @@ impl CoordinatorAgent {
                                     last_error: zero_file_error,
                                 });
                             continue;
-                        } else if implement_phase {
-                            // Any implement-stage agent's success triggers the
-                            // review cycle (ADR-35 §5), not just the built-in
-                            // Coder.
-                            let review_context = context.clone();
-                            let desc_for_review = desc.clone();
-                            let review_result = self
-                                .run_review_cycle(
-                                    &mut graph,
-                                    task_id,
-                                    desc_for_review,
-                                    sid,
-                                    &result,
-                                    &review_context,
-                                    task.clone(),
-                                    &cancel,
-                                )
-                                .await?;
-                            total_cost += review_result.cost_usd;
-                            total_tool_calls += review_result.tool_call_count;
-                            all_files.extend(review_result.files_modified.clone());
-                            let settled = metrics_from_result(&review_result);
-                            provider_metrics.push(settled.clone());
-                            self.settled_metrics.push(settled);
-                            if !matches!(review_result.outcome, AgentOutcome::Success) {
-                                recoverable_notes.push(format!(
-                                    "Review remains unresolved: {}",
-                                    review_result.summary
-                                ));
-                            }
                         }
                     }
                     AgentOutcome::NeedsRevision { reason } => {
@@ -6325,28 +6395,6 @@ impl CoordinatorAgent {
             }
         }
 
-        // ── 3. Run validation suite ──────────────────────────────────────
-        // C-06: acceptance of a run that contained implement-stage work is
-        // coordinator-owned; the validation loop needs to know whether this
-        // was a build task so it can enforce artifact + verification
-        // evidence.
-        let build_task = graph.all_tasks().iter().any(|subtask| {
-            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
-        });
-        let validation_result = self
-            .run_validation_loop(&task, &context, &cancel, build_task, &mut action_ledger)
-            .await?;
-        total_cost += validation_result.cost_usd;
-        total_tool_calls += validation_result.tool_call_count;
-        all_files.extend(validation_result.files_modified.clone());
-        let settled = metrics_from_result(&validation_result);
-        provider_metrics.push(settled.clone());
-        self.settled_metrics.push(settled);
-        if !matches!(validation_result.outcome, AgentOutcome::Success) {
-            recoverable_notes
-                .push(format!("Validation remains unresolved: {}", validation_result.summary));
-        }
-
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
@@ -6381,11 +6429,58 @@ impl CoordinatorAgent {
             );
         }
 
-        let completion_status = if recoverable_notes.is_empty() {
+        let mut completion_status = if recoverable_notes.is_empty() {
             concerto_core::types::AgentCompletionStatus::Completed
         } else {
             concerto_core::types::AgentCompletionStatus::Partial
         };
+        // ── C-06 completion-time acceptance gate ─────────────────────────
+        // ADR-35 amendment (2026-09-16 §4): a build task may only be
+        // reported Completed when the Coordinator actually invoked
+        // verification and the artifacts passed acceptance. The gate
+        // detects "declared verification evidence" — a successful
+        // acceptance-stage dispatch in the ledger (subtask settled with
+        // kind "completed" whose role resolves to StageKind::Acceptance) —
+        // and invokes `acceptance_rejection` to enforce artifact checks
+        // and record the accepted/rejected decision. Without declared
+        // verification evidence the completion claim is downgraded to
+        // Partial with a recoverable note.
+        let build_task = graph.all_tasks().iter().any(|subtask| {
+            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
+        });
+        let has_declared_verification = graph.all_tasks().iter().any(|subtask| {
+            self.role_in_kind_stage(&subtask.role, StageKind::Acceptance, AgentStage::is_validate)
+                && action_ledger
+                    .iter()
+                    .any(|action| action.task_id == Some(subtask.id) && action.kind == "completed")
+        });
+        if build_task && completion_status == concerto_core::types::AgentCompletionStatus::Completed
+        {
+            if has_declared_verification {
+                // ADR-35 §4: the Coordinator dispatched a validator that
+                // succeeded. Invoke acceptance_rejection to enforce artifact
+                // checks and record the accepted/rejected decision in the
+                // action ledger.
+                let project_root =
+                    camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+                        .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
+                if let Some(rejected) =
+                    self.acceptance_rejection(&task, build_task, &project_root, &mut action_ledger)
+                {
+                    recoverable_notes.push(rejected.summary.clone());
+                    completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                }
+            } else {
+                // No verification evidence was declared for this run.
+                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                recoverable_notes.push(
+                    "Acceptance gate C-06: the run contained implement-stage work but no \
+                     verification evidence was declared for this run; the completion claim \
+ is reported Partial."
+                        .to_owned(),
+                );
+            }
+        }
         // ── Run-continuity Phase 1: stall gate at the final exit ────────
         // A stalled run (declared-Completion false, declared deliverables
         // unproduced, or a Failed/Blocked subtask) KEEPS its resumable
@@ -6468,6 +6563,8 @@ impl CoordinatorAgent {
     ) -> Result<AgentOutput, OrchestratorError> {
         // Fresh run: forget settlements from any prior run on this instance.
         self.settled_metrics.clear();
+        // Fresh run: no pending human-input request carries across runs.
+        self.requested_user_input = None;
         // ADR-52: the run-wide dispatch cap is per `run` invocation (a fresh
         // run or a resume restarts the counter). The Coordinator's decision
         // loop counts toward it too, so loop + graph dispatches share one
@@ -6490,6 +6587,7 @@ impl CoordinatorAgent {
             action_ledger,
             dispatch_summary,
             loop_notes,
+            requested_user_input,
             objective: run_objective,
             objective_hash: run_objective_hash,
         } = match self.decompose_or_restore(&task, &context, &cancel, resume_checkpoint_json).await
@@ -6570,6 +6668,7 @@ impl CoordinatorAgent {
             run_objective,
             run_objective_hash,
             loop_notes,
+            requested_user_input,
         )
         .await
         .map(|(output, _notes)| output)
@@ -6623,6 +6722,14 @@ impl CoordinatorAgent {
     /// running a duplicate second review. Costs spent by the crashed attempt
     /// are gone with it (only verdicts are durable) and are honestly absent
     /// from the resumed run's totals.
+    ///
+    /// ADR-35 amendment (2026-09-16 §2): review is now a Coordinator
+    /// DECISION (`call_specialist` to the review-stage agent), not an
+    /// automatic post-implement pipeline gate, so no call site remains in
+    /// `execute_graph`. The method is retained (unused) for the Coordinator
+    /// self-review/resumption paths that follow; removing it would delete a
+    /// deliberate, resumable capability.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     async fn run_review_cycle(
         &mut self,
@@ -6946,7 +7053,26 @@ impl CoordinatorAgent {
             }
             graph.mark_done(&review_task_id);
 
-            self.review_cycles.next_cycle(task_id)?;
+            // ADR-35 amendment (2026-09-16 §2): an exceeded review-cycle
+            // count is informational evidence, never a terminal stop. Publish
+            // the escalation event and return the reviewer's verdict as a
+            // recoverable result so the Coordinator decides the next move
+            // (re-dispatch, re-plan, or request_user_input).
+            if self.review_cycles.next_cycle(task_id).is_err() {
+                let _ = self.bus.publish_for_session(
+                    session_id,
+                    task_id.0,
+                    EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                );
+                let mut escalated = result;
+                escalated.cost_usd += revision_cost;
+                escalated.tool_call_count =
+                    escalated.tool_call_count.saturating_add(revision_tool_calls);
+                escalated.files_modified.extend(revision_files);
+                escalated.tokens_in = escalated.tokens_in.saturating_add(revision_tokens_in);
+                escalated.tokens_out = escalated.tokens_out.saturating_add(revision_tokens_out);
+                return Ok(escalated);
+            }
 
             match &result.outcome {
                 AgentOutcome::Success => {
@@ -7241,6 +7367,14 @@ impl CoordinatorAgent {
     /// those runs acceptance is coordinator-owned (audit C-06) and requires
     /// artifact + verification evidence (see [`Self::acceptance_rejection`]).
     /// `action_ledger` records the acceptance decision for the checkpoint.
+    ///
+    /// ADR-35 amendment (2026-09-16 §2): validation is now a Coordinator
+    /// DECISION (`call_specialist` to the acceptance-stage agent), not an
+    /// automatic post-graph pipeline gate, so no call site remains in
+    /// `execute_graph`. The method is retained (unused) for the Coordinator
+    /// self-validation/resumption paths that follow; removing it would delete
+    /// a deliberate, resumable capability.
+    #[allow(dead_code)]
     async fn run_validation_loop(
         &mut self,
         task: &AgentTask,
@@ -7399,8 +7533,24 @@ impl CoordinatorAgent {
                 task.id.0,
                 EventKind::ValidationCycleStarted { task_id: task.id, cycle_num: cycle },
             );
-            // Advance validation cycle counter
-            self.validation_cycles.next_cycle(task.id)?;
+            // ADR-35 amendment (2026-09-16 §2): an exceeded validation-cycle
+            // count is informational evidence, never a terminal stop. Publish
+            // the escalation event and return a recoverable Failed verdict so
+            // the Coordinator decides the next move.
+            if self.validation_cycles.next_cycle(task.id).is_err() {
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    task.id.0,
+                    EventKind::ValidationEscalated { task_id: task.id, max_cycles },
+                );
+                return Ok(acceptance_failure_result(
+                    task,
+                    format!(
+                        "Validation cycle ceiling ({max_cycles}) reached; escalation is \
+                         informational per ADR-35 amendment (2026-09-16 §2)."
+                    ),
+                ));
+            }
 
             // Use the validation-stage agent to run the test suite
             let agent = self.registry.get(&validator_role).ok_or_else(|| {
@@ -7787,6 +7937,7 @@ impl CoordinatorAgent {
             action_ledger: ledger.action_ledger,
             dispatch_summary: summary,
             loop_notes: ledger.notes,
+            requested_user_input: self.requested_user_input.take(),
             objective: seed.plan_text,
             objective_hash: seed.objective_hash,
         })
@@ -7846,6 +7997,9 @@ impl CoordinatorAgent {
             // Issue #63: the declarative wait surface — parks the decision
             // loop on conditions/deadline with zero model turns.
             tool_defs.push(wait_tool_definition());
+            // ADR-35 amendment (2026-09-16 §2): the human-input request
+            // surface — stops the run AwaitingUser for the operator's answer.
+            tool_defs.push(request_user_input_tool_definition());
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
@@ -8123,6 +8277,15 @@ impl CoordinatorAgent {
                         )
                         .await
                     }
+                    // ADR-35 amendment (2026-09-16 §2): the human-input
+                    // request surface. The handler records the reason and the
+                    // loop unwinds (inner and outer breaks below); the run
+                    // ends AwaitingUser with the reason and a preserved
+                    // checkpoint. Dispatches nothing, touches no tools — the
+                    // operator-consent path itself applies no policy gate.
+                    REQUEST_USER_INPUT_TOOL if dispatching => {
+                        self.handle_request_user_input(&tool_call.arguments).await
+                    }
                     // Issue #64: the explicit reconsideration surface — the
                     // model supersedes a decision and freezes ONLY its
                     // affected pending tasks (a deterministic transform,
@@ -8221,6 +8384,22 @@ impl CoordinatorAgent {
                     tokens_in: None,
                     tokens_out: None,
                 });
+                // ADR-35 amendment (2026-09-16 §2): the tool result was just
+                // delivered and the Coordinator requested human input — stop
+                // this batch's remaining tool calls; the outer break below
+                // ends the loop.
+                if self.requested_user_input.is_some() {
+                    break;
+                }
+            }
+
+            // ── ADR-35 amendment (2026-09-16 §2): the Coordinator asked the
+            //       operator a question — the decision loop ends here. This is
+            //       a deliberate stop (not the iteration bound), so the tail's
+            //       structural-bound note is suppressed below.
+            if self.requested_user_input.is_some() {
+                hit_iteration_bound = false;
+                break;
             }
 
             // ── Issue #53: progress-aware stall detection ──────────────
@@ -11030,6 +11209,38 @@ impl CoordinatorAgent {
         })
     }
 
+    /// ADR-35 amendment (2026-09-16 §2): handle ONE `request_user_input`
+    /// tool call. The Coordinator asks the operator a question — the reason
+    /// is recorded and the decision loop unwinds on it (the inner/outer
+    /// breaks in `run_dispatch_session`), so `execute_graph` returns an
+    /// `AwaitingUser` output with the reason as the final message and a
+    /// preserved checkpoint. No policy gate: this is the human-in-the-loop
+    /// consent path itself, not a workspace mutation, and no agent is named
+    /// or dispatched. Touches no graph, journal, or ledger state — the
+    /// run-level outcome (status + message + checkpoint) is the record.
+    async fn handle_request_user_input(
+        &mut self,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial request) ────────────────────────────────
+        let Some(reason) = arguments
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "request_user_input requires a non-empty string reason",
+            });
+        };
+        self.requested_user_input = Some(reason.to_string());
+        serde_json::json!({
+            "status": "awaiting_human_input",
+            "message": "The run is paused awaiting your input.",
+        })
+    }
+
     /// Issue #64: handle ONE `reconsider` tool call — supersede a decision
     /// whose assumptions proved wrong and freeze only the affected pending
     /// tasks. Same failure discipline as the sibling decision surfaces:
@@ -11698,6 +11909,25 @@ impl CoordinatorAgent {
             prompt.push_str(&self.environment_card);
             prompt.push_str("\n\n");
         }
+        // ── Dispatch budget advisory (ADR-35 amendment 2026-09-16 §6) ────
+        // The run-wide dispatch ceiling (ADR-52 `max_total_iterations`) is
+        // the Coordinator's hard budget. Publishing it up front lets the
+        // model decide early whether to invoke `request_user_input` for
+        // operator guidance instead of spending its remaining specialist
+        // calls on low-confidence work. Emitted only while dispatching and
+        // only when a ceiling is configured.
+        if dispatching {
+            if let Some(cap) = self.max_total_iterations {
+                let used = self.model_dispatch_count.min(cap);
+                let remaining = cap - used;
+                prompt.push_str(&format!(
+                    "<dispatch_budget>\nRun-wide ceiling: {cap} specialist calls; {used} used, \
+                     {remaining} remaining. Budget them — prefer request_user_input when the \
+                     path ahead is low-confidence rather than spending the remaining calls on \
+                     speculative work.\n</dispatch_budget>\n\n"
+                ));
+            }
+        }
         prompt.push_str(&format!("Objective: {}\n", task.description));
         // Issue #56: the Coordinator's decisions consume the structured
         // world model — a bounded rendered block rides every dispatch-
@@ -12316,6 +12546,8 @@ mod tests {
                 }
                 arguments
             },
+
+            ..Default::default()
         }
     }
 
@@ -12353,6 +12585,8 @@ mod tests {
                 }
                 arguments
             },
+
+            ..Default::default()
         }
     }
 
@@ -12363,6 +12597,8 @@ mod tests {
             id: format!("read-{path}"),
             name: "filesystem".to_string(),
             arguments: serde_json::json!({ "operation": "read", "path": path }),
+
+            ..Default::default()
         }
     }
 
@@ -12400,6 +12636,8 @@ mod tests {
             id: "inv-batch".to_string(),
             name: INVESTIGATE_HYPOTHESES_TOOL.to_string(),
             arguments: serde_json::json!({ "hypotheses": specs }),
+
+            ..Default::default()
         }
     }
 
@@ -12948,6 +13186,8 @@ mod tests {
             id: format!("write-{path}"),
             name: "test_write_file".to_string(),
             arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
         }
     }
 
@@ -13091,6 +13331,8 @@ mod tests {
                     "path": "injected.rs",
                     "content": "// pwned",
                 }),
+
+                ..Default::default()
             }]),
             CoordinatorTurn::Text("I could not write; here is my advisory answer.".into()),
             CoordinatorTurn::Text("done".into()),
@@ -13650,6 +13892,8 @@ mod tests {
                     "path": "injected.rs",
                     "content": "// pwned",
                 }),
+
+                ..Default::default()
             }]),
             // Whichever consultant popped the write still settles in prose,
             // then the other conclusion, then the coordinator.
@@ -14362,6 +14606,7 @@ mod tests {
                 "build the thing".to_string(),
                 blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await
             .expect("execute_graph returns");
@@ -14821,9 +15066,9 @@ mod tests {
 
     /// A build task (contains implement-stage work) whose pipeline has no
     /// validation-stage agent must not be silently accepted: with no declared
-    /// verification, acceptance is a failure (audit C-06). The validation
-    /// loop runs at the tail of the run regardless of how the graph was
-    /// built (the Coordinator's decision loop included).
+    /// verification evidence the C-06 acceptance gate reports the completion
+    /// claim Partial (audit C-06). No validation cycle may run and no
+    /// validation-stage specialist may ever be dispatched.
     #[tokio::test]
     async fn build_task_without_validator_is_not_silently_accepted() {
         let bus = EventBus::new(256);
@@ -14854,8 +15099,8 @@ mod tests {
         .await;
 
         assert!(
-            output.final_message.contains("Acceptance rejected: no validation-stage agent"),
-            "unexpected final message: {}",
+            output.final_message.contains("Acceptance gate C-06"),
+            "no declared verification evidence must leave the completion claim Partial: {}",
             output.final_message
         );
         assert!(
@@ -14989,9 +15234,10 @@ mod tests {
     /// Verify that when a Coder subtask exhausts retries with an
     /// artifact-production failure, the coordinator creates an Architect
     /// replan subtask, and when the Architect completes with a valid
-    /// DesignDoc, a new Coder subtask is spawned.  The run completes
-    /// successfully because the follow-up Coder (populated from the
-    /// mock's default success) passes.
+    /// DesignDoc, a new Coder subtask is spawned. The follow-up Coder
+    /// (populated from the mock's default success) passes, so the graph
+    /// normalizes — but the run still exits Partial because no
+    /// validation-stage evidence was declared (audit C-06).
     #[tokio::test]
     async fn coder_artifact_failure_triggers_replan_and_spawns_new_coder() {
         // ── 1. Coordinator with mocks ───────────────────────────────
@@ -15143,6 +15389,7 @@ mod tests {
                 run_objective,
                 run_objective_hash,
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await;
 
@@ -15150,14 +15397,20 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got error: {result:?}");
         let (output, _notes) = result.unwrap();
 
-        // The new Coder from replan gets a default-success from the mock,
-        // so the overall run should be Completed (not Partial).
+        // The new Coder from replan gets a default-success from the mock, so
+        // the graph normalizes — but no validation-stage evidence was ever
+        // declared, so the C-06 gate reports the completion Partial.
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Completed,
-            "replan fallback should produce Completed status when the \
-             follow-up Coder succeeds, got: {:?}",
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the replan resolves the graph, but no verification evidence means \
+             the run must not claim full completion, got: {:?}",
             output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("Acceptance gate C-06"),
+            "an unverified build-task completion must be reported Partial: {}",
+            output.final_message
         );
 
         // Smoke-check that the replan occurred: the coordinator's
@@ -15417,6 +15670,7 @@ mod tests {
                 "test task".to_string(),
                 blake3::hash("test task".as_bytes()).to_hex().to_string(),
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await
             .expect("execute_graph should succeed");
@@ -15781,8 +16035,9 @@ mod tests {
         // The coder mock declares the implement stage, so the run is a
         // build task: the C-06 acceptance gate requires verification
         // evidence from a registered validation-stage agent. A succeeding
-        // validator mock supplies it (the run has no expected artifacts,
-        // so the artifact check is vacuous).
+        // validator subtask (added to the graph below) supplies that
+        // dispatch, and the run has no expected artifacts, so the artifact
+        // check is vacuous.
         let validator = MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok");
         let session_id = Ulid::new();
         let mut coordinator = coordinator_for_ladder(
@@ -15794,7 +16049,28 @@ mod tests {
             },
             Arc::new(MockProvider::default()),
         );
-        let (graph, _task_id) = single_pending_graph(session_id, "coder");
+        let (mut graph, coder_id) = single_pending_graph(session_id, "coder");
+        // The coder declares the implement stage, so this is a build task and
+        // the C-06 acceptance gate requires declared verification evidence.
+        // Add the succeeding validator as the coder's child so the run has a
+        // completed acceptance-stage dispatch after the tier-1 rescue.
+        let validator_id = TaskId::new();
+        graph.add_child(
+            SubTask {
+                id: validator_id,
+                parent_id: Some(coder_id),
+                session_id,
+                role: AgentId::new("validator"),
+                description: "verify".into(),
+                status: SubTaskStatus::Pending,
+                dependencies: vec![coder_id],
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            },
+            coder_id,
+            crate::graph::Dependency::MustFinishBefore,
+        );
 
         let (output, events) =
             run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new())
@@ -16325,10 +16601,10 @@ mod tests {
     }
 
     /// ADR-52: a run-wide dispatch cap stops the run at the batch boundary.
-    /// Build a chained two-subtask graph (researcher → coder); with no cap the
-    /// run completes with both dispatches; with a cap of 1 the run pauses with
-    /// a Partial outcome (and a clear message) rather than dispatching the
-    /// second subtask.
+    /// Build a chained three-subtask graph (researcher → coder → validator);
+    /// with no cap the run completes with all three dispatches; with a cap
+    /// of 1 the run pauses with a Partial outcome (and a clear message)
+    /// rather than dispatching the next subtask.
     #[tokio::test]
     async fn max_total_iterations_caps_dispatch_at_batch_boundary() {
         let session_id = Ulid::new();
@@ -16347,7 +16623,9 @@ mod tests {
             )
             .with_max_total_iterations(cap);
             drop(bus);
-            // Chained graph: researcher → coder (no other ready set).
+            // Chained graph: researcher → coder → validator (one ready
+            // task per batch: the validator is the run's declared
+            // verification evidence for C-06).
             let mut graph = TaskGraph::new();
             let researcher_id = TaskId::new();
             let coder_id = TaskId::new();
@@ -16377,6 +16655,23 @@ mod tests {
                     completed_at: None,
                 },
                 researcher_id,
+                crate::graph::Dependency::MustFinishBefore,
+            );
+            let validator_id = TaskId::new();
+            graph.add_child(
+                SubTask {
+                    id: validator_id,
+                    parent_id: Some(coder_id),
+                    session_id,
+                    role: AgentId::new("validator"),
+                    description: "verify".into(),
+                    status: SubTaskStatus::Pending,
+                    dependencies: vec![coder_id],
+                    deliverable: None,
+                    created_at: time::OffsetDateTime::now_utc(),
+                    completed_at: None,
+                },
+                coder_id,
                 crate::graph::Dependency::MustFinishBefore,
             );
             let (output, _events) = run_graph_for_test(
@@ -16425,8 +16720,10 @@ mod tests {
 
         // A cap that exactly covers the needed dispatches must NOT pause the
         // run: the batch boundary check happens before the next batch, so
-        // `count >= cap` only trips when there is still ready work.
-        let output = run_case(Some(2)).await;
+        // `count >= cap` only trips when there is still ready work. The graph
+        // dispatches three subtasks (researcher → coder → validator), so the
+        // exact-coverage cap is 3.
+        let output = run_case(Some(3)).await;
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
@@ -17251,6 +17548,7 @@ mod tests {
                 run_objective,
                 run_objective_hash,
                 Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await;
 
@@ -17536,6 +17834,10 @@ mod tests {
                         call_specialist("architect", "design it"),
                         call_specialist("coder", "implement"),
                     ]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
                     CoordinatorTurn::Text("done".into()),
                 ],
                 &["src/a.rs"],
@@ -17589,6 +17891,7 @@ mod tests {
                     call_specialist("architect", "design it"),
                     call_specialist("coder", "implement"),
                 ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             &["src/a.rs"],
@@ -17613,9 +17916,10 @@ mod tests {
         );
     }
 
-    /// C-06: when the validator errors because the eval capability is
-    /// disabled, verification never ran and a build task is rejected even
-    /// though the coder produced files.
+    /// C-06: when the validator cannot run (the eval capability is disabled),
+    /// verification never completes and a build task must not be silently
+    /// accepted: the exhausted validator dispatch blocks the subtask and the
+    /// run ends Partial with the recovery note — never Completed.
     #[tokio::test]
     async fn build_task_with_disabled_verification_is_rejected() {
         let bus = EventBus::new(256);
@@ -17633,19 +17937,40 @@ mod tests {
             ),
         ];
         let (output, _events) = run_for_test(
-            coordinator_with_grounded(
+            coordinator_with_grounded_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design it"),
+                        call_specialist("coder", "implement"),
+                    ]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
                 &["src/a.rs"],
             ),
             bus.clone(),
         )
         .await;
 
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an unverifiable build task must not complete: {}",
+            output.final_message
+        );
         assert!(
-            output.final_message.contains("Acceptance rejected: verification did not run"),
-            "unexpected final message: {}",
+            output.final_message.contains("paused after exhausting recovery attempts"),
+            "the unavailable validator must surface as an exhausted, blocked dispatch: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("remained blocked after 3 attempts"),
+            "the validator subtask must block at the attempt ceiling: {}",
             output.final_message
         );
     }
@@ -17823,8 +18148,9 @@ mod tests {
     /// `src/main.rs` exists (no Cargo.toml, so the eval engine selects the
     /// `make` runner — no cargo/network). A real eval-mode validator runs
     /// `make test`; the coordinator's C-06 gate then rejects a marker-only
-    /// artifact and accepts a substantive one, recording both decisions in
-    /// the checkpoint ledger.
+    /// artifact (Phase 1 — the rejection lands in the stalled checkpoint's
+    /// ledger) and accepts a substantive one (Phase 2 — the verified build
+    /// completes, since a clean Completed clears its checkpoint).
     #[tokio::test]
     async fn real_disk_build_cycle_rejects_placeholder_and_accepts_real_artifact() {
         let dir = tempfile::tempdir().expect("tempdir for real project workspace");
@@ -17858,6 +18184,7 @@ mod tests {
                     call_specialist("architect", "design it"),
                     call_specialist("coder", "implement"),
                 ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             &["src/main.rs"],
@@ -17902,9 +18229,15 @@ mod tests {
         assert_eq!(evidence.artifacts, vec![camino::Utf8PathBuf::from("src/main.rs")]);
 
         // ── Phase 2: same project, now with a real artifact → accepted ──
-        // The reviewer stays unsatisfied so the run ends Partial and still
-        // serialises the ledger — letting the test observe the accepted
-        // decision and its evidence (artifacts + verification_passed).
+        // ── Phase 2: same project, now with a real artifact → accepted ──
+        // A clean, verified build run lets the C-06 gate fire over the
+        // declared verification evidence: the artifact passes, the gate
+        // records the acceptance, and the run completes — no rejection
+        // note, no C-06 downgrade. (The accepted decision lives in the
+        // in-memory action ledger; a clean Completed clears its checkpoint,
+        // so acceptance is observed here as the completing outcome, while
+        // the reject path above exposes the ledger through the stalled
+        // checkpoint.)
         let bus = EventBus::new(256);
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_MAIN),
@@ -17918,7 +18251,6 @@ mod tests {
             vec!["// real implementation\npub fn main() {}\n".into()],
             "// real implementation\npub fn main() {}\n".into(),
         )));
-        registry.register(Arc::new(AlwaysRevise));
         registry.register(Arc::new(real_eval_validator(&bus, &project_root)));
         let mut coordinator = coordinator_with_grounded_turns(
             bus.clone(),
@@ -17928,7 +18260,7 @@ mod tests {
                     call_specialist("architect", "design it"),
                     call_specialist("coder", "implement"),
                 ]),
-                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             &["src/main.rs"],
@@ -17943,32 +18275,24 @@ mod tests {
             .await
             .expect("coordinator run should succeed");
 
-        // Acceptance passed (the ledger says so); the run is Partial only
-        // because the review stayed unresolved.
+        // Acceptance passed: the verified build task completes with no
+        // rejection note and no C-06 downgrade.
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "an unresolved review keeps the run Partial even though acceptance passed"
-        );
-        assert!(
-            output.final_message.contains("requested revision"),
-            "expected the reviewer's revision note, got: {}",
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a verified build task with a real artifact completes: {}",
             output.final_message
         );
-        let decisions = acceptance_decisions(&output);
-        assert_eq!(
-            decisions.len(),
-            1,
-            "exactly one acceptance decision expected on the accept path"
-        );
-        assert_eq!(decisions[0].kind, "accepted", "real artifact must be accepted");
         assert!(
-            !decisions.iter().any(|action| action.kind == "rejected"),
-            "no rejected entry may exist on the accept path"
+            !output.final_message.contains("Acceptance rejected"),
+            "a real artifact must not be rejected: {}",
+            output.final_message
         );
-        let evidence = decisions[0].evidence.as_ref().expect("acceptance entry carries evidence");
-        assert!(evidence.verification_passed, "acceptance requires the eval pass");
-        assert_eq!(evidence.artifacts, vec![camino::Utf8PathBuf::from("src/main.rs")]);
+        assert!(
+            !output.final_message.contains("Acceptance gate C-06"),
+            "declared verification evidence must satisfy the C-06 gate: {}",
+            output.final_message
+        );
 
         // The artifact the coder wrote is substantive on real disk.
         let disk = std::fs::read_to_string(dir.path().join("src/main.rs")).expect("read artifact");
@@ -17990,17 +18314,17 @@ mod tests {
 
     const DESIGN_DOC_MAIN: &str = r#"{"goals":["implement main"],"proposed_files":["src/main.rs"],"interface_sketch":"entry point"}"#;
 
-    /// A build task with no validation-stage agent is self-verified by the
-    /// coordinator: the eval engine runs a REAL passing `make test` against
-    /// the workspace and the C-06 artifact gate records the acceptance. The
-    /// reviewer stays unsatisfied so the run ends Partial and still
-    /// serialises the checkpoint ledger — letting the test observe the
-    /// accepted decision and its evidence (artifacts + verification_passed).
+    /// ADR-35 amendment (2026-09-16 §5): coordinator self-verification is
+    /// REMOVED. Even when the coordinator holds a real eval engine (over a
+    /// passing `make test`) and a coder produced a real artifact, a build
+    /// task with NO validation-stage dispatch is never evaluated or accepted
+    /// by the coordinator itself: no `ValidationCycleStarted` event, no
+    /// acceptance decision, and no Completed claim.
     #[tokio::test]
-    async fn coordinator_self_verifies_build_task_when_no_validator_registered() {
+    async fn eval_engine_without_validator_does_not_self_verify() {
         let dir = tempfile::tempdir().expect("tempdir for real project workspace");
-        // `detect_runner` selects the `make` runner via the Makefile; the
-        // passing `test` target lets the coordinator's eval engine verify.
+        // A passing test target: if any self-verification remnant ran, it
+        // would succeed — and the run must still show no validation fired.
         std::fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").expect("write Makefile");
         let project_root = dir.path().to_path_buf();
 
@@ -18016,8 +18340,7 @@ mod tests {
         );
         // A real implement-stage agent writes a substantive artifact; the
         // reviewer always asks for revisions (keeps the run Partial). NO
-        // validate-stage agent is registered — the coordinator carries
-        // verification itself.
+        // validate-stage agent is registered and NO validator is dispatched.
         registry.register(Arc::new(DiskCoder::new(
             vec!["// real implementation\npub fn main() {}\n".into()],
             "// real implementation\npub fn main() {}\n".into(),
@@ -18054,59 +18377,45 @@ mod tests {
             collected
         };
 
-        // The coordinator self-verify cycle DID run (stage feed + replay see
-        // the single ValidationCycleStarted event).
+        // The eval engine must NOT run: the self-verify fallback is gone.
         assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
-            "the coordinator self-verify must publish a ValidationCycleStarted event"
+            !events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
+            "the eval engine must not self-verify a build task without a validator"
         );
+        // No acceptance decision can be recorded without verification evidence.
         let decisions = acceptance_decisions(&output);
-        assert_eq!(
-            decisions.len(),
-            1,
-            "exactly one acceptance decision expected on the self-verify path"
-        );
-        assert_eq!(decisions[0].kind, "accepted", "passing self-verification must be accepted");
         assert!(
-            !decisions.iter().any(|action| action.kind == "rejected"),
-            "no rejected entry may exist when self-verification passed"
-        );
-        let evidence = decisions[0].evidence.as_ref().expect("acceptance entry carries evidence");
-        assert!(evidence.verification_passed, "acceptance requires the verification pass");
-        assert_eq!(evidence.artifacts, vec![camino::Utf8PathBuf::from("src/main.rs")]);
-        // The run is Partial only because the review stayed unresolved — the
-        // validation itself passed and no acceptance rejection is present.
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "an unresolved review keeps the run Partial even though self-verification passed"
-        );
-        assert!(
-            output.final_message.contains("requested revision"),
-            "expected the reviewer's revision note, got: {}",
-            output.final_message
+            decisions.is_empty(),
+            "no validator dispatch means no acceptance decision may be recorded: {decisions:?}"
         );
         assert!(
             !output.final_message.contains("Acceptance rejected"),
-            "self-verified acceptance must not be rejected: {}",
+            "the amended pipeline records no artifact rejection here: {}",
+            output.final_message
+        );
+        assert!(
+            !matches!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Completed
+            ),
+            "an unverified build task must never claim full completion: {:?} — {}",
+            output.completion_status,
             output.final_message
         );
     }
 
-    /// A build task with no validation-stage agent and a FAILING test runner
-    /// is rejected by the coordinator's self-verification: verification ran
-    /// but did not pass, so acceptance fails and the ledger records the
-    /// rejection (verification_passed = false, no artifacts).
+    /// ADR-35 amendment (2026-09-16 §5): a run that completed its
+    /// implement-stage work but declared NO verification evidence is reported
+    /// Partial by the C-06 gate — even when nothing else is unresolved. This
+    /// is the canonical case: architect + coder complete cleanly, no review,
+    /// no validator, no eval engine, so the pre-gate outcome is Completed and
+    /// the gate's "no verification evidence" note is what moves it to Partial.
     #[tokio::test]
-    async fn coordinator_self_verification_failure_rejects_build_task() {
+    async fn completion_without_verification_evidence_is_partial() {
         let dir = tempfile::tempdir().expect("tempdir for real project workspace");
-        // `detect_runner` selects the `make` runner; the failing `test`
-        // target makes the coordinator's self-verification fail.
-        std::fs::write(dir.path().join("Makefile"), "test:\n\t@false\n").expect("write Makefile");
         let project_root = dir.path().to_path_buf();
 
         let bus = EventBus::new(256);
-        let mut rx = bus.subscribe();
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_MAIN),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
@@ -18115,16 +18424,12 @@ mod tests {
         registry.attach_configs_for_test(
             std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
         );
-        // Implement-stage coder writes a real artifact; the reviewer passes
-        // (so the run's Partial status comes from the validation failure, not
-        // an unresolved review). NO validate-stage agent is registered.
+        // A real implement-stage agent writes a substantive artifact. No
+        // reviewer, no validator, no eval engine: the implementation work
+        // completes cleanly and the run would otherwise claim Completed.
         registry.register(Arc::new(DiskCoder::new(
             vec!["// real implementation\npub fn main() {}\n".into()],
             "// real implementation\npub fn main() {}\n".into(),
-        )));
-        registry.register(Arc::new(MockExpertAgent::always_succeed(
-            AgentId::new("reviewer"),
-            "approved",
         )));
         let mut coordinator = coordinator_with_grounded_turns(
             bus.clone(),
@@ -18134,12 +18439,10 @@ mod tests {
                     call_specialist("architect", "design it"),
                     call_specialist("coder", "implement"),
                 ]),
-                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             &["src/main.rs"],
-        )
-        .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
+        );
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -18149,45 +18452,30 @@ mod tests {
             .run(task, context, CancellationToken::new(), None)
             .await
             .expect("coordinator run should succeed");
-        let events = {
-            let mut collected = Vec::new();
-            while let Ok(event) = rx.try_recv() {
-                collected.push(event.kind.clone());
-            }
-            collected
-        };
 
-        assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
-            "the coordinator self-verify must publish a ValidationCycleStarted event"
-        );
-        assert!(
-            output
-                .final_message
-                .contains("Acceptance rejected: coordinator self-verification failed"),
-            "unexpected final message: {}",
-            output.final_message
-        );
+        // The C-06 gate: implement-stage work with no declared verification
+        // evidence must not claim full completion.
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
-            "a failing self-verification must not complete the build task"
-        );
-        let decisions = acceptance_decisions(&output);
-        assert!(
-            !decisions.is_empty(),
-            "at least one acceptance decision expected on the self-verify reject path"
+            "a completed-but-unverified build task must exit Partial: {}",
+            output.final_message
         );
         assert!(
-            decisions.iter().all(|action| action.kind == "rejected"),
-            "every acceptance decision on the reject path must be a rejection, got: {decisions:?}"
+            output.final_message.contains("Acceptance gate C-06"),
+            "the C-06 no-evidence note must be present: {}",
+            output.final_message
         );
-        let evidence = decisions[0].evidence.as_ref().expect("acceptance entry carries evidence");
         assert!(
-            !evidence.verification_passed,
-            "self-verification ran but did not pass, so verification_passed must be false"
+            !output.final_message.contains("Acceptance rejected"),
+            "no artifact rejection occurred here: {}",
+            output.final_message
         );
-        assert!(evidence.artifacts.is_empty(), "a rejected run records no verified artifacts");
+        // No validation ever ran and no acceptance decision was recorded.
+        assert!(
+            acceptance_decisions(&output).is_empty(),
+            "no verification evidence means no acceptance decision"
+        );
     }
 
     /// A NON-build task (no implement-stage work) with no validation-stage
@@ -18335,6 +18623,10 @@ mod tests {
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 vec![
                     CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
                     CoordinatorTurn::Text("approved plan executed".into()),
                 ],
             )
@@ -18483,6 +18775,10 @@ mod tests {
                         None,
                         &[plan_event_id.as_str()],
                     )]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
                     CoordinatorTurn::Text("resumed build finished".into()),
                 ],
                 &["src/main.rs"],
@@ -18534,9 +18830,11 @@ mod tests {
                     && event.payload.get("selected_agent").is_some()
             })
             .collect();
-        assert_eq!(decisions.len(), 1, "one recorded dispatch decision: {decisions:?}");
-        let decision = decisions[0];
+        assert_eq!(decisions.len(), 2, "two recorded dispatch decisions: {decisions:?}");
+        let decision = &decisions[0];
         assert_eq!(decision.payload["selected_agent"], "coder");
+        let validation_decision = &decisions[1];
+        assert_eq!(validation_decision.payload["selected_agent"], "validator");
         assert!(
             decision.payload["supporting_evidence_ids"]
                 .as_array()
@@ -18797,6 +19095,7 @@ mod tests {
                     call_specialist("architect", "design it"),
                     call_specialist("coder", "implement"),
                 ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             dir.path(),
@@ -19656,6 +19955,7 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
                 .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let mut registry = AgentRegistry::from_mocks(mocks);
         registry.attach_configs_for_test(
@@ -19672,6 +19972,7 @@ mod tests {
                     call_specialist("coder", "implement"),
                 ]),
                 CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             dir.path(),
@@ -19774,6 +20075,7 @@ mod tests {
                     call_specialist("architect", "design it"),
                     call_specialist("coder", "implement"),
                 ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("done".into()),
             ],
             dir.path(),
@@ -19975,6 +20277,10 @@ mod tests {
                 vec![
                     CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
                     CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
                     CoordinatorTurn::Text("done".into()),
                 ],
                 &["src/main.rs"],
@@ -20027,11 +20333,12 @@ mod tests {
             .collect();
         assert_eq!(
             dispatch_decisions.len(),
-            2,
-            "both Coordinator dispatches are recorded as Decisions: {dispatch_decisions:?}"
+            3,
+            "all three Coordinator dispatches are recorded as Decisions: {dispatch_decisions:?}"
         );
         assert_eq!(dispatch_decisions[0].payload["selected_agent"], "architect");
         assert_eq!(dispatch_decisions[1].payload["selected_agent"], "coder");
+        assert_eq!(dispatch_decisions[2].payload["selected_agent"], "validator");
         assert!(
             logged.iter().any(|event| event.kind == WhiteboardKind::DesignDoc),
             "the DesignDoc claim event landed on the log"
@@ -20415,6 +20722,8 @@ mod tests {
                 "task_id": task_id,
                 "children": children,
             }),
+
+            ..Default::default()
         }
     }
 
@@ -20888,6 +21197,8 @@ mod tests {
                             "task": "implement",
                             "expected_artifacts": ["../../etc/passwd"],
                         }),
+
+                        ..Default::default()
                     }]),
                     CoordinatorTurn::Text("after the rejection".into()),
                 ],
@@ -21354,6 +21665,7 @@ mod tests {
             Arc::new(AgentRegistry::from_mocks(mocks)),
             vec![
                 CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
                 CoordinatorTurn::Text("resumed build finished".into()),
             ],
         );
@@ -21369,12 +21681,62 @@ mod tests {
             "the resumed build completes: {}",
             output.final_message
         );
-        // Exactly TWO model turns: the dispatch turn and the final summary.
+        // Exactly THREE model turns: the two dispatch turns and the final summary.
         // A planner re-entry would add provider calls and desync the script.
         assert_eq!(
             provider.turn_count(),
-            2,
+            3,
             "the resume runs the decision loop only — no planner re-entry"
+        );
+    }
+
+    /// ADR-35 amendment (2026-09-16): when the Coordinator calls the
+    /// `request_user_input` tool, the run ends with `AwaitingUser` — it is
+    /// NOT Completed and NOT Partial, and the preserved checkpoint lets a
+    /// later resume continue exactly where the user response is awaited.
+    #[tokio::test]
+    async fn request_user_input_returns_awaiting_user() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        // Empty registry: nothing may be dispatched — the single tool call
+        // is the whole run.
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Calls(vec![ToolCall {
+                id: "call-user-1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL.to_string(),
+                arguments: serde_json::json!({ "reason": "confirm the module boundary" }),
+
+                ..Default::default()
+            }])],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "clarify before building");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the async-awaiting run returns Ok");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "the run must stop in AwaitingUser, not complete: {:?}",
+            output.completion_status
+        );
+        assert!(
+            output.final_message.contains("confirm the module boundary"),
+            "the awaited reason must surface in the final message: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "an AwaitingUser run must carry a checkpoint so a resume can continue"
         );
     }
 
@@ -21398,6 +21760,8 @@ mod tests {
                     id: "call-draft".to_string(),
                     name: DRAFT_PLAN_TOOL.to_string(),
                     arguments: serde_json::json!({}),
+
+                    ..Default::default()
                 }]),
                 CoordinatorTurn::Text("I considered the draft; dispatching nothing yet".into()),
             ],
@@ -22274,6 +22638,8 @@ mod tests {
                 "task": task,
                 "expected_artifacts": artifacts,
             }),
+
+            ..Default::default()
         }
     }
 

@@ -3031,6 +3031,8 @@ mod tests {
                 id: "always".into(),
                 name: self.name.into(),
                 arguments: serde_json::json!({ "text": "loop" }),
+
+                ..Default::default()
             };
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
                 reasoning: None,
@@ -3213,6 +3215,8 @@ mod tests {
             id: "call_1".into(),
             name: name.into(),
             arguments: serde_json::json!({"text": text}),
+
+            ..Default::default()
         }
     }
 
@@ -3931,6 +3935,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "write", "path": "src/main.rs" }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -3959,6 +3965,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "read", "path": "src/main.rs" }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4046,6 +4054,8 @@ mod tests {
                 "path": "hello.py",
                 "content": "print('hello from disk')\n"
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4374,6 +4384,8 @@ mod tests {
                 "path": "native.txt",
                 "content": "native path"
             }),
+
+            ..Default::default()
         };
         // provider_name "scripted" resolves to the provider default (native
         // tools), so no fallback engagement — even though the usage model
@@ -4410,6 +4422,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
         };
         let write_tc = ToolCall {
             id: "call_2".into(),
@@ -4419,6 +4433,8 @@ mod tests {
                 "path": "note.md",
                 "content": "# updated\n",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![read_tc], vec![write_tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4499,6 +4515,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
         };
         // Call 2 re-reads the identical path. The first read executed and
         // cached; the second must be served without reaching the executor.
@@ -4592,6 +4610,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
         };
         let calls = vec![vec![read_tc.clone()], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4670,6 +4690,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
         };
         let write_tc = ToolCall {
             id: "call_2".into(),
@@ -4679,6 +4701,8 @@ mod tests {
                 "path": "note.md",
                 "content": "# updated\n",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![read_tc.clone()], vec![write_tc], vec![read_tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4758,6 +4782,8 @@ mod tests {
                 "path": "src/main.rs",
                 "content": "fn main() {}",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4789,6 +4815,8 @@ mod tests {
                 "operation": "write",
                 "path": "some/deep/path.rs",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4822,6 +4850,8 @@ mod tests {
                 "operation": "write",
                 "path": "output.txt",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -4867,6 +4897,8 @@ mod tests {
                 "path": "hello.py",
                 "content": "print('hello')\n",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -5147,6 +5179,8 @@ mod tests {
                 "path": "output.txt",
                 "content": "exactly-once payload\n",
             }),
+
+            ..Default::default()
         };
         let provider = Arc::new(CountingScriptedProvider::new(vec![
             Ok(vec![CompletionChunk {
@@ -5531,6 +5565,8 @@ mod tests {
             id: "call_null".into(),
             name: "filesystem".into(),
             arguments: serde_json::Value::Null,
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
@@ -5596,7 +5632,8 @@ mod tests {
                 r#"{"operation": "WRITE", "path": "guarded.txt", "content": "hi", "rationale": "because"}"#
                     .into(),
             ),
-        };
+
+        ..Default::default()};
         loop_
             .execute_single_tool_call(
                 &tc,
@@ -5643,6 +5680,8 @@ mod tests {
             name: "filesystem".into(),
             // Partial args (unknown key only): retries apply.
             arguments: serde_json::json!({"bogus": 1}),
+
+            ..Default::default()
         };
         for _ in 0..3 {
             loop_
@@ -5690,6 +5729,8 @@ mod tests {
             id: "call_empty".into(),
             name: "filesystem".into(),
             arguments: serde_json::Value::Null,
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
@@ -5735,6 +5776,8 @@ mod tests {
             id: "call_infer_read".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "path": "existing.txt" }),
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
@@ -5785,6 +5828,8 @@ mod tests {
             id: "call_infer_write".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "path": "inferred.txt", "content": "hi" }),
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
@@ -5841,6 +5886,8 @@ mod tests {
             id: "call_infer_cmd".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "cmd": "echo guard-heuristic-ok" }),
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
@@ -5900,6 +5947,8 @@ mod tests {
             id: "call_text_extract".into(),
             name: "filesystem".into(),
             arguments: serde_json::Value::Null,
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
@@ -6067,6 +6116,8 @@ mod tests {
             id: "call_fail".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": "false", "args": [] }),
+
+            ..Default::default()
         };
 
         // Three rounds against the SAME tool-call id: two repairs, then the
@@ -6132,6 +6183,8 @@ mod tests {
             id: "call_denied".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": "rm -rf /", "args": [] }),
+
+            ..Default::default()
         };
 
         // Repeat: even across rounds a denial never earns a repair turn.
@@ -6178,6 +6231,8 @@ mod tests {
             id: "call_ok".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": "true", "args": [] }),
+
+            ..Default::default()
         };
 
         loop_
@@ -6227,6 +6282,8 @@ mod tests {
             id: "call_cancelled".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": "slow", "args": [] }),
+
+            ..Default::default()
         };
 
         loop_
@@ -6266,6 +6323,8 @@ mod tests {
             id: "call_timeout".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": "long-build", "args": [] }),
+
+            ..Default::default()
         };
 
         loop_
@@ -6309,6 +6368,8 @@ mod tests {
             id: "call_spawn".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": "fruitloop", "args": ["--help"] }),
+
+            ..Default::default()
         };
 
         loop_
@@ -6348,6 +6409,8 @@ mod tests {
             id: "call_caps".into(),
             name: "shell".into(),
             arguments: serde_json::json!({ "command": long_command, "args": [] }),
+
+            ..Default::default()
         };
 
         loop_
@@ -6463,6 +6526,8 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({"text": "hi"}),
+
+                ..Default::default()
             }],
             Some(CompletionUsage { prompt_tokens: Some(100), completion_tokens: Some(20) }),
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
@@ -6500,6 +6565,8 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({}),
+
+                ..Default::default()
             }],
             None,
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
@@ -6611,6 +6678,8 @@ mod tests {
             id: "call_norm".into(),
             name: "fs_write".into(),
             arguments: serde_json::json!({ "path": "Cargo.toml", "content": "hi" }),
+
+            ..Default::default()
         };
         loop_
             .execute_single_tool_call(
