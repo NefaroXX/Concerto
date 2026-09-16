@@ -3003,6 +3003,8 @@ mod tests {
                     id: "call_1".into(),
                     name: "write_file".into(),
                     arguments: serde_json::json!({"operation": "write", "path": "src/a.rs"}),
+
+                    ..Default::default()
                 }),
                 is_final: true,
                 usage: None,
@@ -3177,6 +3179,8 @@ mod tests {
                         id: "call_1".into(),
                         name: "write_file".into(),
                         arguments: serde_json::json!({"operation": "write", "path": "src/a.rs"}),
+
+                        ..Default::default()
                     }),
                     is_final: true,
                     usage: None,
@@ -3306,7 +3310,12 @@ mod tests {
         CompletionChunk {
             reasoning: None,
             delta: String::new(),
-            tool_call: Some(ToolCall { id: id.into(), name: tool.into(), arguments }),
+            tool_call: Some(ToolCall {
+                id: id.into(),
+                name: tool.into(),
+                arguments,
+                ..Default::default()
+            }),
             is_final: true,
             usage: None,
         }
@@ -3710,6 +3719,8 @@ mod tests {
                     id: "call_loop".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "operation": "read", "path": "src/auth.rs" }),
+
+                    ..Default::default()
                 }),
                 is_final: true,
                 usage: None,
@@ -4744,7 +4755,12 @@ mod tests {
         CompletionChunk {
             reasoning: None,
             delta: String::new(),
-            tool_call: Some(ToolCall { id: id.into(), name: "filesystem".into(), arguments }),
+            tool_call: Some(ToolCall {
+                id: id.into(),
+                name: "filesystem".into(),
+                arguments,
+                ..Default::default()
+            }),
             is_final: true,
             usage: None,
         }
@@ -4848,6 +4864,8 @@ mod tests {
                     id: "call_1".into(),
                     name: "filesystem".into(),
                     arguments: serde_json::Value::Null,
+
+                    ..Default::default()
                 }),
                 is_final: true,
                 usage: None,

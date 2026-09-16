@@ -12546,6 +12546,8 @@ mod tests {
                 }
                 arguments
             },
+
+            ..Default::default()
         }
     }
 
@@ -12583,6 +12585,8 @@ mod tests {
                 }
                 arguments
             },
+
+            ..Default::default()
         }
     }
 
@@ -12593,6 +12597,8 @@ mod tests {
             id: format!("read-{path}"),
             name: "filesystem".to_string(),
             arguments: serde_json::json!({ "operation": "read", "path": path }),
+
+            ..Default::default()
         }
     }
 
@@ -12630,6 +12636,8 @@ mod tests {
             id: "inv-batch".to_string(),
             name: INVESTIGATE_HYPOTHESES_TOOL.to_string(),
             arguments: serde_json::json!({ "hypotheses": specs }),
+
+            ..Default::default()
         }
     }
 
@@ -13178,6 +13186,8 @@ mod tests {
             id: format!("write-{path}"),
             name: "test_write_file".to_string(),
             arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
         }
     }
 
@@ -13321,6 +13331,8 @@ mod tests {
                     "path": "injected.rs",
                     "content": "// pwned",
                 }),
+
+                ..Default::default()
             }]),
             CoordinatorTurn::Text("I could not write; here is my advisory answer.".into()),
             CoordinatorTurn::Text("done".into()),
@@ -13880,6 +13892,8 @@ mod tests {
                     "path": "injected.rs",
                     "content": "// pwned",
                 }),
+
+                ..Default::default()
             }]),
             // Whichever consultant popped the write still settles in prose,
             // then the other conclusion, then the coordinator.
@@ -20708,6 +20722,8 @@ mod tests {
                 "task_id": task_id,
                 "children": children,
             }),
+
+            ..Default::default()
         }
     }
 
@@ -21181,6 +21197,8 @@ mod tests {
                             "task": "implement",
                             "expected_artifacts": ["../../etc/passwd"],
                         }),
+
+                        ..Default::default()
                     }]),
                     CoordinatorTurn::Text("after the rejection".into()),
                 ],
@@ -21689,6 +21707,8 @@ mod tests {
                 id: "call-user-1".to_string(),
                 name: REQUEST_USER_INPUT_TOOL.to_string(),
                 arguments: serde_json::json!({ "reason": "confirm the module boundary" }),
+
+                ..Default::default()
             }])],
             dir.path(),
         )
@@ -21740,6 +21760,8 @@ mod tests {
                     id: "call-draft".to_string(),
                     name: DRAFT_PLAN_TOOL.to_string(),
                     arguments: serde_json::json!({}),
+
+                    ..Default::default()
                 }]),
                 CoordinatorTurn::Text("I considered the draft; dispatching nothing yet".into()),
             ],
@@ -22616,6 +22638,8 @@ mod tests {
                 "task": task,
                 "expected_artifacts": artifacts,
             }),
+
+            ..Default::default()
         }
     }
 

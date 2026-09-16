@@ -7560,6 +7560,8 @@ mod runtime_runner_tests {
             id: "call_1".into(),
             name: name.into(),
             arguments: serde_json::json!({"text": text}),
+
+            ..Default::default()
         }
     }
 

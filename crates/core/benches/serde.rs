@@ -28,6 +28,8 @@ fn build_messages(n: usize) -> Vec<Message> {
                             id: format!("call_{i}_1"),
                             name: "read_file".into(),
                             arguments: serde_json::json!({"path": format!("/path/to/file_{i}.rs")}),
+
+                            ..Default::default()
                         },
                         ToolCall {
                             id: format!("call_{i}_2"),
@@ -36,6 +38,8 @@ fn build_messages(n: usize) -> Vec<Message> {
                                 "path": format!("/path/to/output_{i}.rs"),
                                 "content": "fn main() { println!(\"hello\"); }"
                             }),
+
+                            ..Default::default()
                         },
                     ])
                 } else {
@@ -122,6 +126,8 @@ fn bench_serde(c: &mut Criterion) {
             id: "call_abc".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "src/main.rs"}),
+
+            ..Default::default()
         }]),
         tool_results: None,
         reasoning_content: None,
@@ -207,6 +213,8 @@ fn bench_serde(c: &mut Criterion) {
         id: "call_def456".into(),
         name: "edit_file".into(),
         arguments: serde_json::json!({"path": "src/main.rs", "content": "fn main() { println!(\"updated\"); }"}),
+
+        ..Default::default()
     };
     group.bench_function("serialize/single_tool_call", |b| {
         b.iter(|| serde_json::to_string(black_box(&tc)).unwrap());

@@ -50,11 +50,24 @@ pub struct CompletionRequest {
     pub stream: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Provider-specific opaque state that must be echoed back verbatim when
+    /// this tool call is replayed on a later request.
+    ///
+    /// Gemini 3.x models (and sometimes 2.5 under thinking) attach a
+    /// `thought_signature` to each `functionCall` part; Google's API requires
+    /// the client to replay that part exactly on the next request that re-sends
+    /// the call, or it fails with `400 INVALID_ARGUMENT` (`Function call is
+    /// missing a thought_signature`). `None` for every provider that does not
+    /// emit one. `#[serde(default)]` keeps old persisted JSON (without this
+    /// field) deserializable; `skip_serializing_if` keeps the serialized wire
+    /// shape of a `None`-carrying call byte-identical to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2080,11 +2093,52 @@ mod tests {
             id: "call_1".into(),
             name: "test_tool".into(),
             arguments: serde_json::json!({"input": "hello"}),
+
+            ..Default::default()
         };
         let json = serde_json::to_value(&tc).unwrap();
         let back: ToolCall = serde_json::from_value(json).unwrap();
         assert_eq!(back.id, "call_1");
         assert_eq!(back.name, "test_tool");
+    }
+
+    /// Legacy persisted `ToolCall` JSON (from before the `thought_signature`
+    /// field existed) still deserializes: `#[serde(default)]` fills `None`.
+    #[test]
+    fn tool_call_legacy_json_deserializes() {
+        let json = r#"{"id":"call_1","name":"test_tool","arguments":{"input":"hello"}}"#;
+        let tc: ToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.name, "test_tool");
+        assert_eq!(tc.thought_signature, None);
+    }
+
+    /// `thought_signature` round-trips when present and is omitted from the
+    /// serialized value when `None` (`skip_serializing_if` keeps the wire
+    /// shape of signature-less calls identical to legacy output).
+    #[test]
+    fn tool_call_thought_signature_roundtrip_and_omit() {
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "test_tool".into(),
+            arguments: serde_json::json!({"input": "hello"}),
+            thought_signature: Some("sig-9f2a".into()),
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(json["thought_signature"], "sig-9f2a");
+        let back: ToolCall = serde_json::from_value(json).unwrap();
+        assert_eq!(back.thought_signature.as_deref(), Some("sig-9f2a"));
+
+        let none = ToolCall {
+            id: "call_1".into(),
+            name: "test_tool".into(),
+            arguments: serde_json::json!({"input": "hello"}),
+            ..Default::default()
+        };
+        assert!(
+            serde_json::to_value(&none).unwrap().get("thought_signature").is_none(),
+            "None must serialize without the thought_signature key"
+        );
     }
 
     #[test]

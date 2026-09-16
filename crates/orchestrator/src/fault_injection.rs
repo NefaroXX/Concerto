@@ -212,6 +212,8 @@ fn dispatch_call(agent_id: &str, task: &str) -> ToolCall {
         id: format!("call-{agent_id}-{task}"),
         name: CALL_SPECIALIST_TOOL.to_owned(),
         arguments: serde_json::json!({ "agent_id": agent_id, "task": task }),
+
+        ..Default::default()
     }
 }
 

@@ -78,6 +78,37 @@ fn function_call_args(fc: &serde_json::Value) -> serde_json::Value {
     )
 }
 
+/// Parse one Gemini `functionCall` part into a canonical [`ToolCall`].
+///
+/// Gemini provides no unique call IDs, so `counter` mints sequential `gc_<n>`
+/// ids for the stream. When the loose tool-schema tier was active for the
+/// stream, `unflatten` re-nests dot-notation arguments back into the tools'
+/// original nested shape (see [`crate::adapters::schema_loose`]).
+///
+/// The opaque `thought_signature` the model attached to the part is preserved
+/// verbatim: Google's API requires it to be replayed on the next request that
+/// re-sends this function call, or the request 400s (see
+/// [`crate::adapters::google`]).
+fn parse_function_call_part(
+    fc: &serde_json::Value,
+    counter: &mut u64,
+    unflatten: bool,
+) -> ToolCall {
+    let name = fc
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut args = function_call_args(fc);
+    if unflatten {
+        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+    }
+    *counter += 1;
+    let id = format!("gc_{counter}");
+    let thought_signature = fc.get("thought_signature").and_then(|v| v.as_str()).map(str::to_owned);
+    ToolCall { id, name, arguments: args, thought_signature }
+}
+
 #[async_trait]
 impl LlmProvider for GoogleProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
@@ -263,35 +294,20 @@ impl LlmProvider for GoogleProvider {
                                                         }));
                                                     }
                                                     if let Some(fc) = part.get("functionCall") {
-                                                        // Gemini emits function calls inline in parts.
-                                                        // Parse the name and args into a ToolCall chunk.
-                                                        let name = fc
-                                                            .get("name")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("unknown");
-                                                        let mut args = function_call_args(fc);
-                                                        // Adaptive tool schemas: re-nest
-                                                        // dot-notation arguments from
-                                                        // loose-schema streams before the
-                                                        // executor or the tool-call guard
-                                                        // validates against the nested
-                                                        // schema.
-                                                        if tool_adapted {
-                                                            crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
-                                                        }
-                                                        // Gemini does not provide a unique call ID,
-                                                        // so we generate sequential IDs per stream.
-                                                        fc_counter += 1;
-                                                        let id =
-                                                            format!("gc_{}", fc_counter);
+                                                        // Gemini emits function calls inline in
+                                                        // parts. Parse the name, args, and the
+                                                        // opaque `thought_signature` (replayed
+                                                        // verbatim by the dialect) into a
+                                                        // ToolCall chunk.
+                                                        let tc = parse_function_call_part(
+                                                            fc,
+                                                            &mut fc_counter,
+                                                            tool_adapted,
+                                                        );
                                                         items.push(Ok(CompletionChunk {
                                                             reasoning: None,
                                                             delta: String::new(),
-                                                            tool_call: Some(ToolCall {
-                                                                id,
-                                                                name: name.to_string(),
-                                                                arguments: args,
-                                                            }),
+                                                            tool_call: Some(tc),
                                                             is_final: false, usage: None,
                                                         }));
                                                     }
@@ -464,6 +480,26 @@ mod tests {
         // Well-formed object args -> unchanged.
         let fc = serde_json::json!({"name": "shell", "args": {"command": "ls"}});
         assert_eq!(function_call_args(&fc), serde_json::json!({"command": "ls"}));
+    }
+
+    /// Gemini 3.x `functionCall` parts carry an opaque `thought_signature`
+    /// that must be preserved for replay on the next request; the parsed
+    /// canonical tool call keeps it (and leaves it `None` when absent).
+    #[test]
+    fn function_call_part_preserves_thought_signature() {
+        let mut counter = 0u64;
+        let fc = serde_json::json!({"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-9f2a"});
+        let tc = parse_function_call_part(&fc, &mut counter, false);
+        assert_eq!(tc.name, "shell");
+        assert_eq!(tc.arguments, serde_json::json!({"command": "ls"}));
+        assert_eq!(tc.thought_signature.as_deref(), Some("sig-9f2a"));
+        assert_eq!(tc.id, "gc_1", "sequential stream id minted once");
+
+        // A part without a signature parses to `None` — no replay key emitted.
+        let plain = serde_json::json!({"name": "shell", "args": {"command": "ls"}});
+        let tc = parse_function_call_part(&plain, &mut counter, false);
+        assert_eq!(tc.thought_signature, None);
+        assert_eq!(tc.id, "gc_2", "counter advances across parts");
     }
 
     /// ADR-66 §4 family: the loose tier flattens nested properties for the

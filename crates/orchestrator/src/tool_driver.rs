@@ -197,7 +197,7 @@ impl TextToolDriver {
             }
             let id = format!("td_{}", self.next_id);
             self.next_id += 1;
-            tool_calls.push(ToolCall { id, name, arguments });
+            tool_calls.push(ToolCall { id, name, arguments, ..Default::default() });
         }
         DriverTurn::ToolCalls(tool_calls)
     }
