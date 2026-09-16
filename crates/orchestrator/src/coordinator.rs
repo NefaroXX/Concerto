@@ -11858,6 +11858,25 @@ impl CoordinatorAgent {
             prompt.push_str(&self.environment_card);
             prompt.push_str("\n\n");
         }
+        // ── Dispatch budget advisory (ADR-35 amendment 2026-09-16 §6) ────
+        // The run-wide dispatch ceiling (ADR-52 `max_total_iterations`) is
+        // the Coordinator's hard budget. Publishing it up front lets the
+        // model decide early whether to invoke `request_user_input` for
+        // operator guidance instead of spending its remaining specialist
+        // calls on low-confidence work. Emitted only while dispatching and
+        // only when a ceiling is configured.
+        if dispatching {
+            if let Some(cap) = self.max_total_iterations {
+                let used = self.model_dispatch_count.min(cap);
+                let remaining = cap - used;
+                prompt.push_str(&format!(
+                    "<dispatch_budget>\nRun-wide ceiling: {cap} specialist calls; {used} used, \
+                     {remaining} remaining. Budget them — prefer request_user_input when the \
+                     path ahead is low-confidence rather than spending the remaining calls on \
+                     speculative work.\n</dispatch_budget>\n\n"
+                ));
+            }
+        }
         prompt.push_str(&format!("Objective: {}\n", task.description));
         // Issue #56: the Coordinator's decisions consume the structured
         // world model — a bounded rendered block rides every dispatch-
