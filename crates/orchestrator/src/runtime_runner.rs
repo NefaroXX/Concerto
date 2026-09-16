@@ -3829,6 +3829,10 @@ async fn run_multi_agent(
         // writer's per-call `generation` comes from `AgentContext` instead of
         // being baked here.
         gate_log_pool.clone(),
+        // Custom-ai-shell plan (Phase C): the resolved shell profile drives
+        // the validator's eval engine (build/validation commands), matching
+        // the single-agent and coordinator eval-engine paths.
+        services.config.resolved_shell_settings().selected_profile().cloned(),
     ));
     // The feed task below resolves implement-stage roles from the registry,
     // so keep a clone before `registry` moves into the coordinator.
@@ -8364,6 +8368,7 @@ mod runtime_runner_tests {
             "",
             true,
             None, // no fact-writer pool in this test
+            None, // no shell profile in this test
         );
 
         let task_id = TaskId::new();
