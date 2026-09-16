@@ -6395,28 +6395,6 @@ impl CoordinatorAgent {
             }
         }
 
-        // ── 3. Run validation suite ──────────────────────────────────────
-        // C-06: acceptance of a run that contained implement-stage work is
-        // coordinator-owned; the validation loop needs to know whether this
-        // was a build task so it can enforce artifact + verification
-        // evidence.
-        let build_task = graph.all_tasks().iter().any(|subtask| {
-            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
-        });
-        let validation_result = self
-            .run_validation_loop(&task, &context, &cancel, build_task, &mut action_ledger)
-            .await?;
-        total_cost += validation_result.cost_usd;
-        total_tool_calls += validation_result.tool_call_count;
-        all_files.extend(validation_result.files_modified.clone());
-        let settled = metrics_from_result(&validation_result);
-        provider_metrics.push(settled.clone());
-        self.settled_metrics.push(settled);
-        if !matches!(validation_result.outcome, AgentOutcome::Success) {
-            recoverable_notes
-                .push(format!("Validation remains unresolved: {}", validation_result.summary));
-        }
-
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
@@ -7323,6 +7301,14 @@ impl CoordinatorAgent {
     /// those runs acceptance is coordinator-owned (audit C-06) and requires
     /// artifact + verification evidence (see [`Self::acceptance_rejection`]).
     /// `action_ledger` records the acceptance decision for the checkpoint.
+    ///
+    /// ADR-35 amendment (2026-09-16 §2): validation is now a Coordinator
+    /// DECISION (`call_specialist` to the acceptance-stage agent), not an
+    /// automatic post-graph pipeline gate, so no call site remains in
+    /// `execute_graph`. The method is retained (unused) for the Coordinator
+    /// self-validation/resumption paths that follow; removing it would delete
+    /// a deliberate, resumable capability.
+    #[allow(dead_code)]
     async fn run_validation_loop(
         &mut self,
         task: &AgentTask,
