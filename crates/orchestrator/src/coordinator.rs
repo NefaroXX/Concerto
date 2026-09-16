@@ -5884,36 +5884,6 @@ impl CoordinatorAgent {
                                     last_error: zero_file_error,
                                 });
                             continue;
-                        } else if implement_phase {
-                            // Any implement-stage agent's success triggers the
-                            // review cycle (ADR-35 §5), not just the built-in
-                            // Coder.
-                            let review_context = context.clone();
-                            let desc_for_review = desc.clone();
-                            let review_result = self
-                                .run_review_cycle(
-                                    &mut graph,
-                                    task_id,
-                                    desc_for_review,
-                                    sid,
-                                    &result,
-                                    &review_context,
-                                    task.clone(),
-                                    &cancel,
-                                )
-                                .await?;
-                            total_cost += review_result.cost_usd;
-                            total_tool_calls += review_result.tool_call_count;
-                            all_files.extend(review_result.files_modified.clone());
-                            let settled = metrics_from_result(&review_result);
-                            provider_metrics.push(settled.clone());
-                            self.settled_metrics.push(settled);
-                            if !matches!(review_result.outcome, AgentOutcome::Success) {
-                                recoverable_notes.push(format!(
-                                    "Review remains unresolved: {}",
-                                    review_result.summary
-                                ));
-                            }
                         }
                     }
                     AgentOutcome::NeedsRevision { reason } => {
@@ -6727,6 +6697,14 @@ impl CoordinatorAgent {
     /// running a duplicate second review. Costs spent by the crashed attempt
     /// are gone with it (only verdicts are durable) and are honestly absent
     /// from the resumed run's totals.
+    ///
+    /// ADR-35 amendment (2026-09-16 §2): review is now a Coordinator
+    /// DECISION (`call_specialist` to the review-stage agent), not an
+    /// automatic post-implement pipeline gate, so no call site remains in
+    /// `execute_graph`. The method is retained (unused) for the Coordinator
+    /// self-review/resumption paths that follow; removing it would delete a
+    /// deliberate, resumable capability.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     async fn run_review_cycle(
         &mut self,
