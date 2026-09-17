@@ -37,6 +37,7 @@ use concerto_orchestrator::runtime_runner::{
     init_memory_system, memory_enabled, run_shared_agent, ActiveMemoryServices,
 };
 use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
+use concerto_plugins::manager::SharedPluginManager;
 use concerto_providers::factory::ProviderFactory;
 use concerto_providers::provider_defs::{
     model_options_for, provider_definition, provider_readiness,
@@ -186,6 +187,10 @@ pub enum Message {
     GitSummaryLoaded(Option<concerto_tools::git::RepositorySummary>),
     /// Result of a manual memory re-index (triggered from the Memory view).
     ReindexResult(ReindexResult),
+    /// Result of a post-SaveSettings plugin re-discovery pass against the
+    /// retained plugin manager (log-only today; kept as a message so the task
+    /// can later surface per-plugin outcomes without changing the wiring).
+    PluginProvidersRefreshed,
     MemoryEntriesLoaded(Result<Vec<views::memory::MemoryRow>, String>),
     MemoryEntryDeleted {
         id: String,
@@ -290,6 +295,12 @@ pub struct App {
     /// Project-scoped memory services (store, indexer, sync, cancel).
     /// Switched when the active project changes.
     pub memory_services: Arc<Mutex<Option<ActiveMemoryServices>>>,
+    /// Process-lifetime WASM plugin-manager handle (plugin liveness). Passed
+    /// to every run's `ServicesBuilder` and shared with the Settings state so
+    /// the revoke and provider re-refresh paths act on the same plugin
+    /// instances a running agent uses. The manager itself is materialised on
+    /// the first agent run (its epoch ticker needs a tokio runtime context).
+    pub plugin_manager: SharedPluginManager,
     pub cancel_token: concerto_core::CancellationToken,
     pub run_status: RunStatus,
     /// Current intent-router stage of the active run (ADR-55 Phase 2a),
@@ -756,6 +767,10 @@ impl App {
             .map(|settings| settings.default_enabled)
             .unwrap_or(false);
         let initial_session_cap = initial_config.session_spend_cap_usd;
+        // Process-lifetime plugin-manager handle: shared with the Settings
+        // state (revoke) and passed to every run's ServicesBuilder (liveness).
+        // The inner manager is materialised on the first agent run.
+        let plugin_manager = concerto_plugins::manager::new_shared_plugin_manager();
         let mut app = Self {
             page: Page::Chat,
             current_theme: theme,
@@ -766,7 +781,9 @@ impl App {
             tool_log: views::tool_log::State::new(),
             settings: {
                 let cfg = global_config.clone();
-                views::settings::State::from_config(&cfg)
+                let mut state = views::settings::State::from_config(&cfg);
+                state.with_plugin_manager(plugin_manager.clone());
+                state
             },
             agent_graph: views::agent_graph::State::new(),
             terminal: {
@@ -788,6 +805,7 @@ impl App {
             config: Some(initial_config),
             global_config,
             memory_services: Arc::new(Mutex::new(None)),
+            plugin_manager,
             cancel_token: CancellationToken::new(),
             run_status: RunStatus::Idle,
             run_stage: None,
@@ -1298,6 +1316,12 @@ impl App {
                 }
                 iced::Task::none()
             }
+            Message::PluginProvidersRefreshed => {
+                // Log-only outcome (the refresh task logs its own results);
+                // kept as a message so future UI feedback needs no wiring
+                // change.
+                iced::Task::none()
+            }
             Message::MemoryEntryDeleted { id, result } => {
                 match result {
                     Ok(()) => self.memory.remove_entry(&id),
@@ -1400,7 +1424,10 @@ impl App {
                     // or model-discovery results).
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
-                    task
+                    // Plugin liveness: after a save (which may have added a
+                    // provider or dropped a `.wasm` into the search path),
+                    // re-discover plugins in the retained manager. Log-only.
+                    iced::Task::batch(vec![task, self.refresh_plugin_providers()])
                 }
                 views::settings::Message::ProviderModelsRefreshed {
                     provider_id,
@@ -2247,6 +2274,7 @@ impl App {
             let bus = self.bus.clone();
             let config = cfg.clone();
             let memory = self.memory_services.clone();
+            let plugin_manager = self.plugin_manager.clone();
             let vfs = self.vfs.clone();
             let approval_sink = desktop_approval_sink(
                 self.cap_pending.clone(),
@@ -2344,6 +2372,7 @@ impl App {
                             .with_vfs(vfs)
                             .with_session_manager(handler.manager())
                             .with_memory(memory)
+                            .with_plugins(plugin_manager)
                             .build();
 
                         run_shared_agent(request, services).await
@@ -2363,6 +2392,60 @@ impl App {
             self.page = Page::Settings;
             iced::Task::none()
         }
+    }
+
+    /// Re-run WASM plugin discovery against the retained plugin manager after
+    /// a Settings save (interim "provider added" re-collect hook). A newly
+    /// dropped-in `.wasm` provider plugin becomes active in the
+    /// process-lifetime manager so the next run — and any future picker work —
+    /// sees it, without displacing already-loaded plugins. Gated on plugins
+    /// being enabled with `auto_load`, the same condition the runtime uses to
+    /// auto-approve at run time. A full `.wasm` filesystem watcher is a
+    /// documented follow-up; until then this save-time pass is the trigger.
+    fn refresh_plugin_providers(&self) -> iced::Task<Message> {
+        let Some(config) = self.config.clone() else {
+            return iced::Task::none();
+        };
+        let Some(ref plugin_cfg) = config.plugins else {
+            return iced::Task::none();
+        };
+        if !plugin_cfg.enabled || !plugin_cfg.auto_load {
+            return iced::Task::none();
+        }
+        let manager = self.plugin_manager.clone();
+        let search_paths = plugin_cfg.search_paths.clone();
+        iced::Task::perform(
+            async move {
+                let mut guard = manager.lock().await;
+                let Some(manager) = guard.as_mut().map(|(_, manager)| manager) else {
+                    // No run has materialised the manager yet; the first run
+                    // discovers any new plugin anyway.
+                    tracing::debug!("plugin refresh: manager not materialised yet — skipped");
+                    return;
+                };
+                let config = concerto_plugins::discovery::DiscoveryConfig {
+                    search_paths: search_paths.into_iter().map(std::path::PathBuf::from).collect(),
+                    bundled_path: None,
+                };
+                // Newly discovered plugins are initialised with an EMPTY grant
+                // set on purpose: host functions stay fail-closed until the
+                // next run re-initialises the plugin with its run-scoped,
+                // auto-approved grants.
+                match manager
+                    .refresh_new_plugins(config, |_| {
+                        concerto_plugins::capability::GrantedCapabilities::new()
+                    })
+                    .await
+                {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "plugin refresh: loaded newly discovered plugins");
+                    }
+                    Ok(_) => tracing::debug!("plugin refresh: no new plugins"),
+                    Err(error) => tracing::warn!(error = %error, "plugin refresh failed"),
+                }
+            },
+            |_| Message::PluginProvidersRefreshed,
+        )
     }
 
     /// Resolve the default chat model for the active provider.

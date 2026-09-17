@@ -62,6 +62,10 @@ use concerto_tools::git::GitTool;
 
 use concerto_lsp::tools::*;
 
+use concerto_plugins::capability::CapabilityManager;
+use concerto_plugins::discovery::DiscoveryConfig as PluginDiscoveryCfg;
+use concerto_plugins::host::PluginHost;
+use concerto_plugins::manager::PluginManager;
 use concerto_providers::factory::ProviderFactory;
 use concerto_providers::model_registry::ModelRegistry;
 use concerto_providers::model_selector::ModelSelector;
@@ -558,6 +562,13 @@ pub struct SharedServices {
     /// `server_state`/`servers`/`tools_for` and toggles servers via
     /// `start_server`/`stop_server`.
     pub mcp: Arc<concerto_mcp::McpManager>,
+    /// Process-lifetime WASM plugin manager (desktop-only, plugin liveness).
+    /// When `Some`, `load_and_configure_plugins` materialises it on the first
+    /// run and reuses it across runs so the Settings UI's revoke and
+    /// re-discovery paths act on the same live instances a running agent uses.
+    /// When `None` (CLI, tests, headless), a per-run manager is constructed
+    /// and dropped after each run as before.
+    pub plugins: Option<concerto_plugins::manager::SharedPluginManager>,
 }
 
 /// Simple no‑op audit logger used when no UI logging is required.
@@ -1344,44 +1355,27 @@ pub async fn init_memory_system(
     Ok(system as Arc<dyn MemoryStore>)
 }
 
-/// Load and initialise WASM plugins, registering their tools and collecting
-/// provider instances. Errors are logged silently — a missing plugin host or
-/// invalid WASM module never fails the agent run.
-async fn load_and_configure_plugins(
-    config: &AppConfig,
-    project_dir: &std::path::Path,
-    registry: &mut ToolRegistry,
-) -> HashMap<String, Arc<dyn LlmProvider>> {
-    let mut plugin_providers = HashMap::new();
-    let Some(ref plugin_cfg) = config.plugins else {
-        return plugin_providers;
-    };
-    if !plugin_cfg.enabled || !plugin_cfg.auto_load {
-        if plugin_cfg.enabled {
-            tracing::info!(
-                "WASM plugins enabled but auto_load=false — no frontend loads them automatically"
-            );
-        }
-        return plugin_providers;
-    }
-
-    use concerto_plugins::capability::{
-        CapabilityDiscriminant, CapabilityManager, GrantedCapabilities,
-    };
-    use concerto_plugins::discovery::DiscoveryConfig as PluginDiscoveryCfg;
-    use concerto_plugins::host::PluginHost;
-    use concerto_plugins::manager::PluginManager;
-
+/// Build a fresh WASM plugin host, capability store, and manager. Returns both
+/// the host and the manager (the per-candidate loader in
+/// [`load_discovered_plugins`] needs the host).
+///
+/// Starts the epoch ticker once — call this exactly once per host. Per-run
+/// tickers on the same retained engine would compound epoch increments and
+/// silently shorten the ~100 s interruption budget. The spawned ticker task
+/// runs until the tokio runtime shuts down (dropping the returned value only
+/// detaches it), matching the pre-existing lifecycle.
+fn build_plugin_manager() -> Option<(Arc<PluginHost>, PluginManager)> {
     let Ok(host) = PluginHost::new() else {
         tracing::warn!("failed to create WASM plugin host — continuing without plugins");
-        return plugin_providers;
+        return None;
     };
     let host = Arc::new(host);
 
-    // Start the epoch ticker for WASM interruption (belt-and-suspenders with fuel).
-    // This runs in the background and periodically increments the engine epoch,
-    // allowing long-running plugins to be interrupted after EPOCH_DEADLINE ticks
-    // (~EPOCH_BUDGET_SECS of wall-clock time at the configured interval).
+    // Start the epoch ticker for WASM interruption (belt-and-suspenders with
+    // fuel). This runs in the background and periodically increments the
+    // engine epoch, allowing long-running plugins to be interrupted after
+    // EPOCH_DEADLINE ticks (~EPOCH_BUDGET_SECS of wall-clock time at the
+    // configured interval).
     let _epoch_ticker = host.start_epoch_ticker(PluginHost::EPOCH_TICKER_INTERVAL_MS);
 
     let data_dir = concerto_sessions::app_data_dir()
@@ -1389,13 +1383,25 @@ async fn load_and_configure_plugins(
         .join("plugins");
     let Ok(cap_mgr) = CapabilityManager::open(&data_dir) else {
         tracing::warn!("failed to open capability store — continuing without plugins");
-        return plugin_providers;
+        return None;
     };
-    let mut manager = PluginManager::new(host.clone(), cap_mgr, None, None);
-    let search_paths: Vec<std::path::PathBuf> =
-        plugin_cfg.search_paths.iter().map(std::path::PathBuf::from).collect();
-    let disc_cfg = PluginDiscoveryCfg { search_paths, bundled_path: None };
+    Some((host.clone(), PluginManager::new(host, cap_mgr, None, None)))
+}
 
+/// Load every discovered `.wasm` into `manager` with auto-approved session
+/// grants rooted at `project_dir`, register their tools into `registry`, and
+/// collect the plugin-backed providers for this run. Never fails a run:
+/// discovery/load/init failures degrade to "no plugin providers".
+async fn load_discovered_plugins(
+    manager: &mut PluginManager,
+    host: Arc<PluginHost>,
+    disc_cfg: PluginDiscoveryCfg,
+    project_dir: &std::path::Path,
+    registry: &mut ToolRegistry,
+) -> HashMap<String, Arc<dyn LlmProvider>> {
+    use concerto_plugins::capability::{CapabilityDiscriminant, GrantedCapabilities};
+
+    let mut plugin_providers = HashMap::new();
     let Ok(candidates) = manager.discover(disc_cfg) else {
         tracing::warn!("plugin discovery failed — continuing without plugins");
         return plugin_providers;
@@ -1468,6 +1474,61 @@ async fn load_and_configure_plugins(
         ),
     }
     plugin_providers
+}
+
+/// Load and initialise WASM plugins, registering their tools and collecting
+/// provider instances. Errors are logged silently — a missing plugin host or
+/// invalid WASM module never fails the agent run.
+///
+/// When the caller passes a [`SharedPluginManager`] handle (desktop), the
+/// manager is materialised here on first use and reused across runs, matching
+/// the pattern used for the shared memory wrapper. Without a handle (CLI,
+/// tests) a per-run manager is built and dropped on return, preserving the
+/// previous behaviour.
+async fn load_and_configure_plugins(
+    config: &AppConfig,
+    project_dir: &std::path::Path,
+    registry: &mut ToolRegistry,
+    plugins: Option<&concerto_plugins::manager::SharedPluginManager>,
+) -> HashMap<String, Arc<dyn LlmProvider>> {
+    let plugin_providers = HashMap::new();
+    let Some(ref plugin_cfg) = config.plugins else {
+        return plugin_providers;
+    };
+    if !plugin_cfg.enabled || !plugin_cfg.auto_load {
+        if plugin_cfg.enabled {
+            tracing::info!(
+                "WASM plugins enabled but auto_load=false — no frontend loads them automatically"
+            );
+        }
+        return plugin_providers;
+    }
+
+    let search_paths: Vec<std::path::PathBuf> =
+        plugin_cfg.search_paths.iter().map(std::path::PathBuf::from).collect();
+    let disc_cfg = PluginDiscoveryCfg { search_paths, bundled_path: None };
+
+    // Desktop retained path: materialise the process-lifetime manager on the
+    // first run (inside a tokio runtime context — the epoch ticker needs one)
+    // and reuse it across runs, so the Settings UI's revoke/refresh operations
+    // act on the same live plugin instances.
+    if let Some(handle) = plugins {
+        let mut guard = handle.lock().await;
+        if guard.is_none() {
+            *guard = build_plugin_manager();
+        }
+        let Some((host, manager)) = guard.as_mut() else {
+            return plugin_providers;
+        };
+        return load_discovered_plugins(manager, host.clone(), disc_cfg, project_dir, registry)
+            .await;
+    }
+
+    // No shared handle (CLI, tests): per-run manager, dropped on return.
+    let Some((host, mut manager)) = build_plugin_manager() else {
+        return plugin_providers;
+    };
+    load_discovered_plugins(&mut manager, host, disc_cfg, project_dir, registry).await
 }
 
 /// Build the tool registry with filesystem, shell, git, and LSP tools.
@@ -2748,9 +2809,16 @@ pub async fn run_shared_agent(
     // 1. Build tool registry (filesystem, shell, git, LSP tools)
     let mut registry = build_tool_registry(&req.project_dir, &services.vfs, &services.config);
 
-    // 2. Load WASM plugins and collect plugin-backed providers
-    let plugin_providers =
-        load_and_configure_plugins(&services.config, &req.project_dir, &mut registry).await;
+    // 2. Load WASM plugins and collect plugin-backed providers. The desktop
+    // passes a retained manager handle (plugin liveness); CLI/tests pass none
+    // and get the per-run behaviour.
+    let plugin_providers = load_and_configure_plugins(
+        &services.config,
+        &req.project_dir,
+        &mut registry,
+        services.plugins.as_ref(),
+    )
+    .await;
 
     // 3. MCP servers (ADR-43): bridge namespaced `mcp:<server>:<tool>` tools.
     // Runs after plugin tools so MCP can never clobber them; a failed or

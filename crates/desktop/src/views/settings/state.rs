@@ -147,6 +147,10 @@ pub struct State {
     pub plugin_grants_summary: Vec<String>,
     /// Transient result after a plugin revoke action.
     pub plugin_revoke_result: Option<String>,
+    /// Process-lifetime plugin-manager handle supplied by the desktop App
+    /// (plugin liveness). `None` headless/tests: revoke falls back to the
+    /// fresh best-effort manager, tolerating `NotActive`.
+    pub plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>,
 
     // ADR-43 — Skills configuration
     /// Master skills toggle (`skills.enabled`).
@@ -310,6 +314,7 @@ impl State {
             plugin_granted_ids: Vec::new(),
             plugin_grants_summary: Vec::new(),
             plugin_revoke_result: None,
+            plugin_manager: None,
             skills_enabled: skills.enabled,
             skills_search_paths: skills.search_paths.clone(),
             skills_auto_load: skills.auto_load,
@@ -682,6 +687,16 @@ impl State {
 
     fn normalize_model_settings(&mut self) {
         self.rebuild_cache();
+    }
+
+    /// Attach the desktop's process-lifetime plugin-manager handle so the
+    /// Settings revoke path can clear a LIVE plugin's in-memory grants
+    /// (plugin liveness) instead of always hitting a fresh manager.
+    pub fn with_plugin_manager(
+        &mut self,
+        plugin_manager: concerto_plugins::manager::SharedPluginManager,
+    ) {
+        self.plugin_manager = Some(plugin_manager);
     }
 
     /// Load plugin grants from the capability store and populate UI state.
@@ -1197,7 +1212,7 @@ impl State {
             // displays the outcome line.
             Message::PluginRevokePressed(plugin_id) => {
                 return iced::Task::perform(
-                    super::helpers::revoke_plugin_grants(plugin_id),
+                    super::helpers::revoke_plugin_grants(plugin_id, self.plugin_manager.clone()),
                     Message::PluginRevokeResult,
                 );
             }
