@@ -176,6 +176,23 @@ impl CompletionChunk {
 /// Mirrors the OpenAI chat-completions `usage` object. All fields are
 /// optional because providers differ in what they report (e.g. reasoning-only
 /// endpoints may omit `completion_tokens`, and `total_tokens` is derived).
+///
+/// # Provider contract — every connector must follow
+///
+/// Wire usage is surfaced on the terminal [`CompletionChunk`] only, via its
+/// `usage` field:
+///
+/// - when the provider reports token counts, the connector maps them into
+///   this struct and attaches `Some(usage)` to the terminal chunk;
+/// - when the wire carries no usable counts (absent or counts-less usage
+///   object), the connector leaves `usage` as `None` — empty is not a
+///   measurement;
+/// - `None` and `0` are both legitimate provider reports: the connector must
+///   never coalesce a missing count to `0`, nor drop a real `0`;
+/// - intermediate (non-terminal) chunks always carry `usage: None`.
+///
+/// The estimation fallback (`len / 4 + 4`) is orthogonal and lives
+/// downstream: it applies only where `usage` is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CompletionUsage {
     /// Input (prompt) tokens attributed to this completion.

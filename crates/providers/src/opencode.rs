@@ -30,7 +30,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
-use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall};
+use concerto_core::types::{
+    CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
+};
 use concerto_core::CancellationToken;
 use futures::stream::StreamExt;
 use reqwest::header::CONTENT_TYPE;
@@ -529,6 +531,11 @@ struct AnthropicStreamState {
     /// arguments are re-nested from dot-notation back into the tools'
     /// original nested shape (see `crate::adapters::schema_loose`).
     tool_adapted: bool,
+    /// Provider-reported usage merged from the events that carry it (ADR-48
+    /// §4): `message_start` reports `message.usage.input_tokens`, and
+    /// `message_delta` reports the cumulative `usage.output_tokens`. Attached
+    /// to the `message_stop` terminal chunk only.
+    usage: Option<CompletionUsage>,
 }
 
 struct ResponsesStreamState {
@@ -588,6 +595,31 @@ impl AnthropicStreamState {
             parse: AnthropicParseState::default(),
             pending: VecDeque::new(),
             tool_adapted: false,
+            usage: None,
+        }
+    }
+
+    /// Merge provider-reported token counts into the accumulated usage.
+    ///
+    /// The Zen gateway's Anthropic-dialect path mirrors the Anthropic SSE
+    /// shape (ADR-48 §4): `message_start` carries
+    /// `message.usage.input_tokens`, `message_delta` carries the cumulative
+    /// `usage.output_tokens`. Only counts actually present on the wire are
+    /// recorded — `None` and `0` are both legitimate reports, so no
+    /// coalescing happens here. The `message_start` `output_tokens`
+    /// placeholder (`1`) is overwritten by the later real cumulative total.
+    fn capture_usage(&mut self, data: &serde_json::Value) {
+        let input_tokens = data["message"]["usage"]["input_tokens"].as_u64();
+        let output_tokens = data["usage"]["output_tokens"].as_u64();
+        if input_tokens.is_none() && output_tokens.is_none() {
+            return;
+        }
+        let usage = self.usage.get_or_insert_with(CompletionUsage::default);
+        if let Some(input) = input_tokens {
+            usage.prompt_tokens = Some(input);
+        }
+        if let Some(output) = output_tokens {
+            usage.completion_tokens = Some(output);
         }
     }
 
@@ -611,6 +643,8 @@ impl AnthropicStreamState {
             Ok(v) => v,
             Err(_) => return,
         };
+
+        self.capture_usage(&data);
 
         let event_type = event.event.as_deref().unwrap_or("");
 
@@ -683,7 +717,7 @@ impl AnthropicStreamState {
                     delta: String::new(),
                     tool_call: None,
                     is_final: true,
-                    usage: None,
+                    usage: self.usage.take(),
                 }));
             }
             _ => {}
@@ -899,6 +933,93 @@ mod tests {
         let tc = chunks[0].tool_call.as_ref().unwrap();
         assert!(tc.arguments.is_object(), "empty args must coerce to object");
         assert_eq!(tc.arguments, serde_json::json!({}));
+    }
+
+    /// ADR-48 §4: `message_start` input_tokens and `message_delta`
+    /// output_tokens are merged and attached to the `message_stop` terminal
+    /// chunk only; intermediate content chunks carry no usage.
+    #[test]
+    fn stream_captures_usage_on_final_chunk() {
+        let mut state = AnthropicStreamState::new();
+        let event = |etype: &str, data: &str| crate::sse::SseEvent {
+            event: Some(etype.to_string()),
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        state.handle_event(event(
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+        ));
+        state.handle_event(event(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ));
+        state.handle_event(event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+        ));
+        state.handle_event(event(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ));
+        state.handle_event(event(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
+        ));
+        state.handle_event(event("message_stop", r#"{"type":"message_stop"}"#));
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.unwrap()).collect();
+        assert!(
+            chunks[..chunks.len() - 1].iter().all(|chunk| !chunk.is_final),
+            "only the final chunk is terminal"
+        );
+        assert_eq!(chunks[0].usage, None, "content deltas carry no usage");
+        let terminal = chunks.last().unwrap();
+        assert!(terminal.is_final);
+        assert_eq!(
+            terminal.usage,
+            Some(CompletionUsage { prompt_tokens: Some(25), completion_tokens: Some(15) })
+        );
+        crate::testing::assert_terminal_usage_contract(&chunks);
+    }
+
+    /// ADR-48 §4: usage objects with no token counts are not measurements
+    /// and must not be surfaced as one (mirrors the OpenAI capture rule).
+    #[test]
+    fn stream_ignores_usage_without_counts() {
+        let mut state = AnthropicStreamState::new();
+        let event = |etype: &str, data: &str| crate::sse::SseEvent {
+            event: Some(etype.to_string()),
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        // Both usage-bearing event shapes arrive with empty usage objects:
+        // no counts means no measurement, so usage stays `None`.
+        state.handle_event(event(
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{}}}"#,
+        ));
+        state.handle_event(event(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{}}"#,
+        ));
+        state.handle_event(event("message_stop", r#"{"type":"message_stop"}"#));
+
+        assert!(state.usage.is_none(), "counts-less usage must stay None");
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.unwrap()).collect();
+        let terminal = chunks.last().unwrap();
+        assert!(terminal.is_final);
+        assert_eq!(
+            terminal.usage, None,
+            "counts-less usage must not surface on the terminal chunk"
+        );
+        crate::testing::assert_terminal_usage_contract(&chunks);
     }
 
     // -----------------------------------------------------------------------

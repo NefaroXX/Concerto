@@ -31,6 +31,14 @@ pub type CompletionStream =
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Stream a completion as canonical [`CompletionChunk`]s.
+    ///
+    /// ADR-48 §4 — every connector must attach provider-reported wire usage
+    /// to the terminal chunk only (via `CompletionChunk::usage`): `Some`
+    /// when the provider reports counts, `None` when the wire carries no
+    /// usable counts. Empty stays `None`; `None`/`0` are never coalesced;
+    /// intermediate chunks always carry `usage: None`. See the full contract
+    /// on [`crate::types::CompletionUsage`].
     async fn stream_completion(
         &self,
         request: CompletionRequest,

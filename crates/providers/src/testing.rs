@@ -127,6 +127,29 @@ impl Default for ScriptedProvider {
     }
 }
 
+/// Assert the ADR-48 §4 usage contract across a finished provider stream.
+///
+/// Every provider connector must surface wire usage on the terminal chunk
+/// when the provider reported it, and never on intermediate chunks; when the
+/// wire carries no usable counts, usage stays `None`. `None` and `0` are both
+/// legitimate provider reports, so this helper only checks *placement*, never
+/// coalescing: it fails when a non-terminal chunk carries usage, or when more
+/// than one chunk in the stream carries it. New connectors mirror the
+/// per-provider `stream_*_usage*` tests using this helper so the rule stays
+/// enforced as provider coverage grows.
+pub fn assert_terminal_usage_contract(chunks: &[CompletionChunk]) {
+    let carrying = chunks.iter().filter(|chunk| chunk.usage.is_some()).count();
+    assert!(
+        carrying <= 1,
+        "usage must surface on at most one (terminal) chunk; found {carrying} carrying chunks"
+    );
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.usage.is_some() {
+            assert!(chunk.is_final, "chunk #{index} carries usage but is not the terminal chunk");
+        }
+    }
+}
+
 impl ScriptedProvider {
     pub fn collect_metrics(&self) -> ProviderMetrics {
         ProviderMetrics {

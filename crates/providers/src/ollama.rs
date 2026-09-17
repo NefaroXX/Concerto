@@ -2,7 +2,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
-use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget};
+use concerto_core::types::{
+    CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget,
+};
 use concerto_core::CancellationToken;
 use futures::stream::StreamExt;
 
@@ -199,6 +201,7 @@ impl LlmProvider for OllamaProvider {
         let s = stream! {
             let mut byte_stream = response.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
+            let mut usage: Option<CompletionUsage> = None;
             while let Some(chunk) = byte_stream.next().await {
                 if cancel.is_cancelled() {
                     yield Err(ProviderError::Cancelled);
@@ -225,7 +228,7 @@ impl LlmProvider for OllamaProvider {
                                 Err(e) => String::from_utf8_lossy(e.as_bytes()).to_string(),
                             };
                             if line.is_empty() { continue; }
-                            items.extend(ollama_line_to_chunks(&line, tool_adapted));
+                            items.extend(ollama_line_to_chunks(&line, tool_adapted, &mut usage));
                         }
                         items
                     }
@@ -251,7 +254,7 @@ impl LlmProvider for OllamaProvider {
                 let residual = String::from_utf8_lossy(&buf).trim().to_string();
                 buf.clear();
                 if !residual.is_empty() {
-                    for item in ollama_line_to_chunks(&residual, tool_adapted) {
+                    for item in ollama_line_to_chunks(&residual, tool_adapted, &mut usage) {
                         yield item;
                     }
                 }
@@ -284,13 +287,30 @@ impl LlmProvider for OllamaProvider {
 /// Tool-call arguments arrive as complete JSON values in both cases, so
 /// loose-schema dot-notation keys are re-nested here whenever the request
 /// was rendered with adapted schemas.
+///
+/// `usage` accumulates the provider-reported token counts (ADR-48 §4) across
+/// lines: Ollama emits `prompt_eval_count` / `eval_count` on every streamed
+/// object, so the last observation (the final `done: true` line) wins. The
+/// terminal chunk attached to the `done: true` line takes the accumulated
+/// value, leaving it drained for the stream.
 fn ollama_line_to_chunks(
     line: &str,
     tool_adapted: bool,
+    usage: &mut Option<CompletionUsage>,
 ) -> Vec<Result<CompletionChunk, ProviderError>> {
     let mut items = Vec::new();
     match serde_json::from_str::<serde_json::Value>(line) {
         Ok(json) => {
+            // ADR-48 §4: Ollama reports input/output tokens as
+            // `prompt_eval_count` / `eval_count`. Only counts actually present
+            // on the wire are recorded — `None` and `0` are both legitimate
+            // reports, so no coalescing happens here. A line with no counts
+            // is not a measurement and leaves the accumulator untouched.
+            let prompt_tokens = json["prompt_eval_count"].as_u64();
+            let completion_tokens = json["eval_count"].as_u64();
+            if prompt_tokens.is_some() || completion_tokens.is_some() {
+                *usage = Some(CompletionUsage { prompt_tokens, completion_tokens });
+            }
             if let Some(content) = json["message"]["content"].as_str() {
                 if !content.is_empty() {
                     items.push(Ok(CompletionChunk {
@@ -341,7 +361,7 @@ fn ollama_line_to_chunks(
                     delta: String::new(),
                     tool_call: None,
                     is_final: true,
-                    usage: None,
+                    usage: usage.take(),
                 }));
             }
         }
@@ -380,10 +400,11 @@ mod tests {
             "done_reason": "stop"
         });
 
-        let chunks: Vec<CompletionChunk> = ollama_line_to_chunks(&body.to_string(), false)
-            .into_iter()
-            .map(|result| result.expect("chunk emitted"))
-            .collect();
+        let chunks: Vec<CompletionChunk> =
+            ollama_line_to_chunks(&body.to_string(), false, &mut None)
+                .into_iter()
+                .map(|result| result.expect("chunk emitted"))
+                .collect();
 
         assert_eq!(chunks.len(), 3, "content + tool call + final");
         assert_eq!(chunks[0].delta, "Reading the file.");
@@ -409,7 +430,7 @@ mod tests {
         })
         .to_string();
 
-        let chunks: Vec<CompletionChunk> = ollama_line_to_chunks(&line, true)
+        let chunks: Vec<CompletionChunk> = ollama_line_to_chunks(&line, true, &mut None)
             .into_iter()
             .map(|result| result.expect("chunk emitted"))
             .collect();
@@ -421,8 +442,69 @@ mod tests {
     /// silent drop.
     #[test]
     fn unparseable_line_yields_error() {
-        let items = ollama_line_to_chunks("not json", false);
+        let items = ollama_line_to_chunks("not json", false, &mut None);
         assert_eq!(items.len(), 1);
         assert!(items[0].is_err());
+    }
+
+    /// ADR-48 §4: Ollama reports `prompt_eval_count` / `eval_count` on every
+    /// streamed object; the final `done: true` line carries the cumulative
+    /// totals, which are attached to the terminal chunk only.
+    #[test]
+    fn stream_captures_usage_on_final_chunk() {
+        let mut usage: Option<CompletionUsage> = None;
+        // Intermediate streamed objects carry partial counts — later
+        // observations overwrite earlier ones (last observation wins).
+        let mid: serde_json::Value = serde_json::json!({
+            "message": {"content": "partial"},
+            "done": false,
+            "prompt_eval_count": 42,
+            "eval_count": 3
+        });
+        let mid_chunks: Vec<CompletionChunk> =
+            ollama_line_to_chunks(&mid.to_string(), false, &mut usage)
+                .into_iter()
+                .map(|result| result.expect("chunk emitted"))
+                .collect();
+        assert!(!mid_chunks.iter().any(|chunk| chunk.is_final));
+        assert!(mid_chunks.iter().all(|chunk| chunk.usage.is_none()));
+
+        // Terminal line carries the cumulative totals.
+        let done: serde_json::Value = serde_json::json!({
+            "message": {"content": "done speaking"},
+            "done": true,
+            "prompt_eval_count": 42,
+            "eval_count": 7
+        });
+        let done_chunks: Vec<CompletionChunk> =
+            ollama_line_to_chunks(&done.to_string(), false, &mut usage)
+                .into_iter()
+                .map(|result| result.expect("chunk emitted"))
+                .collect();
+        let terminal = done_chunks.iter().find(|chunk| chunk.is_final).expect("terminal chunk");
+        assert_eq!(
+            terminal.usage,
+            Some(CompletionUsage { prompt_tokens: Some(42), completion_tokens: Some(7) })
+        );
+        assert_eq!(usage, None, "the terminal chunk drains the accumulator");
+        let mut all = mid_chunks;
+        all.extend(done_chunks);
+        crate::testing::assert_terminal_usage_contract(&all);
+    }
+
+    /// ADR-48 §4: lines without token counts are not measurements; usage
+    /// stays `None` on a counts-less terminal.
+    #[test]
+    fn stream_ignores_usage_without_counts() {
+        let mut usage: Option<CompletionUsage> = None;
+        let done: serde_json::Value =
+            serde_json::json!({"message": {"content": "done"}, "done": true});
+        let chunks: Vec<CompletionChunk> =
+            ollama_line_to_chunks(&done.to_string(), false, &mut usage)
+                .into_iter()
+                .map(|result| result.expect("chunk emitted"))
+                .collect();
+        let terminal = chunks.iter().find(|chunk| chunk.is_final).expect("terminal chunk");
+        assert_eq!(terminal.usage, None, "counts-less lines must not surface usage");
     }
 }

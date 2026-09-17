@@ -2,7 +2,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
-use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall};
+use concerto_core::types::{
+    CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
+};
 use concerto_core::CancellationToken;
 use futures::stream::StreamExt;
 
@@ -109,6 +111,131 @@ fn parse_function_call_part(
     ToolCall { id, name, arguments: args, thought_signature }
 }
 
+/// Streaming state for one Gemini `:streamGenerateContent` response.
+///
+/// Holds the SSE parser and the accumulated provider-reported usage so the
+/// stream reducer is testable without network I/O (mirrors the state structs
+/// of the OpenAI/Anthropic connectors).
+struct GoogleStreamState {
+    parser: BufferedSseParser,
+    /// Provider-reported usage captured from the final chunk's
+    /// `usageMetadata` (ADR-48 §4); attached to the terminal chunk only.
+    usage: Option<CompletionUsage>,
+}
+
+impl GoogleStreamState {
+    fn new() -> Self {
+        Self { parser: BufferedSseParser::new(), usage: None }
+    }
+
+    /// Capture Gemini's `usageMetadata` (ADR-48 §4).
+    ///
+    /// Gemini reports input/output tokens in the `usageMetadata` member of
+    /// the final streamed chunk (`promptTokenCount` / `candidatesTokenCount`).
+    /// Only counts actually present on the wire are recorded — `None` and
+    /// `0` are both legitimate reports, so no coalescing happens here. A
+    /// metadata object with no token counts is not a measurement and stays
+    /// `None`.
+    fn capture_usage(&mut self, parsed: &serde_json::Value) {
+        let Some(metadata) = parsed.get("usageMetadata") else { return };
+        let prompt_tokens = metadata["promptTokenCount"].as_u64();
+        let completion_tokens = metadata["candidatesTokenCount"].as_u64();
+        if prompt_tokens.is_none() && completion_tokens.is_none() {
+            return;
+        }
+        self.usage = Some(CompletionUsage { prompt_tokens, completion_tokens });
+    }
+
+    /// Reduce one SSE event into canonical chunks to yield.
+    fn handle_event(
+        &mut self,
+        event: crate::sse::SseEvent,
+        fc_counter: &mut u64,
+        tool_adapted: bool,
+    ) -> Vec<Result<CompletionChunk, ProviderError>> {
+        let mut items = Vec::new();
+        if event.keepalive {
+            // Liveness signal (SSE comment line): emit an empty chunk so the
+            // stream stays active and the orchestrator idle timeout does not
+            // fire during long keep-alive-only periods.
+            items.push(Ok(CompletionChunk {
+                reasoning: None,
+                delta: String::new(),
+                tool_call: None,
+                is_final: false,
+                usage: None,
+            }));
+            return items;
+        }
+        let Some(data) = event.data else { return items };
+        if data == "[DONE]" {
+            items.push(Ok(CompletionChunk {
+                reasoning: None,
+                delta: String::new(),
+                tool_call: None,
+                is_final: true,
+                usage: self.usage.take(),
+            }));
+            return items;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => return items,
+        };
+        self.capture_usage(&parsed);
+        if let Some(candidates) = parsed["candidates"].as_array() {
+            if let Some(candidate) = candidates.first() {
+                if let Some(content) = candidate["content"].as_object() {
+                    // `content` is a `serde_json::Map`, whose `Index` impl
+                    // panics on a missing key (unlike `Value` indexing, which
+                    // yields Null). Gemini may omit "parts" (e.g.
+                    // finishReason-only candidates).
+                    if let Some(parts) = content.get("parts").and_then(serde_json::Value::as_array)
+                    {
+                        for part in parts {
+                            if let Some(text) = part["text"].as_str() {
+                                items.push(Ok(CompletionChunk {
+                                    reasoning: None,
+                                    delta: text.to_string(),
+                                    tool_call: None,
+                                    is_final: false,
+                                    usage: None,
+                                }));
+                            }
+                            if let Some(fc) = part.get("functionCall") {
+                                // Gemini emits function calls inline in
+                                // parts. Parse the name, args, and the opaque
+                                // `thought_signature` (replayed verbatim by
+                                // the dialect) into a ToolCall chunk.
+                                let tc = parse_function_call_part(fc, fc_counter, tool_adapted);
+                                items.push(Ok(CompletionChunk {
+                                    reasoning: None,
+                                    delta: String::new(),
+                                    tool_call: Some(tc),
+                                    is_final: false,
+                                    usage: None,
+                                }));
+                            }
+                        }
+                    }
+                }
+                if let Some(finish) = candidate["finishReason"].as_str() {
+                    if !finish.is_empty() && finish != "STOP" {
+                        items.push(Ok(CompletionChunk {
+                            reasoning: None,
+                            delta: String::new(),
+                            tool_call: None,
+                            is_final: true,
+                            usage: self.usage.take(),
+                        }));
+                    }
+                }
+            }
+        }
+        items
+    }
+}
+
 #[async_trait]
 impl LlmProvider for GoogleProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
@@ -206,9 +333,6 @@ impl LlmProvider for GoogleProvider {
 
         // Clone cancel token for use inside the stream later
         let cancel = cancel.clone();
-        // Gemini does not provide unique call IDs for function calls, so we
-        // generate sequential IDs within a stream.
-        let mut fc_counter: u64 = 0;
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             result = async {
@@ -233,8 +357,13 @@ impl LlmProvider for GoogleProvider {
             }
         };
 
+        // Gemini does not provide unique call IDs for function calls, so we
+        // generate sequential IDs within a stream.
+        let fc_counter: u64 = 0;
+
         let s = stream! {
-            let mut parser = BufferedSseParser::new();
+            let mut state = GoogleStreamState::new();
+            let mut fc_counter = fc_counter;
             let mut byte_stream = response.bytes_stream();
             while let Some(chunk) = byte_stream.next().await {
                 // Check for cancellation before processing the chunk
@@ -243,90 +372,10 @@ impl LlmProvider for GoogleProvider {
                 }
                 let items = match chunk {
                     Ok(bytes) => {
-                        let events = parser.push_bytes(&bytes);
+                        let events = state.parser.push_bytes(&bytes);
                         let mut items = Vec::new();
                         for event in events {
-                            if event.keepalive {
-                                // Liveness signal (SSE comment line): emit an
-                                // empty chunk so the stream stays active and the
-                                // orchestrator idle timeout does not fire during
-                                // long keep-alive-only periods.
-                                items.push(Ok(CompletionChunk {
-                                    reasoning: None,
-                                    delta: String::new(),
-                                    tool_call: None,
-                                    is_final: false, usage: None,
-                                }));
-                                continue;
-                            }
-                            if let Some(data) = event.data {
-                                if data == "[DONE]" {
-                                    items.push(Ok(CompletionChunk {
-                                        reasoning: None,
-                                        delta: String::new(),
-                                        tool_call: None,
-                                        is_final: true, usage: None,
-                                    }));
-                                    continue;
-                                }
-                                let parsed: serde_json::Value = match serde_json::from_str(&data) {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
-                                };
-                                if let Some(candidates) = parsed["candidates"].as_array() {
-                                    if let Some(candidate) = candidates.first() {
-                                        if let Some(content) = candidate["content"].as_object() {
-                                            // `content` is a `serde_json::Map`, whose
-                                            // `Index` impl panics on a missing key
-                                            // (unlike `Value` indexing, which yields
-                                            // Null). Gemini may omit "parts" (e.g.
-                                            // finishReason-only candidates).
-                                            if let Some(parts) =
-                                                content.get("parts").and_then(serde_json::Value::as_array)
-                                            {
-                                                for part in parts {
-                                                    if let Some(text) = part["text"].as_str() {
-                                                        items.push(Ok(CompletionChunk {
-                                                            reasoning: None,
-                                                            delta: text.to_string(),
-                                                            tool_call: None,
-                                                            is_final: false, usage: None,
-                                                        }));
-                                                    }
-                                                    if let Some(fc) = part.get("functionCall") {
-                                                        // Gemini emits function calls inline in
-                                                        // parts. Parse the name, args, and the
-                                                        // opaque `thought_signature` (replayed
-                                                        // verbatim by the dialect) into a
-                                                        // ToolCall chunk.
-                                                        let tc = parse_function_call_part(
-                                                            fc,
-                                                            &mut fc_counter,
-                                                            tool_adapted,
-                                                        );
-                                                        items.push(Ok(CompletionChunk {
-                                                            reasoning: None,
-                                                            delta: String::new(),
-                                                            tool_call: Some(tc),
-                                                            is_final: false, usage: None,
-                                                        }));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if let Some(finish) = candidate["finishReason"].as_str() {
-                                            if !finish.is_empty() && finish != "STOP" {
-                                                items.push(Ok(CompletionChunk {
-                                                    reasoning: None,
-                                                    delta: String::new(),
-                                                    tool_call: None,
-                                                    is_final: true, usage: None,
-                                                }));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            items.extend(state.handle_event(event, &mut fc_counter, tool_adapted));
                         }
                         items
                     }
@@ -583,5 +632,135 @@ mod tests {
         };
         assert!(!strict.adapt_tools_for(&mut request, "mimo-v2.5-free"));
         assert!(loose.adapt_tools_for(&mut request, "gemini-2.0-flash"));
+    }
+
+    /// ADR-48 §4: Gemini's `usageMetadata` (`promptTokenCount` /
+    /// `candidatesTokenCount`, reported on the final streamed chunk) is
+    /// captured and attached to the terminal chunk only; intermediate chunks
+    /// carry no usage.
+    #[test]
+    fn stream_captures_usage_on_final_chunk() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let mut chunks: Vec<CompletionChunk> = Vec::new();
+        // Content delta (no usage on intermediate chunks).
+        chunks.extend(
+            state
+                .handle_event(
+                    event(r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#),
+                    &mut fc_counter,
+                    false,
+                )
+                .into_iter()
+                .map(|r| r.expect("chunk emitted")),
+        );
+        // The final data chunk carries usageMetadata; Gemini ends the stream
+        // with finishReason "STOP" and then the [DONE] sentinel.
+        chunks.extend(
+            state
+                .handle_event(
+                    event(r#"{"candidates":[{"content":{"parts":[{"text":" world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":5}}"#),
+                    &mut fc_counter,
+                    false,
+                )
+                .into_iter()
+                .map(|r| r.expect("chunk emitted")),
+        );
+        chunks.extend(
+            state
+                .handle_event(event("[DONE]"), &mut fc_counter, false)
+                .into_iter()
+                .map(|r| r.expect("chunk emitted")),
+        );
+
+        assert!(
+            chunks[..chunks.len() - 1].iter().all(|chunk| !chunk.is_final),
+            "only the final chunk is terminal"
+        );
+        assert_eq!(chunks[0].usage, None, "content deltas carry no usage");
+        let terminal = chunks.last().expect("terminal chunk");
+        assert!(terminal.is_final);
+        assert_eq!(
+            terminal.usage,
+            Some(CompletionUsage { prompt_tokens: Some(11), completion_tokens: Some(5) })
+        );
+        crate::testing::assert_terminal_usage_contract(&chunks);
+    }
+
+    /// ADR-48 §4: `finishReason` terminals other than `STOP` (e.g.
+    /// `MAX_TOKENS` / `SAFETY`) carry the usage captured from the same
+    /// chunk's `usageMetadata`.
+    #[test]
+    fn stream_captures_usage_on_non_stop_finish() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let chunks: Vec<CompletionChunk> = state
+            .handle_event(
+                event(r#"{"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":3}}"#),
+                &mut fc_counter,
+                false,
+            )
+            .into_iter()
+            .map(|r| r.expect("chunk emitted"))
+            .collect();
+        assert_eq!(chunks.len(), 1);
+        let terminal = chunks.last().expect("terminal chunk");
+        assert!(terminal.is_final);
+        assert_eq!(
+            terminal.usage,
+            Some(CompletionUsage { prompt_tokens: Some(9), completion_tokens: Some(3) })
+        );
+        crate::testing::assert_terminal_usage_contract(&chunks);
+    }
+
+    /// ADR-48 §4: a `usageMetadata` object with no token counts is not a
+    /// measurement and must not be surfaced as one (mirrors the OpenAI /
+    /// Anthropic capture rule).
+    #[test]
+    fn stream_ignores_usage_without_counts() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let mut chunks: Vec<CompletionChunk> = Vec::new();
+        chunks.extend(
+            state
+                .handle_event(
+                    event(r#"{"candidates":[],"usageMetadata":{}}"#),
+                    &mut fc_counter,
+                    false,
+                )
+                .into_iter()
+                .map(|r| r.expect("chunk emitted")),
+        );
+        chunks.extend(
+            state
+                .handle_event(event("[DONE]"), &mut fc_counter, false)
+                .into_iter()
+                .map(|r| r.expect("chunk emitted")),
+        );
+        let terminal = chunks.last().expect("terminal chunk");
+        assert!(terminal.is_final);
+        assert_eq!(terminal.usage, None, "counts-less usageMetadata must stay None");
+        crate::testing::assert_terminal_usage_contract(&chunks);
     }
 }
