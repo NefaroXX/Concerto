@@ -12,7 +12,7 @@ pub use concerto_core::VectorStore;
 
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
-use concerto_core::CancellationToken;
+use concerto_core::{CancellationToken, RowIndexFact};
 use serde_json;
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
@@ -433,8 +433,8 @@ impl VectorStore for SqliteVectorStore {
     ) -> Result<Vec<VectorResult>, MemoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, content, vector FROM vector_store
-            WHERE project_id = ? AND tombstone = 0 AND stale = 0
+            SELECT id, content, vector, stale FROM vector_store
+            WHERE project_id = ? AND tombstone = 0
             "#,
         )
         .bind(&project_id.0)
@@ -453,6 +453,7 @@ impl VectorStore for SqliteVectorStore {
             .filter_map(|row| {
                 let id: String = row.get("id");
                 let content: String = row.get("content");
+                let stale: bool = row.get::<i64, _>("stale") == 1;
                 let vec_bytes: Vec<u8> = row.get("vector");
                 if !vec_bytes.len().is_multiple_of(4) {
                     return None;
@@ -469,7 +470,7 @@ impl VectorStore for SqliteVectorStore {
                     return None;
                 }
                 let score = dot / (query_norm * stored_norm);
-                Some(VectorResult { chunk_id: id, score, content })
+                Some(VectorResult { chunk_id: id, score, content, stale })
             })
             .collect();
 
@@ -485,8 +486,8 @@ impl VectorStore for SqliteVectorStore {
         _cancel: CancellationToken,
     ) -> Result<Vec<VectorResult>, MemoryError> {
         let rows = sqlx::query(
-            "SELECT id, content, vector FROM vector_store \
-             WHERE project_id = ? AND tombstone = 0 AND stale = 0 \
+            "SELECT id, content, vector, stale FROM vector_store \
+             WHERE project_id = ? AND tombstone = 0 \
              ORDER BY created_at DESC LIMIT ?",
         )
         .bind(&project_id.0)
@@ -509,6 +510,7 @@ impl VectorStore for SqliteVectorStore {
                     chunk_id: row.get("id"),
                     score: 1.0,
                     content: row.get("content"),
+                    stale: row.get::<i64, _>("stale") == 1,
                 })
             })
             .collect())
@@ -524,8 +526,8 @@ impl VectorStore for SqliteVectorStore {
         for chunk_id in chunk_ids {
             let row = sqlx::query(
                 "SELECT id, content, file_path, start_line, end_line, chunk_type, \
-                 model_id, model_version FROM vector_store \
-                 WHERE id = ? AND project_id = ? AND tombstone = 0 AND stale = 0",
+                 model_id, model_version, stale FROM vector_store \
+                 WHERE id = ? AND project_id = ? AND tombstone = 0",
             )
             .bind(chunk_id)
             .bind(&project_id.0)
@@ -550,6 +552,7 @@ impl VectorStore for SqliteVectorStore {
                     score: 0.0,
                     model_id: row.get("model_id"),
                     model_version: row.get("model_version"),
+                    stale: row.get::<i64, _>("stale") == 1,
                 });
             }
         }
@@ -610,6 +613,39 @@ impl VectorStore for SqliteVectorStore {
         .await
         .map_err(|e| MemoryError::Persistence(e.to_string()))?;
         Ok(())
+    }
+
+    async fn row_index_facts(
+        &self,
+        project_id: &ProjectId,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<RowIndexFact>, MemoryError> {
+        let rows = sqlx::query(
+            "SELECT id, model_version, stale, length(vector) AS vec_len, metadata \
+             FROM vector_store WHERE project_id = ? AND tombstone = 0",
+        )
+        .bind(&project_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                // ADR-39 FTS-only sentinels are empty-vector rows with no
+                // metadata sidecar and are never marked stale (a same-version
+                // sentinel always has stale = 0; a bumped version re-embeds
+                // it and clears staleness on the fresh row).
+                let is_sentinel = row.get::<i64, _>("vec_len") == 0
+                    && row.get::<Option<String>, _>("metadata").is_none()
+                    && row.get::<i64, _>("stale") == 0;
+                RowIndexFact {
+                    id: row.get("id"),
+                    model_version: row.get("model_version"),
+                    is_sentinel,
+                }
+            })
+            .collect())
     }
 
     async fn delete_by_project(

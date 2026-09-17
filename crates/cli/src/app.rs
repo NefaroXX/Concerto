@@ -1601,6 +1601,15 @@ fn event_line(kind: &EventKind) -> Option<String> {
         EventKind::EmbedderDegraded { reason, .. } => Some(format!(
             "· Embedding unavailable ({reason}) — semantic search degraded to full-text"
         )),
+        // -- model-version staleness (ADR-12) --
+        EventKind::EmbeddingModelMismatch { stored_version, current_version } => Some(format!(
+            "· Embedding model changed: stored {stored_version} → now {current_version} — \
+             old rows marked stale"
+        )),
+        EventKind::StaleVectorsDetected { project_id, stale_count } => Some(format!(
+            "· {stale_count} stale memory row(s) flagged for project {project_id} — re-index \
+             to refresh"
+        )),
         // -- session --
         EventKind::SessionSaved => Some("· Session saved".to_string()),
         // -- provider retry --

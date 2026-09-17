@@ -18,4 +18,4 @@ pub use memory::MemoryStore;
 pub use policy::{AuditLog, PolicyEngine};
 pub use provider::{CompletionStream, LlmProvider};
 pub use tool::Tool;
-pub use vector_store::VectorStore;
+pub use vector_store::{RowIndexFact, VectorStore};

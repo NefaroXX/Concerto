@@ -1209,6 +1209,41 @@ pub async fn init_memory_system(
     let embedder: Arc<dyn EmbeddingGenerator> =
         Arc::new(ProviderEmbedder::new("bge-small-en-v1.5"));
 
+    // ADR-12 Option A startup gate: rows produced by an earlier embedder
+    // version are marked stale (kept searchable but rank-demoted) so the
+    // background re-index can lazily refresh only the rows that differ.
+    // Rows already at the live version are untouched. Runs BEFORE the
+    // background index task so every stale row is flagged up front.
+    let live_version = embedder.model_version().to_string();
+    match vector_store.row_index_facts(&project_id, lifecycle.child_token()).await {
+        Ok(facts) => {
+            let stale_rows: Vec<_> =
+                facts.iter().filter(|fact| fact.model_version != live_version).collect();
+            if !stale_rows.is_empty() {
+                let _ = bus.publish_raw(EventKind::EmbeddingModelMismatch {
+                    stored_version: stale_rows[0].model_version.clone(),
+                    current_version: live_version.clone(),
+                });
+                let _ = bus.publish_raw(EventKind::StaleVectorsDetected {
+                    project_id: project_id.0.clone(),
+                    stale_count: stale_rows.len(),
+                });
+                if let Err(error) = vector_store
+                    .mark_stale(&project_id, &live_version, lifecycle.child_token())
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        "failed to mark stale embeddings at startup (re-index will refresh them)"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read model-version facts for staleness gate");
+        }
+    }
+
     // Chunk sync service is the single write path for the vector + FTS stores.
     let sync = Arc::new(ChunkSyncService::new(vector_store.clone(), fts_store.clone()));
     let indexer = Arc::new(ProjectIndexer::new(embedder.clone(), bus.clone(), project_id.clone()));

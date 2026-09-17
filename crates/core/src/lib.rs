@@ -75,7 +75,7 @@ pub use traits::approval::{ApprovalDecision, ApprovalSink};
 pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy, TruncateOldest};
 pub use traits::memory::MemoryStore;
 pub use traits::provider::LlmProvider;
-pub use traits::vector_store::VectorStore;
+pub use traits::vector_store::{RowIndexFact, VectorStore};
 
 /// Durable typed session transcript model (ADR-36).
 pub use transcript::{

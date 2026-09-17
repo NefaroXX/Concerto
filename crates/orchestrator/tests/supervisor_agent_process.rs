@@ -167,6 +167,7 @@ impl MemoryStore for CountingMemoryStore {
             score: 0.9,
             model_id: "test-model".to_owned(),
             model_version: "0".to_owned(),
+            stale: false,
         }])
     }
 

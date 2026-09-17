@@ -464,6 +464,7 @@ impl MemoryStore for GateProxyMemoryStore {
                 score: chunk.score,
                 model_id: String::new(),
                 model_version: String::new(),
+                stale: false,
             })
             .collect())
     }

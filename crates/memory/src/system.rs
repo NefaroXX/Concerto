@@ -24,7 +24,7 @@ use tracing;
 use crate::budget::ContextBudgetAllocator;
 use crate::decision_store::DecisionStore;
 use crate::embedder::EmbeddingGenerator;
-use crate::embedder_health::{EmbedderHealth, EMBEDDER_DEGRADED_NOTICE};
+use crate::embedder_health::EmbedderHealth;
 use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
 use crate::rag::HybridRetriever;
@@ -124,7 +124,6 @@ impl MemoryStore for MemorySystem {
 
         // Compute query embedding if an embedder is configured; otherwise
         // fall back to full-text-only retrieval.
-        let mut degraded_window = false;
         let embedding = if let Some(ref embedder) = self.embedder {
             match embedder.embed(&query.text).await {
                 Ok(embedding) => embedding,
@@ -140,7 +139,7 @@ impl MemoryStore for MemorySystem {
                     // returns `Some` only on the first failure of a (new)
                     // broken window — exactly one transition per window.
                     let health = EmbedderHealth::for_project(&query.project_id);
-                    degraded_window = health.record_failure(std::time::Instant::now()).is_some();
+                    let _ = health.record_failure(std::time::Instant::now());
                     Vec::new()
                 }
             }
@@ -151,18 +150,6 @@ impl MemoryStore for MemorySystem {
         let results =
             self.retriever.retrieve(query, &embedding, Some(query.top_k), cancel.clone()).await;
 
-        // S2 (ADR-39): surface the degraded notice to the user. The API-level
-        // notice on the retriever's `FusedResult` carries no channel through
-        // `MemoryChunk` (core memory types are frozen this wave), so surface it
-        // via a log once per broken window (aligned with the query-path window
-        // transition above / the indexer's event line).
-        if degraded_window && results.iter().any(|r| r.notice.is_some()) {
-            tracing::warn!(
-                project_id = %query.project_id.0,
-                "{}",
-                EMBEDDER_DEGRADED_NOTICE
-            );
-        }
         let ids: Vec<String> = results.iter().map(|result| result.chunk_id.clone()).collect();
         let metadata = self.retriever.load_chunks(&query.project_id, &ids, cancel.clone()).await?;
         let metadata_is_authoritative = self.retriever.supports_chunk_metadata();
@@ -188,10 +175,12 @@ impl MemoryStore for MemorySystem {
                         score: result.score,
                         model_id: String::new(),
                         model_version: String::new(),
+                        stale: result.stale,
                     },
                 };
                 chunk.score = result.score;
                 chunk.content = result.content;
+                chunk.stale = result.stale;
                 matches_filters(&chunk, &query.filters, &file_patterns).then_some(chunk)
             })
             .collect())
@@ -234,10 +223,12 @@ impl MemoryStore for MemorySystem {
                         score: result.score,
                         model_id: String::new(),
                         model_version: String::new(),
+                        stale: result.stale,
                     },
                 };
                 chunk.score = result.score;
                 chunk.content = result.content;
+                chunk.stale = result.stale;
                 Some(chunk)
             })
             .collect())

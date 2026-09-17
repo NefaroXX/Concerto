@@ -70,6 +70,7 @@ fn make_chunk(id: &str, project: &ProjectId, content: &str) -> MemoryChunk {
         score: 1.0,
         model_id: "benchmark".into(),
         model_version: "0.1.0".into(),
+        stale: false,
     }
 }
 

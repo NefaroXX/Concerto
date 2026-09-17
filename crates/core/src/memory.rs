@@ -133,6 +133,10 @@ pub struct MemoryChunk {
     pub score: f64,
     pub model_id: String,
     pub model_version: String,
+    /// `true` when the row was produced by an older embedding model version
+    /// and has not been re-indexed yet.  Stale rows are still searchable but
+    /// are rank-demoted behind fresh rows in hybrid retrieval results.
+    pub stale: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +314,8 @@ pub struct FtsResult {
     pub chunk_id: String,
     pub score: f64,
     pub content: String,
+    /// Whether the backing row is stale (older model version).
+    pub stale: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +328,8 @@ pub struct VectorResult {
     pub chunk_id: String,
     pub score: f64,
     pub content: String,
+    /// Whether the backing row is stale (older model version).
+    pub stale: bool,
 }
 
 #[cfg(test)]
@@ -330,27 +338,37 @@ mod tests {
 
     #[test]
     fn fts_result_fields() {
-        let r =
-            FtsResult { chunk_id: "chunk1".into(), score: 0.95, content: "matched text".into() };
+        let r = FtsResult {
+            chunk_id: "chunk1".into(),
+            score: 0.95,
+            content: "matched text".into(),
+            stale: false,
+        };
         assert_eq!(r.chunk_id, "chunk1");
         assert_eq!(r.score, 0.95);
         assert_eq!(r.content, "matched text");
+        assert!(!r.stale);
     }
 
     #[test]
     fn vector_result_fields() {
-        let r =
-            VectorResult { chunk_id: "vec1".into(), score: 0.87, content: "vector content".into() };
+        let r = VectorResult {
+            chunk_id: "vec1".into(),
+            score: 0.87,
+            content: "vector content".into(),
+            stale: false,
+        };
         assert_eq!(r.chunk_id, "vec1");
         assert_eq!(r.score, 0.87);
         assert_eq!(r.content, "vector content");
+        assert!(!r.stale);
     }
 
     #[test]
     fn fts_result_score_non_negative() {
         // BM25 scores from FTS5 (negated rank) are positive and unbounded.
         for score in [0.0, 0.5, 1.0, 3.2] {
-            let r = FtsResult { chunk_id: "c".into(), score, content: String::new() };
+            let r = FtsResult { chunk_id: "c".into(), score, content: String::new(), stale: false };
             assert!(r.score >= 0.0, "FTS score must be non-negative, got {score}");
         }
     }

@@ -140,6 +140,7 @@ mod tests {
             score,
             model_id: "test".into(),
             model_version: "1.0".into(),
+            stale: false,
         }
     }
 

@@ -19,6 +19,7 @@ use concerto_core::error::MemoryError;
 use concerto_core::memory::{
     ChunkType, EmbeddingRecord, FtsResult, MemoryChunk, MemoryNamespace, ProjectId, VectorResult,
 };
+use concerto_core::RowIndexFact;
 
 // ---------------------------------------------------------------------------
 // InMemoryVectorStore
@@ -99,6 +100,7 @@ impl VectorStore for InMemoryVectorStore {
                 chunk_id: r.id.clone(),
                 score: 0.5,
                 content: r.content.clone(),
+                stale: r.stale,
             })
             .collect();
         results.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
@@ -131,6 +133,7 @@ impl VectorStore for InMemoryVectorStore {
                 score: 0.0,
                 model_id: record.model_id.clone(),
                 model_version: record.model_version.clone(),
+                stale: record.stale,
             })
             .collect())
     }
@@ -141,10 +144,18 @@ impl VectorStore for InMemoryVectorStore {
 
     async fn tombstone(
         &self,
-        _chunk_id: &str,
-        _project_id: &ProjectId,
+        chunk_id: &str,
+        project_id: &ProjectId,
         _cancel: CancellationToken,
     ) -> Result<(), MemoryError> {
+        // SQLite keeps the row and sets `tombstone = 1` (excluded from
+        // search/list/get_chunks). This fake has no tombstone column, so it
+        // physically removes the record to match the observable semantics:
+        // a tombstoned chunk is no longer retrievable.
+        let mut map = self.data.lock().unwrap();
+        if let Some(records) = map.get_mut(project_id) {
+            records.retain(|record| record.id != chunk_id);
+        }
         Ok(())
     }
 
@@ -169,6 +180,25 @@ impl VectorStore for InMemoryVectorStore {
             }
         }
         Ok(())
+    }
+
+    async fn row_index_facts(
+        &self,
+        project_id: &ProjectId,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<RowIndexFact>, MemoryError> {
+        let map = self.data.lock().unwrap();
+        let Some(records) = map.get(project_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(records
+            .iter()
+            .map(|record| RowIndexFact {
+                id: record.id.clone(),
+                model_version: record.model_version.clone(),
+                is_sentinel: record.vector.is_empty() && !record.stale,
+            })
+            .collect())
     }
 
     async fn delete_by_project(
@@ -347,6 +377,7 @@ impl FullTextStore for InMemoryFullTextStore {
                 chunk_id: id.clone(),
                 score: 1.0,
                 content: content.clone(),
+                stale: false,
             })
             .collect();
         results.truncate(top_k);
@@ -462,6 +493,7 @@ mod tests {
             score: 1.0,
             model_id: "test".into(),
             model_version: "1.0".into(),
+            stale: false,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();

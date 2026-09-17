@@ -6,12 +6,14 @@
 //! single point of coordination that enforces this invariant.
 
 use concerto_core::CancellationToken;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::{EmbeddingRecord, MemoryChunk, MemoryNamespace, ProjectId};
+use concerto_core::RowIndexFact;
 
 use crate::fts::FullTextStore;
 use crate::vector_store::VectorStore;
@@ -59,6 +61,7 @@ impl ChunkSyncService {
             score: 1.0, // neutral default for stored chunks; query-time FTS rank or vector similarity overwrites this
             model_id: record.model_id.clone(),
             model_version: record.model_version.clone(),
+            stale: record.stale,
         };
         self.fts_store.insert(&chunk, &record.project_id, cancel).await?;
 
@@ -68,31 +71,78 @@ impl ChunkSyncService {
     /// Replace the complete index for a project after a successful full scan.
     /// This prunes deleted and newly excluded files instead of accumulating
     /// stale rows across restarts and manual re-indexes.
+    ///
+    /// Lazy re-index (ADR-12): chunk ids are stable content+location hashes,
+    /// so a row already at the live model version is *skipped* — kept exactly
+    /// as it was, without re-embedding. Rows from an older model version
+    /// (marked stale at startup) are re-stored at the live version, which
+    /// clears their stale flag via the upsert. Rows present on disk but
+    /// absent from this scan are tombstones (deleted / newly excluded files).
     pub async fn replace_project(
         &self,
         project_id: &ProjectId,
         records: &[EmbeddingRecord],
         cancel: CancellationToken,
     ) -> Result<(), MemoryError> {
-        self.vector_store.delete_by_project(project_id, cancel.clone()).await?;
-        self.fts_store.delete_by_project(project_id, cancel.clone()).await?;
-        self.vector_store.store(records, cancel.clone()).await?;
+        let facts = self.vector_store.row_index_facts(project_id, cancel.clone()).await?;
+        let facts_by_id: HashMap<&str, &RowIndexFact> =
+            facts.iter().map(|fact| (fact.id.as_str(), fact)).collect();
+
+        // Keep rows already at the live model version. The `is_sentinel` arm
+        // ensures a real vector is never skipped just because a same-version
+        // FTS-only sentinel (ADR-39) occupies the id — such sentinels are
+        // upgraded, not skipped.
+        let mut to_store: Vec<&EmbeddingRecord> = Vec::new();
         for record in records {
-            let chunk = MemoryChunk {
-                id: record.id.clone(),
-                project_id: record.project_id.clone(),
-                namespace: MemoryNamespace::Project(record.project_id.clone()),
-                content: record.content.clone(),
-                file_path: Some(record.file_path.clone()),
-                start_line: record.start_line,
-                end_line: record.end_line,
-                chunk_type: record.chunk_type,
-                score: 1.0, // neutral default for stored chunks; query-time FTS rank or vector similarity overwrites this
-                model_id: record.model_id.clone(),
-                model_version: record.model_version.clone(),
-            };
-            self.fts_store.insert(&chunk, project_id, cancel.clone()).await?;
+            let skip = facts_by_id.get(record.id.as_str()).is_some_and(|fact| {
+                let versions_equal = fact.model_version == record.model_version;
+                versions_equal && (record.vector.is_empty() || !fact.is_sentinel)
+            });
+            if !skip {
+                to_store.push(record);
+            }
         }
+
+        // Prune orphans: rows present on disk but absent from the scan. Soft
+        // delete (tombstone) keeps them out of search/list while retaining
+        // audit history until `delete_tombstoned` physically prunes them.
+        let incoming_ids: HashSet<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        let mut to_prune: Vec<&RowIndexFact> = Vec::new();
+        for fact in &facts {
+            if !incoming_ids.contains(fact.id.as_str()) {
+                to_prune.push(fact);
+            }
+        }
+
+        if !to_store.is_empty() {
+            let stored: Vec<EmbeddingRecord> = to_store.into_iter().cloned().collect();
+            self.vector_store.store(&stored, cancel.clone()).await?;
+            for record in &stored {
+                let chunk = MemoryChunk {
+                    id: record.id.clone(),
+                    project_id: record.project_id.clone(),
+                    namespace: MemoryNamespace::Project(record.project_id.clone()),
+                    content: record.content.clone(),
+                    file_path: Some(record.file_path.clone()),
+                    start_line: record.start_line,
+                    end_line: record.end_line,
+                    chunk_type: record.chunk_type,
+                    score: 1.0, // neutral default for stored chunks; query-time FTS rank or vector similarity overwrites this
+                    model_id: record.model_id.clone(),
+                    model_version: record.model_version.clone(),
+                    stale: record.stale,
+                };
+                self.fts_store.insert(&chunk, project_id, cancel.clone()).await?;
+            }
+        }
+
+        for fact in to_prune {
+            self.vector_store.tombstone(&fact.id, project_id, cancel.clone()).await?;
+            if let Err(e) = self.fts_store.delete(&fact.id, project_id, cancel.clone()).await {
+                tracing::warn!("failed to purge FTS chunk {}: {e}", fact.id);
+            }
+        }
+
         Ok(())
     }
 
@@ -343,5 +393,110 @@ mod tests {
         let a_results =
             fts.search("content a1", &pid_a, 5, CancellationToken::new()).await.unwrap();
         assert!(a_results.is_empty(), "project A should be empty");
+    }
+
+    #[tokio::test]
+    async fn replace_project_skips_chunks_already_at_live_version() {
+        let vs = Arc::new(InMemoryVectorStore::new());
+        let fts = Arc::new(InMemoryFullTextStore::new());
+        let sync = ChunkSyncService::new(vs.clone(), fts.clone());
+        let project_id = ProjectId("lazy-skip".into());
+
+        let seeded = make_record(project_id.clone(), "unchanged");
+        sync.store(&seeded, CancellationToken::new()).await.unwrap();
+
+        // Full re-scan produces the same chunk at the same model version.
+        sync.replace_project(&project_id, std::slice::from_ref(&seeded), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // The row survives the replace untouched (lazy skip — no wipe or
+        // re-embed) and remains searchable and retrievable.
+        let v_results =
+            vs.search(&project_id, &[0.1, 0.2, 0.3], 5, CancellationToken::new()).await.unwrap();
+        assert_eq!(v_results.len(), 1);
+        assert_eq!(v_results[0].chunk_id, "unchanged");
+        assert!(!v_results[0].stale, "kept row must not be marked stale");
+        assert_eq!(
+            vs.get_chunks(&project_id, std::slice::from_ref(&seeded.id), CancellationToken::new())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fts.search("content unchanged", &project_id, 5, CancellationToken::new())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_project_upgrades_sentinel_to_real_vector() {
+        let vs = Arc::new(InMemoryVectorStore::new());
+        let fts = Arc::new(InMemoryFullTextStore::new());
+        let sync = ChunkSyncService::new(vs.clone(), fts.clone());
+        let project_id = ProjectId("sentinel-upgrade".into());
+
+        // ADR-39 FTS-only sentinel: same id, empty vector, same version.
+        let mut sentinel = make_record(project_id.clone(), "s1");
+        sentinel.vector = Vec::new();
+        sync.store(&sentinel, CancellationToken::new()).await.unwrap();
+
+        // A later scan produced a real embedding for the same chunk — the
+        // same-version sentinel must be upgraded, not skipped.
+        let real = make_record(project_id.clone(), "s1");
+        sync.replace_project(&project_id, std::slice::from_ref(&real), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let v_results =
+            vs.search(&project_id, &[0.1, 0.2, 0.3], 5, CancellationToken::new()).await.unwrap();
+        assert_eq!(v_results.len(), 1, "upgraded chunk must be searchable");
+        assert_eq!(v_results[0].chunk_id, "s1");
+    }
+
+    #[tokio::test]
+    async fn replace_project_refreshes_stale_rows_at_live_version() {
+        let vs = Arc::new(InMemoryVectorStore::new());
+        let fts = Arc::new(InMemoryFullTextStore::new());
+        let sync = ChunkSyncService::new(vs.clone(), fts.clone());
+        let project_id = ProjectId("stale-refresh".into());
+
+        let old = make_record(project_id.clone(), "c1");
+        sync.store(&old, CancellationToken::new()).await.unwrap();
+
+        // Startup gate marks the old-model row stale; a full re-scan re-embeds
+        // it at the new live version and clears the stale flag.
+        vs.mark_stale(&project_id, "2.0", CancellationToken::new()).await.unwrap();
+        assert!(
+            vs.search(&project_id, &[0.1, 0.2, 0.3], 5, CancellationToken::new()).await.unwrap()[0]
+                .stale,
+            "precondition: row is stale after mark_stale"
+        );
+
+        let refreshed = EmbeddingRecord { model_version: "2.0".into(), ..old.clone() };
+        sync.replace_project(
+            &project_id,
+            std::slice::from_ref(&refreshed),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let v_results =
+            vs.search(&project_id, &[0.1, 0.2, 0.3], 5, CancellationToken::new()).await.unwrap();
+        assert_eq!(v_results.len(), 1);
+        assert!(!v_results[0].stale, "re-indexed row must be fresh again");
+        let chunk = vs
+            .get_chunks(&project_id, &[old.id], CancellationToken::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("chunk present");
+        assert_eq!(chunk.model_version, "2.0");
     }
 }

@@ -27,6 +27,9 @@ pub struct FusedResult {
     /// Set when the embedder is broken for the project (ADR-39): the result
     /// is FTS-only and carries an explicit notice to the caller.
     pub notice: Option<std::sync::Arc<str>>,
+    /// `true` when the backing row is stale (older embedding model version).
+    /// Stale results are retained but rank-demoted behind fresh ones (ADR-12).
+    pub stale: bool,
 }
 
 /// Hybrid retriever combining BM25 and vector search.
@@ -105,6 +108,7 @@ impl HybridRetriever {
                     fts_score: 1.0 / (k as f64 + rank as f64),
                     content: fr.content,
                     notice: Some(EMBEDDER_DEGRADED_NOTICE.into()),
+                    stale: false,
                 })
                 .collect();
             degraded.truncate(k);
@@ -122,7 +126,15 @@ impl HybridRetriever {
         let fts_results = fts_results.unwrap_or_default();
 
         let mut fused = fuse_results(&vector_results, &fts_results, RRF_K);
-        fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Two-tier demotion (ADR-12): fresh rows rank first, stale rows after,
+        // each tier ordered by fused score descending. No score scaling — this
+        // keeps RRF ordinal purity while ensuring old-model rows never crowd
+        // out fresh ones in the top-k.
+        fused.sort_by(|a, b| {
+            a.stale
+                .cmp(&b.stale)
+                .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        });
         fused.truncate(k);
         fused
     }
@@ -140,12 +152,16 @@ fn fuse_results(
     let mut scores: HashMap<String, (f64, f64)> = HashMap::new();
     // Map chunk_id -> content from vector results (if any)
     let mut content_map: HashMap<String, String> = HashMap::new();
+    // Map chunk_id -> staleness, carried from the vector store (authoritative
+    // for model-version staleness; the FTS table has no staleness column).
+    let mut stale_map: HashMap<String, bool> = HashMap::new();
 
     for (rank, vr) in vector_results.iter().enumerate() {
         let entry = scores.entry(vr.chunk_id.clone()).or_insert((0.0, 0.0));
         entry.0 = 1.0 / (k + (rank as f64));
         // Store content for later use
         content_map.insert(vr.chunk_id.clone(), vr.content.clone());
+        stale_map.insert(vr.chunk_id.clone(), vr.stale);
     }
 
     for (rank, fr) in fts_results.iter().enumerate() {
@@ -164,8 +180,12 @@ fn fuse_results(
             fts_score: f_score,
             content: content_map.get(&chunk_id).cloned().unwrap_or_default(),
             notice: None,
+            stale: stale_map.get(&chunk_id).copied().unwrap_or(false),
         })
         .collect();
+    // `fuse_results` ranks purely by fused score (RRF ordinal purity is
+    // preserved — the two-tier demotion happens in `retrieve`); this sort is
+    // only a stable order for callers that rely on score ordering.
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results
 }
@@ -175,11 +195,15 @@ mod tests {
     use super::*;
 
     fn make_vector_result(chunk_id: &str, score: f64, content: &str) -> VectorResult {
-        VectorResult { chunk_id: chunk_id.into(), score, content: content.into() }
+        VectorResult { chunk_id: chunk_id.into(), score, content: content.into(), stale: false }
     }
 
     fn make_fts_result(chunk_id: &str, score: f64, content: &str) -> FtsResult {
-        FtsResult { chunk_id: chunk_id.into(), score, content: content.into() }
+        FtsResult { chunk_id: chunk_id.into(), score, content: content.into(), stale: false }
+    }
+
+    fn make_vector_result_stale(chunk_id: &str, score: f64, content: &str) -> VectorResult {
+        VectorResult { chunk_id: chunk_id.into(), score, content: content.into(), stale: true }
     }
 
     #[test]
@@ -246,6 +270,18 @@ mod tests {
         assert_eq!(result.len(), 1);
         // FTS content wins because it's inserted last into content_map
         assert_eq!(result[0].content, "fts content");
+    }
+
+    /// ADR-12: `fuse_results` carries the vector store's staleness flag
+    /// through to the fused result (the FTS table has no staleness column,
+    /// so the vector store is authoritative for model-version staleness).
+    #[test]
+    fn fuse_results_propagates_stale_from_vector_result() {
+        let vector = vec![make_vector_result_stale("a", 0.9, "stale content")];
+        let fts = vec![make_fts_result("a", 0.8, "stale content")];
+        let result = fuse_results(&vector, &fts, RRF_K);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].stale, "staleness must survive fusion");
     }
 
     #[test]
@@ -323,6 +359,7 @@ mod tests {
             score: 1.0,
             model_id: "m".into(),
             model_version: "1".into(),
+            stale: false,
         };
         fts.insert(&chunk, &pid, CancellationToken::new()).await.unwrap();
         let retriever = HybridRetriever::new(vs, fts);
@@ -349,5 +386,81 @@ mod tests {
         let recovered =
             retriever.retrieve(&query, &[0.1; 8], Some(5), CancellationToken::new()).await;
         assert!(recovered.iter().all(|r| r.notice.is_none()), "notice cleared on recovery");
+    }
+
+    /// ADR-12 two-tier demotion: in `retrieve`, a stale (old embedding model)
+    /// row ranks behind a fresh row even when the stale row has the higher
+    /// fused RRF score. Fresh-first ordering is a hard rank rule, not a score
+    /// tie-break (no score scaling — RRF ordinal purity is preserved).
+    #[tokio::test]
+    async fn retrieve_ranks_fresh_before_stale_regardless_of_score() {
+        use concerto_core::memory::{ChunkType, EmbeddingRecord, MemoryNamespace};
+
+        let pid = ProjectId("adam12-proj".into());
+        // InMemoryVectorStore::search sorts by chunk_id, so "a_stale" is
+        // vector rank 0 (highest RRF fused score) and "z_fresh" rank 1 —
+        // without demotion the stale row would come first.
+        let stale_record = EmbeddingRecord {
+            id: "a_stale".into(),
+            project_id: pid.clone(),
+            chunk_hash: "h0".into(),
+            content: "stale content".into(),
+            file_path: "a.rs".into(),
+            start_line: Some(1),
+            end_line: Some(2),
+            chunk_type: ChunkType::Function,
+            vector: vec![0.1, 0.2, 0.3],
+            model_id: "old-model".into(),
+            model_version: "1.0".into(),
+            stale: true,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let fresh_record = EmbeddingRecord {
+            id: "z_fresh".into(),
+            project_id: pid.clone(),
+            chunk_hash: "h1".into(),
+            content: "fresh content".into(),
+            file_path: "b.rs".into(),
+            start_line: Some(1),
+            end_line: Some(2),
+            chunk_type: ChunkType::Function,
+            vector: vec![0.4, 0.5, 0.6],
+            model_id: "new-model".into(),
+            model_version: "2.0".into(),
+            stale: false,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+
+        let vs = Arc::new(crate::testing::InMemoryVectorStore::with_records(vec![
+            (pid.clone(), stale_record),
+            (pid.clone(), fresh_record),
+        ]));
+        let fts = Arc::new(crate::testing::InMemoryFullTextStore::new());
+        let retriever = HybridRetriever::new(vs, fts);
+        let query = MemoryQuery {
+            text: "irrelevant".into(),
+            project_id: pid.clone(),
+            namespace: MemoryNamespace::Project(pid.clone()),
+            top_k: 2,
+            filters: vec![],
+        };
+
+        let results =
+            retriever.retrieve(&query, &[1.0; 8], Some(2), CancellationToken::new()).await;
+        assert_eq!(results.len(), 2, "both rows are candidates at top_k=2");
+        // Prove the premise: the stale row's fused score is higher, so only
+        // demotion (not raw scoring) can put the fresh row first.
+        let stale = results.iter().find(|r| r.chunk_id == "a_stale").unwrap();
+        let fresh = results.iter().find(|r| r.chunk_id == "z_fresh").unwrap();
+        assert!(
+            stale.score > fresh.score,
+            "stale row must outscore fresh row for a meaningful test"
+        );
+        assert_eq!(
+            results[0].chunk_id, "z_fresh",
+            "fresh row must outrank the higher-scoring stale row"
+        );
+        assert_eq!(results[1].chunk_id, "a_stale");
+        assert!(!results[0].stale && results[1].stale);
     }
 }

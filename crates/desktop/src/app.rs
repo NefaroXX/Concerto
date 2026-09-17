@@ -3303,6 +3303,7 @@ impl App {
                             age: String::new(),
                             score: chunk.score as f32,
                             entry_type,
+                            stale: chunk.stale,
                         }
                     })
                     .collect())
@@ -5533,6 +5534,7 @@ custom_agents = []
             age: String::new(),
             score: 0.9,
             entry_type: crate::views::memory::MemoryEntryType::Fact,
+            stale: false,
         }
     }
 
