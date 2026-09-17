@@ -423,8 +423,11 @@ impl Default for AppConfig {
 /// Additive serde-default only: every knob is optional, and a missing
 /// `[context]` section (or missing knob) keeps the engine's embedded defaults
 /// from `context_compaction.rs` (`trigger_tokens` 16000, `retain_user_turns` 4,
-/// `minimum_user_turns` 6). No schema migration is required; this section is a
-/// first-class v5 field but defaults to `None` for old configs.
+/// `minimum_user_turns` 6). `cache_stable_prefix` is the ADR-048 gap knob:
+/// it is resolved on the engine's budget policy but held as a label while the
+/// dialect cache-op wiring lands (additive, no behavior change when unset).
+/// No schema migration is required; this section is a first-class v5 field but
+/// defaults to `None` for old configs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ContextConfig {
     /// Token budget that triggers deterministic compaction. When unset the
@@ -439,6 +442,22 @@ pub struct ContextConfig {
     /// (`6`) applies.
     #[serde(default)]
     pub minimum_user_turns: Option<usize>,
+    /// Request an explicit prefix-stability boundary between the deterministic
+    /// checkpoint head and the recent tail the engine materializes for the
+    /// next request. `true` asks the engine to mark the frontier/tail edge so
+    /// a provider dialect's prompt-cache op can break there — aligning the
+    /// cached prefix with the byte-stable head instead of the first user turn.
+    /// `false` or unset (`None`, the default) keeps today's behavior, where
+    /// the provider-level `[model_settings.providers].cache_breakpoints` dial
+    /// is the only cache-marker path.
+    ///
+    /// TODO(ADR-048): exposed and resolved on the engine's budget policy but
+    /// not yet forwarded to a dialect cache op — the marker needs a
+    /// `Message`-level carrier before `AnthropicChatDialect::apply_cache_breakpoints`
+    /// can consume it. Wiring deliberately deferred; `None` output is
+    /// byte-identical to today.
+    #[serde(default)]
+    pub cache_stable_prefix: Option<bool>,
 }
 
 /// Runtime memory controls shared by CLI and desktop.
@@ -2457,6 +2476,41 @@ mod tests {
         )
         .unwrap();
         assert!(explicit.cache_breakpoints);
+    }
+
+    #[test]
+    fn context_config_cache_stable_prefix_round_trip() {
+        // Legacy `[context]` section without the knob loads with it unset
+        // (additive `serde(default)`; None = existing behavior). This is the
+        // ADR-048 gap knob and must never change what an old section means.
+        let legacy = toml::from_str::<ContextConfig>("trigger_tokens = 8000\n").unwrap();
+        assert_eq!(legacy.cache_stable_prefix, None, "unset knob stays None");
+
+        // Explicit true and false survive a TOML round trip unchanged.
+        for enabled in [true, false] {
+            let config =
+                ContextConfig { cache_stable_prefix: Some(enabled), ..ContextConfig::default() };
+            let encoded = toml::to_string(&config).unwrap();
+            assert!(
+                encoded.contains(&format!("cache_stable_prefix = {enabled}")),
+                "unexpected encoding: {encoded}"
+            );
+            let decoded: ContextConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.cache_stable_prefix, Some(enabled));
+            assert_eq!(
+                toml::to_string(&decoded).unwrap(),
+                encoded,
+                "round trip is byte-stable for enabled={enabled}"
+            );
+        }
+
+        // Parsing an explicitly-true section sets the knob.
+        let explicit = toml::from_str::<ContextConfig>(
+            "trigger_tokens = 8000\nretain_user_turns = 2\nminimum_user_turns = 4\n\
+             cache_stable_prefix = true\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.cache_stable_prefix, Some(true));
     }
 
     // ------------------------------------------------------------------

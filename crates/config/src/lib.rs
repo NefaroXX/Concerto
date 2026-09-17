@@ -880,6 +880,7 @@ mod tests {
         assert_eq!(context.trigger_tokens, Some(8_000));
         assert_eq!(context.retain_user_turns, None, "unset knobs stay None");
         assert_eq!(context.minimum_user_turns, None, "unset knobs stay None");
+        assert_eq!(context.cache_stable_prefix, None, "unset knobs stay None");
 
         let without = load_config(None, None).expect("defaults must load");
         assert!(without.context.is_none(), "no [context] section -> None");
@@ -891,7 +892,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 5\n[context]\ntrigger_tokens = 12000\nretain_user_turns = 2\nminimum_user_turns = 4\n",
+            "schema_version = 5\n[context]\ntrigger_tokens = 12000\nretain_user_turns = 2\nminimum_user_turns = 4\ncache_stable_prefix = true\n",
         )
         .unwrap();
         let cfg = load_config(Some(&path), None).expect("config with full [context] must load");
@@ -899,6 +900,7 @@ mod tests {
         assert_eq!(context.trigger_tokens, Some(12_000));
         assert_eq!(context.retain_user_turns, Some(2));
         assert_eq!(context.minimum_user_turns, Some(4));
+        assert_eq!(context.cache_stable_prefix, Some(true));
     }
 
     // ---- ADR-58: [orchestration] loads and validates at load time ----

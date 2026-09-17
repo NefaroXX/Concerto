@@ -767,6 +767,7 @@ mod tests {
                 trigger_tokens: Some(20_000),
                 retain_user_turns: None,
                 minimum_user_turns: Some(2),
+                cache_stable_prefix: Some(true),
             }),
             ..Default::default()
         }
