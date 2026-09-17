@@ -15,6 +15,7 @@ pub mod failures;
 pub mod helpers;
 pub mod ids;
 pub mod intent;
+pub mod lock;
 pub mod memory;
 pub mod policy;
 pub mod policy_presets;

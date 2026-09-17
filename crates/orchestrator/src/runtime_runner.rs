@@ -34,6 +34,7 @@ use concerto_core::event::{Event, EventBus, EventKind, IntentRouteDecision};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{PlanDecision, RequestedOutcome, RouterOutput, RouterRoute, RunStage};
+use concerto_core::lock::DataDirLock;
 use concerto_core::traits::approval::ApprovalSink;
 use concerto_core::traits::memory::{MemoryStore, NullMemoryStore};
 use concerto_core::traits::policy::{AuditEntry, AuditLog, PolicyEngine};
@@ -527,6 +528,10 @@ pub struct ActiveMemoryServices {
     pub reindex: Arc<ProjectIndexer>,
     pub reindex_sync: Arc<ChunkSyncService>,
     pub cancel: CancellationToken,
+    /// Held `.concerto.lock` for the Concerto data root (ADR-11), acquired
+    /// when the memory system initialises and kept for the subsystem's
+    /// lifetime.
+    pub data_dir_lock: Option<Arc<DataDirLock>>,
 }
 
 /// Bundles services that are reused across calls.
@@ -1106,6 +1111,10 @@ fn resolve_model_id(
         .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string())
 }
 
+/// How long memory initialisation waits for the `.concerto.lock` (ADR-11)
+/// before failing the memory init.
+const MEMORY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Initialise or reuse the memory system scoped to a project root.
 pub async fn init_memory_system(
     bus: EventBus,
@@ -1114,6 +1123,7 @@ pub async fn init_memory_system(
     reindex: &Arc<Mutex<Option<Arc<ProjectIndexer>>>>,
     reindex_sync: &Arc<Mutex<Option<Arc<ChunkSyncService>>>>,
     memory_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    data_dir_lock: &Arc<Mutex<Option<Arc<DataDirLock>>>>,
 ) -> Result<Arc<dyn MemoryStore>, OrchestratorError> {
     // Re‑use the same implementation as CLI/Desktop apps – copy/paste the
     // `init_memory_system` logic from those modules (project ID hashing, DB
@@ -1126,9 +1136,20 @@ pub async fn init_memory_system(
         previous.cancel();
     }
 
-    let data_dir = concerto_sessions::app_data_dir()
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: {e}")))?
-        .join("memory");
+    // ADR-11: one `.concerto.lock` at the data root governs the memory
+    // database. Acquired here and parked into `data_dir_lock` so it is held
+    // for the memory subsystem's lifetime, not just during init.
+    let root_data_dir = concerto_sessions::app_data_dir()
+        .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: {e}")))?;
+    let lock = concerto_core::lock::acquire_data_dir_lock(
+        &root_data_dir,
+        Some(MEMORY_LOCK_TIMEOUT),
+        Some(&lifecycle),
+    )
+    .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: lock {e}")))?;
+    *data_dir_lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+
+    let data_dir = root_data_dir.join("memory");
     let db_path = data_dir.join("memory.db");
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2029,6 +2050,7 @@ async fn select_or_init_memory_services(
     let reindex_temp: Arc<Mutex<Option<Arc<ProjectIndexer>>>> = Arc::new(Mutex::new(None));
     let reindex_sync_temp: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let lock_temp: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
     let mem = init_memory_system(
         services.bus.clone(),
         &services.config,
@@ -2036,6 +2058,7 @@ async fn select_or_init_memory_services(
         &reindex_temp,
         &reindex_sync_temp,
         &cancel_temp,
+        &lock_temp,
     )
     .await
     .map_err(|e| OrchestratorError::AgentLoopError(format!("Memory init failed: {e}")))?;
@@ -2054,9 +2077,16 @@ async fn select_or_init_memory_services(
             )
         })?;
     let cancel = cancel_temp.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let data_dir_lock = lock_temp.lock().unwrap_or_else(|e| e.into_inner()).take();
 
-    let active =
-        ActiveMemoryServices { project_id, store: mem.clone(), reindex, reindex_sync, cancel };
+    let active = ActiveMemoryServices {
+        project_id,
+        store: mem.clone(),
+        reindex,
+        reindex_sync,
+        cancel,
+        data_dir_lock,
+    };
     *services.memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
     Ok(Some(mem))
 }
@@ -6303,6 +6333,7 @@ mod runtime_runner_tests {
                 Arc::new(DummyFullTextStore),
             )),
             cancel: CancellationToken::new(),
+            data_dir_lock: None,
         }
     }
 

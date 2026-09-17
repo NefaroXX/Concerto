@@ -1280,6 +1280,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "criterion",
+ "fd-lock",
  "futures",
  "gix",
  "proptest",

@@ -3087,6 +3087,8 @@ impl App {
                         Arc::new(Mutex::new(None));
                     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> =
                         Arc::new(Mutex::new(None));
+                    let lock_temp: Arc<Mutex<Option<Arc<concerto_core::lock::DataDirLock>>>> =
+                        Arc::new(Mutex::new(None));
                     match init_memory_system(
                         bus,
                         &app_config,
@@ -3094,6 +3096,7 @@ impl App {
                         &reindex_temp,
                         &reindex_sync_temp,
                         &cancel_temp,
+                        &lock_temp,
                     )
                     .await
                     {
@@ -3107,6 +3110,8 @@ impl App {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .take()
                                 .unwrap_or_default();
+                            let data_dir_lock =
+                                lock_temp.lock().unwrap_or_else(|e| e.into_inner()).take();
                             match (indexer, sync) {
                                 (Some(indexer), Some(sync)) => {
                                     let active = ActiveMemoryServices {
@@ -3115,6 +3120,7 @@ impl App {
                                         reindex: indexer.clone(),
                                         reindex_sync: sync.clone(),
                                         cancel: cancel.clone(),
+                                        data_dir_lock,
                                     };
                                     *memory.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(active);
@@ -3196,6 +3202,8 @@ impl App {
                         Arc::new(Mutex::new(None));
                     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> =
                         Arc::new(Mutex::new(None));
+                    let lock_temp: Arc<Mutex<Option<Arc<concerto_core::lock::DataDirLock>>>> =
+                        Arc::new(Mutex::new(None));
                     let store = init_memory_system(
                         bus,
                         &config,
@@ -3203,6 +3211,7 @@ impl App {
                         &reindex_temp,
                         &reindex_sync_temp,
                         &cancel_temp,
+                        &lock_temp,
                     )
                     .await
                     .map_err(|error| error.to_string())?;
@@ -3223,12 +3232,14 @@ impl App {
                         .unwrap_or_else(|e| e.into_inner())
                         .take()
                         .unwrap_or_default();
+                    let data_dir_lock = lock_temp.lock().unwrap_or_else(|e| e.into_inner()).take();
                     let active = ActiveMemoryServices {
                         project_id,
                         store: store.clone(),
                         reindex,
                         reindex_sync,
                         cancel,
+                        data_dir_lock,
                     };
                     *memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
                     store

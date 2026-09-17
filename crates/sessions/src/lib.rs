@@ -26,6 +26,7 @@ pub use whiteboard::{
 pub mod testing;
 
 use concerto_core::ids::Ulid;
+use concerto_core::lock::{acquire_data_dir_lock, DataDirLock};
 use concerto_core::transcript::TranscriptEntry;
 use concerto_core::types::{Message, ProviderMetrics, TokenBudget};
 use concerto_core::CancellationToken;
@@ -33,6 +34,7 @@ use concerto_core::TaskId;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -71,6 +73,16 @@ impl From<serde_json::Error> for SessionError {
         SessionError::Serialization(err.to_string())
     }
 }
+
+impl From<concerto_core::lock::LockError> for SessionError {
+    fn from(err: concerto_core::lock::LockError) -> Self {
+        SessionError::Lock(err.to_string())
+    }
+}
+
+/// How long `connect()` waits for a `.concerto.lock` held by another instance
+/// (ADR-11) before failing with [`SessionError::Lock`].
+const SESSION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Resolve the Concerto data root — `dirs::data_dir()` (i.e.
 /// `$XDG_DATA_HOME` or `~/.local/share` on Linux) joined with `concerto` —
@@ -421,13 +433,26 @@ pub trait SessionStore: Send + Sync {
 
 pub struct SqliteSessionStore {
     pool: SqlitePool,
+    /// Held `.concerto.lock` for the data root (ADR-11), acquired by the
+    /// convenience `connect()` entry point and kept for the store's lifetime.
+    /// `connect_path` / `connect_in_memory` (tests, explicit paths) never set
+    /// it, so those paths stay free of data-root side effects.
+    _data_dir_lock: Option<Arc<DataDirLock>>,
 }
 
 impl SqliteSessionStore {
+    /// Connect to the canonical sessions database under the Concerto data
+    /// root, holding the process-wide `.concerto.lock` (ADR-11) for as long
+    /// as the returned store lives. Fails with [`SessionError::Lock`] when
+    /// another instance holds the lock and does not release it within the
+    /// wait window.
     pub async fn connect() -> Result<Self, SessionError> {
         let data_dir = app_data_dir()?;
+        let data_dir_lock = acquire_data_dir_lock(&data_dir, Some(SESSION_LOCK_TIMEOUT), None)?;
         let db_path = data_dir.join("sessions.db");
-        Self::connect_path(&db_path).await
+        let mut store = Self::connect_path(&db_path).await?;
+        store._data_dir_lock = Some(data_dir_lock);
+        Ok(store)
     }
 
     /// Connect to an explicit database path. SQLite WAL and `busy_timeout`
@@ -512,7 +537,7 @@ impl SqliteSessionStore {
             .await
             .map_err(|e| SessionError::Database(e.to_string()))?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, _data_dir_lock: None })
     }
 
     // In‑memory connection for tests – avoids filesystem side‑effects and uses the same PRAGMAs.
@@ -554,7 +579,7 @@ impl SqliteSessionStore {
             .await
             .map_err(|e| SessionError::Database(e.to_string()))?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, _data_dir_lock: None })
     }
 }
 

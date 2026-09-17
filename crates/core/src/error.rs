@@ -577,10 +577,27 @@ pub enum MemoryError {
 
     /// Data directory is locked by another instance.
     ///
-    /// Another Concerto instance is already using the data directory. Only one
-    /// instance can access the data directory at a time to prevent corruption.
-    #[error("another instance holds the data directory lock")]
-    DataDirLocked,
+    /// ADR-11: exactly one `.concerto.lock` file lives in the Concerto data
+    /// root and is held via an OS advisory lock (`fd-lock`) by whichever
+    /// instance owns the directory, so only one instance can access it at a
+    /// time. `path` is the locked data directory; `pid_hint` (when known) is
+    /// the holder's PID read back from the lock file (best-effort).
+    #[error(
+        "another instance holds the data directory lock at {path}{}",
+        crate::lock::format_pid_hint(.pid_hint)
+    )]
+    DataDirLocked { path: std::path::PathBuf, pid_hint: Option<u32> },
+}
+
+impl From<crate::lock::LockError> for MemoryError {
+    fn from(error: crate::lock::LockError) -> Self {
+        match error {
+            crate::lock::LockError::Locked { path, pid_hint } => {
+                MemoryError::DataDirLocked { path, pid_hint }
+            }
+            other => MemoryError::Persistence(format!("data directory error: lock {other}")),
+        }
+    }
 }
 
 /// Session persistence and replay errors.
