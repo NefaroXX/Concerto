@@ -745,6 +745,48 @@ fn run_plugin_subcommand(args: &[String]) -> anyhow::Result<()> {
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("usage: concerto plugin revoke <plugin-id>"))?;
             cap_mgr.revoke_plugin(plugin_id)?;
+
+            // Best-effort runtime revocation (ADR-37): signal the in-memory
+            // grant set through a fresh manager. This CLI process never has
+            // plugins loaded, so NotActive is the expected outcome — tolerate
+            // it and only surface unexpected failures.
+            match concerto_plugins::host::PluginHost::new() {
+                Ok(host) => {
+                    let manager = concerto_plugins::manager::PluginManager::new(
+                        std::sync::Arc::new(host),
+                        concerto_plugins::capability::CapabilityManager::open(&data_dir)
+                            .map_err(|e| anyhow::anyhow!("could not open capability store: {e}"))?,
+                        None,
+                        None,
+                    );
+                    let outcome = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("failed to start async runtime: {e}"))?
+                        .block_on(manager.revoke_grants(plugin_id));
+                    match outcome {
+                        Ok(()) => {
+                            tracing::info!(plugin_id, "revoke_grants: live grants cleared");
+                        }
+                        Err(concerto_plugins::error::PluginError::NotActive { .. }) => {
+                            tracing::debug!(
+                                plugin_id,
+                                "revoke_grants: plugin not active in this process (expected)"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            plugin_id,
+                            error = %e,
+                            "revoke_grants: failed to clear in-memory grants"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "revoke_grants: could not construct plugin host — skipped"
+                ),
+            }
+
             println!("Capability grants revoked for plugin '{plugin_id}'.");
         }
         other => {

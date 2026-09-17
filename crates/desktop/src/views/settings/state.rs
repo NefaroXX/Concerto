@@ -1192,33 +1192,25 @@ impl State {
 
             // ADR-37 — Plugin grant lifecycle. Grants are persisted in the
             // capability store (not AppConfig), so revoke never touches
-            // `settings_dirty`.
+            // `settings_dirty`. The revoke runs off the UI thread inside
+            // `Task::perform`; the callback refreshes the cached lists and
+            // displays the outcome line.
             Message::PluginRevokePressed(plugin_id) => {
-                let data_dir = dirs::data_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("concerto")
-                    .join("plugins");
-                let result = (|| -> Result<(), String> {
-                    let cap_mgr = concerto_plugins::capability::CapabilityManager::open(&data_dir)
-                        .map_err(|e| format!("could not open capability store: {e}"))?;
-                    cap_mgr.revoke_plugin(&plugin_id).map_err(|e| e.to_string())?;
-                    Ok(())
-                })();
-                match &result {
-                    Ok(()) => {
-                        self.plugin_revoke_result =
-                            Some(format!("Revoked grants for '{plugin_id}'"));
-                        // Remove from cached lists.
-                        if let Some(pos) =
-                            self.plugin_granted_ids.iter().position(|id| *id == plugin_id)
-                        {
-                            self.plugin_granted_ids.remove(pos);
-                            self.plugin_grants_summary.remove(pos);
-                        }
-                    }
-                    Err(e) => {
-                        self.plugin_revoke_result = Some(format!("Error: {e}"));
-                    }
+                return iced::Task::perform(
+                    super::helpers::revoke_plugin_grants(plugin_id),
+                    Message::PluginRevokeResult,
+                );
+            }
+            Message::PluginRevokeResult(result) => {
+                self.plugin_revoke_result = Some(match &result {
+                    Ok(message) => message.clone(),
+                    Err(error) => format!("Error: {error}"),
+                });
+                if result.is_ok() {
+                    // Persisted grants were removed; re-read the store so the
+                    // cached lists reflect reality (including any other
+                    // plugins affected by the same store write).
+                    self.load_plugin_grants();
                 }
             }
 

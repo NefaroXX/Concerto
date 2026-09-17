@@ -1,5 +1,7 @@
 use crate::active_plugin::ActivePlugin;
-use crate::capability::{CapabilityApprovalUI, CapabilityManager, GrantedCapabilities};
+use crate::capability::{
+    CapabilityApprovalUI, CapabilityDiscriminant, CapabilityManager, GrantedCapabilities,
+};
 use crate::dialect_host::DialectHost;
 use crate::discovery::{DiscoveryConfig, PluginCandidate, PluginDiscovery};
 use crate::error::PluginError;
@@ -46,6 +48,11 @@ pub struct PluginManager {
     plugin_tools: HashMap<String, Vec<String>>,
     /// Violation counts per plugin.
     violations: HashMap<String, u32>,
+    /// Resolved persistent grants for plugins whose `load_plugin` skipped the
+    /// approval prompt because persisted (hash-pinned) grants already covered
+    /// every required capability (ADR-37 prompt-skip). Consumed by
+    /// `initialise_plugin` and cleaned up on unload.
+    resolved_grants: HashMap<String, GrantedCapabilities>,
 }
 
 impl PluginManager {
@@ -69,6 +76,7 @@ impl PluginManager {
             status: HashMap::new(),
             plugin_tools: HashMap::new(),
             violations: HashMap::new(),
+            resolved_grants: HashMap::new(),
         }
     }
 
@@ -91,6 +99,9 @@ impl PluginManager {
         approval_ui: &dyn CapabilityApprovalUI,
     ) -> Result<LoadedPlugin, PluginError> {
         let loaded = self.loader.load_from_bytes(wasm_bytes, source).await?;
+        // A fresh load always starts from a clean resolved-grant slate; the
+        // prompt-skip path below re-populates it when applicable.
+        self.resolved_grants.remove(&loaded.manifest.id);
         let manifest_hash = if loaded.manifest.capabilities_required.is_empty() {
             None
         } else {
@@ -99,6 +110,28 @@ impl PluginManager {
 
         // Request capability approval if needed.
         if !loaded.manifest.capabilities_required.is_empty() {
+            // ADR-37 prompt-skip: persisted (hash-pinned) grants that still
+            // cover every required capability mean the user already approved
+            // this exact binary — load without re-prompting and resolve the
+            // live grant set from the store for `initialise_plugin`.
+            let persisted =
+                self.capability_manager.load_grants(&loaded.manifest.id, manifest_hash.as_deref());
+            let all_covered = loaded.manifest.capabilities_required.iter().all(|req| {
+                let disc: CapabilityDiscriminant = req.into();
+                persisted.iter().any(|(d, _, _)| *d == disc)
+            });
+            if all_covered {
+                tracing::info!(
+                    plugin_id = %loaded.manifest.id,
+                    "persisted grants cover all required capabilities — skipping approval prompt"
+                );
+                self.resolved_grants.insert(
+                    loaded.manifest.id.clone(),
+                    GrantedCapabilities::with_persistent(&loaded.manifest.id, persisted),
+                );
+                return Ok(loaded);
+            }
+
             let decisions = self
                 .capability_manager
                 .request_approval(
@@ -136,7 +169,13 @@ impl PluginManager {
         loaded: &LoadedPlugin,
         granted_caps: GrantedCapabilities,
     ) -> Result<(), PluginError> {
-        let active = self.loader.initialise(loaded, granted_caps).await?;
+        // ADR-37 prompt-skip: when `load_plugin` resolved the grant set from
+        // persisted grants without prompting, prefer those over the
+        // (typically empty) caller-provided set. Consumed once so an
+        // un-initialised plugin never lingers in the map.
+        let effective_caps =
+            self.resolved_grants.remove(&loaded.manifest.id).unwrap_or(granted_caps);
+        let active = self.loader.initialise(loaded, effective_caps).await?;
         let plugin_id = active.manifest.id.clone();
 
         // Track active plugin wrapped in Arc<Mutex> for tool registration.
@@ -234,6 +273,7 @@ impl PluginManager {
         self.active.remove(plugin_id);
         self.status.remove(plugin_id);
         self.violations.remove(plugin_id);
+        self.resolved_grants.remove(plugin_id);
 
         Ok(())
     }

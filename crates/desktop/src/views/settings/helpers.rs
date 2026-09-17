@@ -163,6 +163,60 @@ pub(crate) async fn probe_mcp_server(
     tools.map_err(|error| format!("tools/list failed: {error}"))
 }
 
+/// ADR-37 — Revoke a plugin's capability grants from the Settings UI. First
+/// removes the persisted grants via [`CapabilityManager::revoke_plugin`], then
+/// signals a best-effort live clear through [`PluginManager::revoke_grants`]
+/// so host-function checks fail closed while the plugin is still loaded.
+///
+/// The desktop process keeps no long-lived `PluginManager` (one is created per
+/// agent run inside the orchestrator runtime and dropped afterwards), so this
+/// helper constructs a fresh manager bound to the same capability store.
+/// `NotActive` — the expected outcome when the plugin is not loaded right
+/// now — is tolerated and logged, mirroring `concerto plugin revoke` in the
+/// CLI. Returns a human-readable outcome line for the Plugins section.
+pub(crate) async fn revoke_plugin_grants(plugin_id: String) -> Result<String, String> {
+    let data_dir = concerto_plugins::capability::CapabilityManager::data_dir();
+    let cap_mgr = concerto_plugins::capability::CapabilityManager::open(&data_dir)
+        .map_err(|e| format!("could not open capability store: {e}"))?;
+    cap_mgr.revoke_plugin(&plugin_id).map_err(|e| e.to_string())?;
+
+    // Best-effort live revocation (ADR-37): signal the in-memory grant set
+    // through a fresh manager against the same store. The desktop keeps no
+    // persistent manager handle, so `NotActive` is expected whenever the
+    // plugin is not loaded in this process — tolerate it and only surface
+    // unexpected failures.
+    if let Ok(host) = concerto_plugins::host::PluginHost::new() {
+        let manager = concerto_plugins::manager::PluginManager::new(
+            std::sync::Arc::new(host),
+            cap_mgr,
+            None,
+            None,
+        );
+        match manager.revoke_grants(&plugin_id).await {
+            Ok(()) => {
+                tracing::info!(plugin_id, "revoke_grants: live grants cleared");
+            }
+            Err(concerto_plugins::error::PluginError::NotActive { .. }) => {
+                tracing::debug!(
+                    plugin_id,
+                    "revoke_grants: plugin not active in this process (expected)"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    plugin_id,
+                    error = %error,
+                    "revoke_grants: failed to clear in-memory grants"
+                );
+            }
+        }
+    } else {
+        tracing::warn!("revoke_grants: could not construct plugin host — skipped");
+    }
+
+    Ok(format!("Revoked grants for '{plugin_id}'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::*;

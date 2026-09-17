@@ -401,6 +401,9 @@ impl CapGrantStore {
     /// Load grants for a plugin, filtering out expired entries and those whose
     /// manifest hash (if pinned) does not match the current WASM binary.
     ///
+    /// Pruned entries are persisted back to disk so subsequent loads avoid
+    /// re-processing stale grants (ADR-37 prune-on-load).
+    ///
     /// Each returned entry is `(discriminant, scope, expires_at)` — the expiry
     /// is included so the in-memory grant model can keep enforcing the TTL per
     /// call after load.
@@ -409,50 +412,64 @@ impl CapGrantStore {
         plugin_id: &str,
         wasm_hash: Option<&str>,
     ) -> Vec<(CapabilityDiscriminant, CapabilityScope, u64)> {
-        // In an infallible context - recover from poison
-        let store = self.grants.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(values) = store.get(plugin_id) else {
-            return vec![];
-        };
-        values
-            .iter()
-            .filter(|g| {
-                // Filter out hash mismatches
-                if g.hash_mismatch(wasm_hash) {
-                    tracing::info!(
-                        plugin_id,
-                        "grant hash mismatch (binary changed since approval), re-prompt required"
-                    );
-                    return false;
+        let pruned;
+        let grants = {
+            // Recover from poison in an infallible context.
+            let mut store = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(values) = store.get(plugin_id) else {
+                return vec![];
+            };
+            let count_before = values.len();
+
+            // Keep only grants that survive hash pinning and expiry/format
+            // checks; everything else is dropped from the store so the disk
+            // write below removes it (ADR-37 prune-on-load).
+            let retained: Vec<PersistedGrant> = values
+                .iter()
+                .filter(|g| {
+                    if g.hash_mismatch(wasm_hash) {
+                        tracing::info!(
+                            plugin_id,
+                            disc = %g.disc,
+                            "grant hash mismatch (binary changed since approval), \
+                             pruning and re-prompting"
+                        );
+                        return false;
+                    }
+                    g.to_discriminant_and_scope().is_some()
+                })
+                .cloned()
+                .collect();
+            pruned = retained.len() < count_before;
+            if pruned {
+                if retained.is_empty() {
+                    store.remove(plugin_id);
+                } else {
+                    store.insert(plugin_id.to_string(), retained.clone());
                 }
-                true
-            })
-            .filter_map(|g| g.to_discriminant_and_scope())
-            .collect()
+            }
+
+            retained.iter().filter_map(|g| g.to_discriminant_and_scope()).collect::<Vec<_>>()
+        };
+        // Persist the pruned grants back to disk (lock is released above).
+        if pruned {
+            if let Err(e) = self.write_store() {
+                tracing::warn!(plugin_id, error = %e, "failed to persist pruned grants");
+            }
+        }
+        grants
     }
 
-    /// Save a grant with an optional manifest hash.
-    fn save_grant(
-        &self,
-        plugin_id: &str,
-        cap: &CapabilityDiscriminant,
-        scope: &CapabilityScope,
-        manifest_hash: Option<String>,
-    ) -> Result<(), PluginError> {
-        // Use map_err to handle poison error
-        let mut store = self.grants.lock().map_err(|_| {
+    /// Serialize the current grants map and persist it to disk.
+    ///
+    /// Acquires the grants lock, serialises to JSON, creates the parent
+    /// directory if needed, and writes `plugin_cap_grants.json`.
+    fn write_store(&self) -> Result<(), PluginError> {
+        let store = self.grants.lock().map_err(|_| {
             PluginError::Core(concerto_core::error::CoreError::EventBus(
                 "capability grants lock poisoned".into(),
             ))
         })?;
-        let entry = store.entry(plugin_id.to_string()).or_default();
-        let persisted = PersistedGrant::from_discriminant_and_scope(cap, scope, manifest_hash);
-        // Avoid duplicates: replace an existing entry with the same discriminant.
-        if let Some(pos) = entry.iter().position(|g| g.disc == persisted.disc) {
-            entry[pos] = persisted;
-        } else {
-            entry.push(persisted);
-        }
         let json = serde_json::to_string(&*store).map_err(|e| {
             PluginError::Core(concerto_core::error::CoreError::EventBus(e.to_string()))
         })?;
@@ -463,21 +480,45 @@ impl CapGrantStore {
         Ok(())
     }
 
+    /// Save a grant with an optional manifest hash.
+    fn save_grant(
+        &self,
+        plugin_id: &str,
+        cap: &CapabilityDiscriminant,
+        scope: &CapabilityScope,
+        manifest_hash: Option<String>,
+    ) -> Result<(), PluginError> {
+        {
+            let mut store = self.grants.lock().map_err(|_| {
+                PluginError::Core(concerto_core::error::CoreError::EventBus(
+                    "capability grants lock poisoned".into(),
+                ))
+            })?;
+            let entry = store.entry(plugin_id.to_string()).or_default();
+            let persisted = PersistedGrant::from_discriminant_and_scope(cap, scope, manifest_hash);
+            // Avoid duplicates: replace an existing entry with the same
+            // discriminant.
+            if let Some(pos) = entry.iter().position(|g| g.disc == persisted.disc) {
+                entry[pos] = persisted;
+            } else {
+                entry.push(persisted);
+            }
+        }
+        self.write_store()
+    }
+
     /// Revoke (delete) all grants for a plugin.
     fn revoke_plugin(&self, plugin_id: &str) -> Result<(), PluginError> {
-        let mut store = self.grants.lock().map_err(|_| {
-            PluginError::Core(concerto_core::error::CoreError::EventBus(
-                "capability grants lock poisoned".into(),
-            ))
-        })?;
-        if store.remove(plugin_id).is_some() {
-            let json = serde_json::to_string(&*store).map_err(|e| {
-                PluginError::Core(concerto_core::error::CoreError::EventBus(e.to_string()))
+        let changed = {
+            let mut store = self.grants.lock().map_err(|_| {
+                PluginError::Core(concerto_core::error::CoreError::EventBus(
+                    "capability grants lock poisoned".into(),
+                ))
             })?;
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            std::fs::write(&self.path, json).map_err(PluginError::Io)?;
+            store.remove(plugin_id).is_some()
+        };
+        if changed {
+            self.write_store()?;
             tracing::info!(plugin_id, "capability grants revoked");
         }
         Ok(())
@@ -510,6 +551,16 @@ impl CapabilityManager {
     pub fn open(data_dir: &std::path::Path) -> Result<Self, PluginError> {
         let grant_store = CapGrantStore::open(data_dir)?;
         Ok(Self { grant_store })
+    }
+
+    /// The standard capability-store data directory (`<data_dir>/concerto/
+    /// plugins`), shared by callers that need the store path without opening
+    /// a manager first (e.g. the Settings revoke helper).
+    pub fn data_dir() -> std::path::PathBuf {
+        dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("concerto")
+            .join("plugins")
     }
 
     /// Request capability approval from the user through the provided UI.
@@ -1526,19 +1577,54 @@ mod tests {
 
     #[test]
     fn hash_mismatch_filters_grant() {
+        // Each behavior uses its own store file: prune-on-load destroys the
+        // mismatched grant, so a single store cannot serve all three checks.
+        let grants_json = r#"{"my-plugin":[{"disc":"FilesystemRead","globs":[],"domains":[],"allowlist":[],"created_at":0,"expires_at":9999999999,"manifest_hash":"abc"}]}"#;
+
+        // Current hash differs from the pinned one → stale, filtered out.
         let dir = std::env::temp_dir().join("cap_hash_mismatch_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_grants_json(&dir, grants_json);
+        let cap_mgr = CapabilityManager::open(&dir).unwrap();
+        assert!(cap_mgr.load_grants("my-plugin", Some("def")).is_empty());
+
+        // Matching hash → grant loads (from a fresh, un-pruned store).
+        let dir = std::env::temp_dir().join("cap_hash_match_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_grants_json(&dir, grants_json);
+        let cap_mgr = CapabilityManager::open(&dir).unwrap();
+        assert_eq!(cap_mgr.load_grants("my-plugin", Some("abc")).len(), 1);
+
+        // `None` skips hash pinning entirely → grant loads.
+        let dir = std::env::temp_dir().join("cap_hash_none_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_grants_json(&dir, grants_json);
+        let cap_mgr = CapabilityManager::open(&dir).unwrap();
+        assert_eq!(cap_mgr.load_grants("my-plugin", None).len(), 1);
+    }
+
+    #[test]
+    fn hash_mismatch_pruned_from_disk() {
+        let dir = std::env::temp_dir().join("cap_hash_mismatch_prune_test");
         let _ = std::fs::remove_dir_all(&dir);
         write_grants_json(
             &dir,
             r#"{"my-plugin":[{"disc":"FilesystemRead","globs":[],"domains":[],"allowlist":[],"created_at":0,"expires_at":9999999999,"manifest_hash":"abc"}]}"#,
         );
         let cap_mgr = CapabilityManager::open(&dir).unwrap();
-        // Current hash differs from the pinned one → stale, filtered out.
+        // Loading with a differing hash prunes the stale grant (ADR-37
+        // prune-on-load): a fresh manager over the same file must see nothing.
         assert!(cap_mgr.load_grants("my-plugin", Some("def")).is_empty());
-        // Matching hash → grant loads.
-        assert_eq!(cap_mgr.load_grants("my-plugin", Some("abc")).len(), 1);
-        // `None` skips hash pinning entirely → grant loads.
-        assert_eq!(cap_mgr.load_grants("my-plugin", None).len(), 1);
+        drop(cap_mgr);
+        let reopened = CapabilityManager::open(&dir).unwrap();
+        assert!(
+            reopened.load_grants("my-plugin", None).is_empty(),
+            "the hash-mismatched grant must be removed from disk after first load"
+        );
+        assert!(
+            !reopened.list_granted_plugins().contains(&"my-plugin".to_string()),
+            "pruned plugin must not be listed as granted"
+        );
     }
 
     #[test]

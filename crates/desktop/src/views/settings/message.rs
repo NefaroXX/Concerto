@@ -134,6 +134,9 @@ pub enum Message {
     // ADR-37 — Plugin grant lifecycle management
     /// Request to revoke a plugin's capability grants.
     PluginRevokePressed(String),
+    /// Result of a revoke action: a human-readable outcome line on success, or
+    /// an error message on failure.
+    PluginRevokeResult(Result<String, String>),
 
     // ADR-43 — Skills and MCP extension configuration
     /// Toggle the master skills enable flag (`skills.enabled`).
