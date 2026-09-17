@@ -14,6 +14,7 @@ use iced::{Alignment, Color, Element, Length};
 use crate::app::Message;
 use crate::theme::AppTheme;
 use crate::ui::section_card::{section_card, section_card_with_subtitle};
+use crate::views::studio_runtime::StudioRuntimeSnapshot;
 use crate::widgets::agent_graph::{
     self, AgentGraphModel, AgentState, EdgeKind, Message as GraphMessage,
 };
@@ -330,6 +331,16 @@ pub struct State {
     /// config so `validation()`'s rule (f) is bounded exactly like the config
     /// load seam (`crates/config/src/lib.rs` ~220). `None` = unbounded.
     pub global_max_dispatch_cycles: Option<usize>,
+
+    /// The read-only Coordinator 2.0 runtime snapshot the chat Runtime modal
+    /// renders (loaded through the `StudioRuntimeReader` seam from the session's
+    /// persisted checkpoint; empty until a run state exists — fail-soft).
+    ///
+    /// The Studio no longer renders these panels itself: the observability rail
+    /// was removed so the blueprint editor keeps its width, and the panels now
+    /// live in the per-session chat modal. The snapshot is still cached here
+    /// because it is loaded through this view's `StudioRuntimeLoaded` plumbing.
+    pub runtime_snapshot: StudioRuntimeSnapshot,
 }
 
 impl Default for State {
@@ -373,6 +384,7 @@ impl Default for State {
             stage_advanced_open: HashSet::new(),
             stage_max_cycles_drafts: HashMap::new(),
             global_max_dispatch_cycles: None,
+            runtime_snapshot: StudioRuntimeSnapshot::default(),
         }
     }
 }
@@ -458,6 +470,11 @@ pub enum StudioMessage {
     NewAgentName(String),
     NewAgentRole(String),
     AddAgent,
+    /// Restore the five specialist builtin defaults into an EMPTY roster.
+    /// Shown only as an explicit empty-state action next to "+ Add agent";
+    /// never an automatic re-seed (deletions stick). The coordinator is never
+    /// seeded.
+    RestoreDefaultAgents,
     RemoveAgent(String),
     SelectAgent(Option<String>),
     SelectRelationship(Option<usize>),
@@ -802,6 +819,36 @@ fn semantics_label(semantics: RelationshipSemantics) -> &'static str {
     }
 }
 
+/// Map a legacy `multi_agent` relationship kind to the closed
+/// [`RelationshipSemantics`] it references (ADR-58 §4), so the legacy
+/// pipeline canvas and relationship editor speak the same vocabulary as the
+/// blueprint surface instead of the stale kind strings. The legacy kind
+/// vocabulary is closed (`supervises`, `provides_context_to`, `reports_to`,
+/// `owns_design`); the mapping mirrors the standard blueprint registry and the
+/// config facade's `reports_to → Delegation` fold, with any unknown kind
+/// degrading to `Delegation` (the same family `supervises` and `reports_to`
+/// already use) rather than hiding the row.
+fn legacy_relationship_semantics(kind: &str) -> RelationshipSemantics {
+    match kind {
+        "provides_context_to" => RelationshipSemantics::ContextFlow,
+        "supervises" | "reports_to" | "owns_design" => RelationshipSemantics::Delegation,
+        _ => RelationshipSemantics::Delegation,
+    }
+}
+
+/// The legacy relationship-kind picker options: every closed kind paired with
+/// its `RelationshipSemantics` so the label renders the semantic glyph
+/// (mirrors the blueprint path's [`RelationshipKindOption`]).
+fn legacy_rel_kind_options() -> Vec<RelationshipKindOption> {
+    ["supervises", "provides_context_to", "reports_to", "owns_design"]
+        .into_iter()
+        .map(|kind| RelationshipKindOption {
+            kind: kind.to_string(),
+            semantics: legacy_relationship_semantics(kind),
+        })
+        .collect()
+}
+
 /// Per-field validation surface (ADR-59 D5, spec §5): wrap one editable
 /// widget so a rulebook violation on its field path renders as a 1px
 /// `theme.palette.danger` border around the field, an alert icon to the
@@ -906,27 +953,48 @@ fn relationships_have_cycle(relationships: &[AgentRelationshipConfig]) -> bool {
     false
 }
 
+/// The single hardcoded coordinator definition (ADR-35 §5; maintainer decision
+/// 2026-09): the coordinator is constructed in code, never a user-configurable
+/// roster agent, and its prompts/capabilities are frozen here. It is never
+/// written to config and is filtered from every rendered roster surface, but it
+/// stays in [`State::agents`] so the pipeline topology and relationships that
+/// reference it remain referentially complete.
+fn default_coordinator_agent() -> AgentConfig {
+    AgentConfig {
+        id: "coordinator".into(),
+        name: "Coordinator".into(),
+        role: "coordinator".into(),
+        stage: None,
+        output_mode: OutputMode::Freeform,
+        prompt_sections: PromptSections {
+            system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
+            constraints: "Never bypass a specialist to do their job directly. If a step is ambiguous, get clarification from the Architect or Researcher before assigning it to the Coder. Don't exceed configured max_cycles between any two agents. If a specialist reports a blocking risk (security, data loss, destructive command), stop and surface it to the user instead of proceeding.".into(),
+            output_format: "1) Plan (numbered steps), 2) Specialist assignments, 3) Final synthesized result once specialists report back. No internal chain-of-thought.".into(),
+            ..Default::default()
+        },
+        model_override: None,
+        provider_id: None,
+        capabilities: AgentCapabilities { fs_read: Some(true), ..Default::default() },
+        is_custom: false,
+        disabled: false,
+    }
+}
+
+/// True when a roster row is the engine-constructed coordinator.
+///
+/// The coordinator is hardcoded (maintainer decision 2026-09): it is not a
+/// user-configured roster agent, so every rendered roster surface filters it
+/// out and the persist path never writes it back to config. Identity matches
+/// either the `id` or the legacy `role` key, case-insensitively — mirroring
+/// how the runtime reserves the role.
+fn is_coordinator_agent(agent: &AgentConfig) -> bool {
+    agent.id.eq_ignore_ascii_case("coordinator") || agent.role.eq_ignore_ascii_case("coordinator")
+}
+
 fn default_builtin_agents() -> Vec<AgentConfig> {
     // Matches config::supported.builtin_agent_seeds() typed submission contracts.
     vec![
-        AgentConfig {
-            id: "coordinator".into(),
-            name: "Coordinator".into(),
-            role: "coordinator".into(),
-            stage: None,
-            output_mode: OutputMode::Freeform,
-            prompt_sections: PromptSections {
-                system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
-                constraints: "Never bypass a specialist to do their job directly. If a step is ambiguous, get clarification from the Architect or Researcher before assigning it to the Coder. Don't exceed configured max_cycles between any two agents. If a specialist reports a blocking risk (security, data loss, destructive command), stop and surface it to the user instead of proceeding.".into(),
-                output_format: "1) Plan (numbered steps), 2) Specialist assignments, 3) Final synthesized result once specialists report back. No internal chain-of-thought.".into(),
-                ..Default::default()
-            },
-            model_override: None,
-            provider_id: None,
-            capabilities: AgentCapabilities { fs_read: Some(true), ..Default::default() },
-            is_custom: false,
-            disabled: false,
-        },
+        default_coordinator_agent(),
         AgentConfig {
             id: "architect".into(),
             name: "Architect".into(),
@@ -1092,6 +1160,12 @@ impl State {
     /// default).
     pub fn load_from_config(&mut self, config: &AppConfig) {
         let multi = config.multi_agent.clone().unwrap_or_default();
+        // The coordinator is hardcoded (maintainer decision 2026-09): an
+        // existing config file entry matching its identity is ignored at every
+        // rendered roster surface (`visible_agents`) and never persisted back,
+        // but it is left in `self.agents` untouched so the pipeline topology
+        // that references it stays referentially complete and no user data on
+        // disk is rewritten or lost.
         let config_agents: Vec<AgentConfig> =
             multi.custom_agents.iter().map(custom_to_agent).collect();
         self.agents = if config.owns_agent_roster() {
@@ -1240,11 +1314,21 @@ impl State {
         }
     }
 
+    /// Roster rows the user may see or edit. The hardcoded coordinator is
+    /// engine-owned and filtered from every rendered roster surface
+    /// (maintainer decision 2026-09); it remains in `self.agents` so the
+    /// pipeline topology and relationships stay complete.
+    fn visible_agents(&self) -> impl Iterator<Item = &AgentConfig> {
+        self.agents.iter().filter(|agent| !is_coordinator_agent(agent))
+    }
+
     /// Parts of the studio that should be persisted back to config.
     pub fn persisted_parts(
         &self,
     ) -> (Vec<CustomAgentConfig>, Vec<AgentRelationshipConfig>, Vec<PipelinePreset>) {
-        let custom = self.agents.iter().map(agent_to_custom).collect();
+        // The coordinator is hardcoded and never persisted (maintainer
+        // decision 2026-09): filter it from the roster written to config.
+        let custom = self.visible_agents().map(agent_to_custom).collect();
         let rels = self.relationships.clone();
         // Built-in presets are seeded in code and must never round-trip
         // through config — persisting them is what made the list grow.
@@ -1290,9 +1374,9 @@ impl State {
             messages.push("Run limits: spend cap multiplier must be a positive number".into());
         }
 
-        if !self.agents.iter().any(|a| a.id == "coordinator" || a.role == "coordinator") {
-            messages.push("No coordinator agent present".into());
-        }
+        // The coordinator is code-injected (hardcoded, maintainer decision
+        // 2026-09), so roster validation no longer warns about its absence:
+        // it exists by construction, not by roster membership.
 
         // ADR-35 phase 4: the eval engine is gated on the validator's `eval`
         // capability. Warn in the studio so an eval-off validator doesn't
@@ -1355,7 +1439,13 @@ impl State {
             };
         };
         match validate_blueprint(blueprint, self.global_max_dispatch_cycles) {
-            Ok(()) => ValidationReport { ok: true, messages: Vec::new() },
+            Ok(()) => match self.staffing_membership_error() {
+                Some(error) => {
+                    let view = blueprint_error_view(&error);
+                    ValidationReport { ok: false, messages: vec![view.message] }
+                }
+                None => ValidationReport { ok: true, messages: Vec::new() },
+            },
             Err(error) => {
                 let view = blueprint_error_view(&error);
                 ValidationReport { ok: false, messages: vec![view.message] }
@@ -1363,18 +1453,48 @@ impl State {
         }
     }
 
+    /// Roster-membership rule for blueprint stage staffing (Studio-level
+    /// extension of the `validate_blueprint` rulebook): every id in a stage's
+    /// `agents` list must name an agent present in the rendered roster
+    /// (`visible_agents`). A dangling id — a ghost left by a deleted agent or a
+    /// hand-edited/included blueprint — is a validation error so the toolbar
+    /// badge and the "Pipeline valid" claim can never disagree with the
+    /// staffing the canvas shows. The engine-owned coordinator is not a roster
+    /// member, so it is rejected here too. Returns only the first violation
+    /// (fail-fast, matching `validate_blueprint`'s report shape).
+    fn staffing_membership_error(&self) -> Option<BlueprintError> {
+        let blueprint = self.blueprint.as_ref()?;
+        for stage in &blueprint.pipeline.stages {
+            for agent in &stage.agents {
+                if !self.visible_agents().any(|candidate| &candidate.id == agent) {
+                    return Some(BlueprintError::rule(
+                        "stage.agents",
+                        "rule_k",
+                        &format!(
+                            "stage '{}' staffs unknown agent '{}': the id is absent from the roster",
+                            stage.tag, agent
+                        ),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Recompute the stored per-field validation errors for the editable
     /// blueprint (ADR-59 D5). Called on every `load_from_config`; later slices
     /// call it after each Studio mutation of `self.blueprint` so the toolbar
-    /// badge and detail bar stay current. Never panics: a missing `blueprint`
-    /// simply clears the collection.
+    /// badge and detail bar stay current. The Studio-level staffing-membership
+    /// rule (rule_k, `"stage.agents"`) runs when the rulebook itself is clean,
+    /// so the badge count always agrees with `validation()`. Never panics: a
+    /// missing `blueprint` simply clears the collection.
     pub fn refresh_blueprint_validation(&mut self) {
-        self.blueprint_errors = match self.blueprint.as_ref().and_then(|blueprint| {
-            validate_blueprint(blueprint, self.global_max_dispatch_cycles).err()
-        }) {
-            Some(error) => vec![error],
-            None => Vec::new(),
+        let rulebook_error = match self.blueprint.as_ref() {
+            Some(blueprint) => validate_blueprint(blueprint, self.global_max_dispatch_cycles).err(),
+            None => None,
         };
+        let error = rulebook_error.or_else(|| self.staffing_membership_error());
+        self.blueprint_errors = error.into_iter().collect();
     }
 
     /// Number of structured validation errors on the editable blueprint model.
@@ -1647,6 +1767,57 @@ impl State {
         *self.graph_cache.borrow_mut() = None;
     }
 
+    /// Replace the read-only runtime snapshot the chat Runtime modal renders.
+    /// Called by `App` when the modal opens or the Studio opens (or when a load
+    /// fail-softs); never mutates run state or marks the studio dirty.
+    pub fn set_runtime_snapshot(&mut self, snapshot: StudioRuntimeSnapshot) {
+        self.runtime_snapshot = snapshot;
+    }
+
+    /// Whether the rendered roster has no agents (the empty state that offers
+    /// the explicit "Restore defaults" action). The engine-owned coordinator is
+    /// filtered here on purpose: a roster holding only the coordinator still
+    /// has zero user-visible agents.
+    pub fn roster_is_empty(&self) -> bool {
+        self.visible_agents().next().is_none()
+    }
+
+    /// Explicit "Restore defaults" action: seed the five specialist builtin
+    /// defaults into an EMPTY roster through the same `default_builtin_agents()`
+    /// seed path `State::new()` uses. Never seeds the engine-owned coordinator,
+    /// and never touches a populated roster (a stale click is a silent no-op),
+    /// so deletions stick — this is the only recovery path, and it is one
+    /// deliberate click. Marks the studio dirty so Save persists the roster.
+    fn restore_default_agents(&mut self) -> iced::Task<Message> {
+        if !self.roster_is_empty() {
+            return iced::Task::none();
+        }
+        let mut seeded = 0usize;
+        // The shared seed path, filtered to the five specialist defaults: the
+        // coordinator is code-constructed and never a roster member.
+        for agent in default_builtin_agents() {
+            if is_coordinator_agent(&agent) {
+                continue;
+            }
+            if self.agents.iter().any(|existing| existing.id == agent.id) {
+                continue;
+            }
+            self.agents.push(agent);
+            seeded += 1;
+        }
+        if seeded > 0 {
+            // The restored roster can satisfy a stage's staffing (rule_k), so
+            // recompute the stored errors before the dirty flag flips.
+            self.refresh_blueprint_validation();
+            self.mark_dirty();
+            tracing::info!(
+                count = seeded,
+                "restored default specialist agents into an empty roster"
+            );
+        }
+        iced::Task::none()
+    }
+
     pub fn mark_saved(&mut self) {
         self.unsaved = false;
         self.saved_notice = true;
@@ -1701,14 +1872,26 @@ impl State {
             let Some(to) = self.agents.iter().position(|a| a.id == rel.to) else {
                 continue;
             };
-            let kind = if rel.relationship == "supervises" {
-                EdgeKind::Delegation
-            } else {
-                EdgeKind::Dependency
+            let semantics = legacy_relationship_semantics(&rel.relationship);
+            let kind = match semantics {
+                RelationshipSemantics::Delegation => EdgeKind::Delegation,
+                RelationshipSemantics::ApprovalGate | RelationshipSemantics::ContextFlow => {
+                    EdgeKind::Dependency
+                }
             };
             let cycles =
                 rel.max_cycles.map(|value| value.to_string()).unwrap_or_else(|| "∞".into());
-            model.add_labeled_edge(from, to, kind, format!("{} · {}", rel.relationship, cycles));
+            model.add_labeled_edge(
+                from,
+                to,
+                kind,
+                format!(
+                    "{} {} · {}",
+                    semantics_glyph(semantics),
+                    semantics_label(semantics),
+                    cycles
+                ),
+            );
             edge_to_relationship.push(rel_index);
         }
         let result = (model, edge_to_relationship);
@@ -1822,6 +2005,9 @@ impl State {
                     self.mark_dirty();
                 }
             }
+            StudioMessage::RestoreDefaultAgents => {
+                return self.restore_default_agents();
+            }
             StudioMessage::RemoveAgent(id) => {
                 // The coordinator is code-constructed and always active (see
                 // ADR-35 §5). Guard the invariant at the message level, not
@@ -1842,6 +2028,10 @@ impl State {
                     self.show_relationship_editor = false;
                     self.clear_relationship_draft();
                 }
+                // Removing a roster agent can strand a blueprint stage's
+                // staffing (rule_k): recompute so the badge agrees with
+                // `validation()` immediately, not only after the next edit.
+                self.refresh_blueprint_validation();
                 self.mark_dirty();
             }
             StudioMessage::SelectAgent(opt) => {
@@ -2321,6 +2511,9 @@ impl State {
                 self.selected_agent_id = None;
                 self.show_relationship_editor = false;
                 self.clear_relationship_draft();
+                // A preset can add the agents a blueprint stage staffs, so
+                // recompute rule_k along with the legacy checks.
+                self.refresh_blueprint_validation();
                 self.mark_dirty();
             }
             StudioMessage::SaveOrchestration => {}
@@ -2502,9 +2695,10 @@ impl State {
         } else if self.selected_agent_id.is_some() {
             self.inspector_view(theme)
         } else {
-            // ADR-58/59 (rewritten) Slice 2: no splash and no manual-init button — the roster
-            // is auto-seeded on Studio open, so this inactive fallback renders
-            // only as a defensive placeholder (a broken/torn-down config).
+            // ADR-58/59 (rewritten) Slice 2: no splash and no manual-init button — the
+            // roster is auto-seeded and a missing blueprint selection is filled
+            // on Studio open, so this inactive fallback renders only as a
+            // defensive placeholder (a broken/torn-down config).
             self.blueprint_inactive_view(theme)
         };
         let panes = row![
@@ -2578,7 +2772,7 @@ impl State {
 
         column![
             toolbar,
-            text("Configure the agents and hand-offs used by multi-agent mode.")
+            text("Configure the agents and relationships used by multi-agent mode.")
                 .size(ts.body)
                 .color(theme.palette.text_muted),
             validation_detail_bar,
@@ -2594,9 +2788,11 @@ impl State {
     // Blueprint surface inactive (ADR-58/59 (rewritten) Slice 2).
     //
     // Rendered only when the blueprint surface is NOT active — a defensive
-    // fallback, because Slice 2 auto-seeds the orchestration roster on Studio
-    // open (`App::ensure_orchestration_seeded`), so the surface is active
-    // from the very first open. There is no splash and no manual-init button
+    // fallback. Studio open auto-seeds the orchestration roster AND fills a
+    // missing blueprint selection (`App::ensure_orchestration_seeded`), so a
+    // config that declares `[orchestration]` with no `name`/`include`/`inline`
+    // can no longer reach this view: the fill writes the standard selection
+    // before the first render. There is no splash and no manual-init button
     // anymore: this placeholder carries nothing actionable. Palette colors
     // only.
     // ------------------------------------------------------------------
@@ -2609,8 +2805,8 @@ impl State {
             column![
                 text("Orchestration blueprint inactive").size(ts.title).color(palette.text),
                 text(
-                    "The orchestration roster is not active. Check the project config to \
-                     re-enable it.",
+                    "The orchestration blueprint is not active. Check the global config, \
+                     or reopen the Studio to restore defaults.",
                 )
                 .size(ts.body)
                 .color(palette.text_muted),
@@ -2784,8 +2980,7 @@ impl State {
             })
             .collect();
         let candidates: Vec<AgentOption> = self
-            .agents
-            .iter()
+            .visible_agents()
             .filter(|agent| !stage.agents.contains(&agent.id))
             .map(|agent| AgentOption { id: agent.id.clone(), label: agent.name.clone() })
             .collect();
@@ -3126,10 +3321,10 @@ impl State {
             // The empty-registry caption mirrors the resolution seam
             // (blueprint.rs:649-657): an empty registry falls back to the
             // engine's five standard rows at resolve time, so the caption
-            // names those kinds rather than implying no hand-offs exist.
+            // names those kinds rather than implying no relationships exist.
             rows = rows.push(
                 text(
-                    "Registry is empty — the engine falls back to the standard hand-offs \
+                    "Registry is empty — the engine falls back to the standard relationships \
                      (supervises, provides_context_to, owns_design). Add a row to override.",
                 )
                 .size(ts.body)
@@ -3230,7 +3425,9 @@ impl State {
 
         let query = self.search_query.to_lowercase();
         let mut list = column![].spacing(sp.xs);
-        for agent in &self.agents {
+        // The hardcoded coordinator is engine-owned and never rendered as a
+        // roster row (maintainer decision 2026-09), on either path.
+        for agent in self.visible_agents() {
             if query.is_empty()
                 || agent.name.to_lowercase().contains(&query)
                 || agent.role.to_lowercase().contains(&query)
@@ -3262,48 +3459,32 @@ impl State {
                 )
                 .style(if selected { button::primary } else { button::text })
                 .width(Length::Fill);
-                // The coordinator is engine-owned (ADR-35 §5): on the roster
-                // surface it is a locked row — visibly rendered with an
-                // "Engine-owned" marker, but never selectable into the
-                // inspector and with no Edit/Delete affordance. Guarding the
-                // affordance here (not the row) keeps the sibling
-                // `RemoveAgent`/`SelectAgent` message guards as the final
-                // backstop for non-UI paths.
-                let select = if agent.id == "coordinator" && blueprint_path {
-                    select
-                } else {
-                    select.on_press(Message::OrchestrationStudio(StudioMessage::SelectAgent(Some(
-                        agent.id.clone(),
-                    ))))
-                };
+                // The coordinator is filtered from `visible_agents`, so every
+                // rendered row is selectable/editable (no engine-owned special
+                // case remains here).
+                let select = select.on_press(Message::OrchestrationStudio(
+                    StudioMessage::SelectAgent(Some(agent.id.clone())),
+                ));
                 // Slice 3 roster CRUD: on the blueprint path every agent is a
-                // fully editable template except the engine-owned coordinator
-                // (locked, see above). Edit routes to the per-agent inspector
-                // (persisted through the roster Save arm); Delete removes the
-                // agent from config on the next Save. The legacy path keeps
-                // its historical "Remove custom agent only" affordance.
+                // fully editable template. Edit routes to the per-agent
+                // inspector (persisted through the roster Save arm); Delete
+                // removes the agent from config on the next Save. The legacy
+                // path keeps its historical "Remove custom agent only"
+                // affordance.
                 let agent_row = if blueprint_path {
-                    if agent.id == "coordinator" {
-                        row![select, badge(theme, "Engine-owned")]
-                            .spacing(sp.xs)
-                            .align_y(Alignment::Center)
-                    } else {
-                        row![
-                            select,
-                            button("Edit").style(button::text).on_press(
-                                Message::OrchestrationStudio(StudioMessage::SelectAgent(Some(
-                                    agent.id.clone()
-                                )),)
-                            ),
-                            button("Delete").style(button::text).on_press(
-                                Message::OrchestrationStudio(StudioMessage::RemoveAgent(
-                                    agent.id.clone()
-                                ),)
-                            ),
-                        ]
-                        .spacing(sp.xs)
-                        .align_y(Alignment::Center)
-                    }
+                    row![
+                        select,
+                        button("Edit").style(button::text).on_press(Message::OrchestrationStudio(
+                            StudioMessage::SelectAgent(Some(agent.id.clone())),
+                        )),
+                        button("Delete").style(button::text).on_press(
+                            Message::OrchestrationStudio(StudioMessage::RemoveAgent(
+                                agent.id.clone()
+                            ),)
+                        ),
+                    ]
+                    .spacing(sp.xs)
+                    .align_y(Alignment::Center)
                 } else if agent.is_custom {
                     row![
                         select,
@@ -3345,6 +3526,18 @@ impl State {
         };
         let add_toggle_label =
             if self.show_add_agent_form { "− Hide form" } else { "+ Add agent" };
+        // Explicit recovery for an EMPTY roster: seed the five specialists in
+        // one deliberate click. Auto-reseed stays forbidden (deletions stick),
+        // so the action renders ONLY while there is nothing to delete; a
+        // populated roster renders a zero-size space in its place.
+        let restore_defaults: Element<'_, Message> = if self.roster_is_empty() {
+            button("Restore defaults")
+                .style(button::secondary)
+                .on_press(Message::OrchestrationStudio(StudioMessage::RestoreDefaultAgents))
+                .into()
+        } else {
+            Space::new().into()
+        };
 
         column![
             text(format!("{} agents", self.agents.len()))
@@ -3353,9 +3546,14 @@ impl State {
             search,
             scrollable(list).height(Length::Fill),
             iced::widget::rule::horizontal(1),
-            button(add_toggle_label)
-                .style(button::secondary)
-                .on_press(Message::OrchestrationStudio(StudioMessage::ToggleAddAgentForm)),
+            row![
+                button(add_toggle_label)
+                    .style(button::secondary)
+                    .on_press(Message::OrchestrationStudio(StudioMessage::ToggleAddAgentForm)),
+                restore_defaults,
+            ]
+            .spacing(sp.xs)
+            .align_y(Alignment::Center),
             new_agent,
         ]
         .spacing(sp.sm)
@@ -3397,6 +3595,7 @@ impl State {
                 .max_cycles
                 .map(|value| format!("{value} cycle{}", if value == 1 { "" } else { "s" }))
                 .unwrap_or_else(|| "unlimited cycles".into());
+            let semantics = legacy_relationship_semantics(&rel.relationship);
             relationship_list = relationship_list.push(
                 row![
                     column![
@@ -3406,9 +3605,13 @@ impl State {
                             self.agent_label(&rel.to)
                         ))
                         .size(ts.body),
-                        text(format!("{} · {cycles}", rel.relationship))
-                            .size(ts.caption)
-                            .color(theme.palette.text_muted),
+                        text(format!(
+                            "{} {} · {cycles}",
+                            semantics_glyph(semantics),
+                            semantics_label(semantics)
+                        ))
+                        .size(ts.caption)
+                        .color(theme.palette.text_muted),
                     ]
                     .spacing(sp.xs)
                     .width(Length::Fill),
@@ -3425,7 +3628,9 @@ impl State {
         }
         if self.relationships.is_empty() {
             relationship_list = relationship_list.push(
-                text("No hand-offs configured yet.").size(ts.body).color(theme.palette.text_muted),
+                text("No relationships configured yet.")
+                    .size(ts.body)
+                    .color(theme.palette.text_muted),
             );
         }
 
@@ -3447,12 +3652,9 @@ impl State {
             .collect();
         let selected_from = agent_options.iter().find(|o| o.id == self.new_rel_from).cloned();
         let selected_to = agent_options.iter().find(|o| o.id == self.new_rel_to).cloned();
-        let rel_types: Vec<String> = vec![
-            "supervises".into(),
-            "provides_context_to".into(),
-            "reports_to".into(),
-            "owns_design".into(),
-        ];
+        let rel_types = legacy_rel_kind_options();
+        let selected_rel_type =
+            rel_types.iter().find(|option| option.kind == self.new_rel_type).cloned();
         // The add/edit form only renders while it is relevant: when an edge is
         // clicked (or "Add hand-off" is pressed). Browsing the pipeline and
         // editing a hand-off are now visually distinct states.
@@ -3474,7 +3676,7 @@ impl State {
         };
         let draft_note: Element<'_, Message> = match draft_error {
             Some(error) => text(error).size(ts.caption).color(theme.palette.text_muted).into(),
-            None => text("This hand-off keeps the pipeline acyclic.")
+            None => text("This relationship keeps the pipeline acyclic.")
                 .size(ts.caption)
                 .color(theme.palette.success)
                 .into(),
@@ -3495,17 +3697,9 @@ impl State {
                     Message::OrchestrationStudio(StudioMessage::NewRelTo(option.id))
                 })
                 .placeholder("To agent"),
-                pick_list(
-                    rel_types,
-                    if self.new_rel_type.is_empty() {
-                        None
-                    } else {
-                        Some(self.new_rel_type.clone())
-                    },
-                    |relationship| Message::OrchestrationStudio(StudioMessage::NewRelType(
-                        relationship
-                    )),
-                )
+                pick_list(rel_types, selected_rel_type, |option| {
+                    Message::OrchestrationStudio(StudioMessage::NewRelType(option.kind))
+                })
                 .placeholder("Relationship type"),
                 text_input("Max cycles (optional)", &self.new_rel_max_cycles).on_input(|value| {
                     Message::OrchestrationStudio(StudioMessage::NewRelMaxCycles(value))
@@ -3564,14 +3758,14 @@ impl State {
             if editor_visible { relationship_editor.into() } else { Space::new().into() };
         let handoffs_card = section_card(
             theme,
-            "Hand-offs",
+            "Relationships",
             column![
                 row![
                     text(format!("{} configured", self.relationships.len()))
                         .size(ts.caption)
                         .color(theme.palette.text_muted),
                     Space::new().width(Length::Fill),
-                    button("+ Add hand-off").style(button::secondary).on_press(
+                    button("+ Add relationship").style(button::secondary).on_press(
                         Message::OrchestrationStudio(StudioMessage::ToggleRelationshipEditor(true))
                     ),
                 ]
@@ -4032,6 +4226,64 @@ mod tests {
         assert_eq!(state.relationships.len(), 5);
     }
 
+    /// Degraded blueprint-selection shape (present-but-empty `[orchestration]`
+    /// table): the init fill writes the default standard selector, the load
+    /// seam resolves it, and the Studio activates the stage-card editor — the
+    /// surface is reachable instead of the inactive placeholder.
+    #[test]
+    fn stage_editor_is_reachable_after_the_default_selection_fill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("schema_version = {}\n[orchestration]\n", concerto_config::SCHEMA_VERSION),
+        )
+        .expect("write degraded config");
+        assert!(concerto_config::ensure_default_blueprint(&config_path).expect("fill selection"));
+        let config = concerto_config::load_config(Some(&config_path), None).expect("load");
+
+        let mut state = State::new();
+        state.load_from_config(&config);
+        assert!(state.on_blueprint_path(), "the stage editor surface must be active");
+        assert!(
+            state.blueprint.as_ref().is_some_and(|blueprint| !blueprint.pipeline.stages.is_empty()),
+            "the editor must have stage cards to render"
+        );
+        // Rendering must not panic (the stage-card surface is exercised).
+        let theme = AppTheme::by_name("Midnight");
+        let _ = state.stage_cards_view(&theme);
+    }
+
+    /// The roster derived from the per-agent files is exactly the list the
+    /// Studio renders (no seed resurrection, no second roster copy). The
+    /// stage-staffing picker draws from `visible_agents`, so it lists the same
+    /// file-derived roster and never the hardcoded coordinator.
+    #[test]
+    fn file_derived_roster_is_exactly_the_studio_roster() {
+        let config = AppConfig {
+            agent_files_authoritative: true,
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "from-file".into(),
+                    name: "From File".into(),
+                    role: "from-file".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut state = State::new();
+        state.load_from_config(&config);
+        assert_eq!(state.agents.len(), 1, "the file roster is exactly the list");
+        assert_eq!(state.agents[0].id, "from-file");
+        assert!(
+            state.visible_agents().all(|agent| !is_coordinator_agent(agent)),
+            "the staffing picker source excludes the hardcoded coordinator"
+        );
+    }
+
     #[test]
     fn coordinator_cannot_be_removed_even_directly() {
         let mut state = State::new();
@@ -4039,6 +4291,131 @@ mod tests {
 
         assert!(state.agents.iter().any(|a| a.id == "coordinator"));
         assert!(!state.unsaved, "blocked removal must not mark the studio dirty");
+    }
+
+    /// Maintainer decision 2026-09: the coordinator is hardcoded, so exactly
+    /// one canonical frozen definition exists in code and the seeded fallback
+    /// uses it verbatim.
+    #[test]
+    fn hardcoded_coordinator_is_the_single_frozen_definition() {
+        let frozen = default_coordinator_agent();
+        assert_eq!(frozen.id, "coordinator");
+        assert_eq!(frozen.role, "coordinator");
+
+        let seeded = default_builtin_agents();
+        let coordinators: Vec<&AgentConfig> =
+            seeded.iter().filter(|agent| is_coordinator_agent(agent)).collect();
+        assert_eq!(coordinators.len(), 1, "exactly one hardcoded coordinator row");
+        assert_eq!(coordinators[0].id, frozen.id);
+        assert_eq!(
+            coordinators[0].prompt_sections.system_instructions,
+            frozen.prompt_sections.system_instructions
+        );
+    }
+
+    /// The rendered roster hides the coordinator on the seeded/fallback path,
+    /// while the row stays in `State::agents` so the topology that references
+    /// it (the standard preset's hand-offs) remains complete.
+    #[test]
+    fn studio_roster_excludes_coordinator_on_seeded_path() {
+        let state = State::new();
+        assert!(
+            state.agents.iter().any(is_coordinator_agent),
+            "the frozen row stays in state for topology"
+        );
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "the coordinator must never render as a roster row"
+        );
+    }
+
+    /// An EXISTING config file that carries a coordinator roster entry is
+    /// ignored at display time: the entry is not stripped from state (no user
+    /// data rewritten), but every rendered roster surface filters it.
+    #[test]
+    fn existing_config_coordinator_entry_is_ignored_in_the_roster() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![
+                    concerto_config::CustomAgentConfig {
+                        id: "coordinator".into(),
+                        name: "User Coordinator".into(),
+                        role: "coordinator".into(),
+                        ..Default::default()
+                    },
+                    concerto_config::CustomAgentConfig {
+                        id: "coder".into(),
+                        role: "coder".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "a config-injected coordinator must not render"
+        );
+        assert!(
+            state.agents.iter().any(|agent| agent.id == "coordinator"),
+            "the config entry is ignored, not stripped from state"
+        );
+        assert_eq!(
+            state.visible_agents().filter(|agent| agent.id == "coder").count(),
+            1,
+            "the rest of the roster is untouched"
+        );
+    }
+
+    /// Persisted rosters never contain the coordinator, even when the seeded or
+    /// config-injected in-memory roster does.
+    #[test]
+    fn persisted_roster_never_contains_the_coordinator() {
+        let is_custom_coordinator = |agent: &CustomAgentConfig| {
+            agent.id.eq_ignore_ascii_case("coordinator")
+                || agent.role.eq_ignore_ascii_case("coordinator")
+        };
+
+        // Seeded fallback path.
+        let seeded = State::new();
+        assert!(seeded.agents.iter().any(is_coordinator_agent));
+        let (custom, _, _) = seeded.persisted_parts();
+        assert!(!custom.iter().any(is_custom_coordinator), "seeded roster must not persist it");
+
+        // Config-injected path: the entry does not survive the persist round-trip.
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "coordinator".into(),
+                    role: "coordinator".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut injected = State::new();
+        injected.load_from_config(&config);
+        let (custom, _, _) = injected.persisted_parts();
+        assert!(!custom.iter().any(is_custom_coordinator), "config entry must not persist");
+    }
+
+    /// The obsolete "No coordinator agent present" warning is gone: the
+    /// coordinator exists by construction, not by roster membership.
+    #[test]
+    fn validation_no_longer_warns_about_a_missing_coordinator() {
+        let state = State::default();
+        assert!(state.agents.is_empty());
+        let report = state.validation();
+        assert!(
+            !report.messages.iter().any(|message| message.contains("No coordinator")),
+            "obsolete warning still present: {:?}",
+            report.messages
+        );
     }
 
     #[test]
@@ -4071,9 +4448,11 @@ mod tests {
         assert_eq!(edge_to_relationship, (0..state.relationships.len()).collect::<Vec<_>>());
         // Node ids follow agent order: the coordinator seed is index 0.
         assert_eq!(model.nodes[0].label, "Coordinator");
-        // Edge ids follow relationship order, with type + cycle labels.
-        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("supervises · 3")));
-        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("provides_context_to · 3")));
+        // Edge ids follow relationship order, with the CLOSED relationship
+        // semantics (glyph + label) + cycle labels — never the stale legacy
+        // kind string (M4 terminology).
+        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("⛓ delegation · 3")));
+        assert!(model.edges.iter().any(|e| e.label.as_deref() == Some("➜ context flow · 3")));
     }
 
     #[test]
@@ -4820,16 +5199,27 @@ mod tests {
     fn load_from_config_recomputes_blueprint_validation_and_rule_f_bound() {
         // A resolved `[orchestration]` config loads the editable blueprint and
         // recomputes the (empty) error collection; rule (f)'s bound mirrors
-        // the load seam's `max_total_iterations`.
+        // the load seam's `max_total_iterations`. The roster names exactly the
+        // five agents the standard blueprint staffs, so the roster-membership
+        // rule (rule_k) is satisfied.
         let blueprint =
             concerto_config::named_blueprint("standard").expect("standard blueprint exists");
         let resolved =
             concerto_config::resolve_blueprint(&blueprint).expect("standard resolves cleanly");
+        let roster: Vec<concerto_config::CustomAgentConfig> =
+            ["architect", "researcher", "coder", "reviewer", "validator"]
+                .into_iter()
+                .map(|id| concerto_config::CustomAgentConfig {
+                    id: id.into(),
+                    ..Default::default()
+                })
+                .collect();
         let config = AppConfig {
             orchestration: Some(OrchestrationConfig::default()),
             resolved_blueprint: Some(Arc::new(resolved)),
             multi_agent: Some(concerto_config::MultiAgentConfig {
                 max_total_iterations: Some(50),
+                custom_agents: roster,
                 ..Default::default()
             }),
             ..Default::default()
@@ -4886,13 +5276,18 @@ mod tests {
     // populated via struct literal over `Default`).
     // ────────────────────────────────────────────────────────────────────────
 
-    /// A blueprint-path `State` carrying the valid standard blueprint.
+    /// A blueprint-path `State` carrying the valid standard blueprint. The
+    /// roster holds the five specialist builtins (plus the engine-owned
+    /// coordinator) so the standard blueprint's staffing satisfies the
+    /// Studio's roster-membership rule (rule_k); the coordinator is filtered
+    /// from `visible_agents`, so it never counts as staffable.
     fn standard_blueprint_state() -> State {
         State {
             orchestration: Some(OrchestrationConfig::default()),
             blueprint: Some(Arc::new(
                 concerto_config::named_blueprint("standard").expect("standard blueprint exists"),
             )),
+            agents: default_builtin_agents(),
             ..Default::default()
         }
     }
@@ -5486,6 +5881,31 @@ mod tests {
         }
     }
 
+    /// M4 terminology: the legacy pipeline editor maps every closed legacy
+    /// kind to its `RelationshipSemantics` and renders the semantic glyph
+    /// (never the stale kind string alone). The vocabulary the options carry
+    /// is exactly the current one (`delegation` / `context flow`).
+    #[test]
+    fn legacy_relationship_options_carry_closed_semantics() {
+        let options = legacy_rel_kind_options();
+        assert_eq!(options.len(), 4, "the closed legacy vocabulary is four kinds");
+        let semantics_of = |kind: &str| {
+            options.iter().find(|option| option.kind == kind).map(|option| option.semantics)
+        };
+        assert_eq!(semantics_of("supervises"), Some(RelationshipSemantics::Delegation));
+        assert_eq!(semantics_of("provides_context_to"), Some(RelationshipSemantics::ContextFlow));
+        assert_eq!(semantics_of("reports_to"), Some(RelationshipSemantics::Delegation));
+        assert_eq!(semantics_of("owns_design"), Some(RelationshipSemantics::Delegation));
+        // The picker label pairs the semantic glyph with the kind, so the
+        // affordance is never color/string-only.
+        for option in &options {
+            assert!(
+                option.to_string().starts_with(semantics_glyph(option.semantics)),
+                "option label must carry its semantic glyph: {option}"
+            );
+        }
+    }
+
     #[test]
     fn fallback_persona_edits_mutate_and_revalidate_immediately() {
         // The standard blueprint's review stage (index 3) ships a fallback
@@ -5684,9 +6104,15 @@ mod tests {
         let mut state = standard_blueprint_state();
         let index = 2;
         let mut blueprint = state.blueprint.as_ref().expect("blueprint loaded").as_ref().clone();
-        // Staff the stage with the would-be `implement_fallback` id.
+        // Staff the stage with the would-be `implement_fallback` id. The id is
+        // also added to the roster so rule_k (roster membership) stays clean
+        // while rulebook rule (d) (self-fallback) is what this test exercises.
         blueprint.pipeline.stages[index].agents.push("implement_fallback".into());
         state.blueprint = Some(Arc::new(blueprint));
+        state.agents.push(custom_to_agent(&concerto_config::CustomAgentConfig {
+            id: "implement_fallback".into(),
+            ..Default::default()
+        }));
 
         let _ = state.update(StudioMessage::FallbackAdded(index));
         let fallback = fallback_of(&state, index);
@@ -5715,12 +6141,10 @@ mod tests {
         let stage = &mut blueprint.pipeline.stages[3]; // `review`
         stage.fallback = Some(sentinel);
 
-        let state = State {
-            orchestration: Some(OrchestrationConfig::default()),
-            blueprint: Some(Arc::new(blueprint)),
-            ..Default::default()
-        };
-        let mut state = state;
+        // Roster seeded with the standard specialists so rule_k stays clean
+        // (this test pins the sentinel invariant, not staffing).
+        let mut state = standard_blueprint_state();
+        state.blueprint = Some(Arc::new(blueprint));
         let _ = state.update(StudioMessage::FallbackAdded(3));
         let fallback = fallback_of(&state, 3);
         assert_eq!(fallback.id, FALLBACK_SENTINEL_ID, "sentinel id stays untouched");
@@ -5811,5 +6235,131 @@ mod tests {
             "no orchestration ⇒ legacy path (library and actions rendered)"
         );
         let _ = legacy.view(&theme);
+    }
+
+    /// The Coordinator observability rail is GONE from the Studio: the panes
+    /// row is library + workspace only, and the four read-only panels now live
+    /// in the per-session chat Runtime modal (`views::studio_runtime`). The
+    /// cached snapshot field survives only as the modal's load cache, so the
+    /// Studio must still render with and without it and never panic.
+    #[test]
+    fn studio_view_renders_without_the_runtime_rail() {
+        use concerto_orchestrator::decisions::{CoordinatorDecision, DecisionKind, DecisionStatus};
+        use concerto_orchestrator::suitability::SuitabilityState;
+        use concerto_orchestrator::world_model::WorldModel;
+
+        let theme = AppTheme::by_name("Midnight");
+
+        let mut empty = State::new();
+        assert!(empty.runtime_snapshot.is_empty());
+        let _ = empty.view(&theme);
+
+        let world = WorldModel { objective: Some("ship the slice".into()), ..Default::default() };
+        let decision = CoordinatorDecision {
+            id: "d1".into(),
+            kind: DecisionKind::DispatchSpecialist,
+            target_agent: Some(concerto_core::types::AgentId::new("coder")),
+            task_description: "work".into(),
+            notes: None,
+            supporting_evidence_ids: vec!["e1".into()],
+            expected_artifacts: Vec::new(),
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            status: DecisionStatus::Settled,
+        };
+        empty.set_runtime_snapshot(StudioRuntimeSnapshot::from_parts(
+            &[decision],
+            &[],
+            &world,
+            &SuitabilityState::default(),
+            time::OffsetDateTime::now_utc(),
+        ));
+        assert!(!empty.runtime_snapshot.is_empty());
+        let _ = empty.view(&theme);
+
+        // Fail-soft note path: an unavailable snapshot still renders.
+        empty.set_runtime_snapshot(StudioRuntimeSnapshot::unavailable("checkpoint read failed"));
+        let _ = empty.view(&theme);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Roster visibility: the explicit "Restore defaults" empty-state action
+    // plus the staffing roster-membership validation (rule_k).
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn restore_defaults_is_offered_only_for_an_empty_roster() {
+        // Empty roster: the action is available (the guard the view reads).
+        let mut empty = State { agents: Vec::new(), ..Default::default() };
+        assert!(empty.roster_is_empty());
+        let _ = empty.view(&AppTheme::by_name("Midnight"));
+        let _ = empty.update(StudioMessage::RestoreDefaultAgents);
+        assert_eq!(empty.agents.len(), 5, "the five specialist defaults are seeded");
+        assert!(empty.unsaved, "the restored roster is persisted on Save");
+
+        // Populated roster: the action is hidden (guard false) and a stale
+        // click is a no-op that never dirties the studio.
+        let mut populated = State::new();
+        assert!(!populated.roster_is_empty());
+        let before: Vec<String> = populated.agents.iter().map(|a| a.id.clone()).collect();
+        let _ = populated.update(StudioMessage::RestoreDefaultAgents);
+        let after: Vec<String> = populated.agents.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(before, after, "a populated roster is never re-seeded");
+        assert!(!populated.unsaved, "a no-op restore never dirties the studio");
+    }
+
+    #[test]
+    fn restore_defaults_seeds_the_five_specialists_and_never_the_coordinator() {
+        let mut state = State { agents: Vec::new(), ..Default::default() };
+        let _ = state.update(StudioMessage::RestoreDefaultAgents);
+
+        let ids: Vec<String> = state.agents.iter().map(|id| id.id.clone()).collect();
+        assert_eq!(ids, vec!["architect", "researcher", "coder", "reviewer", "validator"]);
+        assert!(
+            !state.agents.iter().any(is_coordinator_agent),
+            "the engine-owned coordinator is never seeded as a roster agent"
+        );
+        assert!(state.visible_agents().all(|a| a.id != "coordinator"));
+    }
+
+    #[test]
+    fn valid_staffing_passes_validation() {
+        let state = standard_blueprint_state();
+        let report = state.validation();
+        assert!(report.ok, "standard staffing names roster agents: {:?}", report.messages);
+        assert_eq!(state.blueprint_error_count(), 0);
+        assert!(state.errors_for("stage.agents").is_empty());
+    }
+
+    #[test]
+    fn ghost_staffed_blueprint_fails_validation_with_the_id_named() {
+        let mut state = standard_blueprint_state();
+        // Staff stage 0 with an id absent from the roster (the gap the chip
+        // and the add pick-list cannot produce but a hand-edited/included
+        // blueprint can).
+        let _ = state.update(StudioMessage::StageStaffingToggle(0, AgentId::new("ghost")));
+
+        let report = state.validation();
+        assert!(!report.ok, "a ghost-staffed stage must not claim a valid pipeline");
+        assert_eq!(report.messages.len(), 1);
+        assert!(
+            report.messages[0].contains("ghost"),
+            "the offending id must be named: {}",
+            report.messages[0]
+        );
+        // The toolbar badge agrees with the report (fail-fast → one entry).
+        assert_eq!(state.blueprint_error_count(), 1);
+        let errors = state.errors_for("stage.agents");
+        assert_eq!(errors.len(), 1);
+        match errors[0] {
+            BlueprintError::Rule { field, code, message } => {
+                assert_eq!(field, "stage.agents");
+                assert_eq!(*code, "rule_k");
+                assert!(message.contains("ghost"));
+            }
+            other => panic!("expected a structured rule error, got {other:?}"),
+        }
     }
 }

@@ -7,6 +7,9 @@ pub enum Shortcut {
     Memory,
     ToolLog,
     Terminal,
+    /// Open/close the per-session Runtime panels modal (the read-only
+    /// Coordinator observability panels formerly in the Studio rail).
+    RuntimePanels,
     UndoRun,
     SubmitInput,
     CancelDialog,
@@ -57,6 +60,10 @@ pub fn resolve(key: &Key, mods: Modifiers, text_focused: bool) -> Option<Shortcu
         Key::Character(ch) if ch.as_str() == "m" && mods.control() => Some(Shortcut::Memory),
         Key::Character(ch) if ch.as_str() == "l" && mods.control() => Some(Shortcut::ToolLog),
         Key::Character(ch) if ch.as_str() == "`" && mods.control() => Some(Shortcut::Terminal),
+        // Ctrl+R opens the per-session Runtime panels ("R" for Runtime). Free:
+        // no existing binding uses "r" (Ctrl+S screenshot, Ctrl+T/N task,
+        // Ctrl+D diff, Ctrl+M memory, Ctrl+L tool log, Ctrl+` terminal).
+        Key::Character(ch) if ch.as_str() == "r" && mods.control() => Some(Shortcut::RuntimePanels),
         Key::Character(ch) if ch.as_str() == "e" && mods.control() => Some(Shortcut::Editor),
         Key::Character(ch) if ch.as_str() == "z" && mods.control() && !mods.shift() => {
             Some(Shortcut::UndoRun)
@@ -151,6 +158,21 @@ mod tests {
     fn ctrl_l_tool_log() {
         let result = resolve(&Key::Character("l".into()), Modifiers::CTRL, false);
         assert_eq!(result, Some(Shortcut::ToolLog));
+    }
+
+    #[test]
+    fn ctrl_r_runtime_panels() {
+        let result = resolve(&Key::Character("r".into()), Modifiers::CTRL, false);
+        assert_eq!(result, Some(Shortcut::RuntimePanels));
+    }
+
+    /// Ctrl+R must not fire while a text field owns the keyboard (same
+    /// `text_focused` gate as Ctrl+D/Ctrl+L), so typing "r" in the composer is
+    /// never hijacked.
+    #[test]
+    fn ctrl_r_is_gated_by_text_focus() {
+        let result = resolve(&Key::Character("r".into()), Modifiers::CTRL, true);
+        assert_eq!(result, None);
     }
 
     /// Tab with text focused returns None (input captures it).

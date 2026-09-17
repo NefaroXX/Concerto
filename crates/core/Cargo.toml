@@ -23,6 +23,8 @@ schemars = "1"
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 
+fd-lock = { workspace = true }
+
 tracing = { workspace = true }
 camino = { workspace = true }
 regex = { workspace = true }

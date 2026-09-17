@@ -55,21 +55,52 @@
 //! - `MOCK_AGENT_RETRIEVE=N` — after the handshake reply, emit N
 //!   `retrieve-memory` requests (wire ids `300..`, query
 //!   `supervisor memory query`, limit 3). Default: none.
+//! - `MOCK_AGENT_STORE=N` — after the handshake reply, emit N `store-memory`
+//!   requests (wire ids `500..`, content `mock-store-N`, kind `fact`,
+//!   no expiry). Default: none.
+//! - `MOCK_AGENT_INVALIDATE=N` — after the handshake reply, emit N
+//!   `invalidate-memory` requests (wire ids `600..`, a freshly generated
+//!   ULID each). Default: none.
+//!
+//! ### Whiteboard-slice consumption (ADR-60 D3 crash-window tests)
+//!
+//! The stock fixture ignores `whiteboard-slice` notifications. Two optional
+//! knobs turn it into a consuming subscriber for the Ack→cursor window:
+//!
+//! - `MOCK_AGENT_ACK_SLICES=1` — on every received slice, emit an
+//!   `ack-whiteboard` request for its `end_gate_seq` (wire ids `400..`,
+//!   fire-and-forget).
+//! - `MOCK_AGENT_CRASH_ONCE_FILE=<path>` — on the FIRST received slice of
+//!   this fixture lineage: create `<path>` and exit 1 BEFORE acking,
+//!   simulating a subscriber dying between slice delivery and cursor update.
+//!   The file is cross-incarnation memory: the supervisor's restarted child
+//!   sees the marker exists and proceeds to consume + ack instead of
+//!   crashing again.
 //!
 //! Outbound emission order is deterministic: heartbeats, then tool requests,
-//! then publishes, then retrieves — all in one burst after the handshake.
+//! then publishes, then retrieves, then stores, then invalidates — all in one
+//! burst after the handshake.
+//!
+//! Every outbound frame is written synchronously and flushed before the
+//! helper returns (blocking stdio, mirroring the supervisor's parent-side
+//! writes through [`ipc::serialize_frame`]). Delivery must not depend on
+//! `tokio::io::Stdout`'s background flusher: its scheduling delays were
+//! observed to leave the whole post-handshake burst undelivered for a child's
+//! lifetime under load, wedging supervisor-loop tests.
 
+use std::io::Write as IoWrite;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use concerto_core::ids::Ulid;
+use concerto_core::memory::ChunkType;
 use concerto_orchestrator::gate::GateRequest;
 use concerto_orchestrator::ipc::{
     self, IpcError, IpcErrorCode, IpcMethod, IpcNotification, IpcParams, IpcRequest, IpcResponse,
-    IpcResult, IpcTransportError, MAX_MESSAGE_BYTES,
+    IpcResult, IpcTransportError, MemoryEntryWire, MAX_MESSAGE_BYTES,
 };
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use tokio::io::AsyncWriteExt;
 
 /// Wire `agent_id` this fixture sends on all write-path requests — never the
 /// registered id. Tests assert the supervisor binds attribution to the
@@ -104,14 +135,22 @@ async fn run() -> i32 {
     let tool_requests = knob("MOCK_AGENT_TOOL_REQUESTS");
     let publishes = knob("MOCK_AGENT_PUBLISH");
     let retrieves = knob("MOCK_AGENT_RETRIEVE");
+    let stores = knob("MOCK_AGENT_STORE");
+    let invalidates = knob("MOCK_AGENT_INVALIDATE");
     // When set, every JSON line received on stdin is appended (re-serialized)
     // to this file. Test observability only: lets a supervisor e2e assert
     // exactly what the supervisor wrote on the wire (e.g. `whiteboard-slice`
     // notifications).
     let log_path = std::env::var("MOCK_AGENT_LOG_FILE").ok();
+    // Whiteboard-slice consumption knobs (module docs: crash-window tests).
+    let ack_slices = std::env::var("MOCK_AGENT_ACK_SLICES").is_ok();
+    let crash_once_file = std::env::var("MOCK_AGENT_CRASH_ONCE_FILE").ok();
+    let mut next_ack_id = 400u64;
 
     let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    // Synchronous frame sink (see module docs): every write is flushed
+    // before returning, so delivery never depends on a background flusher.
+    let mut stdout = std::io::stdout();
     // Caller-owned carry buffer reused across `read_message` calls (see the
     // framing contract in `ipc.rs`).
     let mut buf = Vec::new();
@@ -134,7 +173,7 @@ async fn run() -> i32 {
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::InvalidData =>
             {
-                if let Some(code) = write_reply(&mut stdout, &parse_error_response()).await {
+                if let Some(code) = write_reply(&mut stdout, &parse_error_response()) {
                     return code;
                 }
                 replies += 1;
@@ -166,9 +205,52 @@ async fn run() -> i32 {
                         }
                     }
                 }
+                // ADR-60 D3 crash-window consumption: a `whiteboard-slice`
+                // notification is either the deterministic crash (first slice
+                // of the lineage: die before acking — the supervisor's cursor
+                // has not advanced, so redelivery is guaranteed) or, on the
+                // restarted incarnation, consumed + acked via a
+                // fire-and-forget `ack-whiteboard` request.
+                if let Some(end_gate_seq) = whiteboard_slice_end(&value) {
+                    if let Some(marker) = &crash_once_file {
+                        if !std::path::Path::new(marker).exists() {
+                            if let Err(error) = std::fs::write(marker, b"slice-before-ack") {
+                                eprintln!(
+                                    "orchestrator-mock-agent: crash marker write failed: {error}"
+                                );
+                                return 1;
+                            }
+                            exit_before_dropping().await;
+                            return 1;
+                        }
+                    }
+                    if ack_slices {
+                        let ack = IpcRequest {
+                            jsonrpc: "2.0".to_owned(),
+                            id: next_ack_id,
+                            method: IpcMethod::AckWhiteboard,
+                            params: IpcParams::AckWhiteboard { end_gate_seq },
+                        };
+                        next_ack_id += 1;
+                        match serde_json::to_value(&ack) {
+                            Ok(ack_value) => {
+                                if let Some(code) = write_json(&mut stdout, &ack_value) {
+                                    return code;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "orchestrator-mock-agent: failed to serialize ack: {error}"
+                                );
+                                return 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match handle_message_typed(value) {
                     MaybeReply::Write(response, agent_id) => {
-                        if let Some(code) = write_reply(&mut stdout, &response).await {
+                        if let Some(code) = write_reply(&mut stdout, &response) {
                             return code;
                         }
                         replies += 1;
@@ -189,18 +271,10 @@ async fn run() -> i32 {
                                     tool_requests,
                                     publishes,
                                     retrieves,
-                                )
-                                .await
-                                {
+                                    stores,
+                                    invalidates,
+                                ) {
                                     return code;
-                                }
-                                // Flush to ensure the outbound messages are sent immediately
-                                if let Err(e) = stdout.flush().await {
-                                    eprintln!(
-                                        "orchestrator-mock-agent: stdout flush failed: {}",
-                                        e
-                                    );
-                                    return 1;
                                 }
                             }
                         }
@@ -236,38 +310,42 @@ fn handle_message(value: Value) -> Option<IpcResponse> {
 
 /// Read one integer test knob from the environment (absent or unparseable →
 /// `0`).
-/// Wait out tokio's background stdout flusher before exiting.
-///
-/// Replies are written through `tokio::io::stdout()`, whose flusher thread
-/// owns the real write to fd 1 — `write_all` completing does not mean the
-/// bytes are on the wire. If the fixture exits immediately after the reply
-/// (e.g. `MOCK_AGENT_EXIT_AFTER=1`), `std::process::exit` can drop the
-/// un-flushed handshake reply and flake the supervisor's spawn. A short
-/// sleep lets the flusher catch up before the process dies.
-async fn exit_before_dropping() {
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-}
-
 fn knob(name: &str) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
 }
 
+/// Defensive pause before exiting right after a reply.
+///
+/// Replies and bursts are written synchronously and flushed before the
+/// writing helper returns, so normally nothing is left in flight. The short
+/// sleep is pure defense-in-depth for fast-exit paths
+/// (`MOCK_AGENT_EXIT_AFTER`, crash-window knob): an exotic stdout
+/// redirection that buffers again must never lose the fixture's final bytes
+/// to [`std::process::exit`].
+async fn exit_before_dropping() {
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
 /// Emit the configured outbound traffic after the handshake reply, in
 /// deterministic order: heartbeat notifications, then `execute-tool`
-/// requests (ids `100..`), `publish-event` requests (`200..`), and
-/// `retrieve-memory` requests (`300..`).
+/// requests (ids `100..`), `publish-event` requests (`200..`),
+/// `retrieve-memory` requests (`300..`), `store-memory` requests (`500..`),
+/// and `invalidate-memory` requests (`600..`).
 ///
 /// Mirrors `write_reply`'s error contract: `Some(exit_code)` on failure.
-async fn write_outbound<W>(
+#[allow(clippy::too_many_arguments)]
+fn write_outbound<W>(
     writer: &mut W,
     agent_id: &str,
     heartbeats: u64,
     tools: u64,
     publishes: u64,
     retrieves: u64,
+    stores: u64,
+    invalidates: u64,
 ) -> Option<i32>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: IoWrite,
 {
     for seq in 1..=heartbeats {
         let notification = IpcNotification {
@@ -283,7 +361,7 @@ where
         let Some(value) = to_value(&notification) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -314,7 +392,7 @@ where
         let Some(value) = to_value(&request) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -342,7 +420,7 @@ where
         let Some(value) = to_value(&request) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -360,7 +438,47 @@ where
         let Some(value) = to_value(&request) else {
             return Some(1);
         };
-        if let Some(code) = write_json(writer, &value).await {
+        if let Some(code) = write_json(writer, &value) {
+            return Some(code);
+        }
+    }
+    for index in 0..stores {
+        let request = IpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: 500 + index,
+            method: IpcMethod::StoreMemory,
+            params: IpcParams::StoreMemory {
+                // Content-only projection: the supervisor assigns the entry
+                // id and binds project scoping at the spine (ADR-60 D6).
+                entry: MemoryEntryWire {
+                    content: format!("mock-store-{index}"),
+                    chunk_type: ChunkType::Fact,
+                    model_id: None,
+                    model_version: None,
+                    metadata: json!({ "seq": index }),
+                    expires_at_ms: None,
+                    created_at_ms: now_millis(),
+                },
+            },
+        };
+        let Some(value) = to_value(&request) else {
+            return Some(1);
+        };
+        if let Some(code) = write_json(writer, &value) {
+            return Some(code);
+        }
+    }
+    for index in 0..invalidates {
+        let request = IpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: 600 + index,
+            method: IpcMethod::InvalidateMemory,
+            params: IpcParams::InvalidateMemory { memory_id: Ulid::new().to_string() },
+        };
+        let Some(value) = to_value(&request) else {
+            return Some(1);
+        };
+        if let Some(code) = write_json(writer, &value) {
             return Some(code);
         }
     }
@@ -387,21 +505,67 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Serialize and write one JSON message line.
+/// Serialize and write one JSON message line, flushed before returning.
 ///
 /// Same error contract as `write_reply`: `Some(exit_code)` when the write
 /// failed and the loop must stop — `0` when the supervisor's read end closed
-/// (broken stdout pipe — graceful teardown), `1` on an internal
-/// serialization failure. `None` means the message was written.
-async fn write_json<W>(writer: &mut W, value: &Value) -> Option<i32>
+/// (broken stdout pipe — graceful teardown), `1` on an internal failure.
+/// `None` means the message is on the wire.
+fn write_json<W>(writer: &mut W, value: &Value) -> Option<i32>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: IoWrite,
 {
-    if let Err(error) = ipc::write_message(writer, value).await {
-        eprintln!("orchestrator-mock-agent: write failed, supervisor gone: {error}");
-        return Some(0);
+    sync_write_frame(writer, value)
+}
+
+/// Blocking-write one serialized frame and flush it before returning — the
+/// fixture's single outbound funnel (the supervisor's parent-side writes use
+/// the same `serialize_frame` + `write_all` + `flush` pattern).
+///
+/// Error contract shared by every writing helper: `Some(exit_code)` when the
+/// loop must stop — `0` when the supervisor's read end closed (broken stdout
+/// pipe — graceful teardown), `1` on any other internal failure. `None`
+/// means the frame was delivered to the OS.
+fn sync_write_frame<W>(writer: &mut W, value: &Value) -> Option<i32>
+where
+    W: IoWrite,
+{
+    let frame = match ipc::serialize_frame(value) {
+        Ok(frame) => frame,
+        Err(error) => {
+            eprintln!("orchestrator-mock-agent: failed to frame message: {error}");
+            return Some(1);
+        }
+    };
+    match IoWrite::write_all(writer, &frame).and_then(|()| IoWrite::flush(writer)) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            eprintln!("orchestrator-mock-agent: write failed, supervisor gone: {error}");
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("orchestrator-mock-agent: stdout write failed: {error}");
+            Some(1)
+        }
     }
-    None
+}
+
+/// The `end_gate_seq` of a `whiteboard-slice` NOTIFICATION line, or `None`.
+/// Shape-probed (not fully deserialized) on purpose: the fixture only needs
+/// the ack coordinate, and a malformed slice must not crash the fixture
+/// outside the deterministic crash window.
+fn whiteboard_slice_end(value: &Value) -> Option<u64> {
+    let method = value.get("method").and_then(|m| m.as_str())?;
+    if method != "whiteboard-slice" {
+        return None;
+    }
+    // Wire shape: params are internally tagged (`type`) with the payload
+    // under `value`, so the ack coordinate lives at params.value.end_gate_seq.
+    value
+        .get("params")
+        .and_then(|params| params.get("value"))
+        .and_then(|payload| payload.get("end_gate_seq"))
+        .and_then(|seq| seq.as_u64())
 }
 
 /// Dispatch one decoded message: requests first (a request also decodes as a
@@ -477,15 +641,15 @@ fn parse_error_response() -> IpcResponse {
     }
 }
 
-/// Serialize and write one response line.
+/// Serialize and write one response line, flushed before returning.
 ///
 /// Returns `Some(exit_code)` when the write failed and the loop must stop:
 /// `0` when the supervisor's read end closed (broken stdout pipe — graceful
 /// teardown), `1` on an internal serialization failure. `None` means the
-/// response was written and the loop continues.
-async fn write_reply<W>(writer: &mut W, response: &IpcResponse) -> Option<i32>
+/// response is on the wire and the loop continues.
+fn write_reply<W>(writer: &mut W, response: &IpcResponse) -> Option<i32>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: IoWrite,
 {
     let value = match serde_json::to_value(response) {
         Ok(value) => value,
@@ -494,11 +658,7 @@ where
             return Some(1);
         }
     };
-    if let Err(error) = ipc::write_message(writer, &value).await {
-        eprintln!("orchestrator-mock-agent: write failed, supervisor gone: {error}");
-        return Some(0);
-    }
-    None
+    sync_write_frame(writer, &value)
 }
 
 #[cfg(test)]
@@ -565,6 +725,78 @@ mod tests {
         let error = response.error.expect("unsupported method errors");
         assert_eq!(error.code, IpcErrorCode::MethodNotFound);
         assert_eq!(error.message, "mock agent: unsupported method");
+    }
+
+    #[test]
+    fn memory_write_requests_get_method_not_found() {
+        // `store-memory` / `invalidate-memory` are supervisor-side methods;
+        // this agent-side fixture rejects both loudly (same contract as the
+        // other unsupported supervisor methods).
+        let store = request_value(
+            9,
+            IpcMethod::StoreMemory,
+            IpcParams::StoreMemory {
+                entry: MemoryEntryWire {
+                    content: "mock".to_owned(),
+                    chunk_type: ChunkType::Fact,
+                    model_id: None,
+                    model_version: None,
+                    metadata: json!({}),
+                    expires_at_ms: None,
+                    created_at_ms: 1_700_000_000_000,
+                },
+            },
+        );
+        let response = handle_message(store).expect("store-memory must get a reply");
+        assert_eq!(response.id, 9);
+        assert_eq!(
+            response.error.expect("store-memory rejected").code,
+            IpcErrorCode::MethodNotFound
+        );
+
+        let invalidate = request_value(
+            10,
+            IpcMethod::InvalidateMemory,
+            IpcParams::InvalidateMemory { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned() },
+        );
+        let response = handle_message(invalidate).expect("invalidate-memory must get a reply");
+        assert_eq!(response.id, 10);
+        assert_eq!(
+            response.error.expect("invalidate-memory rejected").code,
+            IpcErrorCode::MethodNotFound
+        );
+    }
+
+    /// The `MOCK_AGENT_STORE` / `MOCK_AGENT_INVALIDATE` knobs emit the memory
+    /// write-path requests in the documented id bands (`500..` / `600..`)
+    /// with the correct wire shapes.
+    #[test]
+    fn outbound_emits_store_and_invalidate_requests() {
+        let mut wire: Vec<u8> = Vec::new();
+        let result = write_outbound(&mut wire, "agent-a", 0, 0, 0, 0, 2, 1);
+        assert!(result.is_none(), "emission must succeed");
+        let lines: Vec<Value> = String::from_utf8(wire)
+            .expect("frames are utf-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each frame parses"))
+            .collect();
+        assert_eq!(lines.len(), 3, "two stores then one invalidate");
+
+        for (index, value) in lines[..2].iter().enumerate() {
+            assert_eq!(value["id"], json!(500 + index as u64));
+            assert_eq!(value["method"], json!("store-memory"));
+            let entry = &value["params"]["value"]["entry"];
+            assert_eq!(entry["content"], json!(format!("mock-store-{index}")));
+            assert_eq!(entry["chunk_type"], json!("Fact"));
+            assert_eq!(entry["expires_at_ms"], json!(null), "no expiry by default");
+            assert!(entry["created_at_ms"].as_i64().is_some(), "creation time is millis");
+        }
+        assert_eq!(lines[2]["id"], json!(600));
+        assert_eq!(lines[2]["method"], json!("invalidate-memory"));
+        assert!(
+            lines[2]["params"]["value"]["memory_id"].is_string(),
+            "invalidate carries a ULID string"
+        );
     }
 
     #[test]

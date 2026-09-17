@@ -16,7 +16,9 @@
 //! Defaults are the existing behavior (`trigger_tokens` 16000,
 //! `retain_user_turns` 4, `minimum_user_turns` 6), so a config without a
 //! `[context]` section — or with only some knobs set — is byte-identical to
-//! today's runtime.
+//! today's runtime. `cache_stable_prefix` resolves to `false` when unset; the
+//! resolved flag is exposed on the budget but not yet forwarded to a dialect
+//! cache op (additive label, see [`ContextBudgetPolicy`]).
 
 use std::sync::Arc;
 
@@ -42,11 +44,23 @@ pub struct ContextBudgetPolicy {
     pub retain_user_turns: usize,
     /// Minimum user turns before compaction may fire (default 6).
     pub minimum_user_turns: usize,
+    /// Request an explicit prefix-stability marker at the deterministic
+    /// checkpoint-frontier / recent-tail boundary (default `false` = today's
+    /// behavior). Resolved from `[context].cache_stable_prefix` but not yet
+    /// forwarded to a dialect cache op — the marker needs a `Message`-level
+    /// carrier before it can be consumed, so wiring is deferred
+    /// (TODO(ADR-048), additive only).
+    pub cache_stable_prefix: bool,
 }
 
 impl Default for ContextBudgetPolicy {
     fn default() -> Self {
-        Self { trigger_tokens: 16_000, retain_user_turns: 4, minimum_user_turns: 6 }
+        Self {
+            trigger_tokens: 16_000,
+            retain_user_turns: 4,
+            minimum_user_turns: 6,
+            cache_stable_prefix: false,
+        }
     }
 }
 
@@ -63,6 +77,9 @@ impl ContextBudgetPolicy {
                 minimum_user_turns: context
                     .minimum_user_turns
                     .unwrap_or(default.minimum_user_turns),
+                cache_stable_prefix: context
+                    .cache_stable_prefix
+                    .unwrap_or(default.cache_stable_prefix),
             },
         }
     }
@@ -221,7 +238,8 @@ mod tests {
             ContextBudgetPolicy {
                 trigger_tokens: 16_000,
                 retain_user_turns: 4,
-                minimum_user_turns: 6
+                minimum_user_turns: 6,
+                cache_stable_prefix: false,
             }
         );
         // A `None` section resolves to the same budget (defaults = behavior).
@@ -234,6 +252,7 @@ mod tests {
             trigger_tokens: Some(8_000),
             retain_user_turns: None,
             minimum_user_turns: None,
+            cache_stable_prefix: None,
         };
         let budget = ContextBudgetPolicy::from_config(Some(&partial));
         assert_eq!(budget.trigger_tokens, 8_000);
@@ -244,11 +263,43 @@ mod tests {
             trigger_tokens: Some(12_000),
             retain_user_turns: Some(2),
             minimum_user_turns: Some(4),
+            cache_stable_prefix: Some(true),
         };
         let budget = ContextBudgetPolicy::from_config(Some(&full));
         assert_eq!(budget.trigger_tokens, 12_000);
         assert_eq!(budget.retain_user_turns, 2);
         assert_eq!(budget.minimum_user_turns, 4);
+        assert!(budget.cache_stable_prefix, "explicit knob maps through");
+    }
+
+    #[test]
+    fn cache_stable_prefix_resolves_and_defaults_off() {
+        // Unset knob and absent section both keep today's behavior (no
+        // prefix-stability marker; budget equals the default).
+        let unset = ContextConfig { cache_stable_prefix: None, ..ContextConfig::default() };
+        assert!(
+            !ContextBudgetPolicy::from_config(Some(&unset)).cache_stable_prefix,
+            "unset knob keeps today's behavior"
+        );
+        assert_eq!(
+            ContextBudgetPolicy::from_config(None).cache_stable_prefix,
+            ContextBudgetPolicy::default().cache_stable_prefix,
+            "absent [context] section resolves to the default budget"
+        );
+
+        // Explicit true and false map through `from_config`.
+        let on = ContextConfig { cache_stable_prefix: Some(true), ..ContextConfig::default() };
+        assert!(ContextBudgetPolicy::from_config(Some(&on)).cache_stable_prefix);
+        let off = ContextConfig { cache_stable_prefix: Some(false), ..ContextConfig::default() };
+        assert!(!ContextBudgetPolicy::from_config(Some(&off)).cache_stable_prefix);
+
+        // The flag is a label for now: the other budget knobs are untouched,
+        // so compaction/plan output stays byte-identical.
+        let with_flag = ContextBudgetPolicy::from_config(Some(&on));
+        let default = ContextBudgetPolicy::default();
+        assert_eq!(with_flag.trigger_tokens, default.trigger_tokens);
+        assert_eq!(with_flag.retain_user_turns, default.retain_user_turns);
+        assert_eq!(with_flag.minimum_user_turns, default.minimum_user_turns);
     }
 
     #[test]
@@ -297,6 +348,7 @@ mod tests {
             trigger_tokens: Some(100),
             retain_user_turns: Some(2),
             minimum_user_turns: Some(4),
+            cache_stable_prefix: None,
         }));
         assert!(matches!(tuned.plan(&messages), ContextPlan::Compact { .. }));
     }
@@ -324,6 +376,7 @@ mod tests {
             trigger_tokens: Some(1_000),
             retain_user_turns: Some(2),
             minimum_user_turns: Some(4),
+            cache_stable_prefix: None,
         }));
         let active = engine
             .assemble(store.clone(), session.id, &messages, CancellationToken::new(), None)

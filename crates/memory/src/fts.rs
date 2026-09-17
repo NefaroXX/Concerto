@@ -162,6 +162,10 @@ impl FullTextStore for SqliteFullTextStore {
                     chunk_id: row.get::<String, _>("chunk_id"),
                     score: -rank,
                     content: row.get::<String, _>("content"),
+                    // The FTS table carries no staleness flag; the vector store
+                    // is authoritative for model-version staleness, which
+                    // `fuse_results` resolves onto the fused result.
+                    stale: false,
                 }
             })
             .collect();
@@ -201,6 +205,7 @@ mod tests {
             score: 0.0,
             model_id: "test".into(),
             model_version: "1".into(),
+            stale: false,
         }
     }
 
@@ -474,6 +479,7 @@ mod tests {
             score: 0.0,
             model_id: String::new(),
             model_version: String::new(),
+            stale: false,
         }
     }
 }

@@ -145,6 +145,7 @@ mod tests {
             score: 1.0,
             model_id: "test".into(),
             model_version: "1".into(),
+            stale: false,
         };
 
         let formatted = format_retrieved_memory(&[chunk]);

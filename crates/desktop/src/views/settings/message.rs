@@ -37,6 +37,10 @@ pub enum Message {
     FormCancel,
 
     // Phase 3 — model discovery
+    /// User pressed a provider row's "Refresh" model-list control. The App
+    /// layer intercepts this: it owns the request bookkeeping
+    /// (`pending_refresh`) and spawns the async discovery fetch.
+    ProviderModelsRefreshRequested(String),
     /// Discovery result for a saved provider, produced by the app's async task.
     ProviderModelsRefreshed {
         provider_id: String,
@@ -130,6 +134,9 @@ pub enum Message {
     // ADR-37 — Plugin grant lifecycle management
     /// Request to revoke a plugin's capability grants.
     PluginRevokePressed(String),
+    /// Result of a revoke action: a human-readable outcome line on success, or
+    /// an error message on failure.
+    PluginRevokeResult(Result<String, String>),
 
     // ADR-43 — Skills and MCP extension configuration
     /// Toggle the master skills enable flag (`skills.enabled`).
@@ -155,6 +162,11 @@ pub enum Message {
     /// Toggle a collapsible section open/closed.
     #[allow(private_interfaces)]
     ToggleSection(SectionId),
+    /// Navigate to a section: expand it and scroll the main column to its
+    /// header. Sent by the sidebar index (which navigates); the section headers
+    /// keep sending [`Message::ToggleSection`], which only folds.
+    #[allow(private_interfaces)]
+    JumpToSection(SectionId),
 }
 
 /// Identifies a collapsible section in the Settings view.
@@ -171,4 +183,26 @@ pub(crate) enum SectionId {
     Plugins,
     Skills,
     Mcp,
+}
+
+impl SectionId {
+    /// Every section in the order it renders in the main column (and in the
+    /// sidebar index). This canonical order is what a sidebar jump uses to
+    /// derive a scroll position; it is intentionally independent of whether
+    /// the Relationships section is currently hidden (`[orchestration]`-gated),
+    /// because the resulting fractional offset stays within one section height
+    /// either way.
+    pub(crate) const ALL: [SectionId; 11] = [
+        SectionId::Theme,
+        SectionId::Providers,
+        SectionId::Assignments,
+        SectionId::Policy,
+        SectionId::Relationships,
+        SectionId::Retry,
+        SectionId::Memory,
+        SectionId::Shell,
+        SectionId::Plugins,
+        SectionId::Skills,
+        SectionId::Mcp,
+    ];
 }

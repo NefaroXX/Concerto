@@ -62,6 +62,9 @@ pub struct MemoryRow {
     pub age: String,
     pub score: f32,
     pub entry_type: MemoryEntryType,
+    /// `true` when the row was produced by an older embedding model version
+    /// and is awaiting re-index (ADR-12): still searchable, rank-demoted.
+    pub stale: bool,
 }
 
 pub enum MemoryStatus {
@@ -282,13 +285,20 @@ impl State {
                 })
                 .map(|(i, entry)| {
                     let selected = self.selected_index == Some(i);
-                    let row_content = row![
-                        column![
-                            text(&entry.content_preview).size(13),
+                    let source_line = if entry.stale {
+                        row![
+                            text("stale").size(11).color(palette.warning),
                             text(&entry.source).size(11).color(palette.text_muted),
                         ]
-                        .spacing(3)
-                        .width(Length::Fill),
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center)
+                    } else {
+                        row![text(&entry.source).size(11).color(palette.text_muted)]
+                    };
+                    let row_content = row![
+                        column![text(&entry.content_preview).size(13), source_line,]
+                            .spacing(3)
+                            .width(Length::Fill),
                         text(format!("{:.0}%", entry.score * 100.0)).size(11),
                         button(text("✕").size(11))
                             .style(crate::ui::button::secondary)
@@ -348,6 +358,7 @@ mod tests {
             age: String::new(),
             score: 0.9,
             entry_type: MemoryEntryType::Fact,
+            stale: false,
         }]);
         state
     }

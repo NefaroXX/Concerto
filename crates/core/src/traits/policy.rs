@@ -13,6 +13,27 @@ pub trait PolicyEngine: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<PolicyVerdict, PolicyError>;
 
+    /// ADR-65 F1a: advisory policy evaluation.
+    ///
+    /// Same decision logic as [`Self::evaluate`], but **side-effect-free**:
+    /// it never persists an audit decision row and never consumes integration
+    /// quotas (rate-limiter tokens, spend reservations). The read-dedupe serve
+    /// path (ADR-65 §3.2) re-evaluates a cached read through this method before
+    /// serving it, so a denial still falls through to the normal executor path
+    /// without polluting the audit log with a duplicate decision row.
+    ///
+    /// The default implementation delegates to [`Self::evaluate`] so minimal
+    /// engines (test stubs, in-memory presets) keep compiling with their
+    /// pre-ADR-65 behavior; engines that can provide the side-effect-free
+    /// contract override it.
+    async fn evaluate_advisory(
+        &self,
+        action: &PolicyAction<'_>,
+        cancel: CancellationToken,
+    ) -> Result<PolicyVerdict, PolicyError> {
+        self.evaluate(action, cancel).await
+    }
+
     fn audit_log(&self) -> &dyn AuditLog;
 }
 

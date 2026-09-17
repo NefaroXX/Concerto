@@ -190,6 +190,11 @@ the typed runtime adds no second persistence or process-spawning boundary.
   envelope.
 - Automatic repair obeys configurable cycle and spend limits; exhaustion is a
   recoverable result with preserved evidence.
+- Shipped subset (2026-09-07): agent prompts carry an OS/shell identity card
+  (host OS/arch, selected profile, dialect gotchas), and failed shell
+  executions earn bounded corrective repair turns (2 per failed tool-call id
+  per run, not yet configurable); budget exhaustion leaves the recoverable
+  error result with the captured output preserved in the transcript.
 
 ### Phase D — deterministic workflows
 

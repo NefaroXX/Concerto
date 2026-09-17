@@ -239,6 +239,16 @@ impl SubscriptionManager {
             if topics.contains(&event.kind) {
                 let size = serde_json::to_vec(event).map(|json| json.len()).unwrap_or(0);
                 if bytes + size > WHITEBOARD_SLICE_MAX_BYTES {
+                    if kept.is_empty() {
+                        // Single matching event exceeds the byte cap — force
+                        // include it as a one-event over-cap slice rather than
+                        // livelocking (end_gate_seq would otherwise never
+                        // advance past it). This preserves "never lose".
+                        kept.push(event.clone());
+                        end_gate_seq = event.gate_seq;
+                        truncated_by_bytes = true;
+                        break;
+                    }
                     truncated_by_bytes = true;
                     break;
                 }
@@ -477,6 +487,37 @@ mod tests {
         let second = manager.pending_slice("sub").await.expect("continuation");
         assert_eq!(second.events.len() + first.events.len(), 12);
         assert_eq!(second.end_gate_seq, 12);
+    }
+
+    #[tokio::test]
+    async fn single_oversized_event_is_force_delivered_not_livelocked() {
+        let (_dir, pool) = test_pool().await;
+        // One matching event whose serialized size alone exceeds the 256 KiB cap
+        let big = "x".repeat(300_000);
+        let ev = append(&pool, WhiteboardKind::Decision, json!({"big": big})).await;
+        assert!(
+            serde_json::to_vec(&ev).unwrap().len() > WHITEBOARD_SLICE_MAX_BYTES,
+            "test event must exceed byte cap"
+        );
+        // A trailing small event to exercise continuation after the oversized one
+        append(&pool, WhiteboardKind::Decision, json!({"n": 2})).await;
+
+        let manager = SubscriptionManager::new(pool.clone());
+        manager.register("sub".to_owned(), decision_scope()).await;
+
+        // First slice must force-deliver the single oversized event, not livelock
+        let first = manager.pending_slice("sub").await.expect("oversized slice present");
+        assert_eq!(first.events.len(), 1, "single oversized event force-delivered");
+        assert_eq!(first.events[0].gate_seq, ev.gate_seq);
+        assert_eq!(first.end_gate_seq, ev.gate_seq);
+        assert!(first.more, "more indicates continuation");
+
+        // Acking must advance past it; next slice delivers the trailing event
+        manager.mark_flushed("sub", first.end_gate_seq, first.more).await;
+        manager.ack("sub", first.end_gate_seq).await;
+        let second = manager.pending_slice("sub").await.expect("continuation after oversized");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].payload["n"], json!(2));
     }
 
     #[tokio::test]

@@ -31,10 +31,16 @@ use crate::ConfigError;
 /// `classifier_model`, and `classifier_confidence_threshold`. Additive;
 /// `migrate_v6_to_v7` inserts the section with defaults when absent.
 ///
+/// v7 -> v8: drop the retired `[intent]` classifier surface (ADR-56, the
+/// 2026-09-11 clarification). With the classifier off the run hot path the
+/// three keys serve no reader; the section ceases to exist in the struct and
+/// stale TOML keys are ignored at load because `AppConfig` has no
+/// `deny_unknown_fields` (v5 -> v6 precedent).
+///
 /// ADR-56 supersedes the Phase 2c `classifier_enabled` default pin (off → on):
 /// the LLM classifier is the primary intent decider, so the omitted-key
 /// default now enables it. Nothing else changes.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // Provider retry configuration
@@ -213,93 +219,6 @@ impl RetryConfig {
     }
 }
 
-// ---- ADR-55: intent routing and intent-gated authorization ----------------
-
-fn default_classifier_enabled() -> bool {
-    // ADR-56 (model-first): when `[intent] classifier_enabled` is true the LLM
-    // classifier is the PRIMARY intent decider for every non-fast-path
-    // message. The deterministic router (concerto_core::intent::route) remains
-    // the offline / fail-soft fallback and supplies the two fast-path
-    // detections (negation-override, smalltalk). Default is ON — one bounded
-    // model call per non-fast-path message is the intended primary path, not
-    // an opt-in extra (ADR-56 §1/§2).
-    true
-}
-
-fn default_classifier_confidence_threshold() -> f32 {
-    // Bound to the gate's constant (not a literal) so no configured threshold
-    // can create a [threshold, LOW_CONFIDENCE_THRESHOLD) band where a
-    // classifier Execute re-route would miss the gate's arm-1 dialog
-    // (ADR-55 Phase 2c §2).
-    concerto_core::LOW_CONFIDENCE_THRESHOLD
-}
-
-/// LLM intent classifier configuration (ADR-55 Phase 2c §2; ADR-56).
-///
-/// `[intent]` is additive and default-on. When the classifier is enabled it is
-/// the primary intent decider for every non-fast-path request (ADR-56 §1); a
-/// missing `[intent]` section or a disabled classifier leaves the run
-/// deterministic — the offline / fail-soft fallback (ADR-56 §3). The section
-/// carries the three classifier keys only — the `mode`/`enabled` keys dropped
-/// at v6 are NOT resurrected; the intent gate stays always-on.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IntentConfig {
-    /// Whether the LLM classifier is the primary intent decider. Default:
-    /// true (ADR-56 §2) — the classifier runs for every non-fast-path message;
-    /// only the negation-override and smalltalk fast paths bypass it (ADR-56
-    /// §1).
-    #[serde(default = "default_classifier_enabled")]
-    pub classifier_enabled: bool,
-
-    /// Model used for the classifier call. `None` = the run's effective chat
-    /// model (ADR-55 Phase 2c §2, per §9 "same chat model").
-    #[serde(default)]
-    pub classifier_model: Option<String>,
-
-    /// Minimum classifier confidence required to re-route the deterministic
-    /// routing result to the suggested outcome. Default: 0.7 — validated at
-    /// config load to be `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (the
-    /// gate's constant), so a classifier Execute re-route always clears the
-    /// intent gate's arm-1 confirmation dialog (ADR-55 Phase 2c §2; ADR-56 §4
-    /// keeps the invariant).
-    #[serde(default = "default_classifier_confidence_threshold")]
-    pub classifier_confidence_threshold: f32,
-}
-
-impl Default for IntentConfig {
-    fn default() -> Self {
-        Self {
-            classifier_enabled: default_classifier_enabled(),
-            classifier_model: None,
-            classifier_confidence_threshold: default_classifier_confidence_threshold(),
-        }
-    }
-}
-
-impl IntentConfig {
-    /// Validate the classifier settings during config loading, mirroring
-    /// [`RetryConfig::validate`].
-    ///
-    /// The threshold is bound to `concerto_core::LOW_CONFIDENCE_THRESHOLD`
-    /// (not a literal): the intent gate's `is_confident_execute`/arm-1 dialog
-    /// uses that constant, so a configured threshold below it could re-route a
-    /// classifier Execute at a confidence the gate treats as ambiguous —
-    /// landing it in the read-only wildcard instead of the confirmation
-    /// dialog (ADR-55 Phase 2c §2, never-grant invariant).
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.classifier_confidence_threshold.is_finite()
-            || self.classifier_confidence_threshold < concerto_core::LOW_CONFIDENCE_THRESHOLD
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "intent.classifier_confidence_threshold must be finite and >= {} \
-                 (concerto_core::LOW_CONFIDENCE_THRESHOLD)",
-                concerto_core::LOW_CONFIDENCE_THRESHOLD
-            )));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub schema_version: u32,
@@ -390,16 +309,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub context: Option<ContextConfig>,
 
-    /// LLM intent classifier (ADR-55 Phase 2c §2; ADR-56).
-    ///
-    /// `None` (a config without a `[intent]` section) disables the classifier
-    /// — the deterministic router is the only routing path, serving as the
-    /// offline / fail-soft fallback (ADR-56 §3). `migrate_v6_to_v7` inserts
-    /// the section with defaults (classifier ON) when absent. Additive: no
-    /// `deny_unknown_fields`, so stale v6 keys keep loading.
-    #[serde(default)]
-    pub intent: Option<IntentConfig>,
-
     /// Tool-level runtime settings applied at session start.
     ///
     /// `None` (a config without a `[tools]` section) keeps the embedded
@@ -434,6 +343,16 @@ pub struct AppConfig {
     /// config object was not built through the load seam.
     #[serde(skip)]
     pub resolved_blueprint: Option<Arc<ResolvedBlueprint>>,
+
+    /// Whether the working roster was sourced from the per-agent config files
+    /// under `<global-config-dir>/agents/` (the single source of truth).
+    ///
+    /// Derived load-time state — never round-trips through a config file
+    /// (`#[serde(skip)]`); set by the load seam when the agents directory
+    /// exists. Ensures an intentionally empty file-backed roster (every agent
+    /// deleted) still owns the roster, so no builtin seed is resurrected.
+    #[serde(skip)]
+    pub agent_files_authoritative: bool,
 }
 
 impl PartialEq for AppConfig {
@@ -463,7 +382,6 @@ impl PartialEq for AppConfig {
             && self.shell_settings == other.shell_settings
             && self.project_roots == other.project_roots
             && self.context == other.context
-            && self.intent == other.intent
             && self.tool_settings == other.tool_settings
             && self.orchestration == other.orchestration
     }
@@ -492,10 +410,10 @@ impl Default for AppConfig {
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
-            intent: None,
             tool_settings: None,
             orchestration: None,
             resolved_blueprint: None,
+            agent_files_authoritative: false,
         }
     }
 }
@@ -505,8 +423,11 @@ impl Default for AppConfig {
 /// Additive serde-default only: every knob is optional, and a missing
 /// `[context]` section (or missing knob) keeps the engine's embedded defaults
 /// from `context_compaction.rs` (`trigger_tokens` 16000, `retain_user_turns` 4,
-/// `minimum_user_turns` 6). No schema migration is required; this section is a
-/// first-class v5 field but defaults to `None` for old configs.
+/// `minimum_user_turns` 6). `cache_stable_prefix` is the ADR-048 gap knob:
+/// it is resolved on the engine's budget policy but held as a label while the
+/// dialect cache-op wiring lands (additive, no behavior change when unset).
+/// No schema migration is required; this section is a first-class v5 field but
+/// defaults to `None` for old configs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ContextConfig {
     /// Token budget that triggers deterministic compaction. When unset the
@@ -521,6 +442,22 @@ pub struct ContextConfig {
     /// (`6`) applies.
     #[serde(default)]
     pub minimum_user_turns: Option<usize>,
+    /// Request an explicit prefix-stability boundary between the deterministic
+    /// checkpoint head and the recent tail the engine materializes for the
+    /// next request. `true` asks the engine to mark the frontier/tail edge so
+    /// a provider dialect's prompt-cache op can break there — aligning the
+    /// cached prefix with the byte-stable head instead of the first user turn.
+    /// `false` or unset (`None`, the default) keeps today's behavior, where
+    /// the provider-level `[model_settings.providers].cache_breakpoints` dial
+    /// is the only cache-marker path.
+    ///
+    /// TODO(ADR-048): exposed and resolved on the engine's budget policy but
+    /// not yet forwarded to a dialect cache op — the marker needs a
+    /// `Message`-level carrier before `AnthropicChatDialect::apply_cache_breakpoints`
+    /// can consume it. Wiring deliberately deferred; `None` output is
+    /// byte-identical to today.
+    #[serde(default)]
+    pub cache_stable_prefix: Option<bool>,
 }
 
 /// Runtime memory controls shared by CLI and desktop.
@@ -539,6 +476,16 @@ pub struct MemoryConfig {
     /// `.gitignore` and `.concertoignore`.
     #[serde(default)]
     pub ignore_file: Option<Utf8PathBuf>,
+    /// ADR-65 §8 retention for derived summary chunks (`Fact` +
+    /// `SessionSummary`): keep the newest N per session bucket and prune
+    /// older ones. `0` disables the count cap (keep everything).
+    #[serde(default = "default_summary_keep_per_session")]
+    pub summary_keep_per_session: u32,
+    /// ADR-65 §8 retention window (days) for derived summary chunks:
+    /// summaries older than this are pruned at memory init. `0` disables the
+    /// age-based prune. Source chunks are never window-pruned here.
+    #[serde(default = "default_summary_retention_days")]
+    pub summary_retention_days: u16,
 }
 
 fn default_memory_enabled() -> bool {
@@ -549,6 +496,14 @@ fn default_memory_ttl_days() -> u16 {
     30
 }
 
+fn default_summary_keep_per_session() -> u32 {
+    20
+}
+
+fn default_summary_retention_days() -> u16 {
+    365
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -556,6 +511,8 @@ impl Default for MemoryConfig {
             ttl_days: default_memory_ttl_days(),
             exclude_patterns: Vec::new(),
             ignore_file: None,
+            summary_keep_per_session: default_summary_keep_per_session(),
+            summary_retention_days: default_summary_retention_days(),
         }
     }
 }
@@ -565,6 +522,11 @@ impl MemoryConfig {
         if !(1..=365).contains(&self.ttl_days) {
             return Err(ConfigError::InvalidValue(
                 "memory.ttl_days must be between 1 and 365".into(),
+            ));
+        }
+        if self.summary_retention_days > 365 {
+            return Err(ConfigError::InvalidValue(
+                "memory.summary_retention_days must be 0 (disabled) or between 1 and 365".into(),
             ));
         }
         Ok(())
@@ -969,6 +931,51 @@ impl ConditionDef {
     }
 }
 
+// ---- Tool-schema presentation tier (adaptive tool schemas) -------------------
+
+/// How tool parameter schemas are presented to a model on the wire.
+///
+/// Weak tool-calling models (audit: `mimo-v2.5-free`) stall on nested
+/// JSON-Schema tool parameters: they emit `null` arguments, hallucinate keys,
+/// and miss required nested fields. "Loose" presentation flattens nested
+/// object properties to dot-notation leaves, appends argument examples to
+/// tool descriptions, and spells out enum members in property descriptions;
+/// the provider connector re-nests dot-notation arguments on the way back so
+/// the executor and the tool-call guard still see the original nested shape
+/// (see `concerto_providers::adapters::schema_loose`).
+///
+/// The user-facing dial lives on each `[providers.*]` entry as the
+/// `tool_schema_mode` string (`"auto"` | `"strict"` | `"loose"`); this enum is
+/// the parsed, provider-side value. Default is [`ToolSchemaMode::Auto`]:
+/// unknown model names keep today's verbatim ("strict") schema — only names
+/// matching the weak-tier heuristic are adapted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolSchemaMode {
+    /// Decide per resolved model name: weak tool-callers (heuristic, see
+    /// `concerto_providers::adapters::schema_loose`) get loose schemas,
+    /// every other model keeps the verbatim strict schema.
+    #[default]
+    Auto,
+    /// Always send the tool schema verbatim (strong tool-calling models).
+    Strict,
+    /// Always send the adapted loose schema, regardless of model name.
+    Loose,
+}
+
+/// Parse the `[providers.*] tool_schema_mode` dial into a [`ToolSchemaMode`].
+///
+/// Lenient like the `reasoning_echo` dial: `None`, empty, and unrecognized
+/// values resolve to [`ToolSchemaMode::Auto`] so configs stay
+/// forward-compatible. Unknown-but-present values are logged by the factory,
+/// which is the only caller that has logging context.
+pub fn parse_tool_schema_mode(raw: Option<&str>) -> ToolSchemaMode {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("strict") => ToolSchemaMode::Strict,
+        Some(value) if value.eq_ignore_ascii_case("loose") => ToolSchemaMode::Loose,
+        _ => ToolSchemaMode::Auto,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     /// Unique identifier for referencing in agent assignments.
@@ -1027,6 +1034,14 @@ pub struct ProviderConfig {
     /// no-op. Off preserves the current wire output exactly.
     #[serde(default)]
     pub cache_breakpoints: bool,
+    /// Tool-schema presentation tier for this provider's models.
+    ///
+    /// One of `"auto"` (default — adapt schemas only for weak tool-calling
+    /// model names such as `mimo-v2.5-free`), `"strict"` (never adapt), or
+    /// `"loose"` (always adapt). `None`/unrecognized resolves to `"auto"`.
+    /// See [`ToolSchemaMode`] for what adaptation changes on the wire.
+    #[serde(default)]
+    pub tool_schema_mode: Option<String>,
 }
 
 impl ProviderConfig {
@@ -1154,6 +1169,7 @@ impl Default for ProviderConfig {
             extra_models: Vec::new(),
             reasoning_echo: None,
             cache_breakpoints: false,
+            tool_schema_mode: None,
         }
     }
 }
@@ -1318,6 +1334,24 @@ pub struct AgentModelAssignment {
 
 // ---- Phase 5: multi-agent configuration ------------------------------------
 
+/// Source of truth for an approved plan's Execute state (ADR-60 D7, issue
+/// #152). Kebab-case on the wire (`whiteboard` / `legacy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanBindingSource {
+    /// Whiteboard events keyed by `plan_id` are the source of truth: an
+    /// approved-plan Execute rehydrates the content-addressed structured
+    /// artifact + carry-forward ledger from the log and forbids silent
+    /// re-decompose (loud failure on divergence without re-approval).
+    #[default]
+    Whiteboard,
+    /// Pre-D7 behavior kept byte-identical as the migration escape hatch:
+    /// the rendered plan text rides as prose and conversation history is
+    /// injected as before. Plans without whiteboard rows degrade here too
+    /// (with a warn), so bindings created before the D7 slice keep working.
+    Legacy,
+}
+
 /// Multi-agent orchestration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MultiAgentConfig {
@@ -1405,6 +1439,26 @@ pub struct MultiAgentConfig {
     /// config-file knob.
     #[serde(default)]
     pub coordinator_prompt: Option<String>,
+    /// ADR-60 Phase 1 (thin slice): when `true`, an Execute-classified
+    /// multi-agent run dispatches through the process supervisor
+    /// ([`Supervisor`] + real `orchestrator-agent-process` children) instead
+    /// of the in-process `CoordinatorAgent` waves. Defaults to `false` — the
+    /// coordinator remains the production path until supervised parity lands.
+    /// When enabled but the supervisor cannot start (no session-DB pool,
+    /// missing child binary, empty roster), the run degrades loudly (a warn)
+    /// back to the coordinator.
+    ///
+    /// [`Supervisor`]: concerto_orchestrator::supervisor::Supervisor
+    #[serde(default)]
+    pub supervisor_enabled: bool,
+    /// ADR-60 D7 (#152): how an approved plan's Execute run sources its
+    /// state. Defaults to [`PlanBindingSource::Whiteboard`]; D7 whiteboard
+    /// persistence is gated solely by this switch — `supervisor_enabled` only
+    /// controls the supervised concurrency runtime (issue #19 decoupling).
+    /// `legacy` keeps the exact pre-D7 prose path for operators who need it
+    /// during migration.
+    #[serde(default)]
+    pub plan_binding_source: PlanBindingSource,
 }
 
 fn default_true() -> bool {
@@ -1436,6 +1490,8 @@ impl Default for MultiAgentConfig {
             max_subtask_attempts: None,
             max_total_iterations: None,
             coordinator_prompt: None,
+            supervisor_enabled: false,
+            plan_binding_source: PlanBindingSource::default(),
         }
     }
 }
@@ -1790,28 +1846,6 @@ mod tests {
         assert_eq!(rc.stream_idle_timeout_seconds, 300);
     }
 
-    /// ADR-56 §2: `classifier_enabled` defaults to true — the LLM classifier
-    /// is the primary intent decider and a config without an explicit key (or
-    /// migrated from v6) enables it. `classifier_model` and the threshold
-    /// keep their unchanged defaults.
-    #[test]
-    fn intent_classifier_defaults_to_enabled() {
-        let intent = IntentConfig::default();
-        assert!(intent.classifier_enabled, "classifier must default ON (ADR-56)");
-        assert_eq!(intent.classifier_model, None, "classifier_model still defaults to None");
-        assert_eq!(
-            intent.classifier_confidence_threshold,
-            concerto_core::LOW_CONFIDENCE_THRESHOLD,
-            "threshold still defaults to LOW_CONFIDENCE_THRESHOLD (0.7)"
-        );
-        // The serde default (what an omitted `classifier_enabled` key loads)
-        // must agree with the `Default` impl — the flip applies to both paths.
-        let from_toml =
-            crate::schema::IntentConfig::deserialize(toml::Value::Table(toml::map::Map::new()))
-                .expect("omitted keys fall back to their serde defaults");
-        assert!(from_toml.classifier_enabled, "serde default must also be ON");
-    }
-
     /// `[tools] git_auto_init` defaults to true on both construction paths:
     /// the `Default` impl (what the session manager uses) and the serde
     /// default (what an omitted `git_auto_init` key loads).
@@ -1962,6 +1996,20 @@ mod tests {
         assert_eq!(decoded, agent);
     }
 
+    /// Maintainer decision 2026-09: the embedded agent seeds never contain the
+    /// coordinator — it is constructed in code, not seeded or persisted.
+    #[test]
+    fn builtin_agent_seeds_never_contain_the_coordinator() {
+        let seeds = builtin_agent_seeds();
+        assert!(
+            !seeds.iter().any(|seed| {
+                seed.id.eq_ignore_ascii_case("coordinator")
+                    || seed.role.eq_ignore_ascii_case("coordinator")
+            }),
+            "the config seed roster must never carry a coordinator entry: {seeds:?}"
+        );
+    }
+
     #[test]
     fn pipeline_warnings_flags_coordinator_entries() {
         let agent = |id: &str, role: &str| CustomAgentConfig {
@@ -2095,6 +2143,68 @@ mod tests {
         let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
         let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(parsed.coordinator_prompt, None);
+    }
+
+    #[test]
+    fn multi_agent_supervisor_enabled_defaults_off_and_round_trips() {
+        // ADR-60 Phase 1: the supervised multi-agent path is opt-in. The flag
+        // defaults to false (the coordinator stays the production path), and
+        // configs that never carried the key keep loading as coordinator runs.
+        let cfg = MultiAgentConfig::default();
+        assert!(!cfg.supervisor_enabled, "the supervisor path must default to off");
+
+        let json = serde_json::to_string(&MultiAgentConfig {
+            supervisor_enabled: true,
+            ..Default::default()
+        })
+        .expect("serialize");
+        let restored: MultiAgentConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.supervisor_enabled, "an explicit opt-in must survive the round trip");
+
+        let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
+        let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
+        assert!(
+            !parsed.supervisor_enabled,
+            "legacy config without the key stays on the coordinator"
+        );
+    }
+
+    #[test]
+    fn plan_binding_source_defaults_to_whiteboard_and_round_trips_legacy() {
+        // ADR-60 D7: the whiteboard is the default source of truth for an
+        // approved plan's Execute state; `legacy` is the explicit migration
+        // escape hatch and must survive a round trip byte-for-byte.
+        let cfg = MultiAgentConfig::default();
+        assert_eq!(
+            cfg.plan_binding_source,
+            PlanBindingSource::Whiteboard,
+            "D7 is gated by plan_binding_source alone; whiteboard is a safe default \
+             independent of supervisor_enabled",
+        );
+
+        let json = serde_json::to_string(&MultiAgentConfig {
+            plan_binding_source: PlanBindingSource::Legacy,
+            ..Default::default()
+        })
+        .expect("serialize");
+        let restored: MultiAgentConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.plan_binding_source,
+            PlanBindingSource::Legacy,
+            "an explicit legacy opt-out must survive the round trip"
+        );
+
+        // Kebab-case on the wire.
+        let wire = serde_json::to_value(PlanBindingSource::Legacy).expect("kind serializes");
+        assert_eq!(wire, serde_json::json!("legacy"));
+
+        let legacy = r#"{"spend_cap_multiplier":3.0,"default_enabled":false}"#;
+        let parsed: MultiAgentConfig = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(
+            parsed.plan_binding_source,
+            PlanBindingSource::Whiteboard,
+            "a config that never carried the key defaults to the D7 source of truth"
+        );
     }
 
     #[test]
@@ -2283,6 +2393,60 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_tool_schema_mode_round_trip() {
+        // Legacy provider block without the field must load with the dial
+        // unset (additive `serde(default)`, backward compatible).
+        let legacy = toml::from_str::<ProviderConfig>(
+            "id = \"outdated\"\nprovider = \"openrouter\"\nmodel = \"mimo-v2.5-free\"\n\
+             timeout_seconds = 30\nkeyring_key = \"openrouter/api_key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.tool_schema_mode, None,
+            "legacy provider must default to unset tool_schema_mode"
+        );
+
+        // Explicit values survive a round trip unchanged. Like
+        // `reasoning_echo`, the dial is stored as a raw string and leniently
+        // parsed at provider-build time.
+        let pc = ProviderConfig {
+            id: "gateway".into(),
+            provider: "openrouter".into(),
+            model: "mimo-v2.5-free".into(),
+            tool_schema_mode: Some("loose".into()),
+            ..ProviderConfig::default()
+        };
+        let encoded = toml::to_string(&pc).unwrap();
+        assert!(encoded.contains("tool_schema_mode"), "unexpected encoding: {encoded}");
+        let decoded: ProviderConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.tool_schema_mode.as_deref(), Some("loose"));
+
+        // An unknown value is preserved as raw config data so the factory can
+        // warn and fall back — never a hard parse failure.
+        let lenient: ProviderConfig =
+            toml::from_str(&encoded.replace("\"loose\"", "\"sometimes\"")).unwrap();
+        assert_eq!(lenient.tool_schema_mode.as_deref(), Some("sometimes"));
+    }
+
+    #[test]
+    fn parse_tool_schema_mode_dial() {
+        // Unset, empty, and unknown values all resolve to Auto (lenient,
+        // forward-compatible parsing).
+        assert_eq!(parse_tool_schema_mode(None), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("   ")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("sometimes")), ToolSchemaMode::Auto);
+
+        // Known values parse case-insensitively and tolerate whitespace.
+        assert_eq!(parse_tool_schema_mode(Some("auto")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("AUTO")), ToolSchemaMode::Auto);
+        assert_eq!(parse_tool_schema_mode(Some("strict")), ToolSchemaMode::Strict);
+        assert_eq!(parse_tool_schema_mode(Some("Strict")), ToolSchemaMode::Strict);
+        assert_eq!(parse_tool_schema_mode(Some("loose")), ToolSchemaMode::Loose);
+        assert_eq!(parse_tool_schema_mode(Some(" loose ")), ToolSchemaMode::Loose);
+    }
+
+    #[test]
     fn provider_config_cache_breakpoints_round_trip() {
         // Legacy provider block without the field must load with breakpoints
         // off (additive `serde(default)`, backward compatible).
@@ -2312,6 +2476,41 @@ mod tests {
         )
         .unwrap();
         assert!(explicit.cache_breakpoints);
+    }
+
+    #[test]
+    fn context_config_cache_stable_prefix_round_trip() {
+        // Legacy `[context]` section without the knob loads with it unset
+        // (additive `serde(default)`; None = existing behavior). This is the
+        // ADR-048 gap knob and must never change what an old section means.
+        let legacy = toml::from_str::<ContextConfig>("trigger_tokens = 8000\n").unwrap();
+        assert_eq!(legacy.cache_stable_prefix, None, "unset knob stays None");
+
+        // Explicit true and false survive a TOML round trip unchanged.
+        for enabled in [true, false] {
+            let config =
+                ContextConfig { cache_stable_prefix: Some(enabled), ..ContextConfig::default() };
+            let encoded = toml::to_string(&config).unwrap();
+            assert!(
+                encoded.contains(&format!("cache_stable_prefix = {enabled}")),
+                "unexpected encoding: {encoded}"
+            );
+            let decoded: ContextConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.cache_stable_prefix, Some(enabled));
+            assert_eq!(
+                toml::to_string(&decoded).unwrap(),
+                encoded,
+                "round trip is byte-stable for enabled={enabled}"
+            );
+        }
+
+        // Parsing an explicitly-true section sets the knob.
+        let explicit = toml::from_str::<ContextConfig>(
+            "trigger_tokens = 8000\nretain_user_turns = 2\nminimum_user_turns = 4\n\
+             cache_stable_prefix = true\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.cache_stable_prefix, Some(true));
     }
 
     // ------------------------------------------------------------------

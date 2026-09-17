@@ -9,7 +9,7 @@ use concerto_config::{
     PolicyConfig, PolicyRuleDef, ProviderConfig, ShellSettings, SkillsConfig,
 };
 use concerto_providers::provider_defs::{
-    model_options_for, provider_definition, PROVIDER_TYPE_IDS,
+    picker_model_options, provider_definition, PROVIDER_TYPE_IDS,
 };
 
 use crate::theme::AppTheme;
@@ -18,8 +18,8 @@ use super::helpers::default_managed_source;
 use super::message::SectionId;
 use super::{
     readable_provider_label, Message, PolicyActionChoice, PolicyConditionChoice,
-    CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, POLICY_ACTIONS, POLICY_CONDITION_KINDS,
-    POLICY_OPERATION_TOOLS, POLICY_TOOLS,
+    CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID, POLICY_ACTIONS,
+    POLICY_CONDITION_KINDS, POLICY_OPERATION_TOOLS, POLICY_TOOLS,
 };
 
 pub struct State {
@@ -57,6 +57,13 @@ pub struct State {
     pub cached_provider_model_options: Vec<Vec<String>>,
     pub cached_model_names: Vec<String>,
     pub cached_models_by_provider: HashMap<String, Vec<String>>,
+    /// Providers with a model-list refresh currently in flight; their Refresh
+    /// control renders inert ("Refreshing…") until the result arrives. View
+    /// mirror of the App's `pending_refresh` request bookkeeping.
+    pub refreshing_providers: HashSet<String>,
+    /// Last model-discovery failure per provider id, shown inline next to the
+    /// Refresh control until a later successful refresh clears it.
+    pub provider_refresh_errors: HashMap<String, String>,
 
     // Add-provider form state
     pub show_form: bool,
@@ -140,6 +147,10 @@ pub struct State {
     pub plugin_grants_summary: Vec<String>,
     /// Transient result after a plugin revoke action.
     pub plugin_revoke_result: Option<String>,
+    /// Process-lifetime plugin-manager handle supplied by the desktop App
+    /// (plugin liveness). `None` headless/tests: revoke falls back to the
+    /// fresh best-effort manager, tolerating `NotActive`.
+    pub plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>,
 
     // ADR-43 — Skills configuration
     /// Master skills toggle (`skills.enabled`).
@@ -239,6 +250,8 @@ impl State {
             cached_provider_model_options: Vec::new(),
             cached_model_names: Vec::new(),
             cached_models_by_provider: HashMap::new(),
+            refreshing_providers: HashSet::new(),
+            provider_refresh_errors: HashMap::new(),
             show_form: false,
             form_provider_type: State::load_form_provider_type_def().to_string(),
             form_name: String::new(),
@@ -286,21 +299,14 @@ impl State {
             shell_managed_export_path: String::new(),
             shell_managed_import_path: String::new(),
             shell_managed_result: None,
-            collapsed_sections: {
-                let mut s = HashSet::new();
-                s.insert(SectionId::Policy);
-                s.insert(SectionId::Retry);
-                s.insert(SectionId::Memory);
-                s.insert(SectionId::Relationships);
-                s.insert(SectionId::Shell);
-                s.insert(SectionId::Plugins);
-                s.insert(SectionId::Skills);
-                s.insert(SectionId::Mcp);
-                s
-            },
+            // Every section starts folded (ADR-57 §3d UX): the sidebar index is
+            // the navigation surface, and clicking an entry expands its section
+            // in place via `Message::JumpToSection`.
+            collapsed_sections: SectionId::ALL.iter().copied().collect(),
             plugin_granted_ids: Vec::new(),
             plugin_grants_summary: Vec::new(),
             plugin_revoke_result: None,
+            plugin_manager: None,
             skills_enabled: skills.enabled,
             skills_search_paths: skills.search_paths.clone(),
             skills_auto_load: skills.auto_load,
@@ -390,6 +396,10 @@ impl State {
         self.confirm_clear_for = None;
         self.editing_key_for = None;
         self.key_edit_text.clear();
+        // Drop refresh markers/errors whose provider row no longer exists so
+        // they can neither leak nor resurface on a recycled id.
+        self.refreshing_providers.retain(|id| self.providers.iter().any(|p| &p.id == id));
+        self.provider_refresh_errors.retain(|id, _| self.providers.iter().any(|p| p.id == *id));
     }
 
     /// Build the `AppConfig` fragments this page owns, merging onto `base`.
@@ -588,20 +598,11 @@ impl State {
         format!("prov_{}", concerto_core::ids::Ulid::new())
     }
 
-    /// Model options for a provider: static known models merged with any models
-    /// discovered at runtime and persisted in `ProviderConfig::cached_models`.
+    /// Model options for a provider: the shared picker resolver (selected /
+    /// default / static known models, plus discovered `cached_models` and
+    /// config-first `extra_models`) [ADR-57 §3d].
     fn model_options_with_discovered(p: &ProviderConfig) -> Vec<String> {
-        let def = provider_definition(&p.provider);
-        let mut opts = model_options_for(p, &def, None);
-        let mut seen: std::collections::HashSet<String> =
-            opts.iter().map(|s| s.to_lowercase()).collect();
-        for m in &p.cached_models {
-            let t = m.trim().to_string();
-            if !t.is_empty() && seen.insert(t.to_lowercase()) {
-                opts.push(t);
-            }
-        }
-        opts
+        picker_model_options(p)
     }
 
     fn rebuild_cache(&mut self) {
@@ -671,6 +672,16 @@ impl State {
         self.rebuild_cache();
     }
 
+    /// Attach the desktop's process-lifetime plugin-manager handle so the
+    /// Settings revoke path can clear a LIVE plugin's in-memory grants
+    /// (plugin liveness) instead of always hitting a fresh manager.
+    pub fn with_plugin_manager(
+        &mut self,
+        plugin_manager: concerto_plugins::manager::SharedPluginManager,
+    ) {
+        self.plugin_manager = Some(plugin_manager);
+    }
+
     /// Load plugin grants from the capability store and populate UI state.
     pub fn load_plugin_grants(&mut self) {
         let data_dir = dirs::data_dir()
@@ -718,6 +729,17 @@ impl State {
         !self.skills_loaded && !self.skills_loading
     }
 
+    /// Mark a provider's model-list refresh as in flight. The row's Refresh
+    /// control renders inert until the matching result message arrives.
+    pub fn begin_provider_refresh(&mut self, provider_id: &str) {
+        self.refreshing_providers.insert(provider_id.to_string());
+    }
+
+    /// Clear a provider's in-flight refresh marker. Idempotent.
+    pub fn end_provider_refresh(&mut self, provider_id: &str) {
+        self.refreshing_providers.remove(provider_id);
+    }
+
     /// Start a skill discovery pass. Sets the loading flag and returns the
     /// task whose completion is routed back as `SkillsDiscoveryResult`.
     /// Idempotent: a second call while a run is in flight is a no-op.
@@ -743,6 +765,29 @@ impl State {
             self.skills_enabled_ids =
                 self.skills_discovered.iter().map(|skill| skill.id.clone()).collect();
         }
+    }
+
+    /// Scroll the Settings main column so `section`'s header lands at the top.
+    ///
+    /// Uses a fractional [`RelativeOffset`] derived from the section's position
+    /// in the canonical [`SectionId::ALL`] order — a stable proxy for the
+    /// rendered column, whose per-section heights vary. The `+ 1` denominator
+    /// accounts for the trailing save footer and biases the jump slightly high,
+    /// so the target section's expanded body (which grows downward) stays
+    /// visible.
+    fn scroll_to_section(section: SectionId) -> iced::Task<Message> {
+        let Some(index) = SectionId::ALL.iter().position(|candidate| *candidate == section) else {
+            return iced::Task::none();
+        };
+        let fraction = index as f32 / (SectionId::ALL.len() + 1) as f32;
+        let offset = iced_core::widget::operation::scrollable::RelativeOffset {
+            x: Some(0.0),
+            y: Some(fraction),
+        };
+        iced::advanced::widget::operate(iced_core::widget::operation::scrollable::snap_to(
+            iced::widget::Id::new(MAIN_SCROLL_ID),
+            offset,
+        ))
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -909,11 +954,40 @@ impl State {
                 self.show_form = false;
             }
 
-            // Phase 3 — model discovery (auto-triggered at startup; no manual button)
+            // Phase 3 — model discovery (startup auto-fetch + per-provider
+            // Refresh button; the App layer spawns the fetch and forwards
+            // the result here).
+            Message::ProviderModelsRefreshRequested(provider_id) => {
+                // Normally intercepted by the App layer before reaching this
+                // update. Handled anyway so a misrouted message still flips
+                // the row into its in-flight state instead of leaving a dead
+                // button.
+                self.begin_provider_refresh(&provider_id);
+            }
             Message::ProviderModelsRefreshed { provider_id, request_id: _, result } => {
-                if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
-                    if let Ok(models) = result {
-                        p.record_discovered_models(models);
+                self.end_provider_refresh(&provider_id);
+                match result {
+                    Ok(models) => {
+                        if models.is_empty() {
+                            // The providers crate collapses every discovery
+                            // failure (network, auth, …) into an empty list.
+                            // Keep the previous cache so one offline refresh
+                            // cannot wipe the user's usable model list.
+                            self.provider_refresh_errors.insert(
+                                provider_id.clone(),
+                                "Discovery returned no models — check credentials/network."
+                                    .to_string(),
+                            );
+                        } else {
+                            self.provider_refresh_errors.remove(&provider_id);
+                            if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id)
+                            {
+                                p.record_discovered_models(models);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.provider_refresh_errors.insert(provider_id.clone(), error);
                     }
                 }
                 self.rebuild_cache();
@@ -1136,36 +1210,34 @@ impl State {
                     self.collapsed_sections.insert(id);
                 }
             }
+            // Sidebar navigation: always expand the target (never fold it) and
+            // scroll the main column to its header.
+            Message::JumpToSection(id) => {
+                self.collapsed_sections.remove(&id);
+                return Self::scroll_to_section(id);
+            }
 
             // ADR-37 — Plugin grant lifecycle. Grants are persisted in the
             // capability store (not AppConfig), so revoke never touches
-            // `settings_dirty`.
+            // `settings_dirty`. The revoke runs off the UI thread inside
+            // `Task::perform`; the callback refreshes the cached lists and
+            // displays the outcome line.
             Message::PluginRevokePressed(plugin_id) => {
-                let data_dir = dirs::data_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("concerto")
-                    .join("plugins");
-                let result = (|| -> Result<(), String> {
-                    let cap_mgr = concerto_plugins::capability::CapabilityManager::open(&data_dir)
-                        .map_err(|e| format!("could not open capability store: {e}"))?;
-                    cap_mgr.revoke_plugin(&plugin_id).map_err(|e| e.to_string())?;
-                    Ok(())
-                })();
-                match &result {
-                    Ok(()) => {
-                        self.plugin_revoke_result =
-                            Some(format!("Revoked grants for '{plugin_id}'"));
-                        // Remove from cached lists.
-                        if let Some(pos) =
-                            self.plugin_granted_ids.iter().position(|id| *id == plugin_id)
-                        {
-                            self.plugin_granted_ids.remove(pos);
-                            self.plugin_grants_summary.remove(pos);
-                        }
-                    }
-                    Err(e) => {
-                        self.plugin_revoke_result = Some(format!("Error: {e}"));
-                    }
+                return iced::Task::perform(
+                    super::helpers::revoke_plugin_grants(plugin_id, self.plugin_manager.clone()),
+                    Message::PluginRevokeResult,
+                );
+            }
+            Message::PluginRevokeResult(result) => {
+                self.plugin_revoke_result = Some(match &result {
+                    Ok(message) => message.clone(),
+                    Err(error) => format!("Error: {error}"),
+                });
+                if result.is_ok() {
+                    // Persisted grants were removed; re-read the store so the
+                    // cached lists reflect reality (including any other
+                    // plugins affected by the same store write).
+                    self.load_plugin_grants();
                 }
             }
 

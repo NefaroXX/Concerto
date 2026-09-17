@@ -180,9 +180,8 @@ Configuration is layered in this order:
 3. a project-root `.concerto.toml` file;
 4. `CONCERTO_*` environment overrides (env always wins).
 
-Legacy `OPENCODE_RS_*` environment variables remain recognized for migration.
-New configurations should use the `CONCERTO_` names and must not set both
-prefixes for the same value.
+The `CONCERTO_` prefix is the only recognized environment override prefix; the
+legacy `OPENCODE_RS_*` forms are no longer read.
 
 The optional `project_roots` list restricts which project directories can be
 opened. Set it as an array in the config file

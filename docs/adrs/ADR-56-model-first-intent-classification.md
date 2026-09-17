@@ -223,3 +223,65 @@ remain in force. Where this ADR is silent, ADR-55 governs.
 - Audit: two rows per classifier-eligible event — the router row keeps the
   pre-replacement route name, the classifier row keeps
   `rule_matched = "llm_classifier"` with the shared correlation id.
+
+## Amendment (2026-09-06) — the classifier may auto-grant at high confidence (issue #27, superseded in part)
+
+ADR-55 Addendum (Phase 2d) lands automatic intent gating: `route()` +
+classifier result is the decision, and high-confidence outcomes auto-grant.
+This amendment supersedes, **in part**, two §4/§8 invariants as finalized by
+2d:
+
+- **§4 "The classifier never grants"** — "a re-routed Execute still passes
+  through the confirmation dialog and grants machinery (arm-1 gate; the 2c §4
+  never-grant invariant is unchanged)": replaced by 2d §1 — a re-routed
+  `Execute` (or `Plan`/`Verify`/`Review`/`Diagnose`) at
+  `confidence >= classifier_confidence_threshold` **auto-grants** with the
+  standard `filesystem`/`git` scopes; no confirmation dialog.
+- **§8 "The model classifies, never authorizes"** — "it can never produce an
+  unconfirmed mutation": a high-confidence misclassification (>= 0.7) can now
+  produce an unconfirmed mutation. This is the deliberate, accepted trade of
+  issue #27 (the click added no information above the threshold) and is
+  bounded — never silent — by:
+
+  1. the negation fast path (§1a) runs before any model and is an absolute
+     read-only veto; `NEGATION_PHRASES` remains load-bearing;
+  2. `AskUser` (confidence `0.0`) never auto-grants — hard read-only (2d §2);
+  3. `AutoDeny` danger patterns and `Deny`-is-final run first in the policy
+     engine; `IntentAuthorized` only upgrades `RequireApproval`, never
+     overrides `Deny` (ADR-55 §Decision 2);
+  4. `Consequential` tier and unscoped actions are outside any blanket grant
+     (ADR-55 §Decision 2) — the auto-grant carries exactly the
+     `filesystem`/`git` scopes a confirmed `Apply` holds today;
+  5. spend cap + reserve-before-call (§7) gate the classifier call itself;
+  6. every auto decision is audited (`intent_router: auto_granted` +
+     `RoutingDecided`, 2d §5) — observable, not blocking.
+
+**Unchanged:** §1a/§1b fast paths and their precedence; §3 offline fallback
+chain (classifier off/unreachable → byte-identical deterministic chain with
+the AskUser modal standing — the modal survives only where no confidence
+exists, not as a click tax on confident routes); §4 threshold validation
+(`classifier_confidence_threshold >= LOW_CONFIDENCE_THRESHOLD` at config
+load; no `[threshold, 0.7)` band); §5 audit chain; §6 utterance-only prompt;
+§7 cost semantics.
+
+## Amendment (2026-09-09) — classifier retired from run dispatch (unification, ADR-55 Phase 2e)
+
+The classifier leaves the run hot path: §1 "primary decider" and §4
+"reroute at threshold" no longer operate on run dispatch (saves one bounded
+LLM call + latency per run). What remains: deterministic safety rules +
+flavor scan in `route()`; the `intent_classifier` module itself, retained
+for future eval/classification UX and marked off-hot-path (no dispatch
+hookups). §8 (classifies, never authorizes) holds wherever the module is
+used. The 2026-09-06 auto-grant amendment is moot on the hot path — grants
+derive from the deterministic envelope (ADR-55 Phase 2e §§2–3), not from
+classifier output.
+
+## Clarification (2026-09-11) — classifier config surface removed
+
+With the classifier off the hot path, its dedicated config surface
+(`[intent].classifier_enabled`, `[intent].classifier_model`,
+`[intent].classifier_confidence_threshold`, ADR-55 Phase 2c §2 as adopted
+by §2 here) serves no reader and is removed from the schema (unknown-key
+tolerant: old files keep loading). The `intent_classifier` module itself
+stays for eval/future UX per the 2026-09-09 amendment. ADR-55 Phase 2c §2's
+schema-6→7 history stands as record; no threshold invariant survives it.

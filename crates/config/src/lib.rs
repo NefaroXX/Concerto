@@ -9,6 +9,7 @@
 //! and project configuration, provider/model assignments, retry and policy
 //! settings, shell profiles, and OS-keychain credential storage.
 
+pub mod agents;
 pub mod blueprint;
 pub mod credentials;
 pub mod facade;
@@ -20,6 +21,12 @@ mod saving;
 mod schema;
 pub mod setup;
 pub mod shell;
+
+pub use agents::{
+    agent_file_path, agents_dir_for_config, delete_agent_file, ensure_agent_files,
+    load_agent_roster, save_agent_roster_files, write_agent_file, AgentFile,
+    EnsureAgentFilesOutcome, AGENTS_DIR_NAME, AGENT_FILE_SCHEMA_VERSION,
+};
 
 pub use blueprint::{
     coordinator_fallback, coordinator_self_implement_fallback, include_write_target,
@@ -38,16 +45,20 @@ pub use managed::{
 };
 pub use projects::ProjectRegistry;
 pub use saving::{
-    roster_materialized, save_agent_roster, save_blueprint, save_inline_blueprint,
-    seed_agent_roster_only, seed_orchestration_roster,
+    declared_project_orchestration_keys, ensure_default_blueprint,
+    import_project_orchestration_to_global, orchestration_declared,
+    remove_project_orchestration_keys, roster_materialized, save_agent_roster, save_blueprint,
+    save_inline_blueprint, seed_agent_roster_only, seed_orchestration_roster,
+    strip_project_orchestration_keys, ImportOrchestrationOutcome, ProjectOrchestrationStrip,
+    GLOBAL_ONLY_ORCHESTRATION_KEYS,
 };
 pub use schema::{
-    builtin_agent_seeds, AgentCapabilities, AgentModelAssignment, AgentRelationshipConfig,
-    AppConfig, ConditionDef, ContextConfig, CustomAgentConfig, FewShotExample, IntentConfig,
-    McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings,
-    MultiAgentConfig, ObservabilityConfig, PipelinePreset, PolicyConfig, PolicyRuleDef,
-    PromptSections, ProviderConfig, RetryConfig, SkillsConfig, ToolSettings, UpdatesConfig,
-    SCHEMA_VERSION,
+    builtin_agent_seeds, parse_tool_schema_mode, AgentCapabilities, AgentModelAssignment,
+    AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig, CustomAgentConfig,
+    FewShotExample, McpConfig, McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride,
+    ModelSettings, MultiAgentConfig, ObservabilityConfig, PipelinePreset, PlanBindingSource,
+    PolicyConfig, PolicyRuleDef, PromptSections, ProviderConfig, RetryConfig, SkillsConfig,
+    ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};
 pub use shell::{
@@ -90,9 +101,7 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// between the global file and env so per-project overrides (policy rules, model pins, spend cap)
 /// can be committed to the project repo or gitignored as desired.
 ///
-/// Environment variables: `CONCERTO_*` is the primary prefix. As a
-/// convenience, `OPENCODE_RS_*` variables are also merged so existing
-/// shell configs continue working.
+/// Environment variables: `CONCERTO_*` is the primary prefix.
 ///
 /// If the loaded config has an older `schema_version`, automatic schema
 /// migration is applied (see [`migration::migrate_config`]).
@@ -130,37 +139,74 @@ fn load_config_layers(
         }
     }
 
-    // 2) Project-scoped config (inserted between global config and env)
+    // 2) Project-scoped config (inserted between global config and env).
+    // Maintainer decision (2026-09): orchestration is GLOBAL ONLY — the
+    // global-only orchestration keys ([`saving::GLOBAL_ONLY_ORCHESTRATION_KEYS`])
+    // are stripped from the PROJECT document before the merge, so a project
+    // `[orchestration]` / `[multi_agent.custom_agents]` /
+    // `[multi_agent.model_pins]` no longer collides with a seeded global
+    // selection at the exactly-one blueprint seam. Every other project key
+    // (policy, spend caps, relationships, presets, run limits, the rest of
+    // `[multi_agent]`) keeps its layered precedence. Nothing is ever written:
+    // removal is load-time only. When nothing is to strip the raw file is
+    // merged exactly as before (figment reads it, byte-identical behavior).
     if let Some(root) = project_root {
         let project_file = root.join(legacy::NEW_PROJECT_CONFIG_FILE);
         if project_file.exists() {
-            figment = figment.merge(Toml::file(&project_file));
-        } else if let Some(parent) = project_file.parent() {
-            // Legacy project file fallback
-            let legacy_project = parent.join(legacy::OLD_PROJECT_CONFIG_FILE);
-            if legacy_project.exists() {
-                figment = figment.merge(Toml::file(&legacy_project));
+            let stripped = crate::saving::strip_project_orchestration_keys(
+                &std::fs::read_to_string(&project_file).map_err(|e| {
+                    ConfigError::Load(format!("failed to read {}: {e}", project_file.display()))
+                })?,
+            )?;
+            match stripped {
+                Some(stripped) => {
+                    tracing::warn!(
+                        project = %project_file.display(),
+                        ignored = %stripped.removed_keys.join(", "),
+                        "orchestration is global only: ignoring project config \
+                         orchestration keys — use the Studio's import action to move \
+                         them into the global config"
+                    );
+                    figment = figment.merge(Toml::string(&stripped.document));
+                }
+                // Nothing to strip: the document merges exactly as before,
+                // straight from the file (byte-identical behavior).
+                None => figment = figment.merge(Toml::file(&project_file)),
             }
         }
     }
 
-    // 3) Env vars (highest priority over files). Both prefixes remain readable
-    //    for migration; callers should not define the same key under both.
-    //    `project_roots` is excluded from the env providers: its env source is
+    // 3) Env vars (highest priority over files). `project_roots` is excluded from the env providers: its env source is
     //    a path-separated scalar (`CONCERTO_PROJECT_ROOTS`), which would fail
     //    `Vec` deserialization during figment extraction. It is parsed
     //    explicitly after extraction (ADR-44).
     if include_environment {
         figment =
             figment.merge(Env::prefixed(legacy::NEW_ENV_PREFIX).filter(|k| k != "project_roots"));
-        figment =
-            figment.merge(Env::prefixed(legacy::OLD_ENV_PREFIX).filter(|k| k != "project_roots"));
     }
 
     let config: AppConfig = figment.extract().map_err(|e| ConfigError::Load(e.to_string()))?;
 
     // Apply schema migration if needed.
     let mut config = migration::migrate_config(config)?;
+
+    // Per-agent config files (single source of truth): when the global
+    // config dir has an `agents/` directory, the files ARE the roster. Merge
+    // them into `multi_agent.custom_agents` here — the one load-time seam —
+    // so every downstream consumer (Studio, runtime role resolution, agent
+    // registry) reads the file-sourced roster through the same types it
+    // already used. The directory's absence means files are not yet
+    // authoritative (legacy inline roster stands; the Studio's init seam
+    // materializes the files once).
+    if let Some(ref path) = global_config {
+        if let Ok(dir) = agents::agents_dir_for_config(path) {
+            if let Some(roster) = agents::load_agent_roster(&dir)? {
+                let multi = config.multi_agent.get_or_insert_with(Default::default);
+                multi.custom_agents = roster;
+                config.agent_files_authoritative = true;
+            }
+        }
+    }
 
     // ADR-44 §1: `CONCERTO_PROJECT_ROOTS` (path-separated) replaces the roots
     // from config files when set to a non-empty value — env wins per the
@@ -186,14 +232,6 @@ fn load_config_layers(
     // Validate retry settings (after migration so defaults are in place).
     config.retry.validate()?;
     config.memory.validate()?;
-
-    // Validate the Phase-2c intent classifier threshold (ADR-55 Phase 2c §2):
-    // a configured threshold below the deterministic gate constant would
-    // create a band where a classifier Execute re-route misses the gate's
-    // arm-1 confirmation dialog.
-    if let Some(intent) = &config.intent {
-        intent.validate()?;
-    }
 
     // Validate MCP server entries (ADR-43 §4: non-empty id, no ':').
     if let Some(mcp) = &config.mcp {
@@ -275,7 +313,8 @@ impl AppConfig {
     /// config stays deleted. Only when the config declares neither do the
     /// embedded seeds stand in (the legacy embedded default, unchanged).
     pub fn owns_agent_roster(&self) -> bool {
-        self.orchestration.is_some()
+        self.agent_files_authoritative
+            || self.orchestration.is_some()
             || self.multi_agent.as_ref().is_some_and(|m| !m.custom_agents.is_empty())
     }
 }
@@ -557,6 +596,45 @@ mod tests {
         assert_eq!(global.session_spend_cap_usd, Some(1.0));
     }
 
+    /// The old project-scoped filename is no longer read: a stale
+    /// `.opencode-rs.toml` in the project root must be ignored entirely
+    /// (nothing ever generated it — the rename predates first use).
+    #[test]
+    fn stale_opencode_rs_project_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        std::fs::write(
+            project.join(".opencode-rs.toml"),
+            format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 3.0\n"),
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&global_path), Some(&project)).unwrap();
+        assert_eq!(
+            cfg.session_spend_cap_usd, None,
+            "stale .opencode-rs.toml must provide no overrides"
+        );
+    }
+
+    /// The old `OPENCODE_RS_*` env prefix is no longer merged by the config
+    /// loader — only `CONCERTO_*` applies.
+    #[test]
+    fn opencode_rs_env_prefix_is_not_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_global = dir.path().join("nonexistent-config.toml");
+        std::env::set_var("OPENCODE_RS_SESSION_SPEND_CAP_USD", "9.0");
+        let cfg = load_config(Some(&fake_global), Some(dir.path())).unwrap();
+        assert_ne!(
+            cfg.session_spend_cap_usd,
+            Some(9.0),
+            "OPENCODE_RS_* env vars must not reach the config"
+        );
+        std::env::remove_var("OPENCODE_RS_SESSION_SPEND_CAP_USD");
+    }
+
     #[test]
     fn memory_settings_validate_on_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -711,85 +789,50 @@ mod tests {
     }
 
     #[test]
-    fn v4_config_file_migrates_to_schema_v7() {
+    fn v4_config_file_migrates_to_latest_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "schema_version = 4\n").unwrap();
         let cfg = load_config(Some(&path), None).expect("v4 config must load");
         // v4 -> v5 (version bump) -> v6 (mode/intent removal) -> v7 ([intent]
-        // classifier keys), landing on the latest schema.
-        assert_eq!(cfg.schema_version, 7, "v4 config must migrate to the current schema");
+        // classifier keys) -> v8 (classifier keys retired), landing on the
+        // latest schema.
+        assert_eq!(cfg.schema_version, 8, "v4 config must migrate to the current schema");
         assert!(cfg.skills.is_none());
         assert!(cfg.mcp.is_none());
-        // v6→v7 inserts [intent] with defaults: classifier on (ADR-56).
-        let intent = cfg.intent.expect("migrated config must carry [intent]");
-        assert!(intent.classifier_enabled, "classifier defaults to on (ADR-56)");
     }
 
-    /// ADR-56 §2 (C1 superseded): an existing v6 config file loads at schema 7
-    /// with `[intent]` defaulted (classifier ON).
+    /// A retired v6 config file still loads — the migration chain bumps it
+    /// through v7 into v8 without resurrecting the `[intent]` surface
+    /// (removed at v8; ADR-56 2026-09-11 clarification).
     #[test]
-    fn v6_config_file_loads_with_intent_defaulted() {
+    fn v6_config_file_migrates_to_latest_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "schema_version = 6\nsession_spend_cap_usd = 1.0\n").unwrap();
         let cfg = load_config(Some(&path), None).expect("v6 config must load");
-        assert_eq!(cfg.schema_version, 7);
+        assert_eq!(cfg.schema_version, 8);
         assert_eq!(cfg.session_spend_cap_usd, Some(1.0));
-        let intent = cfg.intent.expect("v6→v7 migration must insert [intent]");
-        assert!(intent.classifier_enabled, "classifier defaults to on (ADR-56)");
-        assert_eq!(intent.classifier_model, None);
-        assert_eq!(intent.classifier_confidence_threshold, concerto_core::LOW_CONFIDENCE_THRESHOLD);
     }
 
-    /// ADR-55 Phase 2c §2 (C1): a configured threshold below
-    /// `LOW_CONFIDENCE_THRESHOLD` is rejected at load.
+    /// Schema v8 removed the `[intent]` classifier keys, but `AppConfig` has
+    /// no `deny_unknown_fields`: a legacy file carrying the full retired
+    /// section — including a threshold value that v7's validation used to
+    /// reject — ignores the stale keys and loads unchanged (v5 → v6 removal
+    /// precedent).
     #[test]
-    fn intent_threshold_below_low_confidence_rejected_at_load() {
+    fn legacy_config_with_intent_classifier_keys_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 7\n[intent]\nclassifier_enabled = true\nclassifier_confidence_threshold = 0.5\n",
+            "schema_version = 7\n[intent]\nclassifier_enabled = false\n\
+             classifier_model = \"claude-sonnet-4\"\nclassifier_confidence_threshold = 0.5\n",
         )
         .unwrap();
-        let err = load_config(Some(&path), None).expect_err("sub-0.7 threshold must be rejected");
-        assert!(
-            format!("{err}").contains("classifier_confidence_threshold"),
-            "expected threshold rejection, got: {err}"
-        );
-    }
-
-    /// ADR-55 Phase 2c §2: a threshold exactly at `LOW_CONFIDENCE_THRESHOLD`
-    /// (0.7) is accepted — the boundary value clears validation.
-    #[test]
-    fn intent_threshold_at_low_confidence_is_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "schema_version = 7\n[intent]\nclassifier_enabled = true\nclassifier_confidence_threshold = 0.7\n",
-        )
-        .unwrap();
-        let cfg = load_config(Some(&path), None).expect("threshold 0.7 must load");
-        let intent = cfg.intent.expect("[intent] section must be present");
-        assert!(intent.classifier_enabled);
-        assert_eq!(intent.classifier_confidence_threshold, 0.7);
-    }
-
-    /// ADR-55 Phase 2c §2: the `classifier_model` key parses.
-    #[test]
-    fn intent_classifier_model_key_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "schema_version = 7\n[intent]\nclassifier_enabled = true\nclassifier_model = \"claude-sonnet-4\"\n",
-        )
-        .unwrap();
-        let cfg = load_config(Some(&path), None).expect("config with classifier_model must load");
-        let intent = cfg.intent.expect("[intent] section must be present");
-        assert_eq!(intent.classifier_model.as_deref(), Some("claude-sonnet-4"));
+        let cfg = load_config(Some(&path), None)
+            .expect("legacy [intent] classifier keys must not block loading");
+        assert_eq!(cfg.schema_version, 8, "v7 file migrates over the retired keys");
     }
 
     #[test]
@@ -837,6 +880,7 @@ mod tests {
         assert_eq!(context.trigger_tokens, Some(8_000));
         assert_eq!(context.retain_user_turns, None, "unset knobs stay None");
         assert_eq!(context.minimum_user_turns, None, "unset knobs stay None");
+        assert_eq!(context.cache_stable_prefix, None, "unset knobs stay None");
 
         let without = load_config(None, None).expect("defaults must load");
         assert!(without.context.is_none(), "no [context] section -> None");
@@ -848,7 +892,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 5\n[context]\ntrigger_tokens = 12000\nretain_user_turns = 2\nminimum_user_turns = 4\n",
+            "schema_version = 5\n[context]\ntrigger_tokens = 12000\nretain_user_turns = 2\nminimum_user_turns = 4\ncache_stable_prefix = true\n",
         )
         .unwrap();
         let cfg = load_config(Some(&path), None).expect("config with full [context] must load");
@@ -856,6 +900,7 @@ mod tests {
         assert_eq!(context.trigger_tokens, Some(12_000));
         assert_eq!(context.retain_user_turns, Some(2));
         assert_eq!(context.minimum_user_turns, Some(4));
+        assert_eq!(context.cache_stable_prefix, Some(true));
     }
 
     // ---- ADR-58: [orchestration] loads and validates at load time ----
@@ -1132,5 +1177,181 @@ relationship = "watches"
             msg.contains("watches") && msg.contains("reviewer") && msg.contains("coder"),
             "expected relationship naming, got: {msg}"
         );
+    }
+
+    // ---- global-only orchestration enforcement at load (maintainer decision 2026-09) ----
+
+    /// A project config declaring the global-only orchestration keys is
+    /// IGNORED at load: the merged config resolves the blueprint, roster, and
+    /// model pins from the global file only — while every non-orchestration
+    /// project key keeps its layered override (spend cap, run limit,
+    /// relationships policy).
+    #[test]
+    fn merged_config_ignores_project_orchestration_but_honors_other_project_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            format!(
+                r#"schema_version = {SCHEMA_VERSION}
+[orchestration]
+schema_version = 1
+[orchestration.blueprint]
+name = "standard"
+[multi_agent]
+custom_agents = []
+"#
+            ),
+        )
+        .unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(legacy::NEW_PROJECT_CONFIG_FILE),
+            format!(
+                r#"schema_version = {SCHEMA_VERSION}
+session_spend_cap_usd = 2.5
+[orchestration]
+schema_version = 1
+[orchestration.blueprint]
+name = "tdd"
+[multi_agent]
+max_concurrent_agents = 3
+model_pins = {{ coder = "project-pin" }}
+[[multi_agent.custom_agents]]
+id = "proj-agent"
+name = "Proj"
+role = "proj-agent"
+[[multi_agent.relationships]]
+from = "architect"
+to = "coder"
+relationship = "supervises"
+"#
+            ),
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&global_path), Some(&project)).expect("must load");
+        // Orchestration keys resolved GLOBAL-ONLY:
+        assert_eq!(
+            cfg.orchestration
+                .as_ref()
+                .expect("global orchestration present")
+                .blueprint
+                .name
+                .as_deref(),
+            Some("standard"),
+            "the project [orchestration] selection is ignored; global wins"
+        );
+        let multi_agent = cfg.multi_agent.as_ref().expect("[multi_agent] present");
+        assert!(
+            multi_agent.custom_agents.is_empty(),
+            "the project roster is ignored: {:?}",
+            multi_agent.custom_agents
+        );
+        assert!(multi_agent.model_pins.is_empty(), "project model_pins are ignored");
+        // Non-orchestration project keys keep applying:
+        assert_eq!(cfg.session_spend_cap_usd, Some(2.5), "project spend cap still applies");
+        assert_eq!(
+            multi_agent.max_concurrent_agents, 3,
+            "unrelated [multi_agent] keys still apply"
+        );
+        assert_eq!(multi_agent.relationships.len(), 1, "project relationships stay layered");
+    }
+
+    /// No-strip case is byte-identical to the pre-enforcement loader: a
+    /// project config without orchestration keys merges exactly as before
+    /// (one precedence run proving both layers resolve).
+    #[test]
+    fn no_strip_case_merges_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 1.0\n"),
+        )
+        .unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(legacy::NEW_PROJECT_CONFIG_FILE),
+            format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 2.0\n"),
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(project.join(legacy::NEW_PROJECT_CONFIG_FILE)).unwrap();
+        assert!(
+            saving::strip_project_orchestration_keys(&raw).expect("parsed").is_none(),
+            "the document carries none of the ignored keys"
+        );
+        let cfg = load_config(Some(&global_path), Some(&project)).unwrap();
+        assert_eq!(cfg.session_spend_cap_usd, Some(2.0));
+    }
+
+    // ---- per-agent config files (single source of truth) ----
+
+    /// The load seam merges the per-agent files into `multi_agent.custom_agents`
+    /// and marks the roster file-authoritative, so every downstream consumer
+    /// reads the file roster through the same types.
+    #[test]
+    fn per_agent_files_are_merged_into_the_roster_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        let agents_dir = crate::agents::agents_dir_for_config(&global_path).unwrap();
+        crate::agents::write_agent_file(
+            &agents_dir,
+            &CustomAgentConfig {
+                id: "file-agent".into(),
+                name: "File Agent".into(),
+                role: "file-agent".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&global_path), None).unwrap();
+        assert!(cfg.agent_files_authoritative, "files rule when the directory exists");
+        assert!(cfg.owns_agent_roster());
+        let roster = &cfg.multi_agent.as_ref().expect("[multi_agent] present").custom_agents;
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].id, "file-agent");
+    }
+
+    /// An intentionally empty file-backed roster (every agent deleted) still
+    /// owns the roster: no builtin seed is resurrected.
+    #[test]
+    fn empty_agents_dir_owns_the_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        let agents_dir = crate::agents::agents_dir_for_config(&global_path).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let cfg = load_config(Some(&global_path), None).unwrap();
+        assert!(cfg.agent_files_authoritative);
+        assert!(
+            cfg.owns_agent_roster(),
+            "an initialized-but-empty roster still owns the roster (deletions stick)"
+        );
+    }
+
+    /// A file with a future schema version refuses loudly rather than silently
+    /// dropping settings (the load seam surfaces the error).
+    #[test]
+    fn future_agent_file_version_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        let agents_dir = crate::agents::agents_dir_for_config(&global_path).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("future.toml"),
+            "schema_version = 99\nid = \"future\"\nname = \"Future\"\nrole = \"future\"\n",
+        )
+        .unwrap();
+
+        let err = load_config(Some(&global_path), None).expect_err("future version must fail");
+        assert!(err.to_string().contains("newer"), "{err}");
     }
 }

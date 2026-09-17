@@ -23,6 +23,7 @@ fn make_chunk(id: &str, content: &str, project: &ProjectId) -> MemoryChunk {
         score: 0.0,
         model_id: String::new(),
         model_version: String::new(),
+        stale: false,
     }
 }
 

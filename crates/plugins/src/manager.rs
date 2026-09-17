@@ -1,5 +1,7 @@
 use crate::active_plugin::ActivePlugin;
-use crate::capability::{CapabilityApprovalUI, CapabilityManager, GrantedCapabilities};
+use crate::capability::{
+    CapabilityApprovalUI, CapabilityDiscriminant, CapabilityManager, GrantedCapabilities,
+};
 use crate::dialect_host::DialectHost;
 use crate::discovery::{DiscoveryConfig, PluginCandidate, PluginDiscovery};
 use crate::error::PluginError;
@@ -34,6 +36,24 @@ pub struct ActivePluginInfo {
     pub tool_names: Vec<String>,
 }
 
+/// A process-lifetime, lazily-materialised plugin-manager handle shared
+/// between the desktop App and the orchestrator runtime.
+///
+/// The manager (and its host, kept alive so the orchestrator can still build
+/// per-candidate loaders) is materialised on the first agent run — the epoch
+/// ticker in [`PluginHost::start_epoch_ticker`] needs a tokio runtime
+/// context — after which it lives for the rest of the process so the Settings
+/// UI's live revocation and provider re-discovery operate on the same plugin
+/// instances an agent run uses. `None` inside the mutex means "not
+/// materialised yet"; frontends without such a handle (CLI, tests) build a
+/// per-run manager as before.
+pub type SharedPluginManager = Arc<Mutex<Option<(Arc<PluginHost>, PluginManager)>>>;
+
+/// Create a new shared plugin-manager handle (desktop).
+pub fn new_shared_plugin_manager() -> SharedPluginManager {
+    Arc::new(Mutex::new(None))
+}
+
 /// Central plugin lifecycle manager.
 pub struct PluginManager {
     loader: PluginLoader,
@@ -46,6 +66,11 @@ pub struct PluginManager {
     plugin_tools: HashMap<String, Vec<String>>,
     /// Violation counts per plugin.
     violations: HashMap<String, u32>,
+    /// Resolved persistent grants for plugins whose `load_plugin` skipped the
+    /// approval prompt because persisted (hash-pinned) grants already covered
+    /// every required capability (ADR-37 prompt-skip). Consumed by
+    /// `initialise_plugin` and cleaned up on unload.
+    resolved_grants: HashMap<String, GrantedCapabilities>,
 }
 
 impl PluginManager {
@@ -69,6 +94,7 @@ impl PluginManager {
             status: HashMap::new(),
             plugin_tools: HashMap::new(),
             violations: HashMap::new(),
+            resolved_grants: HashMap::new(),
         }
     }
 
@@ -91,6 +117,9 @@ impl PluginManager {
         approval_ui: &dyn CapabilityApprovalUI,
     ) -> Result<LoadedPlugin, PluginError> {
         let loaded = self.loader.load_from_bytes(wasm_bytes, source).await?;
+        // A fresh load always starts from a clean resolved-grant slate; the
+        // prompt-skip path below re-populates it when applicable.
+        self.resolved_grants.remove(&loaded.manifest.id);
         let manifest_hash = if loaded.manifest.capabilities_required.is_empty() {
             None
         } else {
@@ -99,6 +128,28 @@ impl PluginManager {
 
         // Request capability approval if needed.
         if !loaded.manifest.capabilities_required.is_empty() {
+            // ADR-37 prompt-skip: persisted (hash-pinned) grants that still
+            // cover every required capability mean the user already approved
+            // this exact binary — load without re-prompting and resolve the
+            // live grant set from the store for `initialise_plugin`.
+            let persisted =
+                self.capability_manager.load_grants(&loaded.manifest.id, manifest_hash.as_deref());
+            let all_covered = loaded.manifest.capabilities_required.iter().all(|req| {
+                let disc: CapabilityDiscriminant = req.into();
+                persisted.iter().any(|(d, _, _)| *d == disc)
+            });
+            if all_covered {
+                tracing::info!(
+                    plugin_id = %loaded.manifest.id,
+                    "persisted grants cover all required capabilities — skipping approval prompt"
+                );
+                self.resolved_grants.insert(
+                    loaded.manifest.id.clone(),
+                    GrantedCapabilities::with_persistent(&loaded.manifest.id, persisted),
+                );
+                return Ok(loaded);
+            }
+
             let decisions = self
                 .capability_manager
                 .request_approval(
@@ -136,7 +187,13 @@ impl PluginManager {
         loaded: &LoadedPlugin,
         granted_caps: GrantedCapabilities,
     ) -> Result<(), PluginError> {
-        let active = self.loader.initialise(loaded, granted_caps).await?;
+        // ADR-37 prompt-skip: when `load_plugin` resolved the grant set from
+        // persisted grants without prompting, prefer those over the
+        // (typically empty) caller-provided set. Consumed once so an
+        // un-initialised plugin never lingers in the map.
+        let effective_caps =
+            self.resolved_grants.remove(&loaded.manifest.id).unwrap_or(granted_caps);
+        let active = self.loader.initialise(loaded, effective_caps).await?;
         let plugin_id = active.manifest.id.clone();
 
         // Track active plugin wrapped in Arc<Mutex> for tool registration.
@@ -150,7 +207,9 @@ impl PluginManager {
     /// Register plugin tools into the given registry.
     ///
     /// Tool names are prefixed with `plugin:<plugin_id>:` if a conflict exists
-    /// with existing tools, otherwise the friendly name is used.
+    /// with existing tools (or the name is a reserved grant-sensitive /
+    /// orchestration name: `call_specialist`, `filesystem`, `git`, `shell`),
+    /// otherwise the friendly name is used.
     pub fn register_tools(
         &mut self,
         plugin_id: &str,
@@ -180,12 +239,10 @@ impl PluginManager {
             return Ok(());
         }
 
-        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let registered_names =
+            register_plugin_tools(plugin_id, plugin_arc.clone(), &tools, registry);
 
-        // Register tools into the registry.
-        register_plugin_tools(plugin_id, plugin_arc.clone(), &tools, registry);
-
-        self.plugin_tools.insert(plugin_id.to_string(), tool_names);
+        self.plugin_tools.insert(plugin_id.to_string(), registered_names.clone());
 
         Ok(())
     }
@@ -234,6 +291,7 @@ impl PluginManager {
         self.active.remove(plugin_id);
         self.status.remove(plugin_id);
         self.violations.remove(plugin_id);
+        self.resolved_grants.remove(plugin_id);
 
         Ok(())
     }
@@ -255,6 +313,104 @@ impl PluginManager {
         caps.session_grants.clear();
         caps.persistent_grants.clear();
         Ok(())
+    }
+
+    /// Best-effort live revocation (ADR-37): clears a loaded plugin's
+    /// in-memory grants via [`revoke_grants`], tolerating `NotActive` (the
+    /// plugin is not loaded in this manager) and logging unexpected failures.
+    /// Returns `true` when a loaded plugin's grants were actually cleared.
+    ///
+    /// Shared helper for callers that cannot afford to fail the revocation
+    /// workflow on `NotActive` — the CLI process and the desktop Settings UI
+    /// both tolerate "plugin not loaded in this process".
+    pub async fn revoke_grants_best_effort(&self, plugin_id: &str) -> bool {
+        match self.revoke_grants(plugin_id).await {
+            Ok(()) => {
+                tracing::info!(plugin_id, "revoke_grants: live grants cleared");
+                true
+            }
+            Err(PluginError::NotActive { .. }) => {
+                tracing::debug!(
+                    plugin_id,
+                    "revoke_grants: plugin not active in this process (expected)"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    plugin_id,
+                    error = %error,
+                    "revoke_grants: failed to clear in-memory grants"
+                );
+                false
+            }
+        }
+    }
+
+    /// Re-run discovery and initialise any newly-appeared plugins that are not
+    /// already active, so a settings-time "provider added" save surfaces new
+    /// `.wasm` files to the retained manager without disturbing plugins a
+    /// running agent holds.
+    ///
+    /// Already-active plugins are skipped. New plugins are initialised with the
+    /// grants produced by `grant` — callers typically pass an empty set so
+    /// host functions stay fail-closed until a run re-initialises the plugin
+    /// with its run-scoped, auto-approved grant set. Tools are NOT registered
+    /// here (there is no per-run registry at this point); the next agent run
+    /// registers them. Returns the number of newly loaded plugins.
+    pub async fn refresh_new_plugins(
+        &mut self,
+        config: DiscoveryConfig,
+        mut grant: impl FnMut(&PluginManifest) -> GrantedCapabilities,
+    ) -> Result<usize, PluginError> {
+        let candidates = self.discover(config)?;
+        let mut newly_loaded = 0;
+        for candidate in &candidates {
+            let wasm_bytes = match std::fs::read(&candidate.wasm_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %candidate.wasm_path.display(),
+                        error = %error,
+                        "plugin refresh: failed to read plugin WASM"
+                    );
+                    continue;
+                }
+            };
+            // The manifest id is only known after loading; a previously-loaded
+            // plugin is then skipped so a refresh never displaces it.
+            let loaded = match self.loader.load_from_bytes(&wasm_bytes, &candidate.wasm_path).await
+            {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %candidate.wasm_path.display(),
+                        error = %error,
+                        "plugin refresh: failed to load plugin module"
+                    );
+                    continue;
+                }
+            };
+            let plugin_id = loaded.manifest.id.clone();
+            if self.active.contains_key(&plugin_id) {
+                tracing::debug!(plugin_id, "plugin refresh: already active — skipping");
+                continue;
+            }
+            match self.initialise_plugin(&loaded, grant(&loaded.manifest)).await {
+                Ok(()) => {
+                    tracing::info!(plugin_id, "plugin refresh: loaded newly discovered plugin");
+                    newly_loaded += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        plugin_id,
+                        error = %error,
+                        "plugin refresh: failed to initialise new plugin"
+                    );
+                }
+            }
+        }
+        Ok(newly_loaded)
     }
 
     /// Record a capability violation for a plugin.
@@ -685,5 +841,141 @@ mod tests {
         mgr.record_violation(plugin_id);
         assert_eq!(mgr.violation_count(plugin_id), 2);
         assert!(mgr.should_disable(plugin_id));
+    }
+
+    /// `revoke_grants_best_effort` must tolerate `NotActive` (unknown plugin)
+    /// and clear a LIVE plugin's in-memory grants, reporting whether anything
+    /// was actually cleared. This is the CLI/desktop shared helper, so the
+    /// "expected" `NotActive` outcome must never surface as an error.
+    #[tokio::test]
+    async fn test_manager_revoke_grants_best_effort_tolerates_not_active() {
+        let dir = std::env::temp_dir().join("plugin_test_revoke_best_effort");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let host = Arc::new(PluginHost::new().expect("PluginHost should initialise"));
+        let cap_mgr = CapabilityManager::open(&dir).expect("CapabilityManager should open");
+        let mut mgr = PluginManager::new(host, cap_mgr, None, None);
+
+        // Unknown plugin: `NotActive` must be tolerated, not surfaced.
+        assert!(
+            !mgr.revoke_grants_best_effort("no-such-plugin").await,
+            "no live plugin -> nothing cleared"
+        );
+
+        // Build a minimal plugin with its manifest JSON carried as data, using
+        // the runtime-computed byte length so the decl never drifts from the
+        // actual JSON.
+        let manifest = r#"{"id":"revoke-be-test","name":"Revoke Be Test","version":"0.1.0","description":"Revoke best-effort test","abi_version":1,"capabilities_required":[],"provides":[]}"#;
+        let escaped = manifest.replace('"', "\\\"");
+        let wasm_source = format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (global (export "scratch_buffer") (mut i32) (i32.const 0))
+              (global (export "scratch_buffer_size") i32 (i32.const 65536))
+              (data (i32.const 256) "{escaped}")
+              (func (export "manifest") (result i64)
+                (i64.or
+                  (i64.shl (i64.const 256) (i64.const 32))
+                  (i64.const {})
+                )
+              )
+              (func (export "init") (result i32)
+                i32.const 0
+              )
+            )"#,
+            manifest.len()
+        );
+        let wasm = wat::parse_str(&wasm_source).expect("WAT should parse");
+
+        struct AutoApprove;
+        #[async_trait::async_trait]
+        impl CapabilityApprovalUI for AutoApprove {
+            async fn request(
+                &self,
+                _plugin: &PluginManifest,
+                capabilities: &[concerto_api_types::plugin::CapabilityRequest],
+            ) -> Result<Vec<GrantDecision>, PluginError> {
+                Ok(vec![GrantDecision::Granted; capabilities.len()])
+            }
+        }
+
+        let loaded = mgr
+            .load_plugin(&wasm, std::path::Path::new("revoke_be_test.wasm"), &AutoApprove)
+            .await
+            .expect("load_plugin should succeed");
+
+        let mut caps = GrantedCapabilities::new();
+        caps.grant_session(CapabilityDiscriminant::FilesystemWrite, CapabilityScope::default());
+        mgr.initialise_plugin(&loaded, caps).await.expect("initialise should succeed");
+
+        // Live plugin: grants must be cleared and the helper must report it.
+        assert!(
+            mgr.revoke_grants_best_effort("revoke-be-test").await,
+            "live plugin grants must be cleared"
+        );
+        let plugin_arc = mgr.active.get("revoke-be-test").expect("plugin should still be active");
+        let active = plugin_arc.lock().await;
+        assert!(
+            active.store.data().granted_caps.session_grants.is_empty(),
+            "session grants must be cleared on best-effort revocation"
+        );
+    }
+
+    /// `refresh_new_plugins` must initialise a newly-appeared `.wasm`, skip
+    /// already-active plugins on a second pass, and apply the caller-provided
+    /// grants (empty set — fail-closed until a run re-grants).
+    #[tokio::test]
+    async fn test_manager_refresh_new_plugins_loads_new_plugins_once() {
+        let dir = std::env::temp_dir().join("plugin_test_refresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let host = Arc::new(PluginHost::new().expect("PluginHost should initialise"));
+        let cap_mgr = CapabilityManager::open(&dir).expect("CapabilityManager should open");
+        let mut mgr = PluginManager::new(host, cap_mgr, None, None);
+
+        // Build a minimal plugin with its manifest JSON carried as data, using
+        // the runtime-computed byte length so the decl never drifts from the
+        // actual JSON.
+        let manifest = r#"{"id":"refresh-test","name":"Refresh Test","version":"0.1.0","description":"Refresh test","abi_version":1,"capabilities_required":[],"provides":[]}"#;
+        let escaped = manifest.replace('"', "\\\"");
+        let wasm_source = format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (global (export "scratch_buffer") (mut i32) (i32.const 0))
+              (global (export "scratch_buffer_size") i32 (i32.const 65536))
+              (data (i32.const 256) "{escaped}")
+              (func (export "manifest") (result i64)
+                (i64.or
+                  (i64.shl (i64.const 256) (i64.const 32))
+                  (i64.const {})
+                )
+              )
+              (func (export "init") (result i32)
+                i32.const 0
+              )
+            )"#,
+            manifest.len()
+        );
+        let wasm = wat::parse_str(&wasm_source).expect("WAT should parse");
+        std::fs::write(dir.join("refresh-test.wasm"), &wasm).expect("should write plugin wasm");
+
+        let disc = DiscoveryConfig { search_paths: vec![dir.clone()], bundled_path: None };
+        let count = mgr
+            .refresh_new_plugins(disc, |_| GrantedCapabilities::new())
+            .await
+            .expect("refresh should succeed");
+        assert_eq!(count, 1, "first refresh must load the new plugin");
+        assert!(mgr.is_active("refresh-test"), "plugin must be active after refresh");
+
+        // A second pass must not re-initialise an already-active plugin.
+        let disc = DiscoveryConfig { search_paths: vec![dir.clone()], bundled_path: None };
+        let count = mgr
+            .refresh_new_plugins(disc, |_| GrantedCapabilities::new())
+            .await
+            .expect("second refresh should succeed");
+        assert_eq!(count, 0, "already-active plugins must be skipped");
+        assert!(mgr.is_active("refresh-test"));
     }
 }

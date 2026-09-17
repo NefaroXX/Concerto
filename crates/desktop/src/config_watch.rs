@@ -20,14 +20,15 @@ use notify::{RecommendedWatcher, RecursiveMode};
 use tokio::sync::mpsc;
 
 /// File names whose changes are forwarded. `config.toml` covers both the new
-/// and legacy global dirs (they share the file name); the project-scoped names
-/// differ by era. The ADR-58 blueprint include file is tracked too, so edits
+/// and legacy global dirs (they share the file name); the project file is
+/// always the `.concerto.toml` era — the old `.opencode-rs.toml` project name
+/// is no longer read anywhere, so watching it would only produce dead
+/// signals. The ADR-58 blueprint include file is tracked too, so edits
 /// to `orchestration.blueprint.toml` propagate to the next run exactly like
 /// `config.toml` edits do (the reload path re-reads it at load time).
-const TRACKED_NAMES: [&str; 4] = [
+const TRACKED_NAMES: [&str; 3] = [
     "config.toml",
     concerto_config::legacy::NEW_PROJECT_CONFIG_FILE,
-    concerto_config::legacy::OLD_PROJECT_CONFIG_FILE,
     concerto_config::blueprint::BLUEPRINT_INCLUDE_FILE,
 ];
 
@@ -142,8 +143,11 @@ mod tests {
     #[test]
     fn tracked_names_cover_every_config_filename() {
         // The ADR-58 blueprint include file is tracked alongside config.toml:
-        // an edit must also propagate to the next run.
-        assert_eq!(TRACKED_NAMES[3], concerto_config::blueprint::BLUEPRINT_INCLUDE_FILE);
+        // an edit must also propagate to the next run. The old
+        // `.opencode-rs.toml` project name is no longer read anywhere, so it
+        // must NOT be watched.
+        assert_eq!(TRACKED_NAMES[2], concerto_config::blueprint::BLUEPRINT_INCLUDE_FILE);
+        assert!(!TRACKED_NAMES.contains(&".opencode-rs.toml"));
         for name in TRACKED_NAMES {
             assert!(is_tracked(&PathBuf::from(format!("/some/dir/{name}"))), "{name}");
         }

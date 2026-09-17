@@ -82,6 +82,9 @@ impl PluginBackedVectorStore {
             chunk_id: val.get("chunk_id")?.as_str()?.to_string(),
             score: val.get("score")?.as_f64()?,
             content: val.get("content")?.as_str()?.to_string(),
+            // ABI compat: older adapter plugins predate the `stale` field and
+            // omit it — default to fresh.
+            stale: val.get("stale").and_then(|v| v.as_bool()).unwrap_or(false),
         })
     }
 }

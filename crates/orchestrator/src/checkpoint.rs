@@ -6,23 +6,37 @@
 //! skips the expensive `decompose_task` (Architect) phase and resumes the
 //! execution loop with the remaining subtasks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use concerto_core::types::{
     AgentId, AgentRunResult, DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskId,
 };
 use concerto_core::OrchestratorError;
+use concerto_sessions::whiteboard::{WhiteboardCheckpoint, WhiteboardEvent, WhiteboardKind};
+use concerto_sessions::SessionError;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::graph::{Dependency, TaskGraph};
 
-pub const GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+/// ADR-65 §7 (Phase 7): the checkpoint schema carries the whiteboard cursor,
+/// the doc resolution, the snapshot generation, and the pending dispatch
+/// decision, so a continuation restores STATE at the cursor instead of
+/// replaying prose.
+pub const GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// Last schema version before the current one.  Records written at this
 /// version load under the current policy (new fields filled with serde
 /// defaults) and are migrated in-memory to the current version on load.
-pub const LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+
+/// Oldest schema version still migrated by the load policy. v2 predates the
+/// design-doc/lledger capture and the §7 cursor fields; it migrates through
+/// the same serde-default path (every later field defaults), so old rows keep
+/// restoring. The chain is additive only: each bump added optional,
+/// serde-defaulted keys, and serde ignores unknown fields — so a reader built
+/// for an older schema treats the newer keys as opaque.
+pub const OLDEST_MIGRATABLE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CheckpointStage {
@@ -89,6 +103,68 @@ pub struct CheckpointAction {
     pub evidence: Option<AcceptanceEvidence>,
 }
 
+/// ADR-65 §7: where the DesignDoc claim stood when the checkpoint was
+/// persisted, with the REAL log event ids that establish it (never fabricated
+/// — acceptance 8 validation applies to any decision citing them).
+///
+/// Serialized with a kebab-case `state` tag; the payload keys are additive
+/// schema keys, so older readers treat the whole field as opaque and newer
+/// reason codes can be added without another bump.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum CheckpointDocResolution {
+    /// The doc binds (Verified): its contract paths are consumed.
+    Active {
+        /// Grounded contract paths (verifier `contract_paths`).
+        #[serde(default)]
+        contract_paths: Vec<String>,
+        /// Real event id of the `design-doc` claim row.
+        #[serde(default)]
+        claim_event_id: Option<String>,
+        /// Real event id of the coordinator's verdict decision row.
+        #[serde(default)]
+        verdict_event_id: Option<String>,
+    },
+    /// The doc was quarantined; the machine-checkable codes ride along.
+    Quarantined {
+        /// Quarantine reason codes (kebab-case), deterministic order.
+        #[serde(default)]
+        reason_codes: Vec<String>,
+        #[serde(default)]
+        claim_event_id: Option<String>,
+        #[serde(default)]
+        verdict_event_id: Option<String>,
+    },
+    /// The doc was skipped (empty claim): the design is the repo.
+    Skipped {
+        #[serde(default)]
+        claim_event_id: Option<String>,
+        #[serde(default)]
+        verdict_event_id: Option<String>,
+    },
+}
+
+/// ADR-65 §7: the last scheduler `DispatchStep` awaiting completion at
+/// checkpoint time — the recorded, evidence-backed decision a resume may
+/// continue behind. Dispatches to architect/researcher-class agents on resume
+/// are allowed ONLY through a decision like this one (acceptance 7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPendingDecision {
+    /// The agent the recorded decision selected.
+    pub selected_agent: String,
+    /// The machine reason code of the dispatch decision (ADR-65 §6 shape).
+    pub reason: String,
+    /// What the dispatch must produce.
+    pub required_output: String,
+    /// The real event ids the decision consumed (validated at append).
+    #[serde(default)]
+    pub supporting_evidence_ids: Vec<String>,
+    /// The subtask the decision dispatched, when recorded (the §6 fallback
+    /// exploration decision precedes subtask materialization and stays None).
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+}
+
 /// Coordinator-side state captured into every checkpoint snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointContext {
@@ -104,6 +180,62 @@ pub struct CheckpointContext {
     pub default_model_provider_attempted: HashSet<TaskId>,
     pub self_execute_attempted: HashSet<TaskId>,
     pub escalation_attempted: HashSet<TaskId>,
+    /// ADR-65 §7: where the DesignDoc claim stood at save time (verdict +
+    /// real event ids). `None` when never resolved.
+    pub doc_resolution: Option<CheckpointDocResolution>,
+    /// ADR-65 §7: the workspace snapshot generation at save time, so a resume
+    /// can tell whether the workspace objectively changed since.
+    pub snapshot_generation: Option<String>,
+    /// ADR-65 §7: the last scheduler dispatch still awaiting completion.
+    pub pending_decision: Option<CheckpointPendingDecision>,
+    /// Issue #52: the decision journal captured at save time — the typed,
+    /// validated strategy decisions of this run's Coordinator decision
+    /// loop. Decision state separate from the execution ledger: persisted
+    /// additively, inspectable independently. Old checkpoints default it
+    /// empty (serde default) — additive, no bump.
+    pub decision_journal: Vec<crate::decisions::CoordinatorDecision>,
+    /// Issue #53: the coordinator progress tracker's state (fingerprint
+    /// history, equivalence streak, bounded recovery budget) captured at
+    /// save time, so stall detection survives a resume. Old checkpoints
+    /// default it empty (serde default) — additive, no bump.
+    pub progress_tracker: crate::progress::ProgressTrackerState,
+    /// Issue #54: the run's structured failure diagnoses (normalized,
+    /// bounded history) captured at save time so the audit trail survives a
+    /// resume. Old checkpoints default it empty (serde default) — additive,
+    /// no bump.
+    pub failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
+    /// Issue #56: the coordinator's compact world-model projection captured
+    /// at save time, so a resume restores the SAME model (the question
+    /// ledger travels with it). Old checkpoints default it empty —
+    /// additive, no bump; those runs rebuild the model from their own
+    /// restored state at the next decision session.
+    pub world_model: crate::world_model::WorldModel,
+    /// Issue #60: the coordinator's suitability record (bounded, decayed
+    /// dispatch-outcome history per specialist × task class) captured at
+    /// save time, so delegation-quality evidence survives a resume. Old
+    /// records default it empty — additive, no bump.
+    pub suitability: crate::suitability::SuitabilityState,
+    /// Issue #61: the artifact-ownership table (canonical artifact → owner +
+    /// acquiring event + acquired-at + stale-or-owned status) captured at
+    /// save time, so a resume restores the SAME ownership state. Old
+    /// records default it empty — additive, no bump; ownership is
+    /// re-derivable from the log's applied writes and ownership events when
+    /// absent.
+    pub ownership: crate::ownership::OwnershipState,
+    /// Issue #63: the in-flight WAIT record — a wait still parked when the
+    /// snapshot was taken (set before `execute_wait` sleeps so a crash
+    /// mid-wait is resumable). The resume re-evaluates the restored wait
+    /// against the CURRENT world once and reports the outcome to the model
+    /// instead of silently dropping the wait or re-entering the sleep loop.
+    /// Old checkpoints default it empty (serde default) — additive, no bump.
+    pub active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the run's explicit external-workspace-change records
+    /// detected so far (live wait scan + F3 resume reconciliation), each
+    /// scoped to one affected path. Captured at save time so a resume keeps
+    /// reconciling the SAME changes instead of dropping them with the
+    /// one-shot verdict. Old checkpoints default it empty (serde default) —
+    /// additive, no bump.
+    pub external_changes: Vec<crate::external_change::ExternalChangeRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +332,86 @@ pub struct GraphCheckpoint {
     pub self_execute_attempted: HashSet<TaskId>,
     #[serde(default)]
     pub escalation_attempted: HashSet<TaskId>,
+    /// ADR-65 §7: the whiteboard cursor — the `gate_seq` of the last log
+    /// event applied when this checkpoint was persisted (the log head at
+    /// persist time). A resume reads only facts appended AFTER this cursor;
+    /// pre-cursor events are state, never replayed. `None` on pre-§7 (v3 and
+    /// older) records; the resume path backfills it from the log fail-soft.
+    #[serde(default)]
+    pub whiteboard_cursor_gate_seq: Option<u64>,
+    /// ADR-65 §7: where the DesignDoc claim stood at save time (Active /
+    /// Quarantined / Skipped + real event ids). `None` on records persisted
+    /// before the verdict was resolved, or by paths that did not capture it;
+    /// backfilled from the log on resume (additive, fail-soft).
+    #[serde(default)]
+    pub doc_resolution: Option<CheckpointDocResolution>,
+    /// ADR-65 §7: the workspace snapshot `generation` at save time. A resume
+    /// compares this against the fresh run's snapshot to detect an
+    /// objectively changed workspace.
+    #[serde(default)]
+    pub snapshot_generation: Option<String>,
+    /// ADR-65 §7: the last scheduler `DispatchStep` awaiting completion —
+    /// the recorded, evidence-backed decision a resume may continue behind.
+    #[serde(default)]
+    pub pending_decision: Option<CheckpointPendingDecision>,
+    /// Issue #52: the decision journal — the typed, validated strategy
+    /// decisions of the run's Coordinator decision loop, persisted
+    /// separately from the execution fields so decision state is
+    /// inspectable independently. Additive only: absent on older records
+    /// (serde default = empty journal); the §1 bump-chain stays intact and
+    /// both migrate paths fill it empty, which is the zero-value decision
+    /// state.
+    #[serde(default)]
+    pub decision_journal: Vec<crate::decisions::CoordinatorDecision>,
+    /// Issue #53: the coordinator progress tracker's state — per-cycle
+    /// observable fingerprints of the decision loop, the equivalence
+    /// streak, and the bounded recovery budget, persisted so stall
+    /// detection survives a resume. Additive only: absent on older records
+    /// (serde default = empty/zero state); old readers ignore the key.
+    #[serde(default)]
+    pub progress_tracker: crate::progress::ProgressTrackerState,
+    /// Issue #54: the run's structured failure diagnoses — the normalized
+    /// failure record with its recovery-relevant flags, captured so the
+    /// diagnosis/evidence trail survives a resume. Additive only: absent on
+    /// older records (serde default = empty history); old readers ignore
+    /// the key.
+    #[serde(default)]
+    pub failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
+    /// Issue #56: the coordinator world-model projection (facts, tasks,
+    /// artifacts, unresolved questions, roster, risks, pending decision),
+    /// persisted so a resume reconstructs the SAME model — the round-trip
+    /// "restore or rebuild" story: this field for current checkpoints, a
+    /// deterministic rebuild from the restored state for older ones.
+    /// Additive only (serde default = the empty model); old readers ignore
+    /// the key.
+    #[serde(default)]
+    pub world_model: crate::world_model::WorldModel,
+    /// Issue #60: the coordinator's suitability record — the bounded,
+    /// decayed dispatch-outcome history per (specialist, task class),
+    /// persisted so a resume keeps scoring delegation quality on the FULL
+    /// history (history informs ranking across resumes). Additive only:
+    /// absent on older records (serde default = the empty record); old
+    /// readers ignore the key.
+    #[serde(default)]
+    pub suitability: crate::suitability::SuitabilityState,
+    /// Issue #61: the artifact-ownership table (see
+    /// [`CheckpointContext::ownership`]). Additive only: absent on older
+    /// records (serde default = the empty state); old readers ignore the
+    /// key.
+    #[serde(default)]
+    pub ownership: crate::ownership::OwnershipState,
+    /// Issue #63: the in-flight WAIT record (see
+    /// [`CheckpointContext::active_wait`]). Additive only: absent on older
+    /// records (serde default = no wait parked); old readers ignore the
+    /// key.
+    #[serde(default)]
+    pub active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the explicit external-workspace-change records (see
+    /// [`CheckpointContext::external_changes`]). Additive only: absent on
+    /// older records (serde default = no recorded changes); old readers
+    /// ignore the key.
+    #[serde(default)]
+    pub external_changes: Vec<crate::external_change::ExternalChangeRecord>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -209,10 +421,15 @@ const fn current_schema_version() -> u32 {
 impl GraphCheckpoint {
     /// Deserialize a checkpoint JSON string, applying the schema-version
     /// policy:
-    /// - current version (v3) loads as-is;
-    /// - legacy v2 records are migrated in-memory to v3 (serde fills the
-    ///   new fields with defaults);
+    /// - current version (v4) loads as-is;
+    /// - legacy v3 and v2 records are migrated in-memory to v4 (serde fills
+    ///   the newer fields with defaults; the §7 fields are then backfilled
+    ///   from the log by the resume path);
     /// - unknown future versions are rejected with a clear error.
+    ///
+    /// The bumps are additive only — every new field is optional and
+    /// serde-defaulted, so a reader built for an older schema treats the
+    /// newer keys as opaque when it loads the JSON.
     pub fn from_json(json: &str) -> Result<Self, String> {
         let mut checkpoint: GraphCheckpoint = serde_json::from_str(json)
             .map_err(|error| format!("failed to deserialize checkpoint: {error}"))?;
@@ -225,29 +442,51 @@ impl GraphCheckpoint {
         match self.schema_version {
             GRAPH_CHECKPOINT_SCHEMA_VERSION => Ok(()),
             LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION => {
-                // v2 -> v3: serde defaults already filled the new fields
-                // (design_doc=None, model_assignments={}, action_ledger=[],
-                // per-task timestamps None, ladder guard sets empty). Bump the
-                // recorded version so a resaved checkpoint is canonical v3.
+                // v3 -> v4: serde defaults already filled the §7 fields
+                // (cursor/doc/snapshot/pending all None). Bump the recorded
+                // version so a resaved checkpoint is canonical v4; the resume
+                // path backfills the §7 fields from the log (additive,
+                // fail-soft).
+                self.schema_version = GRAPH_CHECKPOINT_SCHEMA_VERSION;
+                Ok(())
+            }
+            OLDEST_MIGRATABLE_SCHEMA_VERSION => {
+                // v2 -> v4: the same additive-default path (design_doc,
+                // model_assignments, action_ledger, per-task timestamps, and
+                // the §7 fields all default). Bump so a resave is canonical.
                 self.schema_version = GRAPH_CHECKPOINT_SCHEMA_VERSION;
                 Ok(())
             }
             other => Err(format!(
-                "unsupported checkpoint schema version {other}: this runtime supports v{GRAPH_CHECKPOINT_SCHEMA_VERSION} and migrates v{LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION}"
+                "unsupported checkpoint schema version {other}: this runtime supports \
+                 v{GRAPH_CHECKPOINT_SCHEMA_VERSION} and migrates v{LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION} \
+                 and v{OLDEST_MIGRATABLE_SCHEMA_VERSION}"
             )),
         }
     }
 
+    /// Validate that this checkpoint may resume for `(session_id, project_id)`.
+    ///
+    /// Scope is **session + project only**: a same-session, same-project
+    /// resume must always be accepted (run-continuity Phase 1). The recorded
+    /// `source_revision` is advisory metadata for the audit trail, not a
+    /// scope bound — the stalled run (or the user) may legitimately commit
+    /// work between the checkpoint and the resume, and rejecting on that
+    /// drift destroyed the only resumable state a bare "continue" had.
+    /// Cross-session and cross-project checkpoints are still rejected, as is
+    /// anything the runtime cannot understand (schema) or that claims to be
+    /// already completed.
     pub fn validate_scope(
         &self,
         session_id: concerto_core::ids::Ulid,
         project_id: &str,
-        source_revision: Option<&str>,
     ) -> Result<(), String> {
-        // The current and the last legacy schema version are both resumable;
-        // anything else (a future version) must be rejected cleanly.
+        // The current and both migrated-legacy schema versions are
+        // resumable; anything else (a future version) must be rejected
+        // cleanly.
         if self.schema_version != GRAPH_CHECKPOINT_SCHEMA_VERSION
             && self.schema_version != LEGACY_GRAPH_CHECKPOINT_SCHEMA_VERSION
+            && self.schema_version != OLDEST_MIGRATABLE_SCHEMA_VERSION
         {
             return Err(format!(
                 "checkpoint schema {} is incompatible with runtime schema {}",
@@ -259,13 +498,6 @@ impl GraphCheckpoint {
         }
         if self.project_id != project_id {
             return Err("checkpoint belongs to a different project".into());
-        }
-        if self.source_revision.as_deref() != source_revision {
-            return Err(format!(
-                "checkpoint source revision {:?} differs from current revision {:?}",
-                self.source_revision.as_deref(),
-                source_revision
-            ));
         }
         if self.completed || self.stage == CheckpointStage::Completed {
             return Err("checkpoint is already completed".into());
@@ -373,6 +605,38 @@ pub fn build_checkpoint(
         default_model_provider_attempted: context.default_model_provider_attempted.clone(),
         self_execute_attempted: context.self_execute_attempted.clone(),
         escalation_attempted: context.escalation_attempted.clone(),
+        // ADR-65 §7 fields. The cursor is stamped at PERSIST time (the log
+        // head then), so the builder leaves it `None` for
+        // `persist_checkpoint` to fill; the rest come from the captured
+        // context.
+        whiteboard_cursor_gate_seq: None,
+        doc_resolution: context.doc_resolution.clone(),
+        snapshot_generation: context.snapshot_generation.clone(),
+        pending_decision: context.pending_decision.clone(),
+        // Issue #52: additive — decision state rides independently; old
+        // readers treat this key as opaque.
+        decision_journal: context.decision_journal.clone(),
+        // Issue #53: additive — stall-detection state rides independently;
+        // old readers treat this key as opaque.
+        progress_tracker: context.progress_tracker.clone(),
+        // Issue #54: additive — the normalized failure-diagnosis history
+        // rides independently; old readers treat this key as opaque.
+        failure_diagnoses: context.failure_diagnoses.clone(),
+        // Issue #56: additive — the world-model projection rides
+        // independently; old readers treat this key as opaque.
+        world_model: context.world_model.clone(),
+        // Issue #60: additive — the suitability record rides
+        // independently; old readers treat this key as opaque.
+        suitability: context.suitability.clone(),
+        // Issue #61: additive — the artifact-ownership table rides
+        // independently; old readers treat this key as opaque.
+        ownership: context.ownership.clone(),
+        // Issue #63: additive — the in-flight WAIT record rides
+        // independently; old readers treat this key as opaque.
+        active_wait: context.active_wait.clone(),
+        // Issue #65: additive — the explicit external-workspace-change
+        // records ride independently; old readers treat this key as opaque.
+        external_changes: context.external_changes.clone(),
     }
 }
 
@@ -468,6 +732,242 @@ fn restore_edge(
     })
 }
 
+// ---------------------------------------------------------------------------
+// ADR-60 D5: gate-boundary checkpoints & per-agent revert
+// ---------------------------------------------------------------------------
+
+/// A gate-boundary checkpoint (ADR-60 D5 (i)): the projected file state of a
+/// run pinned to a consistent cut of the whiteboard log.
+///
+/// `gate_seq` is the consistent-cut coordinate — "everything ≤ seq S" — and
+/// `files` is that cut replayed through the log's total order: for every
+/// path, the content of the last applied write at or before S. Restoring a
+/// later state means *restore = snapshot + replay tail*
+/// ([`GateBoundaryCheckpoint::replay_tail_excluding`]); per-agent revert is
+/// restore + tail replay skipping one agent's `event_id`s (D5 (ii)) — never a
+/// last-action undo, always an attribution-aware log replay.
+///
+/// The checkpoint is a **projection, not a second store**: every folded event
+/// was committed WAL-first by the write gate before its tool executed (the D4
+/// ordering invariant), so the cut survives any crash without separate
+/// storage and the raw log is never truncated or rewritten. Materialize one
+/// from the durable log via [`crate::gate::WriteGate::create_checkpoint_at`],
+/// or from an in-memory event slice via [`GateBoundaryCheckpoint::at_cut`].
+///
+/// Replay scope: applied filesystem **write** operations only — the op set
+/// the per-agent-revert e2e fixture (`supervisor_parallel_e2e.rs`) exercises,
+/// from which this API was promoted. Move/copy/delete revert remains future
+/// work; non-write rows are skipped, not misapplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateBoundaryCheckpoint {
+    /// The inclusive consistent-cut coordinate: every folded event has
+    /// `gate_seq <= gate_seq`; every event after it belongs to the replay
+    /// tail.
+    pub gate_seq: u64,
+    /// Session filter the cut was taken under (`None` = whole log). Purely
+    /// informational here — filtering happens where events are loaded.
+    pub session_id: Option<String>,
+    /// Projected file state at the cut: relative path → content.
+    pub files: BTreeMap<String, String>,
+}
+
+impl GateBoundaryCheckpoint {
+    /// Fold an ordered event slice into the snapshot at cut `gate_seq`.
+    ///
+    /// `events` must be ordered ascending by `gate_seq` — the order every
+    /// whiteboard reader returns, and the total order the replay semantics
+    /// depend on. Events with `gate_seq > gate_seq` are ignored (they are the
+    /// tail, not part of this cut).
+    pub fn at_cut(events: &[WhiteboardEvent], gate_seq: u64, session_id: Option<String>) -> Self {
+        let mut files = BTreeMap::new();
+        for event in events.iter().filter(|event| event.gate_seq <= gate_seq) {
+            apply_write_event(&mut files, event);
+        }
+        Self { gate_seq, session_id, files }
+    }
+
+    /// D5 (ii): restore to this snapshot, then replay the log tail — every
+    /// event with `gate_seq > self.gate_seq` **excluding** `exclude_agent`'s
+    /// rows — over it, returning the resulting file state.
+    ///
+    /// `exclude_agent = None` replays the whole tail (plain restore-forward).
+    /// The result is the same map shape as [`Self::files`] so callers can
+    /// diff, verify, or materialize it.
+    pub fn replay_tail_excluding(
+        &self,
+        events: &[WhiteboardEvent],
+        exclude_agent: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut files = self.files.clone();
+        for event in events.iter().filter(|event| event.gate_seq > self.gate_seq) {
+            if exclude_agent.is_some_and(|agent| event.agent_id == agent) {
+                continue;
+            }
+            apply_write_event(&mut files, event);
+        }
+        files
+    }
+}
+
+/// Per-agent revert (ADR-60 D5 (ii)) in one call over a log slice: restore to
+/// the consistent cut at `checkpoint_seq`, then replay the tail excluding
+/// `exclude_agent`'s `event_ids`, returning the final file state.
+///
+/// The exclusion filters **the tail only** — a checkpoint is, by definition,
+/// state that predates what is being reverted, so to exclude an agent across
+/// the whole log pass `checkpoint_seq = 0` (empty restore point; this is what
+/// the promoted `supervisor_parallel_e2e` fixture uses). The degenerate
+/// `checkpoint_seq = u64::MAX` with `exclude_agent = None` is the full-log
+/// replay whose last writer per path is the log's verdict. For a stored
+/// snapshot object use [`GateBoundaryCheckpoint::replay_tail_excluding`]
+/// instead of re-folding the prefix.
+pub fn revert_excluding_agent(
+    events: &[WhiteboardEvent],
+    exclude_agent: Option<&str>,
+    checkpoint_seq: u64,
+) -> BTreeMap<String, String> {
+    GateBoundaryCheckpoint::at_cut(events, checkpoint_seq, None)
+        .replay_tail_excluding(events, exclude_agent)
+}
+
+// ---------------------------------------------------------------------------
+// Durable store round-trip (ADR-60 D5 (i)): persist / load
+// ---------------------------------------------------------------------------
+
+/// Why a gate-boundary checkpoint could not be persisted or reloaded.
+#[derive(Debug)]
+pub enum CheckpointStoreError {
+    /// SQLite persistence failure surfaced by the sessions crate.
+    Storage(SessionError),
+    /// The snapshot could not be serialized to its stored JSON form.
+    Serialize(serde_json::Error),
+    /// A stored snapshot row exists but its payload no longer deserializes
+    /// into a [`GateBoundaryCheckpoint`] (schema drift or corruption).
+    Deserialize { gate_seq: u64, reason: String },
+    /// The write gate refused to materialize the cut.
+    Gate(String),
+}
+
+impl std::fmt::Display for CheckpointStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => write!(f, "checkpoint store error: {error}"),
+            Self::Serialize(error) => {
+                write!(f, "failed to serialize checkpoint snapshot: {error}")
+            }
+            Self::Deserialize { gate_seq, reason } => {
+                write!(f, "stored checkpoint at gate_seq {gate_seq} is unreadable: {reason}")
+            }
+            Self::Gate(reason) => write!(f, "gate refused to materialize the checkpoint: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::Serialize(error) => Some(error),
+            Self::Deserialize { .. } | Self::Gate(_) => None,
+        }
+    }
+}
+
+impl From<SessionError> for CheckpointStoreError {
+    fn from(error: SessionError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<serde_json::Error> for CheckpointStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialize(error)
+    }
+}
+
+/// Persist a [`GateBoundaryCheckpoint`] into the sessions whiteboard
+/// checkpoint store (`whiteboard_checkpoints`, migration 028), pinned to the
+/// checkpoint's own `gate_seq` (the consistent-cut coordinate).
+///
+/// The store is a projection, never a second source of truth: every folded
+/// event already lives WAL-first in the log, so a failed persist loses
+/// nothing — restore can always be rebuilt from the raw log.
+pub async fn persist_gate_boundary_checkpoint(
+    pool: &sqlx::SqlitePool,
+    checkpoint: &GateBoundaryCheckpoint,
+) -> Result<WhiteboardCheckpoint, CheckpointStoreError> {
+    let snapshot = serde_json::to_string(checkpoint)?;
+    Ok(concerto_sessions::whiteboard::create_whiteboard_checkpoint(
+        pool,
+        checkpoint.gate_seq,
+        &snapshot,
+    )
+    .await?)
+}
+
+/// Load the latest persisted checkpoint at or before `gate_seq`, deserialized
+/// back into a typed [`GateBoundaryCheckpoint`]. The read-side of restart
+/// restore: **read-only** — this returns the projected file state, it never
+/// materializes anything to disk (see `Supervisor::checkpoint_at_shutdown`
+/// for the write side and the documented restore gap).
+///
+/// `None` means no stored checkpoint exists at or before `gate_seq`.
+pub async fn load_gate_boundary_checkpoint(
+    pool: &sqlx::SqlitePool,
+    gate_seq: u64,
+) -> Result<Option<(WhiteboardCheckpoint, GateBoundaryCheckpoint)>, CheckpointStoreError> {
+    let Some(record) =
+        concerto_sessions::whiteboard::load_whiteboard_checkpoint_by_gate_seq(pool, gate_seq)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let checkpoint = serde_json::from_str(&record.snapshot).map_err(|reason| {
+        CheckpointStoreError::Deserialize { gate_seq: record.gate_seq, reason: reason.to_string() }
+    })?;
+    Ok(Some((record, checkpoint)))
+}
+
+/// Fold one whiteboard row into the projected file state if it is an applied
+/// filesystem write carrying a usable path/content pair; anything else is
+/// skipped. A malformed payload on an applied-write row degrades to a
+/// `debug!`-logged skip (observable), never a hard failure — the projection
+/// must stay reconstructible from any historical log.
+fn apply_write_event(files: &mut BTreeMap<String, String>, event: &WhiteboardEvent) {
+    if event.kind != WhiteboardKind::WriteApplied {
+        return;
+    }
+    let Some(input) = event.payload.get("input") else {
+        tracing::debug!(
+            target: "concerto_orchestrator::checkpoint",
+            event_id = %event.event_id,
+            "checkpoint replay: applied write without input payload; row skipped"
+        );
+        return;
+    };
+    // Slice scope (see [`GateBoundaryCheckpoint`]): writes only, so
+    // move/copy/delete rows are left for their dedicated revert support.
+    if input.get("operation").and_then(serde_json::Value::as_str) != Some("write") {
+        return;
+    }
+    let path = input.get("path").and_then(serde_json::Value::as_str);
+    let content = input.get("content").and_then(serde_json::Value::as_str);
+    match (path, content) {
+        (Some(path), Some(content)) => {
+            files.insert(path.to_owned(), content.to_owned());
+        }
+        (path, content) => {
+            tracing::debug!(
+                target: "concerto_orchestrator::checkpoint",
+                event_id = %event.event_id,
+                ?path,
+                ?content,
+                "checkpoint replay: applied write missing path or string content; row skipped"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +977,16 @@ mod tests {
 
     /// Build a minimal checkpoint for round-trip tests.
     fn build_minimal_checkpoint(graph: &TaskGraph) -> GraphCheckpoint {
+        build_minimal_checkpoint_with_context(graph, &CheckpointContext::default())
+    }
+
+    /// [`build_minimal_checkpoint`] with an explicit context — the additive
+    /// §7-style fields (pending decision, active wait, …) are exercised with
+    /// a tailored context instead of the default.
+    fn build_minimal_checkpoint_with_context(
+        graph: &TaskGraph,
+        context: &CheckpointContext,
+    ) -> GraphCheckpoint {
         build_checkpoint(
             &CheckpointScope {
                 run_id: Ulid::new(),
@@ -506,7 +1016,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &CheckpointContext::default(),
+            context,
         )
     }
 
@@ -920,12 +1430,40 @@ mod tests {
             &HashMap::new(),
             &CheckpointContext {
                 design_doc: Some(design_doc.clone()),
+                world_model: crate::world_model::WorldModel::default(),
+                suitability: crate::suitability::SuitabilityState::default(),
                 model_assignments: model_assignments.clone(),
                 action_ledger: action_ledger.clone(),
                 default_model_provider_attempted: HashSet::new(),
                 default_model_attempted: HashSet::from([task_id]),
                 self_execute_attempted: HashSet::new(),
                 escalation_attempted: HashSet::new(),
+                doc_resolution: None,
+                snapshot_generation: None,
+                pending_decision: None,
+                decision_journal: Vec::new(),
+                failure_diagnoses: Vec::new(),
+                progress_tracker: crate::progress::ProgressTrackerState::default(),
+                ownership: crate::ownership::OwnershipState {
+                    records: vec![
+                        crate::ownership::OwnershipRecord {
+                            artifact: "src/main.rs".to_owned(),
+                            owner: "coder".to_owned(),
+                            acquiring_event_id: "write-1".to_owned(),
+                            acquired_at_ms: 42,
+                            status: crate::ownership::OwnershipStatus::Stale,
+                        },
+                        crate::ownership::OwnershipRecord {
+                            artifact: "docs/plan.md".to_owned(),
+                            owner: "docs-writer".to_owned(),
+                            acquiring_event_id: "transfer-1".to_owned(),
+                            acquired_at_ms: 48,
+                            status: crate::ownership::OwnershipStatus::Owned,
+                        },
+                    ],
+                },
+                active_wait: None,
+                external_changes: vec![],
             },
         );
         assert_eq!(cp.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION);
@@ -956,6 +1494,26 @@ mod tests {
             loaded.self_execute_attempted.is_empty() && loaded.escalation_attempted.is_empty(),
             "empty guard sets preserved"
         );
+        // Issue #61: the ownership table round-trips (records, owners,
+        // acquiring events, and the stale status survive the restore).
+        assert_eq!(loaded.ownership.records.len(), 2, "ownership records preserved");
+        let main_rs = loaded
+            .ownership
+            .records
+            .iter()
+            .find(|record| record.artifact == "src/main.rs")
+            .expect("src/main.rs record survives");
+        assert_eq!(main_rs.owner, "coder");
+        assert_eq!(main_rs.acquiring_event_id, "write-1");
+        assert_eq!(main_rs.status, crate::ownership::OwnershipStatus::Stale);
+        let plan_md = loaded
+            .ownership
+            .records
+            .iter()
+            .find(|record| record.artifact == "docs/plan.md")
+            .expect("docs/plan.md record survives");
+        assert_eq!(plan_md.owner, "docs-writer");
+        assert_eq!(plan_md.status, crate::ownership::OwnershipStatus::Owned);
 
         // Original timestamps survive the restore.
         let restored = restore_graph(&loaded).unwrap();
@@ -1163,12 +1721,23 @@ mod tests {
             &HashMap::new(),
             &CheckpointContext {
                 design_doc: Some(design_doc.clone()),
+                world_model: crate::world_model::WorldModel::default(),
+                suitability: crate::suitability::SuitabilityState::default(),
                 model_assignments: model_assignments.clone(),
                 action_ledger: action_ledger.clone(),
                 default_model_provider_attempted: HashSet::new(),
                 default_model_attempted: HashSet::new(),
                 self_execute_attempted: HashSet::new(),
                 escalation_attempted: HashSet::new(),
+                doc_resolution: None,
+                snapshot_generation: None,
+                pending_decision: None,
+                decision_journal: Vec::new(),
+                failure_diagnoses: Vec::new(),
+                progress_tracker: crate::progress::ProgressTrackerState::default(),
+                ownership: crate::ownership::OwnershipState::default(),
+                active_wait: None,
+                external_changes: vec![],
             },
         );
 
@@ -1215,6 +1784,101 @@ mod tests {
             serde_json::to_value(&completed_results).unwrap(),
             "completed results preserved"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-60 D5: gate-boundary checkpoint + per-agent revert
+    // ------------------------------------------------------------------
+
+    /// A stored `WriteApplied` filesystem-write row shaped exactly like the
+    /// write gate produces (payload `{ tool, input: { operation, path,
+    /// content } }`).
+    fn applied_write(
+        gate_seq: u64,
+        event_id: &str,
+        agent_id: &str,
+        path: &str,
+        content: &str,
+    ) -> WhiteboardEvent {
+        WhiteboardEvent {
+            event_id: event_id.to_owned(),
+            gate_seq,
+            agent_id: agent_id.to_owned(),
+            agent_seq: 1,
+            kind: WhiteboardKind::WriteApplied,
+            scope: String::new(),
+            session_id: None,
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "tool": "filesystem",
+                "input": { "operation": "write", "path": path, "content": content }
+            }),
+            content_hash: String::new(),
+            pre_image_hash: None,
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn d5_checkpoint_at_cut_then_revert_excluding_agent_replays_the_log() {
+        let events = vec![
+            applied_write(1, "e1", "agent-a", "shared.txt", "base"),
+            applied_write(2, "e2", "agent-b", "notes.md", "b1"),
+            // Non-write rows must never be folded into the projection.
+            WhiteboardEvent {
+                kind: WhiteboardKind::Decision,
+                payload: serde_json::json!({ "note": "not a write" }),
+                ..applied_write(3, "e3", "agent-a", "poison.txt", "never")
+            },
+            applied_write(4, "e4", "agent-a", "shared.txt", "cut-value"),
+            // A rejected write carries no file effect even for a kept agent.
+            WhiteboardEvent {
+                kind: WhiteboardKind::WriteRejected,
+                ..applied_write(5, "e5", "agent-b", "rejected.txt", "nope")
+            },
+            applied_write(6, "e6", "agent-b", "shared.txt", "tail-b"),
+            applied_write(7, "e7", "agent-a", "notes.md", "a2"),
+        ];
+
+        // Checkpoint at S = 4 ("everything ≤ seq S"): the cut holds each
+        // path's last applied write at or before the boundary.
+        let cut = GateBoundaryCheckpoint::at_cut(&events, 4, None);
+        assert_eq!(cut.gate_seq, 4);
+        assert_eq!(cut.files.get("shared.txt").map(String::as_str), Some("cut-value"));
+        assert_eq!(cut.files.get("notes.md").map(String::as_str), Some("b1"));
+        assert!(!cut.files.contains_key("poison.txt"), "non-write rows are not applied");
+        assert!(!cut.files.contains_key("rejected.txt"), "rejected writes are not applied");
+        assert!(!cut.files.contains_key("extra.txt"));
+
+        // Per-agent revert (D5 ii): restore the cut, replay the tail minus
+        // agent-b's rows. shared.txt stays at its cut value (b's tail write
+        // is skipped); notes.md advances via agent-a's tail write.
+        let reverted = revert_excluding_agent(&events, Some("agent-b"), 4);
+        assert_eq!(reverted.get("shared.txt").map(String::as_str), Some("cut-value"));
+        assert_eq!(reverted.get("notes.md").map(String::as_str), Some("a2"));
+        assert!(!reverted.contains_key("extra.txt"), "excluded agent's creates are gone");
+
+        // Whole-log exclusion (cut 0 — the promoted fixture's semantics):
+        // agent-b's rows are skipped everywhere, so shared.txt keeps only
+        // agent-a's writes and notes.md advances straight to a2.
+        let no_b = revert_excluding_agent(&events, Some("agent-b"), 0);
+        assert_eq!(no_b.get("shared.txt").map(String::as_str), Some("cut-value"));
+        assert_eq!(no_b.get("notes.md").map(String::as_str), Some("a2"));
+
+        // Full-log replay (empty restore point, no exclusion): the log's last
+        // writer per path wins. Only the two genuinely applied write paths
+        // appear; poison/rejected rows contribute nothing.
+        let full = revert_excluding_agent(&events, None, u64::MAX);
+        assert_eq!(full.len(), 2);
+        assert_eq!(full.get("shared.txt").map(String::as_str), Some("tail-b"));
+        assert_eq!(full.get("notes.md").map(String::as_str), Some("a2"));
+        assert!(!full.contains_key("poison.txt") && !full.contains_key("rejected.txt"));
+
+        // Restore-forward through the same snapshot object agrees with the
+        // one-shot helper.
+        let forward = cut.replay_tail_excluding(&events, Some("agent-b"));
+        assert_eq!(forward, reverted);
     }
 
     // ------------------------------------------------------------------
@@ -1281,7 +1945,7 @@ mod tests {
         assert!(task.created_at.unix_timestamp() > 0, "restore falls back to now for v2");
 
         // The migration is also honored by scope validation (defense in depth).
-        assert!(loaded.validate_scope(loaded.session_id, "test", None).is_ok());
+        assert!(loaded.validate_scope(loaded.session_id, "test").is_ok());
     }
 
     #[test]
@@ -1298,10 +1962,634 @@ mod tests {
 
         // validate_scope also rejects unknown future versions cleanly.
         let future: GraphCheckpoint = serde_json::from_value(value).unwrap();
-        let scope_error = future.validate_scope(future.session_id, "test", None).unwrap_err();
+        let scope_error = future.validate_scope(future.session_id, "test").unwrap_err();
         assert!(
             scope_error.contains("incompatible with runtime schema"),
             "expected scope rejection, got: {scope_error}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-65 §7: v4 fields round-trip; v3 records migrate additively
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn v4_fields_survive_json_round_trip() {
+        let doc_resolution = CheckpointDocResolution::Quarantined {
+            reason_codes: vec!["ungrounded-path".into()],
+            claim_event_id: Some("ev-claim".into()),
+            verdict_event_id: Some("ev-verdict".into()),
+        };
+        let pending = CheckpointPendingDecision {
+            selected_agent: "coder".into(),
+            reason: "doc-active-implement-with-contract".into(),
+            required_output: "Implement: build the thing".into(),
+            supporting_evidence_ids: vec!["ev-1".into(), "ev-2".into()],
+            task_id: Some(TaskId::new()),
+        };
+        let mut cp = build_minimal_checkpoint(&TaskGraph::new());
+        cp.whiteboard_cursor_gate_seq = Some(42);
+        cp.doc_resolution = Some(doc_resolution.clone());
+        cp.snapshot_generation = Some("gen-7".into());
+        cp.pending_decision = Some(pending.clone());
+
+        let json = serde_json::to_string(&cp).unwrap();
+        let loaded = GraphCheckpoint::from_json(&json).unwrap();
+        assert_eq!(loaded.whiteboard_cursor_gate_seq, Some(42), "cursor preserved");
+        assert_eq!(loaded.snapshot_generation.as_deref(), Some("gen-7"));
+        assert_eq!(loaded.doc_resolution, Some(doc_resolution), "doc resolution preserved");
+        assert_eq!(loaded.pending_decision, Some(pending), "pending decision preserved");
+        // Keys are stable kebab/JSON names: the pending decision serializes
+        // with the ADR-65 §6 payload shape.
+        assert!(json.contains("\"selected_agent\""));
+        assert!(json.contains("\"supporting_evidence_ids\""));
+    }
+
+    #[test]
+    fn v3_record_loads_under_v4_policy_with_section7_defaults() {
+        // A realistic v3-shaped record (the §7 fields did not exist): it
+        // migrates to the current version with every new key treated as
+        // absent, and restore proceeds exactly as before.
+        let json = r#"{
+            "schema_version": 3,
+            "run_id": "01HZ0X0X0X0X0X0X0X0X0X0X0X",
+            "session_id": "01HZ0X0X0X0X0X0X0X0X0X0X0X",
+            "root_task_id": "01HZ0X0X0X0X0X0X0X0X0X0X0X",
+            "project_id": "test",
+            "objective": "test objective",
+            "objective_hash": "hash",
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {}
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).unwrap();
+        assert_eq!(
+            loaded.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION,
+            "v3 record migrated to v4 on load"
+        );
+        // The §7 fields default to None; the resume path backfills them
+        // additively from the log (fail-soft).
+        assert!(loaded.whiteboard_cursor_gate_seq.is_none());
+        assert!(loaded.doc_resolution.is_none());
+        assert!(loaded.snapshot_generation.is_none());
+        assert!(loaded.pending_decision.is_none());
+        // Issue #52 (additive, backward-compatible): a checkpoint written
+        // before the decision journal loads with an EMPTY journal — the
+        // zero-value decision state; the migration chain never required it.
+        assert!(loaded.decision_journal.is_empty());
+        assert!(loaded.validate_scope(loaded.session_id, "test").is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #52: the decision journal persists additively, INDEPENDENTLY
+    // of the execution state — a checkpoint without the key loads empty
+    // (old rows keep restoring), and a captured journal round-trips.
+    // ------------------------------------------------------------------
+
+    /// A pre-#52 v4 record with NO `decision_journal` key loads clean with
+    /// an empty journal: the key is additive only and old checkpoints are
+    /// untouched by the schema bump.
+    #[test]
+    fn old_checkpoint_without_decision_journal_loads_empty() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#52 checkpoint loads");
+        assert!(
+            loaded.decision_journal.is_empty(),
+            "the absent journal field defaults to the empty decision state"
+        );
+    }
+
+    /// A captured decision journal round-trips through the checkpoint JSON:
+    /// decision state is persisted and inspectable independently of the
+    /// execution accumulator fields (the execution fields are absent here).
+    #[test]
+    fn decision_journal_round_trips_through_checkpoint_json() {
+        let decision = crate::decisions::CoordinatorDecision {
+            id: "dec-0001".to_owned(),
+            kind: crate::decisions::DecisionKind::DispatchSpecialist,
+            target_agent: Some(AgentId::new("coder")),
+            task_description: "implement the thing".to_owned(),
+            notes: Some("coordinator choice".to_owned()),
+            supporting_evidence_ids: vec!["ev-real".to_owned()],
+            expected_artifacts: vec!["src/main.rs".to_owned()],
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            status: crate::decisions::DecisionStatus::Settled,
+        };
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "decision_journal": [decision],
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("journal loads");
+        assert_eq!(loaded.decision_journal.len(), 1, "one decision entry");
+        assert_eq!(loaded.decision_journal[0], decision, "the entry survives the round trip");
+        assert_eq!(
+            loaded.decision_journal[0].status,
+            crate::decisions::DecisionStatus::Settled,
+            "decision state is its own, independent of execution state"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #53: the coordinator progress tracker persist additively —
+    // a checkpoint without the key loads the zero-value state (old rows
+    // keep restoring), and a captured tracker state round-trips so stall
+    // detection survives a resume.
+    // ------------------------------------------------------------------
+
+    /// A pre-#53 v4 record with NO `progress_tracker` key loads clean with
+    /// the empty state: the key is additive only and old checkpoints are
+    /// untouched by the change.
+    #[test]
+    fn old_checkpoint_without_progress_tracker_loads_default() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#53 checkpoint loads");
+        assert_eq!(
+            loaded.progress_tracker,
+            crate::progress::ProgressTrackerState::default(),
+            "the absent tracker field defaults to the zero-value progress state"
+        );
+    }
+
+    /// A captured tracker state (fingerprint history, equivalence streak,
+    /// recovery budget) round-trips through the checkpoint JSON so a
+    /// resumed run keeps its stall-detection window and budget.
+    #[test]
+    fn progress_tracker_round_trips_through_checkpoint_json() {
+        let state = crate::progress::ProgressTrackerState {
+            fingerprint_history: vec!["aaaa".to_owned(), "bbbb".to_owned(), "bbbb".to_owned()],
+            repeated_rounds: 2,
+            stall_recoveries: 1,
+            wasted_spend_usd: 0.42,
+        };
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "progress_tracker": state,
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("tracker state loads");
+        assert_eq!(
+            loaded.progress_tracker, state,
+            "stall-detection state survives the round trip (resume persistence)"
+        );
+    }
+
+    /// A captured failure-diagnosis history (issue #54) round-trips through
+    /// the checkpoint JSON so a resumed run keeps its diagnosis/evidence
+    /// trail.
+    #[test]
+    fn failure_diagnoses_round_trip_through_checkpoint_json() {
+        let diagnosis =
+            crate::failure_diagnosis::diagnose(&concerto_core::OrchestratorError::Provider(
+                concerto_core::error::ProviderError::Network("reset".into()),
+            ));
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "failure_diagnoses": [diagnosis],
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("diagnosis history loads");
+        assert_eq!(
+            loaded.failure_diagnoses,
+            vec![diagnosis],
+            "the diagnosis/evidence trail survives the round trip (resume persistence)"
+        );
+    }
+
+    /// Issue #63: an in-flight WAIT survives the serialized checkpoint
+    /// surface — the resume path re-evaluates the restored record instead of
+    /// losing the park. Both proof directions: the field is absent on legacy
+    /// JSON (serde-default = none parked) and round-trips in full when the
+    /// checkpoint context carries it.
+    #[test]
+    fn in_flight_wait_survives_checkpoint_json() {
+        // Direction 1: a legacy-shape checkpoint has no wait parked.
+        let legacy = serde_json::json!({
+            "schema_version": 3,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+        })
+        .to_string();
+        assert!(!legacy.contains("active_wait"), "a legacy checkpoint predates the wait field");
+        let migrated = GraphCheckpoint::from_json(&legacy).expect("legacy loads");
+        assert!(migrated.active_wait.is_none(), "additive default = no wait parked");
+
+        // Direction 2: a parked wait survives the build → JSON → load path.
+        let graph = TaskGraph::new();
+        let record = crate::wait::WaitingRecord {
+            decision_id: "wait-1".into(),
+            reason: "review gate pending".into(),
+            supporting_evidence_ids: vec!["ev-9".into()],
+            conditions: vec![
+                crate::wait::WakeCondition::EventResolved { task_ids: vec![TaskId::new()] },
+                crate::wait::WakeCondition::NewEvidence {
+                    event_kinds: vec!["finding".into(), "review-state".into()],
+                },
+            ],
+            affected_task_ids: vec![TaskId::new()],
+            affected_resource_ids: vec!["docs/plan.md".into()],
+            started_at_ms: 42,
+            deadline_ms: Some(9_999_999_999),
+            start_gate_seq: Some(7),
+        };
+        let context =
+            CheckpointContext { active_wait: Some(record.clone()), ..CheckpointContext::default() };
+        let cp = build_minimal_checkpoint_with_context(&graph, &context);
+        let json = serde_json::to_string(&cp).expect("the checkpoint serializes");
+        let loaded = GraphCheckpoint::from_json(&json).expect("the checkpoint loads");
+        let restored = loaded.active_wait.expect("the in-flight wait survives");
+        assert_eq!(restored.decision_id, record.decision_id);
+        assert_eq!(restored.reason, record.reason);
+        assert_eq!(restored.deadline_ms, record.deadline_ms);
+        assert_eq!(restored.start_gate_seq, Some(7));
+        assert_eq!(restored.conditions, record.conditions);
+        assert_eq!(restored.affected_task_ids, record.affected_task_ids);
+        assert_eq!(restored.affected_resource_ids, record.affected_resource_ids);
+    }
+
+    /// Issue #65: the explicit external-workspace-change records round-trip
+    /// through checkpoint JSON — reconcilable state survives a resume
+    /// additively (legacy checkpoints carry none, so they load empty).
+    #[test]
+    fn external_changes_survive_checkpoint_json() {
+        // Direction 1: a legacy-shape checkpoint has no external changes.
+        let legacy = serde_json::json!({
+            "schema_version": 3,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+        })
+        .to_string();
+        assert!(
+            !legacy.contains("external_changes"),
+            "a legacy checkpoint predates the external-change field"
+        );
+        let migrated = GraphCheckpoint::from_json(&legacy).expect("legacy loads");
+        assert!(
+            migrated.external_changes.is_empty(),
+            "additive default = no external changes recorded"
+        );
+
+        // Direction 2: records survive the build → JSON → load path.
+        let graph = TaskGraph::new();
+        let record = crate::external_change::ExternalChangeRecord::new(
+            vec!["src/lib.rs".to_owned()],
+            Some("gen-a".to_owned()),
+            Some("gen-b".to_owned()),
+            Some("coder".to_owned()),
+            Some("task-1".to_owned()),
+            true,
+            1_000,
+        );
+        let context = CheckpointContext {
+            external_changes: vec![record.clone()],
+            ..CheckpointContext::default()
+        };
+        let cp = build_minimal_checkpoint_with_context(&graph, &context);
+        let json = serde_json::to_string(&cp).expect("the checkpoint serializes");
+        let loaded = GraphCheckpoint::from_json(&json).expect("the checkpoint loads");
+        let restored =
+            loaded.external_changes.first().expect("the external change survives the round trip");
+        assert_eq!(restored.affected_paths, record.affected_paths);
+        assert_eq!(restored.previous_generation, Some("gen-a".to_owned()));
+        assert_eq!(restored.current_generation, Some("gen-b".to_owned()));
+        assert_eq!(restored.known_owner.as_deref(), Some("coder"));
+        assert_eq!(restored.known_task.as_deref(), Some("task-1"));
+        assert!(restored.conflicts_with_coordinator_work);
+    }
+
+    /// Issue #60: the suitability record round-trips through checkpoint
+    /// JSON — delegation-quality evidence survives a resume.
+    #[test]
+    fn suitability_round_trips_through_checkpoint_json() {
+        let mut index = crate::suitability::SuitabilityIndex::default();
+        index.record(
+            "coder",
+            crate::suitability::TaskClass::CodeEdit,
+            crate::suitability::OutcomeKind::Success,
+            None,
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid unix epoch"),
+            1_200,
+        );
+        index.record(
+            "coder",
+            crate::suitability::TaskClass::CodeEdit,
+            crate::suitability::OutcomeKind::Failure,
+            Some("tool"),
+            time::OffsetDateTime::from_unix_timestamp(1_700_086_400).expect("valid unix offset"),
+            0,
+        );
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "suitability": index.state(),
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("suitability history loads");
+        assert_eq!(
+            loaded.suitability,
+            index.state(),
+            "the suitability record survives the round trip (resume persistence)"
+        );
+        // The restored history ranks the same as the in-memory one.
+        let restored = crate::suitability::SuitabilityIndex::from_state(loaded.suitability);
+        let candidates = vec!["coder".to_owned()];
+        assert_eq!(
+            index.rank(
+                &candidates,
+                crate::suitability::TaskClass::CodeEdit,
+                time::OffsetDateTime::from_unix_timestamp(1_700_172_800)
+                    .expect("valid unix offset")
+            ),
+            restored.rank(
+                &candidates,
+                crate::suitability::TaskClass::CodeEdit,
+                time::OffsetDateTime::from_unix_timestamp(1_700_172_800)
+                    .expect("valid unix offset")
+            ),
+        );
+    }
+
+    /// Issue #60: a pre-#60 checkpoint record with NO `suitability` key
+    /// loads clean with the EMPTY default — additive, no schema bump, old
+    /// runs are neutral until suitability is recorded again.
+    #[test]
+    fn old_checkpoint_without_suitability_loads_default() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null,
+            "world_model": {}
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#60 checkpoint loads");
+        assert!(
+            crate::suitability::SuitabilityIndex::from_state(loaded.suitability.clone()).is_empty(),
+            "the absent suitability record defaults to the empty index"
+        );
+        // The empty record queries neutrally — every candidate tie at 0.
+        let index = crate::suitability::SuitabilityIndex::from_state(loaded.suitability.clone());
+        let candidates = vec!["a".to_owned(), "b".to_owned()];
+        let ranked = index.rank(
+            &candidates,
+            crate::suitability::TaskClass::CodeEdit,
+            time::OffsetDateTime::now_utc(),
+        );
+        assert!(ranked.iter().all(|entry| entry.score_milli == 0));
+    }
+
+    /// A pre-#54 checkpoint record with NO `failure_diagnoses` key loads
+    /// clean with the empty history (additive serde default, no bump).
+    #[test]
+    fn old_checkpoint_without_failure_diagnoses_loads_default() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#54 checkpoint loads");
+        assert!(
+            loaded.failure_diagnoses.is_empty(),
+            "the absent diagnosis history defaults to empty"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #56: the world-model projection persists additively so a
+    // resume reconstructs the SAME model — a captured model round-trips
+    // through the checkpoint JSON (build → serialize → load → identical
+    // render), and a checkpoint without the key loads the empty default
+    // (those runs rebuild the model from their own restored state).
+    // ------------------------------------------------------------------
+
+    /// A captured world model round-trips through the checkpoint JSON and
+    /// renders BIT-IDENTICALLY after a deserialize.
+    #[test]
+    fn world_model_round_trips_through_checkpoint_json() {
+        let model = crate::world_model::WorldModel {
+            built_at_ms: 1_000,
+            generation: Some("gen-7".to_owned()),
+            workspace_changed: true,
+            objective: Some("fix the parser".to_owned()),
+            criteria: vec!["tests pass".to_owned()],
+            agents: vec!["coordinator".to_owned(), "coder".to_owned()],
+            models: vec!["cheap".to_owned()],
+            facts: vec![crate::world_model::WorldFact {
+                ref_id: "ev-1".to_owned(),
+                label: "wrote src/main.rs by coder".to_owned(),
+                status: crate::world_model::FactStatus::Verified,
+                artifact: Some("src/main.rs".to_owned()),
+                seq: 12,
+            }],
+            tasks: vec![crate::world_model::WorldTask {
+                ref_id: "dec-1".to_owned(),
+                label: "implement the thing".to_owned(),
+                status: "settled".to_owned(),
+            }],
+            artifacts: vec![crate::world_model::WorldArtifact {
+                path: "src/main.rs".to_owned(),
+                status: crate::world_model::ArtifactStatus::Written,
+                owner: Some("coder".to_owned()),
+                last_ref: Some("ev-1".to_owned()),
+            }],
+            questions: vec![crate::world_model::UnresolvedQuestion {
+                id: "q-abc123".to_owned(),
+                kind: crate::world_model::QuestionKind::BlockedPath,
+                question: "is 'src/main.rs' as recorded? re-verify".to_owned(),
+                blocks: Some("src/main.rs".to_owned()),
+                needed: vec!["obs-1".to_owned()],
+                opened_journal_len: 1,
+                opened_ref: Some("obs-1".to_owned()),
+                opened_at_ms: 900,
+                cycles_open: 2,
+                state: crate::world_model::QuestionState::Open,
+                resolved_by: None,
+            }],
+            assumptions: vec![crate::world_model::WorldAssumption {
+                ref_id: "ev-2".to_owned(),
+                label: "design doc binds 2 paths".to_owned(),
+            }],
+            risks: vec![crate::world_model::WorldRisk {
+                ref_id: "ev-2".to_owned(),
+                label: "expected artifact src/main.rs is stale".to_owned(),
+            }],
+            pending: Some("dispatch to coder: implement".to_owned()),
+        };
+        let cp_json = serde_json::json!({
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "world_model": model,
+        })
+        .to_string();
+
+        let loaded = GraphCheckpoint::from_json(&cp_json).expect("world model loads");
+        assert_eq!(
+            loaded.world_model, model,
+            "the projection survives the round trip (resume persistence)"
+        );
+        assert_eq!(
+            loaded.world_model.render(),
+            model.render(),
+            "the resume reconstructs the SAME model (identical render)"
+        );
+    }
+
+    /// A pre-#56 checkpoint record with NO `world_model` key loads clean
+    /// with the empty model (additive serde default, no bump): those runs
+    /// rebuild the projection from their own restored state.
+    #[test]
+    fn old_checkpoint_without_world_model_loads_empty() {
+        let json = r#"{
+            "schema_version": 4,
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "pending_decision": null
+        }"#;
+
+        let loaded = GraphCheckpoint::from_json(json).expect("pre-#56 checkpoint loads");
+        assert_eq!(
+            loaded.world_model,
+            crate::world_model::WorldModel::default(),
+            "the absent world-model field defaults to the empty projection"
+        );
+        assert!(
+            loaded.world_model.is_empty_beyond_objective(),
+            "the empty model carries nothing to consume"
         );
     }
 

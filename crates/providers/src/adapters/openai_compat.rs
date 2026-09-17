@@ -21,6 +21,7 @@
 
 use concerto_core::types::{CompletionRequest, Message, Role, ToolChoice, ToolDefinition};
 
+use super::schema_sanitize::sanitize_tool_schema;
 use super::{Dialect, ReasoningEcho};
 
 /// The OpenAI-compatible chat dialect (`/chat/completions`).
@@ -56,7 +57,11 @@ impl Dialect for OpenAiChatDialect {
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
-            "stream": true,
+            // The request's `stream` flag is honored on the wire: the
+            // weak-model tier (see `schema_loose::non_streaming_transport_active`)
+            // forces `false` in the connector so tool-call arguments arrive
+            // whole instead of as streamed deltas.
+            "stream": request.stream,
         });
 
         if let Some(temp) = request.temperature {
@@ -186,16 +191,23 @@ fn build_tool_messages(m: &Message) -> Vec<serde_json::Value> {
 }
 
 /// Convert a list of `ToolDefinition` into the OpenAI tools JSON array.
+///
+/// Each tool's `parameters` schema is sanitized via
+/// [`sanitize_tool_schema`] to strip draft-2020-12 constructs that
+/// forwarder-gateways and free-tier pilots reject on the wire (`$defs`,
+/// `$ref`, `$schema`, `prefixItems`).
 fn build_openai_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .map(|tool| {
+            let mut params = tool.parameters.clone();
+            sanitize_tool_schema(&mut params);
             serde_json::json!({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.parameters,
+                    "parameters": params,
                 }
             })
         })
@@ -295,6 +307,8 @@ mod tests {
                     id: "call_123".into(),
                     name: "test_tool".into(),
                     arguments: serde_json::json!({"input": "hello"}),
+
+                    ..Default::default()
                 }]),
                 None,
             )],
@@ -420,6 +434,16 @@ mod tests {
         assert_eq!(body["stream"], true);
     }
 
+    /// The request's `stream` flag is honored on the wire: `false` renders
+    /// `"stream": false`, which is how weak-model completions are requested
+    /// non-streamed so their tool-call arguments arrive whole.
+    #[test]
+    fn stream_false_is_honored_in_body() {
+        let request = CompletionRequest { stream: false, ..Default::default() };
+        let body = render(&request, ReasoningEcho::IfPresent);
+        assert_eq!(body["stream"], false);
+    }
+
     #[test]
     fn model_is_set_in_body() {
         let request = CompletionRequest::default();
@@ -451,6 +475,8 @@ mod tests {
                     id: "call_empty".into(),
                     name: "no_arg_tool".into(),
                     arguments: serde_json::json!({}),
+
+                    ..Default::default()
                 }]),
                 None,
             )],
@@ -476,6 +502,8 @@ mod tests {
                     id: "call_null".into(),
                     name: "no_arg_tool".into(),
                     arguments: serde_json::Value::Null,
+
+                    ..Default::default()
                 }]),
                 None,
             )],
@@ -557,6 +585,8 @@ mod tests {
                     tokens_out: None,
                 },
             ],
+            // Streaming is the default transport; the golden body reflects it.
+            stream: true,
             ..Default::default()
         };
         let body = render(&request, ReasoningEcho::IfPresent);
@@ -663,6 +693,8 @@ mod tests {
                     id: "call_1".into(),
                     name: "some_tool".into(),
                     arguments: serde_json::json!({}),
+
+                    ..Default::default()
                 }]),
                 Some("reasoning".into()),
             )],
@@ -688,6 +720,8 @@ mod tests {
                         id: "call_1".into(),
                         name: "shell".into(),
                         arguments: serde_json::json!({"command": "ls"}),
+
+                        ..Default::default()
                     }]),
                     None,
                 ),
@@ -750,11 +784,15 @@ mod tests {
                             id: "call_a".into(),
                             name: "tool_a".into(),
                             arguments: serde_json::json!({"input": "a"}),
+
+                            ..Default::default()
                         },
                         ToolCall {
                             id: "call_b".into(),
                             name: "tool_b".into(),
                             arguments: serde_json::json!({"input": "b"}),
+
+                            ..Default::default()
                         },
                     ]),
                     None,

@@ -21,10 +21,17 @@
 //!   are exempt — `cat /etc/os-release` is a legitimate diagnostic and keeps
 //!   working. `sed`, `grep`, and `awk` count as read-only only when none of
 //!   their recognized write flags is present.
+//! - **Pipelines into `xargs`.** `xargs` consumes the whole pipeline's stdout
+//!   as argv elements for its command, so when any segment lead is `xargs`
+//!   the per-segment read-only exemption is suspended: every path-like token
+//!   in the WHOLE pipeline must resolve in-root (`echo /etc/shadow | xargs rm`
+//!   cannot launder the read-exempt argument into the mutating segment).
 //! - **Redirect writes.** `> file`, `>> file`, `2> file`, `&> file`, and glued
 //!   forms (`2>/tmp/x`) whose target resolves outside the root are rejected
 //!   regardless of the verb — a read-only verb does not get to write outside
-//!   the project.
+//!   the project. A glued token carrying BOTH operators (`2>&1</etc/passwd`)
+//!   resolves each operator's suffix independently, bounded by the other
+//!   operator, so neither target is swallowed by the other's branch.
 //! - **git `-C <dir>`.** Mutation subcommands with a `-C` target outside the
 //!   root are rejected; read subcommands (`status`/`log`/`diff`/`show`/
 //!   `branch`/`fetch`) are exempt so `git -C <outside> status` stays usable as
@@ -48,7 +55,23 @@
 //! the shell directory stack (`popd` restore targets) is not tracked; quoted
 //! content that *looks* like a redirect/path (e.g. `echo "a > /outside"`) is
 //! treated conservatively (may block); short-flag bundles (`sed -in`) count as
-//! in-place writes via prefix matching, so they are not exempt.
+//! in-place writes via prefix matching, so they are not exempt. Three more,
+//! all fail-closed or read-side only:
+//!
+//! - **`$HOME`-as-literal asymmetry.** `$`/backtick tokens are rejected only
+//!   where the scan can see them (target positions and mutating segments); as
+//!   a plain argument of a read-only verb (`echo $HOME`, `cat $HOME/notes`)
+//!   the token passes as an inert literal, so the shell's expansion is seen
+//!   where `~/notes` would have been contained — the read side accepts what a
+//!   target position would reject.
+//! - **`~+`/`~-` over-block.** The `~user` tilde rejection also catches the
+//!   shell's `~+`/`~-` directory-stack forms; they expand to entries of the
+//!   untracked directory stack, so they are rejected without execution
+//!   (over-block, fail-closed).
+//! - **Heredoc bodies unscanned as heredocs.** `<<EOF … EOF` bodies are
+//!   flattened into ordinary tokens; delimiters and body semantics are not
+//!   modeled, so a body line that looks like a path/redirect is scanned as
+//!   one (may conservatively block) and no delimiter validation occurs.
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use concerto_core::ToolError;
@@ -71,6 +94,18 @@ const READ_ONLY_VERBS: &[&str] = &[
 /// marker per the ADR-55 v1 contract.
 const INPLACE_WRITE_FLAGS: &[(&str, &[&str])] =
     &[("sed", &["-i", "--in-place"]), ("grep", &["-w"]), ("awk", &["-i", "--in-place", "-w"])];
+
+/// awk program-text execution primitives (2026-09-15, tight set; mirrored in
+/// core's `AWK_EXEC_PRIMITIVES`, `crates/core/src/authorization.rs`). An
+/// `awk` invocation whose program text carries any of these executes code no
+/// token scan can see into, so the invocation demotes from read-only:
+/// `system("cmd")` (shell-out builtin), `"cmd" | getline` / `|getline` (the
+/// shell runs the left side), `|&` (coprocess), and `print … | "cmd"` /
+/// `print|"cmd"` (the quoted command is executed). Conservative: a program
+/// that merely prints such a literal loses its read-only exemption (a
+/// rejection at most). `awk -f` script-file bodies remain invisible
+/// (documented residual).
+const AWK_EXEC_PRIMITIVES: &[&str] = &["system(", "|&", "|getline", "| getline", "| \"", "|\""];
 
 /// Write-redirect operators whose target is contained regardless of the verb.
 const WRITE_REDIRECT_OPERATORS: &[&str] = &[">", ">>", "2>", "2>>", "&>", "&>>", ">|"];
@@ -139,6 +174,16 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
     if !READ_ONLY_VERBS.contains(&verb) {
         return false;
     }
+    // Interpreter program bodies (2026-09-15): an `awk`/`sed` invocation
+    // whose program text carries code-execution primitives (`awk`'s
+    // `system()`/shell-pipe forms, `sed`'s `s///e` flag or standalone `e`
+    // command) is NOT read-only — the exemption must not free its tokens.
+    // Plain `awk '{print $1}'` / `sed 's/a/b/'` match no primitive and keep
+    // the exemption. Mirror of core's tier check
+    // (`is_read_only_verb_invocation` for Observe): only ever demotes.
+    if interpreter_program_executes(verb, trailing) {
+        return false;
+    }
     let Some(write_flags) = INPLACE_WRITE_FLAGS.iter().find(|(v, _)| *v == verb) else {
         return true;
     };
@@ -152,13 +197,100 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
     })
 }
 
+/// Whether an `awk`/`sed` invocation's trailing tokens (its program text, or
+/// arguments carrying it) contain code-execution primitives. A bounded,
+/// conservative scan — NOT an awk/sed parser; mirror of core's
+/// [`interpreter_program_executes`-analog in `authorization.rs`]
+/// (`interpreter_program_executes`):
+///
+/// - `awk`: any trailing token carrying an [`AWK_EXEC_PRIMITIVES`] member.
+/// - `sed`: the `s///e` execute flag and the standalone `e` command
+///   ([`sed_program_executes`] — bounded delimiter walk).
+///
+/// A false positive costs the read-only exemption (a rejection at most); it
+/// can only ever NARROW the exemption, never widen it.
+fn interpreter_program_executes(verb: &str, trailing: &[String]) -> bool {
+    match verb {
+        "awk" => trailing
+            .iter()
+            .any(|token| AWK_EXEC_PRIMITIVES.iter().any(|primitive| token.contains(primitive))),
+        "sed" => trailing.iter().any(|token| sed_program_executes(token)),
+        _ => false,
+    }
+}
+
+/// Whether a `sed` program text executes shell code (2026-09-15, tight set):
+/// the `s///e` flag (the replacement runs as a shell command) and the
+/// standalone `e` command (`sed 'e'`, `sed 's/x/y/;e ls'`). Bounded walk in
+/// [`sed_substitute_e_flag`]; the standalone command is detected on
+/// `;`/newline chunks whose first character is `e` followed by end/space/tab.
+fn sed_program_executes(script: &str) -> bool {
+    sed_substitute_e_flag(script) || sed_standalone_exec_command(script)
+}
+
+/// Bounded `s<delim>…<delim>…<delim><flags>` walk: returns whether ANY
+/// substitute command's flag run contains the `e` flag. A word containing
+/// `s<delim>` may be misread as a substitute command (over-block only).
+fn sed_substitute_e_flag(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let Some(&delim) = chars.get(i + 1) else {
+            break;
+        };
+        if c != 's' || delim.is_alphanumeric() {
+            continue;
+        }
+        // The delimiter at i+1 is occurrence one; the next two occurrences
+        // bound pattern and replacement.
+        let mut seen = 1usize;
+        for (j, &c2) in chars.iter().enumerate().skip(i + 2) {
+            if c2 != delim {
+                continue;
+            }
+            seen += 1;
+            if seen != 3 {
+                continue;
+            }
+            // Flag run: characters after the third delimiter until a
+            // whitespace/separator boundary; `e` there is the execute flag.
+            if chars.get(j + 1..).is_some_and(|tail| {
+                tail.iter()
+                    .copied()
+                    .take_while(|c2| {
+                        !c2.is_whitespace() && !matches!(c2, ';' | '\n' | '\r' | '&' | '|')
+                    })
+                    .any(|c2| c2 == 'e')
+            }) {
+                return true;
+            }
+            // One flag run per substitute command; keep scanning for the
+            // NEXT `s<delim>` command.
+            break;
+        }
+    }
+    false
+}
+
+/// Bounded standalone-`e`-command walk: `;`/newline-separated chunks whose
+/// first character is `e` followed by end/space/tab execute code.
+fn sed_standalone_exec_command(script: &str) -> bool {
+    script.split([';', '\n', '\r']).any(|chunk| {
+        let chunk = chunk.trim_start();
+        chunk.starts_with('e') && (chunk.len() == 1 || chunk[1..].starts_with([' ', '\t']))
+    })
+}
+
 /// Flatten command + args into whitespace-separated tokens with surrounding
 /// shell quotes stripped, mirroring the denylist's flattened-string scan.
+/// Newline/CR list separators (ADR-55 shell lists: `a\nb` sequences the shell
+/// as two commands) cannot survive whitespace tokenization, so they are
+/// translated into explicit `;` separator tokens that [`list_segments`] can
+/// split on — a quoted multi-line body conservatively gains the separator too.
 fn flat_tokens(command: &str, args: &[String]) -> Vec<String> {
-    let mut flat = command.to_string();
+    let mut flat = command.replace(['\n', '\r'], " ; ");
     for arg in args {
         flat.push(' ');
-        flat.push_str(arg);
+        flat.push_str(&arg.replace(['\n', '\r'], " ; "));
     }
     flat.split_whitespace()
         .filter(|token| !token.is_empty())
@@ -221,6 +353,17 @@ pub(crate) fn msys_drive_to_windows(target: &str) -> Option<String> {
     out.push_str(&rest[letter.len_utf8()..]);
     Some(out)
 }
+
+/// Interpolation metacharacters that make a path target unresolvable at scan
+/// time: the shell expands `$`/backtick substitutions against its own
+/// environment, so the running command's real target is NOT the literal the
+/// scanner anchors (`tee $HOME/x` scans as an in-root relative literal while
+/// the shell writes to the real home — the `$HOME`-spelling asymmetry with
+/// `~/x`, which is expanded and contained). Mirrors the `$`/backtick members
+/// of [`SHELL_INTERPOLATION_CHARS`] (core authorization, tier classifier);
+/// `%`/quote chars stay with the tier classifier (quotes are already stripped
+/// per-token by `flat_tokens`).
+const INTERPOLATION_TARGET_CHARS: &[char] = &['$', '`'];
 
 /// Canonical form of the containment trust anchor.
 fn canonical_root(root: &Utf8Path) -> Result<Utf8PathBuf, ToolError> {
@@ -288,6 +431,36 @@ fn strip_trailing_command_punct(token: &str) -> &str {
 /// components) so new in-root files stay reachable without letting `..`/
 /// symlink tricks climb above the root.
 fn resolve_within(root: &Utf8Path, cwd: &Utf8Path, target: &str) -> Result<Utf8PathBuf, ToolError> {
+    // An interpolation-carrying target is unresolvable, not in-root: the
+    // shell expands the metacharacters after containment returns, so the
+    // lexical candidate is a lie. Reject without execution (2026-09-11: the
+    // `$HOME`-spelling asymmetry — `~/x` expands and is contained, `$HOME/x`
+    // scanned as a harmless relative literal). `/dev/null`-style devices
+    // below cannot contain these characters, so order is immaterial.
+    if target.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)) {
+        return Err(ToolError::VirtualFsConflict {
+            path: Utf8PathBuf::from(target),
+            reason: "shell containment (ADR-55): target contains shell-interpolation \
+                     metacharacters ('$' or '`'); the path the shell resolves cannot \
+                     be scanned and the command is rejected without execution"
+                .into(),
+        });
+    }
+    // A `~user` tilde form (`~root`, `~root/x`) expands in the shell to that
+    // user's home directory — NOT the in-root relative literal
+    // [`build_candidate`] would scan it as. Only the exact `~` (own home)
+    // and `~/...` forms are resolvable here; every other `~`-prefixed target
+    // is rejected without execution (2026-09-11: `~root/x` scanned as an
+    // in-root literal while bash resolved `/root/x`).
+    if target.starts_with('~') && target != "~" && !target.starts_with("~/") {
+        return Err(ToolError::VirtualFsConflict {
+            path: Utf8PathBuf::from(target),
+            reason: "shell containment (ADR-55): '~user' tilde form expands to \
+                     another user's home directory outside the project root; \
+                     command rejected without execution"
+                .into(),
+        });
+    }
     // `/dev/null` and the Windows reserved device names (`nul`, `con`, `prn`,
     // `aux`, `com1`..`com9`, `lpt1`..`lpt9`) are devices, not confined files:
     // canonicalization and root-prefix checks cannot meaningfully confine
@@ -461,6 +634,27 @@ fn scan_directory_changes(
 /// Scan for write-redirect targets (`> file`, `>> file`, `2> file`, `&> file`,
 /// and glued forms) that resolve outside the project root. The block applies
 /// regardless of the verb: a read-only verb must not write outside the root.
+/// Input-redirect (`< file`, glued `<file`) targets are checked the same way
+/// (Finding C): reading from outside the root is the same scope escape —
+/// `cat </etc/passwd` must not bypass containment just because `cat` is a
+/// read-only verb. A glued token carrying BOTH operators (`2>&1</etc/passwd`)
+/// resolves each operator's suffix independently (N-…: the write branch's
+/// `continue` used to consume the whole token and the input target never got
+/// resolved). A token gluing SEVERAL redirect operators (F-B 2026-09-14:
+/// `echo hi 2>/etc/passwd>&2` resolved only the `rfind('>')`/`find('<')`
+/// extremes) resolves every `>`/`<` occurrence's suffix so no mid-token
+/// target slips past the boundary operators.
+fn resolve_glued_suffix(root: &Utf8Path, cwd: &Utf8Path, suffix: &str) -> Result<(), ToolError> {
+    let after = suffix.trim_matches(|c| c == '\'' || c == '"');
+    let after = strip_trailing_command_punct(after);
+    if !after.is_empty()
+        && (is_path_like(after) || after.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)))
+    {
+        resolve_within(root, cwd, after)?;
+    }
+    Ok(())
+}
+
 fn scan_redirects(
     root: &Utf8Path,
     cwd: &Utf8Path,
@@ -475,13 +669,41 @@ fn scan_redirects(
             }
             continue;
         }
-        // Operator glued to its target: `2>/tmp/x`, `>file`.
-        if let Some(idx) = token.rfind('>') {
-            let after = token[idx + 1..].trim_matches(|c| c == '\'' || c == '"');
-            let after = strip_trailing_command_punct(after);
-            if !after.is_empty() && is_path_like(after) {
-                resolve_within(root, cwd, after)?;
+        // Input-redirect operator (`< file`): the target is read, but from
+        // outside the root it is still an escape.
+        if token == "<" {
+            if let Some(target) = tokens.get(i + 1) {
+                resolve_within(root, cwd, strip_trailing_command_punct(target))?;
+                exempt.insert(i + 1);
             }
+            continue;
+        }
+        // Operator glued to its target: `2>/tmp/x`, `>file`, `</etc/passwd`.
+        // Interpolation-carrying glue (`>$HOME`, `>$(cmd)`, `>$VAR`) must flow
+        // into `resolve_within` too (2026-09-11: `$`/backtick targets are not
+        // path-like, so a read-only segment lead exempted them downstream and
+        // the shell expanded the write target out-of-root). `2>&1`/`>&2`
+        // remainders carry neither metacharacter and stay passable.
+        //
+        // EVERY `>`/`<` occurrence resolves its own suffix, bounded by the next
+        // operator occurrence (or token end): extremes like `rfind('>')` see
+        // only the LAST write operand, so `2>/etc/passwd>&2` resolved only the
+        // fd-dup remainder and the earlier redirect target hid in the middle.
+        // A token may also glue BOTH operator kinds (`2>&1</etc/passwd`); with
+        // per-occurrence resolution each suffix is bounded by the next `>`/`<`
+        // automatically, so the write suffix (`&1`) is not misread as a path
+        // and the input target cannot hide behind the write branch's
+        // `continue`.
+        let op_positions: Vec<usize> = token
+            .char_indices()
+            .filter_map(|(i, c)| ((c == '>') || (c == '<')).then_some(i))
+            .collect();
+        if !op_positions.is_empty() {
+            for (k, pos) in op_positions.iter().enumerate() {
+                let end = op_positions.get(k + 1).copied().unwrap_or(token.len());
+                resolve_glued_suffix(root, cwd, &token[pos + 1..end])?;
+            }
+            continue;
         }
     }
     Ok(())
@@ -560,24 +782,277 @@ fn scan_git_change_dir(
     Ok(())
 }
 
-/// General path-argument containment: for mutation-capable verbs, any
-/// path-like token that resolves outside the project root rejects the command.
-/// Read-only verbs are exempt entirely.
+/// A list segment of the flattened token list: the content sections (each a
+/// flattened-token index plus its pre-boundary character content) the shell
+/// will sequence as one command, plus the segment's leading verb when one is
+/// known. Every shell list separator ends the current segment — standalone
+/// (`|`, `&&`, `||`, `;`) or glued inside a token (`/;`, `ls&&rm`); a
+/// non-empty post-glue section (`ls|tee` → `tee`) becomes the next segment's
+/// leading verb, so the first token after the boundary is governed by the
+/// running executable the shell actually resolves there.
+struct ListSegment {
+    sections: Vec<(usize, String)>,
+    lead: Option<String>,
+}
+
+/// Width (in characters) of the shell operator at `bytes[pos..]`, or `0` when
+/// that position starts no separator. Operator-aware exactly like the tier
+/// classifier's [`SHELL_SEGMENT_SEPARATORS`] split: glued `&&`/`||` are ONE
+/// boundary (`a||cat /etc/os-release` must not yield a bogus `|`-prefixed
+/// lead that misclassifies a legitimate fallback), while a lone `|` is the
+/// pipe and single `&`/`;`/`\n`/`\r` are plain list separators.
+fn separator_width(s: &str, pos: usize) -> usize {
+    let bytes = s.as_bytes();
+    match bytes[pos] {
+        b'&' if bytes.get(pos + 1) == Some(&b'&') => 2,
+        b'|' if bytes.get(pos + 1) == Some(&b'|') => 2,
+        b'&' | b'|' | b';' | b'\n' | b'\r' => 1,
+        _ => 0,
+    }
+}
+
+/// Split one flattened token into [`ListSegment`] content sections: alternating
+/// non-separator content (carrying the token's index) and separator runs
+/// (`None`), with `&&`/`||` kept as single boundaries.
+fn token_sections(index: usize, token: &str) -> Vec<Option<(usize, String)>> {
+    let mut sections = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = token[cursor..].find(['&', '|', ';', '\n', '\r']) {
+        let pos = cursor + rel;
+        let head = &token[cursor..pos];
+        if !head.is_empty() {
+            sections.push(Some((index, head.to_string())));
+        }
+        let width = separator_width(token, pos);
+        sections.push(None);
+        cursor = pos + width;
+    }
+    let tail = &token[cursor..];
+    if !tail.is_empty() {
+        sections.push(Some((index, tail.to_string())));
+    }
+    sections
+}
+
+/// Split the flattened token list into [`ListSegment`]s, modeling command
+/// lists the way the shell will sequence them: on every separator —
+/// `&`, `|`, `;`, `\n`, `\r` — standalone, glued inside a token, or trailing a
+/// token, with glued `&&`/`||` recognized as single boundaries. Segments that
+/// contain no content sections are skipped. This mirrors the tier classifier's
+/// segment split (`authorization.rs command_segments`) so a read-only leading
+/// verb exempts only its own list segment: `ls /; rm /etc/shadow` and
+/// `ls / && rm -f ~/…` cannot launder the mutating segment behind `ls`'s
+/// read-only tier.
+fn list_segments(tokens: &[String]) -> Vec<ListSegment> {
+    let mut segments = Vec::new();
+    let mut current: Option<ListSegment> = None;
+    for (index, token) in tokens.iter().enumerate() {
+        for section in token_sections(index, token) {
+            match section {
+                None => {
+                    if let Some(segment) = current.take() {
+                        segments.push(segment);
+                    }
+                }
+                Some(section) => {
+                    let segment = current
+                        .get_or_insert_with(|| ListSegment { sections: Vec::new(), lead: None });
+                    segment.sections.push(section.clone());
+                    if segment.lead.is_none() {
+                        segment.lead = Some(section.1);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(segment) = current {
+        segments.push(segment);
+    }
+    segments
+}
+
+/// Whether `lead` names the `xargs` utility (2026-09-15 sweep). Three
+/// obfuscations used to defeat the exact-basename match, all fail-closed
+/// over:
+///
+/// - **Glued redirect inside the same token** (`xargs>f`, `'xargs'>f`): the
+///   content section carries `xargs` between redirect operators, so the
+///   section text is split on `>`/`<` and every piece's basename is tested.
+/// - **Quote-concatenation** (`x''args`, `x""args`): the shell joins the
+///   quoted fragments into one word, so quote characters are stripped before
+///   the basename compare.
+/// - **Backslash-escape** (`x\args`): `\a` expands to `a`, so backslashes are
+///   stripped the same way.
+///
+/// Only this detection path normalizes — general tokenization
+/// (`flat_tokens`) and the redirect scans are untouched, so legitimately
+/// quoted arguments elsewhere keep their original pass/block behavior. Path
+/// forms route through the same compare (`/usr/bin/xargs`, `./xargs`).
+/// Conservative over-triggers cost a rejection at most: any path component
+/// spelled `xargs` (e.g. `rm /root/xargs/backup`) arms the pipeline-wide
+/// suspicion, never grants anything.
+fn is_xargs_lead(section: &str) -> bool {
+    let normalized: String = section.replace(['\'', '"', '\\'], "");
+    normalized.split(['>', '<', '/']).any(|piece| piece == "xargs")
+}
+
+/// N-4 (2026-09-14): `xargs` consumes the WHOLE pipeline's stdout as argv
+/// elements for its command, so a read-exempt token in ANY segment becomes an
+/// argument of the `xargs` segment after containment returns — `echo
+/// /etc/shadow | xargs rm` passed because the read-only `echo` segment exempt
+/// `/etc/shadow` from the general path scan. When any list segment's lead is
+/// `xargs`, the per-segment read-only exemption is unsound: every path-like
+/// or interpolation-carrying token in the WHOLE pipeline must resolve in-root
+/// (fail-closed). Tokens owned by dedicated rules (`cd` targets, redirect
+/// targets, git `-C` values) stay exempt — those scans ran first and own
+/// their containment.
+///
+/// Wrapper-prefixed forms (F-A 2026-09-14: `env xargs rm`, `nohup xargs`,
+/// `timeout 10 xargs`) do not place `xargs` at the segment lead, so the
+/// lead-based gate misses them. The read-only exemption is instead suspended
+/// pipeline-wide from `scan_path_arguments`: an `xargs` basename appearing in
+/// ANY content section arms it, unless the WHOLE pipeline is read-only (then
+/// nothing can mutate and the exemption is harmless).
+fn scan_xargs_pipeline(
+    root: &Utf8Path,
+    cwd: &Utf8Path,
+    tokens: &[String],
+    exempt: &HashSet<usize>,
+) -> Result<(), ToolError> {
+    let feeds_xargs = list_segments(tokens)
+        .iter()
+        .any(|segment| segment.lead.as_deref().is_some_and(is_xargs_lead));
+    if !feeds_xargs {
+        return Ok(());
+    }
+    for (index, token) in tokens.iter().enumerate() {
+        if exempt.contains(&index) {
+            continue;
+        }
+        let stripped = strip_trailing_command_punct(token);
+        if is_path_like(stripped)
+            || stripped.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c))
+        {
+            resolve_within(root, cwd, stripped)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether any `>(`/`<(` inside `token` opens a process substitution whose
+/// inner command contains a non-read-only verb (2026-09-15, bounded minimal
+/// fallback — not a recursive re-parse): the inner text is bounded by the
+/// NEXT `)` inside the token (or the token end when the argv spans tokens),
+/// split on the separator set, and every inner segment chunk's LEAD must be
+/// a [`READ_ONLY_VERBS`] member. `>(tee out`)` trips (tee writes); `<(grep
+/// root /etc/os-release)` passes (read-only inner). Conservative: a
+/// chunk-lead not in the table (`env cmd`) already triggers — cost at most
+/// a rejection; only ever narrows.
+fn process_substitution_mutates(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    for pos in 0..token.len().saturating_sub(1) {
+        if (bytes[pos] != b'>' && bytes[pos] != b'<') || bytes[pos + 1] != b'(' {
+            continue;
+        }
+        let inner_end = token[pos + 2..].find(')').map(|rel| pos + 2 + rel).unwrap_or(token.len());
+        let inner = &token[pos + 2..inner_end];
+        for chunk in inner.split(['|', '&', ';']) {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+            let lead = chunk.split_whitespace().next().unwrap_or(chunk);
+            if !READ_ONLY_VERBS.contains(&lead) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// General path-argument containment: for mutation-capable leads, any
+/// path-like token that resolves outside the project root rejects the
+/// command. The exemption is PER LIST SEGMENT: a read-only leading verb
+/// exempts only its own segment's tokens — a later `tee`/mutating segment in
+/// a pipe (`cat f | tee /tmp/x`) is a self-contained mutation and must have
+/// its targets contained like any other write.
+///
+/// A glued token may carry content sections of SEVERAL segments (`cat a||rm
+/// x` → sections `a` and the tail); a token is read-only-exempt only when
+/// EVERY content section it carries belongs to a read-only segment — any
+/// mutating section on the same token disables the exemption for the whole
+/// token (conservative: a false positive only costs a rejection).
 fn scan_path_arguments(
     root: &Utf8Path,
     cwd: &Utf8Path,
     tokens: &[String],
     exempt: &HashSet<usize>,
 ) -> Result<(), ToolError> {
-    let verb = &tokens[0];
-    if is_read_only(verb, &tokens[1..]) {
-        return Ok(());
+    // Per original token: how many content sections cover it, and whether all
+    // covering segments are read-only. A token with zero content sections
+    // (pure separator) stays out of the general scan.
+    let segments = list_segments(tokens);
+    let mut section_count = vec![0u32; tokens.len()];
+    let mut all_read_only = vec![true; tokens.len()];
+    let mut fully_read_only = true;
+    for segment in &segments {
+        let lead = segment.lead.clone().unwrap_or_default();
+        // A segment's trailing tokens for write-flag detection: the flattened
+        // tokens carrying this segment's content (the lead's own token
+        // included only when it is not the lead itself).
+        let trailing: Vec<String> =
+            segment.sections.iter().skip(1).map(|(index, _)| tokens[*index].clone()).collect();
+        let read_only = is_read_only(&lead, &trailing);
+        fully_read_only = fully_read_only && read_only;
+        for (index, _) in &segment.sections {
+            section_count[*index] += 1;
+            if !read_only {
+                all_read_only[*index] = false;
+            }
+        }
+    }
+    // F-A (2026-09-14): `xargs` behind a wrapper (`env xargs rm`, `nice xargs`,
+    // `sh -c 'xargs rm'`) is not a segment lead, and its segment is fed the
+    // whole pipeline's stdout as argv — so ANY `xargs` basename in any content
+    // section distrusts the read-only exemption, unless the entire pipeline is
+    // read-only (nothing to exempt against). Fail-closed: a false trigger only
+    // costs a rejection.
+    let xargs_anywhere = segments
+        .iter()
+        .any(|segment| segment.sections.iter().any(|(_, section)| is_xargs_lead(section)));
+    if xargs_anywhere && !fully_read_only {
+        for flag in all_read_only.iter_mut() {
+            *flag = false;
+        }
+    }
+    // Process substitution (2026-09-15): `>(…)`/`<(…)` bodies execute as
+    // commands whose flattened-token argv containment cannot cleanly
+    // reassemble (`echo hi >(rm ~/x)` used to pass inside the read-only
+    // `echo` segment exemption — the inner `rm ~/x` argv spans the tokens
+    // after the paren). A mutating inner verb suspends the exemption
+    // pipeline-wide (same fail-closed shape as the `xargs` arm): a trigger
+    // only ever NARROWS the exemption, never widens it. No
+    // `fully_read_only` gate: the inner mutating command IS the pipeline's
+    // mutation, in whatever token the shell ate it.
+    if tokens.iter().any(|token| process_substitution_mutates(token)) {
+        for flag in all_read_only.iter_mut() {
+            *flag = false;
+        }
     }
     for (i, token) in tokens.iter().enumerate() {
-        if exempt.contains(&i) || i == 0 {
+        if exempt.contains(&i) || i == 0 || section_count[i] == 0 {
             continue;
         }
-        if is_path_like(token) {
+        if all_read_only[i] {
+            continue;
+        }
+        // An interpolation-carrying token (`$HOME`, a backtick form) is not
+        // necessarily path-like — `$HOME` has no `/`/`.`/`~`/`\` — so the
+        // path-shape gate alone would skip it and the shell would expand it
+        // out-of-root after containment returned (2026-09-11: `rm -rf $HOME`,
+        // `mv f $HOME`, `tee >(rm -rf $HOME)`). Flow it into `resolve_within`,
+        // whose interpolation rule rejects it without execution.
+        if is_path_like(token) || token.chars().any(|c| INTERPOLATION_TARGET_CHARS.contains(&c)) {
             resolve_within(root, cwd, strip_trailing_command_punct(token))?;
         }
     }
@@ -617,6 +1092,7 @@ pub(crate) fn contain_shell_command(
     scan_directory_changes(root, &cwd, &tokens, &mut exempt)?;
     scan_redirects(root, &cwd, &tokens, &mut exempt)?;
     scan_git_change_dir(root, &cwd, &tokens, &mut exempt)?;
+    scan_xargs_pipeline(root, &cwd, &tokens, &exempt)?;
     scan_path_arguments(root, &cwd, &tokens, &exempt)
 }
 
@@ -720,6 +1196,132 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn interpolation_metachar_targets_are_unresolvable() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // The `$HOME`-spelling asymmetry (2026-09-11): `$HOME/x` scanned as an
+        // in-root relative literal while the shell expands it to the real
+        // home (the same as `~/x`, which containment blocks). Targets carrying
+        // `$` / a backtick are UNRESOLVABLE at scan time → reject.
+        for command in ["tee $HOME/x", "cat f > $HOME/x", ">$HOME/x", "cat f >> $(pwd)/x"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated target, got: {err}"
+            );
+        }
+        // The backtick-substituted form rejects like `$HOME`.
+        let err = contain_shell_command(&root, &root, "tee", &["`pwd`/x".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("shell-interpolation"),
+            "backtick target must reject, got: {err}"
+        );
+        // Plain in-root relative targets keep passing — no over-block.
+        contain_shell_command(&root, &root, "tee out.txt", &[]).expect("in-root tee allowed");
+        contain_shell_command(&root, &root, "cat f > out.txt", &[]).expect("in-root > allowed");
+        contain_shell_command(&root, &root, "cat f > sub/out.txt", &[])
+            .expect("in-root subdir > allowed");
+    }
+
+    #[test]
+    fn interpolation_token_in_mutating_segment_rejected_even_without_path_shape() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // N-1 (2026-09-11): `$HOME` carries no `/`/`.`/`~`/`\`, so it is not
+        // path-like and previously skipped the general path scan entirely —
+        // `rm -rf $HOME` passed containment and executed out-of-root on
+        // approval. Any `$`/backtick token in a mutating segment must reject.
+        for command in ["rm -rf $HOME", "mv f $HOME", "tee >(rm -rf $HOME)"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated target, got: {err}"
+            );
+        }
+        // The `$`-free in-root forms keep working — no over-block.
+        contain_shell_command(&root, &root, "rm -rf subdir", &[]).expect("in-root rm allowed");
+        contain_shell_command(&root, &root, "mv f out", &[]).expect("in-root mv allowed");
+        contain_shell_command(&root, &root, "tee >(rm -rf subdir)", &[])
+            .expect("in-root process substitution allowed");
+        // Read-only verbs keep their exemption: `echo $HOME` only prints.
+        contain_shell_command(&root, &root, "echo $HOME", &[]).expect("read-only echo allowed");
+    }
+
+    #[test]
+    fn glued_redirect_interpolated_targets_rejected_under_read_only_lead() {
+        let (root, _dir) = temp_root();
+        // HIGH-sibling (2026-09-11): a glued redirect target carrying `$`/a
+        // backtick is not path-like, so the glued-branch gate skipped it and a
+        // read-only segment lead (`echo`, `cat`) exempted the token downstream
+        // — the shell then expanded the write target out-of-root. Every
+        // interpolated glued write target must reject via `resolve_within`.
+        for command in [
+            "echo x >$HOME",
+            "echo x >$(echo /tmp/pwned)",
+            "FOO=/tmp/x; echo hi >$FOO",
+            "echo x >`/tmp/x`",
+            "FOO=/tmp/x; echo hi <`$FOO`",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("shell-interpolation"),
+                "'{command}' must reject the interpolated redirect target, got: {err}"
+            );
+        }
+        // Spaced forms were already contained via the standalone branch and
+        // stay rejected.
+        assert!(
+            contain_shell_command(&root, &root, "echo x > /tmp/y", &[]).is_err(),
+            "spaced outside-root redirect must stay rejected"
+        );
+        // A glued bare in-root name without interpolation keeps working.
+        contain_shell_command(&root, &root, "cat f >out", &[])
+            .expect("glued in-root bare redirect target allowed");
+        contain_shell_command(&root, &root, "cat f <in", &[])
+            .expect("glued in-root bare input target allowed");
+        // `2>&1`/`>&2` remainders and a glued extension-bearing name stay
+        // passable — no metadata characters, resolved as in-root literals.
+        contain_shell_command(&root, &root, "echo hi 2>&1", &[])
+            .expect("glued 2>&1 remainder allowed");
+        contain_shell_command(&root, &root, "echo hi >&2", &[])
+            .expect("glued >&2 remainder allowed");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("glued 2>err.log behavior unchanged");
+    }
+
+    #[test]
+    fn tilde_user_form_rejected_own_home_forms_unchanged() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // N-3 (2026-09-11): `~root/x` is not `~`/`~/…`, so `build_candidate`
+        // scanned it as the in-root relative literal `<root>/~root/x` while
+        // bash expands it to `/root/x` — an unanchored escape. Every
+        // `~`-prefixed target other than exactly `~` or `~/…` must reject.
+        for command in ["mv f ~root/", "cat f > ~root/x", "rm -rf ~root", "cd ~root"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("~root"),
+                "'{command}' must reject the tilde-user target, got: {err}"
+            );
+        }
+        // The resolvable tilde forms keep their existing behavior: `~` and
+        // `~/x` expand to the (out-of-root) home and are rejected by the
+        // ordinary outside-root rule — NOT by the new tilde-user rule.
+        for target in ["~", "~/x"] {
+            let err = resolve_within(&root, &root, target).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{target}' must still reject as outside-root, got: {err}"
+            );
+        }
+        // Plain relative targets are untouched.
+        contain_shell_command(&root, &root, "mv f out", &[]).expect("plain relative allowed");
+        contain_shell_command(&root, &root, "mv f ./out", &[]).expect("dot-relative allowed");
+        contain_shell_command(&root, &root, "mv f sub/out", &[]).expect("subdir target allowed");
+        let _ = dir;
+    }
+
+    #[test]
     fn read_only_verb_outside_absolute_allowed() {
         let (root, _dir) = temp_root();
         // `cat /etc/os-release` is a legitimate diagnostic.
@@ -791,6 +1393,81 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn awk_sed_program_bodies_lift_read_only_exemption() {
+        let (root, _dir) = temp_root();
+        // 2026-09-15: awk/sed program bodies execute code no token scan can
+        // see into (`system()`, pipes into getline, `s///e`, standalone `e`),
+        // so their invocations must NOT keep the read-only exemption — an
+        // out-of-root path argument is resolved like any mutating segment.
+        for command in [
+            "awk '{system(\"rm /etc/hosts\")}' /etc/passwd",
+            "awk '{cmd | getline}' /etc/hosts",
+            "awk '{cmd|& getline}' /etc/hosts",
+            "sed 's/x/y/e' /etc/hosts",
+            "sed 's/x/y/;e cat /etc/hosts' f",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: executing program body lifts the exemption, got: {err}"
+            );
+        }
+        // In-root versions of the same bodies stay passable (paths resolve).
+        contain_shell_command(&root, &root, "awk '{system(\"rm notes.txt\")}' notes.txt", &[])
+            .expect("in-root awk system body allowed");
+        contain_shell_command(&root, &root, "sed 's/x/y/e' notes.txt", &[])
+            .expect("in-root sed s///e allowed");
+        // Preserved pins: plain program bodies keep the read-only exemption
+        // (including against absolute read targets).
+        contain_shell_command(&root, &root, "awk '{print $1}' /etc/os-release", &[])
+            .expect("plain awk '{print $1}' stays free");
+        contain_shell_command(&root, &root, "awk -F: '{print $NF}' /etc/os-release", &[])
+            .expect("plain awk with field flags stays free");
+        contain_shell_command(&root, &root, "sed 's/a/b/' /etc/hosts", &[])
+            .expect("plain sed stays free");
+        contain_shell_command(&root, &root, "sed 's/x/y/I' /etc/hosts", &[])
+            .expect("sed with other flags (I) stays free");
+        // Documented residual: the `-f`/`--file` script-file bodies stay
+        // invisible to this scan; the flag path is unchanged.
+        contain_shell_command(&root, &root, "awk", &["-f".into(), "s.awk".into(), "f".into()])
+            .expect("awk -f path shape unchanged (script bodies remain a residual)");
+    }
+
+    #[test]
+    fn process_substitution_mutating_inner_resolves_inner_argv() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15 (bounded minimal fallback): the shell executes the
+        // `>(…)`/`<(…)` body as a command whose argv spans the tokens after
+        // the paren; the read-only `echo` segment used to exempt them all.
+        // A mutating inner verb suspends the exemption pipeline-wide, so the
+        // inner argv resolves like any mutating segment's targets.
+        for command in [
+            "echo hi >(rm /etc/shadow)",
+            "echo hi <(rm /etc/shadow)",
+            "echo hi >(rm /etc/shadow extra)",
+            "echo hi | xargs <(rm /etc/shadow)",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: mutating process substitution content, got: {err}"
+            );
+        }
+        // In-root mutating inner content stays passable, and read-only inner
+        // verbs (including readers of outside files, like `cat` itself) keep
+        // their exemption.
+        contain_shell_command(&root, &root, "echo hi >(rm -rf notes.txt)", &[])
+            .expect("in-root process substitution allowed");
+        contain_shell_command(&root, &root, "echo hi <(wc -l notes.txt)", &[])
+            .expect("read-only inner command stays free");
+        contain_shell_command(&root, &root, "cat <(grep root /etc/os-release) | head", &[])
+            .expect("cat reading a read-only substitution stays free");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("bare > redirect untouched by the substitution check");
+    }
+
     // -----------------------------------------------------------------------
     // Redirect writes.
     // -----------------------------------------------------------------------
@@ -820,6 +1497,355 @@ mod tests {
         // In-root redirect stays allowed.
         contain_shell_command(&root, &root, "cat", &[">".into(), "out.txt".into()])
             .expect("in-root redirect allowed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipe modeling and input redirects (F5, Finding C).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tee_pipe_target_outside_root_rejected() {
+        let (root, _dir) = temp_root();
+        // Read-only leading verb does not exempt a later tee segment: `cat`'s
+        // exemption must not launder the tee-segment's write target.
+        for command in [
+            "cat f | tee /tmp/out",
+            "cat f | tee ~/out",
+            "cat f|tee /tmp/out",
+            "ls | tee /tmp/out",
+            "cat secret | tee ../escape",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the tee target outside root, got: {err}"
+            );
+        }
+        // A tee-subcommand prefix (e.g. `tee -a`) is still a write.
+        assert!(
+            contain_shell_command(&root, &root, "cat f | tee -a /tmp/out", &[]).is_err(),
+            "tee -a with outside-root target must reject"
+        );
+    }
+
+    #[test]
+    fn read_only_pipe_stays_allowed_and_in_root_tee_allowed() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // Read-only chains keep working.
+        contain_shell_command(&root, &root, "cat f | grep x", &[]).expect("read pipe allowed");
+        contain_shell_command(&root, &root, "ls sub | head", &[]).expect("ls|head allowed");
+        contain_shell_command(&root, &root, "cat f", &[]).expect("plain cat allowed");
+        contain_shell_command(&root, &root, "cat f|grep x", &[]).expect("glued pipe allowed");
+        // In-root tee is allowed (existing path rules apply, not a new block).
+        contain_shell_command(&root, &root, "cat f | tee out.txt", &[])
+            .expect("in-root tee target allowed");
+        contain_shell_command(&root, &root, "cat f | tee sub/out.txt", &[])
+            .expect("in-root subdir tee target allowed");
+    }
+
+    #[test]
+    fn fallback_splitter_lets_legit_fallback_through() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // `||` (glued or spaced) is a boundary, not a pipe: the fallback
+        // segment keeps its own read-only lead and legitimate fallback reads
+        // stay allowed.
+        contain_shell_command(&root, &root, "cat a || cat /etc/os-release", &[])
+            .expect("spaced || fallback read allowed");
+        contain_shell_command(&root, &root, "cat f||cat /etc/os-release", &[])
+            .expect("glued || fallback read allowed");
+        // The bogus `|`-lead must not survive splitting; unit-check segments.
+        let segs = list_segments(&["cat".into(), "a||cat".into(), "/etc/os-release".into()]);
+        let leads: Vec<Option<&str>> = segs.iter().map(|s| s.lead.as_deref()).collect();
+        assert_eq!(leads, vec![Some("cat"), Some("cat")], "|| must not produce a `|` lead");
+        // A lone `|` in a chain of reads stays read-only (unchanged).
+        contain_shell_command(&root, &root, "cat f|grep x", &[]).expect("pipe read allowed");
+    }
+
+    #[test]
+    fn read_only_lead_cannot_exempt_later_list_segments() {
+        let (root, _dir) = temp_root();
+        // The read-only exemption is scoped per list segment: a mutating
+        // segment after `&`/`;`/`&&`/`||`/newline separators keeps scanning
+        // even when the FIRST segment's verb is read-only.
+        for command in [
+            "ls /; rm /etc/shadow",
+            "ls / && rm -f ~/.ssh/authorized_keys",
+            "ls /; rm -rf ../outside",
+            "ls /\nrm /etc/shadow",
+            "cat f & rm /etc/shadow",
+            "cat f||rm /etc/shadow",
+            "ls /&&rm -f ../outside",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the mutating later segment, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_segment_keeps_path_containment() {
+        let (root, dir) = temp_root();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // A mutating second segment keeps its own path args contained: the
+        // read-only exemption of `ls` does not cover `mkdir`'s targets.
+        assert!(
+            contain_shell_command(&root, &root, "ls | mkdir /tmp/pwned", &[]).is_err(),
+            "escaping mkdir segment after pipe must reject"
+        );
+        // In-root mutating segment stays allowed.
+        contain_shell_command(&root, &root, "ls sub | mkdir sub/newdir", &[])
+            .expect("in-root mkdir segment allowed");
+    }
+
+    #[test]
+    fn input_redirect_outside_root_rejected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // Finding C: `< /etc/passwd` reading outside the root is an escape.
+        for command in ["cat < /etc/passwd", "cat </etc/passwd", "wc -l < /etc/passwd"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the input-redirect target, got: {err}"
+            );
+        }
+        // In-root input redirects keep working.
+        contain_shell_command(&root, &root, "cat < f", &[]).expect("in-root < allowed");
+        contain_shell_command(&root, &root, "cat <f", &[]).expect("glued in-root < allowed");
+    }
+
+    // -----------------------------------------------------------------------
+    // xargs pipeline dataflow (N-4) and both-operator glued redirects.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn xargs_pipeline_requires_whole_pipeline_in_root() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // N-4: the read-only `echo` segment exempts `/etc/shadow` from the
+        // per-segment path scan, but `xargs` feeds the whole pipeline's stdout
+        // into `rm`'s argv — the read-exempt token is the mutating segment's
+        // argument after containment returns. Any `xargs` lead suspends the
+        // exemption pipeline-wide.
+        for command in [
+            "echo /etc/shadow | xargs rm",
+            "echo /etc/shadow|xargs rm",
+            "echo f | xargs rm /etc/shadow",
+            "echo /etc/shadow | xargs -0 rm",
+            "echo /etc/shadow | /usr/bin/xargs rm",
+            "ls | xargs rm ../escape",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the out-of-root token feeding xargs, got: {err}"
+            );
+        }
+        // Interpolation-carrying tokens flowing into xargs argv are
+        // unresolvable at scan time — same rule as mutating segments.
+        let err = contain_shell_command(&root, &root, "echo $HOME | xargs rm", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("shell-interpolation"),
+            "interpolated token feeding xargs must reject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn wrapper_prefixed_xargs_suspends_read_only_exemption() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // F-A (2026-09-14): the segment lead is the wrapper (`env`, `nice`,
+        // `nohup`, `timeout`, `stdbuf`, `command`, `sh -c`), not `xargs`, so
+        // the lead-based gate passed `echo /etc/shadow | env xargs rm`. The
+        // read-only exemption is suspended pipeline-wide whenever an `xargs`
+        // basename appears in ANY content section of a non-read-only
+        // pipeline.
+        for command in [
+            "echo /etc/shadow | env xargs rm",
+            "echo /etc/shadow | nice xargs rm",
+            "echo /etc/shadow | nohup xargs rm",
+            "echo /etc/shadow | timeout 10 xargs rm",
+            "echo /etc/shadow | stdbuf -o0 xargs rm",
+            "echo /etc/shadow | command xargs rm",
+            // Quoted wrapper body: flat tokens strip outer quotes, so the
+            // inner `xargs` token is visible.
+            "sh -c 'xargs rm /etc/shadow'",
+            "sh -c 'echo /etc/shadow | xargs rm'",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "wrapper-prefixed '{command}' must not launder the read-only exemption, got: {err}"
+            );
+        }
+        // A wrapper-led xargs segment without path-like tokens is not a new
+        // block — nothing to resolve.
+        contain_shell_command(&root, &root, "echo hi | env xargs grep hi", &[])
+            .expect("wrapper-prefixed xargs without path-like tokens allowed");
+        // An in-root wrapper pipeline keeps working.
+        contain_shell_command(&root, &root, "echo notes.txt | env xargs rm", &[])
+            .expect("in-root wrapper-prefixed xargs pipeline allowed");
+    }
+
+    #[test]
+    fn xargs_in_root_pipeline_and_non_xargs_reads_stay_free() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // In-root pipelines into xargs keep working (no new in-root block).
+        contain_shell_command(&root, &root, "echo notes.txt | xargs rm", &[])
+            .expect("in-root xargs pipeline allowed");
+        contain_shell_command(&root, &root, "echo hi | xargs echo", &[])
+            .expect("xargs without path-like tokens allowed");
+        contain_shell_command(&root, &root, "ls | xargs", &[]).expect("bare xargs allowed");
+        // F-A (2026-09-14) fail-closed tradeoff: a bare `xargs` token ANYWHERE
+        // now arms the pipeline-wide exemption suspension in any non-read-only
+        // pipeline, so `echo xargs …` is no longer exempt as a plain-argument
+        // pipeline. It stays allowed here only because the pipeline is fully
+        // read-only AND bare `xargs` carries no path shape — a deliberate
+        // narrowing, not a preserved guarantee.
+        contain_shell_command(&root, &root, "echo xargs", &[]).expect("bare echo xargs allowed");
+        // Likewise: `xargs` purely as a read-only pipeline's argument/pattern
+        // keeps working; no path-like token exists to resolve.
+        contain_shell_command(&root, &root, "cat notes.txt | grep xargs | head", &[])
+            .expect("grep xargs pattern in read-only pipeline stays free");
+        // Preserved behavior: the classic read-only pipeline without xargs
+        // keeps its per-segment read exemption.
+        contain_shell_command(&root, &root, "cat notes.txt | grep x | head", &[])
+            .expect("cat f | grep x | head stays free");
+        contain_shell_command(&root, &root, "echo /etc/os-release | head", &[])
+            .expect("read-only pipeline with outside read arg stays free");
+        // `~+`/`~-` and heredoc bodies are documented-only v1 limitations; no
+        // behavior change is asserted here beyond the free pipeline above.
+    }
+
+    #[test]
+    fn xargs_glued_into_redirect_tokens_detected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15: `xargs` glued inside a redirect-carrying token was
+        // invisible to the basename match — the section text carries `xargs`
+        // between `>`/`<` operators. A redirect-glued command lead still
+        // executes `xargs` (with the pipeline's stdout as argv), so the
+        // pipeline-wide suspension must arm for these spellings too.
+        for command in ["echo /etc/shadow | xargs>f rm", "echo /etc/shadow |'xargs'>f rm"] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: xargs glued into redirect tokens, got: {err}"
+            );
+        }
+        // Preserved pin: redirect glue without any xargs spelling keeps
+        // resolving targets in-root as before — and `>xargs` as a redirect
+        // TARGET (a file literally named `xargs`) is redirected output, not
+        // an xargs execution, so a fully read-only segment stays passable.
+        contain_shell_command(&root, &root, "echo hi >out.txt>notes.txt", &[])
+            .expect("xargs-free double write glue unchanged");
+        contain_shell_command(&root, &root, "cat notes.txt >xargs>f", &[])
+            .expect("redirect into files named xargs/f stays free (no xargs command)");
+        contain_shell_command(&root, &root, "cat notes.txt >out.xargs.log", &[])
+            .expect("filename merely spelling 'xargs' in a suffix stays free");
+    }
+
+    #[test]
+    fn xargs_quote_concat_and_backslash_escapes_detected() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        // 2026-09-15: quote-concatenation (`x''args`, `x""args`) and
+        // backslash-escaping (`x\args`) re-form the word `xargs` in the shell
+        // while defeating the exact basename match. The detection strips
+        // quote characters and backslashes before comparing.
+        for command in [
+            "echo /etc/shadow | x''args rm",
+            "echo /etc/shadow | x\"\"args rm",
+            "echo /etc/shadow | x\\args rm",
+            "echo /etc/shadow | x'a'rgs rm",
+            "echo /etc/shadow | ./x\\args rm",
+            "echo /etc/shadow | /usr/bin/x''args rm",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject: quote/backslash-obfuscated xargs, got: {err}"
+            );
+        }
+        // Preserved pin: no normalization outside the xargs detection path.
+        contain_shell_command(&root, &root, "echo x\nargs notes.txt", &[])
+            .expect("fragmented non-xargs command stays free");
+        contain_shell_command(&root, &root, "cat notes.txt | grep xargs | head", &[])
+            .expect("grep xargs pattern in read-only pipeline stays free");
+        contain_shell_command(&root, &root, "echo /etc/shadow | xargs-y rm", &[])
+            .expect("affix-bearing lookalike is not the xargs utility");
+    }
+
+    #[test]
+    fn glued_both_operators_resolve_each_suffix_independently() {
+        let (root, dir) = temp_root();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        // The write-glue branch used to consume `2>&1</etc/passwd` whole via
+        // `rfind('>')` and `continue`, so the `<`-suffix never got resolved
+        // and the input target escaped containment.
+        for command in [
+            "cat 2>&1</etc/passwd",
+            "wc -l 2>&1</etc/shadow",
+            "cat f >out.txt 2>&1</etc/passwd",
+            "cat f </etc/passwd>out.txt",
+            "cat 2>>/dev/null</etc/passwd",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the input target behind the glued fd-dup, got: {err}"
+            );
+        }
+        // The fd-duplicate write suffix must not be misread as a path, and
+        // in-root targets through the same glue keep working.
+        contain_shell_command(&root, &root, "cat f 2>&1", &[]).expect("2>&1 remainder unchanged");
+        contain_shell_command(&root, &root, "echo hi >&2 2>&1", &[])
+            .expect("chained fd-dup remainders unchanged");
+        contain_shell_command(&root, &root, "cat f 2>&1<in", &[])
+            .expect("glued fd-dup with in-root bare input allowed");
+        contain_shell_command(&root, &root, "cat f 2>&1<f", &[])
+            .expect("glued fd-dup with in-root input allowed");
+        contain_shell_command(&root, &root, "echo hi 2>err.log 2>&1", &[])
+            .expect("in-root glued write plus fd-dup unchanged");
+    }
+
+    #[test]
+    fn multi_operator_glue_resolves_each_redirect_suffix() {
+        let (root, _dir) = temp_root();
+        // F-B (2026-09-14): `2>/etc/passwd>&2` passed because only the
+        // extremes (`rfind('>')`, `find('<')`) resolved — the middle
+        // redirect's target hid between them. Every `>`/`<` occurrence now
+        // resolves its suffix up to the next operator.
+        for command in [
+            "echo hi 2>/etc/passwd>&2",
+            "echo hi 2>/etc/passwd>out.txt",
+            "echo hi 2>/etc/passwd>>out.txt",
+            "cat f 2>/etc/shadow>&1",
+        ] {
+            let err = contain_shell_command(&root, &root, command, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the project root"),
+                "'{command}' must reject the mid-token redirect target, got: {err}"
+            );
+        }
+        // Preserved pins: fd-dup remainders (`2>&1`/`>&2`) and in-root targets
+        // through the same glue stay passable.
+        contain_shell_command(&root, &root, "echo hi 2>&1", &[]).expect("bare 2>&1 unchanged");
+        contain_shell_command(&root, &root, "echo hi >&2", &[]).expect("bare >&2 unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>err.log", &[])
+            .expect("in-root 2>err.log unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>>err.log", &[])
+            .expect("in-root 2>>err.log unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>err.log>&2", &[])
+            .expect("in-root same-operator glue with fd-dup tail unchanged");
+        contain_shell_command(&root, &root, "echo hi 2>err.log>out.txt", &[])
+            .expect("in-root double write glue unchanged");
     }
 
     // -----------------------------------------------------------------------

@@ -187,6 +187,7 @@ async fn supervisor_pushes_one_bounded_slice_and_never_resends_an_unacked_span()
         gate: fs_gate(pool.clone(), gate_root.path()),
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone()),
+        consolidation: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d3-flush".to_owned()),
     };

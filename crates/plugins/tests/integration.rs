@@ -700,6 +700,85 @@ async fn provider_checks_cancellation_before_plugin_call() {
     }
 }
 
+/// ADR-66 §2(b) fail-loud seam, decision (a): plugin-backed providers are
+/// gated to AnswerOnly tasks. A completion request carrying tool
+/// declarations must be refused with `CapabilityRefused` naming provider,
+/// model, and capability — never silently degraded to text-only output.
+#[tokio::test]
+async fn provider_plugin_refuses_tool_declarations() {
+    use concerto_core::error::ProviderError;
+    use concerto_core::traits::provider::LlmProvider;
+    use concerto_core::types::{CompletionRequest, ToolDefinition};
+    use concerto_core::CancellationToken;
+    use concerto_plugins::provider_host::PluginBackedProvider;
+
+    let host = test_host();
+    let wasm = compile_wat(PROVIDER_PLUGIN_WAT);
+    let loader = PluginLoader::new(host);
+    let loaded = loader.load_from_bytes(&wasm, Path::new("td.wasm")).await.expect("load");
+    let caps = GrantedCapabilities::new();
+    let active = loader.initialise(&loaded, caps).await.expect("init");
+    let plugin = Arc::new(tokio::sync::Mutex::new(active));
+
+    let provider = PluginBackedProvider::new(plugin, "test", "test-model".into());
+    let req = CompletionRequest {
+        model: "test-model".into(),
+        messages: vec![],
+        tools: Some(vec![ToolDefinition {
+            name: "filesystem".into(),
+            description: "File ops.".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }]),
+        ..Default::default()
+    };
+    let result = provider.stream_completion(req, CancellationToken::new()).await;
+    match result {
+        Err(ProviderError::CapabilityRefused { provider, model, capability }) => {
+            assert_eq!(provider, "plugin:test");
+            assert_eq!(model, "test-model");
+            assert_eq!(capability, "tool_calling");
+        }
+        Err(other) => panic!("expected CapabilityRefused, got: {other:?}"),
+        Ok(_) => panic!("expected CapabilityRefused, got Ok"),
+    }
+}
+
+/// A tool-free request still reaches the plugin (the refusal guard must not
+/// fire on absent tool lists).
+#[tokio::test]
+async fn provider_plugin_accepts_tool_free_request() {
+    use concerto_core::error::ProviderError;
+    use concerto_core::traits::provider::LlmProvider;
+    use concerto_core::types::CompletionRequest;
+    use concerto_core::CancellationToken;
+    use concerto_plugins::provider_host::PluginBackedProvider;
+
+    let host = test_host();
+    let wasm = compile_wat(PROVIDER_PLUGIN_WAT);
+    let loader = PluginLoader::new(host);
+    let loaded = loader.load_from_bytes(&wasm, Path::new("tf.wasm")).await.expect("load");
+    let caps = GrantedCapabilities::new();
+    let active = loader.initialise(&loaded, caps).await.expect("init");
+    let plugin = Arc::new(tokio::sync::Mutex::new(active));
+
+    let provider = PluginBackedProvider::new(plugin, "test", "test-model".into());
+    let req =
+        CompletionRequest { model: "test-model".into(), messages: vec![], ..Default::default() };
+    let result = provider.stream_completion(req, CancellationToken::new()).await;
+    match result {
+        Ok(mut stream) => {
+            use futures::StreamExt;
+            while let Some(item) = stream.next().await {
+                assert!(item.is_ok(), "tool-free plugin completion must proceed: {item:?}");
+            }
+        }
+        Err(ProviderError::CapabilityRefused { .. }) => {
+            panic!("tool-less request must not be capability-refused");
+        }
+        Err(other) => panic!("unexpected provider error: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn provider_context_capacity_and_cost() {
     use concerto_core::traits::provider::LlmProvider;

@@ -11,9 +11,11 @@
 //! - [`GateProxyBackend`] — [`ToolExecutionBackend`]: every tool call is a
 //!   gated write (`execute-tool`) through the supervisor's single write gate
 //!   (ADR-60 D4). Tool definitions are cached at connect.
-//! - [`GateProxyMemoryStore`] — the loop's memory spine is a facade over
-//!   `retrieve-memory` (ADR-60 D6); stores/invalidations are logged and
-//!   dropped agent-side (memory ingestion is a supervisor concern).
+//! - [`GateProxyMemoryStore`] — the loop's memory spine is a facade over the
+//!   supervisor's memory methods: `retrieve-memory` (ADR-60 D6) for reads and
+//!   `store-memory` / `invalidate-memory` for writes. The wire entry is a
+//!   projection (`ipc::MemoryEntryWire`); the supervisor assigns ids and
+//!   binds project scoping, so the child never carries trusted identity.
 //!
 //! The client is sequential by construction: the loop awaits each request
 //! before issuing the next, so at most one request is in flight per agent
@@ -244,6 +246,10 @@ impl GateProxyClient {
 pub struct GateProxyBackend {
     client: Arc<tokio::sync::Mutex<GateProxyClient>>,
     agent_id: String,
+    /// ADR-60 D7 ledger enrichment (Phase 4): the approved plan this child
+    /// executes (from `CONCERTO_PLAN_ID`), stamped onto every gated request
+    /// so write-applied rows key into the plan's ledger.
+    plan_id: Option<String>,
     definitions: std::sync::OnceLock<Vec<ToolDefinition>>,
 }
 
@@ -255,11 +261,12 @@ impl GateProxyBackend {
     pub async fn new(
         client: Arc<tokio::sync::Mutex<GateProxyClient>>,
         agent_id: String,
+        plan_id: Option<String>,
     ) -> Result<Self, GateProxyError> {
         let mut guard = client.lock().await;
         let tools = guard.list_tools().await?;
         drop(guard);
-        let backend = Self { client, agent_id, definitions: std::sync::OnceLock::new() };
+        let backend = Self { client, agent_id, plan_id, definitions: std::sync::OnceLock::new() };
         let _ = backend.definitions.set(tools);
         Ok(backend)
     }
@@ -329,7 +336,9 @@ impl ToolExecutionBackend for GateProxyBackend {
             input,
             session_id: Some(session.session_id.to_string()),
             scope: Self::SCOPE.to_owned(),
-            plan_id: None,
+            // Ledger enrichment (ADR-60 D7): the run's approved plan, when
+            // the process was spawned for a plan-driven task.
+            plan_id: self.plan_id.clone(),
             causation: None,
             base_versions,
         };
@@ -381,8 +390,11 @@ impl ToolExecutionBackend for GateProxyBackend {
 }
 
 /// The loop's memory facade when supervised: retrieval crosses to the
-/// supervisor's memory spine (`retrieve-memory`, ADR-60 D6); stores and
-/// invalidations are supervisor concerns and are logged, not forwarded.
+/// supervisor's memory spine (`retrieve-memory`, ADR-60 D6) and so do the
+/// write paths — `store-memory` persists with the supervisor-assigned id
+/// echoed back, `invalidate-memory` forwards the ULID. Project scoping and
+/// entry ids are supervisor concerns; the wire entry is a projection
+/// ([`crate::ipc::MemoryEntryWire`]).
 pub struct GateProxyMemoryStore {
     client: Arc<tokio::sync::Mutex<GateProxyClient>>,
     agent_id: String,
@@ -452,29 +464,74 @@ impl MemoryStore for GateProxyMemoryStore {
                 score: chunk.score,
                 model_id: String::new(),
                 model_version: String::new(),
+                stale: false,
             })
             .collect())
     }
 
     async fn store(
         &self,
-        _entry: MemoryEntry,
-        _cancel: CancellationToken,
+        entry: MemoryEntry,
+        cancel: CancellationToken,
     ) -> Result<MemoryId, MemoryError> {
-        tracing::warn!(
-            "agent process: memory stores are supervisor-side in the ADR-60 model; \
-             dropping the agent-side store entry"
-        );
-        Ok(MemoryId(Ulid::new()))
+        if cancel.is_cancelled() {
+            return Err(MemoryError::Cancelled);
+        }
+        let response = self
+            .client
+            .lock()
+            .await
+            .request(
+                IpcMethod::StoreMemory,
+                IpcParams::StoreMemory { entry: crate::ipc::MemoryEntryWire::from_entry(&entry) },
+            )
+            .await
+            .map_err(|error| MemoryError::Persistence(error.to_string()))?;
+        if cancel.is_cancelled() {
+            return Err(MemoryError::Cancelled);
+        }
+        if let Some(error) = response.error {
+            return Err(MemoryError::Persistence(format!(
+                "supervisor store-memory failed {:?}: {}",
+                error.code, error.message
+            )));
+        }
+        let memory_id = match response.result {
+            Some(IpcResult::StoreMemory { memory_id }) => memory_id,
+            _ => return Err(MemoryError::Persistence("store-memory result missing".to_owned())),
+        };
+        let ulid = Ulid::from_string(&memory_id)
+            .map_err(|_| MemoryError::Serialization(format!("invalid memory id: {memory_id}")))?;
+        Ok(MemoryId(ulid))
     }
 
-    async fn invalidate(
-        &self,
-        _id: MemoryId,
-        _cancel: CancellationToken,
-    ) -> Result<(), MemoryError> {
-        tracing::warn!("agent process: memory invalidation is supervisor-side; ignoring");
-        Ok(())
+    async fn invalidate(&self, id: MemoryId, cancel: CancellationToken) -> Result<(), MemoryError> {
+        if cancel.is_cancelled() {
+            return Err(MemoryError::Cancelled);
+        }
+        let response = self
+            .client
+            .lock()
+            .await
+            .request(
+                IpcMethod::InvalidateMemory,
+                IpcParams::InvalidateMemory { memory_id: id.to_string() },
+            )
+            .await
+            .map_err(|error| MemoryError::Persistence(error.to_string()))?;
+        if cancel.is_cancelled() {
+            return Err(MemoryError::Cancelled);
+        }
+        if let Some(error) = response.error {
+            return Err(MemoryError::Persistence(format!(
+                "supervisor invalidate-memory failed {:?}: {}",
+                error.code, error.message
+            )));
+        }
+        match response.result {
+            Some(IpcResult::InvalidateMemory { .. }) => Ok(()),
+            _ => Err(MemoryError::Persistence("invalidate-memory result missing".to_owned())),
+        }
     }
 }
 

@@ -9,10 +9,15 @@ pub mod audit;
 pub mod plan_bindings;
 pub mod plans;
 pub mod replay;
+pub mod resource_facts;
 pub mod spend;
 pub mod whiteboard;
 
 pub use plan_bindings::PlanBindingRecord;
+pub use resource_facts::{
+    CachedRead, ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
+    WorkspaceSnapshotPayload,
+};
 pub use whiteboard::{
     NewWhiteboardEvent, WhiteboardEvent, WhiteboardKind, WhiteboardScope, WhiteboardSubscription,
 };
@@ -21,13 +26,15 @@ pub use whiteboard::{
 pub mod testing;
 
 use concerto_core::ids::Ulid;
+use concerto_core::lock::{acquire_data_dir_lock, DataDirLock};
 use concerto_core::transcript::TranscriptEntry;
 use concerto_core::types::{Message, ProviderMetrics, TokenBudget};
 use concerto_core::CancellationToken;
 use concerto_core::TaskId;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -48,6 +55,11 @@ pub enum SessionError {
     Serialization(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// A write was rejected by a structural validation rule before it could
+    /// land (ADR-65 §1: a claim or decision referencing evidence must
+    /// reference existing event ids — the append is rejected).
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl From<sqlx::Error> for SessionError {
@@ -61,6 +73,16 @@ impl From<serde_json::Error> for SessionError {
         SessionError::Serialization(err.to_string())
     }
 }
+
+impl From<concerto_core::lock::LockError> for SessionError {
+    fn from(err: concerto_core::lock::LockError) -> Self {
+        SessionError::Lock(err.to_string())
+    }
+}
+
+/// How long `connect()` waits for a `.concerto.lock` held by another instance
+/// (ADR-11) before failing with [`SessionError::Lock`].
+const SESSION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Resolve the Concerto data root — `dirs::data_dir()` (i.e.
 /// `$XDG_DATA_HOME` or `~/.local/share` on Linux) joined with `concerto` —
@@ -411,13 +433,26 @@ pub trait SessionStore: Send + Sync {
 
 pub struct SqliteSessionStore {
     pool: SqlitePool,
+    /// Held `.concerto.lock` for the data root (ADR-11), acquired by the
+    /// convenience `connect()` entry point and kept for the store's lifetime.
+    /// `connect_path` / `connect_in_memory` (tests, explicit paths) never set
+    /// it, so those paths stay free of data-root side effects.
+    _data_dir_lock: Option<Arc<DataDirLock>>,
 }
 
 impl SqliteSessionStore {
+    /// Connect to the canonical sessions database under the Concerto data
+    /// root, holding the process-wide `.concerto.lock` (ADR-11) for as long
+    /// as the returned store lives. Fails with [`SessionError::Lock`] when
+    /// another instance holds the lock and does not release it within the
+    /// wait window.
     pub async fn connect() -> Result<Self, SessionError> {
         let data_dir = app_data_dir()?;
+        let data_dir_lock = acquire_data_dir_lock(&data_dir, Some(SESSION_LOCK_TIMEOUT), None)?;
         let db_path = data_dir.join("sessions.db");
-        Self::connect_path(&db_path).await
+        let mut store = Self::connect_path(&db_path).await?;
+        store._data_dir_lock = Some(data_dir_lock);
+        Ok(store)
     }
 
     /// Connect to an explicit database path. SQLite WAL and `busy_timeout`
@@ -502,7 +537,7 @@ impl SqliteSessionStore {
             .await
             .map_err(|e| SessionError::Database(e.to_string()))?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, _data_dir_lock: None })
     }
 
     // In‑memory connection for tests – avoids filesystem side‑effects and uses the same PRAGMAs.
@@ -544,7 +579,7 @@ impl SqliteSessionStore {
             .await
             .map_err(|e| SessionError::Database(e.to_string()))?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, _data_dir_lock: None })
     }
 }
 
@@ -1064,7 +1099,10 @@ impl SessionStore for SqliteSessionStore {
             "transcript_entries",
             "plan_bindings",
         ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE session_id = ?"))
+            // AUDITED (sqlx 0.9 `AssertSqlSafe`): `{table}` iterates the hard-coded
+            // literal allow-list above — no user input is interpolated; the session id
+            // is bound.
+            sqlx::query(AssertSqlSafe(format!("DELETE FROM {table} WHERE session_id = ?")))
                 .bind(&id_str)
                 .execute(&mut *tx)
                 .await?;
@@ -2337,6 +2375,53 @@ mod tests {
 
         store.clear_orchestration_checkpoint(session.id).await.unwrap();
         assert!(store.load_orchestration_checkpoint(session.id).await.unwrap().is_none());
+    }
+
+    /// Run-continuity Phase 1: the orchestration-checkpoint load is the
+    /// "newest NON-completed checkpoint" lookup that backs a bare "continue"
+    /// — a row marked completed (a settled run) must never be served, while
+    /// the same row before completion is.
+    #[tokio::test]
+    async fn orchestration_checkpoint_load_skips_completed_rows() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/checkpoint-project");
+        let session = store
+            .create_session(&project_dir, "provider", "model", CancellationToken::new())
+            .await
+            .unwrap();
+        let record = OrchestrationCheckpointRecord {
+            session_id: session.id,
+            run_id: Ulid::new(),
+            root_task_id: TaskId::new(),
+            project_id: "checkpoint-project".into(),
+            objective_hash: "objective-hash".into(),
+            schema_version: 3,
+            source_revision: None,
+            sequence_num: 1,
+            state_json: r#"{"stage":"Executing"}"#.into(),
+            completed: true,
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        // A completed row is invisible to the resume lookup.
+        store.save_orchestration_checkpoint(&record).await.unwrap();
+        assert!(
+            store.load_orchestration_checkpoint(session.id).await.unwrap().is_none(),
+            "a completed checkpoint must never be served for a resume"
+        );
+
+        // The same row before completion (a stalled run) IS served — the
+        // upsert flips `completed` back without inserting a second row.
+        let mut stalled = record.clone();
+        stalled.completed = false;
+        store.save_orchestration_checkpoint(&stalled).await.unwrap();
+        let loaded = store
+            .load_orchestration_checkpoint(session.id)
+            .await
+            .unwrap()
+            .expect("the stalled checkpoint is resumable");
+        assert!(!loaded.completed);
+        assert_eq!(loaded.run_id, record.run_id);
     }
 
     // -----------------------------------------------------------------------

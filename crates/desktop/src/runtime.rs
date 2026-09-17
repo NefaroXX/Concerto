@@ -340,10 +340,27 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
         EventKind::DelegationDecided { child_id, role, reason, .. } => {
             activity("Coordinator", format!("Delegated subtask {child_id} to {role:?}: {reason}"))
         }
-        EventKind::RoutingDecided { task_id, role, provider, model, reason } => activity(
-            "Coordinator",
-            format!("Routed {role:?} subtask {task_id} to {provider}/{model}: {reason}"),
-        ),
+        EventKind::RoutingDecided { task_id, role, provider, model, reason, intent } => {
+            match intent {
+                // ADR-55 Phase 2d §5: an intent-routing record tells the routing
+                // decision story instead of a model assignment.
+                Some(decision) => activity(
+                    "Coordinator",
+                    format!(
+                        "Intent routed to {} (rule {}, route {}, confidence {:.2}): {}",
+                        decision.outcome,
+                        decision.rule,
+                        decision.route,
+                        decision.confidence,
+                        if decision.auto_granted { "auto-granted" } else { "read-only" }
+                    ),
+                ),
+                None => activity(
+                    "Coordinator",
+                    format!("Routed {role:?} subtask {task_id} to {provider}/{model}: {reason}"),
+                ),
+            }
+        }
         EventKind::AgentHandoff { from, to, task_id, rationale } => activity(
             "Coordinator",
             format!("{from:?} handed subtask {task_id} to {to:?}: {rationale}"),
@@ -698,7 +715,7 @@ pub fn route_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use concerto_core::event::Event;
+    use concerto_core::event::{Event, IntentRouteDecision};
     use concerto_core::{AgentId, TaskId};
 
     #[test]
@@ -732,6 +749,8 @@ mod tests {
                 provider: "openrouter".into(),
                 model: "example/model".into(),
                 reason: "configured assignment".into(),
+                // Model-routing row: no intent payload (ADR-55 2d §5).
+                intent: None,
             },
         );
 
@@ -740,6 +759,39 @@ mod tests {
             Some(DesktopEvent::AgentThought { content, .. })
                 if content.contains("openrouter/example/model")
                     && content.contains("configured assignment")
+        ));
+    }
+
+    /// ADR-55 Phase 2d §5: an intent-routing `RoutingDecided` record renders
+    /// the routing decision story ({rule, route, confidence, outcome}) rather
+    /// than a model assignment.
+    #[test]
+    fn intent_routing_decision_is_visible_as_chat_activity() {
+        let event = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::RoutingDecided {
+                task_id: TaskId::new(),
+                role: AgentId::new("intent_router"),
+                provider: "openrouter".into(),
+                model: "example/model".into(),
+                reason: "auto_granted".into(),
+                intent: Some(IntentRouteDecision {
+                    outcome: "Execute".into(),
+                    rule: "execute_keyword".into(),
+                    confidence: 0.8,
+                    route: "RuleHit".into(),
+                    auto_granted: true,
+                }),
+            },
+        );
+
+        assert!(matches!(
+            translate_event(&event),
+            Some(DesktopEvent::AgentThought { content, .. })
+                if content.contains("Intent routed to Execute")
+                    && content.contains("execute_keyword")
+                    && content.contains("auto-granted")
         ));
     }
 

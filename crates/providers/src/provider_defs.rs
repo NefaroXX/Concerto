@@ -275,6 +275,31 @@ pub fn model_options_for(
     pinned
 }
 
+/// Build the picker-facing model list for a provider config: the shared
+/// [`model_options_for`] resolution merged with the provider's *additive
+/// advertising* candidates — `cached_models` (live discovery) and
+/// `extra_models` (config-first gateways).
+///
+/// This is the single resolver every desktop model picker (Settings provider
+/// rows, the global default picker, the chat header) should call, so a model
+/// only has to be advertised in one place to become selectable. It is pure —
+/// no I/O, no credential lookups — and never mutates the persisted selection.
+///
+/// `extra_models` entries are model names, not provider ids: plugin-backed
+/// providers stay run-only and are intentionally absent from the provider-type
+/// picker ([`PROVIDER_TYPE_IDS`]).
+pub fn picker_model_options(provider: &ProviderConfig) -> Vec<String> {
+    let definition = provider_definition(&provider.provider);
+    let mut options = model_options_for(provider, &definition, None);
+    let mut seen: HashSet<String> = options.iter().map(|m| m.to_lowercase()).collect();
+    // Config-declared `extra_models` come before discovered `cached_models`, so
+    // the user's spelling wins when the two advertise the same id.
+    for model in provider.extra_models.iter().chain(provider.cached_models.iter()) {
+        push_unique(&mut options, &mut seen, model);
+    }
+    options
+}
+
 /// Why a provider cannot yet be used for dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -463,6 +488,34 @@ mod tests {
         let opts1 = model_options_for(&p, &provider_definition("openai"), None);
         let opts2 = model_options_for(&p, &provider_definition("openai"), None);
         assert_eq!(opts1, opts2);
+    }
+
+    // ---- picker_model_options -----------------------------------------------
+
+    #[test]
+    fn picker_options_merge_extra_and_cached_models() {
+        let mut p = pc("openai", "gpt-4o", None, "openai/api_key");
+        p.extra_models = vec!["gateway-model-a".into(), "  ".into(), "gpt-4o".into()];
+        p.cached_models = vec!["discovered-model".into(), "GATEWAY-MODEL-A".into()];
+        let opts = picker_model_options(&p);
+        // Selected / static resolver output survives.
+        assert_eq!(opts[0], "gpt-4o");
+        assert!(opts.contains(&"gpt-4o-mini".to_string()));
+        // Additive advertising candidates become selectable.
+        assert!(opts.contains(&"gateway-model-a".to_string()));
+        assert!(opts.contains(&"discovered-model".to_string()));
+        // Trimmed, de-duplicated (case-insensitively), empties dropped.
+        assert_eq!(opts.iter().filter(|m| m.eq_ignore_ascii_case("gateway-model-a")).count(), 1);
+        assert!(!opts.iter().any(|m| m.trim().is_empty()));
+    }
+
+    #[test]
+    fn picker_options_with_no_additions_match_resolver() {
+        let p = pc("openai", "gpt-4o", None, "openai/api_key");
+        assert_eq!(
+            picker_model_options(&p),
+            model_options_for(&p, &provider_definition("openai"), None)
+        );
     }
 
     #[test]

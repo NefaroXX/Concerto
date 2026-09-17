@@ -1,68 +1,70 @@
-//! Context budget allocator for RAG and working memory.
+//! RAG-only context budget bound.
 //!
 //! Replaces ad-hoc percentage calculations with a tested, configurable
-//! struct that enforces allocation limits.
+//! struct that enforces the RAG allocation limit. Per ADR-16 code reality
+//! (ADR-48), the only load-bearing use of this allocator is the score-ordered
+//! RAG bound in [`ContextBudgetAllocator::truncate_to_rag_limit`]. The former
+//! full assembly (`build_context`) had no verified production caller and was
+//! removed; conversation and working-memory bounds belong to `ContextEngine`
+//! + `ContextGuardProvider` in the orchestrator.
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::MemoryChunk;
-use concerto_core::types::Message;
+use concerto_core::types::TokenBudget;
 
 const CLIPPED_SUFFIX: &str = "\n[Content clipped to fit the context budget.]";
 
-/// Allocates context window capacity across RAG, working memory, and
-/// conversation history.
+/// Bounds the amount of retrieved memory (RAG) injected into the prompt.
 ///
-/// Default split:
-/// - 25% RAG chunks
-/// - 10% working memory
-/// - 65% conversation history
+/// RAG-only intent (ADR-16/ADR-48): this allocator no longer splits capacity
+/// across working memory and conversation history — that assembly lives in
+/// the orchestrator's `ContextEngine` + `ContextGuardProvider`. The single
+/// responsibility here is the aggregate RAG token bound.
 pub struct ContextBudgetAllocator {
-    /// Fraction of total capacity reserved for RAG chunks (default 0.25).
+    /// Fraction of the request budget reserved for RAG chunks (default 0.25).
     pub rag_pct: f64,
-    /// Fraction of total capacity reserved for working memory (default 0.10).
-    pub working_mem_pct: f64,
 }
 
 impl Default for ContextBudgetAllocator {
     fn default() -> Self {
-        Self { rag_pct: 0.25, working_mem_pct: 0.10 }
+        Self { rag_pct: 0.25 }
     }
 }
 
 impl ContextBudgetAllocator {
-    pub fn new(rag_pct: f64, working_mem_pct: f64) -> Result<Self, MemoryError> {
-        if !rag_pct.is_finite()
-            || !working_mem_pct.is_finite()
-            || rag_pct < 0.0
-            || working_mem_pct < 0.0
-            || rag_pct + working_mem_pct >= 1.0
-        {
+    pub fn new(rag_pct: f64) -> Result<Self, MemoryError> {
+        // `Range::contains` compares with `<`, so NaN (and ±inf) fall outside
+        // the range and are rejected alongside negatives and full-window values.
+        if !(0.0..1.0).contains(&rag_pct) {
             return Err(MemoryError::Persistence(
-                "RAG and working-memory percentages must be finite, non-negative, and leave room for history".into(),
+                "RAG percentage must be finite, non-negative, and leave room for the rest of the context"
+                    .into(),
             ));
         }
-        Ok(Self { rag_pct, working_mem_pct })
+        Ok(Self { rag_pct })
     }
 
-    /// Token limit for RAG chunks given total capacity.
-    pub fn rag_limit(&self, capacity: u64) -> u64 {
-        (capacity as f64 * self.rag_pct) as u64
-    }
-
-    /// Token limit for working memory.
-    pub fn working_mem_limit(&self, capacity: u64) -> u64 {
-        (capacity as f64 * self.working_mem_pct) as u64
+    /// Token limit for RAG chunks given the available request tokens.
+    ///
+    /// Takes the *available* prompt tokens (capacity minus response
+    /// reservation), never the raw total context capacity.
+    pub fn rag_limit(&self, available: u64) -> u64 {
+        (available as f64 * self.rag_pct) as u64
     }
 
     /// Select and, when necessary, clip chunks to the aggregate RAG budget.
     /// Highest-scored chunks are retained first; one oversized chunk can no
     /// longer consume the complete provider context.
+    ///
+    /// `budget` is the provider-reported [`TokenBudget`]; the bound is
+    /// computed against [`TokenBudget::available`] (`capacity` minus
+    /// `reserved_for_response`), never the raw total `capacity`.
     pub fn truncate_to_rag_limit(
         &self,
         mut chunks: Vec<MemoryChunk>,
-        capacity: u64,
+        budget: &TokenBudget,
     ) -> Vec<MemoryChunk> {
-        let limit = self.rag_limit(capacity);
+        let limit = self.rag_limit(budget.available);
         if chunks.is_empty() || limit == 0 {
             return Vec::new();
         }
@@ -92,77 +94,10 @@ impl ContextBudgetAllocator {
 
         selected
     }
-
-    /// Assemble final ordered message list respecting all budgets.
-    pub fn build_context(
-        &self,
-        rag_chunks: Vec<MemoryChunk>,
-        mut working_mem_block: Message,
-        history: &[Message],
-        capacity: u64,
-    ) -> Vec<Message> {
-        let mut messages = Vec::new();
-
-        // 1. RAG context as system messages.
-        for chunk in self.truncate_to_rag_limit(rag_chunks, capacity) {
-            messages.push(Message {
-                role: concerto_core::types::Role::System,
-                content: format!("[Context]\n{}", chunk.content),
-                tool_calls: None,
-                tool_results: None,
-                reasoning_content: None,
-                tokens_in: None,
-                tokens_out: None,
-            });
-        }
-
-        // 2. Working memory is independently bounded before insertion.
-        let working_limit = self.working_mem_limit(capacity);
-        if !working_mem_block.content.is_empty() && working_limit > 0 {
-            working_mem_block.content =
-                clip_text_to_tokens(&working_mem_block.content, working_limit);
-            messages.push(working_mem_block);
-        }
-
-        // 3. Use the actual consumed tokens and keep the newest history that
-        // fits. The old implementation reserved 10% and then inserted an
-        // unlimited block, while also subtracting the reservation twice.
-        let used = messages.iter().map(estimate_message_tokens).sum::<u64>();
-        let remaining = capacity.saturating_sub(used);
-        let mut retained_history = Vec::new();
-        let mut history_tokens = 0u64;
-        for message in history.iter().rev() {
-            let estimated = estimate_message_tokens(message);
-            if history_tokens.saturating_add(estimated) > remaining {
-                break;
-            }
-            history_tokens = history_tokens.saturating_add(estimated);
-            retained_history.push(message.clone());
-        }
-        retained_history.reverse();
-        messages.extend(retained_history);
-
-        messages
-    }
 }
 
 fn estimate_text_tokens(value: &str) -> u64 {
     value.len().div_ceil(4) as u64
-}
-
-fn estimate_message_tokens(message: &Message) -> u64 {
-    let content = estimate_text_tokens(&message.content);
-    let calls = message
-        .tool_calls
-        .as_ref()
-        .and_then(|value| serde_json::to_vec(value).ok())
-        .map_or(0, |value| value.len().div_ceil(4) as u64);
-    let results = message
-        .tool_results
-        .as_ref()
-        .and_then(|value| serde_json::to_vec(value).ok())
-        .map_or(0, |value| value.len().div_ceil(4) as u64);
-    content.saturating_add(calls).saturating_add(results).saturating_add(4)
 }
 
 fn clip_text_to_tokens(value: &str, token_limit: u64) -> String {
@@ -191,7 +126,6 @@ fn clip_text_to_tokens(value: &str, token_limit: u64) -> String {
 mod tests {
     use super::*;
     use concerto_core::memory::{ChunkType, MemoryNamespace, ProjectId};
-    use concerto_core::types::Role;
 
     fn make_chunk(content: &str, score: f64) -> MemoryChunk {
         MemoryChunk {
@@ -206,75 +140,47 @@ mod tests {
             score,
             model_id: "test".into(),
             model_version: "1.0".into(),
+            stale: false,
         }
     }
 
-    fn message(role: Role, content: impl Into<String>) -> Message {
-        Message {
-            role,
-            content: content.into(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        }
-    }
-
-    fn message_with_tool_calls(role: Role, content: impl Into<String>) -> Message {
-        use concerto_core::types::{ToolCall, ToolResult};
-        Message {
-            role,
-            content: content.into(),
-            tool_calls: Some(vec![ToolCall {
-                id: "call_1".into(),
-                name: "test".into(),
-                arguments: serde_json::json!({}),
-            }]),
-            tool_results: Some(vec![ToolResult {
-                id: "call_1".into(),
-                name: "test".into(),
-                content: serde_json::json!({"success": true}),
-            }]),
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        }
+    /// Budget for a given (capacity, reserved) pair, exercising the
+    /// `available = capacity - reserved` semantics.
+    fn budget(capacity: u64, reserved_for_response: u64) -> TokenBudget {
+        TokenBudget::new(capacity, reserved_for_response)
     }
 
     #[test]
     fn default_allocation() {
         let alloc = ContextBudgetAllocator::default();
         assert_eq!(alloc.rag_limit(10_000), 2_500);
-        assert_eq!(alloc.working_mem_limit(10_000), 1_000);
     }
 
     #[test]
     fn new_rejects_invalid_allocations() {
-        assert!(ContextBudgetAllocator::new(0.6, 0.5).is_err());
-        assert!(ContextBudgetAllocator::new(-0.1, 0.1).is_err());
-        assert!(ContextBudgetAllocator::new(f64::NAN, 0.1).is_err());
+        assert!(ContextBudgetAllocator::new(1.0).is_err());
+        assert!(ContextBudgetAllocator::new(-0.1).is_err());
+        assert!(ContextBudgetAllocator::new(f64::NAN).is_err());
     }
 
     #[test]
-    fn new_total_exactly_1_0_errors() {
-        // Sum exactly 1.0 (rag + working >= 1.0 triggers error)
-        assert!(ContextBudgetAllocator::new(0.5, 0.5).is_err());
-        assert!(ContextBudgetAllocator::new(0.99, 0.01).is_err());
+    fn new_rejects_full_window_allocation() {
+        // RAG must leave room for the rest of the context: exactly 1.0 and
+        // anything above it is rejected.
+        assert!(ContextBudgetAllocator::new(1.0).is_err());
+        assert!(ContextBudgetAllocator::new(2.0).is_err());
     }
 
     #[test]
-    fn new_accepts_valid_zero_percentages() {
-        let alloc = ContextBudgetAllocator::new(0.0, 0.0).unwrap();
+    fn new_accepts_valid_zero_percentage() {
+        let alloc = ContextBudgetAllocator::new(0.0).unwrap();
         assert_eq!(alloc.rag_limit(10_000), 0);
-        assert_eq!(alloc.working_mem_limit(10_000), 0);
     }
 
     #[test]
     fn new_accepts_valid_boundary_below_one() {
-        let alloc = ContextBudgetAllocator::new(0.5, 0.49).unwrap();
-        assert_eq!(alloc.rag_limit(10_000), 5_000);
-        assert_eq!(alloc.working_mem_limit(10_000), 4_900);
+        let alloc = ContextBudgetAllocator::new(0.99).unwrap();
+        assert_eq!(alloc.rag_limit(10_000), 9_900);
     }
 
     #[test]
@@ -285,7 +191,7 @@ mod tests {
             make_chunk(&"b".repeat(80), 0.1),
             make_chunk(&"c".repeat(80), 0.5),
         ];
-        let selected = alloc.truncate_to_rag_limit(chunks, 200);
+        let selected = alloc.truncate_to_rag_limit(chunks, &budget(200, 0));
         assert!(!selected.is_empty());
         assert_eq!(selected[0].score, 0.9);
         assert!(
@@ -296,7 +202,7 @@ mod tests {
     #[test]
     fn truncate_empty_chunks_returns_empty() {
         let alloc = ContextBudgetAllocator::default();
-        let selected = alloc.truncate_to_rag_limit(vec![], 1_000);
+        let selected = alloc.truncate_to_rag_limit(vec![], &budget(1_000, 0));
         assert!(selected.is_empty());
     }
 
@@ -308,7 +214,7 @@ mod tests {
             make_chunk(&"b".repeat(40), 0.8),
             make_chunk(&"c".repeat(40), 0.7),
         ];
-        let selected = alloc.truncate_to_rag_limit(chunks, 10_000);
+        let selected = alloc.truncate_to_rag_limit(chunks, &budget(10_000, 0));
         assert_eq!(selected.len(), 3);
     }
 
@@ -320,9 +226,9 @@ mod tests {
             make_chunk(&"b".repeat(800), 0.8),
             make_chunk(&"c".repeat(800), 0.7),
         ];
-        // rag_limit(3200) = 800 tokens — but each chunk is ~200 tokens,
-        // so exactly 4 fit. With 3 chunks of 200 tokens each, all 3 fit.
-        let selected = alloc.truncate_to_rag_limit(chunks, 100); // rag_limit=25
+        // rag_limit(available=100) = 25 tokens; each chunk is ~200 tokens, so
+        // only the highest-scored chunk survives.
+        let selected = alloc.truncate_to_rag_limit(chunks, &budget(100, 0)); // rag_limit=25
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].score, 0.9);
     }
@@ -336,15 +242,15 @@ mod tests {
             make_chunk(&"V".repeat(800), 0.5),
         ];
         // rag_limit(100) = 25 tokens, each chunk ~200 tokens → only 1 fits after clip
-        let selected = alloc.truncate_to_rag_limit(chunks, 100);
+        let selected = alloc.truncate_to_rag_limit(chunks, &budget(100, 0));
         assert_eq!(selected.len(), 1);
     }
 
     #[test]
     fn oversized_single_chunk_is_clipped_to_rag_limit() {
         let alloc = ContextBudgetAllocator::default();
-        let selected =
-            alloc.truncate_to_rag_limit(vec![make_chunk(&"x".repeat(20_000), 1.0)], 1_000);
+        let selected = alloc
+            .truncate_to_rag_limit(vec![make_chunk(&"x".repeat(20_000), 1.0)], &budget(1_000, 0));
         assert_eq!(selected.len(), 1);
         assert!(estimate_text_tokens(&selected[0].content) <= alloc.rag_limit(1_000));
         assert!(selected[0].content.contains("clipped"));
@@ -354,76 +260,32 @@ mod tests {
     fn zero_capacity_returns_empty() {
         let alloc = ContextBudgetAllocator::default();
         let chunks = vec![make_chunk("test", 1.0)];
-        assert!(alloc.truncate_to_rag_limit(chunks, 0).is_empty());
+        assert!(alloc.truncate_to_rag_limit(chunks, &budget(0, 0)).is_empty());
     }
 
     #[test]
     fn rag_limit_rounds_down() {
-        let alloc = ContextBudgetAllocator::new(0.25, 0.10).unwrap();
+        let alloc = ContextBudgetAllocator::new(0.25).unwrap();
         // 7 * 0.25 = 1.75 → truncates to 1
         assert_eq!(alloc.rag_limit(7), 1);
-        assert_eq!(alloc.working_mem_limit(7), 0); // 7 * 0.10 = 0.7 → truncates to 0
     }
 
     #[test]
-    fn build_context_orders_correctly() {
-        let alloc = ContextBudgetAllocator::default();
-        let chunks = vec![make_chunk("rag data", 1.0)];
-        let working = message(Role::System, "<working_memory>active</working_memory>");
-        let history = vec![message(Role::User, "hello")];
-        let result = alloc.build_context(chunks, working, &history, 1_000);
-        assert!(result.len() >= 2);
-        assert!(result[0].content.contains("rag data"));
-    }
-
-    #[test]
-    fn build_context_no_rag_chunks() {
-        let alloc = ContextBudgetAllocator::default();
-        let working = message(Role::System, "<wm>data</wm>");
-        let history = vec![message(Role::User, "hello")];
-        let result = alloc.build_context(vec![], working, &history, 1_000);
-        assert!(result.iter().any(|m| m.content.contains("<wm>")));
-        assert!(result.iter().any(|m| m.content == "hello"));
-    }
-
-    #[test]
-    fn build_context_no_working_mem() {
-        let alloc = ContextBudgetAllocator::default();
-        let chunks = vec![make_chunk("rag data", 1.0)];
-        let result = alloc.build_context(chunks, message(Role::System, ""), &[], 1_000);
-        assert!(result.iter().any(|m| m.content.contains("rag data")));
-    }
-
-    #[test]
-    fn build_context_empty_history() {
-        let alloc = ContextBudgetAllocator::default();
-        let chunks = vec![make_chunk("rag data", 1.0)];
-        let result = alloc.build_context(chunks, message(Role::System, ""), &[], 1_000);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].content.contains("rag data"));
-    }
-
-    #[test]
-    fn working_memory_cannot_exceed_its_allocation() {
-        let alloc = ContextBudgetAllocator::default();
-        let working = message(Role::System, "w".repeat(100_000));
-        let result = alloc.build_context(Vec::new(), working, &[], 10_000);
-        assert_eq!(result.len(), 1);
-        assert!(estimate_message_tokens(&result[0]) <= alloc.working_mem_limit(10_000) + 4);
-        assert!(result[0].content.contains("clipped"));
-    }
-
-    #[test]
-    fn newest_history_is_retained_when_history_does_not_fit() {
-        let alloc = ContextBudgetAllocator::new(0.0, 0.0).unwrap();
-        let history = vec![
-            message(Role::User, "old".repeat(2_000)),
-            message(Role::Assistant, "middle".repeat(2_000)),
-            message(Role::User, "latest"),
-        ];
-        let result = alloc.build_context(Vec::new(), message(Role::System, ""), &history, 100);
-        assert!(result.iter().any(|item| item.content == "latest"));
-        assert!(!result.iter().any(|item| item.content.starts_with("old")));
+    fn rag_budget_binds_to_available_not_capacity() {
+        // The provider reserves part of the window for the response. The RAG
+        // bound must be derived from `available` (capacity - reserved), never
+        // raw total capacity — the ambiguity the `TokenBudget` entry point
+        // resolves.
+        let alloc = ContextBudgetAllocator::default(); // rag_pct = 0.25
+        let full = budget(10_000, 0);
+        let with_reservation = budget(10_000, 4_000);
+        assert_eq!(alloc.rag_limit(full.available), 2_500);
+        // available = 6_000 → rag_limit = 1_500, not 2_500.
+        assert_eq!(alloc.rag_limit(with_reservation.available), 1_500);
+        assert_eq!(
+            alloc.truncate_to_rag_limit(vec![make_chunk("x", 1.0)], &with_reservation).len(),
+            1
+        );
     }
 
     #[test]
@@ -446,25 +308,5 @@ mod tests {
         // limit of 1 token = 4 bytes, suffix alone may be longer than that
         let clipped = clip_text_to_tokens(text, 1);
         assert!(clipped.len() < text.len() || clipped == text);
-    }
-
-    #[test]
-    fn build_context_with_tool_calls_in_history() {
-        let alloc = ContextBudgetAllocator::new(0.0, 0.0).unwrap();
-        let history = vec![message_with_tool_calls(Role::Assistant, "calling tool")];
-        let result = alloc.build_context(Vec::new(), message(Role::System, ""), &history, 10_000);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].content == "calling tool");
-    }
-
-    #[test]
-    fn estimate_message_tokens_counts_tool_calls_and_results() {
-        let msg = message_with_tool_calls(Role::Assistant, "hello");
-        let estimated = estimate_message_tokens(&msg);
-        // Content "hello" = 5 / 4 = 1.25 → 1 token
-        // Tool calls JSON approx 32 bytes / 4 = 8 tokens
-        // Tool results JSON approx 16 bytes / 4 = 4 tokens
-        // + 4 overhead
-        assert!(estimated > 5, "should count tool calls and results, got {estimated}");
     }
 }

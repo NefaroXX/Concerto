@@ -23,6 +23,7 @@ pub mod tokenizer;
 
 pub mod adapters;
 pub mod anthropic;
+pub mod capability;
 pub mod google;
 pub mod nim;
 pub mod ollama;

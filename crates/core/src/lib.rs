@@ -15,6 +15,7 @@ pub mod failures;
 pub mod helpers;
 pub mod ids;
 pub mod intent;
+pub mod lock;
 pub mod memory;
 pub mod policy;
 pub mod policy_presets;
@@ -56,9 +57,10 @@ pub use intent::{
 // authorization seam the policy engine consults under
 // `Condition::IntentAuthorized`, and the audit rule-name vocabulary.
 pub use authorization::{
-    classify_tier, IntentAuthorization, IntentTier, IntentVerdict, RULE_CONSEQUENTIAL,
-    RULE_INTENT_AUTHORIZED, RULE_INTENT_READONLY_DENY, RULE_OBSERVE, RULE_SHELL_REQUIRES_APPROVAL,
-    RULE_UN_GRANTED,
+    classify_tier, is_project_bounded_shell, IntentAuthorization, IntentTier, IntentVerdict,
+    RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_AUTHORIZED_DELEGATION,
+    RULE_INTENT_AUTHORIZED_SHELL, RULE_INTENT_READONLY_DENY, RULE_OBSERVE,
+    RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
 };
 
 // Re-export Phase 4 memory types from the dedicated module.
@@ -73,7 +75,7 @@ pub use traits::approval::{ApprovalDecision, ApprovalSink};
 pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy, TruncateOldest};
 pub use traits::memory::MemoryStore;
 pub use traits::provider::LlmProvider;
-pub use traits::vector_store::VectorStore;
+pub use traits::vector_store::{RowIndexFact, VectorStore};
 
 /// Durable typed session transcript model (ADR-36).
 pub use transcript::{

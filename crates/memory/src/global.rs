@@ -148,6 +148,7 @@ impl GlobalMemoryStore {
                 score: 1.0,
                 model_id: String::new(),
                 model_version: String::new(),
+                stale: false,
             })
             .collect())
     }

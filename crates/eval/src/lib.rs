@@ -76,6 +76,72 @@ impl EvalEngine {
         self
     }
 
+    /// Manifest file names [`Self::detect_runner`] recognizes, in priority
+    /// order (the first match inside a directory decides the runner).
+    const RUNNER_MANIFESTS: [&str; 5] =
+        ["Cargo.toml", "package.json", "pyproject.toml", "setup.py", "Makefile"];
+
+    fn manifest_in_dir(dir: &Path) -> Option<&'static str> {
+        Self::RUNNER_MANIFESTS.iter().find(|manifest| dir.join(manifest).exists()).copied()
+    }
+
+    /// Resolve the directory the eval harness should run in, preferring the
+    /// manifest-bearing directory nearest the run's modified files
+    /// (validation-root resolution from run evidence).
+    ///
+    /// Agents legitimately build inside a subdirectory of the session root
+    /// (e.g. a "create a new Cargo project" instruction); runner detection
+    /// then fails at the root with `Unknown("no config file found")` even
+    /// though a fully valid project exists one level down. For every
+    /// evidence path kept under the project root, each ancestor directory
+    /// up to (and including) the root itself is checked for a runner
+    /// manifest; the deepest manifest-bearing directory (closest to the
+    /// files) wins, ties break on the lexicographically smallest path for
+    /// determinism. When nothing better exists — no manifest anywhere, no
+    /// evidence at all, or the nearest manifest IS the root — the project
+    /// root is returned, preserving today's behavior including the honest
+    /// `Unknown("no config file found")` failure message.
+    pub fn resolve_manifest_root(
+        project_root: &Path,
+        modified_files: &[camino::Utf8PathBuf],
+    ) -> PathBuf {
+        let root_depth = project_root.components().count();
+        let mut best: Option<(usize, PathBuf)> = None;
+        for file in modified_files {
+            // Evidence under the root only: an absolute path outside the
+            // root, or a relative path escaping it, carries no signal.
+            let resolved = if file.is_absolute() {
+                PathBuf::from(file.as_str())
+            } else {
+                project_root.join(file.as_std_path())
+            };
+            if !resolved.starts_with(project_root) {
+                continue;
+            }
+            for ancestor in resolved.ancestors() {
+                let depth = ancestor.components().count();
+                if depth < root_depth {
+                    break;
+                }
+                if Self::manifest_in_dir(ancestor).is_some() {
+                    let dir_depth = depth;
+                    let dir_path = ancestor.to_path_buf();
+                    best = match &best {
+                        Some((best_depth, best_path))
+                            if *best_depth > dir_depth
+                                || (*best_depth == dir_depth && *best_path <= dir_path) =>
+                        {
+                            best.clone()
+                        }
+                        _ => Some((dir_depth, dir_path)),
+                    };
+                    break;
+                }
+            }
+        }
+        best.map_or_else(|| project_root.to_path_buf(), |(_, path)| path)
+    }
+
     /// Detect the test runner by checking for known config files.
     pub fn detect_runner(project_dir: &Path) -> TestRunner {
         if project_dir.join("Cargo.toml").exists() {
@@ -110,6 +176,7 @@ impl EvalEngine {
         &self,
         runner: TestRunner,
         args: &[&str],
+        project_dir: &Path,
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
         let start = std::time::Instant::now();
@@ -144,7 +211,7 @@ impl EvalEngine {
             command
         };
         let child = command
-            .current_dir(&self.project_dir)
+            .current_dir(project_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -188,13 +255,25 @@ impl EvalEngine {
 
     /// Run the test suite (full) – default entry point.
     pub async fn run(&self, cancel: CancellationToken) -> Result<EvalResult, EvalError> {
-        let runner = Self::detect_runner(&self.project_dir);
-        self.run_for_runner(runner, cancel).await
+        self.run_in_dir(&self.project_dir, cancel).await
+    }
+
+    /// Run the full test suite in `project_dir` — the evidence-resolved entry
+    /// point for validators that resolve their working root from the run's
+    /// modified files (see [`Self::resolve_manifest_root`]).
+    pub async fn run_in_dir(
+        &self,
+        project_dir: &Path,
+        cancel: CancellationToken,
+    ) -> Result<EvalResult, EvalError> {
+        let runner = Self::detect_runner(project_dir);
+        self.run_for_runner(runner, project_dir, cancel).await
     }
 
     async fn run_for_runner(
         &self,
         runner: TestRunner,
+        project_dir: &Path,
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
         // Default args per runner
@@ -208,7 +287,7 @@ impl EvalEngine {
             }
             _ => &[],
         };
-        self.run_with_args(runner, default_args, cancel).await
+        self.run_with_args(runner, default_args, project_dir, cancel).await
     }
 
     /// Run tests scoped to changed paths; falls back to full suite if mapping unavailable.
@@ -217,12 +296,25 @@ impl EvalEngine {
         changed_paths: &[camino::Utf8PathBuf],
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
-        let runner = Self::detect_runner(&self.project_dir);
+        self.run_scoped_in_dir(&self.project_dir, changed_paths, cancel).await
+    }
+
+    /// Run tests scoped to changed paths in `project_dir` (evidence-resolved
+    /// variant of [`Self::run_scoped`]). The scoped-args mapping still keys
+    /// off the project-root-relative spellings of `changed_paths`, mirroring
+    /// [`Self::run_scoped`]'s semantics at the configured root.
+    pub async fn run_scoped_in_dir(
+        &self,
+        project_dir: &Path,
+        changed_paths: &[camino::Utf8PathBuf],
+        cancel: CancellationToken,
+    ) -> Result<EvalResult, EvalError> {
+        let runner = Self::detect_runner(project_dir);
         if let Some(arg_vec) = Self::scoped_args(&runner, changed_paths) {
             let args_ref: Vec<&str> = arg_vec.iter().map(|s| s.as_str()).collect();
-            self.run_with_args(runner, &args_ref, cancel).await
+            self.run_with_args(runner, &args_ref, project_dir, cancel).await
         } else {
-            self.run_for_runner(runner, cancel).await
+            self.run_for_runner(runner, project_dir, cancel).await
         }
     }
 
@@ -569,7 +661,8 @@ impl EvalEngine {
             }
             // For non-Cargo runners, run tests normally, then collect coverage separately.
             _ => {
-                let eval = self.run_for_runner(runner.clone(), cancel.clone()).await?;
+                let eval =
+                    self.run_for_runner(runner.clone(), &self.project_dir, cancel.clone()).await?;
                 let cov = self.run_coverage(cancel).await.ok();
                 (eval.passed, eval.exit_code, eval.duration_ms, eval.output_tail, cov)
             }
@@ -663,6 +756,88 @@ mod tests {
     }
 
     #[test]
+    fn detect_runner_unknown_message_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            EvalEngine::detect_runner(dir.path()),
+            TestRunner::Unknown("no config file found".into())
+        );
+    }
+
+    /// Validation-root resolution: a manifest inside a build subdirectory
+    /// wins — the agent's `hexview/`-style layout validates in the subdir.
+    #[test]
+    fn resolve_manifest_root_prefers_subdir_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("hexview/src")).unwrap();
+        std::fs::write(dir.path().join("hexview/Cargo.toml"), "[package]\n").unwrap();
+        let files = [
+            camino::Utf8PathBuf::from("hexview/src/main.rs"),
+            camino::Utf8PathBuf::from("."),
+            camino::Utf8PathBuf::from("notes.txt"),
+        ];
+        assert_eq!(
+            EvalEngine::resolve_manifest_root(dir.path(), &files),
+            dir.path().join("hexview")
+        );
+    }
+
+    /// The root-manifest shape resolves to the root (unchanged behavior).
+    #[test]
+    fn resolve_manifest_root_manifest_at_root_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let files = vec![camino::Utf8PathBuf::from("src/lib.rs")];
+        assert_eq!(EvalEngine::resolve_manifest_root(dir.path(), &files), dir.path());
+    }
+
+    /// No manifest anywhere keeps the project root — and the honest
+    /// `Unknown("no config file found")` failure stays in place.
+    #[test]
+    fn resolve_manifest_root_no_manifest_keeps_root_and_honest_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/main.rs"), "fn main() {}\n").unwrap();
+        let files = vec![camino::Utf8PathBuf::from("sub/main.rs")];
+        assert_eq!(EvalEngine::resolve_manifest_root(dir.path(), &files), dir.path());
+        assert_eq!(
+            EvalEngine::detect_runner(dir.path()),
+            TestRunner::Unknown("no config file found".into())
+        );
+    }
+
+    /// No evidence at all falls back to the project root.
+    #[test]
+    fn resolve_manifest_root_no_evidence_falls_back_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<camino::Utf8PathBuf> = Vec::new();
+        assert_eq!(EvalEngine::resolve_manifest_root(dir.path(), &files), dir.path());
+    }
+
+    /// A manifest both at the root and deeper resolves to the DEEPER one —
+    /// the directory nearest the evidence files.
+    #[test]
+    fn resolve_manifest_root_nearest_wins_over_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("app/src")).unwrap();
+        std::fs::write(dir.path().join("app/Cargo.toml"), "[package]\n").unwrap();
+        let files = vec![camino::Utf8PathBuf::from("app/src/main.rs")];
+        assert_eq!(EvalEngine::resolve_manifest_root(dir.path(), &files), dir.path().join("app"));
+    }
+
+    /// Evidence outside the project root (absolute) carries no signal.
+    #[test]
+    fn resolve_manifest_root_ignores_out_of_root_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let files =
+            vec![camino::Utf8PathBuf::from_path_buf(outside.path().join("src/x.rs")).unwrap()];
+        assert_eq!(EvalEngine::resolve_manifest_root(dir.path(), &files), dir.path());
+    }
+
+    #[test]
     fn dry_run_known_runners() {
         let dir = tempfile::tempdir().unwrap();
         let cargo = dir.path().join("Cargo.toml");
@@ -684,7 +859,7 @@ mod tests {
         let engine = EvalEngine::new(dir.path()).with_shell_profile(profile);
 
         let error = engine
-            .run_for_runner(TestRunner::Cargo, CancellationToken::new())
+            .run_for_runner(TestRunner::Cargo, dir.path(), CancellationToken::new())
             .await
             .expect_err("missing profile must fail before spawn");
 

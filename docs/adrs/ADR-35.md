@@ -1,7 +1,7 @@
 # ADR-35: Tag-driven agent orchestration with Coordinator-first architecture
 
-**Status:** Accepted (Revised 2026-08-13)
-**Date:** 2026-08-01 (original), 2026-08-13 (revision)
+**Status:** Accepted (Revised 2026-09-16)
+**Date:** 2026-08-01 (original), 2026-08-13 (revision), 2026-09-05 (amendment), 2026-09-16 (amendment)
 
 ## Revision record (2026-08-13)
 
@@ -211,6 +211,174 @@ no validation-stage agent is self-verified by the Coordinator through its
 executor (declared verification commands, `require_verification` semantics)
 when capable. Acceptance is rejected only when verification is required and
 cannot be performed at all. Vacuous-accept policy unchanged.
+
+## Amendment (2026-09-05) — the Coordinator decides; planner and stage sequencing are advisory
+
+Revised **in place**, not superseded (per the project owner's standing
+instruction: no new ADR numbers). This amendment reconciles the document with
+the requirement already quoted in the Revision record above — the Coordinator
+"gets context about other agents ... and figures out how to delegate; the
+current five agents are only a known-working default preset". The **code**
+over-built beyond this contract: a pre-run planner whose output was
+materialized verbatim as graph roles, blueprint staffing equality enforced
+against the registry, and a compiled evidence scheduler. All three are revoked
+here; contradictions elsewhere in this document resolve in favor of this
+amendment.
+
+### 1. Dispatch authority belongs to the Coordinator, not to code
+
+- The Coordinator calls registered agents through a policy-gated
+  `call_specialist(agent_id, task, notes)` tool. It decides *which* agent and
+  *when*, from the agents' **context injected into its prompt** (id, name,
+  role, declared capabilities, output mode, system instructions) plus the
+  run's recorded evidence.
+- No agent is called because its stage tag exists. The stage table in §2 is
+  **informational vocabulary** (output-mode typing, verifier routing) — it is
+  not a dispatch policy and imposes no ordering.
+
+### 2. The planner is demoted to an advisory tool
+
+- §4's "passes control to the planner" is revoked. `TaskPlanner` output is
+  **never materialized as `SubTask` roles/dependencies** by
+  `decompose_task`/`decompose_from_evidence`. It may exist only as an
+  optional, coordinator-invoked advisor ("draft a work breakdown") whose plan
+  is context the Coordinator may use or ignore; `PLAN.md`/plan artifacts are
+  advisory records, never an authoritative workload.
+
+### 3. Registry is the roster; staffing is never enforced
+
+- The registry built from `custom_agents` config (ADR-58) is the roster.
+  Blueprint `def.agents` staffing equality checks and drift asserts are
+  **deleted**; a blueprint is advisory data at most.
+
+### 4. No compiled dispatch policy
+
+- There is no scheduler/decision-function that selects agents. Evidence
+  (ADR-65 facts, claims, decisions) is injected into the Coordinator's
+  context as guidance; the Coordinator selects, and every selection is
+  recorded as an evidence-backed `Decision` event (ADR-65 §6/§7 ledger, kept).
+
+### 5. Safety nets unchanged (post-action compensation)
+
+- Write gates, `SimplePolicyEngine`, `VirtualFs`, the zero-work guard, and the
+  checkpoint/resume ledger remain. Correctness is enforced **after** action —
+  verify, attribute, gate, revise — not by pre-empting the Coordinator.
+
+## Amendment (2026-09-16) — review and validation are Coordinator decisions; the run continues until a Coordinator decision or an error
+
+Revised **in place**, not superseded (per the project owner's standing
+instruction: no new ADR numbers). The 2026-09-05 amendment revokes compiled
+dispatch for implement-stage work; this amendment completes that revocation:
+**review and validation are also Coordinator decisions.** The Coordinator
+decides *whether* to call a reviewer or validator, *when*, and *what to do with
+the verdict* — including continuing to run until it concludes human
+intervention is required, or a genuine error stops it. Contradictions elsewhere
+in this document (notably the §4 "implement-stage completion triggers review
+cycles" sentence and the §2 stage-table rows that read `review`/`validate` as
+"loop … up to max_cycles" gates) resolve in favor of this amendment.
+
+### 1. Review and validation are Coordinator decisions, not pipeline gates
+
+- The auto-review trigger on any implement-stage success
+  (`execute_graph` → `run_review_cycle`) is **removed**. No agent is invoked
+  "because its stage tag exists" — a review-stage agent is called only when the
+  Coordinator calls it, through the same policy-gated `call_specialist` tool
+  as any specialist, journaled as an evidence-backed `Decision` event (ADR-65).
+- The auto-validation gate at the end of graph execution
+  (`execute_graph` → `run_validation_loop`) is **removed**. A validate-stage
+  agent (or Coordinator self-verification) runs only when the Coordinator
+  invokes it.
+- `CollaborationRule.max_cycles` (Review 3 / Acceptance 2 defaults) is
+  **advisory context injected into the Coordinator's prompt** (a "typical
+  cycle ceiling" it may weigh), never a hardcoded loop bound that terminates
+  the run.
+
+### 2. The run continues until a Coordinator decision or an error
+
+A run ends only through one of:
+
+1. **Completed** — the Coordinator decides the objective is met (no further
+   tool calls) **and** the acceptance check passes (see §4).
+2. **AwaitingUser** — the Coordinator calls the new `request_user_input` tool
+   with a reason; the run stops with a preserved checkpoint, surfaced to the
+   UI so the operator can answer and resume. This is the Coordinator-side half
+   of the consent gate; the interactive answer channel is tracked by
+   TODO #22/#23.
+3. **Partial/Failed on error** — a genuine hard error (provider failure,
+   cancellation, policy denial, run-wide dispatch cap ADR-52), with the
+   checkpoint ledger preserved for resume.
+
+There is **no** hardcoded cycle-count or stage-triggered terminal stop.
+`ReviewCycleEscalated` / `ValidationEscalated` events may still be published as
+informational evidence, but no code path converts them into a terminal
+`MultiAgentModeCompleted`.
+
+### 3. Verdicts are evidence, and failure returns to the Coordinator
+
+- A reviewer's verdict and a validator's Pass/Fail + eval output return as
+  tool results (`call_specialist`) and become ADR-65 evidence, so the next
+  decision-loop iteration sees them in the world model.
+- On validation (or review) failure the Coordinator decides the response:
+  re-dispatch the implementer with feedback, call a different specialist,
+  re-plan, or `request_user_input`. It may retry and iterate; nothing outside
+  the Coordinator forces a stop.
+- The fix/revision feedback loop that `run_review_cycle` /
+  `run_validation_loop` hardcoded (queue revision subtask up to max_cycles,
+  then escalate) is replaced by Coordinator-chosen re-dispatch.
+
+### 4. Acceptance stays a safety net, not a gate
+
+- The C-06 verification invariant survives: a build task may not be reported
+  `Completed` unless verification evidence exists *for this run* (an accepted
+  validator Pass, or accepted Coordinator self-verification). This is enforced
+  **after** the Coordinator declares completion (post-action compensation,
+  per the 2026-09-05 amendment §5), not by pre-empting it.
+- `record_acceptance` / `acceptance_rejection` remain and are invoked as part
+  of the completion decision, keyed on declared verification evidence.
+- `verify_expected_artifacts` (missing/placeholder artifact rejection) is
+  unchanged.
+
+### 5. Eval engine and shell profile
+
+- The eval-runner validation engine is unchanged in operation; the
+  registered-validator engine (`registry.rs`) is brought to parity with the
+  Coordinator self-verify engine by attaching the configured shell profile, so
+  a registered validator uses the same shell environment (PATH, aliases) as
+  Coordinator self-verification. This closes the observed Windows/msys2 smoke
+  gap (bare `pytest` resolution).
+
+## Consequences
+
+### Positive
+- The Coordinator is the sole decider of *which* agent runs, *when*, and
+  *why* — the 2026-09-05 amendment's dispatch authority now covers
+  review and validation too, with no residual hardcoded stage topology.
+- Failure terminates runs only by Coordinator conclusion or genuine error;
+  escalation becomes evidence, so a fixed-point loop can't silently end a run
+  at a hardcoded cycle ceiling.
+- The consent gate gains its Coordinator-side surface (`request_user_input` →
+  `AwaitingUser` + checkpoint), ready to be wired to the interactive channel.
+- C-06 verification-required semantics and artifact checks are preserved as
+  post-action safety nets.
+
+### Negative
+- The Coordinator may need more decisions (and hence more model dispatches) to
+  reach the same outcome; previously-hardcoded review/validation loops no
+  longer count against the Coordinator's budget by construction.
+- Tests that asserted the auto-gate behavior must be rewritten to assert
+  Coordinator-driven invocation and verdict handling.
+- Coordinator-solo runs that skip review/validation still rely on the
+  Coordinator's own judgment plus the completion-time acceptance check; a
+  Coordinator that never validates will be caught at completion (Partial with
+  preserved checkpoint), not mid-run.
+
+### Migration
+
+Implemented and verified on a feature branch merged to `dev` via PR with the
+2026-09-16 amendment. Gate: fmt, clippy `-D warnings`, nextest, cargo-deny all
+green; affected auto-gate tests rewritten; new tests cover Coordinator-driven
+review/validation, verdict-as-evidence, `request_user_input` →
+`AwaitingUser`, and completion-without-verification → Partial.
 
 ## Consequences
 

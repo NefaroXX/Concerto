@@ -169,6 +169,22 @@ agent. Scheduled after the live-test phase (2026-08-06 decision).
   chunk count at `cli/src/ui.rs:250`, P7 `switch_project` at
   `cli/src/app.rs:229`); document marked complete as of 2026-08-03.
 
+- **Consent gate: persistent "always allow" (issue #22).** Not started
+  (deferred — future web UI) — `docs/adrs/ADR-44.md:37`: the desktop
+  out-of-root consent gate's Allow is process-lifetime; a persistent
+  "always allow" was deferred alongside the api-server pending-approval flow.
+  Same gating condition as issue #23 below: implement when an in-tree
+  interactive web UI exists.
+
+## API / Server
+
+- **Out-of-root session pending-approval consent flow (issue #23).** Not
+  started (deferred — future web UI) — `docs/adrs/ADR-44.md:37`: session roots
+  outside `project_roots` are refused HTTP 403 by design today; the server-side
+  pending-approval flow (session created in a pending state, event emitted over
+  the bus/SSE, interactive client approves/rejects) was deferred because there
+  is no in-tree interactive HTTP client. Implement when a web UI materializes.
+
 ## Providers
 
 - **Flat tool-call parsing for OpenAI-compatible proxies.** Not started —

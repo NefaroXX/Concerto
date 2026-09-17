@@ -280,8 +280,8 @@ impl ProjectIndexer {
     /// service (vector store + FTS). Used for re-indexing changed files.
     ///
     /// Skips directories, unreadable/non-UTF8 files, and files exceeding the
-    /// configured size limit. Embedding failures fall back to FTS-only (a
-    /// zero vector) rather than failing the file.
+    /// configured size limit. Embedding failures fall back to FTS-only (an
+    /// empty-vector sentinel) rather than failing the file.
     pub async fn index_file(
         &self,
         path: &Path,

@@ -33,6 +33,7 @@ pub struct ServicesBuilder {
     vfs: Option<Arc<Mutex<VirtualFs>>>,
     session_manager: Option<Arc<ProjectSessionManager>>,
     memory: Arc<Mutex<Option<ActiveMemoryServices>>>,
+    plugins: Option<concerto_plugins::manager::SharedPluginManager>,
 }
 
 impl ServicesBuilder {
@@ -45,6 +46,7 @@ impl ServicesBuilder {
             vfs: None,
             session_manager: None,
             memory: Arc::new(Mutex::new(None)),
+            plugins: None,
         }
     }
 
@@ -67,6 +69,17 @@ impl ServicesBuilder {
     /// from the same frontend App.
     pub fn with_memory(mut self, memory: Arc<Mutex<Option<ActiveMemoryServices>>>) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Attach a process-lifetime WASM plugin-manager handle (desktop-only).
+    ///
+    /// The manager is materialised on the first run and reused across runs so
+    /// live grant revocation and provider re-discovery from the Settings UI
+    /// act on the same plugin instances an agent run uses. Omit for CLI/tests
+    /// (a per-run manager is built and dropped each run instead).
+    pub fn with_plugins(mut self, plugins: concerto_plugins::manager::SharedPluginManager) -> Self {
+        self.plugins = Some(plugins);
         self
     }
 
@@ -98,6 +111,7 @@ impl ServicesBuilder {
             session_manager: self.session_manager,
             skills,
             mcp,
+            plugins: self.plugins,
         }
     }
 }

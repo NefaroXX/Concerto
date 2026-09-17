@@ -31,8 +31,11 @@
 //! the accepted report is surfaced as canonical JSON in the run summary so
 //! the coordinator's existing snapshot path keeps working.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
+use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
 use concerto_core::event::{EventBus, EventKind};
 use concerto_core::executor::ToolExecutor;
@@ -40,8 +43,9 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
-    CompletionRequest, DesignDoc, EvalResult, Message, OutputMode, ResearchReport, ReviewReport,
-    ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition, ToolResult,
+    CompletionRequest, CompletionUsage, DesignDoc, EvalResult, Message, OutputMode, ResearchReport,
+    ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall, ToolChoice,
+    ToolDefinition, ToolOutput, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -93,6 +97,16 @@ pub struct GenericSpecialistAgent {
     /// verbatim into every prompt this agent builds; empty when skills are
     /// disabled.
     skills_section: String,
+    /// Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C),
+    /// threaded from the runtime's resolved shell settings. Injected into
+    /// every prompt this agent builds; empty when no card was provided
+    /// (manual/test constructions).
+    environment_card: String,
+    /// ADR-65 §3: tool-evidence writer. When `Some`, every completed tool
+    /// command this agent executes is recorded as a `ToolExecuted` whiteboard
+    /// event attributed to this agent (its `id`) — fail-soft, never affects
+    /// tool results.
+    tool_facts: Option<ToolFactContext>,
 }
 
 impl GenericSpecialistAgent {
@@ -131,6 +145,8 @@ impl GenericSpecialistAgent {
             eval: None,
             eval_mode: false,
             skills_section: String::new(),
+            environment_card: String::new(),
+            tool_facts: None,
         }
     }
 
@@ -164,6 +180,110 @@ impl GenericSpecialistAgent {
         self
     }
 
+    /// Attach the pre-rendered OS/shell identity card (custom-ai-shell plan,
+    /// Phase C), injected into every prompt this agent builds. Pass an empty
+    /// string to disable injection (manual/test constructions without resolved
+    /// shell settings).
+    pub fn with_environment_card(mut self, environment_card: &str) -> Self {
+        self.environment_card = environment_card.to_string();
+        self
+    }
+
+    /// Attach an ADR-65 §3 tool-evidence writer. When `Some`, every completed
+    /// tool command is recorded as a `ToolExecuted` whiteboard event
+    /// attributed to this agent's id — fail-soft, never affects tool results.
+    pub fn with_tool_facts(mut self, tool_facts: Option<ToolFactContext>) -> Self {
+        self.tool_facts = tool_facts;
+        self
+    }
+
+    /// ADR-65 §3: record a completed tool command as a `ToolExecuted`
+    /// whiteboard fact. Attribution is real, never inferred: this agent's
+    /// `ToolFactContext` carries its own id, and the per-call fact carries the
+    /// task id, run id, and workspace generation from the dispatch context.
+    /// Recording is fail-soft — a writer failure never affects the tool
+    /// result already returned to the model.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_tool_fact(
+        &self,
+        task: &SubTask,
+        context: &AgentContext,
+        tool: &str,
+        arguments: &serde_json::Value,
+        success: bool,
+        output_data: Option<&serde_json::Value>,
+        file_affecting: bool,
+        pre_image_hashes: HashMap<String, Option<String>>,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = task.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        let paths = crate::tool_facts::extract_affected_paths(arguments, output_data);
+        facts
+            .record_tool_executed(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: context.run_id.as_deref(),
+                    generation: context.workspace_generation.as_deref().unwrap_or(""),
+                    project_root: &context.session.project_dir,
+                    tool,
+                    args: arguments,
+                    success,
+                    exit_code: None,
+                    paths: &paths,
+                    file_affecting,
+                    pre_image_hashes,
+                },
+                cancel,
+            )
+            .await;
+    }
+
+    /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
+    /// `served_from` (the original observation's event id) and empty paths —
+    /// see `ToolFactContext::record_served_read`. Fail-soft, like every
+    /// evidence write; never affects the tool result already returned.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_served_read_fact(
+        &self,
+        task: &SubTask,
+        context: &AgentContext,
+        tool: &str,
+        arguments: &serde_json::Value,
+        served_from: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = task.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_served_read(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: context.run_id.as_deref(),
+                    generation: context.workspace_generation.as_deref().unwrap_or(""),
+                    project_root: &context.session.project_dir,
+                    tool,
+                    args: arguments,
+                    success: true,
+                    exit_code: None,
+                    paths: &[],
+                    file_affecting: false,
+                    pre_image_hashes: HashMap::new(),
+                },
+                served_from,
+                cancel,
+            )
+            .await;
+    }
+
     /// Build the prompt for this agent from its configured sections plus
     /// the task, memory context, and previous results.
     ///
@@ -189,10 +309,39 @@ impl GenericSpecialistAgent {
             prompt.push_str(&self.skills_section);
             prompt.push_str("\n\n");
         }
+        // OS/shell identity card (custom-ai-shell plan, Phase C): specialists
+        // execute shell tools, so they must know the host OS and the selected
+        // agent shell's dialect. Only appended when the runtime supplied a
+        // card — manual/test constructions without one are unchanged.
+        if !self.environment_card.is_empty() {
+            prompt.push_str(&self.environment_card);
+            prompt.push_str("\n\n");
+        }
         prompt.push_str(&task.description);
         prompt.push_str(&format!("\n\nWorkspace root: {}", context.session.project_dir.display()));
         prompt.push_str("\n\n");
         prompt.push_str(&crate::memory_prompt::format_run_memory(&context.working_memory));
+
+        // ADR-64 Phase 5: inject workspace capsule after working memory
+        // and before previous results. The capsule provides task-specific
+        // file metadata from the timeline so agents never re-read files
+        // merely to confirm existence.
+        if let Some(capsule) = &context.workspace_capsule {
+            let formatted = crate::capsule::format_capsule(capsule);
+            if !formatted.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&formatted);
+            }
+        }
+
+        // ADR-65 §2 (Phase 2): the pre-planning workspace snapshot digest —
+        // generation id, file/byte totals, top-level tree. Grounds the agent in
+        // the deterministic inventory captured before planning began.
+        if let Some(digest) = &context.workspace_snapshot_digest {
+            prompt.push_str("\n\n<workspace_snapshot>\n");
+            prompt.push_str(digest);
+            prompt.push_str("\n</workspace_snapshot>");
+        }
 
         if !context.previous_results.is_empty() {
             prompt.push_str("\n\n");
@@ -290,6 +439,11 @@ impl GenericSpecialistAgent {
     /// Run the historical Freeform tool loop: execute any tool calls through
     /// the optional executor and report the final text as the summary.
     ///
+    /// Every tool call passes through the shared tool-call guard
+    /// ([`guard_coordinator_tool_call`]) before execution, so weak-model
+    /// argument defects (e.g. `arguments: null`) are repaired or answered
+    /// with a corrective tool result instead of raw executor errors.
+    ///
     /// (Private inherent helper — the `ExpertAgent` trait's `run` dispatches
     /// here when `output_mode` is `Freeform`.)
     async fn run_freeform(
@@ -326,6 +480,11 @@ impl GenericSpecialistAgent {
             tokens_in: None,
             tokens_out: None,
         }];
+        // Per-run corrective-retry streaks, mirroring the single-agent loop's
+        // `tool_guard_rejects` map: at most
+        // [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective injections per
+        // tool before the exhausted message tells the model to move on.
+        let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
         // NOTE: chars/4 is a heuristic until provider usage is plumbed through.
         let mut tokens_in = 0_u64;
         let mut tokens_out = 0_u64;
@@ -333,36 +492,94 @@ impl GenericSpecialistAgent {
         let mut files_modified = Vec::new();
         let mut summary = String::new();
 
+        // ADR-66 §4: the universal text-fallback driver engages
+        // automatically when the provider lacks native tool support (never
+        // for plugin providers — those are hard-gated to AnswerOnly tasks
+        // with an explicit error). Fallback-driven requests carry no wire
+        // tool declarations; the driver's prompt section replaces them.
+        let mut tool_driver = (!tool_defs.is_empty()
+            && crate::tool_driver::fallback_engaged(self.provider.provider_name(), model))
+        .then(|| crate::tool_driver::TextToolDriver::new(tool_defs.clone()));
+        if let Some(_driver) = tool_driver.as_ref() {
+            // The prompt section is injected per request by
+            // [`TextToolDriver::augment_request`] (inserting its own System
+            // message when none exists), so the wire request never carries
+            // tool declarations and the conversation history stays clean.
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::AgentThought {
+                    agent_id: agent_id.to_string(),
+                    content: format!(
+                        "tool_driver: fallback engaged (provider '{}', model '{model}')",
+                        self.provider.provider_name()
+                    ),
+                },
+            );
+            self.record_tool_driver_event(
+                task,
+                model,
+                "engage",
+                "fallback",
+                "text-fallback tool driver engaged (no native tool support)",
+                &cancel,
+            )
+            .await;
+        }
+
         for iteration in 0..MAX_TOOL_ITERATIONS {
             if cancel.is_cancelled() {
                 return Err(OrchestratorError::Cancelled);
             }
 
-            let request = CompletionRequest {
+            let mut request = CompletionRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: (!tool_defs.is_empty()).then_some(tool_defs.clone()),
+                tools: match &tool_driver {
+                    // Fallback-driven requests carry no wire tool
+                    // declarations (ADR-66 §4 driver contract).
+                    Some(_) => None,
+                    None => (!tool_defs.is_empty()).then_some(tool_defs.clone()),
+                },
                 tool_choice: None,
                 temperature: Some(0.7),
                 max_tokens: Some(8192),
                 stream: false,
             };
+            if let Some(driver) = tool_driver.as_ref() {
+                driver.augment_request(&mut request);
+            }
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
             let estimated_tokens_in =
                 request.messages.iter().map(|message| message.content.len() as u64).sum::<u64>()
                     / 4;
 
-            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
-                &self.provider,
-                &request,
-                &self.retry_policy,
-                &self.bus,
-                task.session_id,
-                task.id,
-                &cancel,
-            )
-            .await?;
+            let (text, reasoning, tool_calls, usage) =
+                match self.complete_provider_audited(&request, task, &cancel).await {
+                    Ok(turn) => turn,
+                    Err(error) => return Err(error),
+                };
+            // ADR-66 §4: resolve the turn through the text-fallback driver —
+            // structured tool-call blocks parsed from the text, bounded
+            // repair on malformed blocks, loud failure on bound exhaustion.
+            // Native turns (driver inactive) pass through untouched.
+            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
+                Some(driver) => {
+                    self.freeform_driver_turn(
+                        driver,
+                        task,
+                        model,
+                        text,
+                        reasoning,
+                        usage,
+                        &mut messages,
+                        &cancel,
+                    )
+                    .await?
+                }
+                None => (text, reasoning, tool_calls, usage),
+            };
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
             let usage_in = usage.as_ref().and_then(|u| u.prompt_tokens);
@@ -409,24 +626,147 @@ impl GenericSpecialistAgent {
                         content: tool_execution_description(&tool_call.name, &tool_call.arguments),
                     },
                 );
+                // Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT →
+                // REPAIR): normalize the provider-accumulated arguments
+                // before execution. `text` is the assistant message that
+                // carried these tool calls — its intent feeds the guard's
+                // text-extraction backstop. Rejected calls never execute;
+                // the model receives a corrective tool result and retries on
+                // the next iteration.
+                let arguments = match guard_coordinator_tool_call(
+                    &tool_call.name,
+                    &tool_call.arguments,
+                    executor,
+                    &mut tool_guard_rejects,
+                    Some(text.as_str()),
+                ) {
+                    GuardedArguments::Pass(arguments) => arguments,
+                    GuardedArguments::Reject { content, payload } => {
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task.id.0,
+                            EventKind::AgentThought {
+                                agent_id: agent_id.to_string(),
+                                content: content.clone(),
+                            },
+                        );
+                        messages.push(Message {
+                            role: Role::Tool,
+                            content,
+                            tool_calls: None,
+                            tool_results: Some(vec![ToolResult {
+                                id: tool_call.id,
+                                name: tool_call.name.clone(),
+                                content: payload,
+                            }]),
+                            reasoning_content: None,
+                            tokens_in: None,
+                            tokens_out: None,
+                        });
+                        continue;
+                    }
+                };
+                // The write classification reads the guarded arguments so a
+                // heuristically repaired filesystem write is still recorded.
                 let is_file_change = matches!(
                     tool_call.name.as_str(),
                     "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
                 ) || (tool_call.name == "filesystem"
-                    && tool_call
-                        .arguments
-                        .get("operation")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|operation| {
-                            matches!(operation, "write" | "delete" | "move" | "copy")
-                        }));
-                match executor
-                    .execute(
+                    && arguments.get("operation").and_then(|value| value.as_str()).is_some_and(
+                        |operation| matches!(operation, "write" | "delete" | "move" | "copy"),
+                    ));
+                // ADR-65 §3: hash the pre-write state of every path this
+                // command will touch before it runs (fail-soft).
+                let pre_image_hashes = match &self.tool_facts {
+                    Some(facts) => {
+                        let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
+                        facts
+                            .pre_image_hashes(&context.session.project_dir, &affected, &cancel)
+                            .await
+                    }
+                    None => HashMap::new(),
+                };
+                // ADR-65 §4: safe read dedupe — a plain single-path filesystem
+                // read whose clean observation still matches the disk (re-statted
+                // now, content hash verified) is a serve candidate. Any doubt
+                // degrades to normal execution; the model receives a
+                // byte-identical read result either way.
+                let serve = match &self.tool_facts {
+                    Some(facts) => {
+                        crate::read_cache::maybe_serve_read(
+                            facts,
+                            &context.session.project_dir,
+                            &tool_call.name,
+                            &arguments,
+                            &cancel,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                // ADR-65 F1a: serve only when the policy engine explicitly
+                // allows the read through the advisory path (no decision row, no
+                // quota consumption); any non-Allow verdict runs the normal,
+                // fully policy-checked executor path below.
+                let serve = match serve {
+                    Some(serve)
+                        if executor
+                            .policy_verdict_is_allow(
+                                &tool_call.name,
+                                &arguments,
+                                &context.session,
+                                cancel.clone(),
+                            )
+                            .await =>
+                    {
+                        Some(serve)
+                    }
+                    _ => None,
+                };
+                if let Some(serve) = serve {
+                    // ADR-65 F1b: the serve consumed no executor decision row —
+                    // persist its own ServedFromCache audit row (fail-soft).
+                    executor
+                        .record_served_read_audit(
+                            &tool_call.name,
+                            &arguments,
+                            &serve.path,
+                            &context.session,
+                            cancel.clone(),
+                        )
+                        .await;
+                    let served_summary =
+                        format!("Read {} bytes from {}", serve.content.len(), serve.path);
+                    let output = ToolOutput {
+                        summary: served_summary.clone(),
+                        data: serde_json::json!({ "content": serve.content, "path": serve.path }),
+                    };
+                    self.record_served_read_fact(
+                        task,
+                        &context,
                         &tool_call.name,
-                        tool_call.arguments.clone(),
-                        &context.session,
-                        cancel.clone(),
+                        &arguments,
+                        &serve.event_id,
+                        &cancel,
                     )
+                    .await;
+                    messages.push(Message {
+                        role: Role::Tool,
+                        content: String::new(),
+                        tool_calls: None,
+                        tool_results: Some(vec![ToolResult {
+                            id: tool_call.id,
+                            name: tool_call.name.clone(),
+                            content: serde_json::to_value(&output).unwrap_or_default(),
+                        }]),
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    continue;
+                }
+                match executor
+                    .execute(&tool_call.name, arguments.clone(), &context.session, cancel.clone())
                     .await
                 {
                     Ok(output) => {
@@ -449,6 +789,34 @@ impl GenericSpecialistAgent {
                                 }
                             }
                         }
+                        // ADR-65 §3: record the completed (successful) tool
+                        // command with the paths it actually touched.
+                        self.record_tool_fact(
+                            task,
+                            &context,
+                            &tool_call.name,
+                            &arguments,
+                            true,
+                            Some(&output.data),
+                            is_file_change,
+                            pre_image_hashes.clone(),
+                            &cancel,
+                        )
+                        .await;
+                        // ADR-65 §4: cache the exact bytes of a successful plain
+                        // read (after the observation above, so the row exists)
+                        // so an identical later read can be served. Fail-soft.
+                        if let Some(facts) = &self.tool_facts {
+                            crate::read_cache::cache_read_output(
+                                facts,
+                                &context.session.project_dir,
+                                &tool_call.name,
+                                &arguments,
+                                &output.data,
+                                &cancel,
+                            )
+                            .await;
+                        }
                         messages.push(Message {
                             role: Role::Tool,
                             content: String::new(),
@@ -464,6 +832,20 @@ impl GenericSpecialistAgent {
                         });
                     }
                     Err(error) => {
+                        // ADR-65 §3: record the completed (failed) tool
+                        // command too — evidence exists either way.
+                        self.record_tool_fact(
+                            task,
+                            &context,
+                            &tool_call.name,
+                            &arguments,
+                            false,
+                            None,
+                            is_file_change,
+                            pre_image_hashes.clone(),
+                            &cancel,
+                        )
+                        .await;
                         let _ = self.bus.publish_for_session(
                             task.session_id,
                             task.id.0,
@@ -665,6 +1047,217 @@ impl GenericSpecialistAgent {
         }
     }
 
+    /// One provider completion with the ADR-66 capability-refusal audit:
+    /// a `ProviderError::CapabilityRefused` surfacing here (a tool-carrying
+    /// request that reached an incapable wire path) is recorded as a
+    /// `capability_gate` / Refused audit row (fail-soft) before the error
+    /// propagates — observable and diagnosable, never silent.
+    async fn complete_provider_audited(
+        &self,
+        request: &CompletionRequest,
+        task: &SubTask,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
+    {
+        match crate::prompts::complete_provider_request(
+            &self.provider,
+            request,
+            &self.retry_policy,
+            &self.bus,
+            task.session_id,
+            task.id,
+            cancel,
+        )
+        .await
+        {
+            Ok(turn) => Ok(turn),
+            Err(OrchestratorError::Provider(
+                concerto_core::error::ProviderError::CapabilityRefused {
+                    provider,
+                    model,
+                    capability,
+                },
+            )) => {
+                // ADR-66: every capability refusal is audited (fail-soft —
+                // the row write must not mask the refusal itself), then the
+                // error propagates loudly.
+                if let Some(executor) = &self.tool_executor {
+                    executor
+                        .record_capability_refusal(
+                            task.session_id,
+                            task.id.0,
+                            &provider,
+                            &model,
+                            &capability,
+                            "request_build",
+                            cancel.clone(),
+                        )
+                        .await;
+                }
+                Err(OrchestratorError::Provider(
+                    concerto_core::error::ProviderError::CapabilityRefused {
+                        provider,
+                        model,
+                        capability,
+                    },
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Persist an ADR-66 §4 `tool_driver` audit row through the optional
+    /// executor (fail-soft no-op without one).
+    async fn record_tool_driver_event(
+        &self,
+        task: &SubTask,
+        model: &str,
+        event: &str,
+        verdict: &str,
+        detail: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(executor) = &self.tool_executor else { return };
+        executor
+            .record_tool_driver_event(
+                task.session_id,
+                task.id.0,
+                self.provider.provider_name(),
+                model,
+                event,
+                verdict,
+                detail,
+                cancel.clone(),
+            )
+            .await;
+    }
+
+    /// ADR-66 §4: resolve one Freeform provider turn through the
+    /// text-fallback driver.
+    ///
+    /// Parses the turn's text for structured tool-call blocks. A malformed
+    /// block is repaired by re-prompting (bounded by
+    /// [`crate::tool_driver::MAX_REPAIR_ATTEMPTS`], each attempt audited and
+    /// labeled); bound exhaustion fails the run loudly — never a silent
+    /// completion. A turn with no block at all is a final answer in plain
+    /// text and keeps the loop's existing summary semantics.
+    #[allow(clippy::too_many_arguments)]
+    async fn freeform_driver_turn(
+        &self,
+        driver: &mut crate::tool_driver::TextToolDriver,
+        task: &SubTask,
+        model: &str,
+        mut text: String,
+        mut reasoning: Option<String>,
+        mut usage: Option<CompletionUsage>,
+        messages: &mut Vec<Message>,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
+    {
+        let mut attempts = 0u32;
+        loop {
+            match driver.parse_turn(&text) {
+                crate::tool_driver::DriverTurn::ToolCalls(calls) => {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: self.id.as_str().to_string(),
+                            content: format!(
+                                "tool_driver: fallback turn — {} tool call(s) parsed",
+                                calls.len()
+                            ),
+                        },
+                    );
+                    self.record_tool_driver_event(
+                        task,
+                        model,
+                        "turn",
+                        "fallback",
+                        &format!("{} tool call(s) parsed from text", calls.len()),
+                        cancel,
+                    )
+                    .await;
+                    return Ok((text, reasoning, calls, usage));
+                }
+                crate::tool_driver::DriverTurn::FinalAnswer(final_text) => {
+                    return Ok((final_text, reasoning, Vec::new(), usage));
+                }
+                crate::tool_driver::DriverTurn::Malformed { reason } => {
+                    if attempts >= crate::tool_driver::MAX_REPAIR_ATTEMPTS {
+                        self.record_tool_driver_event(
+                            task,
+                            model,
+                            "exhausted",
+                            "exhausted",
+                            &format!(
+                                "bounded repair exhausted after {attempts} attempts: {reason}"
+                            ),
+                            cancel,
+                        )
+                        .await;
+                        return Err(OrchestratorError::AgentLoopError(format!(
+                            "tool_driver: text-fallback repair exhausted after {attempts} attempts \
+                             (provider '{}', model '{model}'): {reason}",
+                            self.provider.provider_name()
+                        )));
+                    }
+                    attempts += 1;
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: self.id.as_str().to_string(),
+                            content: format!(
+                                "tool_driver: fallback repair attempt {attempts}: {reason}"
+                            ),
+                        },
+                    );
+                    self.record_tool_driver_event(
+                        task,
+                        model,
+                        "repair",
+                        "fallback",
+                        &format!("repair attempt {attempts}: {reason}"),
+                        cancel,
+                    )
+                    .await;
+                    // Re-prompt: the malformed reply stays in the history so
+                    // the model can see its own defect, followed by the
+                    // repair instruction.
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: reasoning.clone(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    messages.push(crate::tool_driver::TextToolDriver::repair_message(&reason));
+                    let mut request = CompletionRequest {
+                        model: model.to_string(),
+                        messages: messages.clone(),
+                        tools: None,
+                        tool_choice: None,
+                        temperature: Some(0.7),
+                        max_tokens: Some(8192),
+                        stream: false,
+                    };
+                    driver.augment_request(&mut request);
+                    let (repaired_text, repaired_reasoning, _, repaired_usage) =
+                        match self.complete_provider_audited(&request, task, cancel).await {
+                            Ok(turn) => turn,
+                            Err(error) => return Err(error),
+                        };
+                    usage = crate::tool_driver::merge_usage(usage, repaired_usage);
+                    text = repaired_text;
+                    reasoning = repaired_reasoning.or(reasoning);
+                }
+            }
+        }
+    }
+
     /// Run the historical validator eval path (audit A-01): delegate to the
     /// attached [`EvalEngine`] instead of calling an LLM, then post-process
     /// the result through the configured constraint rules and output format.
@@ -676,7 +1269,7 @@ impl GenericSpecialistAgent {
     async fn run_eval(
         &self,
         task: &SubTask,
-        _context: AgentContext,
+        context: AgentContext,
         cancel: CancellationToken,
     ) -> Result<AgentRunResult, OrchestratorError> {
         let agent_id = self.id.as_str();
@@ -715,8 +1308,31 @@ impl GenericSpecialistAgent {
 
         let start = std::time::Instant::now();
 
+        // Validation-root resolution from run evidence: prefer the manifest-
+        // bearing directory nearest the files the run actually wrote, falling
+        // back to the session project root when nothing better exists (no
+        // manifest anywhere keeps the honest Unknown failure). The engine's
+        // own configured directory is only redirected when the evidence
+        // actually selects a DIFFERENT directory — an empty evidence set, or
+        // a manifest resolved back at the session root, keeps the engine as
+        // constructed.
+        let evidence_files: Vec<camino::Utf8PathBuf> = context
+            .previous_results
+            .iter()
+            .flat_map(|result| result.files_modified.iter().cloned())
+            .collect();
+        let session_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+            .unwrap_or_default();
+        let resolved =
+            EvalEngine::resolve_manifest_root(&context.session.project_dir, &evidence_files);
+        let eval_dir = (!evidence_files.is_empty() && resolved != session_root.as_std_path())
+            .then_some(resolved);
+
         // Delegate to EvalEngine — no LLM call needed
-        let eval_result = match eval.run(cancel.clone()).await {
+        let eval_result = match match &eval_dir {
+            Some(dir) => eval.run_in_dir(dir, cancel.clone()).await,
+            None => eval.run(cancel.clone()).await,
+        } {
             Ok(result) => result,
             Err(e) => {
                 let latency_ms = start.elapsed().as_millis() as u64;
@@ -1135,8 +1751,9 @@ impl GenericSpecialistAgent {
     ///    bounded loop (max [`MAX_SUBMISSION_ATTEMPTS`] contract attempts);
     ///    after the bound the agent fails cleanly — it never restarts the run.
     /// 4. Non-contract tool calls go through the executor like `run_freeform`
-    ///    (policy-gated); they never count as submission attempts, so a
-    ///    tool-happy model is bounded by the hard [`MAX_TOOL_ITERATIONS`] cap.
+    ///    (tool-guard normalized, policy-gated); they never count as
+    ///    submission attempts, so a tool-happy model is bounded by the hard
+    ///    [`MAX_TOOL_ITERATIONS`] cap.
     /// 5. Providers that return text fall back to a tolerant parse of the
     ///    same shape (aliases included).
     ///
@@ -1229,6 +1846,9 @@ impl GenericSpecialistAgent {
         let mut validation_errors: Vec<String> = Vec::new();
         let mut files_modified: Vec<camino::Utf8PathBuf> = Vec::new();
         let mut iteration = 0_u32;
+        // Per-run corrective-retry streaks for executor tools, mirroring the
+        // single-agent loop's `tool_guard_rejects` map (see `run_freeform`).
+        let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
 
         let (summary, outcome) = 'submission: loop {
             if cancel.is_cancelled() {
@@ -1394,6 +2014,54 @@ impl GenericSpecialistAgent {
                                 ),
                             },
                         );
+                        // Tool-call guard (VALIDATE → COERCE → INFER →
+                        // EXTRACT → REPAIR), mirroring `run_freeform`: the
+                        // assistant text feeds text extraction, and rejected
+                        // calls never execute — the model receives a
+                        // corrective tool result in the same conversation.
+                        let arguments = match &self.tool_executor {
+                            Some(executor) => {
+                                match guard_coordinator_tool_call(
+                                    &tool_call.name,
+                                    &tool_call.arguments,
+                                    executor,
+                                    &mut tool_guard_rejects,
+                                    Some(text.as_str()),
+                                ) {
+                                    GuardedArguments::Pass(arguments) => arguments,
+                                    GuardedArguments::Reject { content, payload } => {
+                                        let _ = self.bus.publish_for_session(
+                                            task.session_id,
+                                            task.id.0,
+                                            EventKind::AgentThought {
+                                                agent_id: agent_id.to_string(),
+                                                content: content.clone(),
+                                            },
+                                        );
+                                        messages.push(Message {
+                                            role: Role::Tool,
+                                            content,
+                                            tool_calls: None,
+                                            tool_results: Some(vec![ToolResult {
+                                                id: tool_call.id.clone(),
+                                                name: tool_call.name.clone(),
+                                                content: payload,
+                                            }]),
+                                            reasoning_content: None,
+                                            tokens_in: None,
+                                            tokens_out: None,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            // No executor: nothing to guard; the legacy
+                            // "tool not found" error below keeps its shape.
+                            None => tool_call.arguments.clone(),
+                        };
+                        // The write classification reads the guarded
+                        // arguments so a heuristically repaired filesystem
+                        // write is still recorded.
                         let is_file_change = matches!(
                             tool_call.name.as_str(),
                             "write_file"
@@ -1402,19 +2070,117 @@ impl GenericSpecialistAgent {
                                 | "create_file"
                                 | "modify_file"
                         ) || (tool_call.name == "filesystem"
-                            && tool_call
-                                .arguments
+                            && arguments
                                 .get("operation")
                                 .and_then(|value| value.as_str())
                                 .is_some_and(|operation| {
                                     matches!(operation, "write" | "delete" | "move" | "copy")
                                 }));
+                        // ADR-65 §3: hash the pre-write state of every path
+                        // this command will touch before it runs (fail-soft).
+                        let pre_image_hashes = match &self.tool_facts {
+                            Some(facts) => {
+                                let affected =
+                                    crate::tool_facts::extract_affected_paths(&arguments, None);
+                                facts
+                                    .pre_image_hashes(
+                                        &context.session.project_dir,
+                                        &affected,
+                                        &cancel,
+                                    )
+                                    .await
+                            }
+                            None => HashMap::new(),
+                        };
+                        // ADR-65 §4: safe read dedupe (same rule as the
+                        // freeform loop above; any doubt → execute normally).
+                        let serve = match &self.tool_facts {
+                            Some(facts) => {
+                                crate::read_cache::maybe_serve_read(
+                                    facts,
+                                    &context.session.project_dir,
+                                    &tool_call.name,
+                                    &arguments,
+                                    &cancel,
+                                )
+                                .await
+                            }
+                            None => None,
+                        };
+                        // ADR-65 F1a: serve only on an explicit policy Allow via
+                        // the advisory path; anything else runs the normal,
+                        // fully policy-checked executor path below.
+                        let serve = match &self.tool_executor {
+                            Some(executor) => match serve {
+                                Some(serve)
+                                    if executor
+                                        .policy_verdict_is_allow(
+                                            &tool_call.name,
+                                            &arguments,
+                                            &context.session,
+                                            cancel.clone(),
+                                        )
+                                        .await =>
+                                {
+                                    Some(serve)
+                                }
+                                _ => None,
+                            },
+                            None => None,
+                        };
+                        if let Some(serve) = serve {
+                            // ADR-65 F1b: persist the ServedFromCache audit row
+                            // (fail-soft) — the serve consumed no decision row.
+                            if let Some(executor) = &self.tool_executor {
+                                executor
+                                    .record_served_read_audit(
+                                        &tool_call.name,
+                                        &arguments,
+                                        &serve.path,
+                                        &context.session,
+                                        cancel.clone(),
+                                    )
+                                    .await;
+                            }
+                            let served_summary =
+                                format!("Read {} bytes from {}", serve.content.len(), serve.path);
+                            let output = ToolOutput {
+                                summary: served_summary.clone(),
+                                data: serde_json::json!({
+                                    "content": serve.content,
+                                    "path": serve.path
+                                }),
+                            };
+                            self.record_served_read_fact(
+                                task,
+                                &context,
+                                &tool_call.name,
+                                &arguments,
+                                &serve.event_id,
+                                &cancel,
+                            )
+                            .await;
+                            messages.push(Message {
+                                role: Role::Tool,
+                                content: String::new(),
+                                tool_calls: None,
+                                tool_results: Some(vec![ToolResult {
+                                    id: tool_call.id.clone(),
+                                    name: tool_call.name.clone(),
+                                    content: serde_json::to_value(&output).unwrap_or_default(),
+                                }]),
+                                reasoning_content: None,
+                                tokens_in: None,
+                                tokens_out: None,
+                            });
+                            continue;
+                        }
                         let result = match &self.tool_executor {
                             Some(executor) => {
                                 executor
                                     .execute(
                                         &tool_call.name,
-                                        tool_call.arguments.clone(),
+                                        arguments.clone(),
                                         &context.session,
                                         cancel.clone(),
                                     )
@@ -1448,6 +2214,34 @@ impl GenericSpecialistAgent {
                                         }
                                     }
                                 }
+                                // ADR-65 §3: record the completed
+                                // (successful) tool command.
+                                self.record_tool_fact(
+                                    task,
+                                    &context,
+                                    &tool_call.name,
+                                    &arguments,
+                                    true,
+                                    Some(&output.data),
+                                    is_file_change,
+                                    pre_image_hashes.clone(),
+                                    &cancel,
+                                )
+                                .await;
+                                // ADR-65 §4: cache the exact bytes of a
+                                // successful plain read (after the observation
+                                // above). Fail-soft.
+                                if let Some(facts) = &self.tool_facts {
+                                    crate::read_cache::cache_read_output(
+                                        facts,
+                                        &context.session.project_dir,
+                                        &tool_call.name,
+                                        &arguments,
+                                        &output.data,
+                                        &cancel,
+                                    )
+                                    .await;
+                                }
                                 messages.push(Message {
                                     role: Role::Tool,
                                     content: String::new(),
@@ -1463,6 +2257,20 @@ impl GenericSpecialistAgent {
                                 });
                             }
                             Err(error) => {
+                                // ADR-65 §3: record the completed (failed)
+                                // tool command too.
+                                self.record_tool_fact(
+                                    task,
+                                    &context,
+                                    &tool_call.name,
+                                    &arguments,
+                                    false,
+                                    None,
+                                    is_file_change,
+                                    pre_image_hashes.clone(),
+                                    &cancel,
+                                )
+                                .await;
                                 let _ = self.bus.publish_for_session(
                                     task.session_id,
                                     task.id.0,
@@ -1641,6 +2449,142 @@ fn truncate_preview(text: &str) -> String {
     }
 }
 
+/// Outcome of the coordinator-path tool-call guard (mirrors the single-agent
+/// loop's `GuardOutcome` in `agent_loop.rs`).
+enum GuardedArguments {
+    /// Arguments are usable (possibly after coercion/repair); execute with
+    /// these instead of the raw provider arguments.
+    Pass(serde_json::Value),
+    /// Arguments are invalid even after repair; do not execute. Carries the
+    /// corrective tool-message text and structured payload to hand back to
+    /// the model so it retries with corrected arguments.
+    Reject { content: String, payload: serde_json::Value },
+}
+
+/// Tool-call guard for the multi-agent coordinator path (VALIDATE → COERCE →
+/// INFER → EXTRACT → REPAIR), mirroring the single-agent loop's
+/// `AgentLoop::guard_tool_call` exactly:
+///
+/// * parses `null`/empty/stringified arguments (including fenced JSON blocks)
+///   into a JSON object;
+/// * applies schema-guided safe coercions (string → number/boolean, enum case
+///   normalization, unknown-key stripping), logging every fix;
+/// * validates required fields, types, and enum membership against the tool's
+///   advertised schema (from [`ToolExecutor::tool_definitions`]); on failure
+///   attempts per-tool heuristic inference for unresolved required fields,
+///   accepting the repair only when the completed arguments re-validate
+///   cleanly;
+/// * when structured arguments and heuristics both fail, recovers the
+///   arguments from the model's own assistant message text
+///   ([`tool_guard::extract_from_text`], live-audit backstop) when the text
+///   states the call (e.g. `operation="read" path="src/main.rs"`), merging
+///   and re-validating before anything executes;
+/// * otherwise injects a structured corrective result, bounded by
+///   [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective retries per tool name
+///   via `guard_rejects` (which must live for one agent run), so the model
+///   retries with corrected arguments instead of stalling on raw executor
+///   `missing field` errors.
+///
+/// `assistant_text` is the latest assistant message text (`None` skips text
+/// extraction, leaving the guard's behavior unchanged).
+///
+/// Backend-protocol keys (`base_versions`, ADR-60 D5) are never stripped —
+/// the shared coercion layer treats them as reserved. Tools without a
+/// registry schema pass through untouched: the executor and policy engine
+/// own unknown-tool errors. The guard adds no `await` points, so the
+/// caller's `CancellationToken` is unaffected; callers stay bounded by their
+/// own iteration caps (`MAX_TOOL_ITERATIONS`) even when the model never
+/// corrects the arguments.
+fn guard_coordinator_tool_call(
+    tool_name: &str,
+    raw_arguments: &serde_json::Value,
+    executor: &ToolExecutor,
+    guard_rejects: &mut HashMap<String, u32>,
+    assistant_text: Option<&str>,
+) -> GuardedArguments {
+    let parsed = tool_guard::parse_tool_arguments(raw_arguments);
+    let definitions = executor.tool_definitions();
+    let Some(schema) =
+        definitions.iter().find(|definition| definition.name == tool_name).map(|d| &d.parameters)
+    else {
+        return GuardedArguments::Pass(parsed);
+    };
+
+    // The original parse result is kept for heuristic alias recovery:
+    // coercion strips hallucinated alias keys (`cmd`, `file`, ...), which
+    // are exactly the alternative field names the heuristics recover.
+    let (coerced, coercions) = tool_guard::coerce_arguments(parsed.clone(), schema);
+    if !coercions.is_empty() {
+        tracing::warn!(
+            tool = %tool_name,
+            coercions = ?coercions,
+            "coordinator tool-call guard coerced tool arguments"
+        );
+    }
+
+    let errors = tool_guard::validate_arguments(&coerced, schema);
+    if errors.is_empty() {
+        guard_rejects.remove(tool_name);
+        return GuardedArguments::Pass(coerced);
+    }
+
+    // Heuristic inference (adaptive tool-guard Solution 3): last-mile
+    // recovery before coaching the model — conservative by construction, and
+    // rejected with the original errors when the result still does not
+    // validate.
+    let mut repaired = coerced;
+    if let Some(notes) = tool_guard::heuristic_infer(tool_name, &parsed, &mut repaired, schema) {
+        // The fills stay on the outer `repaired` (text extraction may merge
+        // over them below); the re-coerce validates a copy.
+        let (repaired, repair_coercions) = tool_guard::coerce_arguments(repaired.clone(), schema);
+        if tool_guard::validate_arguments(&repaired, schema).is_empty() {
+            tracing::warn!(
+                tool = %tool_name,
+                heuristic_inferred = ?notes,
+                coercions = ?repair_coercions,
+                "coordinator tool-call guard heuristically inferred missing tool arguments"
+            );
+            guard_rejects.remove(tool_name);
+            return GuardedArguments::Pass(repaired);
+        }
+    }
+
+    // Text-intent extraction (live-audit backstop): when the structured
+    // arguments and heuristics both fail but the model's own message text
+    // states the call, recover the arguments from that text. Conservative by
+    // construction and accepted only when the merged arguments re-validate;
+    // anything else falls through to the corrective reject below unchanged —
+    // the fast-fail on empty args still applies when the text yields nothing.
+    if let Some(text) = assistant_text {
+        if let Some(extracted) = tool_guard::extract_from_text(text, tool_name, schema) {
+            let merged = tool_guard::merge_extracted_arguments(extracted, &repaired);
+            let (merged, _merge_coercions) = tool_guard::coerce_arguments(merged, schema);
+            if tool_guard::validate_arguments(&merged, schema).is_empty() {
+                guard_rejects.remove(tool_name);
+                return GuardedArguments::Pass(merged);
+            }
+        }
+    }
+
+    // Live-proven (Sep 2026 audit): zero-argument calls never correct on
+    // coaching — fail fast instead of burning the retry budget. Partial args
+    // keep bounded retries; the example can guide those repairs.
+    let has_keys = parsed.as_object().is_some_and(|map| !map.is_empty());
+    let reject_count = guard_rejects.entry(tool_name.to_string()).or_insert(0);
+    *reject_count += 1;
+    let exhausted = !has_keys || *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+    let content = tool_guard::corrective_message_text(tool_name, &errors, schema, exhausted);
+    let payload = tool_guard::corrective_tool_result(tool_name, &errors, schema, exhausted);
+    tracing::warn!(
+        tool = %tool_name,
+        reject_count,
+        exhausted,
+        errors = ?errors,
+        "coordinator tool-call guard rejected tool arguments; injecting corrective tool result"
+    );
+    GuardedArguments::Reject { content, payload }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1670,6 +2614,10 @@ mod tests {
             previous_results: Vec::new(),
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
+            workspace_capsule: None,
+            workspace_snapshot_digest: None,
+            run_id: None,
+            workspace_generation: None,
         }
     }
 
@@ -1780,6 +2728,76 @@ mod tests {
         assert!(prompt.contains("Implement the feature"));
     }
 
+    #[tokio::test]
+    async fn build_prompt_injects_environment_card() {
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            Arc::new(MockProvider::default()),
+            None,
+            EventBus::new(1024),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        )
+        .with_skills_section("## Skills\nWrite tests first.")
+        .with_environment_card(
+            "## Environment\n- OS: linux (x86_64)\n- Agent shell: OS default (`bash`)",
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Implement the feature".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let prompt = agent.build_prompt(&task, &ctx()).await;
+        assert!(prompt.contains("## Environment"), "identity card missing: {prompt}");
+        // Card comes after skills, before the task description.
+        let skills = prompt.find("## Skills").unwrap();
+        let card = prompt.find("## Environment").unwrap();
+        let task_text = prompt.find("Implement the feature").unwrap();
+        assert!(skills < card && card < task_text, "card ordering wrong: {prompt}");
+    }
+
+    #[tokio::test]
+    async fn build_prompt_omits_environment_card_when_empty() {
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            Arc::new(MockProvider::default()),
+            None,
+            EventBus::new(1024),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Implement the feature".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let prompt = agent.build_prompt(&task, &ctx()).await;
+        assert!(!prompt.contains("## Environment"), "unexpected identity card: {prompt}");
+        assert!(prompt.contains("Implement the feature"));
+    }
+
     // ------------------------------------------------------------------
     // Tool loop
     // ------------------------------------------------------------------
@@ -1795,6 +2813,33 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<(), concerto_core::error::PolicyError> {
             Ok(())
+        }
+    }
+
+    /// Capturing audit log for the ADR-66 `tool_driver` /
+    /// `capability_gate` row assertions.
+    #[derive(Clone)]
+    struct CapturingAudit(Arc<std::sync::Mutex<Vec<concerto_core::traits::policy::AuditEntry>>>);
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::policy::AuditLog for CapturingAudit {
+        async fn record(
+            &self,
+            entry: concerto_core::traits::policy::AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), concerto_core::error::PolicyError> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).push(entry);
+            Ok(())
+        }
+    }
+
+    impl CapturingAudit {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn entries(&self) -> Vec<concerto_core::traits::policy::AuditEntry> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
         }
     }
 
@@ -1835,10 +2880,77 @@ mod tests {
     struct SequencedProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<CompletionChunk>>,
     }
-
     impl SequencedProvider {
         fn new(responses: Vec<CompletionChunk>) -> Self {
             Self { responses: std::sync::Mutex::new(responses.into()) }
+        }
+    }
+
+    /// A text-only provider for the ADR-66 §4 fallback tests: each
+    /// `stream_completion` call pops the next plain-text reply (the last
+    /// scripted reply repeats once the script ends). Named `opencode` so,
+    /// paired with the `muse-v2` model, the exact production engagement
+    /// predicate fires.
+    struct TextSequencedProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+        saw_wire_tools: Arc<std::sync::atomic::AtomicBool>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TextSequencedProvider {
+        fn new(replies: Vec<String>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                saw_wire_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls_made(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for TextSequencedProvider {
+        async fn stream_completion(
+            &self,
+            request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, concerto_core::error::ProviderError> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                self.saw_wire_tools.store(true, Ordering::SeqCst);
+            }
+            let reply = {
+                let mut queue = self.replies.lock().unwrap_or_else(|error| error.into_inner());
+                if queue.len() > 1 {
+                    queue.pop_front().unwrap_or_default()
+                } else {
+                    // The last scripted reply repeats once the script ends —
+                    // an always-malformed provider keeps emitting the same
+                    // defect, which is what the exhaustion test needs.
+                    queue.back().cloned().unwrap_or_default()
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(CompletionChunk {
+                delta: reply,
+                reasoning: None,
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            })])))
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "opencode"
         }
     }
 
@@ -1891,6 +3003,8 @@ mod tests {
                     id: "call_1".into(),
                     name: "write_file".into(),
                     arguments: serde_json::json!({"operation": "write", "path": "src/a.rs"}),
+
+                    ..Default::default()
                 }),
                 is_final: true,
                 usage: None,
@@ -2065,6 +3179,8 @@ mod tests {
                         id: "call_1".into(),
                         name: "write_file".into(),
                         arguments: serde_json::json!({"operation": "write", "path": "src/a.rs"}),
+
+                        ..Default::default()
                     }),
                     is_final: true,
                     usage: None,
@@ -2137,6 +3253,27 @@ mod tests {
                     .any(|message| message.role == Role::User && message.content.contains(needle))
             })
         }
+
+        /// Whether any recorded request carried a `ToolResult` whose content
+        /// is a tool-guard corrective payload of the given `error` kind.
+        fn request_carried_guard_reject(&self, error: &str) -> bool {
+            self.guard_reject_payload(error).is_some()
+        }
+
+        /// The first recorded `ToolResult` content that is a tool-guard
+        /// corrective payload of the given `error` kind, if any.
+        fn guard_reject_payload(&self, error: &str) -> Option<serde_json::Value> {
+            self.calls.lock().unwrap().iter().find_map(|request| {
+                request.messages.iter().find_map(|message| {
+                    message.tool_results.as_ref().and_then(|results| {
+                        results.iter().find_map(|result| {
+                            (result.content.get("error").and_then(|v| v.as_str()) == Some(error))
+                                .then(|| result.content.clone())
+                        })
+                    })
+                })
+            })
+        }
     }
 
     #[async_trait::async_trait]
@@ -2173,7 +3310,12 @@ mod tests {
         CompletionChunk {
             reasoning: None,
             delta: String::new(),
-            tool_call: Some(ToolCall { id: id.into(), name: tool.into(), arguments }),
+            tool_call: Some(ToolCall {
+                id: id.into(),
+                name: tool.into(),
+                arguments,
+                ..Default::default()
+            }),
             is_final: true,
             usage: None,
         }
@@ -2577,6 +3719,8 @@ mod tests {
                     id: "call_loop".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "operation": "read", "path": "src/auth.rs" }),
+
+                    ..Default::default()
                 }),
                 is_final: true,
                 usage: None,
@@ -3313,6 +4457,99 @@ mod tests {
         assert_eq!(result.tool_call_count, 0);
     }
 
+    /// AgentContext whose session root differs from the engine's configured
+    /// directory (the smoke-session shape: the run built in a subdirectory).
+    fn ctx_at(project_dir: std::path::PathBuf) -> AgentContext {
+        AgentContext {
+            session: concerto_core::types::SessionContext {
+                session_id: concerto_core::ids::Ulid::new(),
+                project_id: ProjectId("test".into()),
+                project_dir,
+                user_prefs: Default::default(),
+            },
+            previous_results: Vec::new(),
+            ..ctx()
+        }
+    }
+
+    /// A pre-existing coder result providing the run's write evidence.
+    fn evidence_result(relative_paths: &[&str]) -> AgentRunResult {
+        AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            outcome: AgentOutcome::Success,
+            summary: "wrote files".into(),
+            files_modified: relative_paths.iter().map(camino::Utf8PathBuf::from).collect(),
+            tool_call_count: 1,
+            cost_usd: 0.0,
+            latency_ms: 0,
+            provider: "test".into(),
+            model: "test-model".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+        }
+    }
+
+    /// The validator resolves its working root from the run's write
+    /// evidence: a manifest inside a build subdirectory (“create a new Cargo
+    /// project” smoke regression) wins over the manifest-free session root,
+    /// where detection used to fail twice with `Unknown("no config file
+    /// found")` despite a fully built and verified project.
+    #[tokio::test]
+    async fn eval_mode_resolves_manifest_root_from_run_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let subdir = root.path().join("hexview");
+        std::fs::create_dir_all(subdir.join("src")).unwrap();
+        std::fs::write(subdir.join("Makefile"), "test:\n\t@echo \"all passed\"\n").unwrap();
+        // The engine is constructed at the (manifest-free) session root,
+        // exactly like the production runtime wiring.
+        let agent = eval_agent(
+            Some(Arc::new(EvalEngine::new(root.path()))),
+            PromptSections { output_format: "Pass/Fail report".into(), ..Default::default() },
+        );
+        let mut context = ctx_at(root.path().to_path_buf());
+        context.previous_results =
+            vec![evidence_result(&["hexview/src/main.rs", "hexview/Cargo.toml"])];
+
+        let result = agent
+            .run(&eval_task(), context, "test-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert!(
+            result.summary.contains("runner=make"),
+            "validation must run inside the subdirectory manifest root: {}",
+            result.summary
+        );
+    }
+
+    /// No manifest anywhere keeps the fallback root — the run still fails
+    /// honestly with the unchanged message instead of silently passing.
+    #[tokio::test]
+    async fn eval_mode_without_manifest_falls_back_to_session_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("loose.rs"), "fn main() {}\n").unwrap();
+        let agent = eval_agent(
+            Some(Arc::new(EvalEngine::new(root.path()))),
+            PromptSections { output_format: "Pass/Fail report".into(), ..Default::default() },
+        );
+        let mut context = ctx_at(root.path().to_path_buf());
+        context.previous_results = vec![evidence_result(&["loose.rs"])];
+
+        let result = agent
+            .run(&eval_task(), context, "test-model", CancellationToken::new())
+            .await
+            .expect("a failed validation is a clean AgentOutcome, not an Err");
+
+        assert!(matches!(result.outcome, AgentOutcome::Failed { .. }));
+        assert!(
+            result.summary.contains("no config file found"),
+            "the honest Unknown failure must surface unchanged: {}",
+            result.summary
+        );
+    }
+
     #[tokio::test]
     async fn eval_mode_run_fails_with_engine() {
         let dir = make_project("FAILED test_foo", false);
@@ -3455,5 +4692,508 @@ mod tests {
             tool_execution_description("shell", &serde_json::Value::String("nope".into())),
             "Executing tool shell (no arguments)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Tool-call guard on the coordinator path (multi-agent specialists)
+    // ------------------------------------------------------------------
+
+    /// Filesystem-named tool carrying the REAL filesystem schema; records
+    /// every executed input so tests can assert exactly what the guard let
+    /// through (and that rejected calls never execute).
+    struct RecordingFilesystemTool {
+        executed: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl RecordingFilesystemTool {
+        /// Register this tool in `registry`, returning the shared record of
+        /// executed inputs.
+        fn register_in(registry: &mut concerto_core::types::ToolRegistry) -> SharedExecutedInputs {
+            let executed: SharedExecutedInputs =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            registry.register(Box::new(Self { executed: std::sync::Arc::clone(&executed) }));
+            executed
+        }
+    }
+
+    /// Handle to the executed-input record shared with the registered tool.
+    type SharedExecutedInputs = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for RecordingFilesystemTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+        fn description(&self) -> &str {
+            "filesystem operations"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            concerto_tools::filesystem::FilesystemTool::new(camino::Utf8PathBuf::from("."))
+                .input_schema()
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            _session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            self.executed.lock().unwrap().push(input);
+            Ok(concerto_core::types::ToolOutput {
+                summary: "recorded".into(),
+                data: serde_json::json!({}),
+            })
+        }
+    }
+
+    /// A filesystem tool-call chunk with the given arguments (the weak-model
+    /// defect shape from the live audit).
+    fn filesystem_chunk(id: &str, arguments: serde_json::Value) -> CompletionChunk {
+        CompletionChunk {
+            reasoning: None,
+            delta: String::new(),
+            tool_call: Some(ToolCall {
+                id: id.into(),
+                name: "filesystem".into(),
+                arguments,
+                ..Default::default()
+            }),
+            is_final: true,
+            usage: None,
+        }
+    }
+
+    fn recording_filesystem_executor() -> (SharedExecutedInputs, Arc<ToolExecutor>) {
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        let executed = RecordingFilesystemTool::register_in(&mut registry);
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let executor = Arc::new(concerto_core::executor::ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(concerto_core::policy::SimplePolicyEngine::new(
+                allow_all,
+                Arc::new(NullAudit),
+            )),
+        ));
+        (executed, executor)
+    }
+
+    #[tokio::test]
+    async fn tool_guard_rejects_null_arguments_with_corrective_result() {
+        // Audit scenario: a weak model calls filesystem with `arguments:
+        // null` on the multi-agent coordinator path. The guard must reject
+        // the call (never reaching the executor) and hand the model a
+        // structured corrective payload instead of the raw executor
+        // "missing field" error.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            filesystem_chunk("call_1", serde_json::Value::Null),
+            text_chunk("Done without tools."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Read a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1, "the rejected call still counts as a tool call");
+        assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
+        let payload = provider
+            .guard_reject_payload("tool_guard_exhausted")
+            .expect("exhausted payload must reach the model");
+        assert_eq!(payload["tool"], "filesystem");
+        assert_eq!(payload["recovery"], "stop_or_ask_user");
+        assert!(
+            payload["field_errors"].as_array().is_some_and(|errors| !errors.is_empty()),
+            "field errors: {payload}"
+        );
+        // The human-readable corrective sentence rides the Tool message too.
+        assert!(
+            provider.calls.lock().unwrap().iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    message.role == Role::Tool
+                        && message.content.contains("Tool call invalid for 'filesystem'")
+                })
+            }),
+            "corrective message text must reach the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_extracts_arguments_from_assistant_text_and_executes() {
+        // Live-audit backstop shape on the multi-agent coordinator path: the
+        // model picks the right tool but emits `arguments: null` while its
+        // own message text states the call. The guard must recover the
+        // arguments from the assistant text and execute instead of rejecting
+        // with a corrective payload.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            // One completion carrying BOTH the intent-bearing text and the
+            // broken (null-args) tool call — exactly the audit's evidence
+            // shape.
+            CompletionChunk {
+                delta: "Filesystem operation=\"list\" path=\"src\"".into(),
+                reasoning: None,
+                tool_call: Some(ToolCall {
+                    id: "call_1".into(),
+                    name: "filesystem".into(),
+                    arguments: serde_json::Value::Null,
+
+                    ..Default::default()
+                }),
+                is_final: true,
+                usage: None,
+            },
+            text_chunk("Done."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Read a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1);
+        assert!(
+            !provider.request_carried_guard_reject("tool_guard_exhausted"),
+            "a text-repairable call must not be rejected"
+        );
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![serde_json::json!({"operation": "list", "path": "src"})],
+            "executor must receive the text-extracted arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristic_repair_executes_repaired_write() {
+        // A path+content filesystem call without `operation` is repaired by
+        // heuristic inference: the executor receives the completed arguments
+        // (operation=write), and the repaired write is recorded as a file
+        // change. `base_versions` (ADR-60 D5 gate protocol key) must survive
+        // the guard untouched.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            filesystem_chunk(
+                "call_1",
+                serde_json::json!({
+                    "path": "src/lib.rs",
+                    "content": "hello",
+                    "base_versions": { "src/lib.rs": "abc123" }
+                }),
+            ),
+            text_chunk("Wrote the file."),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implementation")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Write a file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let result = agent
+            .run(&task, ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1);
+        assert!(
+            !provider.request_carried_guard_reject("invalid_tool_arguments"),
+            "a repairable call must not be rejected"
+        );
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![serde_json::json!({
+                "path": "src/lib.rs",
+                "content": "hello",
+                "base_versions": { "src/lib.rs": "abc123" },
+                "operation": "write"
+            })],
+            "executor must receive the repaired arguments, raw args never reach it"
+        );
+        // The write classification ran on the guarded arguments: without the
+        // guard this write would be missing from files_modified.
+        assert_eq!(result.files_modified, vec![camino::Utf8PathBuf::from("src/lib.rs")]);
+    }
+
+    #[tokio::test]
+    async fn tool_guard_rejects_null_arguments_on_submission_path() {
+        // Same defect on the structured-output (run_submission) path: a
+        // non-contract filesystem call with null arguments is answered with
+        // the corrective payload, never executed, and the model still
+        // completes its submission afterwards.
+        let (executed, executor) = recording_filesystem_executor();
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            filesystem_chunk("call_1", serde_json::Value::Null),
+            submission_chunk("call_2", valid_doc_args()),
+        ]));
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("designer"),
+            "Designer".into(),
+            Some(AgentStage::new("design")),
+            provider.clone(),
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities::default(),
+        )
+        .with_output_mode(OutputMode::DesignDoc);
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 2, "filesystem call + submission");
+        assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
+        let payload = provider
+            .guard_reject_payload("tool_guard_exhausted")
+            .expect("exhausted payload must reach the model on the submission path");
+        assert_eq!(payload["tool"], "filesystem");
+        assert_eq!(payload["recovery"], "stop_or_ask_user");
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-66 §4: universal text-fallback driver (coordinator Freeform path)
+    // -------------------------------------------------------------------
+
+    /// Build a Freeform specialist wired for the fallback tests: a real
+    /// executor with [`WriteFileTool`] behind a capturing audit log.
+    fn fallback_agent(
+        provider: Arc<dyn LlmProvider>,
+        audit: CapturingAudit,
+    ) -> GenericSpecialistAgent {
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        registry.register(Box::new(WriteFileTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let executor = Arc::new(concerto_core::executor::ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(concerto_core::policy::SimplePolicyEngine::new(allow_all, Arc::new(audit))),
+        ));
+        GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            provider,
+            Some(executor),
+            EventBus::new(256),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        )
+    }
+
+    fn fallback_task() -> SubTask {
+        SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "write the file".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        }
+    }
+
+    /// ADR-66 A5: a simulated text-only specialist provider completes a
+    /// tool task through the fallback driver — the tool-call block parses,
+    /// executes through the real executor, and no wire tool declarations
+    /// are ever sent.
+    #[tokio::test]
+    async fn freeform_fallback_completes_tool_task() {
+        let block = "<tool_calls>\n\
+            [{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/fb.rs\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextSequencedProvider::new(vec![
+            block.to_string(),
+            "Wrote the file via the text driver.".to_string(),
+        ]));
+        let agent = fallback_agent(provider.clone(), CapturingAudit::new());
+        let task = fallback_task();
+        let result = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect("fallback-driven freeform run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success), "{:?}", result.outcome);
+        assert!(
+            result.summary.contains("Wrote the file via the text driver."),
+            "final answer must surface as the summary: {}",
+            result.summary
+        );
+        assert!(
+            !provider.saw_wire_tools.load(std::sync::atomic::Ordering::SeqCst),
+            "fallback-driven requests must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: a malformed block is repaired by re-prompting — the
+    /// specialist sees its defect plus the format instruction, and the next
+    /// reply parses.
+    #[tokio::test]
+    async fn freeform_fallback_repairs_malformed_block() {
+        let valid = "<tool_calls>\n\
+            [{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/repaired.rs\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextSequencedProvider::new(vec![
+            "<tool_calls>\nnot json\n</tool_calls>".to_string(),
+            valid.to_string(),
+            "Done.".to_string(),
+        ]));
+        let agent = fallback_agent(provider.clone(), CapturingAudit::new());
+        let task = fallback_task();
+        let result = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect("repaired freeform run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        // 3 provider calls: malformed turn + repair re-prompt + final answer.
+        assert_eq!(provider.calls_made(), 3);
+        assert!(
+            !provider.saw_wire_tools.load(std::sync::atomic::Ordering::SeqCst),
+            "repair re-prompts must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: bound exhaustion fails the specialist run loudly — the
+    /// error names the driver and the exhaustion, never a silent summary.
+    #[tokio::test]
+    async fn freeform_fallback_exhaustion_fails_loudly() {
+        let provider = Arc::new(TextSequencedProvider::new(vec![
+            "<tool_calls>\nstill not json\n</tool_calls>".to_string(),
+        ]));
+        let agent = fallback_agent(provider, CapturingAudit::new());
+        let task = fallback_task();
+        let error = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect_err("bound exhaustion must fail the run loudly");
+        let message = error.to_string();
+        assert!(message.contains("tool_driver"), "the failure must name the driver: {message}");
+        assert!(message.contains("muse-v2"), "the failure must name the model: {message}");
+    }
+
+    /// ADR-66: a capability refusal surfacing from the specialist's
+    /// provider call is audited (`capability_gate` / Refused) and then
+    /// propagates loudly.
+    #[tokio::test]
+    async fn freeform_capability_refusal_is_audited_and_loud() {
+        use concerto_core::error::ProviderError;
+
+        struct RefusingProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for RefusingProvider {
+            async fn stream_completion(
+                &self,
+                _request: CompletionRequest,
+                _cancel: CancellationToken,
+            ) -> Result<CompletionStream, ProviderError> {
+                Err(ProviderError::CapabilityRefused {
+                    provider: "opencode".into(),
+                    model: "muse-v2".into(),
+                    capability: "tool_calling".into(),
+                })
+            }
+            fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+                concerto_core::types::TokenBudget::new(128_000, 4_096)
+            }
+            fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+                0.0
+            }
+            fn provider_name(&self) -> &'static str {
+                "opencode"
+            }
+        }
+
+        let audit = CapturingAudit::new();
+        let agent = fallback_agent(Arc::new(RefusingProvider), audit.clone());
+        let task = fallback_task();
+        let error = agent
+            .run(&task, ctx(), "muse-v2", CancellationToken::new())
+            .await
+            .expect_err("a capability refusal must fail the run loudly");
+        let message = error.to_string();
+        assert!(
+            message.contains("tool_calling"),
+            "the refusal must name the missing capability: {message}"
+        );
+        let refusal_rows: Vec<_> = audit
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.tool_name == "capability_gate")
+            .collect();
+        assert_eq!(refusal_rows.len(), 1, "exactly one refusal audit row");
+        assert_eq!(refusal_rows[0].verdict, "Refused");
+        assert_eq!(refusal_rows[0].rule_matched.as_deref(), Some("request_build"));
     }
 }

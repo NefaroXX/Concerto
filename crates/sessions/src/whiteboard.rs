@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::query_as;
+use sqlx::AssertSqlSafe;
 
 use crate::SessionError;
 
@@ -50,6 +51,33 @@ pub enum WhiteboardKind {
     ReviewState,
     Consolidation,
     MemoryFact,
+    // ADR-65 evidence spine (additive). These are runtime-appended observed
+    // facts; older binaries reading the log see them as unknown kinds and must
+    // treat them as opaque — already the case for the JSON payload design.
+    ToolExecuted,
+    WorkspaceSnapshot,
+    /// ADR-65 §5: the DesignDoc produced for a planning stage, recorded as an
+    /// evidence-backed CLAIM. Payload is the serialized `DesignDoc`; the
+    /// deterministic verifier later resolves that claim against grounded
+    /// observations to either bind it (Verified) or quarantine it. Note this
+    /// is an *assertion about the intended workspace contract*, not a record
+    /// of observed reality — so it is spelled `design-doc`, not folded into
+    /// the runtime-observed kinds above.
+    /// Payload is the serialized `DesignDoc`; the
+    /// deterministic verifier later resolves that claim against grounded
+    /// observations to either bind it (Verified) or quarantine it. Note this
+    /// is an *assertion about the intended workspace contract*, not a record
+    /// of observed reality — so it is spelled `design-doc`, not folded into
+    /// the runtime-observed kinds above.
+    DesignDoc,
+    /// Issue #61: an artifact-ownership lifecycle audit event (transfer /
+    /// release / stale-mark), appended by the gate or its supervisor
+    /// callers. Payload is free-form JSON
+    /// (`ownership.rs::OwnershipAction` producers); the first-writer
+    /// auto-acquire is NOT a separate event — it rides the write's own
+    /// `write-applied` row (`ownership_acquired` payload), whose event id is
+    /// the acquiring-event id of the produced record.
+    OwnershipEvent,
 }
 
 impl WhiteboardKind {
@@ -73,6 +101,10 @@ impl WhiteboardKind {
             Self::ReviewState => "review-state",
             Self::Consolidation => "consolidation",
             Self::MemoryFact => "memory-fact",
+            Self::ToolExecuted => "tool-executed",
+            Self::WorkspaceSnapshot => "workspace-snapshot",
+            Self::DesignDoc => "design-doc",
+            Self::OwnershipEvent => "ownership-event",
         }
     }
 
@@ -247,6 +279,21 @@ fn push_field(buf: &mut Vec<u8>, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
+/// The evidence ids a Decision event's payload references, if any.
+///
+/// ADR-65 §6 fixes the Decision payload shape as `selected_agent, reason,
+/// required_output, supporting_evidence_ids`; the ids are read from the
+/// optional `supporting_evidence_ids` key (absent or non-array ⇒ empty).
+/// Any other payload — including every pre-existing Decision payload —
+/// validates as referencing nothing.
+fn decision_evidence_ids(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get("supporting_evidence_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
 /// Append a whiteboard event and return the stored row.
 ///
 /// `gate_seq` (global) and `agent_seq` (per-agent) are assigned inside a
@@ -259,14 +306,43 @@ fn push_field(buf: &mut Vec<u8>, value: &[u8]) {
 /// a no-op that returns the existing row (`INSERT OR IGNORE`), per the
 /// at-least-once + dedup contract. The returned row is the DB authority —
 /// duplicate inserts never mutate sequencing state.
+///
+/// Evidence-reference validation (ADR-65 §1, acceptance 8): a `Decision`
+/// event whose payload carries `supporting_evidence_ids` must reference
+/// EXISTING event ids — a fabricated coordinator evidence id fails
+/// validation and the append is rejected. The check runs inside the append
+/// transaction so the log cannot gain a decision citing an id it does not
+/// hold. (Claim kinds carry no citation field in the current schema, so
+/// there is nothing to validate on them yet; `causation` is deliberately
+/// unvalidated — it may legally carry non-event trigger strings such as
+/// workspace generations.)
 pub async fn append_whiteboard_event(
     pool: &sqlx::SqlitePool,
     event: &NewWhiteboardEvent,
 ) -> Result<WhiteboardEvent, SessionError> {
     let payload_json = serde_json::to_string(&event.payload)?;
     let content_hash = compute_content_hash(event)?;
+    let evidence_ids = if event.kind == WhiteboardKind::Decision {
+        decision_evidence_ids(&event.payload)
+    } else {
+        Vec::new()
+    };
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    for id in &evidence_ids {
+        let known: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM whiteboard_events WHERE event_id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if known.is_none() {
+            return Err(SessionError::Validation(format!(
+                "decision event {} references unknown evidence id {id:?}",
+                event.event_id
+            )));
+        }
+    }
 
     sqlx::query(
         "INSERT OR IGNORE INTO whiteboard_events
@@ -319,7 +395,10 @@ pub async fn load_whiteboard_events(
     }
     sql.push_str(" ORDER BY gate_seq ASC LIMIT ?");
 
-    let mut query = query_as::<_, WhiteboardEventRow>(&sql).bind(opts.after_gate_seq as i64);
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let mut query =
+        query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql)).bind(opts.after_gate_seq as i64);
     if let Some(session_id) = &opts.session_id {
         query = query.bind(session_id);
     }
@@ -343,8 +422,57 @@ pub async fn load_whiteboard_events_by_plan(
     let sql = format!(
         "SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE plan_id = ? ORDER BY gate_seq ASC"
     );
-    let rows = query_as::<_, WhiteboardEventRow>(&sql).bind(plan_id).fetch_all(pool).await?;
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let rows =
+        query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql)).bind(plan_id).fetch_all(pool).await?;
     rows.into_iter().map(WhiteboardEvent::try_from).collect()
+}
+
+/// ADR-60 D5 consistent-cut read: every event with `gate_seq <= max_gate_seq`
+/// ("everything ≤ seq S"), optionally restricted to one session, ordered by
+/// `gate_seq` ascending.
+///
+/// Unlike [`load_whiteboard_events`] there is no exclusive cursor and no
+/// limit: a gate-boundary checkpoint materializes the whole prefix of the cut,
+/// which is exactly the replay input for restore. The raw log is only read —
+/// never truncated or rewritten (the checkpoint is a projection).
+pub async fn load_whiteboard_events_up_to(
+    pool: &sqlx::SqlitePool,
+    max_gate_seq: u64,
+    session_id: Option<&str>,
+) -> Result<Vec<WhiteboardEvent>, SessionError> {
+    let mut sql = format!("SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE gate_seq <= ?");
+    if session_id.is_some() {
+        sql.push_str(" AND session_id = ?");
+    }
+    sql.push_str(" ORDER BY gate_seq ASC");
+
+    // Log-assigned seqs always fit i64; saturate absurd bounds (`u64::MAX`
+    // meaning "through end of log") instead of wrapping negative on cast.
+    let bound = i64::try_from(max_gate_seq).unwrap_or(i64::MAX);
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let mut query = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql)).bind(bound);
+    if let Some(session_id) = session_id {
+        query = query.bind(session_id);
+    }
+    let rows = query.fetch_all(pool).await?;
+    rows.into_iter().map(WhiteboardEvent::try_from).collect()
+}
+
+/// Current head of the log: the largest assigned `gate_seq`, or `0` when the
+/// log is empty. This is the natural boundary for "checkpoint at the current
+/// gate" ([`load_whiteboard_events_up_to`] takes it as its inclusive bound).
+pub async fn latest_gate_seq(pool: &sqlx::SqlitePool) -> Result<u64, SessionError> {
+    let head: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(gate_seq) FROM whiteboard_events").fetch_one(pool).await?;
+    match head {
+        Some(seq) => {
+            u64::try_from(seq).map_err(|_| SessionError::Storage("negative gate_seq".to_string()))
+        }
+        None => Ok(0),
+    }
 }
 
 const EVENT_COLUMNS: &str =
@@ -358,7 +486,9 @@ async fn load_whiteboard_event(
     event_id: &str,
 ) -> Result<WhiteboardEvent, SessionError> {
     let sql = format!("SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE event_id = ?");
-    let row = query_as::<_, WhiteboardEventRow>(&sql)
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let row = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql))
         .bind(event_id)
         .fetch_optional(conn)
         .await?
@@ -503,6 +633,139 @@ struct WhiteboardSubscriptionRow {
     subscriber_id: String,
     scopes: String,
     cursor_gate_seq: i64,
+}
+
+/// A whiteboard checkpoint: gate-boundary snapshot for D5 reversibility and
+/// deterministic replay (ADR-60 D5). The snapshot is an opaque JSON blob
+/// (file-system or whiteboard projection) taken at `gate_seq`; restore is
+/// snapshot + replay of tail events with `gate_seq > gate_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhiteboardCheckpoint {
+    /// Checkpoint id (ULID string).
+    pub id: String,
+    /// Gate sequence the snapshot is taken at (consistent cut).
+    pub gate_seq: u64,
+    /// Opaque snapshot payload (JSON).
+    pub snapshot: String,
+    /// Creation time (unix epoch ms, UTC).
+    pub created_at: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct WhiteboardCheckpointRow {
+    id: String,
+    gate_seq: i64,
+    snapshot: String,
+    created_at: i64,
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Create a whiteboard checkpoint at `gate_seq` with `snapshot` payload.
+pub async fn create_whiteboard_checkpoint(
+    pool: &sqlx::SqlitePool,
+    gate_seq: u64,
+    snapshot: &str,
+) -> Result<WhiteboardCheckpoint, SessionError> {
+    let id = ulid::Ulid::new().to_string();
+    let created_at = now_millis();
+    sqlx::query(
+        "INSERT INTO whiteboard_checkpoints (id, gate_seq, snapshot, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(gate_seq as i64)
+    .bind(snapshot)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(WhiteboardCheckpoint { id, gate_seq, snapshot: snapshot.to_owned(), created_at })
+}
+
+/// Load a checkpoint by id.
+pub async fn load_whiteboard_checkpoint(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<Option<WhiteboardCheckpoint>, SessionError> {
+    let row = sqlx::query_as::<_, WhiteboardCheckpointRow>(
+        "SELECT id, gate_seq, snapshot, created_at FROM whiteboard_checkpoints WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| WhiteboardCheckpoint {
+        id: r.id,
+        gate_seq: r.gate_seq as u64,
+        snapshot: r.snapshot,
+        created_at: r.created_at,
+    }))
+}
+
+/// Load the latest checkpoint at or before `gate_seq`.
+pub async fn load_whiteboard_checkpoint_by_gate_seq(
+    pool: &sqlx::SqlitePool,
+    gate_seq: u64,
+) -> Result<Option<WhiteboardCheckpoint>, SessionError> {
+    let row = sqlx::query_as::<_, WhiteboardCheckpointRow>(
+        "SELECT id, gate_seq, snapshot, created_at FROM whiteboard_checkpoints WHERE gate_seq <= ? ORDER BY gate_seq DESC LIMIT 1",
+    )
+    .bind(gate_seq as i64)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| WhiteboardCheckpoint {
+        id: r.id,
+        gate_seq: r.gate_seq as u64,
+        snapshot: r.snapshot,
+        created_at: r.created_at,
+    }))
+}
+
+/// List all checkpoints ordered by gate_seq ascending.
+pub async fn list_whiteboard_checkpoints(
+    pool: &sqlx::SqlitePool,
+) -> Result<Vec<WhiteboardCheckpoint>, SessionError> {
+    let rows = sqlx::query_as::<_, WhiteboardCheckpointRow>(
+        "SELECT id, gate_seq, snapshot, created_at FROM whiteboard_checkpoints ORDER BY gate_seq ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| WhiteboardCheckpoint {
+            id: r.id,
+            gate_seq: r.gate_seq as u64,
+            snapshot: r.snapshot,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Replay tail events after `checkpoint_gate_seq`, excluding `exclude_event_ids`.
+/// Used for per-agent revert: restore snapshot at checkpoint, then replay
+/// excluding the reverted agent's event_ids. Returns events in gate_seq order.
+pub async fn replay_whiteboard_tail_excluding(
+    pool: &sqlx::SqlitePool,
+    checkpoint_gate_seq: u64,
+    exclude_event_ids: &[String],
+) -> Result<Vec<WhiteboardEvent>, SessionError> {
+    let mut events = load_whiteboard_events(
+        pool,
+        &WhiteboardLoadOpts {
+            after_gate_seq: checkpoint_gate_seq,
+            session_id: None,
+            scope: None,
+            limit: 10000,
+        },
+    )
+    .await?;
+    if !exclude_event_ids.is_empty() {
+        events.retain(|e| !exclude_event_ids.contains(&e.event_id));
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -679,6 +942,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consistent_cut_reader_returns_inclusive_prefix_and_head() {
+        let (_dir, pool) = test_pool(1).await;
+        assert_eq!(latest_gate_seq(&pool).await.expect("empty head"), 0, "empty log head is 0");
+
+        for (i, (agent, session)) in
+            [("agent-a", Some("sess-1")), ("agent-b", None), ("agent-a", None)].iter().enumerate()
+        {
+            let mut event = new_event(&format!("cut-{i}"), agent, WhiteboardKind::WriteApplied);
+            event.session_id = session.map(str::to_owned);
+            append_whiteboard_event(&pool, &event).await.expect("append");
+        }
+
+        assert_eq!(latest_gate_seq(&pool).await.expect("head"), 3);
+
+        // Inclusive upper bound: seq 2 folds rows 1 and 2, never 3.
+        let cut = load_whiteboard_events_up_to(&pool, 2, None).await.expect("cut at 2");
+        assert_eq!(cut.iter().map(|ev| ev.gate_seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        let full = load_whiteboard_events_up_to(&pool, u64::MAX, None).await.expect("full cut");
+        assert_eq!(full.len(), 3);
+
+        // Session filter composes with the cut.
+        let sess1 = load_whiteboard_events_up_to(&pool, u64::MAX, Some("sess-1"))
+            .await
+            .expect("session cut");
+        assert_eq!(sess1.iter().map(|ev| ev.event_id.as_str()).collect::<Vec<_>>(), vec!["cut-0"]);
+    }
+
+    #[tokio::test]
     async fn cursor_pagination_respects_limit_and_ordering() {
         let (_dir, pool) = test_pool(1).await;
         for i in 1..=5 {
@@ -794,6 +1086,9 @@ mod tests {
             (WhiteboardKind::ReviewState, "review-state"),
             (WhiteboardKind::Consolidation, "consolidation"),
             (WhiteboardKind::MemoryFact, "memory-fact"),
+            (WhiteboardKind::ToolExecuted, "tool-executed"),
+            (WhiteboardKind::WorkspaceSnapshot, "workspace-snapshot"),
+            (WhiteboardKind::DesignDoc, "design-doc"),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.as_str(), expected, "as_str kebab-case");
@@ -803,6 +1098,119 @@ mod tests {
                 "serde kebab-case"
             );
         }
+    }
+
+    /// ADR-65 evidence-spine kinds are ordinary log kinds: they append, load
+    /// back, dedup by event_id, and their payload survives the JSON round trip
+    /// exactly like the established kinds.
+    #[tokio::test]
+    async fn adr65_evidence_kinds_round_trip_through_the_log() {
+        let (_dir, pool) = test_pool(1).await;
+
+        let mut executed = new_event("ev-1", "agent-a", WhiteboardKind::ToolExecuted);
+        executed.payload = json!({
+            "tool": "apply_diff",
+            "args": { "path": "a.md" },
+            "success": true,
+            "generation": "gen-3",
+            "paths": [{ "path": "a.md", "content_hash": "h1" }]
+        });
+        let mut snapshot = new_event("ev-2", "agent-a", WhiteboardKind::WorkspaceSnapshot);
+        snapshot.payload = json!({
+            "generation": "gen-3",
+            "files": [{ "path": "a.md", "size_bytes": 42, "content_hash": "h1" }]
+        });
+
+        let stored_exec = append_whiteboard_event(&pool, &executed).await.expect("append executed");
+        let stored_snap = append_whiteboard_event(&pool, &snapshot).await.expect("append snapshot");
+
+        // Kinds serialize kebab-case on the wire.
+        assert_eq!(serde_json::to_value(stored_exec.kind).expect("kind"), json!("tool-executed"));
+        assert_eq!(
+            serde_json::to_value(stored_snap.kind).expect("kind"),
+            json!("workspace-snapshot")
+        );
+
+        // They are ordinary log rows: dedup by event_id, ordered by gate_seq.
+        let replay = append_whiteboard_event(&pool, &executed).await.expect("replay executed");
+        assert_eq!(replay.event_id, "ev-1", "dedup keeps the original row");
+        assert_eq!(replay.gate_seq, 1, "the duplicate did not advance the log");
+
+        let loaded =
+            load_whiteboard_events(&pool, &WhiteboardLoadOpts::default()).await.expect("load");
+        assert_eq!(
+            loaded.iter().map(|ev| ev.kind).collect::<Vec<_>>(),
+            vec![WhiteboardKind::ToolExecuted, WhiteboardKind::WorkspaceSnapshot],
+            "both evidence kinds load back in append order"
+        );
+
+        // Nested evidence payloads survive the JSON round trip.
+        let decoded: WhiteboardEvent =
+            serde_json::from_str(&serde_json::to_string(&stored_snap).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(decoded.payload["files"][0]["path"], json!("a.md"));
+        assert_eq!(decoded.payload["files"][0]["size_bytes"], json!(42));
+        assert_eq!(decoded.payload["generation"], json!("gen-3"));
+    }
+
+    /// ADR-65 §1 acceptance 8: a Decision event citing REAL evidence ids
+    /// appends; one citing a fabricated id is rejected at append and nothing
+    /// lands. Decisions without the payload key (every pre-existing payload
+    /// shape) and non-Decision kinds are unaffected.
+    #[tokio::test]
+    async fn decision_evidence_ids_are_validated_at_append() {
+        let (_dir, pool) = test_pool(1).await;
+
+        // A real evidence event to cite.
+        append_whiteboard_event(
+            &pool,
+            &new_event("ev-real", "agent-a", WhiteboardKind::ToolExecuted),
+        )
+        .await
+        .expect("evidence event appended");
+
+        // A Decision citing the real id appends.
+        let mut citing = new_event("dec-1", "coordinator", WhiteboardKind::Decision);
+        citing.payload = json!({
+            "selected_agent": "coder",
+            "reason": "evidence-sufficient-implement",
+            "required_output": "Implement: obj",
+            "supporting_evidence_ids": ["ev-real"],
+        });
+        append_whiteboard_event(&pool, &citing).await.expect("real evidence ids are accepted");
+
+        // A Decision citing a fabricated id is REJECTED at append.
+        let mut fabricated = new_event("dec-2", "coordinator", WhiteboardKind::Decision);
+        fabricated.payload = json!({
+            "selected_agent": "coder",
+            "reason": "evidence-gap-explore",
+            "required_output": "Grounded fact inventory",
+            "supporting_evidence_ids": ["ev-fabricated"],
+        });
+        let err = append_whiteboard_event(&pool, &fabricated)
+            .await
+            .expect_err("a fabricated evidence id must be rejected");
+        assert!(matches!(err, SessionError::Validation(_)), "got: {err:?}");
+
+        // Nothing landed for the rejected decision.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM whiteboard_events WHERE event_id = 'dec-2'")
+                .fetch_one(&pool)
+                .await
+                .expect("row count");
+        assert_eq!(count, 0, "the rejected decision never lands");
+
+        // A Decision payload without the key (every pre-existing shape) is
+        // unaffected.
+        append_whiteboard_event(&pool, &new_event("dec-3", "agent-a", WhiteboardKind::Decision))
+            .await
+            .expect("payload without evidence ids appends");
+
+        // Non-Decision kinds are never evidence-validated, even when they
+        // carry a lookalike key.
+        let mut executed = new_event("ev-2", "agent-a", WhiteboardKind::ToolExecuted);
+        executed.payload = json!({ "supporting_evidence_ids": ["ev-fabricated"] });
+        append_whiteboard_event(&pool, &executed).await.expect("non-Decision kinds unvalidated");
     }
 
     #[tokio::test]
@@ -1023,5 +1431,71 @@ mod tests {
         let loaded =
             load_whiteboard_subscription(&pool, "agent-b").await.expect("load").expect("row");
         assert_eq!(loaded, re_registered, "re-registration replaces scopes and cursor");
+    }
+
+    // --- ADR-60 D5: checkpoint durability (migration 028) ---
+
+    #[tokio::test]
+    async fn whiteboard_checkpoint_round_trips() {
+        let (_dir, pool) = test_pool(1).await;
+        let cp1 = create_whiteboard_checkpoint(&pool, 5, r#"{"files":{"a.txt":"hello"}}"#)
+            .await
+            .expect("create cp1");
+        assert_eq!(cp1.gate_seq, 5);
+        let loaded = load_whiteboard_checkpoint(&pool, &cp1.id).await.expect("load").expect("row");
+        assert_eq!(loaded, cp1);
+        let cp2 = create_whiteboard_checkpoint(&pool, 10, r#"{"files":{"a.txt":"hello world"}}"#)
+            .await
+            .expect("create cp2");
+        let by_gate = load_whiteboard_checkpoint_by_gate_seq(&pool, 7)
+            .await
+            .expect("load by gate")
+            .expect("row");
+        assert_eq!(by_gate.id, cp1.id, "latest checkpoint <= gate_seq");
+        let all = list_whiteboard_checkpoints(&pool).await.expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].gate_seq, 5);
+        assert_eq!(all[1].gate_seq, 10);
+        let _ = cp2;
+    }
+
+    #[tokio::test]
+    async fn replay_excluding_filters_per_agent_events() {
+        let (_dir, pool) = test_pool(1).await;
+        let e1 = append_whiteboard_event(
+            &pool,
+            &new_event("e1", "agent-a", WhiteboardKind::WriteApplied),
+        )
+        .await
+        .expect("append e1");
+        let e2 = append_whiteboard_event(
+            &pool,
+            &new_event("e2", "agent-a", WhiteboardKind::WriteApplied),
+        )
+        .await
+        .expect("append e2");
+        let e3 = append_whiteboard_event(
+            &pool,
+            &new_event("e3", "agent-a", WhiteboardKind::WriteApplied),
+        )
+        .await
+        .expect("append e3");
+        create_whiteboard_checkpoint(&pool, e1.gate_seq, r#"{"snap":1}"#)
+            .await
+            .expect("checkpoint");
+        // Replay after e1, excluding e2 (per-agent revert)
+        let replay = replay_whiteboard_tail_excluding(
+            &pool,
+            e1.gate_seq,
+            std::slice::from_ref(&e2.event_id),
+        )
+        .await
+        .expect("replay");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, e3.event_id);
+        // Full replay without exclusion
+        let full = replay_whiteboard_tail_excluding(&pool, e1.gate_seq, &[]).await.expect("full");
+        assert_eq!(full.len(), 2);
+        let _ = e1;
     }
 }

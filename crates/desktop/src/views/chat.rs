@@ -33,6 +33,11 @@ pub enum SubView {
     ToolLog,
     /// Spend Log modal overlay (status-bar spend chip).
     SpendLog,
+    /// Per-session Runtime modal overlay: the read-only Coordinator 2.0
+    /// observability panels (Decision Journal / World Model / Failure
+    /// Diagnoses / Suitability) for the active session. Opened from the chat
+    /// window (Ctrl+R); Esc or the close button dismisses it.
+    Runtime,
 }
 
 /// Messages that the chat view can handle.

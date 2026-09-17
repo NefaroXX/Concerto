@@ -12,7 +12,9 @@
 //! The slice runs exactly one task per process: the task arrives via the
 //! environment, the loop runs to completion, a terminal whiteboard event is
 //! published (`subtask-completed` / `failure`), and the process exits. The
-//! supervisor owns restarts.
+//! supervisor owns restarts. On Linux the child additionally arms
+//! `PR_SET_PDEATHSIG` so a supervisor crash tears it down instead of leaking
+//! it (ADR-60 D1 orphan cleanup).
 //!
 //! ## Environment contract
 //!
@@ -24,6 +26,7 @@
 //! | `CONCERTO_MAX_ITERATIONS` | Loop iteration cap (default 25). |
 //! | `CONCERTO_PROVIDER` | `mock` (the only wiring in the slice; default). |
 //! | `CONCERTO_MOCK_SCRIPT_JSON` | Optional per-turn [`CompletionChunk`] script for the mock provider. |
+//! | `CONCERTO_PLAN_ID` | Optional approved plan id (ADR-60 D7 ledger enrichment); stamps every gated write and the terminal event. |
 //!
 //! ## Stdout discipline
 //!
@@ -101,6 +104,16 @@ async fn run() -> i32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(25);
+    // ADR-60 D7 ledger enrichment: a plan-driven run hands its approved plan
+    // id to every child; the child mirrors it onto each gated write and its
+    // terminal whiteboard events so `fold_ledger` can attribute them.
+    let plan_id = std::env::var("CONCERTO_PLAN_ID").ok().filter(|plan_id| !plan_id.is_empty());
+
+    // ADR-60 D1 orphan cleanup: on Linux, ask the kernel to SIGTERM this
+    // process when its parent (the supervisor) dies. Best-effort — see
+    // `install_parent_death_signal`.
+    #[cfg(target_os = "linux")]
+    install_parent_death_signal();
 
     // Bind to the supervisor: handshake (D2) then the tool registry (the
     // gate owns what the loop may present to the model).
@@ -112,13 +125,14 @@ async fn run() -> i32 {
         }
     };
     let client = Arc::new(tokio::sync::Mutex::new(client));
-    let backend = match GateProxyBackend::new(client.clone(), agent_id.clone()).await {
-        Ok(backend) => Arc::new(backend),
-        Err(error) => {
-            eprintln!("agent-process: tool registry fetch failed: {error}");
-            return 1;
-        }
-    };
+    let backend =
+        match GateProxyBackend::new(client.clone(), agent_id.clone(), plan_id.clone()).await {
+            Ok(backend) => Arc::new(backend),
+            Err(error) => {
+                eprintln!("agent-process: tool registry fetch failed: {error}");
+                return 1;
+            }
+        };
 
     let provider: Arc<dyn LlmProvider> = match std::env::var("CONCERTO_PROVIDER").as_deref() {
         Ok("mock") | Err(_) => match mock_provider() {
@@ -170,27 +184,59 @@ async fn run() -> i32 {
     let cancel = CancellationToken::new();
     match agent.run(task.clone(), cancel).await {
         Ok(_output) => {
-            let event = terminal_event(
+            let mut event = terminal_event(
                 &agent_id,
                 &task,
                 WhiteboardKind::SubtaskCompleted,
                 json!({ "task_id": task.id.to_string(), "status": "completed" }),
             );
+            event.plan_id = plan_id;
             publish_best_effort(&backend, event).await;
             eprintln!("agent-process: task completed");
             0
         }
         Err(error) => {
             eprintln!("agent-process: task failed: {error}");
-            let event = terminal_event(
+            let mut event = terminal_event(
                 &agent_id,
                 &task,
                 WhiteboardKind::Failure,
                 json!({ "task_id": task.id.to_string(), "error": error.to_string() }),
             );
+            event.plan_id = plan_id;
             publish_best_effort(&backend, event).await;
             1
         }
+    }
+}
+
+/// Ask Linux to deliver `SIGTERM` to this process when its parent exits
+/// (ADR-60 D1 orphan cleanup). The supervisor spawns this binary directly —
+/// no shell wrapper, no `setsid` (see `Supervisor::spawn_inner`) — so this
+/// process *is* the direct child and `PR_SET_PDEATHSIG`, which survives
+/// `execve`, fires exactly when the supervisor dies.
+///
+/// Best-effort by design: on failure we warn and continue rather than refuse
+/// to start. Normal shutdown is unaffected (stdin-close → grace → SIGKILL
+/// escalation lives supervisor-side), and the narrow startup race where the
+/// supervisor dies before this call self-heals — the subsequent handshake
+/// hits EOF on the dead pipes and `run` returns exit code 1.
+#[cfg(target_os = "linux")]
+fn install_parent_death_signal() {
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGTERM)` sets a per-process kernel
+    // option; it takes no pointers and touches none of our memory. This is
+    // the binary's only `unsafe`, permitted because libc exposes no safe
+    // wrapper for the call. The workspace denies `unsafe_code`; this scoped
+    // allow is the deliberate, documented exception.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+    if result != 0 {
+        // No tracing subscriber is installed in this binary (module docs);
+        // stderr is the diagnostic channel.
+        eprintln!(
+            "agent-process: prctl(PR_SET_PDEATHSIG) failed ({result}); orphan cleanup \
+             degrades to stdio EOF detection"
+        );
     }
 }
 

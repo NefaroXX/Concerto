@@ -1,0 +1,321 @@
+//! Per-model tool-calling capability resolution (ADR-66 §3).
+//!
+//! Tool calling was historically hardcoded `true` per provider, so any
+//! tool-requiring task dispatched to a model without tool support degraded
+//! to silent text-only output. This module resolves
+//! `supports_tool_calling` **per model** at selection time with a fixed
+//! precedence:
+//!
+//! 1. **explicit config override** — `ModelProfileOverride::
+//!    supports_tool_calling`, applied by the caller (config-level concern);
+//! 2. **`list_models` capability flags** — where a provider advertises
+//!    per-model capability metadata (e.g. Ollama's `capabilities` array),
+//!    the advertised value wins over every heuristic below;
+//! 3. **built-in family table** — known model families with known
+//!    capability gaps (today: Zen-served Responses-dialect models —
+//!    genuine `muse-v*` models plus `muse-spark-*` via the explicit
+//!    dialect prefix entry — whose Responses path carries no tool
+//!    declarations);
+//! 4. **provider default** — attempt native tool calling (ADR-66 §3:
+//!    unknown models attempt native first, never silent text).
+//!
+//! The resolution feeds `RoutingProfile::supports_tool_calling` in
+//! [`crate::factory::ProviderFactory::build_profiles`]. Tool-requiring runs
+//! are gated at selection time — before any spend — but only refused when
+//! the gap cannot be covered by the ADR-66 §4 text-fallback driver
+//! ([`tool_fallback_available`]): a model whose ONLY gap is native tool
+//! declarations proceeds with the labeled fallback driver, while
+//! plugin-backed providers (no tool ops in the protocol, excluded from
+//! fallback) refuse loudly.
+//!
+//! # Not covered by the family table
+//!
+//! Plugin-backed providers (`plugin:<id>`) are hard-gated separately: their
+//! wire protocol has no tool ops, so [`is_plugin_backed`] names them and
+//! [`provider_default_supports_tools`] reports `false`. A tool-requiring
+//! task resolved onto a plugin provider must refuse loudly (ADR-66
+//! consequence: the factory gates them to AnswerOnly tasks).
+
+use crate::opencode::{needs_responses_api, TOOL_CALLING_CAPABILITY};
+
+/// Stable capability name used in every capability refusal.
+///
+/// Surfaced verbatim in [`concerto_core::error::ProviderError::
+/// CapabilityRefused`] and in capability-gate audit rows so refusals are
+/// grep-able and diagnosable.
+pub fn tool_calling_capability() -> &'static str {
+    TOOL_CALLING_CAPABILITY
+}
+
+/// Whether `provider` is a plugin-backed provider (`plugin:<id>` names).
+pub fn is_plugin_backed(provider: &str) -> bool {
+    provider.starts_with("plugin:")
+}
+
+/// Built-in family table: does this provider/model family support native
+/// tool calling?
+///
+/// Returns `Some(supports)` when the family is known, `None` when the model
+/// is not in the table (the caller falls through to the provider default).
+/// ADR-66 §5 (corrected 2026-09-08): the Zen Muse rule reuses the dialect
+/// heuristic, so it covers every Responses-dialect model — the genuine
+/// `muse-v*` token rule plus `muse-spark-*` via the explicit full-id prefix
+/// entry — while name-only near-misses (`some-muse-model`, `amuse-v2`, …)
+/// stay outside the table.
+pub fn family_table_supports_tools(provider: &str, model: &str) -> Option<bool> {
+    match provider {
+        // Zen-served genuine Muse models use the Responses API dialect,
+        // which carries no tool declarations at all (ADR-66 context).
+        "opencode" if needs_responses_api(model) => Some(false),
+        _ => None,
+    }
+}
+
+/// Provider-level default for native tool-calling support.
+///
+/// Every HTTP provider family defaults to *attempting* native tools (ADR-66
+/// §3: unknown models attempt native first — never silent text). Plugin
+/// providers have no tool ops in their protocol at all, so their default is
+/// `false` and tool-requiring tasks on them refuse loudly (decision (a) of
+/// the ADR-66 implementation: gated to AnswerOnly tasks with an explicit
+/// error).
+pub fn provider_default_supports_tools(provider: &str) -> bool {
+    !is_plugin_backed(provider)
+}
+
+/// Resolve `supports_tool_calling` for one provider/model pair (ADR-66 §3).
+///
+/// Precedence: `config_override` > `advertised` (list_models capability
+/// flags where the provider publishes them) > built-in family table >
+/// provider default. `config_override` is threaded through for a single
+/// source of truth; profile construction that applies overrides after the
+/// fact passes `None` here and keeps its existing override application
+/// (same precedence by construction).
+pub fn resolve_tool_support(
+    provider: &str,
+    model: &str,
+    config_override: Option<bool>,
+    advertised: Option<bool>,
+) -> bool {
+    config_override
+        .or(advertised)
+        .or_else(|| family_table_supports_tools(provider, model))
+        .unwrap_or_else(|| provider_default_supports_tools(provider))
+}
+
+/// Refuse a tool-requiring resolution onto a model without tool support.
+///
+/// The error names provider, model, and the missing capability (ADR-66
+/// §2(a)) so the failure is actionable before any spend happens.
+pub fn require_tool_support(
+    provider: &str,
+    model: &str,
+    config_override: Option<bool>,
+    advertised: Option<bool>,
+) -> Result<(), concerto_core::error::ProviderError> {
+    if resolve_tool_support(provider, model, config_override, advertised) {
+        return Ok(());
+    }
+    Err(concerto_core::error::ProviderError::CapabilityRefused {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        capability: tool_calling_capability().to_string(),
+    })
+}
+
+/// Whether the ADR-66 §4 text-fallback driver can cover a missing native
+/// tool support on `provider`.
+///
+/// The driver is prompt-text-based, so it works over any text completion —
+/// including the Responses SSE path — and its requests carry no wire tool
+/// declarations. The only uncoverable gap is a wire protocol that cannot
+/// carry a text completion's tool instructions at all: plugin-backed
+/// providers (`plugin:<id>`) are excluded from the fallback (ADR-66
+/// decision (a)) and stay hard-gated to AnswerOnly tasks.
+pub fn tool_fallback_available(provider: &str) -> bool {
+    !is_plugin_backed(provider)
+}
+
+/// Refuse a tool-requiring resolution only when no tool path exists at all.
+///
+/// ADR-66 §2(a) with the §4 fallback carve-out (2026-09-08): a model whose
+/// ONLY gap is native tool declarations proceeds — the automatic
+/// text-fallback driver covers it and labels its turns — so a refusal at
+/// selection is reserved for providers the fallback cannot cover
+/// (plugin-backed, decision (a)). Everything else behaves exactly like
+/// [`require_tool_support`]: explicit override and advertised flags
+/// (precedence levels 1–2) still win, and a supported pair passes.
+pub fn require_tool_support_with_fallback(
+    provider: &str,
+    model: &str,
+    config_override: Option<bool>,
+    advertised: Option<bool>,
+) -> Result<(), concerto_core::error::ProviderError> {
+    if resolve_tool_support(provider, model, config_override, advertised) {
+        return Ok(());
+    }
+    if tool_fallback_available(provider) {
+        return Ok(());
+    }
+    Err(concerto_core::error::ProviderError::CapabilityRefused {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        capability: tool_calling_capability().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_default_is_native_for_http_providers() {
+        assert!(provider_default_supports_tools("openai"));
+        assert!(provider_default_supports_tools("anthropic"));
+        assert!(provider_default_supports_tools("google"));
+        assert!(provider_default_supports_tools("ollama"));
+        assert!(provider_default_supports_tools("opencode"));
+        assert!(provider_default_supports_tools("openrouter"));
+        assert!(provider_default_supports_tools("nim"));
+        assert!(provider_default_supports_tools(""));
+    }
+
+    /// Plugin-backed providers are hard-gated: no tool ops in their wire
+    /// protocol (ADR-66 consequence, decision (a)).
+    #[test]
+    fn plugin_backed_providers_default_to_no_tools() {
+        assert!(is_plugin_backed("plugin:my-llm"));
+        assert!(!is_plugin_backed("openai"));
+        assert!(!is_plugin_backed("pluginish"));
+        assert!(!provider_default_supports_tools("plugin:my-llm"));
+    }
+
+    /// Family table: Zen-served Responses-dialect models have no native
+    /// tool support (the Responses path carries no tool declarations);
+    /// name-only near-misses are not in the family and keep the provider
+    /// default.
+    #[test]
+    fn family_table_covers_muse_and_not_its_near_misses() {
+        assert_eq!(family_table_supports_tools("opencode", "muse-v2"), Some(false));
+        assert_eq!(family_table_supports_tools("opencode", "muse-v3.1"), Some(false));
+        // muse-spark-* rides the explicit Responses dialect prefix entry
+        // (ADR-66 §5 correction: endpoint behavior, not taxonomy), so it
+        // resolves to no NATIVE tool support like the genuine Muse models.
+        assert_eq!(
+            family_table_supports_tools("opencode", "muse-spark-1.3-contributor-free"),
+            Some(false)
+        );
+        assert_eq!(family_table_supports_tools("opencode", "big-pickle"), None);
+        assert_eq!(family_table_supports_tools("openai", "muse-v2"), None);
+        // Name-only near-misses without an explicit dialect entry keep the
+        // provider default.
+        assert_eq!(family_table_supports_tools("opencode", "some-muse-model"), None);
+        assert_eq!(family_table_supports_tools("opencode", "amuse-v2"), None);
+    }
+
+    /// ADR-66 A3: the full precedence — override > advertised flags >
+    /// family table > provider default.
+    #[test]
+    fn resolution_precedence_override_beats_all() {
+        // Override wins even when everything below disagrees.
+        assert!(resolve_tool_support("opencode", "muse-v2", Some(true), Some(false)));
+        assert!(resolve_tool_support("plugin:x", "any", Some(true), None));
+        assert!(!resolve_tool_support("openai", "gpt-4", Some(false), Some(true)));
+    }
+
+    #[test]
+    fn resolution_precedence_advertised_beats_table_and_default() {
+        // Advertised flags win over the family table.
+        assert!(resolve_tool_support("opencode", "muse-v2", None, Some(true)));
+        // ...and over the provider default.
+        assert!(!resolve_tool_support("plugin:x", "any", None, Some(false)));
+        assert!(resolve_tool_support("openai", "unknown-model", None, Some(true)));
+    }
+
+    #[test]
+    fn resolution_precedence_table_beats_default() {
+        // Family table wins over the provider default.
+        assert!(!resolve_tool_support("opencode", "muse-v2", None, None));
+        // No table entry → provider default.
+        assert!(resolve_tool_support("opencode", "big-pickle", None, None));
+        assert!(!resolve_tool_support("plugin:x", "any", None, None));
+    }
+
+    /// `require_tool_support` refuses with provider + model + capability,
+    /// and passes for supported pairs and for explicit overrides.
+    #[test]
+    fn require_tool_support_refusal_names_everything() {
+        let error = require_tool_support("opencode", "muse-v2", None, None)
+            .expect_err("Muse models must refuse tool tasks");
+        match error {
+            concerto_core::error::ProviderError::CapabilityRefused {
+                provider,
+                model,
+                capability,
+            } => {
+                assert_eq!(provider, "opencode");
+                assert_eq!(model, "muse-v2");
+                assert_eq!(capability, "tool_calling");
+            }
+            other => panic!("expected CapabilityRefused, got: {other:?}"),
+        }
+
+        assert!(require_tool_support("openai", "gpt-4", None, None).is_ok());
+        // Explicit override rescues a table-miss.
+        assert!(require_tool_support("opencode", "muse-v2", Some(true), None).is_ok());
+    }
+
+    /// The §4 fallback availability: every provider except plugin-backed
+    /// ones is coverable (the driver is prompt-text-based and works over
+    /// any text completion, including the Responses SSE path).
+    #[test]
+    fn fallback_availability_excludes_only_plugins() {
+        assert!(tool_fallback_available("opencode"));
+        assert!(tool_fallback_available("openai"));
+        assert!(tool_fallback_available("ollama"));
+        assert!(tool_fallback_available(""));
+        assert!(!tool_fallback_available("plugin:my-llm"));
+    }
+
+    /// ADR-66 §2(a) + §4 carve-out: a tool-requiring run on a model whose
+    /// ONLY gap is native tool declarations proceeds (the labeled fallback
+    /// driver covers it — muse-spark-* on Zen is the live case), while a
+    /// plugin-backed gap refuses loudly (decision (a)) with the full
+    /// provider/model/capability naming. Precedence levels 1–2 are
+    /// untouched.
+    #[test]
+    fn gate_with_fallback_refuses_only_uncoverable_gaps() {
+        // Responses-dialect models on Zen proceed via the fallback driver.
+        assert!(require_tool_support_with_fallback("opencode", "muse-v2", None, None).is_ok());
+        assert!(require_tool_support_with_fallback(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            None,
+            None
+        )
+        .is_ok());
+        // Capable pairs pass as before.
+        assert!(require_tool_support_with_fallback("openai", "gpt-4", None, None).is_ok());
+        // Plugin-backed gap: refused, naming everything.
+        let error = require_tool_support_with_fallback("plugin:my-llm", "any", None, None)
+            .expect_err("plugin providers stay hard-gated (ADR-66 decision (a))");
+        match error {
+            concerto_core::error::ProviderError::CapabilityRefused {
+                provider,
+                model,
+                capability,
+            } => {
+                assert_eq!(provider, "plugin:my-llm");
+                assert_eq!(model, "any");
+                assert_eq!(capability, "tool_calling");
+            }
+            other => panic!("expected CapabilityRefused, got: {other:?}"),
+        }
+        // Precedence levels 1–2 unchanged: override and advertised flags win.
+        assert!(require_tool_support_with_fallback("opencode", "muse-v2", Some(true), None).is_ok());
+        assert!(require_tool_support_with_fallback("opencode", "muse-v2", None, Some(true)).is_ok());
+        assert!(
+            require_tool_support_with_fallback("plugin:my-llm", "any", Some(true), None).is_ok()
+        );
+    }
+}

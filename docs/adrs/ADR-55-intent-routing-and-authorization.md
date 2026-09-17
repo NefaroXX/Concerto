@@ -879,3 +879,212 @@ grant persistence; no streaming classification.
   stands).
 - **C6** — the superseding test contract for
   `llm_classifier_is_never_produced_in_phase_0` lands (§7).
+
+## Addendum (Phase 2d) — Automatic intent gating: the Coordinator decides, no clicks (issue #27)
+
+Issue #27 lands the click-tax removal: `route()` + classifier result **is** the
+decision, grants are automatic at high confidence, and the interactive
+plan/execute confirmation dialog is deleted from the hot path. This addendum
+supersedes, **in part**:
+
+- **Decision §1 "hard rule"** — "the classifier (and the deterministic router)
+  can *classify*, never *grant*": replaced by high-confidence auto-grant (§1
+  below) for the five action-grantable outcomes. The AskUser zero-confidence
+  path never grants (§2).
+- **Decision §3** — "Plan agreement — an explicit dialog": the
+  `ApprovalSink` Apply-it dialog is deleted from the hot path; routing +
+  auto-grant replaces the user click.
+- **Decision §4** — "re-confirmed on resume": grants stay non-durable, but
+  re-confirmation happens through routing (auto re-grant), never a dialog.
+- **1d §3 interception** — "No mutation is possible without an explicit Apply":
+  auto-Apply from a hash-verified binding replaces the Apply/Replan/Dismiss
+  clicks. Replan remains reachable only via an explicit new Plan request.
+
+**Unchanged and load-bearing (compose with, do not revoke):** Decision §2
+capability tiers (`Consequential` never covered by blanket authorization;
+`IntentAuthorized` only upgrades `RequireApproval`, never overrides `Deny`);
+Decision §5 audit chain; 1d §2 binding registry (process-scoped, keyed by
+`(session_id, objective_hash)`, newest-wins, 16 KiB `plan_text` cap); 1d §4
+`record_plan_decision` seam; 1d §5 source-revision identity; 1e §2
+gate-covers-all-runs; 2b checkpoint precedence; ADR-56 §1a negation fast path
+(read-only can never be upgraded to writable by any model output or rule).
+No whiteboard / ledger / checkpoint persistence / supervisor changes; no new
+LLM calls beyond the existing classifier (ADR-56 §7).
+
+### 1. Auto-grant — routing is the decision
+
+For outcomes `Execute | Plan | Verify | Review | Diagnose` with
+`confidence >= concerto_core::LOW_CONFIDENCE_THRESHOLD` (0.7) reached via
+`RouterRoute::RuleHit` **or** `RouterRoute::LlmClassifier`, the run loop
+auto-grants in `IntentGrantStore` with the same `filesystem`/`git` scopes a
+confirmed `Apply` holds today. No `ApprovalSink` call, no dialog, no modal.
+**Scope amendment (2026-09-09):** the auto-grant's scopes are now
+`filesystem` + `git` + **project-bounded `shell`** — a shell command is
+covered by the acting grant only while structured command facts prove its
+working directory and every path-like token resolve inside the session
+project root and no denylist/Consequential/network rule already matched
+(`is_project_bounded_shell`; everything outside that scope keeps the
+existing `shell_requires_approval` approval path). The shell scope hole in
+§Decision 2 remains for anything outside these bounds.
+**Scope amendment (2026-09-10, delegation under Acting grants):** the same Acting grant also covers the
+Coordinator's orchestration/delegation surface — `call_specialist`, the only dispatch tool the
+coordinator's decision loop policy-evaluates — so the run-scoped authorization upgrades its
+otherwise-`un_granted` `RequireApproval` to `Allow` under the distinct, individually auditable
+`intent_authorized_delegation` row. Cause-only-no-effect: this authorizes the dispatch, never the
+specialist's own work — every specialist tool call stays policy+grant-gated, spend/task caps
+still bound the fan-out, and a read-only run denies delegation outright.
+The classifier wrapper remains mounted after the two fast paths (ADR-56 §1)
+and its threshold validation (>= 0.7, no band creation, ADR-56 §4) is
+unchanged — the invariant shift is only *what happens after a high-confidence
+route*: grant instead of prompt.
+
+### 2. AskUser and negation — hard read-only invariant
+
+`AskUser` (confidence `0.0`) and `NegationOverride` (`don't`, `never`,
+`without touching`, ...) remain **hard read-only**: no grant, no tool write,
+no spend. The negation read-only invariant continues to rest on the
+`NEGATION_PHRASES` corpus running first-match-wins ahead of any model (ADR-56
+§1a) — a permissive model can never make a read-only request writable. A
+zero-confidence input that needs action lands as a read-only answer-only run
+with an audit row; the user escalates by rephrasing with clearer intent, not
+by clicking a modal.
+
+**2a. Negation trigger — task-level prohibition vs. constraint clause
+(2026-09-06)**
+
+`negation_override` fires only for a **task-level prohibition**: the matched
+phrase either stands alone (short input) or precedes any explicit action
+keyword (`verify`/`plan`/`review`/`diagnose`/`execute`). A requirement clause
+that appears *after* an explicit action request — "build X … do NOT read it as
+UTF-8", "… must not panic", "… don't touch the parser" — constrains the
+artifact the user asked for; it does not prohibit the action. It must not
+demote the run: it passes through as ordinary task text so the constraint
+reaches the executor in the prompt. Reassurance markers (`don't panic`,
+`don't worry`, `don't forget`) never fire the veto in any position.
+
+The hard read-only wall is unchanged **once fired**: negation still beats every
+model and rule (ADR-56 §1a), and a genuine prohibition ("don't do it",
+"just answer", "no changes", "don't build accord") vetoes exactly as before.
+This narrows only *when the veto triggers*; it cannot make a read-only request
+writable — a prohibition-first or prohibition-only message still grants
+nothing (§1 auto-grant composes with the wall unchanged). Standalone `"stop"`
+is deliberately **not** a corpus member — "stop the service and restart it"
+is an action request — and lands `AskUser` (0.0), still hard read-only (§2).
+
+### 3. Plan→Execute auto-Apply — hash-verified binding
+
+When a plan-approved binding exists (1d §2; inserted post-run on a
+Plan-effective `Ok` run) and the next input routes `Execute` at confidence,
+the run auto-`Apply`s the persisted `DesignDoc`: `artifact_hash` verified,
+**loud-fail on drift** (never silent re-decompose — 2b checkpoint precedence
+and ADR-65 §7 resume semantics unchanged). No `approve the plan` click.
+
+### 4. Resume auto re-grant
+
+On resume, grants re-apply automatically through routing (Decision §4
+non-durability retained, dialog channel removed): a high-confidence
+action-required route re-grants; an `AskUser`-routed resume stays read-only.
+No modal at the resume boundary.
+
+### 5. Audit — observable, not blocking
+
+Every auto decision writes to `sessions.db:audit_log` labeled
+`intent_router: auto_granted` with `{rule, confidence, route}` plus a
+`session_events` `RoutingDecided` record. `record_plan_decision` (1d §4)
+gains auto variants (`auto_apply` / `auto_granted`). Denial, negation, and
+AskUser paths keep their existing audit rows.
+
+### 6. Acceptance (issue #27)
+
+- **A1** — `cargo test -p concerto-orchestrator --lib` + `cargo clippy -D
+  warnings` green; `intent` tests green.
+- **A2** — `build accord` → immediate Execute run, no click modal;
+  `audit_log` shows `auto_granted` + `RuleHit|LlmClassifier` +
+  `confidence >= 0.7`.
+- **A3** — `don't build accord` → `NegationOverride` → read-only, zero
+  writes.
+- **A4** — `hmm` (`AskUser` `0.0`) → zero writes, zero grants.
+- **A5** — `plan: X` then `execute` (no `approve` click) → auto-`Apply` from
+  the persisted `DesignDoc`, hash-verified.
+- **A6 (revised by Phase 2e below)** — "Build a Rust CLI tool called hexview
+  … do NOT read it as a UTF-8 string … must not panic … don't panic …
+  verify it" (with or without a `Prompt:`-style glued label) → Acting
+  envelope → the unified loop builds and verifies with tools → files
+  written. Outcomes are flavor hints only; no keyword may select a
+  tool-less path.
+- **A7** — A3 plus "don't do it", "just answer", "no changes" → `NegationOverride`
+  read-only, zero writes, zero grants. Standalone "stop" (deliberately not a
+  corpus member; "stop the service" is an action request) → `AskUser` 0.0,
+  also hard read-only (§2), zero writes, zero grants.
+
+## Addendum (Phase 2e) — Unified agent loop: the router grants envelopes, the model shapes the run (2026-09-09)
+
+Supersedes Phase 2d §§1/3–4 *as dispatch logic* (auto-grant-then-branch).
+Three consecutive smoke failures share one mechanism, not three causes:
+deterministic keyword routing choosing the run's code path before any model
+is consulted (a `verify` subordinate clause hijacks builds into tool-less
+chat; `don't` inside constraints hijacks into the read-only sink; a
+`Prompt:` label glued to the leading verb blinds whole-token matching).
+Narrowing instances (#43, #44, #46) cannot close a mechanism that generates
+them. Grounding: Anthropic "Building Effective Agents" (augmented LLM —
+the model selects tools; agents are LLMs using tools on environmental
+feedback in a loop) and OpenCode (one loop, `permission` rules keyed by
+tool at action time, no request classification).
+
+**Unchanged and load-bearing:** Decision §2 tiers (the *only* gate); §5
+audit chain; §2a prohibition trigger as narrowed by #43 (now an *envelope*
+trigger, not a path selector); ADR-60/65; ADR-66.
+
+### 1. One loop
+
+Every non-empty run enters the unified agent loop (single-agent vs
+coordinator selection unchanged — out of scope). The `run_text_only`
+branch is deleted. Chat is what the loop does when the model uses no tools
+(≈ one text-only call in cost, zero forks).
+
+### 2. Router keeps the safety job only
+
+`route()` still runs (cheap, auditable) and decides only the permission
+envelope: `ReadOnly` (task-level prohibition; empty/zero-confidence) or
+`Acting` (everything else, grant scopes exactly as today). Outcomes become
+non-binding flavor hints — one system-prompt line (e.g. "the user seems to
+want verification; prefer checking over changing"), logged with the routing
+row, never branching.
+
+### 3. Enforcement at grants; modal leaves the hot path
+
+`ReadOnly` = `IntentAuthorized` never set; the policy engine denies writes
+as today. Prohibition inputs get read-capable answers (better UX, identical
+safety). Unclear input gets bounded in-loop clarification (iteration caps
+bind it).
+
+### 4. Classifier retired from dispatch
+
+The ADR-56 classifier leaves the run hot path (saves a call + latency per
+run); deterministic safety rules + flavor scan remain (see ADR-56 amendment
+2026-09-09).
+
+### 5. Guards that stay
+
+Zero-work guard, cycle detection, continuation caps, spend fuses, and the
+empty-completion honesty rule (Phase 2d Fix B — a loop run ending with
+empty final text still synthesizes the explanatory completion).
+Identical-tool-call repetition coverage is verified in `cycle_manager`,
+with a minimal same-call guard added only if absent.
+
+### 6. Narrow normalization (glue-strip)
+
+Routing normalization detaches a leading glued `Label:` iff alphabetic
+length > 1 (excludes `C:` drives) and the remainder begins with an explicit
+action keyword as a whole token (excludes `https://…`). Near-miss
+regression tests pin the exclusions.
+
+### 7. Acceptance (Phase 2e)
+
+- **A8** — `don't build accord` → ReadOnly envelope → answer, zero writes,
+  zero grants.
+- **A9** — `hmm` → bounded in-loop clarification (≤1 turn), zero writes.
+- **A10** — `verify the fix` → Acting envelope → loop verifies *with
+  tools*; writes governed by policy, not by branch.
+- **A11** — full workspace green; `run_text_only` deleted; no text-only
+  branch; no dispatch-time classifier call; routing docs updated.

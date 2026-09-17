@@ -257,6 +257,26 @@ impl LlmProvider for PluginBackedProvider {
             return Err(ProviderError::Cancelled);
         }
 
+        // ADR-66 §2(b) fail-loud seam, decision (a): the plugin provider
+        // protocol has no tool ops (`call_provider` carries a bare
+        // OpenAI-shaped body with no tool declarations), so a request
+        // carrying tools would be silently degraded to text-only. The
+        // plugin protocol was left without tool ops (ADR-66 consequence
+        // chosen over a protocol extension), so plugin-backed providers are
+        // gated to AnswerOnly tasks: a tool-carrying request is refused
+        // here, naming provider, model, and the missing capability.
+        if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err(ProviderError::CapabilityRefused {
+                provider: self.provider_name().to_string(),
+                model: if request.model.is_empty() {
+                    self.model.clone()
+                } else {
+                    request.model.clone()
+                },
+                capability: "tool_calling".to_string(),
+            });
+        }
+
         // Request body handed to the plugin: the canonical OpenAI shape by
         // default, or the dialect's wire body when one is configured (ADR-53).
         let req_value = match &self.dialect {

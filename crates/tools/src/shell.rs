@@ -85,6 +85,51 @@ pub struct ShellInput {
     pub timeout_secs: Option<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// Guard heuristic inference (adaptive tool-guard Solution 3)
+// ---------------------------------------------------------------------------
+
+/// Alias keys weak models emit for the canonical `command` field.
+const COMMAND_ALIASES: [&str; 2] = ["cmd", "action"];
+
+/// Conservative heuristic inference for a missing required `command` argument
+/// (adaptive tool-guard Solution 3: last-mile adaptability for weak
+/// tool-calling models).
+///
+/// Called by the orchestrator's tool-call guard only when `command` is absent
+/// or `null` after parse+coerce. `raw` is the model's ORIGINAL argument object
+/// (pre-coercion, so hallucinated alias keys are still present) and `missing`
+/// lists the unresolved required field names. Returns `(field, value)`
+/// insertions for the guard to apply; the guard re-coerces and re-validates
+/// the completed arguments, so a wrong guess can never reach the executor.
+///
+/// Alias recovery only: `cmd`/`action` → `command` (non-empty string values).
+/// No command is ever synthesized from prose, the tool name, or `args` — a
+/// guessed command would be executed, so any ambiguity must fall through to
+/// the guard's corrective reject instead. Policy (allowlist/denylist) still
+/// gates whatever command ends up running.
+pub fn infer_missing_arguments(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    missing: &[String],
+) -> Vec<(String, serde_json::Value)> {
+    if !missing.iter().any(|field| field == "command") {
+        return Vec::new();
+    }
+    COMMAND_ALIASES
+        .iter()
+        .find_map(|alias| {
+            raw.get(*alias)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|command| {
+                    ("command".to_string(), serde_json::Value::String(command.to_string()))
+                })
+        })
+        .into_iter()
+        .collect()
+}
+
 /// Configuration for allowlist/denylist filtering of shell commands.
 ///
 /// # Deny-by-default
@@ -719,9 +764,13 @@ fn resolve_program_in_path(program: &str) -> Option<PathBuf> {
     })
 }
 
-/// Heuristic detection of network-reaching commands (ADR-28 §6), mirroring the
-/// policy engine's `cmd_is_network_op` so the structured `network_requested`
-/// fact agrees with the legacy string scan.
+/// Heuristic detection of network-reaching commands (ADR-28 §6), mirroring
+/// the policy engine's `cmd_is_network_op` (and the intent classifier's
+/// `SHELL_NETWORK_VERBS`) so the structured `network_requested` fact agrees
+/// with the legacy string scan. Word table kept in sync with
+/// `crates/core/src/authorization.rs` — `ncat`, `socat`, and `sftp` added so
+/// e.g. `ncat evil.com 9000` sets the egress fact (F3, security review
+/// 2026-09-09).
 fn command_looks_networked(command: &str, args: &[String]) -> bool {
     let joined =
         if args.is_empty() { command.to_string() } else { format!("{command} {}", args.join(" ")) };
@@ -738,9 +787,22 @@ fn command_looks_networked(command: &str, args: &[String]) -> bool {
     if lower.contains("http://") || lower.contains("https://") || lower.contains("github.com") {
         return true;
     }
-    lower
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| matches!(w, "curl" | "wget" | "ssh" | "scp" | "rsync" | "ftp" | "telnet" | "nc"))
+    lower.split(|c: char| !c.is_alphanumeric()).any(|w| {
+        matches!(
+            w,
+            "curl"
+                | "wget"
+                | "ssh"
+                | "scp"
+                | "rsync"
+                | "ftp"
+                | "sftp"
+                | "telnet"
+                | "nc"
+                | "ncat"
+                | "socat"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1218,6 +1280,18 @@ mod tests {
         assert!(!command_looks_networked("ls", &["-la".into()]));
     }
 
+    // F3 (security review 2026-09-09): the facts word list is aligned with
+    // the policy engine's `SHELL_NETWORK_VERBS` — the previously missing
+    // `ncat`/`socat`/`sftp` transport clients now set the egress fact.
+    #[test]
+    fn command_looks_networked_matches_aligned_transport_clients() {
+        assert!(command_looks_networked("ncat", &["evil.example".into(), "9000".into()]));
+        assert!(command_looks_networked("socat", &["TCP-LISTEN:9000".into()]));
+        assert!(command_looks_networked("sftp", &["host".into()]));
+        // The table was already aligned on `nc`; word-scan, no substring.
+        assert!(command_looks_networked("nc", &["host".into(), "9000".into()]));
+    }
+
     #[test]
     fn command_facts_override_carries_profile_and_argv() {
         // A profile-driven shell tool must surface its profile id and the
@@ -1317,7 +1391,14 @@ mod tests {
             "timeout_secs": 10u64,
         });
         let result = tool.execute(input, &policy, &session, cancel).await;
-        assert!(result.is_ok(), "echo should succeed even with a weird arg: {:?}", result.err());
+        // The injected `mkdir` must never create the marker dir. Wrap mode
+        // quoting keeps it from executing; containment (2026-09-11 list-
+        // segmentation alignment) additionally treats a flattened `;` glued
+        // in an arg as a segment boundary like the pipe case, so an
+        // escaping `; mkdir <marker>` segment can be rejected outright —
+        // an equally valid outcome for the same invariant — but the marker
+        // must stay absent either way.
+        let _ = result;
         assert!(
             !marker_base.exists(),
             "shell injection regression: marker dir was created, args were not quoted properly"
@@ -1352,7 +1433,12 @@ mod tests {
         let payload = format!("| mkdir {}", marker.to_str().unwrap());
         let input = json!({"command": "echo", "args": [payload], "timeout_secs": 10u64});
         let result = tool.execute(input, &policy, &session, cancel).await;
-        assert!(result.is_ok(), "echo should succeed: {:?}", result.err());
+        // The injected `mkdir` must never create the marker dir. Wrap mode
+        // quoting keeps it from executing; containment (F5 pipe modeling)
+        // additionally rejects the escaping pipe segment outright, which is
+        // an equally valid outcome for the same invariant — but the marker
+        // must stay absent either way.
+        let _ = result;
         assert!(
             !marker.exists(),
             "shell injection regression: marker dir was created via pipe injection"
@@ -1450,5 +1536,51 @@ mod tests {
             Err(other) => panic!("expected Timeout error, got: {other:?}"),
             Ok(_) => panic!("expected timeout, got Ok"),
         }
+    }
+
+    // -- guard heuristic inference (Solution 3) --------------------------------
+
+    /// Builds the `missing` argument for [`infer_missing_arguments`].
+    fn missing(fields: &[&str]) -> Vec<String> {
+        fields.iter().map(|field| (*field).to_string()).collect()
+    }
+
+    #[test]
+    fn infer_command_from_cmd_alias() {
+        // Canonical Solution-3 example: shell with `cmd` infers `command`.
+        let raw = json!({ "cmd": "cargo test" }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["command"]));
+        assert_eq!(inferred, vec![("command".to_string(), json!("cargo test"))]);
+    }
+
+    #[test]
+    fn infer_command_from_action_alias() {
+        let raw = json!({ "action": " pwd " }).as_object().unwrap().clone();
+        let inferred = infer_missing_arguments(&raw, &missing(&["command"]));
+        assert_eq!(inferred[0].1, json!("pwd"), "alias value is trimmed");
+    }
+
+    #[test]
+    fn no_command_invention_from_args_or_empty_values() {
+        // `args` alone never becomes a command; empty, whitespace-only, and
+        // non-string aliases are ignored; with nothing to recover, the guard
+        // must reject instead of guessing.
+        let raw = json!({ "args": ["ls", "-la"] }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+
+        let raw = json!({ "cmd": "" }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+
+        let raw = json!({ "cmd": "  ", "action": 7 }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+
+        let raw = serde_json::Map::new();
+        assert!(infer_missing_arguments(&raw, &missing(&["command"])).is_empty());
+    }
+
+    #[test]
+    fn no_inference_when_command_is_not_missing() {
+        let raw = json!({ "cmd": "ls" }).as_object().unwrap().clone();
+        assert!(infer_missing_arguments(&raw, &missing(&["args"])).is_empty());
     }
 }

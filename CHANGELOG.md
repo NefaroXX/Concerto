@@ -9,6 +9,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Unified agent loop (ADR-55 Phase 2e):** the router now grants permission
+  envelopes (ReadOnly/Acting) instead of choosing code paths — every
+  non-empty run enters the loop and the model shapes it; outcomes are
+  non-binding flavor hints; the text-only branch is deleted; the classifier
+  left the hot path. No keyword can convert a build into chat anymore.
+- **Cost-routing deletion:** the harness never selects models — automatic
+  cheapest-compatible selection, cost sorting, and downgrade-on-failure are
+  removed. Assignment is explicit only (Studio pins, coordinator setting,
+  agent-fallback → global-default chain); spend tracking + budget caps and
+  loud capability refusal on pinned models are unchanged.
+- **Mid-stream retry:** transport-caused stream failures are bounded-retryable
+  (`StreamTransport`); framing/parse errors stay fatal.
+- **OS/shell identity card (shell plan):** every agent prompt now carries a
+  compact environment card (OS + arch, canonical agent shell profile +
+  executable, 2–4 dialect gotchas for the detected bash/PowerShell/cmd
+  family) across single-agent, specialist, and coordinator prompts — models
+  no longer have to guess which dialect executes their commands.
+- **Bounded shell repair turns (shell plan Phase C subset):** failed shell
+  executions get up to 2 labeled corrective turns (command, exit code,
+  stderr/stdout tails, likely-cause category) without consuming continuation
+  rounds; policy denials are never repaired; exhaustion stays a recoverable
+  result with evidence preserved.
+- **Universal text-fallback tool driver (ADR-66):** harness-level
+  prompt-based tool calling (schema injection, strict parser,
+  repair-by-reprompt, bounded attempts) engages automatically for providers
+  without native function calling, so any chat model can drive agent tools;
+  native preferred, fallback labeled in transcript + audit.
+
+### Fixed
+- **Speculative investigation (#62):** bounded concurrent read-only
+  consults over competing hypotheses with per-hypothesis attribution,
+  a deterministic comparator, batch budgets, shared cancellation, and
+  no auto-promotion of speculation to fact.
+- **Shell containment residuals:** xargs quote/backslash/glued-redirect
+  obfuscations detected; interpreter program bodies (`awk system()`/`getline`,
+  `sed s///e`, standalone `e`) and process-substitution bodies demoted from
+  free Observe in both the tier classifier and the containment scanner; plugin
+  `plugin:`/`mcp:` name claims force-namespaced. All movement toward approval
+  only; known v1 limits documented.
+- **Shell containment hardening batch:** xargs-fed argv contained
+  (including wrapper-prefixed and any-position triggers), glued redirect
+  suffixes resolved per-operator, plugin namespace claims force-prefixed;
+  all fail-closed with pinned tests. Three security reviews drove it.
+- **Supply-chain green again:** fixed the deny CI job (toolchain pin) and
+  patched RUSTSEC-2026-0285 by bumping rustls 0.23.41 → 0.23.45 (TLS 1.3
+  handshake hardening; patch-level, no API changes).
+- **Runtime modal + roster visibility:** Coordinator 2.0 panels moved from
+  the Studio rail to a per-session chat modal (Ctrl+R, Esc closes),
+  restoring full editor width; explicit Restore-defaults action for empty
+  rosters (no auto-reseed, never coordinator); ghost staffing fails
+  validation with the id named.
+- **Missing-table migration:** a global config owning a roster but no
+  `[orchestration]` table gains only the default blueprint selection
+  (idempotent, never overwrites) — the degraded Studio fallback had no
+  other exit for this shape.
+- **Per-agent config files:** each agent owns `<config>/agents/<id>.toml`
+  (model/prompt/permissions), seeded from hardcoded defaults when missing,
+  migrated when stale; Studio CRUD writes files directly (add/remove/edit,
+  deletions stick); stage editor restored with file-derived staffing;
+  observability rail collapsed by default; coordinator never
+  seeded/listed/persisted/staffable.
+- **Hardcoded coordinator + Studio 2.0 panels:** coordinator leaves the
+  Studio roster on all paths (frozen definition, global-default model,
+  existing config entries ignored at display); legacy pipeline speaks
+  Relationships vocabulary; four read-only observability panels (decision
+  journal, world model, failure diagnoses, suitability) fed from
+  checkpoints with fail-soft empty states.
+- **Studio fallback + default seeding:** the inactive-blueprint view no
+  longer directs users to project config; opening the Studio fills a
+  default standard blueprint selection when none is declared (idempotent,
+  never overwrites, repairs the present-but-empty table shape that breaks
+  loading).
+- **Artifact ownership (#61):** acquire-on-write, evented release on
+  settle/crash, coordinator-mediated transfer only, stale on out-of-gate
+  modification — enforced at the write gate, fail-closed; additive
+  persistence. (Known limit: in-process specialists bypass gate-level
+  ownership today; tracked follow-up.)
+- **Delegation quality (#60):** per-(agent, task-class) suitability from
+  dispatch history (14-day decay, exclusion floor, bounded reasons),
+  advisory-only; spend recorded, never scored; models never selected.
+- **Specialist consultation (#59):** typed `Consult` operation distinct
+  from dispatch — read-only enforced (writes/shell/git denied even under
+  Acting grants, proven adversarially), findings become citable evidence,
+  deterministic trigger on aged open questions, effort-bounded.
+- **Critical-path scheduling (#58):** ready batches ranked by deterministic
+  priority (chain/dependents/sole-blocker/failure-penalty/availability,
+  TaskId tie-break) with per-cycle reasons; starvation-guarded; live-graph
+  recomputation keeps #57 transforms correct.
+- **Dynamic task split/merge (#57):** open tasks split into children
+  (edges union-rewritten, lineage kept) and overlapping pending tasks merge
+  (lowest-ULID survivor, unions deduped), proven on throwaway copies —
+  settled work untouchable, old checkpoints load.
+- **Coordinator world model (#56):** deterministic structured projection
+  (objective, facts-by-id with freshness rules, artifacts+owners,
+  unresolved-question lifecycle, risks) consumed by dispatch decisions and
+  persisted additively across resume; bounded and capped.
+- **Global-only orchestration enforced:** project-layer `[orchestration]` /
+  roster / model-pins are ignored at load (warned, never silent) so seeded
+  global selections can no longer collide with project selections and break
+  blueprint resolution; Studio offers explicit import-to-global (with
+  conflict refusal); existing project files keep loading for all other
+  keys; no migration, no deletion.
+- **Fault-injection eval suite (#55):** 16 deterministic failure scenarios
+  + 3 gate tests proving #52/#53/#54 end to end, test-gated harness
+  (zero production changes), ~0.05s suite runtime for CI.
+- **Structured failure diagnosis + recovery (#54):** provider/tool/agent/
+  task/environment/dependency/contract failures normalize into one typed
+  diagnosis driving deterministic recovery (retry-same / alternate /
+  reconsider / escalate) through existing paths; single-specialist failure
+  no longer hard-stops siblings; permanent failures escalate bounded;
+  denials diagnose permanent instead of burning retries.
+- **Progress-aware loop + stall detection (#53):** coordinator cycles
+  fingerprint observable state (transitions, facts, snapshot, journal,
+  artifacts); 3 identical cycles trigger bounded reconsideration then
+  escalation — never a hard stop, never a false stall on recoveries;
+  hard ceilings untouched.
+- **Coordinator decision/execution split (#52):** typed `CoordinatorDecision`
+  + validator enforced at dispatch seams (ready-set, evidence existence,
+  artifact canonicalization); decision journal persisted additively
+  (old checkpoints load); fabricated evidence now rejects the dispatch.
+- **Containment segmentation + squat/interpolation hardening:** the
+  read-only path exemption is now per list-segment (`& | ;` newline,
+  glued included); plugin orchestration/observe-class names always
+  namespace (`plugin:<id>:`); `$`/backtick/`~user`/glued-redirect targets
+  rejected at resolve; second-segment destructive verbs classify
+  Consequential; `mark_stale` direction fixed. Tiers/denylist/grant scopes
+  untouched; legit `cat f | grep x` chains stay free.
+- **Inert classifier config removed (Item E):** the `[intent]`
+  classifier keys are gone from the schema (7→8 version-bump migration;
+  legacy files load); the classifier module stays off-hot-path for
+  eval/future use.
+- **Smoke follow-ups:** validation resolves its working root from run
+  evidence (manifest nearest modified files, session-root fallback);
+  completion `files` keeps only regular files written by tools;
+  orchestration (blueprint + agent roster) persists to the global config
+  only — project `.concerto.toml` files are never created by Studio and
+  existing ones keep loading unchanged; legacy `.opencode-rs.toml` /
+  `OPENCODE_RS_*` fallback merges deleted (live keyring/data-dir compat
+  reads kept); pipes/`tee`/`<` modeled in read-only classification and
+  containment (`cat f | grep x` stays free, exfiltrating shapes don't).
+- **Coordinator delegation grant:** `call_specialist` is covered under Acting
+  grants (`intent_authorized_delegation` audit row) — the coordinator can
+  delegate unattended; ReadOnly still denies, ungranted still prompts, and
+  specialists remain individually gated with caps and zero-work guard intact.
+- **Smoke runtime recovery:** the single/multi switch now routes (multi +
+  acting → coordinator for every acting outcome); project-bounded shell
+  auto-approves under acting grants via a positive 9-verb allowlist with
+  segment-aware scanning and interpreter exclusion (tiers/denylist/network/
+  plugin gate untouched; `intent_authorized_shell` audit row); repair turns
+  never fire on policy denials (verdict-based, not substring); completion
+  cards and task signals mirror `completion_status` (no default-true);
+  file-change counting reconciled with audited writes; bounded end-reasons
+  persisted for diagnosability.
+- **Evidence spine (ADR-65):** multi-agent runs are grounded in a single
+  append-only whiteboard evidence chain — runtime-written tool facts with agent
+  attribution, a deterministic workspace-snapshot readiness barrier, safe read
+  dedupe with action digests, DesignDoc verification (hallucinated docs cannot
+  bind), evidence-driven dispatch (Decision events reference real evidence ids),
+  and cursor-based continuation that never re-dispatches architects/researchers
+  without a recorded evidence-backed decision. Whiteboard facts/decisions stay
+  in structured SQL; vector memory is strictly derived summaries.
 - **Always-on write-conflict detection (ADR-60 D5):** versioned gated writes
   now carry per-target `base_versions` claims — `GateRequest.base_version`
   (single) became a `base_versions` map with `#[serde(default)]` wire
@@ -107,7 +268,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Daily-total spend output stubbed (field present, always `None`) until daily
   tracking is enabled
 
-### Fixed
+- **muse-spark Zen 500 regression:** `muse-spark-*` is routed to the Responses
+  API again via an explicit full-id prefix table (wire dialect follows
+  endpoint behavior, not family taxonomy — ADR-66 §5/A2 corrected in place);
+  tool-requiring runs on fallback-coverable models proceed via the labeled
+  fallback driver instead of being refused, while the plugin hard gate is
+  unchanged.
+- **Silent tool-call degradation removed (ADR-66):** tool-requiring runs
+  either drive tools or fail loud naming provider/model/capability — never
+  silent text. Per-model capability resolution (config override > advertised
+  flags > family table > provider default) with refusal before spend; the Zen
+  Responses path and plugin providers refuse tool-carrying requests instead
+  of dropping them (plugins gated to AnswerOnly); `muse-spark-*` no longer
+  misroutes to the Muse/Responses dialect; Google weak models gain the
+  loose-schema adapter path.
+- **Negation veto false-positive (`concerto-core`):** the read-only
+  `negation_override` veto now fires only for a **task-level prohibition** — a
+  negation-corpus match that stands alone or precedes every explicit action
+  keyword. Requirement clauses after an action request ("build X … do NOT read
+  it as UTF-8", "must not panic", "don't touch the parser") are constraints on
+  the artifact, not prohibitions of the action, and no longer demote explicit
+  build/verify requests to read-only (ADR-55 Phase 2d §2a). Reassurance
+  markers (`don't panic`, `don't worry`, `don't forget`) never veto. The hard
+  read-only wall is unchanged once fired; standalone "stop" lands `AskUser`
+  (0.0, still read-only) rather than the veto corpus.
+- **Silent empty read-only completions (`concerto-orchestrator`):** when a
+  read-only run's provider returns empty text, the completion now synthesizes
+  an explanation (read-only + "no files changed" + rephrase hint) instead of a
+  bare empty "done" — non-empty model text is never overridden and
+  action-capable routes (Execute/Plan) never get the fallback.
 - Orchestration Studio no longer rebuilds its graph, loads a tokenizer, or
   writes the full configuration during every UI edit; configuration is saved
   only on explicit request, with visible dirty/success/failure state
@@ -193,6 +382,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provides explicit user revocation.
 
 ### Changed
+- **Dev Windows artifacts:** every `dev` push builds the desktop binary on
+  Windows CI and uploads it SHA-named (`concerto-dev-<sha>-*.exe`, 14-day
+  retention) — smoke-test binaries are traceable to their commit, no local
+  builds required.
+- **Dependency bumps (low-risk batch):** `rand` 0.8→0.10 (bench-only
+  migration), `tower-http` 0.6→0.7 (no direct usage, recompile), `nix`
+  0.26→0.31 (signal APIs unchanged, unix gating intact). All rust-versions
+  within MSRV 1.88; zero behavioral delta (3,565/3,565 tests).
+- **Dependency bumps (careful batch):** `toml` 0.8→1.1 (zero API fixes
+  needed; `toml_edit` stays 0.22, decoupled; new hostile-string save→load
+  roundtrip test) and `fastembed` 4→6 (`&mut` embed wrapper; 384 dims
+  unchanged — stored vectors valid, no migration; network smoke tests
+  committed as ignored). MSRV-safe throughout.
+- **Automatic intent gating (ADR-55 Phase 2d, ADR-56 amendment; issue #27):**
+  routing is the decision — a high-confidence route (>= 0.7) to one of the
+  five action-grantable outcomes (`Execute`/`Plan`/`Verify`/`Review`/
+  `Diagnose`) via a deterministic rule hit or the LLM classifier auto-grants
+  the same `filesystem`/`git` scopes a confirmed Apply held, with no approval
+  dialog, no modal, no click. The plan-approval Apply/Replan dialog is removed
+  from the hot path: a confident Execute over a stored plan binding
+  auto-Applies the persisted plan hash-verified, loud-failing on drift (never
+  silently re-decomposing). Hard read-only invariants are unchanged: the
+  negation corpus keeps first-match-wins priority ahead of any model output,
+  and a zero-confidence `AskUser` route never grants — with the classifier off
+  it still opens the AskUser modal (byte-identical offline chain); with a real
+  classification it lands as a read-only answer-only run. Every auto decision
+  is audited (`intent_router: auto_granted` with a `{rule, confidence, route}`
+  envelope, a `session_events` `RoutingDecided` record, and the `auto_apply`
+  plan-decision variant) under one correlation id. Grants stay non-durable,
+  Consequential actions stay unconditionally gated (`Deny` is final), and
+  spend-cap semantics are unchanged.
+- **The Coordinator decides (ADR-35 amendment 2026-09-05):** dispatch authority
+  moved from code to the Coordinator. A policy-gated `call_specialist`
+  coordinator tool dispatches registered specialists (roster context injected
+  into the Coordinator prompt; every dispatch appends an evidence-backed
+  whiteboard `Decision` event whose cited ids are validated at append); each
+  call materializes a chained `SubTask` node, so the graph records what the
+  Coordinator did. The compiled evidence scheduler is removed, the planner is
+  demoted to an optional `draft_plan` advisor (never materialized as roles),
+  and blueprint staffing equality/stage sequencing are no longer enforced.
+  Safety layers are unchanged: write gates, policy engine, VirtualFs, zero-work
+  guard, step caps/doom guard (the decision loop counts toward the run cap),
+  and the checkpoint/resume ledger.
 - Removed subjective capability-tier routing. Explicit provider/model pins are
   authoritative; unassigned routing uses objective tool support and budget data
 - Memory documentation and runtime contract now identify SQLite FTS5/vector

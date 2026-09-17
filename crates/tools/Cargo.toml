@@ -30,7 +30,7 @@ blake3 = { workspace = true }
 imara-diff = { workspace = true }
 gix = { workspace = true }
 regex = { workspace = true }
-nix = { version = "0.26", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 tempfile = "3"

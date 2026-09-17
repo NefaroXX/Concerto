@@ -56,6 +56,15 @@ Registered calls pass through `ToolExecutor`, which applies spend checks,
 - Shell validation maintains an independent hard denylist that is consulted
   before allow-all mode.
 - Approval is a user decision, not proof that a command is safe.
+- **Read-dedupe cache never bypasses policy.** Identical plain filesystem reads
+  may be served from `resource_facts` without re-executing, but only when the
+  policy engine's advisory evaluation returns an explicit `Allow` for that read
+  (ADR-65 F1a). `Deny`/`RequireApproval` verdicts fall through to the executor,
+  where the normal policy and approval gates apply on every call. Served reads
+  are separately audited as `ServedFromCache` (ADR-65 F1b), are scoped to the
+  canonical project root and are never stale: every serve re-stats the disk and
+  re-hashes the cached bytes, and any write/shell/git side effect dirties the
+  row and purges its cached content, forcing fresh execution.
 
 See [Policy Rules](docs/policy-rules.md) for exact condition values. Keep narrow
 rules before catch-alls and test them on a disposable project.

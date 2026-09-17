@@ -6,7 +6,7 @@
 //!   blocking the UI.
 //! - `EmbeddingGenerator` produces vectors from text using `fastembed`.
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 use concerto_core::error::MemoryError;
@@ -46,6 +46,8 @@ pub trait EmbeddingGenerator: Send + Sync {
 ///
 /// The BAAI/bge-small-en-v1.5 model is loaded on first call (may trigger a download).
 /// Runtime inference is offloaded via `spawn_blocking` since `fastembed` uses sync ONNX inference.
+/// Since fastembed 6, `embed` requires exclusive (`&mut self`) access to the model,
+/// so the ready model sits behind its own sync mutex and concurrent calls serialize on it.
 pub struct ProviderEmbedder {
     model: String,
     embedding_model: Arc<Mutex<EmbedderState>>,
@@ -53,7 +55,7 @@ pub struct ProviderEmbedder {
 
 enum EmbedderState {
     Uninitialized,
-    Ready(Arc<TextEmbedding>),
+    Ready(Arc<StdMutex<TextEmbedding>>),
     Unavailable(String),
 }
 
@@ -96,7 +98,7 @@ impl EmbeddingGenerator for ProviderEmbedder {
                     };
                     match initialized {
                         Ok(model) => {
-                            let model = Arc::new(model);
+                            let model = Arc::new(StdMutex::new(model));
                             *guard = EmbedderState::Ready(Arc::clone(&model));
                             model
                         }
@@ -109,10 +111,15 @@ impl EmbeddingGenerator for ProviderEmbedder {
             }
         };
 
-        // Offload synchronous ONNX inference via spawn_blocking.
+        // fastembed 6 requires exclusive access to the model for inference.
+        // Serialize calls on the model mutex and keep the sync ONNX work off
+        // the async runtime threads.
         let text = text.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            model_arc
+            let mut model = model_arc.lock().map_err(|_| {
+                MemoryError::Persistence("embedding model mutex poisoned".to_string())
+            })?;
+            model
                 .embed(vec![text], None)
                 .map_err(|e| MemoryError::Persistence(format!("embedding inference failed: {e}")))
         })
@@ -224,6 +231,7 @@ impl ModelDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastembed::Pooling;
 
     #[test]
     fn needs_reindex_same_version() {
@@ -274,5 +282,63 @@ mod tests {
         assert_eq!(embedder.model_id(), "bge-small-en-v1.5");
         assert_eq!(embedder.model_version(), "bge-small-en-v1.5-fastembed-4");
         assert_eq!(embedder.dims(), 384);
+    }
+
+    /// Offline dimension proof for the fastembed 6 bump: fastembed's model
+    /// catalog must keep BAAI/bge-small-en-v1.5 at 384 dims and at the same
+    /// ONNX model source as fastembed 4 (`Xenova/bge-small-en-v1.5`,
+    /// `onnx/model.onnx`, CLS pooling). Same model + same dims + same
+    /// normalization is what keeps previously persisted vectors valid.
+    #[test]
+    fn bge_small_model_catalog_pins_dims_and_model_source() {
+        let info =
+            TextEmbedding::get_model_info(&EmbeddingModel::BGESmallENV15).expect("model info");
+        assert_eq!(info.dim, 384);
+        assert_eq!(info.model_code, "Xenova/bge-small-en-v1.5");
+        assert_eq!(info.model_file, "onnx/model.onnx");
+        assert_eq!(
+            TextEmbedding::get_default_pooling_method(&EmbeddingModel::BGESmallENV15),
+            Some(Pooling::Cls)
+        );
+        assert_eq!(ProviderEmbedder::new("bge-small-en-v1.5").dims(), info.dim);
+    }
+
+    /// Real-model smoke + dimension proof for the fastembed 6 bump: BAAI/bge-small-en-v1.5
+    /// must still produce 384-dimensional, L2-normalized vectors, so previously
+    /// persisted vectors stay valid for cosine retrieval. Network-gated
+    /// because it downloads the ONNX weights (~30 MB) on first run.
+    #[test]
+    #[ignore = "requires network + downloads the BGE-small ONNX model on first run"]
+    fn bge_small_real_embedding_dimension_is_384() {
+        let mut embedder = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGESmallENV15))
+            .expect("failed to initialize fastembed BGESmallENV15");
+        let texts = ["first sample sentence", "second one", "a third one"];
+        let embeddings = embedder.embed(texts, None).expect("embedding failed");
+        assert_eq!(embeddings.len(), 3);
+        for embedding in &embeddings {
+            assert_eq!(embedding.len(), 384, "BGE-small-en-v1.5 must stay 384-dimensional");
+            let norm: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "expected L2 norm ~1.0, got {norm}");
+        }
+    }
+
+    /// Smoke test through the full `ProviderEmbedder` wrapper (lazy init +
+    /// spawn_blocking + serialization) against the real model. Network-gated
+    /// for the same reason as `bge_small_real_embedding_dimension_is_384`.
+    #[tokio::test]
+    #[ignore = "requires network + downloads the BGE-small ONNX model on first run"]
+    async fn provider_embedder_real_embedding_smoke() {
+        let embedder = ProviderEmbedder::new("bge-small-en-v1.5");
+        let vector_a = embedder
+            .embed("the quick brown fox jumps over the lazy dog")
+            .await
+            .expect("embed failed");
+        let vector_b = embedder.embed("a fox jumped over a dog today").await.expect("embed failed");
+        assert_eq!(vector_a.len(), 384);
+        assert_eq!(vector_b.len(), 384);
+        // Both vectors are L2-normalized, so the dot product is the cosine
+        // similarity; related sentences must remain positively correlated.
+        let cosine: f32 = vector_a.iter().zip(&vector_b).map(|(a, b)| a * b).sum();
+        assert!(cosine > 0.0, "expected positive cosine similarity, got {cosine}");
     }
 }

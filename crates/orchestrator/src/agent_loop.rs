@@ -3,6 +3,7 @@
 //! Phase 3: basic sequential loop with memory, undo, and eval hooks.
 //! Multi-agent coordination is Phase 5.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -29,7 +30,11 @@ use concerto_tools::undo::UndoManager;
 use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
+use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
+use crate::tool_driver::{self, DriverTurn, TextToolDriver};
+use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
+use crate::tool_guard;
 
 /// The single-agent loop driving plan → act → observe → plan cycles.
 pub struct AgentLoop {
@@ -47,6 +52,18 @@ pub struct AgentLoop {
     eval: EvalEngine,
     prompt_builder: PromptBuilder,
     cycle_budget: CycleBudgetTracker,
+    /// Consecutive tool-guard rejections per tool name within the current
+    /// run (cleared on a valid guarded call and at run start). Bounds the
+    /// corrective-retry coaching for weak models at
+    /// [`tool_guard::MAX_TOOL_GUARD_REJECTS`] injections per tool.
+    tool_guard_rejects: HashMap<String, u32>,
+    /// Repair turns spent per failed `shell` tool-call id within the current
+    /// run (cleared at run start). Bounds the execution-failure repair loop
+    /// at [`shell_repair::MAX_SHELL_REPAIR_ATTEMPTS`] corrective turns per
+    /// failed call id. Independent of `tool_guard_rejects`: that budget
+    /// repairs argument SHAPE before execution, this one coaches the model
+    /// after an execution failure.
+    shell_repair_attempts: HashMap<String, u32>,
     max_iterations: u32,
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
@@ -58,9 +75,11 @@ pub struct AgentLoop {
     /// trigger ratio of the model's context capacity.
     overflow_strategy: Option<Arc<dyn ContextOverflowStrategy>>,
 
-    /// Optional context budget allocator for RAG chunk filtering.
+    /// Optional RAG-only context budget bound (ADR-16/ADR-48).
     /// When set, retrieved memory chunks are filtered through this
-    /// allocator before being injected into the prompt.
+    /// allocator's score-ordered `truncate_to_rag_limit` before being
+    /// injected into the prompt. The bound is derived from the provider
+    /// budget's `available` tokens — never raw total capacity.
     budget_allocator: Option<ContextBudgetAllocator>,
 
     /// Prior conversation messages (loaded from the persistent session) used
@@ -74,6 +93,12 @@ pub struct AgentLoop {
     /// Optional session store for persistence of tasks, messages, and events.
     /// When `None`, persistence is skipped (best-effort, warnings only).
     session_store: Option<Arc<dyn SessionStore>>,
+
+    /// ADR-65 §3: optional tool-evidence writer. When `Some`, every completed
+    /// tool command in this loop is recorded as a `ToolExecuted` whiteboard
+    /// event attributed to `"single-agent"`; the writer is fail-soft and never
+    /// affects tool results.
+    tool_facts: Option<ToolFactContext>,
 
     /// Model id and cumulative usage for session/dashboard accounting.
     usage_model: String,
@@ -90,6 +115,10 @@ const MAX_CONTINUATION_ROUNDS: u32 = 8;
 /// Number of consecutive rounds with identical progress before declaring
 /// non-convergence and escalating to the user.
 const MAX_STALE_ROUNDS: u32 = 3;
+
+/// Character cap for the loop's persisted end-reason note (completion fix:
+/// the terminal reason/surfaces bounded into the session event log).
+const END_REASON_CHARS: usize = 2000;
 
 /// Snapshot of progress used to detect non-convergence across continuation
 /// rounds (two identical fingerprints in a row ⇒ no real forward motion).
@@ -144,6 +173,53 @@ fn merge_run_progress(accumulated: &mut AgentOutput, latest: &AgentOutput) {
     }
 }
 
+/// Number of successful, audited file-changing tool calls recorded in
+/// `output.tool_events` (completion-fix counter reconciliation, 2026-09-09).
+///
+/// The ActionRequired completion check consults the in-loop counter
+/// (`file_changing_tool_count`), which is SCOPED to one continuation round
+/// and keys off the raw arguments' tool name / `operation` field — while the
+/// audited write path (tool summaries, tool-fact rows) accumulates across
+/// rounds and records what the tool normalized. A run that wrote a file in
+/// an earlier round then ended Blocked on "no file-changing tool call
+/// succeeded" reported a disagreement between the two views (live smoke
+/// evidence). This reconciles the check with the audited write path: the
+/// cross-round audit counts as file-changing evidence too.
+fn audited_file_changes(output: &AgentOutput) -> u32 {
+    output
+        .tool_events
+        .iter()
+        .filter(|event| event.success && is_audited_mutation_event(event))
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// True when a tool-execution summary names a mutating tool or operation —
+/// the same grammar [`crate::tool_facts::is_file_affecting_tool`] uses on the
+/// RAW arguments, applied to the summary the executor produced, with the
+/// filesystem tool's own write/delete success marker ("Wrote …"/"Deleted …")
+/// as the fallback for normalized (alias/inferred) calls whose raw
+/// `operation` field was absent.
+fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
+    if event
+        .operation
+        .as_deref()
+        .is_some_and(|op| matches!(op, "write" | "delete" | "move" | "copy"))
+    {
+        return true;
+    }
+    if matches!(
+        event.tool_name.as_str(),
+        "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
+    ) {
+        return true;
+    }
+    // Normalized writes whose raw arguments carried no `operation` field:
+    // classify from the tool's own success summary vocabulary.
+    ["Wrote ", "Deleted "].iter().any(|marker| event.summary.starts_with(marker))
+}
+
 /// Hard completion condition: verification must actually pass when the task
 /// requires it. Without this, a capped or partially-failed run could be
 /// reported as `Done`.
@@ -169,6 +245,16 @@ enum ProviderResponseAction {
     Proceed,
 }
 
+/// Outcome of the tool-call guard (VALIDATE → COERCE → REPAIR) for one
+/// incoming tool call.
+enum GuardOutcome {
+    /// Arguments are usable (possibly after coercion); execute with these.
+    Pass(serde_json::Value),
+    /// Arguments are invalid after coercion; inject the corrective tool
+    /// result so the model retries and skip execution entirely.
+    Reject { summary: String, content: String, payload: serde_json::Value },
+}
+
 /// Normalize a collected reasoning string into an `Option`, so an empty
 /// reasoning buffer maps to `None` (ADR-46).
 fn non_empty_reasoning(reasoning: Option<String>) -> Option<String> {
@@ -176,6 +262,21 @@ fn non_empty_reasoning(reasoning: Option<String>) -> Option<String> {
         Some(r) if r.trim().is_empty() => None,
         other => other,
     }
+}
+
+/// The most recent assistant message text in `messages` — the cheapest
+/// source of the model's stated intent for tool-guard text extraction
+/// ([`AgentLoop::guard_tool_call`]). The assistant message that carried the
+/// tool call is pushed before tool execution starts, so it is always the
+/// last usable entry here. Whitespace-only texts are skipped; `None` when no
+/// usable text exists (extraction is then skipped and guard behavior is
+/// unchanged).
+fn latest_assistant_text(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
+        .map(|message| message.content.as_str())
 }
 
 impl AgentLoop {
@@ -241,6 +342,8 @@ impl AgentLoop {
             eval,
             prompt_builder,
             cycle_budget: CycleBudgetTracker::default(),
+            tool_guard_rejects: HashMap::new(),
+            shell_repair_attempts: HashMap::new(),
             max_iterations,
             fast,
             state: AgentState::Idle,
@@ -250,6 +353,7 @@ impl AgentLoop {
             initial_messages: Vec::new(),
             retry_policy: RetryPolicy::default(),
             session_store: None,
+            tool_facts: None,
             usage_model: String::new(),
             usage_tokens_in: 0,
             usage_tokens_out: 0,
@@ -298,6 +402,15 @@ impl AgentLoop {
         self
     }
 
+    /// Attach an ADR-65 §3 tool-evidence writer. When `Some`, every completed
+    /// tool command is recorded as a `ToolExecuted` whiteboard event
+    /// attributed to `"single-agent"`; the writer is fail-soft and never
+    /// affects tool results.
+    pub fn with_tool_facts(mut self, facts: Option<ToolFactContext>) -> Self {
+        self.tool_facts = facts;
+        self
+    }
+
     /// Run the agent loop for the given task.
     ///
     /// Thin wrapper that handles best-effort session persistence around the
@@ -310,6 +423,10 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<AgentOutput, OrchestratorError> {
         let session_id = task.session_id;
+        // Fresh run: clear any corrective-retry streaks carried over from a
+        // previous run on this loop instance.
+        self.tool_guard_rejects.clear();
+        self.shell_repair_attempts.clear();
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -318,6 +435,12 @@ impl AgentLoop {
         let mut last_partial: Option<AgentOutput> = None;
         let mut cumulative_progress: Option<AgentOutput> = None;
 
+        let mut carried_file_changes: u32 = 0;
+        // Cross-round file-changing carry (completion-fix reconciliation):
+        // the ActionRequired completion check runs INSIDE `run_once` with a
+        // round-scoped counter; the audited write path accumulates across
+        // continuation rounds. The carry tracks the audited file-changing
+        // total so a later round's check sees the earlier rounds' writes.
         for round in 0..MAX_CONTINUATION_ROUNDS {
             // Seed this round's conversation. The first round includes the
             // original task prompt; continuation rounds reuse the full prior
@@ -335,7 +458,8 @@ impl AgentLoop {
                 });
             }
 
-            let exit = self.run_once(task.clone(), seed, cancel.clone()).await?;
+            let exit =
+                self.run_once(task.clone(), seed, cancel.clone(), carried_file_changes).await?;
 
             match exit {
                 AgentRunExit::Done(mut output) => {
@@ -343,8 +467,11 @@ impl AgentLoop {
                         merge_run_progress(accumulated, &output);
                         output = accumulated.clone();
                     }
-                    output.completion_status =
-                        concerto_core::types::AgentCompletionStatus::Completed;
+                    // Truthful completion (ADR-55 Phase 2e, completion fix):
+                    // `AgentOutput.completion_status` is the single source
+                    // of truth. `finalize_completion` set it from the agent's
+                    // own landing state (an eval failure stays `Partial`);
+                    // no transport-level success ever overrides it here.
                     self.persist_run_success(session_id, &output, cancel.clone()).await;
                     return Ok(output);
                 }
@@ -355,6 +482,15 @@ impl AgentLoop {
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
+                    // End-reason persistence (completion-fix): surface the
+                    // loop-end reason into the session event log so the next
+                    // diagnosis reads it from the log, not code archaeology.
+                    self.publish_end_reason(
+                        session_id,
+                        "user input required",
+                        &reason,
+                        cancel.clone(),
+                    );
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
                     return Ok(output);
                 }
@@ -365,6 +501,7 @@ impl AgentLoop {
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
+                    self.publish_end_reason(session_id, "blocked", &reason, cancel.clone());
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
                     return Ok(output);
                 }
@@ -375,6 +512,9 @@ impl AgentLoop {
                         cumulative_progress = Some(partial.clone());
                     }
                     let cumulative = cumulative_progress.as_ref().unwrap_or(&partial);
+                    // Reconcile the cross-round file-changing carry with the
+                    // audited write path (completion-fix).
+                    carried_file_changes = audited_file_changes(cumulative);
                     let fp = ProgressFingerprint::from_output(cumulative);
                     if Some(&fp) == last_fp.as_ref() {
                         stale_rounds += 1;
@@ -389,6 +529,12 @@ impl AgentLoop {
                         );
                         partial_out.completion_status =
                             concerto_core::types::AgentCompletionStatus::Partial;
+                        self.publish_end_reason(
+                            session_id,
+                            "no convergence",
+                            &reason,
+                            cancel.clone(),
+                        );
                         self.persist_run_partial(session_id, &partial_out, cancel.clone()).await;
                         return Ok(partial_out);
                     }
@@ -439,8 +585,48 @@ impl AgentLoop {
         partial.final_message =
             format!("Blocked: reached maximum continuation rounds ({MAX_CONTINUATION_ROUNDS}).");
         partial.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+        self.publish_end_reason(
+            session_id,
+            "maximum continuation rounds reached",
+            &partial.final_message,
+            cancel.clone(),
+        );
         self.persist_run_partial(session_id, &partial, cancel.clone()).await;
         Ok(partial)
+    }
+
+    /// End-reason persistence (completion-fix): the loop's terminal reason
+    /// surfaces as a session event (`AgentThought` diagnostic channel — an
+    /// existing payload field, no schema change) so the session event log
+    /// carries WHY the run ended; the same reason lands in the message log
+    /// through `persist_run_partial`'s assistant summary. Content is
+    /// truncated ([`END_REASON_CHARS`]) and fail-soft (a publish failure
+    /// never changes the run's outcome).
+    fn publish_end_reason(
+        &self,
+        session_id: Ulid,
+        kind: &str,
+        reason: &str,
+        cancel: CancellationToken,
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let mut reason = reason.trim();
+        if reason.is_empty() {
+            reason = "(no recorded reason)";
+        }
+        let content = if reason.chars().count() > END_REASON_CHARS {
+            let truncated: String = reason.chars().take(END_REASON_CHARS).collect();
+            format!("run ended ({kind}): {truncated}… [truncated]")
+        } else {
+            format!("run ended ({kind}): {reason}")
+        };
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::AgentThought { agent_id: "single-agent".to_owned(), content },
+        );
     }
 
     async fn run_once(
@@ -448,6 +634,11 @@ impl AgentLoop {
         task: AgentTask,
         seed_messages: Vec<Message>,
         cancel: CancellationToken,
+        // Cross-round audited file-changing carry (completion-fix): the
+        // ActionRequired completion check inside `decide_exit` sees the
+        // earlier continuation rounds' audited writes, not just this round's
+        // round-scoped counter.
+        prior_file_changes: u32,
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Planning;
         let correlation_id = Ulid::new();
@@ -496,6 +687,45 @@ impl AgentLoop {
                 &verification,
                 &retrieved_memory_block,
             );
+
+            // ADR-66 §4: the universal text-fallback driver engages
+            // automatically when the provider lacks native tool support
+            // (never for plugin providers — those are hard-gated to
+            // AnswerOnly tasks with an explicit error). Fallback-driven
+            // requests carry no wire tool declarations; the driver's prompt
+            // section replaces them. First engagement is audited once per
+            // run and labeled in the event stream.
+            let mut tool_driver = self.resolve_tool_driver();
+            let mut request = request;
+            if let Some(driver) = tool_driver.as_ref() {
+                driver.augment_request(&mut request);
+                if iteration == 1 {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        correlation_id,
+                        EventKind::AgentThought {
+                            agent_id: "single-agent".to_string(),
+                            content: format!(
+                                "tool_driver: fallback engaged (provider '{}', model '{}')",
+                                self.provider.provider_name(),
+                                self.usage_model
+                            ),
+                        },
+                    );
+                    self.tool_executor
+                        .record_tool_driver_event(
+                            task.session_id,
+                            correlation_id,
+                            self.provider.provider_name(),
+                            &self.usage_model,
+                            "engage",
+                            "fallback",
+                            "text-fallback tool driver engaged (no native tool support)",
+                            cancel.clone(),
+                        )
+                        .await;
+                }
+            }
 
             // Publish lifecycle event before provider call
             let _ = self.bus.publish_for_session(
@@ -552,6 +782,32 @@ impl AgentLoop {
                     self.state = AgentState::Failed;
                     return Err(e);
                 }
+            };
+
+            // ADR-66 §4: resolve the turn through the text-fallback driver —
+            // structured tool-call blocks parsed from the text, bounded
+            // repair on malformed blocks, loud failure on bound exhaustion.
+            // Native turns (driver inactive) pass through untouched.
+            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
+                Some(driver) => {
+                    self.driver_resolve_turn(
+                        driver,
+                        &task,
+                        iteration,
+                        &files_modified,
+                        &tool_events,
+                        &verification,
+                        &retrieved_memory_block,
+                        text,
+                        reasoning,
+                        usage,
+                        &mut messages,
+                        correlation_id,
+                        &cancel,
+                    )
+                    .await?
+                }
+                None => (text, reasoning, tool_calls, usage),
             };
 
             // Publish lifecycle event after provider call succeeds
@@ -648,6 +904,7 @@ impl AgentLoop {
             &output,
             tool_call_count,
             file_changing_tool_count,
+            prior_file_changes,
             &eval_result,
             completed,
             messages,
@@ -738,10 +995,12 @@ impl AgentLoop {
                 .unwrap_or_default()
         };
 
-        // Apply context budget allocation if configured
+        // Apply the RAG context budget if configured. The allocator derives
+        // its bound from the provider budget's `available` tokens (capacity
+        // minus the response reservation) — never the raw total capacity.
         if let Some(ref allocator) = self.budget_allocator {
-            let capacity = self.provider.context_capacity(&self.usage_model);
-            memory_chunks = allocator.truncate_to_rag_limit(memory_chunks, capacity.available);
+            let budget = self.provider.context_capacity(&self.usage_model);
+            memory_chunks = allocator.truncate_to_rag_limit(memory_chunks, &budget);
         }
 
         crate::memory_prompt::format_retrieved_memory(&memory_chunks)
@@ -788,6 +1047,165 @@ impl AgentLoop {
         request
     }
 
+    /// Resolve the ADR-66 §4 text-fallback driver for this loop.
+    ///
+    /// `Some` only when there are tools to drive and the provider/model
+    /// resolves to no native tool support (plugin providers are excluded —
+    /// they are hard-gated to AnswerOnly tasks with an explicit error, and
+    /// the driver must not bypass that gate).
+    fn resolve_tool_driver(&self) -> Option<TextToolDriver> {
+        let tools = self.tool_executor.tool_definitions();
+        if tools.is_empty() {
+            return None;
+        }
+        if !tool_driver::fallback_engaged(self.provider.provider_name(), &self.usage_model) {
+            return None;
+        }
+        Some(TextToolDriver::new(tools))
+    }
+
+    /// ADR-66 §4: resolve one provider turn through the text-fallback
+    /// driver.
+    ///
+    /// Parses the turn's text for structured tool-call blocks. A malformed
+    /// block is repaired by re-prompting (bounded by
+    /// [`tool_driver::MAX_REPAIR_ATTEMPTS`], each attempt audited and
+    /// labeled); bound exhaustion fails the run loudly — never a silent
+    /// completion. A turn with no block at all is a final answer in plain
+    /// text; the loop's own completion semantics (including the
+    /// action-required gate) decide whether that answer satisfies the task.
+    #[allow(clippy::too_many_arguments)]
+    async fn driver_resolve_turn(
+        &mut self,
+        driver: &mut TextToolDriver,
+        task: &AgentTask,
+        iteration: u32,
+        files_modified: &[Utf8PathBuf],
+        tool_events: &[ToolExecutionSummary],
+        verification: &[VerificationSummary],
+        retrieved_memory_block: &str,
+        mut text: String,
+        mut reasoning: Option<String>,
+        mut usage: Option<CompletionUsage>,
+        messages: &mut Vec<Message>,
+        correlation_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
+    {
+        let provider = self.provider.provider_name();
+        let model = self.usage_model.clone();
+        let mut attempts = 0u32;
+        loop {
+            match driver.parse_turn(&text) {
+                DriverTurn::ToolCalls(calls) => {
+                    // Fallback turns are labeled in the event stream and the
+                    // audit log (ADR-66: `tool_driver: fallback`).
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        correlation_id,
+                        EventKind::AgentThought {
+                            agent_id: "single-agent".to_string(),
+                            content: format!(
+                                "tool_driver: fallback turn — {} tool call(s) parsed",
+                                calls.len()
+                            ),
+                        },
+                    );
+                    self.tool_executor
+                        .record_tool_driver_event(
+                            task.session_id,
+                            correlation_id,
+                            provider,
+                            &model,
+                            "turn",
+                            "fallback",
+                            &format!("{} tool call(s) parsed from text", calls.len()),
+                            cancel.clone(),
+                        )
+                        .await;
+                    return Ok((text, reasoning, calls, usage));
+                }
+                DriverTurn::FinalAnswer(final_text) => {
+                    return Ok((final_text, reasoning, Vec::new(), usage));
+                }
+                DriverTurn::Malformed { reason } => {
+                    if attempts >= tool_driver::MAX_REPAIR_ATTEMPTS {
+                        self.tool_executor
+                            .record_tool_driver_event(
+                                task.session_id,
+                                correlation_id,
+                                provider,
+                                &model,
+                                "exhausted",
+                                "exhausted",
+                                &format!(
+                                    "bounded repair exhausted after {attempts} attempts: {reason}"
+                                ),
+                                cancel.clone(),
+                            )
+                            .await;
+                        return Err(OrchestratorError::AgentLoopError(format!(
+                            "tool_driver: text-fallback repair exhausted after {attempts} attempts \
+                             (provider '{provider}', model '{model}'): {reason}"
+                        )));
+                    }
+                    attempts += 1;
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        correlation_id,
+                        EventKind::AgentThought {
+                            agent_id: "single-agent".to_string(),
+                            content: format!(
+                                "tool_driver: fallback repair attempt {attempts}: {reason}"
+                            ),
+                        },
+                    );
+                    self.tool_executor
+                        .record_tool_driver_event(
+                            task.session_id,
+                            correlation_id,
+                            provider,
+                            &model,
+                            "repair",
+                            "fallback",
+                            &format!("repair attempt {attempts}: {reason}"),
+                            cancel.clone(),
+                        )
+                        .await;
+                    // Re-prompt: the malformed reply stays in the history so
+                    // the model can see its own defect, followed by the
+                    // repair instruction.
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: reasoning.clone(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    messages.push(TextToolDriver::repair_message(&reason));
+                    let mut request = self.build_provider_request(
+                        &task.description,
+                        iteration,
+                        messages,
+                        files_modified,
+                        tool_events,
+                        verification,
+                        retrieved_memory_block,
+                    );
+                    driver.augment_request(&mut request);
+                    let (repaired_text, repaired_reasoning, _, repaired_usage) = self
+                        .call_provider_with_retry(&request, task.session_id, task.id, cancel)
+                        .await?;
+                    usage = tool_driver::merge_usage(usage, repaired_usage);
+                    text = repaired_text;
+                    reasoning = repaired_reasoning.or(reasoning);
+                }
+            }
+        }
+    }
+
     /// Phase 4: Call the LLM provider through the shared retry boundary and
     /// collect the streaming response into text and tool calls.
     ///
@@ -803,7 +1221,7 @@ impl AgentLoop {
         cancel: &CancellationToken,
     ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
     {
-        crate::prompts::complete_provider_request(
+        match crate::prompts::complete_provider_request(
             &self.provider,
             request,
             &self.retry_policy,
@@ -813,6 +1231,35 @@ impl AgentLoop {
             cancel,
         )
         .await
+        {
+            Ok(turn) => Ok(turn),
+            Err(OrchestratorError::Provider(ProviderError::CapabilityRefused {
+                provider,
+                model,
+                capability,
+            })) => {
+                // ADR-66: every capability refusal is audited (fail-soft —
+                // the row write must not mask the refusal itself), then the
+                // error propagates loudly (§2(b): never send tool-less).
+                self.tool_executor
+                    .record_capability_refusal(
+                        session_id,
+                        Ulid::new(),
+                        &provider,
+                        &model,
+                        &capability,
+                        "request_build",
+                        cancel.clone(),
+                    )
+                    .await;
+                Err(OrchestratorError::Provider(ProviderError::CapabilityRefused {
+                    provider,
+                    model,
+                    capability,
+                }))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Phase 5: Process the provider's text response and tool calls.
@@ -952,6 +1399,13 @@ impl AgentLoop {
     }
 
     /// Phase 7: Apply conversation-history overflow strategy if configured.
+    ///
+    /// Audit C-03 gate: in-run LLM overflow strategies are disabled in
+    /// production — the runtime forces `None` (see `runtime_runner`) and
+    /// context overflow is bounded deterministically before/after the run by
+    /// `ContextEngine` + `ContextGuardProvider`. Any strategy reaching this
+    /// point is a miswire; log it so it can never run silently, and never
+    /// re-enable without a superseding ADR.
     async fn trim_conversation_history(
         &self,
         messages: &mut Vec<Message>,
@@ -959,18 +1413,27 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) {
         if let Some(ref strategy) = self.overflow_strategy {
+            tracing::warn!(
+                "overflow strategy applied inside agent loop — in-run overflow strategies are \
+                 gated (audit C-03); context should be bounded by deterministic compaction"
+            );
             let budget = self.provider.context_capacity("");
             strategy.apply(messages, &budget, session_id, cancel).await;
         }
     }
 
-    /// Phase 8: Run evaluation (test suite) on modified files.
+    /// Phase 8: Run evaluation (test suite) on modified files. The harness
+    /// root is resolved from the run's own write evidence — nearest
+    /// manifest-bearing ancestor of the modified files under the project
+    /// root — so a project built in a subdirectory validates there, with the
+    /// session root as the fallback when nothing better exists.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
         cancel: CancellationToken,
     ) -> Option<concerto_core::types::EvalResult> {
-        self.eval.run_scoped(files_modified, cancel).await.ok()
+        let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files_modified);
+        self.eval.run_scoped_in_dir(&eval_dir, files_modified, cancel).await.ok()
     }
 
     /// Phase 9: Build an `AgentOutput` summarising the current progress
@@ -986,11 +1449,17 @@ impl AgentLoop {
         tool_events: &[ToolExecutionSummary],
         verification: &[VerificationSummary],
     ) -> AgentOutput {
+        // files_modified hygiene (smoke follow-up round 2): the accumulator
+        // records audited-mutation argument paths, which can carry directory
+        // spellings (`hexview/`, `.`) or targets that never existed as files.
+        // Run artifacts must contain only real, in-root, regular files.
+        let files_modified =
+            crate::tool_facts::sanitize_files_modified(&self.project_root, files_modified);
         AgentOutput {
             task_id: task.id,
             session_id: task.session_id,
             final_message: final_message.to_string(),
-            files_modified: files_modified.to_vec(),
+            files_modified,
             tool_call_count,
             eval_result: eval_result.clone(),
             tool_events: tool_events.to_vec(),
@@ -1014,6 +1483,11 @@ impl AgentLoop {
         output: &AgentOutput,
         tool_call_count: u32,
         file_changing_tool_count: u32,
+        // Cross-round audited file-changing carry (completion-fix, see
+        // `run_once`): the check reconciles with the audited write path, so
+        // a write that succeeded in an earlier continuation round is not
+        // treated as "no file-changing tool call succeeded".
+        prior_file_changes: u32,
         eval_result: &Option<concerto_core::types::EvalResult>,
         completed: bool,
         messages: Vec<Message>,
@@ -1031,9 +1505,17 @@ impl AgentLoop {
                 return Err(OrchestratorError::ExecutionRequiredButNoTools);
             }
 
-            if file_changing_tool_count == 0 {
+            // Counter reconciliation (completion-fix): the round-scoped
+            // in-loop counter is authoritative for THIS round, but the
+            // audited write path accumulates across rounds (both the
+            // cross-round carry and this round's own audited tool counts).
+            // The Blocked verdict fires only when BOTH views report zero.
+            if file_changing_tool_count == 0
+                && prior_file_changes == 0
+                && audited_file_changes(output) == 0
+            {
                 return Ok(Some(AgentRunExit::Blocked {
-                    reason: "Action-required task failed: no file-changing tool call succeeded. Text-only provider claims are ignored. Expected filesystem operation \"write\" or \"delete\", or an equivalent file mutation tool.".to_string(),
+                    reason: "Action-required task failed: no file-changing tool call succeeded. Text-only provider claims are ignored. Expected filesystem operation \"write\" or \"delete\", or an equivalent file mutation tool. File-changing counting reconciles with the audited write path (round-local and cross-round).".to_string(),
                     partial: output.clone(),
                 }));
             }
@@ -1065,7 +1547,7 @@ impl AgentLoop {
         &mut self,
         task: &AgentTask,
         session: &SessionContext,
-        output: AgentOutput,
+        mut output: AgentOutput,
         eval_result: &Option<concerto_core::types::EvalResult>,
         tool_call_count: u32,
         files_modified: &[Utf8PathBuf],
@@ -1074,13 +1556,26 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Completed;
+
+        // Truthful completion: `AgentOutput.completion_status` is the single
+        // source of truth, decided HERE from the agent's own landing state —
+        // an eval failure stays `Partial`, everything else lands `Completed`
+        // (a run with no evaluation result is a normal done run, exactly once
+        // the task genuinely reached finalize). Nothing transport-derived
+        // (a successful provider call, a successful tool transfer) can
+        // override this afterwards; `persist_run_success` and the run-level
+        // Completion card mirror this status.
+        output.completion_status = if eval_result.as_ref().is_some_and(|result| !result.passed) {
+            concerto_core::types::AgentCompletionStatus::Partial
+        } else {
+            concerto_core::types::AgentCompletionStatus::Completed
+        };
+        let success =
+            output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
         let _ = self.bus.publish_for_session(
             task.session_id,
             correlation_id,
-            EventKind::TaskCompleted {
-                task_id: task.id,
-                success: eval_result.as_ref().is_none_or(|r| r.passed),
-            },
+            EventKind::TaskCompleted { task_id: task.id, success },
         );
 
         self.store_task_summary(
@@ -1093,12 +1588,6 @@ impl AgentLoop {
         )
         .await;
 
-        let mut output = output;
-        output.completion_status = if eval_result.as_ref().is_none_or(|result| result.passed) {
-            concerto_core::types::AgentCompletionStatus::Completed
-        } else {
-            concerto_core::types::AgentCompletionStatus::Partial
-        };
         Ok(AgentRunExit::Done(output))
     }
 
@@ -1199,7 +1688,20 @@ impl AgentLoop {
         if cancel.is_cancelled() {
             return;
         }
-        if let Err(e) = store.update_task_status(output.task_id, "completed", cancel.clone()).await
+        // Truthful completion (completion-status fix): the TaskCompleted
+        // event and the task row mirror `AgentOutput.completion_status` —
+        // never an unconditional transport-level `success: true`. A partial
+        // landing (eval failure) persists `success: false` with a `partial`
+        // task row, exactly like `persist_run_partial`.
+        let success =
+            output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
+        if let Err(e) = store
+            .update_task_status(
+                output.task_id,
+                if success { "completed" } else { "partial" },
+                cancel.clone(),
+            )
+            .await
         {
             tracing::warn!(error = %e, "failed to update task status");
         }
@@ -1207,7 +1709,7 @@ impl AgentLoop {
         let event = Event::new(
             Ulid::new(),
             session_id,
-            EventKind::TaskCompleted { task_id: output.task_id, success: true },
+            EventKind::TaskCompleted { task_id: output.task_id, success },
         );
         if cancel.is_cancelled() {
             return;
@@ -1284,8 +1786,131 @@ impl AgentLoop {
         self.state
     }
 
-    /// Execute a single tool call: cycle-budget check, approval, execution, and
-    /// structured result persistence.
+    /// Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT → REPAIR):
+    /// normalize weak-model arguments against the tool's advertised JSON
+    /// Schema before the cycle budget or the executor sees the call.
+    ///
+    /// * parses `null`/empty/stringified arguments (including fenced JSON
+    ///   blocks) into an object;
+    /// * applies schema-guided safe coercions (string → number/boolean, enum
+    ///   case normalization, unknown-key stripping), logging every fix;
+    /// * validates required fields, types, and enum membership; on failure
+    ///   attempts per-tool heuristic inference (adaptive tool-guard Solution
+    ///   3) for required fields that are absent or `null` — e.g. filesystem
+    ///   `operation` from path shape, shell `command` recovered from a `cmd`
+    ///   alias — accepting the result only when the completed arguments
+    ///   re-validate cleanly;
+    /// * when structured arguments and heuristics both fail, recovers the
+    ///   arguments from the model's own assistant message text
+    ///   ([`tool_guard::extract_from_text`], live-audit backstop) when the
+    ///   text states the call (e.g. `operation="read" path="src/main.rs"`),
+    ///   merging and re-validating before anything executes;
+    /// * otherwise injects a structured corrective `ToolResult` (bounded by
+    ///   [`tool_guard::MAX_TOOL_GUARD_REJECTS`] per tool name per run) so the
+    ///   model retries with corrected arguments.
+    ///
+    /// `assistant_text` is the latest assistant message text (`None` skips
+    /// text extraction; see [`latest_assistant_text`]).
+    ///
+    /// Tools without a schema in the registry pass through untouched — the
+    /// executor and policy engine own unknown-tool errors. The guard adds no
+    /// `await` points, so the caller's `CancellationToken` is unaffected.
+    fn guard_tool_call(&mut self, tc: &ToolCall, assistant_text: Option<&str>) -> GuardOutcome {
+        let parsed = tool_guard::parse_tool_arguments(&tc.arguments);
+        let definitions = self.tool_executor.tool_definitions();
+        let Some(schema) =
+            definitions.iter().find(|definition| definition.name == tc.name).map(|d| &d.parameters)
+        else {
+            return GuardOutcome::Pass(parsed);
+        };
+
+        // The original parse result is kept for heuristic alias recovery:
+        // coercion strips hallucinated alias keys (`cmd`, `file`, ...), which
+        // are exactly the alternative field names the heuristics recover.
+        let (coerced, coercions) = tool_guard::coerce_arguments(parsed.clone(), schema);
+        if !coercions.is_empty() {
+            tracing::warn!(
+                tool = %tc.name,
+                coercions = ?coercions,
+                "tool-call guard coerced tool arguments"
+            );
+        }
+
+        let errors = tool_guard::validate_arguments(&coerced, schema);
+        if errors.is_empty() {
+            self.tool_guard_rejects.remove(&tc.name);
+            return GuardOutcome::Pass(coerced);
+        }
+
+        // Heuristic inference (Solution 3): last-mile recovery for unresolved
+        // required fields before coaching the model. Conservative by
+        // construction — fills only absent/`null` slots, logged, and accepted
+        // only when the completed arguments validate cleanly; anything else
+        // falls through to the corrective reject below with the original
+        // errors (no silent guesses).
+        let mut repaired = coerced;
+        if let Some(notes) = tool_guard::heuristic_infer(&tc.name, &parsed, &mut repaired, schema) {
+            // The fills stay on the outer `repaired` (text extraction may
+            // merge over them below); the re-coerce validates a copy.
+            let (repaired, repair_coercions) =
+                tool_guard::coerce_arguments(repaired.clone(), schema);
+            if tool_guard::validate_arguments(&repaired, schema).is_empty() {
+                tracing::warn!(
+                    tool = %tc.name,
+                    heuristic_inferred = ?notes,
+                    coercions = ?repair_coercions,
+                    "tool-call guard heuristically inferred missing tool arguments"
+                );
+                self.tool_guard_rejects.remove(&tc.name);
+                return GuardOutcome::Pass(repaired);
+            }
+        }
+
+        // Text-intent extraction (live-audit backstop): when the structured
+        // arguments and heuristics both fail but the model's own message text
+        // states the call (e.g. `operation="read" path="src/main.rs"`), the
+        // arguments are recovered from that text. Conservative by
+        // construction (see [`tool_guard::extract_from_text`]) and accepted
+        // only when the merged arguments re-validate cleanly; anything else
+        // falls through to the corrective reject below unchanged — the
+        // fast-fail on empty args still applies when the text yields nothing.
+        if let Some(text) = assistant_text {
+            if let Some(extracted) = tool_guard::extract_from_text(text, &tc.name, schema) {
+                let merged = tool_guard::merge_extracted_arguments(extracted, &repaired);
+                let (merged, _merge_coercions) = tool_guard::coerce_arguments(merged, schema);
+                if tool_guard::validate_arguments(&merged, schema).is_empty() {
+                    self.tool_guard_rejects.remove(&tc.name);
+                    return GuardOutcome::Pass(merged);
+                }
+            }
+        }
+
+        // Live-proven (Sep 2026 audit): a model emitting zero-argument calls
+        // never corrects on coaching — retries only burn iterations. Fail
+        // fast on empty args; keep bounded retries for partial args (some
+        // keys present), where the example can actually guide a repair.
+        let has_keys = parsed.as_object().is_some_and(|map| !map.is_empty());
+        let reject_count = self.tool_guard_rejects.entry(tc.name.clone()).or_insert(0);
+        *reject_count += 1;
+        let exhausted = !has_keys || *reject_count > tool_guard::MAX_TOOL_GUARD_REJECTS;
+        let content = tool_guard::corrective_message_text(&tc.name, &errors, schema, exhausted);
+        let payload = tool_guard::corrective_tool_result(&tc.name, &errors, schema, exhausted);
+        tracing::warn!(
+            tool = %tc.name,
+            reject_count,
+            exhausted,
+            errors = ?errors,
+            "tool-call guard rejected tool arguments; injecting corrective tool result"
+        );
+        GuardOutcome::Reject {
+            summary: format!("invalid arguments: {}", errors.first().cloned().unwrap_or_default()),
+            content,
+            payload,
+        }
+    }
+
+    /// Execute a single tool call: tool-guard validation, cycle-budget check,
+    /// approval, execution, and structured result persistence.
     #[allow(clippy::too_many_arguments)]
     async fn execute_single_tool_call(
         &mut self,
@@ -1300,7 +1925,62 @@ impl AgentLoop {
         tool_events: &mut Vec<ToolExecutionSummary>,
         messages: &mut Vec<Message>,
     ) -> Result<(), OrchestratorError> {
-        let input_hash = blake3::hash(tc.arguments.to_string().as_bytes());
+        // Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT → REPAIR):
+        // normalize the provider-accumulated arguments against the tool's
+        // schema before anything else sees them. The assistant message that
+        // carried these tool calls was pushed before execution started, so
+        // its text is available for the guard's text-intent extraction
+        // backstop. Rejected calls never execute and never touch the cycle
+        // budget; the model receives a corrective tool result instead and
+        // retries on the next iteration.
+        let assistant_text = latest_assistant_text(messages);
+        let arguments = match self.guard_tool_call(tc, assistant_text) {
+            GuardOutcome::Pass(arguments) => arguments,
+            GuardOutcome::Reject { summary, content, payload } => {
+                *tool_call_count += 1;
+                tool_events.push(ToolExecutionSummary {
+                    tool_name: tc.name.clone(),
+                    operation: None,
+                    path: None,
+                    success: false,
+                    summary: summary.clone(),
+                });
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    correlation_id,
+                    EventKind::ToolExecutionFinished {
+                        tool_name: tc.name.clone(),
+                        duration_ms: 0,
+                        success: false,
+                        detail: Some(summary),
+                    },
+                );
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    correlation_id,
+                    EventKind::AgentThought {
+                        agent_id: "single-agent".to_string(),
+                        content: content.clone(),
+                    },
+                );
+                messages.push(Message {
+                    role: Role::Tool,
+                    content,
+                    tool_calls: None,
+                    tool_results: Some(vec![concerto_core::types::ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        content: payload,
+                    }]),
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                });
+                return Ok(());
+            }
+        };
+
+        let input_hash = blake3::hash(arguments.to_string().as_bytes());
 
         // Check cycle budget — on repeat, pause and ask the user
         // rather than hard-failing (roadmap requirement 3.2).
@@ -1319,7 +1999,7 @@ impl AgentLoop {
 
             let action = PolicyAction {
                 tool_name: &tc.name,
-                input: &tc.arguments,
+                input: &arguments,
                 session_id: task.session_id,
                 correlation_id: Ulid::new(),
                 capability_requirements: CapabilitySet::default(),
@@ -1348,8 +2028,8 @@ impl AgentLoop {
         }
 
         // Execute via tool executor
-        let filesystem_operation = tc.arguments.get("operation").and_then(|v| v.as_str());
-        let detail_path = tc.arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let filesystem_operation = arguments.get("operation").and_then(|v| v.as_str());
+        let detail_path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
         let start_detail = match (tc.name.as_str(), filesystem_operation, &detail_path) {
             (_, Some(op), Some(p)) => Some(format!("{} {}", op, p)),
             (_, Some(op), None) => Some(op.to_string()),
@@ -1366,25 +2046,148 @@ impl AgentLoop {
             },
         );
 
+        // ADR-65 §3: a completed tool command is evidence. Capture the
+        // pre-write content hashes now (before execution) so the fact can
+        // record the workspace state prior to this command — the write
+        // classifier mirrors the in-arm file-change accounting below.
+        let file_affecting = crate::tool_facts::is_file_affecting_tool(&tc.name, &arguments);
+        let pre_image_hashes = match &self.tool_facts {
+            Some(facts) => {
+                let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
+                facts.pre_image_hashes(&self.project_root, &affected, &cancel).await
+            }
+            None => HashMap::new(),
+        };
+
+        // ADR-65 §4: safe read dedupe. A plain single-path filesystem read
+        // whose clean observation still matches the disk (re-statted now,
+        // content hash verified) is a serve candidate. Any doubt (_None_)
+        // degrades to normal execution below.
+        let serve = match &self.tool_facts {
+            Some(facts) => {
+                crate::read_cache::maybe_serve_read(
+                    facts,
+                    &self.project_root,
+                    &tc.name,
+                    &arguments,
+                    &cancel,
+                )
+                .await
+            }
+            None => None,
+        };
+        // ADR-65 F1a: a cached read is served ONLY when the policy engine
+        // explicitly allows the read through the advisory path — re-evaluated
+        // here, per serve, so a served read is never a policy bypass. The
+        // advisory evaluation records no decision row and consumes no quota
+        // (see `ToolExecutor::policy_verdict_is_allow`); a non-`Allow` verdict
+        // falls through to the normal executor path below, where the full
+        // policy gate (Deny / RequireApproval) surfaces as usual.
+        let serve = match serve {
+            Some(serve)
+                if self
+                    .tool_executor
+                    .policy_verdict_is_allow(&tc.name, &arguments, session, cancel.clone())
+                    .await =>
+            {
+                Some(serve)
+            }
+            _ => None,
+        };
+        if let Some(serve) = serve {
+            *tool_call_count += 1;
+            // ADR-65 F1b: the serve consumed no executor decision row, so we
+            // persist its own ServedFromCache audit row (fail-soft: a write
+            // error is logged, never fails the serve).
+            self.tool_executor
+                .record_served_read_audit(
+                    &tc.name,
+                    &arguments,
+                    &serve.path,
+                    session,
+                    cancel.clone(),
+                )
+                .await;
+            let served_summary = format!("Read {} bytes from {}", serve.content.len(), serve.path);
+            tool_events.push(ToolExecutionSummary {
+                tool_name: tc.name.clone(),
+                operation: Some("read".to_string()),
+                path: Some(Utf8PathBuf::from(&serve.path)),
+                success: true,
+                summary: served_summary.clone(),
+            });
+            let served_data = serde_json::json!({
+                "content": serve.content,
+                "path": serve.path,
+            });
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                correlation_id,
+                EventKind::ToolExecutionFinished {
+                    tool_name: tc.name.clone(),
+                    duration_ms: 0,
+                    success: true,
+                    detail: Some(served_summary.clone()),
+                },
+            );
+            let tool_result_content = format!(
+                "TOOL_RESULT\ntool: {}\nid: {}\nstatus: success\nsummary: {}\ndata: {}",
+                tc.name,
+                tc.id,
+                served_summary,
+                serde_json::to_string(&served_data).unwrap_or_else(|_| "{}".to_string())
+            );
+            messages.push(Message {
+                role: Role::Tool,
+                content: tool_result_content.clone(),
+                tool_calls: None,
+                tool_results: Some(vec![concerto_core::types::ToolResult {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    content: serde_json::json!({ "summary": served_summary, "data": served_data }),
+                }]),
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            });
+            self.record_served_read_fact(
+                session,
+                task,
+                &tc.name,
+                &arguments,
+                &serve.event_id,
+                &cancel,
+            )
+            .await;
+            return Ok(());
+        }
+
         match self
             .tool_executor
-            .execute(&tc.name, tc.arguments.clone(), &tc.id, session, cancel)
+            .execute(&tc.name, arguments.clone(), &tc.id, session, cancel.clone())
             .await
         {
             Ok(output) => {
                 *tool_call_count += 1;
 
-                // Track file-changing tools separately
-                let is_file_changing = matches!(
-                    tc.name.as_str(),
-                    "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
-                ) || (tc.name == "filesystem"
-                    && matches!(filesystem_operation, Some("write" | "delete" | "move" | "copy")));
-
-                if is_file_changing {
+                // Track file-changing tools separately. Reconciled with the
+                // audited write path (completion fix, 2026-09-09 smoke): the
+                // pre-execution classification reads the RAW arguments' tool
+                // name / `operation` field, but the write path records what
+                // the TOOL actually normalized and executed — alias keys
+                // (`op`), content-inferred writes, and guard text-extracted
+                // fills can all execute a real, audited mutation that the
+                // raw-args classifier misses. A successful tool result that
+                // itself records a materialized mutation (`materialized:
+                // true`, the filesystem tool's write/delete success marker)
+                // therefore counts exactly like a pre-classified one.
+                let audited_mutation = file_affecting
+                    || output.data.get("materialized").and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                if audited_mutation {
                     *file_changing_tool_count += 1;
 
-                    if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                    if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
                         let path = camino::Utf8PathBuf::from(path);
                         if !files_modified.contains(&path) {
                             files_modified.push(path);
@@ -1448,6 +2251,48 @@ impl AgentLoop {
                     tokens_in: None,
                     tokens_out: None,
                 });
+
+                self.record_tool_fact(
+                    session,
+                    task,
+                    &tc.name,
+                    &arguments,
+                    true,
+                    None,
+                    crate::tool_facts::extract_affected_paths(&arguments, Some(&output.data)),
+                    audited_mutation,
+                    pre_image_hashes.clone(),
+                    &cancel,
+                )
+                .await;
+
+                // ADR-65 §4: cache the exact bytes of a successful plain read
+                // (runs after the observation above, so the row exists) so an
+                // identical later read can be served from cache. Fail-soft.
+                if let Some(facts) = &self.tool_facts {
+                    crate::read_cache::cache_read_output(
+                        facts,
+                        &self.project_root,
+                        &tc.name,
+                        &arguments,
+                        &output.data,
+                        &cancel,
+                    )
+                    .await;
+                }
+
+                // Bounded execution-failure repair (custom-ai-shell plan,
+                // Phase C subset): a `shell` command that RAN but exited
+                // non-zero earns a corrective user turn so the model can
+                // retry a fixed command without consuming a continuation
+                // round. Policy outcomes never reach this arm.
+                if let Some(failure) = shell_repair::repairable_failure(&tc.name, &output) {
+                    if let Some(repair) =
+                        self.shell_repair_turn(task.session_id, tc, &arguments, failure, &cancel)
+                    {
+                        messages.push(repair);
+                    }
+                }
             }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
@@ -1485,6 +2330,21 @@ impl AgentLoop {
                     tokens_in: None,
                     tokens_out: None,
                 });
+                // A policy-denied command never executed; record the refused
+                // attempt as a negative fact (nothing changed on disk).
+                self.record_tool_fact(
+                    session,
+                    task,
+                    &tc.name,
+                    &arguments,
+                    false,
+                    None,
+                    crate::tool_facts::extract_affected_paths(&arguments, None),
+                    file_affecting,
+                    pre_image_hashes.clone(),
+                    &cancel,
+                )
+                .await;
             }
             Err(e) => {
                 tool_events.push(ToolExecutionSummary {
@@ -1521,9 +2381,190 @@ impl AgentLoop {
                 tokens_in: None,
                 tokens_out: None,
                 });
+                // Execution errored before completing; record the failed
+                // attempt as a negative fact.
+                self.record_tool_fact(
+                    session,
+                    task,
+                    &tc.name,
+                    &arguments,
+                    false,
+                    None,
+                    crate::tool_facts::extract_affected_paths(&arguments, None),
+                    file_affecting,
+                    pre_image_hashes.clone(),
+                    &cancel,
+                )
+                .await;
+
+                // Bounded execution-failure repair (custom-ai-shell plan,
+                // Phase C subset): process-level shell failures (timeout,
+                // spawn failure) earn a corrective user turn the same way a
+                // non-zero exit does. `repairable_error_failure` refuses
+                // policy outcomes — denials, approval outcomes, containment
+                // blocks, and cancellation always surface unchanged.
+                if let Some(failure) = shell_repair::repairable_error_failure(&tc.name, &e) {
+                    if let Some(repair) =
+                        self.shell_repair_turn(task.session_id, tc, &arguments, failure, &cancel)
+                    {
+                        messages.push(repair);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Bounded shell-repair coaching (custom-ai-shell plan, Phase C subset).
+    ///
+    /// Consumes one unit of the per-call repair budget and returns the
+    /// corrective `User` turn to append to the conversation; the next
+    /// provider iteration sees it, so NO continuation round is consumed.
+    /// Returns `None` when the budget for this tool-call id is exhausted
+    /// ([`shell_repair::MAX_SHELL_REPAIR_ATTEMPTS`]) or the token is already
+    /// cancelled — a cancelled run must not spend a repair turn.
+    fn shell_repair_turn(
+        &mut self,
+        session_id: Ulid,
+        tc: &ToolCall,
+        arguments: &serde_json::Value,
+        failure: ShellFailure,
+        cancel: &CancellationToken,
+    ) -> Option<Message> {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let attempt = {
+            let spent = self.shell_repair_attempts.entry(tc.id.clone()).or_insert(0);
+            if *spent >= shell_repair::MAX_SHELL_REPAIR_ATTEMPTS {
+                tracing::debug!(
+                    tool_call = %tc.id,
+                    max = shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
+                    "shell repair budget exhausted; failure surfaces unchanged"
+                );
+                return None;
+            }
+            *spent += 1;
+            *spent
+        };
+        tracing::warn!(
+            tool_call = %tc.id,
+            attempt,
+            max = shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
+            diagnostic = shell_repair::diagnostic_code(&failure),
+            "shell execution failed; injecting bounded repair turn"
+        );
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::AgentThought {
+                agent_id: "single-agent".to_string(),
+                content: format!(
+                    "shell-repair: attempt {attempt}/{} injected ({})",
+                    shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
+                    shell_repair::diagnostic_code(&failure)
+                ),
+            },
+        );
+        let content = shell_repair::corrective_message_text(
+            attempt,
+            &shell_repair::command_from_arguments(arguments),
+            &failure,
+        );
+        Some(Message {
+            role: Role::User,
+            content,
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        })
+    }
+
+    /// ADR-65 §3: record a completed (or refused) tool command as evidence.
+    /// The writer is fail-soft — a persistence failure can never fail the tool
+    /// result this loop is already returning. The single-agent loop has no
+    /// run/generation concept (no ADR-65 §2 barrier, no checkpoint run id), so
+    /// both are recorded honestly as absent.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_tool_fact(
+        &self,
+        session: &SessionContext,
+        task: &AgentTask,
+        tool: &str,
+        args: &serde_json::Value,
+        success: bool,
+        exit_code: Option<i32>,
+        paths: Vec<String>,
+        file_affecting: bool,
+        pre_image_hashes: HashMap<String, Option<String>>,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = session.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_tool_executed(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: None,
+                    generation: "",
+                    project_root: &self.project_root,
+                    tool,
+                    args,
+                    success,
+                    exit_code,
+                    paths: &paths,
+                    file_affecting,
+                    pre_image_hashes,
+                },
+                cancel,
+            )
+            .await;
+    }
+
+    /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
+    /// `served_from` (the original observation's event id). The fact's paths
+    /// are intentionally empty — see `ToolFactContext::record_served_read`.
+    /// Fail-soft, like every evidence write.
+    async fn record_served_read_fact(
+        &self,
+        session: &SessionContext,
+        task: &AgentTask,
+        tool: &str,
+        args: &serde_json::Value,
+        served_from: &str,
+        cancel: &CancellationToken,
+    ) {
+        let Some(facts) = &self.tool_facts else {
+            return;
+        };
+        let session_id = session.session_id.to_string();
+        let task_id = task.id.0.to_string();
+        facts
+            .record_served_read(
+                &ToolExecutedFact {
+                    session_id: &session_id,
+                    task_id: Some(&task_id),
+                    run_id: None,
+                    generation: "",
+                    project_root: &self.project_root,
+                    tool,
+                    args,
+                    success: true,
+                    exit_code: None,
+                    paths: &[],
+                    file_affecting: false,
+                    pre_image_hashes: HashMap::new(),
+                },
+                served_from,
+                cancel,
+            )
+            .await;
     }
 }
 
@@ -1717,7 +2758,7 @@ async fn verify_file_changes(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1732,7 +2773,7 @@ mod tests {
     use concerto_core::policy::SimplePolicyEngine;
     use concerto_core::traits::approval::ApprovalDecision;
     use concerto_core::traits::memory::MemoryStore;
-    use concerto_core::traits::policy::AuditLog;
+    use concerto_core::traits::policy::{AuditEntry, AuditLog};
     use concerto_core::traits::provider::{CompletionStream, LlmProvider};
     use concerto_core::traits::tool::Tool;
     use concerto_core::types::{
@@ -1749,6 +2790,9 @@ mod tests {
     use concerto_memory::task_tree::TaskTreeStore;
     use concerto_memory::vector_store::SqliteVectorStore;
     use concerto_memory::vector_store::VectorStore;
+    use concerto_sessions::resource_facts::ResourceFacts;
+    use concerto_sessions::whiteboard::{load_whiteboard_events, WhiteboardLoadOpts};
+    use concerto_sessions::WhiteboardKind;
     use concerto_tools::filesystem::FilesystemTool;
     use concerto_tools::undo::UndoManager;
     use futures::stream;
@@ -1809,7 +2853,6 @@ mod tests {
         responses: Vec<Vec<ToolCall>>,
         call_count: AtomicUsize,
     }
-
     impl ScriptedProvider {
         fn new(responses: Vec<Vec<ToolCall>>) -> Self {
             Self { responses, call_count: AtomicUsize::new(0) }
@@ -1858,6 +2901,74 @@ mod tests {
                     .collect()
             };
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A text-only provider: each `stream_completion` call pops the next
+    /// queued plain-text reply (delivered as one final chunk). Models the
+    /// ADR-66 §4 fallback world — the provider can never emit a native tool
+    /// call — and is named `opencode` so, paired with the `muse-v2` usage
+    /// model, the exact production engagement predicate fires (Zen-served
+    /// Muse models have no native tool support).
+    struct TextScriptedProvider {
+        replies: Vec<String>,
+        call_count: AtomicUsize,
+        /// Whether any request reached this provider still carrying wire
+        /// tool declarations. Fallback-driven requests must never carry any
+        /// (the fail-loud seams and the driver contract, ADR-66 §4).
+        saw_wire_tools: Arc<AtomicBool>,
+    }
+
+    impl TextScriptedProvider {
+        fn new(replies: Vec<String>) -> Self {
+            Self {
+                replies,
+                call_count: AtomicUsize::new(0),
+                saw_wire_tools: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// The reply served on call N (the last scripted reply repeats once
+        /// the script ends — an always-malformed provider keeps emitting the
+        /// same defect, which is what the exhaustion test needs).
+        fn reply_at(&self, idx: usize) -> String {
+            match self.replies.get(idx) {
+                Some(reply) => reply.clone(),
+                None => self.replies.last().cloned().unwrap_or_default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TextScriptedProvider {
+        fn provider_name(&self) -> &'static str {
+            "opencode"
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+
+        async fn stream_completion(
+            &self,
+            request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, ProviderError> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                self.saw_wire_tools.store(true, Ordering::SeqCst);
+            }
+            Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                delta: self.reply_at(idx),
+                reasoning: None,
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            })])))
         }
     }
 
@@ -1935,6 +3046,8 @@ mod tests {
                 id: "always".into(),
                 name: self.name.into(),
                 arguments: serde_json::json!({ "text": "loop" }),
+
+                ..Default::default()
             };
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
                 reasoning: None,
@@ -1956,6 +3069,33 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<(), concerto_core::error::PolicyError> {
             Ok(())
+        }
+    }
+
+    /// An audit log that captures every entry for assertions (ADR-66 §4
+    /// `tool_driver` row tests).
+    #[derive(Clone)]
+    struct CapturingAudit(Arc<std::sync::Mutex<Vec<AuditEntry>>>);
+
+    #[async_trait]
+    impl AuditLog for CapturingAudit {
+        async fn record(
+            &self,
+            entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), concerto_core::error::PolicyError> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).push(entry);
+            Ok(())
+        }
+    }
+
+    impl CapturingAudit {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn entries(&self) -> Vec<AuditEntry> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
         }
     }
 
@@ -2009,6 +3149,10 @@ mod tests {
             _session: &SessionContext,
             _cancel: CancellationToken,
         ) -> Result<ToolOutput, ToolError> {
+            // Files-modified hygiene (smoke follow-up round 2): run artifacts
+            // must list only regular files actually written by tools, so the
+            // mock write really materializes its claimed path.
+            let _ = std::fs::write("/tmp/test.rs", "new content");
             Ok(ToolOutput {
                 summary: "file written".into(),
                 data: serde_json::json!({"file_path": "/tmp/test.rs"}),
@@ -2086,6 +3230,8 @@ mod tests {
             id: "call_1".into(),
             name: name.into(),
             arguments: serde_json::json!({"text": text}),
+
+            ..Default::default()
         }
     }
 
@@ -2181,12 +3327,30 @@ mod tests {
         approval: Arc<dyn ApprovalSink>,
         max_iterations: u32,
     ) -> AgentLoop {
+        make_loop_with_fs_tool_and_rules(
+            dir,
+            provider,
+            approval,
+            max_iterations,
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+        )
+    }
+
+    /// Same as `make_loop_with_fs_tool` but with an explicit policy rule set,
+    /// so tests can drive the ADR-65 F1a serve gate (Allow-only) through
+    /// real tool executions.
+    fn make_loop_with_fs_tool_and_rules(
+        dir: &std::path::Path,
+        provider: Arc<dyn LlmProvider>,
+        approval: Arc<dyn ApprovalSink>,
+        max_iterations: u32,
+        rules: Vec<PolicyRule>,
+    ) -> AgentLoop {
         let root = camino::Utf8PathBuf::from_path_buf(dir.to_path_buf()).unwrap();
         let mut registry = ToolRegistry::default();
         registry.register(Box::new(EchoTool));
         registry.register(Box::new(FilesystemTool::new(root.clone())));
-        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
-        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        let policy = Arc::new(SimplePolicyEngine::new(rules, Arc::new(TestAudit)));
         let executor = Arc::new(
             ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(approval.clone()),
         );
@@ -2628,11 +3792,24 @@ mod tests {
             &self,
             input: serde_json::Value,
             _policy: &dyn concerto_core::traits::policy::PolicyEngine,
-            _session: &SessionContext,
+            session: &SessionContext,
             _cancel: CancellationToken,
         ) -> Result<ToolOutput, ToolError> {
             let op = input.get("operation").and_then(|v| v.as_str()).unwrap_or("");
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            // Files-modified hygiene (smoke follow-up round 2): run artifacts
+            // must list only regular files actually written by tools, so the
+            // mock write really materializes the claimed path under the
+            // session root before reporting the mutation.
+            if op == "write" && !path.is_empty() {
+                let target = session.project_dir.as_path().join(path);
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let content =
+                    input.get("content").and_then(|v| v.as_str()).unwrap_or("mock content");
+                let _ = std::fs::write(&target, content);
+            }
             match op {
                 "write" => Ok(ToolOutput {
                     summary: "wrote".into(),
@@ -2773,6 +3950,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "write", "path": "src/main.rs" }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -2801,6 +3980,8 @@ mod tests {
             id: "call_1".into(),
             name: "filesystem".into(),
             arguments: serde_json::json!({ "operation": "read", "path": "src/main.rs" }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -2888,6 +4069,8 @@ mod tests {
                 "path": "hello.py",
                 "content": "print('hello from disk')\n"
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -2914,14 +4097,687 @@ mod tests {
         assert!(content.contains("hello from disk"), "written file content mismatch: {content}");
 
         // And it must be runnable: executing it produces the expected output.
-        let ran = std::process::Command::new("python3")
+        // Interpreter probe: prefer `python3`, fall back to `python` (stock
+        // Windows exposes only `python` on PATH). A candidate counts only if
+        // it spawns and exits successfully — Windows' Store alias stub for
+        // `python3` resolves on PATH yet always exits non-zero, so exit status
+        // is part of the probe. With no interpreter at all, degrade to a
+        // logged skip rather than failing the disk-write behavior under test.
+        let interpreter = ["python3", "python"].into_iter().find(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .output()
+                .is_ok_and(|probe| probe.status.success())
+        });
+        let Some(interpreter) = interpreter else {
+            eprintln!("skipping runnability assertion: neither python3 nor python is on PATH");
+            return;
+        };
+        let ran = std::process::Command::new(interpreter)
             .arg(&written)
             .output()
-            .expect("python3 should be available");
+            .expect("interpreter probed above should stay available");
         let stdout = String::from_utf8_lossy(&ran.stdout);
         assert!(
             stdout.contains("hello from disk"),
             "running the program should print the greeting, got: {stdout}"
+        );
+    }
+
+    /// A scratch sqlite pool with the sessions migrations applied — the same
+    /// shape `tool_facts` uses, so the loop's fact writer lands real rows.
+    async fn test_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let db_path = dir.path().join("agent_loop_tool_facts_test.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("test pool connects");
+        sqlx::migrate!("../sessions/migrations")
+            .run(&pool)
+            .await
+            .expect("sessions migrations apply");
+        (dir, pool)
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-66 §4: universal text-fallback driver (single-agent loop)
+    // -----------------------------------------------------------------------
+
+    /// ADR-66 A5: a simulated text-only provider (no native tool support —
+    /// a Zen-served Muse model) completes a multi-turn tool task through
+    /// the fallback driver: the tool-call block is parsed, executed through
+    /// the real FilesystemTool, the materialized file lands on disk, and
+    /// the no-declaration contract holds (no wire tools ever sent).
+    #[tokio::test]
+    async fn text_fallback_driver_completes_tool_task_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let block = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"fallback.txt\", \"content\": \"via text driver\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            block.to_string(),
+            "Done — wrote the file via the text driver.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task =
+            AgentTask::new_action_required(Ulid::new(), "write a file through the text driver");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "fallback-driven run should succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the fallback-driven task must complete: {}",
+            output.final_message
+        );
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("fallback.txt")),
+            "files_modified should include the fallback-written path"
+        );
+        let written = dir.path().join("fallback.txt");
+        assert!(written.exists(), "the file must be materialized on disk");
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert_eq!(content, "via text driver");
+        assert!(
+            !provider.saw_wire_tools.load(Ordering::SeqCst),
+            "fallback-driven requests must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 §5 correction (2026-09-08): `muse-spark-*` rides the explicit
+    /// Responses dialect prefix entry, so it resolves to no NATIVE tool
+    /// support — but its tool-requiring run must PROCEED via the labeled §4
+    /// fallback driver (never refused at selection, never silently
+    /// text-only), exactly like the genuine Muse models. The driver is
+    /// prompt-text-based, so it works over the Responses SSE path.
+    #[tokio::test]
+    async fn responses_dialect_model_completes_tool_task_via_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let block = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"spark-fallback.txt\", \"content\": \"via spark fallback\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            block.to_string(),
+            "Done — wrote the file via the text driver.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-spark-1.3-contributor-free".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write a file on muse-spark");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(
+            result.is_ok(),
+            "a Responses-path model's tool task must proceed via fallback: {:?}",
+            result.err()
+        );
+        let output = result.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the fallback-driven task must complete: {}",
+            output.final_message
+        );
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("spark-fallback.txt")),
+            "files_modified should include the fallback-written path"
+        );
+        let written = dir.path().join("spark-fallback.txt");
+        assert!(written.exists(), "the file must be materialized on disk");
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "via spark fallback");
+        assert!(
+            !provider.saw_wire_tools.load(Ordering::SeqCst),
+            "Responses-path fallback turns must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: a malformed tool-call block is repaired by re-prompting —
+    /// the model sees its own defect plus the format instruction and the
+    /// next reply parses. The repair never executes the malformed turn.
+    #[tokio::test]
+    async fn text_fallback_driver_repairs_malformed_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = "<tool_calls>\nthis is not json\n</tool_calls>";
+        let valid = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"repaired.txt\", \"content\": \"repaired\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            malformed.to_string(),
+            valid.to_string(),
+            "All done.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the repaired file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "repaired run should succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("repaired.txt")),
+            "the repaired tool call must execute: {:?}",
+            output.files_modified
+        );
+        // Exactly one repair round-trip happened (malformed → repair → valid).
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            3,
+            "malformed turn + repair re-prompt + final answer"
+        );
+        assert!(
+            !provider.saw_wire_tools.load(Ordering::SeqCst),
+            "repair re-prompts must never carry wire tool declarations"
+        );
+    }
+
+    /// ADR-66 A5: bound exhaustion fails the run loudly — a provider that
+    /// keeps emitting malformed blocks exhausts the repair budget and the
+    /// run returns a loud error naming the driver, provider, and model,
+    /// never a silent text-only completion.
+    #[tokio::test]
+    async fn text_fallback_driver_exhaustion_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = "<tool_calls>\nstill not json\n</tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![malformed.to_string()]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the impossible file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        let error = result.expect_err("bound exhaustion must fail the run loudly");
+        let message = error.to_string();
+        assert!(
+            message.contains("tool_driver"),
+            "the loud failure must name the driver: {message}"
+        );
+        assert!(message.contains("muse-v2"), "the loud failure must name the model: {message}");
+        assert!(
+            message.contains("exhausted"),
+            "the loud failure must name the exhaustion: {message}"
+        );
+        // 1 initial + MAX_REPAIR_ATTEMPTS repairs — no unbounded retries.
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            1 + crate::tool_driver::MAX_REPAIR_ATTEMPTS as usize,
+            "the repair budget must be bounded"
+        );
+    }
+
+    /// ADR-66 A5: fallback engagement and repair turns are labeled in the
+    /// audit log (`tool_driver` rows) — observable, never silent.
+    #[tokio::test]
+    async fn text_fallback_driver_writes_audit_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = CapturingAudit::new();
+        let malformed = "<tool_calls>\nbroken\n</tool_calls>";
+        let valid = "<tool_calls>\n\
+            [{\"name\": \"filesystem\", \"arguments\": {\"operation\": \"write\", \
+            \"path\": \"audited.txt\", \"content\": \"x\"}}]\n\
+            </tool_calls>";
+        let provider = Arc::new(TextScriptedProvider::new(vec![
+            malformed.to_string(),
+            valid.to_string(),
+            "Done.".to_string(),
+        ]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        // Same construction as `make_loop_with_fs_tool`, but with a
+        // capturing audit log so the tool_driver rows can be asserted.
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(FilesystemTool::new(root.clone())));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(audit.clone())));
+        let executor = Arc::new(
+            ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(approval.clone()),
+        );
+        let mut loop_ = AgentLoop::with_project_root(
+            EventBus::new(256),
+            approval.clone(),
+            provider,
+            executor,
+            Arc::new(NoopMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new(dir.path()))),
+            EvalEngine::new(dir.path()),
+            PromptBuilder::new("test system prompt"),
+            10,
+            true,
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the audited file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "audited fallback run should succeed: {:?}", result.err());
+
+        let driver_rows: Vec<_> =
+            audit.entries().into_iter().filter(|entry| entry.tool_name == "tool_driver").collect();
+        assert!(
+            driver_rows.iter().any(|entry| entry.rule_matched.as_deref() == Some("engage")),
+            "engagement must be audited: {:?}",
+            driver_rows.iter().map(|e| e.rule_matched.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            driver_rows.iter().any(|entry| entry.rule_matched.as_deref() == Some("repair")),
+            "the repair turn must be audited"
+        );
+        assert!(
+            driver_rows.iter().any(|entry| entry.rule_matched.as_deref() == Some("turn")),
+            "the fallback tool-call turn must be audited"
+        );
+        assert!(
+            driver_rows.iter().all(|entry| entry.verdict == "fallback"),
+            "all driver rows must be labeled `tool_driver: fallback`"
+        );
+    }
+
+    /// ADR-66 §5 (A3): unknown models attempt native first — a capable
+    /// provider/model pair is never fallback-driven, so its native tool
+    /// calls reach the loop unchanged.
+    #[tokio::test]
+    async fn native_tool_support_never_engages_the_fallback_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "native.txt",
+                "content": "native path"
+            }),
+
+            ..Default::default()
+        };
+        // provider_name "scripted" resolves to the provider default (native
+        // tools), so no fallback engagement — even though the usage model
+        // alone is a Muse name.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![tc], vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
+            .with_usage_model("muse-v2".to_string());
+        let task = AgentTask::new_action_required(Ulid::new(), "write the native file");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "native run should succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(
+            output.files_modified.iter().any(|p| p.as_str().ends_with("native.txt")),
+            "native tool calls must drive the task: {:?}",
+            output.files_modified
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_tool_calls_record_tool_executed_facts_end_to_end() {
+        // ADR-65 §3 end-to-end: with a real session-DB pool attached to the
+        // loop's fact writer, every completed tool command lands as a
+        // `ToolExecuted` whiteboard event attributed to the writer (never
+        // inferred), and the derived `resource_facts` store tracks the
+        // sequence: the read leaves a CLEAN row, the following write
+        // INVALIDATES it (dirty), and the write event carries the pre-image
+        // hash of the original content.
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"# original\n").expect("fixture written");
+
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
+        };
+        let write_tc = ToolCall {
+            id: "call_2".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "note.md",
+                "content": "# updated\n",
+            }),
+
+            ..Default::default()
+        };
+        let calls = vec![vec![read_tc], vec![write_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        loop_ = loop_.with_tool_facts(Some(ToolFactContext::new(
+            Some(pool.clone()),
+            "single-agent".to_string(),
+        )));
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new_action_required(session_id, "update the note file");
+        let task_id = task.id.0.to_string();
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "read+write task should succeed: {:?}", result.err());
+
+        // Exactly two ToolExecuted facts for this run, both attributed to the
+        // loop's fact writer; payloads carry task attribution (never inferred).
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let executed: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(executed.len(), 2, "expected exactly two ToolExecuted events");
+        for event in &executed {
+            assert_eq!(event.agent_id, "single-agent", "event column carries the writer id");
+            assert_eq!(event.session_id.as_deref(), Some(session_id.to_string().as_str()));
+            assert_eq!(event.payload["tool"], serde_json::json!("filesystem"));
+            assert_eq!(event.payload["success"], serde_json::json!(true));
+            assert_eq!(event.payload["agent_id"], serde_json::json!(task_id));
+        }
+
+        // The read event records no pre-image (read-only); the write event
+        // carries the pre-write content hash of the ORIGINAL file.
+        assert_eq!(executed[0].pre_image_hash, None, "read-only event has no pre-image");
+        assert_eq!(
+            executed[1].pre_image_hash.as_deref(),
+            Some(blake3::hash(b"# original\n").to_hex().as_str()),
+            "write event carries the pre-write content hash"
+        );
+
+        // Derived store: the read left a clean row, the write invalidated it —
+        // both under the loop project root's scope (ADR-65 F5c).
+        let store = ResourceFacts::new(pool);
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let row = store
+            .lookup(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("lookup")
+            .expect("read observation created a resource_facts row");
+        assert!(row.dirty, "the write must have invalidated the cached row");
+        assert_eq!(row.last_agent_id.as_deref(), Some("single-agent"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-65 §4 / F1a-F1b / F2c: safe read-dedupe end to end
+    // -----------------------------------------------------------------------
+
+    /// A second, identical read of an observed file is SERVED from cache
+    /// without re-executing, and the serve appends its own `served_from` fact
+    /// (ADR-65 F1b): attribution to the original observation, empty paths (the
+    /// served read did not re-observe state), no dirtying of the row.
+    #[tokio::test]
+    async fn cached_read_is_served_and_records_a_served_from_fact() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"# stable\n").expect("fixture written");
+
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
+        };
+        // Call 2 re-reads the identical path. The first read executed and
+        // cached; the second must be served without reaching the executor.
+        let calls = vec![vec![read_tc.clone()], vec![read_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        loop_ = loop_.with_tool_facts(Some(ToolFactContext::new(
+            Some(pool.clone()),
+            "single-agent".to_string(),
+        )));
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new_action_required(session_id, "read twice");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "read-only task should succeed: {:?}", result.err());
+
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let executed: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(executed.len(), 2, "one observation + one served-from fact");
+        let obs = executed[0];
+        let served = executed[1];
+
+        assert_eq!(
+            obs.payload["served_from"],
+            serde_json::Value::Null,
+            "the first read executed normally"
+        );
+        assert_eq!(
+            obs.payload["paths"].as_array().map(Vec::len),
+            Some(1),
+            "the observation carries the read path"
+        );
+        assert_eq!(
+            served.payload["served_from"].as_str(),
+            Some(obs.event_id.as_str()),
+            "the served fact attributes the original observation (F1b)"
+        );
+        assert_eq!(
+            served.payload["paths"].as_array().map(Vec::len),
+            Some(0),
+            "a served read never re-observes paths"
+        );
+
+        // The serve left the row clean, attributed to the ORIGINAL observation,
+        // and the content cache intact for the next identical read.
+        let store = ResourceFacts::new(pool);
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let row = store
+            .lookup(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("lookup")
+            .expect("row present");
+        assert!(!row.dirty, "a served read does not dirty the row");
+        assert_eq!(
+            row.last_event_id.as_deref(),
+            Some(obs.event_id.as_str()),
+            "the served read keeps the original observation as the row's last event"
+        );
+        let cached = store
+            .cached_read(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("cached read")
+            .expect("cached row");
+        assert_eq!(cached.content, "# stable\n", "the cache holds the exact served bytes");
+    }
+
+    /// F1a: a non-`Allow` policy verdict KEEPS the serve gate closed even when
+    /// a clean, content-cached row exists. Under a deny policy the read falls
+    /// through to the executor, which then surfaces the denial — a served read
+    /// is never a policy bypass.
+    #[tokio::test]
+    async fn deny_verdict_never_serves_a_cached_read() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"cached bytes\n").expect("fixture written");
+
+        // Loop A: allow-all policy, seeds the clean observation + content cache.
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
+        };
+        let calls = vec![vec![read_tc.clone()], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut seeder = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        seeder = seeder
+            .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "seeder".to_string())));
+        let seeder_session = Ulid::new();
+        seeder
+            .run(
+                AgentTask::new_action_required(seeder_session, "seed the cache"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("seeder run");
+
+        // Loop B: SAME project root and fact writer, but an AutoDeny policy. The
+        // fully populated cache is a serve candidate — the F1a gate must refuse.
+        let calls = vec![vec![read_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut denier = make_loop_with_fs_tool_and_rules(
+            root.path(),
+            provider,
+            approval,
+            10,
+            vec![PolicyRule::AutoDeny(Condition::ToolName("filesystem".into()))],
+        );
+        denier = denier
+            .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "denier".to_string())));
+        let deny_session = Ulid::new();
+        denier
+            .run(
+                AgentTask::new_action_required(deny_session, "read under deny"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("denier run");
+
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(deny_session.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let denied: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(denied.len(), 1, "the deny run records its read attempt exactly once");
+        assert_eq!(
+            denied[0].payload["served_from"],
+            serde_json::Value::Null,
+            "a deny verdict must not serve the cached row (F1a)"
+        );
+        assert_eq!(
+            denied[0].payload["success"],
+            serde_json::json!(false),
+            "the read reached the executor and was denied there — policy was enforced"
+        );
+    }
+
+    /// F2c: a write invalidates the cached row AND purges its bytes, so a
+    /// subsequent identical read cannot be served — it executes fresh, observes
+    /// the new content, and re-caches it.
+    #[tokio::test]
+    async fn invalidation_purges_cache_and_forces_fresh_execution() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("note.md"), b"# original\n").expect("fixture written");
+
+        let read_tc = ToolCall {
+            id: "call_1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "note.md" }),
+
+            ..Default::default()
+        };
+        let write_tc = ToolCall {
+            id: "call_2".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "note.md",
+                "content": "# updated\n",
+            }),
+
+            ..Default::default()
+        };
+        let calls = vec![vec![read_tc.clone()], vec![write_tc], vec![read_tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_fs_tool(root.path(), provider, approval, 10);
+        loop_ = loop_.with_tool_facts(Some(ToolFactContext::new(
+            Some(pool.clone()),
+            "single-agent".to_string(),
+        )));
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new_action_required(session_id, "read, write, read");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "read/write/read task should succeed: {:?}", result.err());
+
+        let events = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("load whiteboard events");
+        let executed: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::ToolExecuted).collect();
+        assert_eq!(executed.len(), 3, "all three commands executed; none was served");
+        for event in &executed {
+            assert_eq!(
+                event.payload["served_from"],
+                serde_json::Value::Null,
+                "the invalidated row could not be served (F2c)"
+            );
+        }
+
+        // The fresh read re-observed the new content: row clean again, cache
+        // repopulated with the UPDATED bytes — proving no stale bytes survived.
+        let store = ResourceFacts::new(pool);
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let row = store
+            .lookup(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("lookup")
+            .expect("row present");
+        assert!(!row.dirty, "the post-invalidation read re-observed a clean row");
+        assert_eq!(
+            row.last_event_id.as_deref(),
+            Some(executed[2].event_id.as_str()),
+            "the fresh observation is the row's newest event"
+        );
+        let cached = store
+            .cached_read(&root_hash, "note.md", &CancellationToken::new())
+            .await
+            .expect("cached read")
+            .expect("cached row");
+        assert_eq!(
+            cached.content, "# updated\n",
+            "the cache holds the fresh bytes, never stale ones"
         );
     }
 
@@ -2941,6 +4797,8 @@ mod tests {
                 "path": "src/main.rs",
                 "content": "fn main() {}",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -2972,6 +4830,8 @@ mod tests {
                 "operation": "write",
                 "path": "some/deep/path.rs",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -3005,6 +4865,8 @@ mod tests {
                 "operation": "write",
                 "path": "output.txt",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -3050,6 +4912,8 @@ mod tests {
                 "path": "hello.py",
                 "content": "print('hello')\n",
             }),
+
+            ..Default::default()
         };
         let calls = vec![vec![tc], vec![]];
         let provider = Arc::new(ScriptedProvider::new(calls));
@@ -3330,6 +5194,8 @@ mod tests {
                 "path": "output.txt",
                 "content": "exactly-once payload\n",
             }),
+
+            ..Default::default()
         };
         let provider = Arc::new(CountingScriptedProvider::new(vec![
             Ok(vec![CompletionChunk {
@@ -3682,6 +5548,915 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Tool-call guard (VALIDATE → COERCE → REPAIR) — integration-level tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: a loop wired with the real `FilesystemTool` plus the default
+    /// request state for one direct `execute_single_tool_call` invocation.
+    fn guard_test_harness(dir: &std::path::Path) -> (AgentLoop, AgentTask, SessionContext) {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop_with_fs_tool(dir, provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "guard harness task");
+        let session = SessionContext::new(task.session_id, dir.to_path_buf());
+        (loop_, task, session)
+    }
+
+    #[tokio::test]
+    async fn tool_guard_rejects_null_arguments_with_corrective_result() {
+        // Audit stall shape: mimo-v2.5-free emits `arguments: null`. The guard
+        // must normalize to `{}`, find the required fields missing, and inject
+        // a corrective tool result instead of executing (or erroring) inside
+        // the filesystem tool.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_null".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1, "exactly one exhausted tool message");
+        assert!(
+            messages[0].content.contains("Tool call invalid for 'filesystem'"),
+            "content: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("missing required field 'operation'"),
+            "content: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("Stop calling 'filesystem'"),
+            "empty args fail fast with no coaching: {}",
+            messages[0].content
+        );
+        let results = messages[0].tool_results.as_ref().unwrap();
+        assert_eq!(results[0].id, "call_null");
+        assert_eq!(results[0].content["error"], "tool_guard_exhausted");
+        assert!(tool_events[0].summary.contains("invalid arguments"), "events: {tool_events:?}");
+        assert!(files_modified.is_empty(), "rejected calls must not execute");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_coerces_stringified_uppercase_arguments_and_executes() {
+        // Weak-model shape that IS repairable: stringified JSON, capitalized
+        // enum value, hallucinated extra key. After coercion the call must
+        // reach the filesystem tool and really write the file.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (mut loop_, calls) =
+            make_loop_with_counting_fs_tool(dir.path(), provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "write a file");
+        let session = SessionContext::new(task.session_id, dir.path().to_path_buf());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_coerce".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::String(
+                r#"{"operation": "WRITE", "path": "guarded.txt", "content": "hi", "rationale": "because"}"#
+                    .into(),
+            ),
+
+        ..Default::default()};
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "filesystem tool executed exactly once");
+        assert!(
+            messages[0].content.contains("status: success"),
+            "content: {}",
+            messages[0].content
+        );
+        let written = dir.path().join("guarded.txt");
+        assert!(written.exists(), "coerced call must materialize the file");
+        assert!(files_modified.iter().any(|p| p.as_str().ends_with("guarded.txt")));
+        assert_eq!(file_changing_tool_count, 1, "coerced write counts as file-changing");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_bounds_corrective_retries_then_exhausts() {
+        // Partial args get two corrective retries per tool per run; the third
+        // consecutive rejection flips to the exhausted form so the model
+        // stops ping-ponging malformed calls.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_bad".into(),
+            name: "filesystem".into(),
+            // Partial args (unknown key only): retries apply.
+            arguments: serde_json::json!({"bogus": 1}),
+
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            loop_
+                .execute_single_tool_call(
+                    &tc,
+                    &task,
+                    Ulid::new(),
+                    &session,
+                    CancellationToken::new(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].content.contains("Please retry with corrected arguments"));
+        assert!(messages[1].content.contains("Please retry with corrected arguments"));
+        assert!(
+            messages[2].content.contains("Stop calling 'filesystem'"),
+            "third rejection must stop coaching: {}",
+            messages[2].content
+        );
+        let exhausted_payload = messages[2].tool_results.as_ref().unwrap()[0].content.clone();
+        assert_eq!(exhausted_payload["error"], "tool_guard_exhausted");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_fails_fast_on_empty_arguments() {
+        // Live-proven (Sep 2026 audit): zero-argument calls never correct on
+        // coaching — the first rejection is already exhausted, no retries.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_empty".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].content.contains("Stop calling 'filesystem'"),
+            "empty args must fail fast: {}",
+            messages[0].content
+        );
+        let payload = messages[0].tool_results.as_ref().unwrap()[0].content.clone();
+        assert_eq!(payload["error"], "tool_guard_exhausted");
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristically_infers_read_from_path_only_call() {
+        // Audit stall shape: the model emits `{"path": "..."}` with no
+        // `operation`. Heuristic inference fills `read` (file-like path) and
+        // the call executes instead of bouncing a corrective result.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_infer_read".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "path": "existing.txt" }),
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            messages[0].content.contains("status: success"),
+            "inferred call must execute: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("Read "),
+            "file-like path must infer read: {}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("Tool call invalid"),
+            "no corrective result expected: {}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristically_infers_write_from_content() {
+        // `content` present without `operation` infers `write`; the call
+        // executes for real and counts as file-changing.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_infer_write".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "path": "inferred.txt", "content": "hi" }),
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            messages[0].content.contains("status: success"),
+            "inferred write must execute: {}",
+            messages[0].content
+        );
+        assert!(
+            dir.path().join("inferred.txt").exists(),
+            "inferred write must materialize the file"
+        );
+        assert_eq!(file_changing_tool_count, 1, "inferred write counts as file-changing");
+        assert!(files_modified.iter().any(|p| p.as_str().ends_with("inferred.txt")));
+    }
+
+    #[tokio::test]
+    async fn tool_guard_heuristically_infers_shell_command_from_cmd_alias() {
+        // Some models send `cmd` instead of `command`; the alias recovers the
+        // command and the call executes through the default shell-wrapped
+        // backend (policy/allowlist still gate it).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_extra_tools(
+            provider,
+            approval,
+            10,
+            vec![Box::new(concerto_tools::shell::ShellTool::allow_all())],
+        );
+        let task = AgentTask::new_action_required(Ulid::new(), "run a command");
+        let session = SessionContext::new(task.session_id, dir.path().to_path_buf());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        let tc = ToolCall {
+            id: "call_infer_cmd".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "cmd": "echo guard-heuristic-ok" }),
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            messages[0].content.contains("status: success"),
+            "alias-recovered call must execute: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("guard-heuristic-ok"),
+            "command output must be present: {}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guard_extracts_arguments_from_assistant_text_and_executes() {
+        // Live-audit backstop shape: the model picks the right tool but emits
+        // `arguments: null` while its own message text states the call. The
+        // guard must recover the arguments from the assistant text and
+        // execute instead of injecting the corrective reject.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let (mut loop_, task, session) = guard_test_harness(dir.path());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        // The assistant message that carried the (broken) tool call — its
+        // text states the intended call explicitly.
+        messages.push(Message {
+            role: Role::Assistant,
+            content: "Listing the sources now: Filesystem operation=\"list\" path=\"src\"".into(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        });
+
+        let tc = ToolCall {
+            id: "call_text_extract".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::Value::Null,
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tool_call_count, 1, "the text-repaired call executes");
+        assert_eq!(messages.len(), 2, "assistant text + executed tool result");
+        assert!(
+            messages[1].content.contains("status: success"),
+            "text-extracted call must execute: {}",
+            messages[1].content
+        );
+        assert!(
+            !messages[1].content.contains("tool_guard_exhausted"),
+            "no corrective payload expected: {}",
+            messages[1].content
+        );
+        assert!(
+            tool_events[0].success,
+            "the guard must let the text-repaired call through: {tool_events:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded shell-repair loop (custom-ai-shell plan, Phase C subset) —
+    // integration-level tests through `execute_single_tool_call`. The shell
+    // tool is mocked: no process is ever spawned.
+    // -----------------------------------------------------------------------
+
+    /// Scripted outcome a [`ScriptedShellTool`] returns for every call.
+    #[derive(Clone)]
+    enum ScriptedShellOutcome {
+        /// Ok output with the given exit code, stdout, and stderr.
+        Exit(i32, String, String),
+        /// Policy denial straight from the tool (as the real denylist does).
+        Deny(String),
+        /// Timeout error.
+        Timeout(u64),
+        /// Process-start / execution failure.
+        SpawnFailed(String),
+    }
+
+    /// A `shell`-named mock tool that returns its scripted outcome without
+    /// spawning any process.
+    struct ScriptedShellTool {
+        outcome: Arc<std::sync::Mutex<ScriptedShellOutcome>>,
+        calls: Arc<AtomicUsize>,
+        /// When set, cancelled during `execute` — before returning the
+        /// scripted outcome — so the loop sees a completed failure while the
+        /// run is already cancelled.
+        cancel_on_execute: Option<CancellationToken>,
+    }
+
+    impl ScriptedShellTool {
+        fn new(outcome: ScriptedShellOutcome) -> (Self, Arc<AtomicUsize>) {
+            Self::with_cancel_on_execute(outcome, None)
+        }
+
+        fn with_cancel_on_execute(
+            outcome: ScriptedShellOutcome,
+            cancel_on_execute: Option<CancellationToken>,
+        ) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    outcome: Arc::new(std::sync::Mutex::new(outcome)),
+                    calls: calls.clone(),
+                    cancel_on_execute,
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ScriptedShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "scripted shell mock"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancel) = &self.cancel_on_execute {
+                cancel.cancel();
+            }
+            let outcome = self.outcome.lock().unwrap_or_else(|error| error.into_inner()).clone();
+            match outcome {
+                ScriptedShellOutcome::Exit(code, stdout, stderr) => Ok(ToolOutput {
+                    summary: format!("Command `x` failed with exit code {code}."),
+                    data: serde_json::json!({
+                        "exit_code": code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }),
+                }),
+                ScriptedShellOutcome::Deny(rule) => Err(ToolError::PolicyDenied { rule }),
+                ScriptedShellOutcome::Timeout(timeout_secs) => {
+                    Err(ToolError::Timeout { timeout_secs })
+                }
+                ScriptedShellOutcome::SpawnFailed(message) => {
+                    Err(ToolError::ExecutionFailed { message })
+                }
+            }
+        }
+    }
+
+    /// Harness for one direct `execute_single_tool_call` against the scripted
+    /// shell mock.
+    fn shell_repair_harness(
+        outcome: ScriptedShellOutcome,
+    ) -> (AgentLoop, AgentTask, SessionContext, Arc<AtomicUsize>) {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (tool, calls) = ScriptedShellTool::new(outcome);
+        let loop_ = make_loop_with_extra_tools(provider, approval, 10, vec![Box::new(tool)]);
+        let task = AgentTask::new_action_required(Ulid::new(), "shell repair harness");
+        let session = SessionContext::new(task.session_id, std::path::PathBuf::from("/tmp"));
+        (loop_, task, session, calls)
+    }
+
+    /// Count the corrective repair turns (User messages) in `messages`.
+    fn repair_turns(messages: &[Message]) -> Vec<&Message> {
+        messages.iter().filter(|m| m.role == Role::User).collect()
+    }
+
+    #[tokio::test]
+    async fn shell_execution_failure_queues_bounded_repair_turns() {
+        let (mut loop_, task, session, calls) = shell_repair_harness(ScriptedShellOutcome::Exit(
+            2,
+            "some stdout".into(),
+            "boom".into(),
+        ));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_fail".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "false", "args": [] }),
+
+            ..Default::default()
+        };
+
+        // Three rounds against the SAME tool-call id: two repairs, then the
+        // budget is exhausted and the third failure surfaces unchanged.
+        for _ in 0..3 {
+            loop_
+                .execute_single_tool_call(
+                    &tc,
+                    &task,
+                    Ulid::new(),
+                    &session,
+                    CancellationToken::new(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "every round must execute");
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 2, "bounded at exactly MAX: {messages:?}");
+        assert!(
+            repairs[0].content.contains("[shell-repair attempt 1/2]"),
+            "marker missing: {}",
+            repairs[0].content
+        );
+        assert!(
+            repairs[1].content.contains("[shell-repair attempt 2/2]"),
+            "marker missing: {}",
+            repairs[1].content
+        );
+        for repair in &repairs {
+            assert!(repair.content.contains("diagnostic: shell.process.non-zero-exit"));
+            assert!(repair.content.contains("Failed command: false"));
+            assert!(repair.content.contains("Exit code: 2"));
+            assert!(repair.content.contains("inspect the captured output above and fix"));
+            assert!(repair.content.contains("exactly ONE corrected `shell` tool call"));
+        }
+        // Three tool results (one per round), each followed by at most one
+        // repair turn; the last round has no trailing repair.
+        let tool_results = messages.iter().filter(|m| m.role == Role::Tool).collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 3);
+        let last = messages.last().expect("non-empty history");
+        assert_eq!(last.role, Role::Tool, "exhaustion leaves only the tool result: {messages:?}");
+        assert!(!last.content.contains("shell-repair"));
+    }
+
+    #[tokio::test]
+    async fn shell_policy_denial_never_queues_repair_turn() {
+        let (mut loop_, task, session, calls) = shell_repair_harness(ScriptedShellOutcome::Deny(
+            "command matched deny pattern: rm -rf /".into(),
+        ));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_denied".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "rm -rf /", "args": [] }),
+
+            ..Default::default()
+        };
+
+        // Repeat: even across rounds a denial never earns a repair turn.
+        for _ in 0..3 {
+            loop_
+                .execute_single_tool_call(
+                    &tc,
+                    &task,
+                    Ulid::new(),
+                    &session,
+                    CancellationToken::new(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(
+            repair_turns(&messages).is_empty(),
+            "policy denials must never be repaired: {messages:?}"
+        );
+        assert!(
+            messages[0].content.contains("[POLICY DENIED]"),
+            "denial surfaces unchanged: {}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_successful_exit_never_queues_repair_turn() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::Exit(0, "all good".into(), String::new()));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_ok".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "true", "args": [] }),
+
+            ..Default::default()
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(messages.len(), 1, "only the tool result: {messages:?}");
+        assert_eq!(messages[0].role, Role::Tool);
+        assert!(repair_turns(&messages).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_cancellation_never_queues_repair_turn() {
+        // The mock cancels the token DURING execution, before returning the
+        // failure — so the loop handles a completed execution failure while
+        // the run is already cancelled. The repair helper must then refuse
+        // to spend a repair turn.
+        let cancel = CancellationToken::new();
+        let (tool, calls) = ScriptedShellTool::with_cancel_on_execute(
+            ScriptedShellOutcome::Exit(1, String::new(), "late".into()),
+            Some(cancel.clone()),
+        );
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_extra_tools(provider, approval, 10, vec![Box::new(tool)]);
+        let task = AgentTask::new_action_required(Ulid::new(), "shell repair harness");
+        let session = SessionContext::new(task.session_id, std::path::PathBuf::from("/tmp"));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_cancelled".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "slow", "args": [] }),
+
+            ..Default::default()
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                cancel,
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            repair_turns(&messages).is_empty(),
+            "a cancelled run must not spend a repair turn: {messages:?}"
+        );
+        assert_eq!(messages.len(), 1, "only the tool result: {messages:?}");
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_queues_repair_turn_with_timeout_category() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::Timeout(30));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_timeout".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "long-build", "args": [] }),
+
+            ..Default::default()
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 1, "timeout earns one repair turn: {messages:?}");
+        assert!(repairs[0].content.contains("diagnostic: shell.process.timeout"));
+        assert!(repairs[0]
+            .content
+            .contains("split the work into smaller steps or raise the timeout"));
+        assert!(repairs[0].content.contains("Failed command: long-build"));
+    }
+
+    #[tokio::test]
+    async fn shell_spawn_failure_queues_repair_turn_with_not_found_category() {
+        let (mut loop_, task, session, _calls) =
+            shell_repair_harness(ScriptedShellOutcome::SpawnFailed(
+                "shell executable not found on PATH: fruitloop".into(),
+            ));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_spawn".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "fruitloop", "args": ["--help"] }),
+
+            ..Default::default()
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 1, "spawn failure earns one repair turn: {messages:?}");
+        assert!(repairs[0].content.contains("diagnostic: shell.execution.failed"));
+        assert!(repairs[0].content.contains("check the executable name for this shell"));
+        assert!(repairs[0].content.contains("Failed command: fruitloop --help"));
+    }
+
+    #[tokio::test]
+    async fn shell_repair_message_honors_truncation_caps() {
+        let (mut loop_, task, session, _calls) =
+            shell_repair_harness(ScriptedShellOutcome::Exit(1, "o".repeat(2000), "e".repeat(5000)));
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let long_command = "c".repeat(900);
+        let tc = ToolCall {
+            id: "call_caps".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": long_command, "args": [] }),
+
+            ..Default::default()
+        };
+
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        let repairs = repair_turns(&messages);
+        assert_eq!(repairs.len(), 1);
+        let content = &repairs[0].content;
+        // Command head-capped at 500 chars.
+        assert!(content.contains(&"c".repeat(500)), "command head missing");
+        assert!(!content.contains(&"c".repeat(501)), "command not head-capped");
+        // Stderr tail-capped at 1500 chars.
+        assert!(content.contains(&"e".repeat(1500)), "stderr tail missing");
+        assert!(!content.contains(&"e".repeat(1501)), "stderr not tail-capped");
+        assert!(!content.contains("o".repeat(501).as_str()), "stdout must be skipped");
+    }
+
+    // -----------------------------------------------------------------------
     // process_provider_response — integration-level tests (needs AgentLoop)
     // -----------------------------------------------------------------------
 
@@ -3766,6 +6541,8 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({"text": "hi"}),
+
+                ..Default::default()
             }],
             Some(CompletionUsage { prompt_tokens: Some(100), completion_tokens: Some(20) }),
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
@@ -3803,6 +6580,8 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({}),
+
+                ..Default::default()
             }],
             None,
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
@@ -3821,5 +6600,248 @@ mod tests {
         assert!(matches!(action, ProviderResponseAction::Proceed));
         assert_eq!(final_message, "", "must NOT set final_message when action_required=true");
         assert!(!completed);
+    }
+
+    // -------------------------------------------------------------------
+    // Truthful completion + counter reconciliation (completion fix)
+    // -------------------------------------------------------------------
+
+    /// A minimal write-shaped tool whose schema does NOT require `operation`
+    /// (the shape custom/plugin tools present): the guard passes the raw
+    /// arguments untouched, the pre-execution classifier finds no
+    /// `operation` field — and the tool's own success output records the
+    /// audited materialized mutation.
+    struct NormalizedWriteTool;
+    #[async_trait]
+    impl Tool for NormalizedWriteTool {
+        fn name(&self) -> &str {
+            "fs_write"
+        }
+        fn description(&self) -> &str {
+            "custom tool that normalizes raw args into a write"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            // Records the audited success exactly like the real filesystem
+            // tool's write result (content-normalized write, no `operation`
+            // in the executed call).
+            Ok(ToolOutput {
+                summary: "Wrote 5 bytes to Cargo.toml".to_owned(),
+                data: serde_json::json!({
+                    "path": input.get("path").cloned().unwrap_or_default(),
+                    "materialized": true
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn audited_mutation_success_counts_across_the_normalization_gap() {
+        // The counter disagreement (live smoke): the counter keys off the
+        // RAW arguments' operation field while the audited write path
+        // records what the TOOL actually executed. A successful tool result
+        // carrying `materialized: true` must count as file-changing even
+        // when the raw argument classification missed it.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(NormalizedWriteTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy));
+        let mut loop_ = AgentLoop::with_project_root(
+            EventBus::new(64),
+            approval.clone(),
+            provider,
+            executor,
+            Arc::new(NoopMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new("/tmp"))),
+            EvalEngine::new(dir.path().to_str().unwrap_or("/tmp")),
+            PromptBuilder::new("test system prompt"),
+            10,
+            true,
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
+
+        let task = AgentTask::new_action_required(Ulid::new(), "write Cargo.toml");
+        let session = SessionContext::new(task.session_id, dir.path().to_path_buf());
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        // Raw arguments WITHOUT an `operation` field: the pre-execution
+        // classifier answers false, the executed tool result records the
+        // audited materialized mutation.
+        let tc = ToolCall {
+            id: "call_norm".into(),
+            name: "fs_write".into(),
+            arguments: serde_json::json!({ "path": "Cargo.toml", "content": "hi" }),
+
+            ..Default::default()
+        };
+        loop_
+            .execute_single_tool_call(
+                &tc,
+                &task,
+                Ulid::new(),
+                &session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                &mut tool_events,
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_changing_tool_count, 1,
+            "an audited materialized write counts as file-changing even when \
+             the raw arguments carried no `operation` field"
+        );
+        assert!(files_modified.iter().any(|p| p.as_str() == "Cargo.toml"));
+        assert!(tool_events.iter().any(|event| event.success));
+    }
+
+    /// The ActionRequired Blocked verdict reconciles with the AUDITED write
+    /// path: a run whose round-scoped counter is 0 but whose audited tool
+    /// landing records a successful write is NOT blocked — the audited write
+    /// path discharges the requirement.
+    #[tokio::test]
+    async fn blocked_check_reconciles_with_audited_writes() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output = AgentOutput {
+            tool_call_count: 1,
+            final_message: "done".to_owned(),
+            files_modified: vec!["Cargo.toml".into()],
+            tool_events: vec![ToolExecutionSummary {
+                tool_name: "filesystem".to_owned(),
+                operation: Some("write".to_owned()),
+                path: Some("Cargo.toml".into()),
+                success: true,
+                summary: "Wrote 9 bytes to Cargo.toml".to_owned(),
+            }],
+            ..agent_output_base()
+        };
+
+        // Round counter 0, prior carry 0 — the round's own AUDITED
+        // successful write satisfies the file-changing requirement.
+        let decision = loop_
+            .decide_exit(
+                &task,
+                &output,
+                1, // tool_call_count >= min_tool_calls
+                0, // round file-changing counter: zero (the defect scenario)
+                0, // prior rounds carry: zero
+                &None,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(
+            decision.is_none(),
+            "an audited successful write discharges the file-changing requirement and must not block"
+        );
+
+        // Without any audited mutation the verdict stays Blocked.
+        let mut no_writes = output.clone();
+        no_writes.tool_events = vec![ToolExecutionSummary {
+            tool_name: "filesystem".to_owned(),
+            operation: Some("read".to_owned()),
+            path: None,
+            success: true,
+            summary: "Read 3 bytes".to_owned(),
+        }];
+        let blocked =
+            loop_.decide_exit(&task, &no_writes, 1, 0, 0, &None, true, Vec::new()).unwrap();
+        assert!(
+            matches!(blocked, Some(AgentRunExit::Blocked { .. })),
+            "with no audited mutation the ActionRequired verdict is still Blocked"
+        );
+    }
+
+    /// The loop-end reason persists into the session event log (the
+    /// diagnostic `AgentThought` channel) so a diagnosis reads from the log.
+    #[tokio::test]
+    async fn blocked_run_surfaces_the_end_reason_in_the_event_log() {
+        let bus = EventBus::new(256);
+        let rx = bus.subscribe();
+        let tc = make_tool_call("echo", "read some data");
+        let calls = vec![vec![tc], vec![]];
+        let provider = Arc::new(ScriptedProvider::new(calls));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_bus(bus, provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "write a file");
+        let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "premise: the run ends partial"
+        );
+
+        let mut inner = rx.into_inner();
+        let mut end_reason = false;
+        while let Ok(event) = inner.try_recv() {
+            if let EventKind::AgentThought { content, .. } = &event.kind {
+                if content.contains("run ended (blocked)")
+                    && content.contains("no file-changing tool call succeeded")
+                {
+                    end_reason = true;
+                }
+            }
+        }
+        assert!(end_reason, "the loop-end reason must surface in the session event log");
+    }
+
+    /// The Done path with no evaluation result is a normal `Completed` run:
+    /// the output stays Completed, and the bus `TaskCompleted` mirrors
+    /// `success: true` — mirrored from the output's status, never a
+    /// transport-level default.
+    #[tokio::test]
+    async fn no_eval_normal_done_is_completed_with_success_true() {
+        let bus = EventBus::new(64);
+        let rx = bus.subscribe();
+        // Answer-only task with no tool calls: text response ends the loop.
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_bus(bus, provider, approval, 4);
+        let task = AgentTask::new(Ulid::new(), "say something");
+        let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "no-eval normal done is Completed"
+        );
+
+        let mut inner = rx.into_inner();
+        let mut task_completed = false;
+        while let Ok(event) = inner.try_recv() {
+            if let EventKind::TaskCompleted { success, .. } = &event.kind {
+                task_completed = true;
+                assert!(success, "the Completed status publishes success:true");
+            }
+        }
+        assert!(task_completed, "the Done path publishes exactly one TaskCompleted");
     }
 }

@@ -50,11 +50,24 @@ pub struct CompletionRequest {
     pub stream: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Provider-specific opaque state that must be echoed back verbatim when
+    /// this tool call is replayed on a later request.
+    ///
+    /// Gemini 3.x models (and sometimes 2.5 under thinking) attach a
+    /// `thought_signature` to each `functionCall` part; Google's API requires
+    /// the client to replay that part exactly on the next request that re-sends
+    /// the call, or it fails with `400 INVALID_ARGUMENT` (`Function call is
+    /// missing a thought_signature`). `None` for every provider that does not
+    /// emit one. `#[serde(default)]` keeps old persisted JSON (without this
+    /// field) deserializable; `skip_serializing_if` keeps the serialized wire
+    /// shape of a `None`-carrying call byte-identical to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +176,23 @@ impl CompletionChunk {
 /// Mirrors the OpenAI chat-completions `usage` object. All fields are
 /// optional because providers differ in what they report (e.g. reasoning-only
 /// endpoints may omit `completion_tokens`, and `total_tokens` is derived).
+///
+/// # Provider contract — every connector must follow
+///
+/// Wire usage is surfaced on the terminal [`CompletionChunk`] only, via its
+/// `usage` field:
+///
+/// - when the provider reports token counts, the connector maps them into
+///   this struct and attaches `Some(usage)` to the terminal chunk;
+/// - when the wire carries no usable counts (absent or counts-less usage
+///   object), the connector leaves `usage` as `None` — empty is not a
+///   measurement;
+/// - `None` and `0` are both legitimate provider reports: the connector must
+///   never coalesce a missing count to `0`, nor drop a real `0`;
+/// - intermediate (non-terminal) chunks always carry `usage: None`.
+///
+/// The estimation fallback (`len / 4 + 4`) is orthogonal and lives
+/// downstream: it applies only where `usage` is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CompletionUsage {
     /// Input (prompt) tokens attributed to this completion.
@@ -177,6 +207,11 @@ pub struct CompletionUsage {
 pub struct TokenBudget {
     pub capacity: u64,
     pub reserved_for_response: u64,
+    /// Tokens available for the request prompt (`capacity − reserved_for_response`).
+    ///
+    /// Context-budget allocators (e.g. the score-ordered RAG bound in
+    /// `concerto-memory`) must bound against `available` — never raw
+    /// `capacity`, which still includes the response reservation.
     pub available: u64,
 }
 
@@ -660,7 +695,19 @@ pub const SYSTEM_PROMPT_BUILD: &str =
     destructive, expensive, or hard to undo — routine reads and edits do \
     not need confirmation. When you are unsure about the user's intent, \
     make a reasonable assumption, state it briefly, and proceed rather \
-    than stalling on a clarifying question.";
+    than stalling on a clarifying question.\n\
+    \n\
+    TOOL USE: every tool call is a JSON function call with one complete \
+    arguments object. Fill every required field exactly as named; never \
+    call a tool with empty or missing arguments.\n\
+    Examples:\n\
+    filesystem {\"operation\": \"read\", \"path\": \"src/main.rs\"}\n\
+    filesystem {\"operation\": \"list\", \"path\": \"src\"}\n\
+    filesystem {\"operation\": \"write\", \"path\": \"src/main.rs\", \"content\": \"fn main() {}\"}\n\
+    shell {\"command\": \"cargo test\"}\n\
+    filesystem operations: read, write, delete, exists, list, move, copy \
+    (write needs content; move/copy need destination). shell takes command \
+    (required) and optional cwd.";
 
 /// Chat-mode system prompt: conversational answer only, no tool use. Used for
 /// every non-Execute, non-Plan outcome (Answer, Diagnose, Review, Verify, and
@@ -899,6 +946,9 @@ pub struct AgentOutput {
 pub enum AgentCompletionStatus {
     Completed,
     Partial,
+    /// The Coordinator requested human input before continuing. Check
+    /// `final_message` for the question.
+    AwaitingUser,
 }
 
 /// One structured record of a single tool execution.
@@ -963,6 +1013,9 @@ impl AgentOutput {
         let mut s = match self.completion_status {
             AgentCompletionStatus::Completed => String::from("Completed.\n\n"),
             AgentCompletionStatus::Partial => String::from("Partial progress preserved.\n\n"),
+            AgentCompletionStatus::AwaitingUser => {
+                return self.final_message.clone();
+            }
         };
         s.push_str("Files changed:\n");
         for p in &self.files_modified {
@@ -1268,6 +1321,13 @@ pub struct ResearchReport {
 pub struct CodeSnippet {
     #[schemars(with = "String")]
     pub file: Utf8PathBuf,
+    /// Declared as `[u32; 2]` for schema purposes: schemars renders the Rust
+    /// tuple `(u32, u32)` as a draft-2020-12 `prefixItems` tuple, which Google
+    /// Gemini rejects (`INVALID_ARGUMENT` on unknown name), while a sized
+    /// array emits `items` + `minItems`/`maxItems` — accepted by every
+    /// provider. Serde serializes tuples and sized arrays identically, so the
+    /// wire contract (`[start, end]`) is unchanged.
+    #[schemars(with = "[u32; 2]")]
     pub lines: (u32, u32),
     pub content: String,
 }
@@ -1438,6 +1498,26 @@ pub struct AgentContext {
     /// The agent runner checks these after execution and rejects premature
     /// completion if required artifacts are missing.
     pub expected_artifacts: Vec<Utf8PathBuf>,
+    /// ADR-64 §6: task-specific workspace capsule preloaded into agent
+    /// prompts so agents never re-read files merely to confirm existence.
+    /// `None` when the timeline projection is unavailable or the feature is
+    /// disabled; `Some` at dispatch time when the coordinator builds it.
+    pub workspace_capsule: Option<WorkspaceCapsule>,
+    /// ADR-65 §2: the pre-planning workspace snapshot digest (generation id,
+    /// totals, top-level tree). `None` when the readiness barrier produced no
+    /// snapshot (e.g. readability or fail-soft); `Some` at dispatch time so
+    /// every agent starts grounded in the deterministic inventory.
+    pub workspace_snapshot_digest: Option<String>,
+    /// ADR-65 §3: the content-addressed workspace `generation` (see
+    /// `WorkspaceSnapshotRecord::generation`) at dispatch time, attached by the
+    /// coordinator so tool-executed evidence facts record the generation the
+    /// tool ran against. `None` when no snapshot barrier produced one.
+    pub workspace_generation: Option<String>,
+    /// ADR-65 §3: the multi-agent run identifier (`CheckpointScope::run_id`)
+    /// the current dispatch belongs to, attached by the coordinator so facts
+    /// are attributable to a run — **never inferred**: `None` when the caller
+    /// has no run concept (single-agent loop).
+    pub run_id: Option<String>,
 }
 
 impl AgentContext {
@@ -1457,7 +1537,65 @@ impl AgentContext {
             previous_results: Vec::new(),
             budget_remaining_usd: None,
             expected_artifacts: Vec::new(),
+            workspace_capsule: None,
+            workspace_snapshot_digest: None,
+            workspace_generation: None,
+            run_id: None,
         }
+    }
+}
+
+// ---- Phase 5: WorkspaceCapsule (ADR-64 §6) ----------------------------------
+
+/// A file known to the workspace — either written via the write gate (timeline
+/// `WroteFile` / `WroteFilesFromPath`) or modified by a completed dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleFileEntry {
+    /// Absolute or workspace-relative path.
+    pub path: String,
+    /// blake3 content hex from the timeline or pre-image cache.
+    pub content_hash: String,
+    /// Whiteboard gate sequence at which this file was last observed.
+    pub last_modified_gate_seq: u64,
+}
+
+/// A pending (not-yet-completed) task in the execution graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsulePendingTask {
+    /// The task's stable identifier.
+    pub task_id: String,
+    /// Human-readable description of the work.
+    pub description: String,
+    /// Task IDs this task depends on.
+    pub dependencies: Vec<String>,
+}
+
+/// A task-specific workspace capsule: the bounded, typed context packet that
+/// preloads file metadata from the timeline so agents never re-read files
+/// merely to confirm existence.
+///
+/// Built by the orchestrator's [`capsule::build_capsule`] and serialized
+/// into agent prompts by [`capsule::format_capsule`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceCapsule {
+    /// Files known to exist (from timeline `WroteFile` + `WroteFilesFromPath`
+    /// events).
+    pub known_files: Vec<CapsuleFileEntry>,
+    /// Files modified earlier in this run by completed dependency tasks.
+    pub modified_files: Vec<CapsuleFileEntry>,
+    /// Pending work not yet done (from the task graph).
+    pub pending_work: Vec<CapsulePendingTask>,
+    /// Expected outputs for this specific task.
+    pub expected_outputs: Vec<String>,
+}
+
+impl WorkspaceCapsule {
+    /// True when the capsule carries no information beyond the expected outputs.
+    pub fn is_empty(&self) -> bool {
+        self.known_files.is_empty()
+            && self.modified_files.is_empty()
+            && self.pending_work.is_empty()
+            && self.expected_outputs.is_empty()
     }
 }
 
@@ -1592,6 +1730,14 @@ pub struct ModelInfo {
     pub name: Option<String>,
     /// Entity that owns/publishes the model, if available.
     pub owned_by: Option<String>,
+    /// Tool-calling capability **as advertised by the provider's listing
+    /// API** (ADR-66 §3 precedence level 2), when the provider publishes
+    /// such metadata (e.g. Ollama's `capabilities` array containing
+    /// `"tools"`). `None` when the provider does not advertise capability
+    /// flags; resolution then falls through the built-in family table to
+    /// the provider default (see `concerto-providers::capability`).
+    #[serde(default)]
+    pub supports_tool_calling: Option<bool>,
 }
 
 // ---- Phase 8: SandboxProfile --------------------------------------------------
@@ -1753,6 +1899,39 @@ mod tests {
             system_prompt_for(crate::intent::RequestedOutcome::Execute),
             SYSTEM_PROMPT_BUILD
         );
+    }
+
+    /// The build prompt must teach weak models the exact tool-call wire
+    /// format: JSON function calls with the real advertised field names
+    /// (`filesystem.operation/path/content`, `shell.command/cwd`) and a
+    /// concrete example per operation family. A wrong field name here would
+    /// teach models to hallucinate exactly the keys the tool-call guard has
+    /// to repair (see `crates/providers/src/adapters/schema_loose.rs`).
+    #[test]
+    fn system_prompt_build_documents_tool_call_format() {
+        let prompt = SYSTEM_PROMPT_BUILD;
+
+        // Format statement + the never-empty rule.
+        assert!(prompt.contains("JSON function call"), "{prompt}");
+        assert!(
+            prompt.contains("never call a tool with empty or missing arguments"),
+            "prompt must forbid empty/missing arguments: {prompt}"
+        );
+
+        // Concrete examples with the real field names.
+        assert!(prompt.contains(r#"{"operation": "read", "path": "src/main.rs"}"#), "{prompt}");
+        assert!(prompt.contains(r#"{"operation": "list", "path": "src"}"#), "{prompt}");
+        assert!(
+            prompt.contains(r#"{"operation": "write", "path": "src/main.rs", "content":"#),
+            "a write example with content must be shown: {prompt}"
+        );
+        assert!(prompt.contains(r#"{"command": "cargo test"}"#), "{prompt}");
+
+        // Real schema vocabulary: the operation enum, and `cwd` — never a
+        // made-up `workdir` key.
+        assert!(prompt.contains("read, write, delete, exists, list, move, copy"), "{prompt}");
+        assert!(prompt.contains("cwd"), "{prompt}");
+        assert!(!prompt.contains("workdir"), "shell has no workdir field: {prompt}");
     }
 
     #[test]
@@ -1936,11 +2115,52 @@ mod tests {
             id: "call_1".into(),
             name: "test_tool".into(),
             arguments: serde_json::json!({"input": "hello"}),
+
+            ..Default::default()
         };
         let json = serde_json::to_value(&tc).unwrap();
         let back: ToolCall = serde_json::from_value(json).unwrap();
         assert_eq!(back.id, "call_1");
         assert_eq!(back.name, "test_tool");
+    }
+
+    /// Legacy persisted `ToolCall` JSON (from before the `thought_signature`
+    /// field existed) still deserializes: `#[serde(default)]` fills `None`.
+    #[test]
+    fn tool_call_legacy_json_deserializes() {
+        let json = r#"{"id":"call_1","name":"test_tool","arguments":{"input":"hello"}}"#;
+        let tc: ToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.name, "test_tool");
+        assert_eq!(tc.thought_signature, None);
+    }
+
+    /// `thought_signature` round-trips when present and is omitted from the
+    /// serialized value when `None` (`skip_serializing_if` keeps the wire
+    /// shape of signature-less calls identical to legacy output).
+    #[test]
+    fn tool_call_thought_signature_roundtrip_and_omit() {
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "test_tool".into(),
+            arguments: serde_json::json!({"input": "hello"}),
+            thought_signature: Some("sig-9f2a".into()),
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(json["thought_signature"], "sig-9f2a");
+        let back: ToolCall = serde_json::from_value(json).unwrap();
+        assert_eq!(back.thought_signature.as_deref(), Some("sig-9f2a"));
+
+        let none = ToolCall {
+            id: "call_1".into(),
+            name: "test_tool".into(),
+            arguments: serde_json::json!({"input": "hello"}),
+            ..Default::default()
+        };
+        assert!(
+            serde_json::to_value(&none).unwrap().get("thought_signature").is_none(),
+            "None must serialize without the thought_signature key"
+        );
     }
 
     #[test]

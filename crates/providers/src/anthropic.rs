@@ -2,7 +2,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
-use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall};
+use concerto_core::types::{
+    CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
+};
 use concerto_core::CancellationToken;
 use futures::stream::StreamExt;
 use reqwest::header::CONTENT_TYPE;
@@ -19,6 +21,10 @@ pub struct AnthropicProvider {
     /// Opt-in Anthropic prompt-cache breakpoints (ADR-48 decision 3). Off by
     /// default; toggled via [`Self::with_cache_breakpoints`].
     cache_breakpoints: bool,
+    /// Tool-schema presentation tier (adaptive tool schemas). Resolved per
+    /// request against the actual model name; `Auto` (default) keeps every
+    /// non-weak model on the verbatim strict schema.
+    tool_schema_mode: concerto_config::ToolSchemaMode,
 }
 
 impl AnthropicProvider {
@@ -29,6 +35,7 @@ impl AnthropicProvider {
             timeout_secs,
             dialect: AnthropicChatDialect,
             cache_breakpoints: false,
+            tool_schema_mode: concerto_config::ToolSchemaMode::default(),
         }
     }
 
@@ -48,6 +55,19 @@ impl AnthropicProvider {
     /// Whether this provider emits Anthropic prompt-cache breakpoints.
     pub fn cache_breakpoints(&self) -> bool {
         self.cache_breakpoints
+    }
+
+    /// Set the tool-schema presentation mode (adaptive tool schemas).
+    ///
+    /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
+    /// tool-calling models (name heuristic) get loose schemas (flattened
+    /// nested objects, enum descriptions, argument examples) and the
+    /// connector re-nests dot-notation arguments on the way back; every
+    /// other model keeps the verbatim strict schema and byte-identical wire
+    /// output. See `crate::adapters::schema_loose`.
+    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
+        self.tool_schema_mode = mode;
+        self
     }
 
     /// Build the wire request body for a completion: render the canonical
@@ -72,6 +92,16 @@ struct AnthropicStreamState {
     parser: BufferedSseParser,
     parse: AnthropicParseState,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
+    /// Whether the request that produced this stream was rendered with
+    /// loose (weak-model) tool schemas. When set, emitted tool-call
+    /// arguments are re-nested from dot-notation back into the tools'
+    /// original nested shape (see `crate::adapters::schema_loose`).
+    tool_adapted: bool,
+    /// Provider-reported usage merged from the events that carry it (ADR-48
+    /// §4): `message_start` reports `message.usage.input_tokens`, and
+    /// `message_delta` reports the cumulative `usage.output_tokens`. Attached
+    /// to the `message_stop` terminal chunk only.
+    usage: Option<CompletionUsage>,
 }
 
 impl AnthropicStreamState {
@@ -80,6 +110,33 @@ impl AnthropicStreamState {
             parser: BufferedSseParser::new(),
             parse: AnthropicParseState::default(),
             pending: VecDeque::new(),
+            tool_adapted: false,
+            usage: None,
+        }
+    }
+
+    /// Merge provider-reported token counts into the accumulated usage.
+    ///
+    /// Anthropic splits usage across events: `message_start` carries
+    /// `message.usage.input_tokens`, `message_delta` carries the cumulative
+    /// `usage.output_tokens`, and newer-API `content_block_stop` events can
+    /// carry a full usage object. Only counts actually present on the wire
+    /// are recorded — `None` and `0` are both legitimate reports, so no
+    /// coalescing happens here (ADR-48 decision 4). The `message_start`
+    /// `output_tokens` placeholder (`1`) is overwritten by the later real
+    /// cumulative total.
+    fn capture_usage(&mut self, data: &serde_json::Value) {
+        let input_tokens = data["message"]["usage"]["input_tokens"].as_u64();
+        let output_tokens = data["usage"]["output_tokens"].as_u64();
+        if input_tokens.is_none() && output_tokens.is_none() {
+            return;
+        }
+        let usage = self.usage.get_or_insert_with(CompletionUsage::default);
+        if let Some(input) = input_tokens {
+            usage.prompt_tokens = Some(input);
+        }
+        if let Some(output) = output_tokens {
+            usage.completion_tokens = Some(output);
         }
     }
 
@@ -106,6 +163,7 @@ impl AnthropicStreamState {
             Ok(v) => v,
             Err(_) => return,
         };
+        self.capture_usage(&data);
 
         let event_type = event.event.as_deref().unwrap_or("");
 
@@ -146,15 +204,26 @@ impl AnthropicStreamState {
                         usage: None,
                     }));
                 } else if let Some((id, name, args_str)) = self.parse.tool_acc.remove(&index) {
-                    let args_json = if args_str.trim().is_empty() {
+                    let mut args_json = if args_str.trim().is_empty() {
                         serde_json::Value::Null
                     } else {
                         serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
                     };
+                    // Adaptive tool schemas: re-nest dot-notation arguments
+                    // from loose-schema streams before the executor or the
+                    // tool-call guard validates against the nested schema.
+                    if self.tool_adapted {
+                        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args_json);
+                    }
                     self.pending.push_back(Ok(CompletionChunk {
                         reasoning: None,
                         delta: String::new(),
-                        tool_call: Some(ToolCall { id, name, arguments: args_json }),
+                        tool_call: Some(ToolCall {
+                            id,
+                            name,
+                            arguments: args_json,
+                            ..Default::default()
+                        }),
                         is_final: false,
                         usage: None,
                     }));
@@ -166,7 +235,7 @@ impl AnthropicStreamState {
                     delta: String::new(),
                     tool_call: None,
                     is_final: true,
-                    usage: None,
+                    usage: self.usage.take(),
                 }));
             }
             _ => {}
@@ -240,7 +309,7 @@ impl LlmProvider for AnthropicProvider {
                         let id = v["id"].as_str()?.to_string();
                         let name =
                             v["display_name"].as_str().or(v["id"].as_str()).map(String::from);
-                        Some(ModelInfo { id, name, owned_by: None })
+                        Some(ModelInfo { id, name, owned_by: None, supports_tool_calling: None })
                     })
                     .collect::<Vec<_>>()
             })
@@ -266,6 +335,21 @@ impl LlmProvider for AnthropicProvider {
 
         let model =
             if request.model.is_empty() { self.model.clone() } else { request.model.clone() };
+
+        // Adaptive tool schemas (weak-model tier): when the resolved model
+        // matches the loose tier, rewrite the request's tool definitions in
+        // place before the dialect renders the body. Strict models are
+        // untouched — their wire output stays byte-identical.
+        let mut request = request;
+        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
+            self.tool_schema_mode,
+            &model,
+        );
+        if tool_adapted {
+            if let Some(tools) = request.tools.as_mut() {
+                crate::adapters::schema_loose::adapt_tool_definitions(tools);
+            }
+        }
 
         // Request-body rendering now lives in
         // `crate::adapters::anthropic` (`AnthropicChatDialect`); stream
@@ -296,7 +380,10 @@ impl LlmProvider for AnthropicProvider {
             } => result,
         }?;
 
-        let state = AnthropicStreamState::new();
+        let mut state = AnthropicStreamState::new();
+        if tool_adapted {
+            state.tool_adapted = true;
+        }
         let cancel = cancel.clone();
 
         let s = stream! {
@@ -319,7 +406,15 @@ impl LlmProvider for AnthropicProvider {
                         }
                         items
                     }
-                    Err(e) => vec![Err(ProviderError::Other(format!("stream error: {}", describe_error_chain(&e))))],
+                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // mid-stream is retriable (tools execute only
+                    // post-assembly — re-issue is side-effect-free within
+                    // the bounded attempt budget); framing/parse failures
+                    // inside a healthy stream stay fatal.
+                    Err(e) => vec![Err(ProviderError::StreamTransport(format!(
+                        "connection dropped mid-stream: {}",
+                        describe_error_chain(&e)
+                    )))]
                 };
                 for item in items {
                     yield item;
@@ -481,6 +576,75 @@ mod tests {
         let state = AnthropicParseState::default();
         assert!(state.text_acc.is_empty());
         assert!(state.tool_acc.is_empty());
+    }
+
+    /// ADR-48 §4: `message_start` input_tokens and `message_delta`
+    /// output_tokens are merged and attached to the `message_stop` terminal
+    /// chunk only; intermediate content chunks carry no usage.
+    #[test]
+    fn stream_captures_usage_on_final_chunk() {
+        let mut state = AnthropicStreamState::new();
+        let event = |event_type: &str, data: &str| crate::sse::SseEvent {
+            event: Some(event_type.to_string()),
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        state.handle_event(event(
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+        ));
+        state.handle_event(event(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ));
+        state.handle_event(event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+        ));
+        state.handle_event(event(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ));
+        state.handle_event(event(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
+        ));
+        state.handle_event(event("message_stop", r#"{"type":"message_stop"}"#));
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        assert!(
+            chunks[..chunks.len() - 1].iter().all(|chunk| !chunk.is_final),
+            "only the final chunk is terminal"
+        );
+        assert_eq!(chunks[0].usage, None, "content deltas carry no usage");
+        let terminal = chunks.last().expect("terminal chunk");
+        assert!(terminal.is_final);
+        assert_eq!(
+            terminal.usage,
+            Some(CompletionUsage { prompt_tokens: Some(25), completion_tokens: Some(15) })
+        );
+    }
+
+    /// ADR-48 §4: a usage object with no token counts is not a measurement
+    /// and must not be surfaced as one (mirrors the OpenAI capture rule).
+    #[test]
+    fn stream_ignores_usage_without_counts() {
+        let mut state = AnthropicStreamState::new();
+        let event = crate::sse::SseEvent {
+            event: Some("message_delta".to_string()),
+            data: Some(r#"{"type":"message_delta","usage":{}}"#.to_string()),
+            id: None,
+            keepalive: false,
+        };
+        state.handle_event(event);
+        assert!(state.usage.is_none(), "counts-less usage must stay None");
+        assert!(
+            state.pending.is_empty(),
+            "message_delta alone emits no chunk; usage surfaces on message_stop"
+        );
     }
 
     /// Cost for unknown model falls back to a default (non-zero) estimate.

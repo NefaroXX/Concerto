@@ -23,9 +23,11 @@ use concerto_core::memory::{
 };
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::memory::MemoryStore;
+use concerto_core::traits::policy::PolicyEngine;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentOutput, AgentRunResult, AgentStage, AgentTask,
-    DesignDoc, ProviderMetrics, SubTask, SubTaskStatus, TaskId,
+    CompletionRequest, DesignDoc, Message, PolicyAction, PolicyVerdict, ProviderMetrics, Role,
+    SubTask, SubTaskStatus, TaskExecutionMode, TaskId, ToolDefinition, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
@@ -33,20 +35,46 @@ use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
-use concerto_sessions::{OrchestrationCheckpointRecord, SessionStore};
+use concerto_sessions::whiteboard::append_whiteboard_event;
+use concerto_sessions::whiteboard::{latest_gate_seq, load_whiteboard_events, WhiteboardLoadOpts};
+use concerto_sessions::{
+    NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
+    SessionStore, WhiteboardEvent, WhiteboardKind,
+};
 
 use crate::agent_runner::AgentRunner;
 use crate::agents::GenericSpecialistAgent;
 use crate::checkpoint;
+use crate::consultation::{consult_tool_definition, CONSULT_SPECIALIST_TOOL};
 use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
 use crate::delta::FileDeltaTracker;
+use crate::design_doc_verifier::{
+    collect_design_doc_evidence, degraded_verdict, verify_design_doc, DesignDocVerdict,
+};
 use crate::graph::{Dependency, TaskGraph, TaskGraphValidator};
+use crate::plan_approval::{
+    append_review_state_event, load_review_resume, review_target_identity, ReviewCycleStatus,
+    ReviewFeedbackEntry, ReviewResume, ReviewStatePayload,
+};
 use crate::planner::{PlanArtifact, PlannerAgentInfo, TaskPlanner};
 use crate::registry::AgentRegistry;
 use crate::relationship::{
     AgentHandoff, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
+use crate::resolver_integration::{self, ResolverOutcome};
+use crate::resume::{self, ResumeOutcome};
+use crate::speculation::{
+    compare_hypotheses, investigate_tool_definition, run_consult_execution, ConsultExecutionInputs,
+    HypothesisCompareInput, HypothesisTerminal, InvestigateHypothesesArgs,
+    INVESTIGATE_HYPOTHESES_TOOL, MAX_SPECULATION_TOTAL_TOOL_CALLS, MAX_SPECULATIVE_HYPOTHESES,
+    MIN_SPECULATIVE_HYPOTHESES,
+};
 use crate::state::OrchestratorState;
+use crate::wait::{
+    check_wake, execute_wait, task_is_resolved, wait_tool_definition, wake_reason_label, WaitArgs,
+    WaitConfig, WaitingRecord, WakeCondition, WakeOutcome, WakeReason, WakeRefiner, WakeState,
+    WakeView, MAX_WAIT_AFFECTED_IDS, WAIT_TOOL,
+};
 use tracing::warn;
 
 /// Default dispatch-attempt ceiling per subtask before the fallback ladder
@@ -75,6 +103,378 @@ Constraints:
 - Report the outcome as your final summary, listing every file you changed and why.
 "#;
 
+/// ADR-35 amendment (2026-09-05): the tool with which the Coordinator calls
+/// registered specialists.
+pub(crate) const CALL_SPECIALIST_TOOL: &str = "call_specialist";
+
+/// Issue #61: the coordinator-mediated artifact-ownership transfer tool.
+/// The only lawful handover of an owned artifact — validated as a typed
+/// decision, applied by the attached gate, never a steal.
+pub(crate) const TRANSFER_OWNERSHIP_TOOL: &str = "transfer_ownership";
+
+/// The optional advisory work-breakdown tool (ADR-35 amendment §2 / ADR-52
+/// amendment 2026-09-05). Its output is context for the Coordinator — NEVER
+/// materialized as `SubTask` roles or dependencies.
+pub(crate) const DRAFT_PLAN_TOOL: &str = "draft_plan";
+
+/// Issue #57: the task-restructuring surfaces. The Coordinator's model may
+/// re-cut an OPEN task into ordered children (`split_task`) or fold
+/// compatible open tasks into one survivor (`merge_tasks`). Both are
+/// deterministic graph transforms validated against the REAL graph state
+/// before anything changes; they dispatch no agents and touch no tools,
+/// which is why they apply no policy gate (there is nothing to gate) and
+/// why the decision loop can offer them alongside `call_specialist`.
+pub(crate) const SPLIT_TASK_TOOL: &str = "split_task";
+pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
+
+/// Issue #64: the explicit reconsideration surface. The Coordinator's model
+/// supersedes a decision whose assumptions proved wrong by marking it
+/// `Superseded` in the decision journal and freezing ONLY the affected
+/// pending tasks (deterministic `Freeze` transform). Completed work, valid
+/// evidence, and accepted artifacts are never touched; the loop returns to
+/// strategy selection from the current world state after the tool result.
+/// Like split/merge it dispatches no agents and touches no tools, so it
+/// applies no policy gate (there is nothing to gate).
+pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
+
+/// ADR-35 amendment (2026-09-16 §2): the explicit human-input request
+/// surface — the Coordinator side of the operator consent/interaction gate.
+/// The model calls it with a reason; the decision loop then unwinds and the
+/// run ends `AwaitingUser` with the reason as the final message and a
+/// preserved checkpoint, so the interactive answer channel (TODO #22/#23)
+/// can resume it after the operator answers. Dispatches no agents, touches
+/// no tools; unlike the other surfaces it applies no policy gate because it
+/// is the human-in-the-loop consent path itself, not a workspace mutation.
+pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
+
+/// Maximum Coordinator decision-loop iterations (model turns with tool
+/// calls) before the loop stops. The run-wide ADR-52 doom guard
+/// (`max_total_iterations`) bounds the loop further; this constant is the
+/// hard structural backstop so a looping model cannot spin unbounded even
+/// with the cap disabled.
+const MAX_DISPATCH_ITERATIONS: usize = 64;
+
+/// ADR-35 amendment (2026-09-05) §1: built-in instructions for the
+/// Coordinator's decision loop. The roster ([`Self::render_specialist_roster`])
+/// is injected after these instructions; the Orchestration Studio's
+/// supplemental prompt (ADR-35 §5) is appended after everything.
+const COORDINATOR_DISPATCH_PROMPT: &str = r#"You are the Coordinator: the sole decision-maker of a multi-agent software project. You decide which specialist to call, when, and with what task — no code decides for you.
+
+How to work:
+1. Read the objective, the recorded evidence (workspace facts, the design document if one binds), and the specialist roster below.
+2. Call a specialist with the call_specialist tool when one is the right tool for the work: name the agent_id exactly as listed, give the specialist a complete self-contained task, and put your guidance in notes.
+3. The tool returns the specialist's outcome (success / failed / blocked / needs_revision, its summary, and the files it changed). Decide the next step from that outcome: re-call the specialist with corrective notes, call a different specialist, or finish.
+4. When a specialist failed or returned needs_revision, you may retry with corrective notes. Every call you make is recorded as a Decision on the whiteboard, so call deliberately.
+5. If no registered specialist fits (or none is registered for the work at all), do the work yourself with your own tools — you are a full agent.
+6. When the objective is met (or nothing more can be done), reply with a plain summary and NO tool call. List what was done, by whom, and any remaining risk.
+
+Evidence discipline:
+- When your decision rests on recorded evidence, cite the real event ids from the context in supporting_evidence_ids. Fabricated ids are rejected and your decision loses its citations.
+- The stage tag of a specialist is informational context. You are never required to follow a stage order — call whoever the work needs, whenever the work needs it.
+
+Restructuring an open task (use sparingly, deterministically):
+- When one open task is doing too much, split_task re-cuts it into ordered children that inherit the task's specialist role, evidence, and attempt counter. Splits of pending/running tasks only — completed work is never re-cut.
+- When several open pending tasks overlap in role and substance, merge_tasks folds them into one survivor with the lowest id. Merge only tasks of the SAME role.
+- Both tools are validated against the real graph BEFORE anything changes; a rejected split or merge is a structured error you can read and fix, never a crash.
+
+Consultation (read-only, use it to resolve open questions):
+- consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
+- The consultation returns findings plus a real evidence id; cite that id in supporting_evidence_ids when a later decision rests on the advice.
+
+Speculative investigation (read-only, for conflicting hypotheses):
+- investigate_hypotheses runs 2–4 bounded consultations in parallel. Each hypothesis is a distinct question to a named specialist under the same read-only contract as consult_specialist.
+- Findings are advisory only; the comparator ranks them (completed-with-evidence first) and returns a recommended hypothesis. No hypothesis is auto-promoted to verified — a separate explicit verification step is required before promoting any finding.
+- Use this when a decision is ambiguous and you want competing advisory answers before committing to a dispatch. Verify the recommended hypothesis (or reconcile conflicting findings) before acting on it.
+
+Waiting on external reality (issue #63):
+- wait suspends the decision loop on a declarative condition or a hard deadline — no model turns, no dispatch, no stall flag. Use it when the next step is genuinely blocked on something outside this loop: tasks you are waiting to settle (event-resolved), a workspace that must change first (workspace-generation-changed), a review or finding event you expect to land (new-evidence), or simply a wall-clock deadline.
+- The loop re-evaluates in bounded, cancellable slices and the tool returns why the wait ended: woken (a condition tripped), expired (the deadline passed), or still-waiting (the internal cap was reached). Decide the next step from that result — re-wait, proceed, or give up.
+- A wait must declare at least one condition or a deadline; fabricated evidence ids are rejected exactly like everywhere else.
+
+Superseding a decision whose assumptions proved wrong (issue #64):
+- reconsider marks one of this run's journaled decisions Superseded and freezes ONLY the affected PENDING tasks whose plans it stood behind. Use it when new evidence or a settlement shows a decision's assumptions no longer hold. Name the real decision id, the pending task ids, and cite the evidence that changed your mind.
+- Completed work, valid evidence, and accepted artifacts are never touched; frozen tasks never re-dispatch on their own. Re-plan the frozen work yourself, under fresh decisions, from the current world state. An unknown or already-rejected decision id is a structured rejection you can read and fix.
+
+Artifact ownership (issue #61):
+- A write by a non-owner to an OWNED artifact is refused; the refusal names the owner and its acquiring event. To hand an owned artifact over to another agent, call transfer_ownership — the mediated handover is the only lawful way; ownership is never stolen.
+"#;
+
+/// Argument schema for the Coordinator's `call_specialist` tool.
+fn call_specialist_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: CALL_SPECIALIST_TOOL.to_string(),
+        description: "Dispatch a registered specialist agent. The specialist runs to \
+                      completion and its outcome is returned so you can decide the next \
+                      step."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "The id of the registered specialist to call, exactly as listed in the roster."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The complete, self-contained task for the specialist."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short guidance for the specialist (constraints, pointers, cautions). Recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids (from the context) that justify this decision. Fabricated ids are rejected."
+                }
+            },
+            "required": ["agent_id", "task"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `transfer_ownership` tool
+/// (issue #61): the coordinator-mediated handover of an owned artifact.
+fn transfer_ownership_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: TRANSFER_OWNERSHIP_TOOL.to_string(),
+        description: "Mediate an artifact-ownership transfer (issue #61). A write by a non-owner \
+                      to an OWNED artifact is refused (the failed tool result names the owner \
+                      and its acquiring event); when another agent must take the artifact \
+                      over, grant that transfer here. The refusing agent never claims the \
+                      artifact by writing again — only this mediated decision can move it, \
+                      and only from its actual current owner."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "The id of the specialist that RECEIVES the artifact's ownership, exactly as listed in the roster."
+                },
+                "expected_artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The owned artifact paths (workspace-root-relative) to transfer. Unowned or foreign-owned paths are rejected with a structured error; nothing is stolen."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the handover. Recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids (from the context) that justify this decision. Fabricated ids are rejected."
+                }
+            },
+            "required": ["agent_id", "expected_artifacts"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `draft_plan` advisor.
+fn draft_plan_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DRAFT_PLAN_TOOL.to_string(),
+        description: "Optional: ask the planner advisor to draft a work breakdown for \
+                      the objective. The draft is CONTEXT for your own decisions — it is \
+                      never executed and no specialist is dispatched by it."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {}
+        }),
+    }
+}
+
+/// Issue #57: argument schema for `split_task` — re-cut one open task into
+/// ordered child tasks that inherit the parent's specialist role, evidence
+/// context, and attempt baseline.
+fn split_task_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: SPLIT_TASK_TOOL.to_string(),
+        description: "Restructure an OPEN (pending/running) task: replace it with 1-8 \
+                      ordered child tasks that inherit the task's specialist role, \
+                      session evidence, and attempt counter. Children may order among \
+                      themselves with `after` (indices of strictly EARLIER children). \
+                      Everything outside the split parent is rewired deterministically \
+                      (its dependencies gate every child; its dependents wait for every \
+                      child). Completed work is never touched."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The id of the open task to split."
+                },
+                "children": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "The complete, self-contained work text for this child."
+                            },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional workspace-root-relative paths this child should produce (canonicalized; fabricated-traversal paths are rejected)."
+                            },
+                            "after": {
+                                "type": "array",
+                                "items": { "type": "integer" },
+                                "description": "Optional indices of strictly EARLIER children (positions in this children list) that must finish before this child runs."
+                            }
+                        },
+                        "required": ["description"]
+                    }
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the split, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the split."
+                }
+            },
+            "required": ["task_id", "children"]
+        }),
+    }
+}
+
+/// Issue #57: argument schema for `merge_tasks` — fold compatible open
+/// tasks (same specialist role, all pending) into one survivor.
+fn merge_tasks_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: MERGE_TASKS_TOOL.to_string(),
+        description: "Fold 2-16 compatible OPEN pending tasks (same specialist role — \
+                      equivalent/overlapping work) into ONE surviving task with the \
+                      lowest id, whose description you supply. Artifacts, evidence, and \
+                      attempt counters carry over deterministically; edges of the \
+                      removed members rewire onto the survivor. Completed or failed \
+                      work never merges."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 16,
+                    "items": { "type": "string" },
+                    "description": "The pending tasks to fold. The survivor is deterministically the lowest id."
+                },
+                "merged_description": {
+                    "type": "string",
+                    "description": "The complete merged task text that replaces the members' descriptions."
+                },
+                "merged_artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional workspace-root-relative paths the merged task should produce."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the merge, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the merge."
+                }
+            },
+            "required": ["task_ids", "merged_description"]
+        }),
+    }
+}
+
+/// Issue #64: argument schema for `reconsider` — supersede a decision whose
+/// assumptions proved wrong and freeze only the pending tasks that stood
+/// behind it. Completed work, valid evidence, and accepted artifacts are
+/// never touched; the affected tasks never re-enter the ready queue on
+/// their own.
+fn reconsider_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: RECONSIDER_TOOL.to_string(),
+        description: "Supersede a decision whose assumptions proved wrong (issue #64): \
+                      mark the cited decision Superseded in the run's journal and freeze \
+                      ONLY the affected PENDING tasks (they become blocked and never \
+                      re-dispatch on their own). Completed work, valid evidence, and \
+                      accepted artifacts are untouched. You re-plan the frozen work \
+                      yourself, under fresh decisions, from the current world state."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision_id": {
+                    "type": "string",
+                    "description": "The id of a decision recorded in this run's journal (from the \
+                                    context) whose assumptions you are superseding. Unknown ids and \
+                                    already-rejected decisions are rejected."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the decision's assumptions no longer hold; recorded as the \
+                                    reconsideration decision's reason."
+                },
+                "affected_task_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 48,
+                    "items": { "type": "string" },
+                    "description": "The PENDING task ids whose plans that decision stood behind, to \
+                                    freeze. Completed/running/failed tasks are rejected — freeze only \
+                                    pending work."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional extra guidance, recorded in the decision notes."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the reconsideration. \
+                                    Fabricated ids are rejected."
+                }
+            },
+            "required": ["decision_id", "reason", "affected_task_ids"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `request_user_input` tool (ADR-35
+/// amendment 2026-09-16 §2): the operator-consent surface that stops the run
+/// with a preserved checkpoint, awaiting the operator's answer (TODO #22/#23
+/// is the interactive answer channel that resumes it).
+fn request_user_input_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REQUEST_USER_INPUT_TOOL.to_string(),
+        description: "Stop the run and request human input. The run ends with \
+                      AwaitingUser status, the checkpoint is preserved, and the \
+                      operator is shown your reason. Use this ONLY when the next \
+                      step genuinely requires the operator's answer — consent, a \
+                      choice, a credential, or a decision only they can make."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "The complete, self-contained question or reason the operator must \
+                                    answer before the run can continue."
+                }
+            },
+            "required": ["reason"]
+        }),
+    }
+}
+
 /// Three-way failure classification for subtask dispatches (ADR-42 §1).
 enum SubtaskFailureClass {
     /// Transient; retry the same agent/model (today's recoverable path).
@@ -88,34 +488,24 @@ enum SubtaskFailureClass {
     NonRecoverable,
 }
 
-/// Classify a subtask dispatch error into the retry/ladder/exit decision
-/// space (ADR-42 §1). Cancellation short-circuits to `NonRecoverable` before
-/// any ladder tier.
-fn classify_subtask_error(error: &OrchestratorError) -> SubtaskFailureClass {
-    if is_cancellation_error(error) {
-        return SubtaskFailureClass::NonRecoverable;
-    }
-    match error {
-        OrchestratorError::AgentLoopError(_)
-        | OrchestratorError::Memory(_)
-        | OrchestratorError::Tool(_) => SubtaskFailureClass::Recoverable,
-        // Transient provider errors (rate limits, network, timeouts, 5xx)
-        // may resolve on retry — treat as Recoverable.
-        OrchestratorError::Provider(p) if p.is_transient() => SubtaskFailureClass::Recoverable,
-        // Provider/model-specific hard failure (auth, context overflow,
-        // rate-limit ceiling) or model-selection failure (no affordable or
-        // capable model, pinned model missing/unavailable/budget-blocked) is a
-        // property of the *assignment*, not of the task — a different model or
-        // agent may still complete it, so walk the fallback ladder.
-        OrchestratorError::Provider(_)
-        | OrchestratorError::NoAffordableModel { .. }
-        | OrchestratorError::NoCapableModel { .. }
-        | OrchestratorError::PinnedModelNotFound { .. }
-        | OrchestratorError::PinnedModelMissingCapability { .. }
-        | OrchestratorError::PinnedModelBudgetExceeded { .. } => SubtaskFailureClass::LimitReached,
-        // Structural errors (invalid task graph, cycle detection, planning
-        // failure, exhausted budgets for delegation) exit immediately.
-        _ => SubtaskFailureClass::NonRecoverable,
+/// Issue #54: the deterministic diagnosis → recovery-class bridge. A
+/// same-agent-viable diagnosis retries in place (ADR-42 Recoverable); an
+/// alternate-viable one walks the fallback ladder (ADR-42 LimitReached);
+/// anything else exits through the graceful non-recoverable path. The
+/// diagnosis flags are the single source of the class — no error-matching
+/// happens outside [`crate::failure_diagnosis`]. Cancellation
+/// short-circuits to `NonRecoverable` before any ladder tier, exactly as
+/// the historical hand-written classifier did (callers check
+/// [`is_cancellation_error`] before diagnosing).
+impl From<&crate::failure_diagnosis::FailureDiagnosis> for SubtaskFailureClass {
+    fn from(diagnosis: &crate::failure_diagnosis::FailureDiagnosis) -> Self {
+        if diagnosis.same_agent_viable {
+            SubtaskFailureClass::Recoverable
+        } else if diagnosis.alternate_agent_viable {
+            SubtaskFailureClass::LimitReached
+        } else {
+            SubtaskFailureClass::NonRecoverable
+        }
     }
 }
 
@@ -175,6 +565,33 @@ fn is_artifact_failure(error: &str) -> bool {
 /// Files larger than this are treated as substantive by construction, so
 /// acceptance only performs bounded reads (audit C-06).
 const MAX_PLACEHOLDER_SCAN_BYTES: u64 = 64 * 1024;
+
+/// ADR-65 §4: newest observed rows folded into the action digest injected
+/// into dispatched agent contexts (bounded so the prompt stays lean).
+const MAX_OBSERVATION_DIGEST_LINES: usize = 20;
+
+/// Render observed `resource_facts` rows as the compact action-digest block:
+/// clean rows as `path | unchanged-since <event_id> | hash-<first 8 hex>` (the
+/// hash segment is omitted when the observation recorded no content hash),
+/// dirty rows as `path | changed`. Deterministic — the input ordering is
+/// already newest-first with a path tiebreak ([`ResourceFacts::list_observations`]).
+fn format_action_digest(rows: &[ResourceFactRow]) -> String {
+    let mut lines = vec![String::from("<action_digest>")];
+    for row in rows {
+        match (&row.dirty, &row.last_event_id, &row.content_hash) {
+            (true, ..) | (false, None, _) => lines.push(format!("{} | changed", row.path)),
+            (false, Some(event_id), Some(hash)) => {
+                let head: String = hash.chars().take(8).collect();
+                lines.push(format!("{} | unchanged-since {} | hash-{}", row.path, event_id, head));
+            }
+            (false, Some(event_id), None) => {
+                lines.push(format!("{} | unchanged-since {}", row.path, event_id));
+            }
+        }
+    }
+    lines.push(String::from("</action_digest>"));
+    lines.join("\n")
+}
 
 /// Minimal stub-marker set for the placeholder predicate (audit C-06).
 ///
@@ -260,6 +677,54 @@ fn verify_expected_artifacts(
     } else {
         Err(violations)
     }
+}
+
+/// The run's declared expected artifacts across all subtasks, de-duplicated
+/// (the C-06 acceptance view of the `expected_artifacts` snapshot).
+fn expected_artifact_list(
+    snapshot: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+) -> Vec<camino::Utf8PathBuf> {
+    let mut seen = HashSet::new();
+    snapshot.values().flatten().filter(|path| seen.insert((*path).clone())).cloned().collect()
+}
+
+/// Whether any declared expected artifact is unproduced on disk (missing,
+/// empty, or placeholder content). An empty declared set is vacuously
+/// produced — mirroring the C-06 acceptance gate's semantics.
+fn expected_artifacts_unproduced(
+    project_root: &camino::Utf8Path,
+    expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+) -> bool {
+    let expected = expected_artifact_list(expected_artifacts);
+    !expected.is_empty() && verify_expected_artifacts(project_root, &expected).is_err()
+}
+
+/// Run-continuity Phase 1: the stall predicate evaluated at a run's final
+/// exit. A run is STALLED — not cleanly done — when any of:
+///
+/// 1. its declared Completion is not complete (`Partial`),
+/// 2. its declared expected deliverables are unproduced on disk (vacuous
+///    when nothing is declared), or
+/// 3. any subtask remains `Failed` or `Blocked`.
+///
+/// A stalled run KEEPS its resumable orchestration checkpoint (persisted
+/// with `completed=false`); only a clean success clears it, so a later
+/// bare "continue" can always pick the run back up.
+fn run_is_stalled(
+    completion_status: concerto_core::types::AgentCompletionStatus,
+    deliverables_missing: bool,
+    graph: &TaskGraph,
+) -> bool {
+    if completion_status != concerto_core::types::AgentCompletionStatus::Completed {
+        return true;
+    }
+    if deliverables_missing {
+        return true;
+    }
+    graph
+        .all_tasks()
+        .iter()
+        .any(|subtask| matches!(subtask.status, SubTaskStatus::Failed | SubTaskStatus::Blocked))
 }
 
 /// Build a `Failed` run result that records an acceptance rejection (C-06).
@@ -448,6 +913,84 @@ struct DecomposeResult {
     retry_feedback: HashMap<TaskId, Vec<AgentRunResult>>,
     model_assignments: HashMap<TaskId, String>,
     action_ledger: Vec<checkpoint::CheckpointAction>,
+    /// The objective this run's checkpoints record. On a fresh run this is
+    /// the task description; on a checkpoint restore it is the ORIGINAL
+    /// objective carried in the checkpoint — a resumed run must keep
+    /// recording the original objective text + hash, not its (bare
+    /// "continue") input, so every later resume still names the same work.
+    objective: String,
+    objective_hash: String,
+    /// The Coordinator decision loop's final summary (ADR-35 amendment
+    /// 2026-09-05). On a fresh run this is the plan/summary the Coordinator
+    /// produced when it stopped calling tools; the planning-only depth
+    /// surfaces it as the run's final message. Empty on a checkpoint restore.
+    dispatch_summary: String,
+    /// Loop notes to downgrade the run exit (per-call zero-work flags, an
+    /// empty dispatch session on an action-required run, cap/iteration-bound
+    /// stops). Consumed by `execute_graph`'s tail. Empty on a restore.
+    loop_notes: Vec<String>,
+    /// ADR-35 amendment (2026-09-16 §2): the reason the Coordinator requested
+    /// human input in its decision loop. Threaded to `execute_graph` so the
+    /// run ends `AwaitingUser` with the reason as the final message and a
+    /// preserved checkpoint. `None` on a checkpoint restore (the resume
+    /// re-decides) and on any run that never asked.
+    requested_user_input: Option<String>,
+}
+
+/// State accumulated by the Coordinator's decision loop (each
+/// `call_specialist` dispatch). Threaded into `execute_graph` so the
+/// loop's work flows into the same accumulators, checkpoints, and final
+/// output the graph-execution machinery maintains.
+#[derive(Debug, Default)]
+struct DispatchLedger {
+    completed_results: HashMap<TaskId, AgentRunResult>,
+    total_cost: f64,
+    total_tool_calls: u32,
+    all_files: Vec<camino::Utf8PathBuf>,
+    provider_metrics: Vec<ProviderMetrics>,
+    subtask_attempts: HashMap<TaskId, u32>,
+    model_assignments: HashMap<TaskId, String>,
+    action_ledger: Vec<checkpoint::CheckpointAction>,
+    /// Coordinator-loop observations that must downgrade the run exit to
+    /// `Partial` (per-call zero-work flags, an empty dispatch session on an
+    /// action-required run). Consumed by `execute_graph`'s tail.
+    notes: Vec<String>,
+}
+
+/// Issue #63: the coordinator's live-world refiner for one parked wait.
+///
+/// Holds immutable reborrows of the coordinator, the graph, and the wait
+/// record for the duration of a single [`execute_wait`] call. The borrow is
+/// scoped to [`CoordinatorAgent::handle_wait`]'s park block, so `&mut self`
+/// resumes afterwards for settling and checkpointing.
+struct CoordinatorWakeRefiner<'a> {
+    coordinator: &'a CoordinatorAgent,
+    graph: &'a TaskGraph,
+    session_id: Ulid,
+    record: &'a WaitingRecord,
+    cancel: CancellationToken,
+}
+
+impl WakeRefiner for CoordinatorWakeRefiner<'_> {
+    async fn refine(&self) -> WakeView {
+        self.coordinator.wake_view_for(self.graph, self.session_id, self.record, &self.cancel).await
+    }
+}
+
+/// ADR-65 §7: the outcome of a resume evaluation applied to the restored
+/// state. `Replan` returns no ledger — the caller falls through to fresh
+/// decomposition (the Phase-6 scheduler governs the new planning; the
+/// resume path itself never dispatches an agent).
+enum ResumeApplication {
+    Applied {
+        /// Ledger entries recording the resume decisions/rewrites, to be
+        /// carried into the resumed run's checkpoints.
+        ledger_entries: Vec<checkpoint::CheckpointAction>,
+        /// The subtask a Continue/Replace decision re-armed; its attempt
+        /// counter resets so the granted decision can actually dispatch.
+        re_armed: Option<TaskId>,
+    },
+    Replan,
 }
 
 /// The coordinator drives the full multi-agent lifecycle.
@@ -555,6 +1098,11 @@ pub struct CoordinatorAgent {
     /// `SkillsContext`; injected into every planner prompt for this run.
     /// Empty when skills are disabled.
     skills_section: String,
+    /// Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C),
+    /// threaded from the runtime's resolved shell settings. Injected into
+    /// every dispatch prompt and into the self-implement persona's prompts.
+    /// Empty when unset (manual/test constructions).
+    environment_card: String,
     /// ADR-55 Phase 2b: how far this run may go — full lifecycle (default)
     /// or planning-only (produce + render + persist the plan, nothing else).
     orchestration_depth: OrchestrationDepth,
@@ -572,6 +1120,12 @@ pub struct CoordinatorAgent {
     /// when `None` self-execution is unavailable and a pipeline without an
     /// implement-stage agent fails exactly as before.
     tool_executor: Option<Arc<ToolExecutor>>,
+    /// ADR-35 amendment (2026-09-05): the run's policy engine, gating every
+    /// `call_specialist` decision like any tool. The SAME engine the shared
+    /// executor enforces (wired from the runtime runner) — never bypassed.
+    /// `None` (unwired, e.g. bare test constructions) fails the tool call
+    /// closed: dispatch is denied, never silently allowed.
+    policy: Option<Arc<dyn PolicyEngine>>,
     /// ADR-35 §5/§8: the Orchestration Studio's supplemental coordinator
     /// prompt, APPENDED to the coordinator self's built-in instructions. Never
     /// replaces or overrides them. Empty when unset.
@@ -581,12 +1135,173 @@ pub struct CoordinatorAgent {
     /// is registered. `None` (the default) preserves the pre-amendment
     /// behavior: a build task without a validator rejects acceptance.
     eval_engine: Option<Arc<concerto_eval::EvalEngine>>,
-    /// ADR-58 P2+P3 (Batch 1): the resolved blueprint's typed facade,
-    /// backing the sequencing guards in [`Self::stage_of`] and
-    /// [`Self::first_agent_for_stage`] (`debug_assert!` comparing the
-    /// registry answer against blueprint staffing). `None` for coordinators
-    /// built without a resolved blueprint (tests) — the guards stay silent.
+    /// ADR-58 P2+P3 (Batch 1): the resolved blueprint's typed facade, backing
+    /// the stage-kind resolutions in [`Self::role_in_kind_stage`] and the
+    /// stage-tag lookups (`execution_stage_tag` / `kind_stage_tag`). `None`
+    /// for coordinators built without a resolved blueprint (tests) — those
+    /// fall back to the canonical stage tags. ADR-58 amendment (2026-09-05):
+    /// the facade NEVER enforces blueprint staffing — the registry is the
+    /// roster.
     blueprint_facade: Option<BlueprintFacade>,
+    /// ADR-60 D7 (#152): structured plan state rehydrated from the whiteboard
+    /// for an approved-plan Execute run. Consumed once by the first
+    /// `decompose_task`: a seeded DesignDoc drives the planner directly and
+    /// the architect is NOT re-invoked on the same objective — re-deriving an
+    /// already-approved plan (silent re-decompose) is forbidden.
+    approved_plan_seed: Option<ApprovedPlanSeed>,
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): the logged-evidence
+    /// dispatch seed for a checkpointless `continue` run. Consumed once by
+    /// `decompose_or_restore` (only when no checkpoint governs the run);
+    /// decompose then schedules from the evidence chain instead of
+    /// re-entering design. See [`HeadlessResumeSeed`].
+    headless_resume_seed: Option<HeadlessResumeSeed>,
+    /// ADR-60 Deferred 3: session-DB pool backing review-cycle resumability
+    /// (`ReviewState` whiteboard snapshots written before every reviewer
+    /// invocation and read back on restart). `None` (the default) degrades
+    /// review cycles to pre-Phase 3 behavior — observable via a debug log at
+    /// cycle entry, never a run failure.
+    review_store: Option<sqlx::SqlitePool>,
+    /// Issue #61: the shared [`WriteGate`], when one is attached to the run,
+    /// for artifact-ownership mediation: settle-release of a task's
+    /// ownerships, coordinator-mediated transfers (validated
+    /// `TransferOwnership` decisions), external-modification stale marks,
+    /// and checkpoint-persisted ownership state. `None` (the default) means
+    /// the coordinator path deploys no gate — ownership is then inert (no
+    /// enforcement exists to mediate; plain-executor writes are unchanged).
+    write_gate: Option<std::sync::Arc<crate::gate::WriteGate>>,
+    /// ADR-65 §2 (Phase 2): the pre-planning workspace snapshot captured by
+    /// the readiness barrier, threaded through to agent dispatch so every
+    /// dispatched agent receives the snapshot digest in its context.
+    /// Never used to gate behavior in this phase — persistence/write gating is
+    /// load-bearing only with the Phase 5/6 evidence checks.
+    workspace_snapshot: Option<crate::workspace_snapshot::WorkspaceSnapshotRecord>,
+    /// ADR-65 §3: the run id (fresh per `execute_graph`, matching the
+    /// checkpoint scope) stamped into every dispatched agent's tool-evidence
+    /// facts, so a run's tool commands are attributable across task
+    /// boundaries. `None` only when no run has started yet.
+    run_id: Option<String>,
+    /// ADR-65 §7: where the DesignDoc claim last stood (verdict + real event
+    /// ids), captured into every checkpoint. Restored from the checkpoint on
+    /// a resume so the §7 fields keep round-tripping; refreshed by the
+    /// Phase-5 verifier on every planning run. (The §7 whiteboard cursor is
+    /// stamped by `persist_checkpoint` at persist time — the log head then —
+    /// and needs no stored field here.)
+    last_doc_resolution: Option<checkpoint::CheckpointDocResolution>,
+    /// ADR-65 §7: the last scheduler dispatch still awaiting completion —
+    /// recorded when a dispatch decision is appended, cleared when its
+    /// subtask settles, and captured into every checkpoint as the pending
+    /// decision a resume may continue behind.
+    last_dispatch_decision: Option<checkpoint::CheckpointPendingDecision>,
+    /// ADR-65 §7: the checkpoint row's own `updated_at` (unix ms), threaded
+    /// from the runtime runner for pre-§7 (v3) checkpoints only — the hint
+    /// the additive backfill uses to derive "the last log event before the
+    /// checkpoint's own append". `None` (no hint) is fail-soft: the cursor
+    /// stays unknown and the resume treats the whole log as pre-cursor.
+    resume_cursor_hint_ms: Option<i64>,
+    /// Issue #52: the decision journal — typed, validated strategy decisions
+    /// of this run's Coordinator decision loop, separate from the execution
+    /// accumulators (`DispatchLedger` / graph) and persisted additively so
+    /// decision state is inspectable independently of the execution state.
+    decision_journal: crate::decisions::DecisionJournal,
+    /// Issue #53: the coordinator progress tracker — per-cycle observable
+    /// fingerprints of the decision loop with bounded stall recovery.
+    /// Persisted/restored through checkpoints like the decision journal so
+    /// stall detection survives a resume; reset when a resume replans (a
+    /// superseded plan's stall history no longer applies).
+    progress_tracker: crate::progress::ProgressTracker,
+    /// Issue #54: the run's structured failure diagnoses — normalized at
+    /// each failure surface (dispatch settlement, specialist result
+    /// handling, tool self-execution), bounded, and persisted additively
+    /// so the diagnosis/evidence trail survives a resume.
+    failure_diagnoses: Vec<crate::failure_diagnosis::FailureDiagnosis>,
+    /// Issue #56: the compact structured world model — a deterministic
+    /// projection of the run's workspace facts, work, freshness (verified /
+    /// assumed / stale), unresolved questions, roster, artifact ownership,
+    /// risks, and the pending dispatch decision. Rebuilt at every refresh
+    /// point from existing state only (never a new store, never model
+    /// calls); the question ledger is the only carried progress and is
+    /// checkpointed additively so a resume restores the same model.
+    world_model: crate::world_model::WorldModel,
+    /// Issue #60: the suitability record — the bounded, decayed
+    /// dispatch-outcome history per (specialist id, task class) DERIVED
+    /// from the coordinator's own dispatch machinery (settled outcomes,
+    /// #54 diagnoses, retry/recovery turns, dispatch policy denials).
+    /// Scored ONLY as advisory ranking context for the Coordinator's
+    /// model — the model still decides; no cost/spend input exists.
+    /// Persisted additively through checkpoints.
+    suitability: crate::suitability::SuitabilityIndex,
+    /// Issue #56: whether the workspace changed materially between the
+    /// recorded checkpoint generation and the current snapshot generation
+    /// (computed once at restore time). While set, the world model marks
+    /// log-derived facts stale and answers no verified-clean queries.
+    workspace_changed_since_checkpoint: bool,
+    /// Issue #63: the in-flight WAIT record — set just before `execute_wait`
+    /// parks the decision loop, cleared when the wait settles. Captured into
+    /// every checkpoint (additive) so a crash mid-wait is resumable: a
+    /// resume re-evaluates the wait against the CURRENT world once and
+    /// reports the outcome (woken/expired/still-waiting) to the model —
+    /// never silently dropped, never re-entering the sleep loop.
+    active_wait: Option<crate::wait::WaitingRecord>,
+    /// Issue #65: the explicit external-workspace-change records detected
+    /// this run — from the live wait wake (`workspace-generation-changed`)
+    /// or the F3 resume reconciliation. Persisted additively in every
+    /// checkpoint so a resume keeps reconciling the SAME changes; surfaced
+    /// to the world model as decision risks.
+    external_changes: Vec<crate::external_change::ExternalChangeRecord>,
+    /// ADR-35 amendment (2026-09-16 §2): the reason the Coordinator requested
+    /// human input via the `request_user_input` tool. Set by the decision-loop
+    /// handler; the loop unwinds on it and `execute_graph` returns an
+    /// `AwaitingUser` output with this text as the final message and a
+    /// preserved checkpoint. `None` when no input was requested (the common
+    /// case); reset at the start of each `run` and never checkpointed — the
+    /// request either surfaces as the run's outcome or, on a later resume,
+    /// the Coordinator re-decides from the restored world.
+    requested_user_input: Option<String>,
+}
+
+/// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
+/// executing an approved plan. Produced by `plan_approval::load_approved_plan`
+/// and attached via [`CoordinatorAgent::with_approved_plan_seed`].
+#[derive(Debug, Clone, Default)]
+pub struct ApprovedPlanSeed {
+    /// The approved plan id (for logging/attribution).
+    pub plan_id: String,
+    /// Structured DesignDoc rehydrated from the `plan-approved` event.
+    /// `None` when the planning run produced only text — decompose then keeps
+    /// its normal design stage rather than inventing a document.
+    pub design_doc: Option<DesignDoc>,
+}
+
+/// ADR-60 D7 (interrupt-safe resume, 2026-09-05): a checkpointless
+/// `continue`/resume run's dispatch seed, built by the runtime runner from the
+/// session's logged evidence chain (the newest hash-verified `plan-approved`
+/// payload plus the session's logged researcher/coder gate events).
+///
+/// The coordinator consumes it in `decompose_or_restore` when no checkpoint
+/// row governs the run: instead of re-entering design (a fresh decompose —
+/// the observed F2 failure), the restored CONTEXT seeds the Coordinator's
+/// decision loop and it re-decides the next dispatch from the log's
+/// evidence. Every dispatch is recorded as a whiteboard `Decision` event
+/// citing REAL evidence ids (ADR-65 §7); an architect/researcher re-dispatch
+/// on this path is impossible without its own recorded, evidence-backed
+/// decision.
+#[derive(Debug, Clone)]
+pub struct HeadlessResumeSeed {
+    /// The approved plan's ORIGINAL objective hash (the `plan-approved`
+    /// payload's `objective_hash`) — the hash a later implicit resume matches
+    /// the original objective text against.
+    pub objective_hash: String,
+    /// The approved plan text — the artifact this resume continues; recorded
+    /// as the resumed run's checkpoint objective for provenance.
+    pub plan_text: String,
+    /// Structured DesignDoc carried by the `plan-approved` payload when the
+    /// planning run produced one. `None` for text-only plans: the approved
+    /// plan text governs (carried by the task description's run-continuity
+    /// section) and no contract paths bind.
+    pub design_doc: Option<DesignDoc>,
+    /// The REAL `plan-approved` whiteboard event id — the evidence the
+    /// recorded dispatch decisions cite and the Decision `causation` anchor.
+    pub plan_approved_event_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -605,6 +1320,125 @@ fn execution_stage_tag(facade: Option<&BlueprintFacade>) -> String {
         .and_then(|facade| facade.primary_execution_stage())
         .map(|stage| stage.def.tag.clone())
         .unwrap_or_else(|| AgentStage::IMPLEMENT.to_string())
+}
+
+/// ADR-65 §6: upper bound on the observation facts gathered per scheduler
+/// consultation, so heavy workspaces keep the evidence read bounded.
+const MAX_EVIDENCE_OBSERVATIONS: usize = 64;
+
+/// Map the Phase-5 verifier's verdict onto the checkpoint's §7 doc-resolution
+/// field: Active/Quarantined/Skipped + the REAL claim/decision event ids. A
+/// failed append yields no ids to cite — the ids stay `None` (never
+/// fabricated), but the resolution itself is still recorded.
+fn checkpoint_doc_resolution(
+    verdict: &Option<DesignDocVerdict>,
+    doc_event_ids: Option<&(String, String)>,
+) -> Option<checkpoint::CheckpointDocResolution> {
+    let evidence = doc_event_ids
+        .map(|(claim_id, decision_id)| (Some(claim_id.clone()), Some(decision_id.clone())))
+        .unwrap_or((None, None));
+    let (claim_event_id, verdict_event_id) = evidence;
+    let verdict = verdict.as_ref()?;
+    use crate::design_doc_verifier::DesignDocState;
+    Some(match verdict.state {
+        DesignDocState::Verified => checkpoint::CheckpointDocResolution::Active {
+            contract_paths: verdict.contract_paths.clone(),
+            claim_event_id,
+            verdict_event_id,
+        },
+        DesignDocState::Skipped => {
+            checkpoint::CheckpointDocResolution::Skipped { claim_event_id, verdict_event_id }
+        }
+        DesignDocState::Quarantined => {
+            checkpoint::CheckpointDocResolution::Quarantined {
+                reason_codes: verdict
+                    .reasons
+                    .iter()
+                    .filter_map(|reason| {
+                        // Kebab-case reason codes (mirrors the verifier's
+                        // wire form via serde rename).
+                        serde_json::to_value(reason.code)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                    })
+                    .collect(),
+                claim_event_id,
+                verdict_event_id,
+            }
+        }
+    })
+}
+
+/// ADR-65 §7: upper bound on the session log window a resume reads (newest
+/// events, anchored at the log head). Bounds the §7 evidence read; a session
+/// with a longer tail simply loses the earliest rows to the fail-soft
+/// degradation (the checkpoint ledger still carries the per-task outcomes).
+const RESUME_LOG_WINDOW: usize = 2000;
+
+/// The paths the run's OWN recorded writes explain (ADR-65 §7): the
+/// checkpoint's accumulated `all_files`, the completed results' reported
+/// `files_modified`, and — for the post-cursor tail — applied write paths
+/// and file-affecting tool paths (a read observation is NOT an own write: a
+/// stalled run's read of a path the user then edited IS an external change).
+/// Used to keep the F3 reconciliation honest: the run's own progress must
+/// never look like an external workspace change.
+fn own_write_paths(
+    checkpoint_all_files: &[camino::Utf8PathBuf],
+    completed_results: &HashMap<TaskId, AgentRunResult>,
+    post_cursor: &[WhiteboardEvent],
+    project_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let mut own = std::collections::HashSet::new();
+    let mut push = |raw: &str| {
+        if let Some(canonical) = crate::tool_facts::canonical_project_path(project_root, raw) {
+            own.insert(canonical);
+        }
+    };
+    for path in checkpoint_all_files {
+        push(path.as_str());
+    }
+    for result in completed_results.values() {
+        for path in &result.files_modified {
+            push(path.as_str());
+        }
+    }
+    for event in post_cursor {
+        match event.kind {
+            WhiteboardKind::WriteApplied => {
+                if let Some(path) = event
+                    .payload
+                    .get("input")
+                    .and_then(|input| input.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    push(path);
+                }
+            }
+            WhiteboardKind::ToolExecuted => {
+                let tool = event.payload.get("tool").and_then(serde_json::Value::as_str);
+                let args = event.payload.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                let file_affecting =
+                    tool.is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, &args));
+                if !(file_affecting
+                    && event.payload.get("success").and_then(serde_json::Value::as_bool)
+                        == Some(true))
+                {
+                    continue;
+                }
+                if let Some(paths) =
+                    event.payload.get("paths").and_then(serde_json::Value::as_array)
+                {
+                    for path in paths {
+                        if let Some(path) = path.get("path").and_then(serde_json::Value::as_str) {
+                            push(path);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    own
 }
 
 /// The tag of the first stage carrying the given known kind, resolved from
@@ -663,6 +1497,304 @@ fn sentinel_capabilities(persona: &FallbackPersonaDef, kind: StageKind) -> Agent
     }
 }
 
+/// ADR-60 Deferred 3: build one full-state [`ReviewStatePayload`] snapshot
+/// for the review cycle identified by `(plan_id, target_hash)`. Every
+/// snapshot carries the complete feedback ledger and counters so a resumed
+/// run needs exactly the newest row (oracle: full state, not minimal).
+#[allow(clippy::too_many_arguments)]
+fn review_snapshot(
+    plan_id: &str,
+    session_id: Ulid,
+    implement_role: &str,
+    review_target: &str,
+    target_hash: &str,
+    status: ReviewCycleStatus,
+    max_cycles: u32,
+    retry_count: u32,
+    ledger: &[ReviewFeedbackEntry],
+    gate_seq_cursor: u64,
+) -> ReviewStatePayload {
+    let now = time::OffsetDateTime::now_utc();
+    ReviewStatePayload {
+        plan_id: plan_id.to_owned(),
+        session_id: session_id.to_string(),
+        implement_role: implement_role.to_owned(),
+        review_target: review_target.to_owned(),
+        review_target_hash: target_hash.to_owned(),
+        status,
+        max_cycles,
+        retry_count,
+        feedback_ledger: ledger.to_vec(),
+        gate_seq_cursor,
+        created_at_ms: now.unix_timestamp() * 1000 + i64::from(now.millisecond()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADR-35 amendment (2026-09-05): Coordinator decision-loop support types
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One `call_specialist` tool call's parsed arguments.
+struct CallSpecialistArgs {
+    agent_id: String,
+    task: String,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+    /// Issue #52: optional model-supplied artifact paths. NEVER trusted:
+    /// they validate (lexically canonicalize inside the project root) at
+    /// decision-validation time before any materialization.
+    expected_artifacts: Vec<String>,
+}
+
+impl CallSpecialistArgs {
+    /// Parse the tool arguments. Malformed arguments (missing or non-string
+    /// `agent_id`/`task`) yield `None` — the caller answers with a
+    /// structured tool error, never a crash.
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let agent_id = arguments.get("agent_id").and_then(serde_json::Value::as_str)?;
+        let task = arguments.get("task").and_then(serde_json::Value::as_str)?;
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        let expected_artifacts = parse_string_array(arguments, "expected_artifacts");
+        Some(Self {
+            agent_id: agent_id.to_owned(),
+            task: task.to_owned(),
+            notes: notes.map(str::to_owned),
+            supporting_evidence_ids,
+            expected_artifacts,
+        })
+    }
+}
+
+/// Issue #57: `split_task` tool arguments.
+struct SplitTaskArgs {
+    task_id: String,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+    children: Vec<SplitChildArgs>,
+}
+
+struct SplitChildArgs {
+    description: String,
+    expected_artifacts: Vec<String>,
+    after: Vec<usize>,
+}
+
+impl SplitTaskArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let task_id = arguments.get("task_id").and_then(serde_json::Value::as_str)?;
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        let children = arguments.get("children").and_then(serde_json::Value::as_array)?;
+        let children = children
+            .iter()
+            .filter_map(|child| {
+                let description = child.get("description").and_then(serde_json::Value::as_str)?;
+                let expected_artifacts = parse_string_array(child, "expected_artifacts");
+                let after = child
+                    .get("after")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values.iter().filter_map(serde_json::Value::as_u64).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| usize::try_from(value).ok())
+                    .collect();
+                Some(SplitChildArgs {
+                    description: description.to_owned(),
+                    expected_artifacts,
+                    after,
+                })
+            })
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            return None;
+        }
+        Some(Self {
+            task_id: task_id.to_owned(),
+            notes: notes.map(str::to_owned),
+            supporting_evidence_ids,
+            children,
+        })
+    }
+}
+
+/// Issue #57: `merge_tasks` tool arguments.
+struct MergeTaskArgs {
+    task_ids: Vec<String>,
+    merged_description: String,
+    merged_artifacts: Vec<String>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl MergeTaskArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let task_ids = parse_string_array(arguments, "task_ids");
+        let merged_description =
+            arguments.get("merged_description").and_then(serde_json::Value::as_str)?;
+        Some(Self {
+            task_ids,
+            merged_description: merged_description.to_owned(),
+            merged_artifacts: parse_string_array(arguments, "merged_artifacts"),
+            notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
+            supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
+        })
+    }
+}
+
+/// Issue #64: `reconsider` tool arguments — the superseded decision id,
+/// the reason (rides the decision's task text), the pending task ids to
+/// freeze, optional notes, and supporting evidence.
+struct ReconsiderArgs {
+    decision_id: String,
+    reason: String,
+    affected_task_ids: Vec<String>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl ReconsiderArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let decision_id = arguments.get("decision_id").and_then(serde_json::Value::as_str)?;
+        let reason = arguments.get("reason").and_then(serde_json::Value::as_str)?;
+        let affected_task_ids = parse_string_array(arguments, "affected_task_ids");
+        if affected_task_ids.is_empty() {
+            return None;
+        }
+        Some(Self {
+            decision_id: decision_id.to_owned(),
+            reason: reason.to_owned(),
+            affected_task_ids,
+            notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
+            supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
+        })
+    }
+}
+
+/// Read an optional JSON array-of-strings field, dropping non-string
+/// entries (absent/non-array ⇒ empty). `pub(crate)`: the consultation
+/// machinery (issue #59) parses its evidence list with the same shape.
+pub(crate) fn parse_string_array(arguments: &serde_json::Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Mutable working state of one Coordinator decision session: the current
+/// DesignDoc claim, its verifier verdict (ADR-65 §5), and the last
+/// dispatched node (the chain parent of the next `call_specialist`).
+struct DispatchSessionState {
+    doc: Option<DesignDoc>,
+    doc_verdict: Option<DesignDocVerdict>,
+    last_node: Option<TaskId>,
+}
+
+/// The binding DesignDoc for expected-artifact derivation: a Verified doc
+/// binds; a seeded/approved doc (no verdict — the approval IS the evidence,
+/// ADR-60 D7) binds unconditionally; anything else binds nothing.
+fn binding_doc(state: &DispatchSessionState) -> Option<DesignDoc> {
+    match (&state.doc_verdict, state.doc.as_ref()) {
+        (Some(verdict), Some(doc)) => verdict.state.is_active().then(|| doc.clone()),
+        (Some(_), None) => None,
+        (None, other) => other.cloned(),
+    }
+}
+
+/// The dispatched specialist's task description: the Coordinator's task text
+/// plus its optional notes.
+fn specialist_task_description(task: &str, notes: Option<&str>) -> String {
+    match notes {
+        Some(notes) => format!("{task}\n\nCoordinator notes: {notes}"),
+        None => task.to_owned(),
+    }
+}
+
+/// Issue #60: the observed dispatch spend in thousandths of a dollar —
+/// recorded for ledger-interpretation parity ONLY. This value is stored
+/// on the suitability observation and NEVER reaches the score (pinned by
+/// `crates/orchestrator/src/suitability.rs::tests::
+/// spend_does_not_change_ranking`).
+fn settled_cost_milli(result: &AgentRunResult) -> u64 {
+    if result.cost_usd.is_finite() {
+        (result.cost_usd.max(0.0) * 1_000.0).round() as u64
+    } else {
+        0
+    }
+}
+
+/// A short machine label for an agent outcome (the `call_specialist` tool
+/// result the Coordinator's model reads).
+fn outcome_label(outcome: &AgentOutcome) -> &'static str {
+    match outcome {
+        AgentOutcome::Success => "success",
+        AgentOutcome::Failed { .. } => "failed",
+        AgentOutcome::Blocked { .. } => "blocked",
+        AgentOutcome::NeedsRevision { .. } => "needs_revision",
+        _ => "unknown",
+    }
+}
+
+/// Render a config `AgentCapabilities` as a compact readable list for the
+/// roster (declared metadata, not enforcement).
+fn render_agent_capabilities(caps: &concerto_config::AgentCapabilities) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if caps.fs_read.unwrap_or(false) {
+        parts.push("fs_read".to_owned());
+    }
+    if caps.fs_write.unwrap_or(false) {
+        parts.push("fs_write".to_owned());
+    }
+    if caps.shell.unwrap_or(false) {
+        parts.push("shell".to_owned());
+    }
+    if caps.git.unwrap_or(false) {
+        parts.push("git".to_owned());
+    }
+    if caps.lsp.unwrap_or(false) {
+        parts.push("lsp".to_owned());
+    }
+    if caps.eval.unwrap_or(false) {
+        parts.push("eval".to_owned());
+    }
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Render an `OutputMode` in its serialized snake_case form for the roster.
+fn render_output_mode(mode: concerto_core::types::OutputMode) -> &'static str {
+    match mode {
+        concerto_core::types::OutputMode::Freeform => "freeform",
+        concerto_core::types::OutputMode::DesignDoc => "design_doc",
+        concerto_core::types::OutputMode::ResearchReport => "research_report",
+        concerto_core::types::OutputMode::ReviewReport => "review_report",
+    }
+}
+
+/// Bound a text to `limit` characters with an ellipsis marker.
+fn bounded_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        text.to_owned()
+    } else {
+        let mut bounded: String = text.chars().take(limit).collect();
+        bounded.push('…');
+        bounded
+    }
+}
+
+/// Whether the shared executor offers `tool_name` (for the coordinator's
+/// ADR-35 §8 self-execution toolset).
+fn tool_executor_offers(executor: Option<&ToolExecutor>, tool_name: &str) -> bool {
+    executor.is_some_and(|executor| {
+        executor.tool_definitions().iter().any(|definition| definition.name == tool_name)
+    })
+}
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -706,6 +1838,7 @@ impl CoordinatorAgent {
             default_provider_config_id: None,
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
             skills_section: String::new(),
+            environment_card: String::new(),
             max_total_iterations: None,
             model_dispatch_count: 0,
             plans: None,
@@ -713,10 +1846,343 @@ impl CoordinatorAgent {
             last_plan_id: None,
             settled_metrics: Vec::new(),
             tool_executor: None,
+            policy: None,
             supplemental_prompt: String::new(),
             eval_engine: None,
             blueprint_facade: None,
+            approved_plan_seed: None,
+            headless_resume_seed: None,
+            review_store: None,
+            write_gate: None,
+            workspace_snapshot: None,
+            run_id: None,
+            last_doc_resolution: None,
+            last_dispatch_decision: None,
+            resume_cursor_hint_ms: None,
+            // Issue #52: decision state starts empty and grows only through
+            // validated decisions; execution state never writes here.
+            decision_journal: crate::decisions::DecisionJournal::default(),
+            // Issue #53: stall-detection state starts empty and grows one
+            // fingerprint per completed decision-loop cycle.
+            progress_tracker: crate::progress::ProgressTracker::new(),
+            // Issue #54: the failure-diagnosis history starts empty and
+            // grows one entry per diagnosed failure surface.
+            failure_diagnoses: Vec::new(),
+            // Issue #56: the coordinator's compact world-model projection
+            // (rebuilt at every refresh point; the question ledger is the
+            // only carried progress). Starts empty; a resume restores it
+            // from the checkpoint's additive field, or an old checkpoint
+            // defaults it and the next decision session rebuilds it.
+            world_model: crate::world_model::WorldModel::default(),
+            // Issue #60: the suitability record starts empty and grows
+            // only through the coordinator's OWN dispatch settlements
+            // (derived evidence); a resume restores it from the
+            // checkpoint's additive field.
+            suitability: crate::suitability::SuitabilityIndex::default(),
+            // Issue #56: whether the workspace changed materially between
+            // the checkpoint and this resume (the F3 generation verdict);
+            // the world-model builder consumes it for the V-CHANGE rule.
+            workspace_changed_since_checkpoint: false,
+            // Issue #63: no wait is parked at startup; the field is set only
+            // by the WAIT handler (and restored from checkpoints on resume).
+            active_wait: None,
+            // Issue #65: no external changes are recorded at startup; the
+            // field grows only through detection (live wait scan + F3
+            // resume reconciliation) and is restored from checkpoints.
+            external_changes: Vec::new(),
+            // ADR-35 amendment (2026-09-16 §2): no pending human-input
+            // request at startup; set only by the request_user_input tool
+            // in the decision loop.
+            requested_user_input: None,
         }
+    }
+
+    /// ADR-65 §7: thread the checkpoint row's own `updated_at` (unix ms) in
+    /// as the backfill hint for pre-§7 (v3) checkpoints. Only the additive
+    /// v4 backfill consumes it; present v4 fields are never overwritten.
+    pub fn with_resume_cursor_hint_ms(mut self, hint_ms: Option<i64>) -> Self {
+        self.resume_cursor_hint_ms = hint_ms;
+        self
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #52: decision validation helpers — every model-proposed
+    // decision is validated deterministically against the roster, the real
+    // whiteboard evidence, and the project root BEFORE any state mutation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Which of the cited evidence ids do NOT exist as whiteboard rows. The
+    /// ADR-65 acceptance-8 check, run at DECISION time (dispatch validation),
+    /// not only inside the append transaction. Bounded: one tiny indexed
+    /// lookup per cited id; cancellation observed up front.
+    async fn missing_evidence_ids(
+        &self,
+        cited: &[String],
+        cancel: &CancellationToken,
+    ) -> Vec<String> {
+        if cited.is_empty() || cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let Some(pool) = self.review_store.as_ref() else {
+            // No log pool: no evidence can be verified against anything.
+            return cited.to_vec();
+        };
+        let mut missing = Vec::new();
+        for id in cited {
+            let known: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM whiteboard_events WHERE event_id = ?")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if known.is_none() {
+                missing.push(id.clone());
+            }
+        }
+        missing
+    }
+
+    /// Build a validator for one decision: the registry's registered ids are
+    /// the roster, `known_event_ids` (REAL log rows) are the only citable
+    /// evidence, and `project_root` bounds artifact canonicalization.
+    fn decision_roster(&self) -> HashSet<String> {
+        self.registry.ids().into_iter().map(|id| id.as_str().to_owned()).collect()
+    }
+
+    /// The decision time's advisory the coordinator's decision machinery
+    /// derives from the world model (issue #56). A real consumed query — the
+    /// skip-recommendation for completed-verified work: `Some` ONLY when the
+    /// decision names expected artifacts and EVERY one is verified-clean in
+    /// the projection as of decision time.
+    fn world_model_decision_advisory(
+        &self,
+        expected_artifacts: &[String],
+    ) -> Option<serde_json::Value> {
+        if expected_artifacts.is_empty() {
+            return None;
+        }
+        let verified = self.world_model.verified_clean_artifacts(expected_artifacts);
+        if verified.len() != expected_artifacts.len() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "verified_clean": verified,
+            "advisory": format!(
+                "all expected artifacts are verified clean in the world model as of \
+        decision time ({}); consider whether the work is already complete before \
+        re-producing them",
+                verified.join(", ")
+            ),
+        }))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #56: the coordinator world model — a bounded, structured
+    // projection rebuilt from existing state (whiteboard facts, resource
+    // rows, decision journal, diagnoses, roster, generation signals). The
+    // builder is pure; this refresh only adapts the I/O the coordinator
+    // already performs.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The bounded event window the builder reads (newest anchored).
+    const WORLD_MODEL_EVENT_WINDOW: usize = 256;
+    /// The observation-row read bound per refresh.
+    const WORLD_MODEL_OBSERVATION_ROWS: usize = 64;
+
+    /// Rebuild `self.world_model` from the current state (Issue #56).
+    ///
+    /// All inputs are existing signals: the bounded whiteboard event window
+    /// (ADR-65 evidence spine), the bounded resource-fact rows (ADR-65 §4),
+    /// the decision journal (issue #52), the failure diagnoses (issue #54),
+    /// the roster, the ledger's artifact paths/models where supplied, the
+    /// DesignDoc goals, the workspace snapshot generation, and the resume
+    /// workspace-change verdict. Fail-soft: a log or row read failure
+    /// degrades that axis to empty — a projection must never fail the
+    /// dispatch loop. Cancellation is honored (the reads carry the token).
+    async fn refresh_world_model(
+        &mut self,
+        task: &AgentTask,
+        ledger_paths: &[camino::Utf8PathBuf],
+        models: Vec<String>,
+        cancel: &CancellationToken,
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let events = self.load_world_model_events(task.session_id, cancel).await;
+        let mut artifacts = self.load_world_model_observations(&events, cancel).await;
+        // Ledger paths: write attribution only (no observation row) — the
+        // builder classifies them `Written` with the ledger's owner slot
+        // unknown.
+        for path in ledger_paths {
+            artifacts.push(crate::world_model::ArtifactObservation {
+                path: path.to_string(),
+                observed: false,
+                dirty: false,
+                generation: None,
+                last_agent_id: None,
+                last_event_id: None,
+            });
+        }
+
+        let roster = self.decision_roster().into_iter().collect::<Vec<String>>();
+        let criteria: Vec<String> =
+            self.design_doc_snapshot().map(|doc| doc.goals.to_vec()).unwrap_or_default();
+        // The pending decision's staleness: the same roster/evidence shape
+        // the ADR-65 §7 resume check uses (deterministic, no new machinery).
+        let pending_stale = match self.last_dispatch_decision.as_ref() {
+            Some(pending) => {
+                let missing =
+                    self.missing_evidence_ids(&pending.supporting_evidence_ids, cancel).await;
+                !missing.is_empty()
+                    || (!pending.selected_agent.is_empty()
+                        && !roster.contains(&pending.selected_agent))
+            }
+            None => false,
+        };
+        let pending = self.last_dispatch_decision.clone();
+        let previous_questions = self.world_model.questions.clone();
+        let now_ms = crate::tool_facts::unix_ms();
+        self.world_model =
+            crate::world_model::WorldModel::build(&crate::world_model::WorldModelInput {
+                objective: &task.description,
+                criteria,
+                current_generation: self.snapshot_generation(),
+                workspace_changed: self.workspace_changed_since_checkpoint,
+                events: &events,
+                artifacts,
+                decisions: self.decision_journal.entries(),
+                diagnoses: &self.failure_diagnoses,
+                roster,
+                models,
+                pending: pending.as_ref(),
+                pending_stale,
+                previous_questions,
+                external_changes: &self.external_changes,
+                now_ms,
+            });
+        tracing::debug!(
+            target: "orchestrator::coordinator",
+            facts = self.world_model.facts.len(),
+            questions = self.world_model.open_question_count(),
+            "world model rebuilt (issue #56 projection)"
+        );
+    }
+
+    /// The bounded newest event window for the world-model builder.
+    /// Fail-soft: no pool or a read failure yields an empty window.
+    async fn load_world_model_events(
+        &self,
+        session_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Vec<WhiteboardEvent> {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let Some(pool) = self.review_store.as_ref() else {
+            return Vec::new();
+        };
+        let head = match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
+            Ok(head) => head,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "issue #56: world-model event read failed (head); \
+                         the projection builds without events this refresh");
+                }
+                return Vec::new();
+            }
+        };
+        let after = head.saturating_sub(Self::WORLD_MODEL_EVENT_WINDOW as u64);
+        match load_whiteboard_events(
+            pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: after,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: Self::WORLD_MODEL_EVENT_WINDOW,
+            },
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "issue #56: world-model event read failed (fail-soft)");
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Adapt the session's resource-fact rows into the builder's observation
+    /// shape, scoped to this project root exactly as the snapshot digest
+    /// machinery reconciles them (ADR-65 §4 F5c). Fail-soft: a read failure
+    /// yields an empty row list.
+    async fn load_world_model_observations(
+        &self,
+        events: &[WhiteboardEvent],
+        cancel: &CancellationToken,
+    ) -> Vec<crate::world_model::ArtifactObservation> {
+        let _ = events;
+        let (Some(pool), Some(snapshot)) =
+            (self.review_store.as_ref(), self.workspace_snapshot.as_ref())
+        else {
+            return Vec::new();
+        };
+        let root_hash = crate::tool_facts::project_root_hash(snapshot.project_root.as_std_path());
+        let rows = match ResourceFacts::new(pool.clone())
+            .list_observations(&root_hash, Self::WORLD_MODEL_OBSERVATION_ROWS, cancel)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "issue #56: world-model observation read failed (fail-soft)");
+                }
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .map(|row| crate::world_model::ArtifactObservation {
+                path: row.path,
+                observed: true,
+                dirty: row.dirty,
+                generation: (!row.generation.is_empty()).then_some(row.generation),
+                last_agent_id: row.last_agent_id,
+                last_event_id: row.last_event_id,
+            })
+            .collect()
+    }
+
+    /// Journal one no-target side decision (`DraftPlan`/`SelfExecute`, issue
+    /// #52: ADR-35 §8/§2 surfaces whose structure is fixed by the machine —
+    /// no ids, no model-controlled fields). Returns the recorded id.
+    fn record_side_decision(
+        &mut self,
+        kind: crate::decisions::DecisionKind,
+        description: &str,
+    ) -> String {
+        let decision = crate::decisions::CoordinatorDecision {
+            id: concerto_core::ids::new_id().to_string(),
+            kind,
+            target_agent: None,
+            task_description: description
+                .chars()
+                .take(crate::decisions::MAX_DECISION_TASK_CHARS)
+                .collect(),
+            notes: None,
+            supporting_evidence_ids: Vec::new(),
+            expected_artifacts: Vec::new(),
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            status: crate::decisions::DecisionStatus::Validated,
+        };
+        let id = decision.id.clone();
+        self.decision_journal.record(decision);
+        id
     }
 
     /// Attach the ADR-45 tier-1b fallback target: the run's default provider
@@ -757,6 +2223,15 @@ impl CoordinatorAgent {
         self
     }
 
+    /// ADR-35 amendment (2026-09-05): attach the run's policy engine. Every
+    /// `call_specialist` decision is evaluated through it exactly like any
+    /// tool call — the same engine the shared executor enforces, never
+    /// bypassed. `None` (unwired) fails dispatches closed.
+    pub fn with_policy_engine(mut self, policy: Arc<dyn PolicyEngine>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     /// ADR-35 §5, Phase 5 C-06 amendment: attach the coordinator's eval
     /// engine, enabling coordinator self-verification when no
     /// validation-stage agent is registered. Without it, a pipeline with no
@@ -768,10 +2243,13 @@ impl CoordinatorAgent {
     }
 
     /// ADR-58 P2+P3 (Batch 1): attach the resolved blueprint's typed facade,
-    /// backing the sequencing guards in [`Self::stage_of`] and
-    /// [`Self::first_agent_for_stage`]. Pass `None` (or omit the call) for
-    /// coordinators built without a resolved blueprint — the guards stay
-    /// silent.
+    /// backing the stage-kind resolutions (`role_in_kind_stage`,
+    /// `execution_stage_tag`, `kind_stage_tag`). Pass `None` (or omit the
+    /// call) for coordinators built without a resolved blueprint — canonical
+    /// stage tags apply.
+    ///
+    /// ADR-58 amendment (2026-09-05): the facade never enforces blueprint
+    /// staffing or dispatch order — the registry is the roster.
     ///
     /// ADR-58 P2+P3 (Batch 3a): the facade is also propagated to the cycle
     /// state so Rule B keys on the gate being executed (R11) and drives the
@@ -790,13 +2268,6 @@ impl CoordinatorAgent {
     pub fn with_supplemental_prompt(mut self, prompt: String) -> Self {
         self.supplemental_prompt = prompt;
         self
-    }
-
-    /// ADR-35 §8, trigger 1 (stage absence): whether the coordinator can carry
-    /// an unstaffed lifecycle stage itself. Requires the shared executor; the
-    /// planning provider is always present.
-    fn self_execute_available(&self) -> bool {
-        self.tool_executor.is_some()
     }
 
     /// Build the coordinator's self-implement persona (ADR-35 §8): a
@@ -836,6 +2307,12 @@ impl CoordinatorAgent {
             sentinel_capabilities(persona, StageKind::Execution),
         )
         .with_skills_section(&self.skills_section)
+        .with_environment_card(&self.environment_card)
+        // ADR-65 §3: evidence attribution for the coordinator's own tool
+        // commands when it self-implements (no registration-time pool).
+        .with_tool_facts(self.review_store.clone().map(|pool| {
+            crate::tool_facts::ToolFactContext::new(Some(pool), "coordinator".to_string())
+        }))
     }
 
     /// ADR-58 P2+P3 (§3/R4): the unstaffed-`Execution` fallback persona — the
@@ -1024,6 +2501,15 @@ impl CoordinatorAgent {
             Err(error) => {
                 let error_string = error.to_string();
                 let cancelled = is_cancellation_error(&error) || cancel.is_cancelled();
+                // Issue #61: the subtask has settled (failed / cancelled) —
+                // its ownerships release (evented) so the artifacts go back
+                // on the table before the next dispatch decision.
+                let settle_reason = if cancelled {
+                    "subtask settled: cancelled"
+                } else {
+                    "subtask settled: failed"
+                };
+                self.settle_release_task_ownership(&subtask.role, settle_reason).await;
                 let _ = self.bus.publish_for_session(
                     subtask.session_id,
                     correlation_id,
@@ -1144,10 +2630,412 @@ impl CoordinatorAgent {
         self.last_plan_id.as_deref()
     }
 
+    /// ADR-60 D7 (#152): seed an approved-plan Execute with the structured
+    /// state rehydrated from the whiteboard. When the seed carries a
+    /// DesignDoc, `decompose_task` skips the architect entirely — the
+    /// approved plan governs and is never re-derived (silent re-decompose is
+    /// forbidden). Unseeded runs (the default) are byte-identical to pre-D7.
+    pub fn with_approved_plan_seed(mut self, seed: ApprovedPlanSeed) -> Self {
+        self.approved_plan_seed = Some(seed);
+        self
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): attach the logged
+    /// evidence-chain dispatch seed for a checkpointless `continue` run. When
+    /// no checkpoint governs the run, `decompose_or_restore` schedules the
+    /// next dispatch from the session's evidence (verified design + recorded
+    /// research facts ⇒ the coder) instead of re-entering design, and records
+    /// every dispatch as an evidence-backed whiteboard `Decision` event
+    /// (ADR-65 §7). Unseeded runs (the default) are byte-identical to
+    /// pre-amendment behavior.
+    pub fn with_headless_resume_seed(mut self, seed: HeadlessResumeSeed) -> Self {
+        self.headless_resume_seed = Some(seed);
+        self
+    }
+
+    /// ADR-60 Deferred 3: attach the whiteboard pool that makes review cycles
+    /// resumable. With a store AND an approved-plan seed attached, every
+    /// review cycle persists full-state snapshots (feedback ledger + retry
+    /// counters + gate-seq cursor) BEFORE invoking the reviewer, and an entry
+    /// after a restart resumes the crashed cycle instead of duplicating it.
+    /// `None` (the default) keeps pre-Phase 3 behavior with a degradation log.
+    pub fn with_review_store(mut self, pool: Option<sqlx::SqlitePool>) -> Self {
+        self.review_store = pool;
+        self
+    }
+
+    /// Issue #61: attach the shared [`WriteGate`] for ownership mediation
+    /// (settle-release, coordinator-mediated transfers, external-modification
+    /// stale marks, checkpoint persistence). `None` leaves ownership inert.
+    pub fn with_write_gate(mut self, gate: Option<std::sync::Arc<crate::gate::WriteGate>>) -> Self {
+        self.write_gate = gate;
+        self
+    }
+
+    /// Issue #61: restore the ownership table from a checkpoint projection
+    /// (resume path). Fail-soft: without an attached gate the state keeps
+    /// living on the checkpoint alone (additively re-persisted next save).
+    pub fn restore_ownership_state(&self, state: &crate::ownership::OwnershipState) {
+        if let Some(gate) = self.write_gate.as_ref() {
+            gate.restore_ownership_state(state);
+        }
+    }
+
+    /// Issue #61: the ownership records to persist additively in every
+    /// checkpoint (empty when no gate is attached).
+    #[must_use]
+    pub fn ownership_state(&self) -> crate::ownership::OwnershipState {
+        crate::ownership::OwnershipState {
+            records: self
+                .write_gate
+                .as_ref()
+                .map(|gate| gate.ownership_records())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Issue #61: release the ownerships an agent's settled subtask held
+    /// (completed / failed / cancelled). Fail-soft: without a gate or with a
+    /// release failure this is logged, never a run failure.
+    async fn settle_release_task_ownership(&self, role: &AgentId, reason: &str) {
+        let Some(gate) = self.write_gate.as_ref() else { return };
+        if let Err(error) = gate.release_agent(role.as_str(), reason).await {
+            tracing::debug!(role = %role, %error, "settle ownership release failed (fail-soft)");
+        }
+    }
+
+    /// ADR-65 §2 (Phase 2): attach the pre-planning workspace snapshot so its
+    /// digest rides into every dispatched agent's context. Purely additive in
+    /// this phase — the snapshot is never used to gate behavior here.
+    pub fn with_workspace_snapshot(
+        mut self,
+        snapshot: crate::workspace_snapshot::WorkspaceSnapshotRecord,
+    ) -> Self {
+        self.workspace_snapshot = Some(snapshot);
+        self
+    }
+
+    /// The pre-planning snapshot digest for context injection; `None` when the
+    /// readiness barrier produced no snapshot (readability or fail-soft).
+    ///
+    /// ADR-65 §4: augmented with a compact per-observation **action digest** —
+    /// the newest [`MAX_OBSERVATION_DIGEST_LINES`] observed paths from the
+    /// derived `resource_facts` store, queried fresh on every dispatch so the
+    /// agent sees what changed since planning rather than a stale snapshot.
+    /// Fail-soft: an absent pool or a store error degrades to the bare
+    /// snapshot digest with a warning, never a dispatch failure.
+    async fn snapshot_digest(&self, cancel: &CancellationToken) -> Option<String> {
+        let snapshot = self.workspace_snapshot.as_ref()?;
+        let base = snapshot.digest();
+        let Some(pool) = &self.review_store else {
+            return Some(base);
+        };
+        // ADR-65 F5c: observations live in the snapshot's own project-root
+        // scope — rows from other roots (or legacy "") must not leak into the
+        // digest's claim about THIS workspace.
+        let root_hash = crate::tool_facts::project_root_hash(snapshot.project_root.as_std_path());
+        // The observations are BORROWED + locally refreshed below so the digest
+        // stays derived-truth; never persisted mutation of the source of truth.
+        let mut observations = match ResourceFacts::new(pool.clone())
+            .list_observations(&root_hash, MAX_OBSERVATION_DIGEST_LINES, cancel)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(%err, "action digest: observation list unavailable; falling back to the snapshot digest only");
+                return Some(base);
+            }
+        };
+        if observations.is_empty() {
+            return Some(base);
+        }
+        // ADR-65 F3: reconcile freshness NOW. A row whose current stat (size,
+        // mtime) diverges from the observation — or whose file vanished — is
+        // folded DIRTY so the action digest never claims an unchanged state the
+        // disk no longer matches. The re-dirty is also persisted best-effort so
+        // the derived store and the digest agree from here on.
+        let store = ResourceFacts::new(pool.clone());
+        for row in &mut observations {
+            let fresh = std::fs::metadata(snapshot.project_root.join(&row.path))
+                .ok()
+                .filter(|meta| {
+                    row.size_bytes.unwrap_or(0) == meta.len()
+                        && row.mtime_ms == crate::tool_facts::mtime_ms(meta)
+                })
+                .is_some();
+            if fresh {
+                continue;
+            }
+            row.dirty = true;
+            if let Err(err) = store.mark_dirty(&root_hash, &row.path, cancel).await {
+                warn!(
+                    %err,
+                    path = %row.path,
+                    "action digest: freshness mark_dirty failed; digest still shows the row as dirty"
+                );
+            }
+        }
+        let mut digest = String::from(&base);
+        digest.push('\n');
+        digest.push_str(&format_action_digest(&observations));
+        Some(digest)
+    }
+
+    /// The pre-planning workspace generation id (ADR-65) for evidence
+    /// attribution; `None` when no snapshot was captured.
+    fn snapshot_generation(&self) -> Option<String> {
+        self.workspace_snapshot.as_ref().map(|snapshot| snapshot.generation.clone())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #65: live external-workspace-change detection.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Captures the CURRENT workspace inventory plus its content-addressed
+    /// generation, off the decision-loop thread (the walk is blocking I/O).
+    /// `None` on cancellation or when no snapshot was captured — the caller
+    /// degrades fail-soft.
+    async fn capture_fresh_workspace(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Option<(String, Vec<concerto_sessions::SnapshotEntry>)> {
+        let snapshot = self.workspace_snapshot.as_ref()?;
+        let root = snapshot.project_root.clone();
+        let capture_cancel = cancel.clone();
+        let entries: Vec<concerto_sessions::SnapshotEntry> =
+            tokio::task::spawn_blocking(move || {
+                crate::workspace_snapshot::capture_workspace_snapshot(
+                    root.as_std_path(),
+                    &capture_cancel,
+                )
+            })
+            .await
+            .ok()?;
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let generation = crate::workspace_snapshot::generation_for(&entries);
+        Some((generation, entries))
+    }
+
+    /// The fresh-generation half of [`Self::capture_fresh_workspace`] — the
+    /// only half `wake_view_for` needs for a live `workspace-generation`
+    /// condition.
+    async fn capture_fresh_generation(&self, cancel: &CancellationToken) -> Option<String> {
+        self.capture_fresh_workspace(cancel).await.map(|(generation, _)| generation)
+    }
+
+    /// Canonical workspace-relative set of every path named as a planned or
+    /// expected artifact — the conflict half of an external-change record
+    /// (a change hitting a path this run has decided to produce is a conflict
+    /// the Coordinator must reconcile before it can rely on that artifact).
+    fn expected_artifact_paths(&self) -> std::collections::HashSet<String> {
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let Some(root) =
+            self.workspace_snapshot.as_ref().map(|snapshot| snapshot.project_root.as_std_path())
+        else {
+            return expected;
+        };
+        for paths in self.expected_artifacts_snapshot().values() {
+            for path in paths {
+                if let Some(canonical) =
+                    crate::tool_facts::canonical_project_path(root, path.as_str())
+                {
+                    expected.insert(canonical);
+                }
+            }
+        }
+        expected
+    }
+
+    /// Issue #65 (live scan): diff the CURRENT workspace against the run-
+    /// start snapshot and classify every changed path the run's OWN writes
+    /// do not explain into one explicit [`ExternalChangeRecord`] per path.
+    ///
+    /// - `own_written`: canonical paths the run itself wrote (the live
+    ///   ledger's `all_files` plus every completed result's `files_modified`)
+    ///   — never classified external (mirrors the F3 exclusion).
+    /// - `expected`: canonical planned/expected artifact paths — a change
+    ///   there is a conflict.
+    ///
+    /// The write-gate ownership table is consulted FIRST: a held path that
+    /// changed externally is flagged with its owner and marked stale, so the
+    /// model must re-read/preserve/escalate before the next write. Fail-soft:
+    /// no snapshot or a cancelled capture yields no records (a wait only
+    /// re-evaluates after a fresh capture succeeded).
+    async fn scan_external_changes(
+        &self,
+        graph: &TaskGraph,
+        own_written: &std::collections::HashSet<String>,
+        expected: &std::collections::HashSet<String>,
+        cancel: &CancellationToken,
+    ) -> Vec<crate::external_change::ExternalChangeRecord> {
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let Some((current_generation, captured)) = self.capture_fresh_workspace(cancel).await
+        else {
+            return Vec::new();
+        };
+        let changed = crate::external_change::diff_workspace_entries(&snapshot.entries, &captured);
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let root = snapshot.project_root.as_std_path();
+        let previous_generation = snapshot.generation.clone();
+        let detected_at_ms = crate::tool_facts::unix_ms();
+        let gate = self.write_gate.as_ref();
+        let mut records: Vec<crate::external_change::ExternalChangeRecord> = Vec::new();
+        for path in &changed {
+            let Some(canonical) = crate::tool_facts::canonical_project_path(root, path) else {
+                continue;
+            };
+            if own_written.contains(&canonical) {
+                // The run's own writes explain this path — not external.
+                continue;
+            }
+            // Ownership table first: a held path that changed is an external
+            // change CONFLICTING with in-flight work (the holder re-reads or
+            // transfers before relying on it).
+            let known_owner = gate.and_then(|gate| gate.ownership_owner(&canonical));
+            let known_task = known_owner.as_deref().and_then(|owner| {
+                graph
+                    .all_tasks()
+                    .into_iter()
+                    .find(|task| task.role.as_str() == owner)
+                    .map(|task| task.id.to_string())
+            });
+            if known_owner.is_some() {
+                if let Some(gate) = gate {
+                    if let Err(error) =
+                        gate.mark_artifact_stale(&canonical, "external-change-scan").await
+                    {
+                        warn!(
+                            %error,
+                            path = %canonical,
+                            "external change scan: stale mark failed; the record still surfaces \
+                             the change"
+                        );
+                    }
+                }
+            }
+            let conflicts = known_owner.is_some() || expected.contains(&canonical);
+            records.push(crate::external_change::ExternalChangeRecord::new(
+                vec![canonical],
+                Some(previous_generation.clone()),
+                Some(current_generation.clone()),
+                known_owner,
+                known_task,
+                conflicts,
+                detected_at_ms,
+            ));
+        }
+        records.sort_by(|a, b| a.first_path().cmp(&b.first_path()));
+        records
+    }
+
+    /// Upserts one record: an existing record for the same path AND previous
+    /// generation is replaced (a re-detection of the same change), otherwise
+    /// the record is appended. The list is bounded to the newest
+    /// [`MAX_EXTERNAL_CHANGE_RECORDS`](crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS).
+    fn upsert_external_change(&mut self, record: crate::external_change::ExternalChangeRecord) {
+        self.external_changes.retain(|existing| {
+            !(existing.first_path() == record.first_path()
+                && existing.previous_generation == record.previous_generation)
+        });
+        self.external_changes.push(record);
+        if self.external_changes.len() > crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS {
+            let excess =
+                self.external_changes.len() - crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS;
+            self.external_changes.drain(0..excess);
+        }
+    }
+
+    /// Issue #65 (resume path): the F3 reconciliation's external evidence —
+    /// paths the run's OWN writes do not explain — becomes explicit records
+    /// (ownership-aware, conflict-flagged, checkpoint-persisted) instead of a
+    /// one-shot verdict the model can only read once. A re-detection of the
+    /// same change (path + previous generation) simply re-upserts.
+    async fn record_resume_external_changes(
+        &mut self,
+        change: &resume::WorkspaceChange,
+        graph: &TaskGraph,
+        previous_generation: Option<String>,
+        cancel: &CancellationToken,
+    ) {
+        if change.externally_changed.is_empty() {
+            return;
+        }
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else {
+            return;
+        };
+        // Owned snapshots of everything the loop needs — `self` is mutated
+        // per record (upsert), so no borrow of `self` may span the loop.
+        let root = snapshot.project_root.clone();
+        let current_generation =
+            self.capture_fresh_generation(cancel).await.or_else(|| self.snapshot_generation());
+        let detected_at_ms = crate::tool_facts::unix_ms();
+        let expected = self.expected_artifact_paths();
+        // Borrow-free snapshot of the gate: ownership lookups below must not
+        // hold a borrow across the per-path `&mut self` upsert.
+        let gate = self.write_gate.clone();
+        for (path, _last_event_id) in &change.externally_changed {
+            let Some(canonical) =
+                crate::tool_facts::canonical_project_path(root.as_std_path(), path)
+            else {
+                continue;
+            };
+            // Ownership table first: a held path that changed externally is
+            // an ownership-hopeful conflict the Coordinator must reconcile.
+            let known_owner = gate.as_ref().and_then(|gate| gate.ownership_owner(&canonical));
+            let known_task = known_owner.as_deref().and_then(|owner| {
+                graph
+                    .all_tasks()
+                    .into_iter()
+                    .find(|task| task.role.as_str() == owner)
+                    .map(|task| task.id.to_string())
+            });
+            if known_owner.is_some() {
+                if let Some(gate) = gate.as_ref() {
+                    if let Err(error) =
+                        gate.mark_artifact_stale(&canonical, "external-change-resume").await
+                    {
+                        warn!(
+                            %error,
+                            path = %canonical,
+                            "external change resume: stale mark failed; the record still \
+                             surfaces the change"
+                        );
+                    }
+                }
+            }
+            let conflicts = known_owner.is_some() || expected.contains(&canonical);
+            let record = crate::external_change::ExternalChangeRecord::new(
+                vec![canonical],
+                previous_generation.clone(),
+                current_generation.clone(),
+                known_owner,
+                known_task,
+                conflicts,
+                detected_at_ms,
+            );
+            self.upsert_external_change(record);
+        }
+    }
+
     /// Attach the session's skills instructions (ADR-43, Task 4), injected
     /// into every planner prompt. Pass an empty string to omit them.
     pub fn with_skills_section(mut self, skills_section: String) -> Self {
         self.skills_section = skills_section;
+        self
+    }
+
+    /// Attach the pre-rendered OS/shell identity card (custom-ai-shell plan,
+    /// Phase C), injected into every dispatch prompt and into the
+    /// self-implement persona's prompts. Pass an empty string to omit it
+    /// (manual/test constructions without resolved shell settings).
+    pub fn with_environment_card(mut self, environment_card: String) -> Self {
+        self.environment_card = environment_card;
         self
     }
 
@@ -1168,8 +3056,35 @@ impl CoordinatorAgent {
         self
     }
 
-    async fn persist_checkpoint(&self, checkpoint: &checkpoint::GraphCheckpoint) {
+    async fn persist_checkpoint(&mut self, checkpoint: &mut checkpoint::GraphCheckpoint) {
+        // ADR-65 §7: stamp the whiteboard cursor at PERSIST time — the log
+        // head is the consistent cut this checkpoint is consistent with, so
+        // a resume reads only facts appended after it. Fail-soft: without a
+        // log pool (or on a read error) the cursor stays `None` and the
+        // resume treats the whole log as pre-cursor.
+        if checkpoint.whiteboard_cursor_gate_seq.is_none() {
+            if let Some(pool) = self.review_store.as_ref() {
+                match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
+                    Ok(head) => checkpoint.whiteboard_cursor_gate_seq = Some(head),
+                    Err(error) => {
+                        warn!(%error, "ADR-65 §7: cursor stamp read failed; checkpoint persists without a cursor")
+                    }
+                }
+            }
+        }
+        if checkpoint.snapshot_generation.is_none() {
+            checkpoint.snapshot_generation = self.snapshot_generation();
+        }
         let Some(store) = &self.session_store else {
+            // Never silent: a coordinator without a session store cannot
+            // leave resumable state, so `continue` can never resume it.
+            // (Live miss, Sep 2026: run_multi_agent never attached the
+            // store and stalled runs persisted zero rows with zero logs.)
+            tracing::warn!(
+                session_id = %checkpoint.session_id,
+                "no session store attached — orchestration checkpoint not persisted; \
+                 stalled runs will not be resumable"
+            );
             return;
         };
         let Ok(state_json) = serde_json::to_string(checkpoint) else {
@@ -1198,7 +3113,11 @@ impl CoordinatorAgent {
         self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
-    fn design_doc_snapshot(&self) -> Option<DesignDoc> {
+    /// ADR-60 D7 (#152): snapshot of the most recent DesignDoc — the
+    /// runtime_runner binds it into the planning-only run's `plan-approved`
+    /// whiteboard event so Execute can rehydrate the structured object
+    /// instead of re-deriving it from rendered prose.
+    pub fn design_doc_snapshot(&self) -> Option<DesignDoc> {
         self.design_doc.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
@@ -1293,6 +3212,10 @@ impl CoordinatorAgent {
     /// ladder guards (default-model / self-execution / escalation attempts).
     /// These are captured into every checkpoint so a resumed run does NOT
     /// re-walk ladder tiers that already fired before the interruption.
+    /// ADR-65 §7: the doc resolution and the pending dispatch decision ride
+    /// along so a resume restores state at the cursor instead of replaying
+    /// prose; the cursor itself is stamped at persist time (the log head
+    /// then) by `persist_checkpoint`.
     fn checkpoint_context(
         &self,
         model_assignments: &HashMap<TaskId, String>,
@@ -1306,35 +3229,52 @@ impl CoordinatorAgent {
             default_model_provider_attempted: self.default_model_provider_attempted.clone(),
             self_execute_attempted: self.self_execute_attempted.clone(),
             escalation_attempted: self.escalation_attempted.clone(),
+            doc_resolution: self.last_doc_resolution.clone(),
+            snapshot_generation: self.snapshot_generation(),
+            pending_decision: self.last_dispatch_decision.clone(),
+            // Issue #52: the decision journal rides every persist so
+            // decision state is restorable/inspectable independently of the
+            // execution fields.
+            decision_journal: self.decision_journal.entries().to_vec(),
+            // Issue #53: the progress tracker rides every persist so stall
+            // detection (fingerprint history + recovery budget) survives a
+            // resume.
+            progress_tracker: self.progress_tracker.state().clone(),
+            // Issue #54: the run's normalized failure diagnoses ride every
+            // persist so the diagnosis/evidence trail survives a resume.
+            failure_diagnoses: self.failure_diagnoses.clone(),
+            // Issue #56: the world-model projection rides every persist so
+            // a resume restores the SAME model (additive checkpoint field).
+            world_model: self.world_model.clone(),
+            // Issue #60: the suitability record rides every persist so
+            // delegation-quality evidence survives a resume (additive
+            // checkpoint field).
+            suitability: self.suitability.state(),
+            // Issue #61: the ownership table rides every persist so the
+            // artifact-ownership state survives a resume (additive
+            // checkpoint field).
+            ownership: self.ownership_state(),
+            // Issue #63: the in-flight WAIT rides every persist so a crash
+            // mid-wait resumes by re-evaluating the record once (additive
+            // checkpoint field).
+            active_wait: self.active_wait.clone(),
+            // Issue #65: the explicit external-workspace-change records ride
+            // every persist so a resume reconciles the SAME changes
+            // (additive checkpoint field).
+            external_changes: self.external_changes.clone(),
         }
     }
 
     /// The declared stage tag of a registered agent, if any. `None` means
     /// the agent is freeform (no lifecycle participation).
+    ///
+    /// ADR-58 amendment (2026-09-05) / ADR-35 amendment (2026-09-05): the
+    /// registry is the roster and stage tags are DECLARED metadata —
+    /// informational (output-mode typing, verifier routing), never a
+    /// dispatch policy. The former registry-vs-blueprint staffing drift
+    /// `debug_assert!` is deleted: blueprint staffing is never enforced.
     fn stage_of(&self, role: &AgentId) -> Option<AgentStage> {
-        let answer = self.registry.get(role).and_then(|agent| agent.stage());
-        // ADR-58 P2+P3 (Batch 1) sequencing guard: when the resolved
-        // blueprint staffs this role, the registry's declared stage must
-        // equal the blueprint staffing tag. `debug_assert!` only — active in
-        // debug builds, silent in release and for coordinators built without
-        // a facade. Every Batch 2+ replacement site (R1–R11) funnels
-        // through this method, so a registry/blueprint drift fails here.
-        if let Some(facade) = &self.blueprint_facade {
-            debug_assert!(
-                match facade.stage_for_agent(role) {
-                    Some(staffed) => {
-                        answer.as_ref().map(AgentStage::as_str) == Some(staffed.def.tag.as_str())
-                    }
-                    // Role not staffed in the resolved blueprint: custom /
-                    // Freeform / run_once — nothing to compare against.
-                    None => true,
-                },
-                "registry stage {answer:?} for {role} diverges from resolved blueprint \
-                 staffing {:?}",
-                facade.stage_for_agent(role).map(|s| s.def.tag.as_str())
-            );
-        }
-        answer
+        self.registry.get(role).and_then(|agent| agent.stage())
     }
 
     /// Whether `role` participates in a stage of the given known kind —
@@ -1358,47 +3298,19 @@ impl CoordinatorAgent {
         }
     }
 
-    /// The single deterministic agent for a lifecycle stage, if any.
+    /// The first registered agent declaring `stage`, if any (lexicographic
+    /// tie-break on the id, so the resolution is deterministic).
     ///
-    /// ADR-35 §5: participants are resolved from the registry by stage tag
-    /// instead of hardcoded role ids. When several agents declare the same
-    /// stage, the lexicographically first id wins; a pipeline without any
-    /// agent for a stage simply skips that stage.
+    /// ADR-35 amendment (2026-09-05) / ADR-58 amendment (2026-09-05): this
+    /// lookup is output-mode typing and verifier routing ONLY (review /
+    /// validation / replan machinery) — never a dispatch authority. The
+    /// former blueprint `def.agents` staffing-equality `debug_assert!` is
+    /// deleted: blueprint staffing is never enforced, and the registry built
+    /// from `custom_agents` is the complete roster.
     fn first_agent_for_stage(&self, stage: &AgentStage) -> Option<AgentId> {
         let mut ids = self.registry.ids_for_stage(stage);
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        let answer = ids.into_iter().next();
-        // ADR-58 P2+P3 (Batch 1) sequencing guard: when the resolved
-        // blueprint defines this stage tag, the set of agents participating
-        // must equal the blueprint's `def.agents` staffing (sorted). The
-        // lexicographically-first id is the single deterministic participant
-        // both the registry path and the blueprint derive identically.
-        if let Some(facade) = &self.blueprint_facade {
-            debug_assert!(
-                match facade.stage_by_tag(stage.as_str()) {
-                    Some(staffed) => {
-                        let mut expected: Vec<&str> =
-                            staffed.def.agents.iter().map(String::as_str).collect();
-                        expected.sort_unstable();
-                        let mut actual: Vec<String> = self
-                            .registry
-                            .ids_for_stage(stage)
-                            .iter()
-                            .map(|a| a.as_str().to_string())
-                            .collect();
-                        actual.sort_unstable();
-                        actual.iter().map(String::as_str).collect::<Vec<_>>() == expected
-                    }
-                    // No such stage tag in the resolved blueprint: nothing to
-                    // compare against.
-                    None => true,
-                },
-                "registry staffing for {stage} diverges from resolved blueprint \
-                 def.agents {:?}",
-                facade.stage_by_tag(stage.as_str()).map(|s| s.def.agents.clone())
-            );
-        }
-        answer
+        ids.into_iter().next()
     }
 
     /// Publish a coordinator `AgentThought` describing a fallback-ladder step.
@@ -1494,12 +3406,20 @@ impl CoordinatorAgent {
         // A role with no registered agent is a configuration error: do not
         // silently rescue it with tier-2 self-execution (which would bypass
         // the missing specialist entirely). The caller surfaces the original
-        // error through its terminal handling.
+        // error through its terminal handling. Issue #52: the ladder is
+        // deterministic, not model-driven — the tier target is ASSERTED
+        // registered before any tier runs, and the rejected ladder attempt
+        // is journaled (decision state, not execution state).
         if self.registry.get(original_role).is_none() {
             tracing::warn!(
                 target: "orchestrator::coordinator",
                 role = ?original_role,
                 "role has no registered agent; skipping fallback ladder",
+            );
+            self.decision_journal.record(
+                crate::decisions::DecisionValidator::ladder_rejected_decision(
+                    original_role.as_str(),
+                ),
             );
             return FallbackOutcome::Exhausted;
         }
@@ -1923,169 +3843,92 @@ impl CoordinatorAgent {
         cancel: &CancellationToken,
         resume_checkpoint_json: Option<String>,
     ) -> Result<DecomposeResult, OrchestratorError> {
+        let checkpoint_present = resume_checkpoint_json.is_some();
         if let Some(cp_json) = resume_checkpoint_json {
-            let cp: crate::checkpoint::GraphCheckpoint =
-                crate::checkpoint::GraphCheckpoint::from_json(&cp_json).map_err(|e| {
-                    OrchestratorError::AgentLoopError(format!(
-                        "failed to deserialize resume checkpoint: {e}"
-                    ))
-                })?;
+            match self.restore_and_evaluate(&cp_json, task, context, cancel).await {
+                Ok(Some(result)) => return Ok(result),
+                // ADR-65 §7 Replan: the workspace objectively changed
+                // materially to the pending step. The resume path itself
+                // dispatches nothing — the fresh decompose below lets the
+                // Coordinator re-decide the new planning.
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
 
-            // Validate checkpoint scope as a second safety net (the
-            // runtime_runner already does this, but we check again here
-            // for defense-in-depth). A scope mismatch is surfaced as a
-            // clean AgentLoopError so the caller can fall through to a
-            // fresh run rather than producing a corrupted partial output.
-            cp.validate_scope(
-                task.session_id,
-                &context.session.project_id.0,
-                self.source_revision.as_deref(),
-            )
-            .map_err(|reason| {
-                OrchestratorError::AgentLoopError(format!(
-                    "checkpoint scope validation failed: {reason}"
-                ))
-            })?;
+        // ADR-60 D7 (interrupt-safe resume, 2026-09-05): a `continue` run with
+        // NO checkpoint row to restore seeds its dispatch from the logged
+        // evidence chain instead of re-entering design — the newest
+        // hash-verified `plan-approved` payload re-anchors the verified
+        // design, and the COORDINATOR re-decides the next dispatch from that
+        // evidence context (no planner re-entry, no scheduler). Every
+        // dispatch is recorded as an evidence-backed `Decision` event
+        // (ADR-65 §7). The checkpoint-restored path above keeps the §7
+        // evaluator; a genuinely fresh run (no seed attached) decomposes
+        // normally below.
+        if !checkpoint_present {
+            if let Some(seed) = self.headless_resume_seed.take() {
+                return self.decompose_from_evidence(task, context, cancel, seed).await;
+            }
+        }
 
-            let graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
-                OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
-            })?;
-            let completed_results = cp.completed_results;
-            let total_cost = cp.total_cost;
-            let total_tool_calls = cp.total_tool_calls;
-            let all_files = cp.all_files;
-            let provider_metrics = cp.provider_metrics;
-            let subtask_attempts = cp.subtask_attempts;
-            let retry_feedback = cp.retry_feedback;
-            let model_assignments = cp.model_assignments;
-            let action_ledger = cp.action_ledger;
-            // Retain the original plan so subsequent checkpoints keep it too.
-            *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) =
-                cp.design_doc.clone();
-            // Retain expected-artifact expectations so the C-06 acceptance
-            // gate verifies the same files after a resume.
-            *self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()) =
-                cp.expected_artifacts.clone();
-            // Restore the ADR-42/ADR-45 ladder guards so a resumed run does
-            // NOT re-walk ladder tiers (default-model swap, default-provider
-            // re-dispatch, self-execution, escalation retry) that already
-            // fired before the interruption.
-            self.default_model_attempted = cp.default_model_attempted.clone();
-            self.default_model_provider_attempted = cp.default_model_provider_attempted.clone();
-            self.self_execute_attempted = cp.self_execute_attempted.clone();
-            self.escalation_attempted = cp.escalation_attempted.clone();
-
-            // ADR-52: a resumed run re-persists its durable plan artifact
-            // (idempotent overwrite of `plan-<run_id>.json`) so the plans dir
-            // stays a complete history of every plan execution, and carries
-            // the run's plan_id into the lifecycle event.
-            let plan = PlanArtifact::from_graph(
-                cp.run_id.to_string(),
-                task,
-                &graph,
-                &cp.expected_artifacts,
-            );
-            let plan_id = self.persist_plan_artifact(&plan);
-            // ADR-55 Phase 2b: retain the id so a planning-only run can bind
-            // its rendered plan to the durable artifact.
-            self.last_plan_id = plan_id.clone();
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                task.id.0,
-                EventKind::MultiAgentModeStarted {
-                    task_id: task.id,
-                    subtask_count: graph.len(),
-                    plan_id,
-                },
-            );
-            Ok(DecomposeResult {
-                graph,
-                completed_results,
-                total_cost,
-                total_tool_calls,
-                all_files,
-                provider_metrics,
-                subtask_attempts,
-                retry_feedback,
-                model_assignments,
-                action_ledger,
-            })
-        } else {
-            // If the Architect agent fails (e.g. repeated malformed JSON
-            // from the LLM) we return a clean Partial result rather than
-            // propagating an error that hard-crashes the session.
-            let (graph, plan_artifact) =
-                match self.decompose_task(task, context, cancel, None).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task.id.0,
-                            EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: 0.0 },
-                        );
-                        return Err(e);
-                    }
-                };
-            TaskGraphValidator::validate(&graph)?;
-            let completed_results = graph
-                .all_tasks()
-                .into_iter()
-                .filter_map(|subtask| {
-                    subtask.deliverable.as_ref().map(|summary| {
-                        (
-                            subtask.id,
-                            AgentRunResult {
-                                task_id: subtask.id,
-                                role: subtask.role.clone(),
-                                outcome: AgentOutcome::Success,
-                                summary: summary.clone(),
-                                files_modified: Vec::new(),
-                                tool_call_count: 0,
-                                cost_usd: 0.0,
-                                latency_ms: 0,
-                                provider: String::new(),
-                                model: String::new(),
-                                tokens_in: 0,
-                                tokens_out: 0,
-                            },
-                        )
-                    })
-                })
-                .collect();
-
-            // ADR-55 Phase 2b: the planning-only branch binds its rendered
-            // plan to the durable artifact id, so *both* decompose paths must
-            // persist one — including the heuristic-pipeline fallback, which
-            // by itself yields no `PlanArtifact` (observed live: a planner
-            // JSON parse failure left `plans/` empty and `plan_id` null even
-            // though the run completed and rendered a plan).
-            let plan_id = match plan_artifact {
-                Some(plan) => self.persist_plan_artifact(&plan),
-                None => {
-                    let fallback_plan = PlanArtifact::from_graph(
-                        Ulid::new().to_string(),
-                        task,
-                        &graph,
-                        &HashMap::new(),
+        // Fresh decompose path (also the ADR-65 §7 Replan destination): the
+        // Coordinator's decision loop. A provider failure inside the loop
+        // returns a clean Partial result rather than propagating an error
+        // that hard-crashes the session.
+        let (graph, plan_artifact, ledger, summary) =
+            match self.decompose_task(task, context, cancel).await {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: 0.0 },
                     );
-                    self.persist_plan_artifact(&fallback_plan)
+                    return Err(e);
                 }
             };
-            // ADR-55 Phase 2b: retain the id so a planning-only run can bind
-            // its rendered plan to the durable artifact.
-            self.last_plan_id = plan_id.clone();
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                task.id.0,
-                EventKind::MultiAgentModeStarted {
-                    task_id: task.id,
-                    subtask_count: graph.len(),
-                    plan_id,
-                },
-            );
-            Ok(DecomposeResult {
+        // ADR-35 amendment: an EMPTY graph is a legal decompose result — the
+        // Coordinator may decide no dispatch is needed (an answer-only run,
+        // or a planning decision to stop). Validation applies to non-empty
+        // graphs only; an empty run surfaces through the tail's stall gates.
+        if !graph.is_empty() {
+            TaskGraphValidator::validate(&graph)?;
+        }
+        // durable artifact id, so both decompose paths persist one — the
+        // advisory draft when the Coordinator invoked the advisor, else the
+        // graph record (ADR-52 amendment: plans are advisory records,
+        // never an authoritative workload).
+        let plan_id = match plan_artifact {
+            Some(plan) => self.persist_plan_artifact(&plan),
+            None => {
+                let fallback_plan = PlanArtifact::from_graph(
+                    Ulid::new().to_string(),
+                    task,
+                    &graph,
+                    &self.expected_artifacts_snapshot(),
+                );
+                self.persist_plan_artifact(&fallback_plan)
+            }
+        };
+        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // its rendered plan to the durable artifact.
+        self.last_plan_id = plan_id.clone();
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeStarted {
+                task_id: task.id,
+                subtask_count: graph.len(),
+                plan_id,
+            },
+        );
+        // ADR-55 Phase 2b: the planning-only run's plan IS the Coordinator's
+        // decision-loop summary (advisory prose; nothing was dispatched).
+        if self.orchestration_depth == OrchestrationDepth::PlanningOnly && summary.is_empty() {
+            return Ok(DecomposeResult {
                 graph,
-                completed_results,
+                completed_results: HashMap::new(),
                 total_cost: 0.0,
                 total_tool_calls: 0,
                 all_files: Vec::new(),
@@ -2094,7 +3937,653 @@ impl CoordinatorAgent {
                 retry_feedback: HashMap::new(),
                 model_assignments: HashMap::new(),
                 action_ledger: Vec::new(),
-            })
+                dispatch_summary: String::new(),
+                loop_notes: Vec::new(),
+                requested_user_input: None,
+                objective: task.description.clone(),
+                objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+            });
+        }
+        Ok(DecomposeResult {
+            graph,
+            completed_results: ledger.completed_results,
+            total_cost: ledger.total_cost,
+            total_tool_calls: ledger.total_tool_calls,
+            all_files: ledger.all_files,
+            provider_metrics: ledger.provider_metrics,
+            subtask_attempts: ledger.subtask_attempts,
+            retry_feedback: HashMap::new(),
+            model_assignments: ledger.model_assignments,
+            action_ledger: ledger.action_ledger,
+            dispatch_summary: summary,
+            loop_notes: ledger.notes,
+            requested_user_input: self.requested_user_input.take(),
+            objective: task.description.clone(),
+            objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+        })
+    }
+
+    /// Restore the graph from `cp_json` and run the ADR-65 §7 resume
+    /// evaluation: read the facts appended after the checkpoint's whiteboard
+    /// cursor, compare workspace reality (fresh snapshot generation + F3
+    /// reconciliation), and choose — continue blocked task / replace agent /
+    /// skip / refresh evidence / replan — recording every outcome as a
+    /// whiteboard `Decision` event with REAL evidence ids (acceptance 8:
+    /// the append validates them). `Ok(None)` means Replan.
+    ///
+    /// Fail-soft by contract: a log read failure or an unreadable payload
+    /// degrades individual evaluation inputs, never the restore; only the
+    /// existing checkpoint/scope errors propagate.
+    async fn restore_and_evaluate(
+        &mut self,
+        cp_json: &str,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+    ) -> Result<Option<DecomposeResult>, OrchestratorError> {
+        let mut cp: crate::checkpoint::GraphCheckpoint =
+            crate::checkpoint::GraphCheckpoint::from_json(cp_json).map_err(|e| {
+                OrchestratorError::AgentLoopError(format!(
+                    "failed to deserialize resume checkpoint: {e}"
+                ))
+            })?;
+
+        // Validate checkpoint scope as a second safety net (the
+        // runtime_runner already does this, but we check again here
+        // for defense-in-depth). A scope mismatch is surfaced as a
+        // clean AgentLoopError so the caller can fall through to a
+        // fresh run rather than producing a corrupted partial output.
+        cp.validate_scope(task.session_id, &context.session.project_id.0).map_err(|reason| {
+            OrchestratorError::AgentLoopError(format!(
+                "checkpoint scope validation failed: {reason}"
+            ))
+        })?;
+
+        // ── ADR-65 §7: additive v4 backfill ──────────────────────────────
+        // Pre-§7 (v3) records carry no cursor/doc/snapshot fields; derive
+        // them from the log (additive, fail-soft). A log read below that
+        // fails degrades to an empty slice and every absent field stays
+        // absent — a resume must not fail because history is imperfect.
+        let log_window = self.read_resume_log_window(task.session_id, cancel).await;
+        resume::backfill_v4_fields(&mut cp, &log_window, self.resume_cursor_hint_ms);
+        // The evidence view: facts appended AFTER the cursor only (never the
+        // pre-cursor log — no prose replay, no pre-cursor fact replayed into
+        // a decision). A checkpoint without a cursor (backfill degraded)
+        // treats the whole log as pre-cursor: the conservative reading.
+        let post_cursor = match cp.whiteboard_cursor_gate_seq {
+            Some(cursor) => resume::split_at_cursor(&log_window, cursor).1,
+            None => &[],
+        };
+
+        let mut graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
+            OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
+        })?;
+        let completed_results = cp.completed_results;
+        let total_cost = cp.total_cost;
+        let total_tool_calls = cp.total_tool_calls;
+        let all_files = cp.all_files;
+        let provider_metrics = cp.provider_metrics;
+        let mut subtask_attempts = cp.subtask_attempts;
+        let retry_feedback = cp.retry_feedback;
+        let model_assignments = cp.model_assignments;
+        let action_ledger = cp.action_ledger;
+        // Retain the original plan so subsequent checkpoints keep it too.
+        *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = cp.design_doc.clone();
+        // Retain expected-artifact expectations so the C-06 acceptance
+        // gate verifies the same files after a resume.
+        *self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()) =
+            cp.expected_artifacts.clone();
+        // Restore the ADR-42/ADR-45 ladder guards so a resumed run does
+        // NOT re-walk ladder tiers (default-model swap, default-provider
+        // re-dispatch, self-execution, escalation retry) that already
+        // fired before the interruption.
+        self.default_model_attempted = cp.default_model_attempted.clone();
+        self.default_model_provider_attempted = cp.default_model_provider_attempted.clone();
+        self.self_execute_attempted = cp.self_execute_attempted.clone();
+        self.escalation_attempted = cp.escalation_attempted.clone();
+        // ADR-65 §7: keep the doc resolution and pending decision
+        // round-tripping — the resumed run's checkpoints carry them forward
+        // (a planning run refreshes them; a dispatch decision recorded below
+        // replaces the stale pending one).
+        self.last_doc_resolution = cp.doc_resolution.clone();
+        self.last_dispatch_decision = cp.pending_decision.clone();
+        // Issue #52: restore decision state independently of the execution
+        // state — the journal round-trips and a resumed run keeps recording
+        // into it (additive; pre-#52 checkpoints carry an empty journal).
+        self.decision_journal =
+            crate::decisions::DecisionJournal::from_entries(cp.decision_journal.clone());
+        // Issue #53: restore the progress tracker so stall detection
+        // (fingerprint history, equivalence streak, recovery budget)
+        // survives a resume; pre-#53 checkpoints carry the zero-value
+        // state.
+        self.progress_tracker =
+            crate::progress::ProgressTracker::from_state(cp.progress_tracker.clone());
+        // Issue #54: restore the failure-diagnosis history so the
+        // diagnosis/evidence trail survives a resume; pre-#54 checkpoints
+        // carry the empty default.
+        self.failure_diagnoses = {
+            let mut diagnoses = cp.failure_diagnoses.clone();
+            let excess =
+                diagnoses.len().saturating_sub(crate::failure_diagnosis::MAX_DIAGNOSIS_HISTORY);
+            diagnoses.drain(0..excess);
+            diagnoses
+        };
+        // Issue #56: restore the world-model projection additively (old
+        // checkpoints carry the empty default and the next decision session
+        // rebuilds the model from the restored state), and compute the
+        // workspace-change verdict the model's freshness rules consume.
+        self.world_model = cp.world_model.clone();
+        // Issue #60: restore the suitability record additively (old
+        // checkpoints carry the empty default — the ranking is neutral
+        // until outcomes are recorded again); the caps are enforced on
+        // restore so resumed stores stay bounded.
+        self.suitability = crate::suitability::SuitabilityIndex::from_state(cp.suitability.clone());
+        // Issue #61: restore the artifact-ownership table additively (the
+        // gate is the live read when attached; old checkpoints carry the
+        // empty default — ownership re-derives from the log then).
+        self.restore_ownership_state(&cp.ownership);
+        // Issue #63: restore the in-flight WAIT additively (old checkpoints
+        // carry the empty default). The resumed dispatch session re-evaluates
+        // it ONCE at the start of the next loop and reports the outcome to
+        // the model; resume never re-enters the park loop.
+        self.active_wait = cp.active_wait.clone();
+        // Issue #65: restore the explicit external-workspace-change records
+        // additively (old checkpoints carry the empty default). The resumed
+        // run keeps reconciling the SAME recorded changes — they ride into
+        // the world model as decision risks — and the F3 verdict below
+        // re-detects anything new (upsert-deduped by path + generation).
+        self.external_changes = cp.external_changes.clone();
+        self.external_changes.truncate(crate::external_change::MAX_EXTERNAL_CHANGE_RECORDS);
+        self.workspace_changed_since_checkpoint =
+            match (&cp.snapshot_generation, self.snapshot_generation()) {
+                (Some(recorded), Some(current)) => recorded.as_str() != current.as_str(),
+                _ => false,
+            };
+
+        // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
+        let pending_decision = cp.pending_decision.clone();
+        let snapshot_generation_at_checkpoint = cp.snapshot_generation.clone();
+        let application = self
+            .evaluate_and_apply_resume(
+                &mut graph,
+                task,
+                context,
+                &action_ledger,
+                &completed_results,
+                &all_files,
+                pending_decision.as_ref(),
+                snapshot_generation_at_checkpoint.as_deref(),
+                &log_window,
+                post_cursor,
+                cancel,
+            )
+            .await;
+        let ResumeApplication::Applied { ledger_entries, re_armed } = application else {
+            // Replan. The restored plan is superseded by workspace reality:
+            // clear the restored per-plan bookkeeping so the fresh decompose
+            // repopulates it for the new graph.
+            self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clear();
+            self.last_doc_resolution = None;
+            self.last_dispatch_decision = None;
+            // Issue #52: the restored decision journal is also superseded —
+            // a replan's strategy cannot govern the replaced plan's steps.
+            self.decision_journal = crate::decisions::DecisionJournal::from_entries(Vec::new());
+            // Issue #53: the stall history of the superseded plan is
+            // equally invalid — the new plan starts with a fresh
+            // fingerprint window and a fresh recovery budget.
+            self.progress_tracker = crate::progress::ProgressTracker::new();
+            warn!(
+                run_id = %cp.run_id,
+                "ADR-65 §7: resume chose REPLAN — the workspace objectively changed \
+                 materially to the pending step; delegating to the Phase-6 scheduler"
+            );
+            return Ok(None);
+        };
+        let mut action_ledger = action_ledger;
+        action_ledger.extend(ledger_entries);
+        if let Some(re_armed) = re_armed {
+            // The resume decision granted the re-armed step a fresh bounded
+            // attempt budget (the ladder guards stay restored, so no tier
+            // re-walks); without the reset the resumed run would exit
+            // Partial before ever dispatching the decided task.
+            subtask_attempts.insert(re_armed, 0);
+        }
+
+        // ADR-52: a resumed run re-persists its durable plan artifact
+        // (idempotent overwrite of `plan-<run_id>.json`) so the plans dir
+        // stays a complete history of every plan execution, and carries
+        // the run's plan_id into the lifecycle event.
+        let plan =
+            PlanArtifact::from_graph(cp.run_id.to_string(), task, &graph, &cp.expected_artifacts);
+        let plan_id = self.persist_plan_artifact(&plan);
+        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // its rendered plan to the durable artifact.
+        self.last_plan_id = plan_id.clone();
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeStarted {
+                task_id: task.id,
+                subtask_count: graph.len(),
+                plan_id,
+            },
+        );
+        // Run-continuity Phase 1: keep recording the ORIGINAL objective
+        // (text + hash) in every checkpoint this resumed run persists —
+        // the resume input is a bare "continue", not the objective. The
+        // fields are trusted metadata from the validated v3 record; a
+        // corrupt value degrades the recorded objective text only and is
+        // never a reason to refuse the resume (fail-soft).
+        let objective = cp.objective.clone();
+        let objective_hash = cp.objective_hash.clone();
+        Ok(Some(DecomposeResult {
+            graph,
+            completed_results,
+            total_cost,
+            total_tool_calls,
+            all_files,
+            provider_metrics,
+            subtask_attempts,
+            retry_feedback,
+            model_assignments,
+            action_ledger,
+            dispatch_summary: String::new(),
+            loop_notes: Vec::new(),
+            requested_user_input: None,
+            objective,
+            objective_hash,
+        }))
+    }
+
+    /// Read this session's log tail window for the resume evaluation
+    /// (ADR-65 §7 read side). Fail-soft: no log pool or a read error yields
+    /// an empty slice — the evaluation then relies on the checkpoint's own
+    /// ledger and workspace reality alone, and never fails the resume. The
+    /// window is a single bounded read of the newest events, anchored at the
+    /// log head.
+    async fn read_resume_log_window(
+        &self,
+        session_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Vec<WhiteboardEvent> {
+        let Some(pool) = self.review_store.as_ref() else {
+            return Vec::new();
+        };
+        let head = match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
+            Ok(head) => head,
+            Err(error) => {
+                warn!(%error, "ADR-65 §7: resume log read failed (head); treating the log as pre-cursor");
+                return Vec::new();
+            }
+        };
+        let after = head.saturating_sub(RESUME_LOG_WINDOW as u64);
+        match load_whiteboard_events(
+            pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: after,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: RESUME_LOG_WINDOW,
+            },
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                if cancel.is_cancelled() {
+                    return Vec::new();
+                }
+                warn!(%error, "ADR-65 §7: resume log window read failed (fail-soft); \
+                     the evaluation proceeds on the checkpoint ledger alone");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The ADR-65 §7 workspace-change verdict for a resume: the fresh
+    /// snapshot generation compared against the checkpoint's, plus the F3
+    /// reconciliation of the observed rows against the live filesystem —
+    /// changed/vanished paths the run's OWN recorded writes do not explain
+    /// are the externally-changed evidence. Fail-soft: every read/storage
+    /// failure degrades to "no change detected" on that axis.
+    async fn workspace_change_verdict(
+        &self,
+        checkpoint_generation: Option<&str>,
+        own_written: &std::collections::HashSet<String>,
+        cancel: &CancellationToken,
+    ) -> resume::WorkspaceChange {
+        let mut change = resume::WorkspaceChange::default();
+        if let (Some(recorded), Some(fresh)) = (checkpoint_generation, self.snapshot_generation()) {
+            change.generation_mismatch = recorded != fresh;
+        }
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else { return change };
+        let Some(pool) = self.review_store.as_ref() else { return change };
+        // ADR-65 F5c: reconcile only this project root's rows.
+        let root_hash = crate::tool_facts::project_root_hash(snapshot.project_root.as_std_path());
+        let rows = match ResourceFacts::new(pool.clone())
+            .list_observations(&root_hash, MAX_EVIDENCE_OBSERVATIONS, cancel)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                if !cancel.is_cancelled() {
+                    warn!(%error, "ADR-65 §7: workspace reconciliation read failed (fail-soft)");
+                }
+                return change;
+            }
+        };
+        for row in rows {
+            // ADR-65 F3: a row whose live stat (size, mtime) diverges from
+            // the observation — or whose file vanished — is stale.
+            let fresh = std::fs::metadata(snapshot.project_root.join(&row.path))
+                .ok()
+                .filter(|meta| {
+                    row.size_bytes.unwrap_or(0) == meta.len()
+                        && row.mtime_ms == crate::tool_facts::mtime_ms(meta)
+                })
+                .is_some();
+            if fresh {
+                continue;
+            }
+            let canonical = crate::tool_facts::canonical_project_path(
+                snapshot.project_root.as_std_path(),
+                &row.path,
+            )
+            .unwrap_or_else(|| row.path.clone());
+            if own_written.contains(&canonical) {
+                // Already explained by the run's own recorded writes.
+                continue;
+            }
+            change.externally_changed.push((row.path.clone(), row.last_event_id.clone()));
+            // Issue #61: the external write is observed OUTSIDE the gate —
+            // an owned record for that artifact flips stale (never a silent
+            // overwrite); the conflict channel surfaces it later.
+            if let Some(gate) = self.write_gate.as_ref() {
+                if let Err(error) = gate.mark_artifact_stale(&canonical, "resume-f3").await {
+                    tracing::warn!(%error, "issue #61: stale mark failed (fail-soft)");
+                }
+            }
+        }
+        change
+    }
+
+    /// The ADR-65 §7 resume evaluation driver: gather the blocked step, its
+    /// post-cursor facts, the workspace-change verdict and the replacement
+    /// candidates, evaluate the deterministic policy, record the Decision
+    /// event (fail-soft, real evidence ids only), and apply the outcome to
+    /// the graph.
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_and_apply_resume(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        context: &AgentContext,
+        checkpoint_action_ledger: &[checkpoint::CheckpointAction],
+        completed_results: &HashMap<TaskId, AgentRunResult>,
+        checkpoint_all_files: &[camino::Utf8PathBuf],
+        pending_decision: Option<&checkpoint::CheckpointPendingDecision>,
+        checkpoint_snapshot_generation: Option<&str>,
+        log_window: &[WhiteboardEvent],
+        post_cursor: &[WhiteboardEvent],
+        cancel: &CancellationToken,
+    ) -> ResumeApplication {
+        // Steps a previous resume already skipped stay skipped — a recorded
+        // skip is terminal for this plan.
+        let skipped_ids: HashSet<TaskId> = checkpoint_action_ledger
+            .iter()
+            .filter(|action| action.kind == "resume-skipped")
+            .filter_map(|action| action.task_id)
+            .collect();
+        // The first blocked/failed step in graph order (callers of the
+        // restored run proceed step by step; later resumes handle the rest).
+        // Snapshot the decision inputs before any outcome mutates the graph.
+        let snapshot = graph.all_tasks().into_iter().find_map(|subtask| {
+            let is_candidate =
+                matches!(subtask.status, SubTaskStatus::Blocked | SubTaskStatus::Failed)
+                    && !skipped_ids.contains(&subtask.id);
+            if !is_candidate {
+                return None;
+            }
+            // Failed outcomes for this step: ledger `failed` entries
+            // (pre-cursor) plus post-cursor failure facts. The cursor keeps
+            // the two disjoint, so summing never double-counts; without a
+            // cursor the post-cursor view is empty (conservative).
+            let ledger_failures = checkpoint_action_ledger
+                .iter()
+                .filter(|action| action.kind == "failed" && action.task_id == Some(subtask.id))
+                .count() as u32;
+            let facts = resume::task_facts_after_cursor(post_cursor, &subtask.id.0.to_string());
+            Some((subtask.id, subtask.role.clone(), facts, ledger_failures))
+        });
+
+        // ── Issue #52: deterministically re-validate the checkpoint's
+        // pending decision BEFORE the resume evaluation consumes it. The
+        // selected agent must still be on the roster, and every cited
+        // evidence id must still exist in the whiteboard log (per-id check
+        // — the exact acceptance-8 predicate). A stale pending decision
+        // cannot stand: the outcome is a forced Replan — deterministic
+        // recovery, the model is never asked to repair checkpoint state.
+        // Without a log pool the evidence is unverifiable (fail-soft: no
+        // staleness is imputed on unknowable facts; roster staleness still
+        // applies).
+        if let Some(pending) = pending_decision {
+            let missing_evidence: Vec<String> = match self.review_store.as_ref() {
+                Some(_) => {
+                    self.missing_evidence_ids(&pending.supporting_evidence_ids, cancel).await
+                }
+                None => Vec::new(),
+            };
+            let known_evidence: HashSet<String> = pending
+                .supporting_evidence_ids
+                .iter()
+                .filter(|id| !missing_evidence.contains(id))
+                .cloned()
+                .collect();
+            let roster_ids = self.decision_roster();
+            let stale = crate::decisions::DecisionValidator {
+                roster_ids: &roster_ids,
+                known_event_ids: &known_evidence,
+                project_root: None,
+            }
+            .pending_decision_is_stale(&pending.selected_agent, &pending.supporting_evidence_ids);
+            if stale {
+                warn!(
+                    selected_agent = %pending.selected_agent,
+                    missing_evidence = missing_evidence.len(),
+                    "ADR-65 §7 + issue #52: the pending decision is stale (unregistered \
+                     target or fabricated evidence); forcing Replan"
+                );
+                self.decision_journal.record(
+                    crate::decisions::DecisionValidator::replan_rejection_decision(
+                        &pending.selected_agent,
+                        &missing_evidence,
+                    ),
+                );
+                return ResumeApplication::Replan;
+            }
+        }
+
+        let mut blocked: Option<resume::BlockedStep> = None;
+        let mut step_facts = resume::TaskFacts::default();
+        if let Some((task_id, role, facts, ledger_failures)) = snapshot {
+            step_facts = facts.clone();
+            // The capability class maps from the registry's stage tags
+            // (ADR-58): research → Explore, design → Design; everything
+            // else (including freeform workers) is Implement-class work.
+            let stage = self.stage_of(&role).map(|stage| stage.as_str().to_owned());
+            let class = match stage.as_deref() {
+                Some(tag) if tag == AgentStage::RESEARCH => resume::StepClass::Explore,
+                Some(tag) if tag == AgentStage::DESIGN => resume::StepClass::Design,
+                _ => resume::StepClass::Implement,
+            };
+            // Agents already tried for this step: its current role, every
+            // agent a logged decision selected, and the pending decision's
+            // selection. Replacement never re-selects a tried agent.
+            let mut tried_agents = vec![role.as_str().to_owned()];
+            tried_agents.extend(resume::selected_agents_after_cursor(log_window));
+            if let Some(pending) = pending_decision {
+                if !pending.selected_agent.is_empty() {
+                    tried_agents.push(pending.selected_agent.clone());
+                }
+            }
+            tried_agents.sort();
+            tried_agents.dedup();
+            // Acceptance 7: the recorded, evidence-backed decision gate —
+            // the pending decision or any logged Decision row explicitly
+            // selecting this step's agent with evidence ids.
+            let recorded_selection =
+                log_window.iter().any(|event| resume::decision_selects(event, role.as_str()))
+                    || pending_decision.is_some_and(|pending| {
+                        pending.selected_agent == role.as_str()
+                            && !pending.supporting_evidence_ids.is_empty()
+                    });
+            blocked = Some(resume::BlockedStep {
+                task_id,
+                agent: role.as_str().to_owned(),
+                class,
+                failure_count: ledger_failures + facts.failure_event_ids.len() as u32,
+                tried_agents,
+                recorded_selection,
+            });
+        }
+
+        // Replacement candidates: registered agents with the implement
+        // stage tag minus the tried agents, deterministic order
+        // (lexicographic — the registry map has no stable order). Design /
+        // explore steps are never replaced by the resume path (acceptance
+        // 7): continue-behind-decision or skip.
+        let candidates: Vec<String> = match blocked.as_ref().map(|step| step.class) {
+            Some(resume::StepClass::Implement) => {
+                let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
+                let mut ids = self.registry.ids_for_stage(&AgentStage::new(implement_tag));
+                ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                ids.into_iter()
+                    .map(|id| id.as_str().to_owned())
+                    .filter(|id| {
+                        blocked.as_ref().is_some_and(|step| !step.tried_agents.contains(id))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        // The workspace-change verdict: generation mismatch + the F3
+        // reconciliation restricted to paths the run's OWN writes do not
+        // explain.
+        let own_written = own_write_paths(
+            checkpoint_all_files,
+            completed_results,
+            post_cursor,
+            &context.session.project_dir,
+        );
+        let change = self
+            .workspace_change_verdict(checkpoint_snapshot_generation, &own_written, cancel)
+            .await;
+        // Issue #65: the F3 external evidence becomes explicit, reconcilable
+        // records (ownership-aware, conflict-flagged, checkpoint-persisted)
+        // instead of a one-shot verdict the model reads once and loses.
+        self.record_resume_external_changes(
+            &change,
+            graph,
+            checkpoint_snapshot_generation.map(str::to_owned),
+            cancel,
+        )
+        .await;
+        let outcome = resume::evaluate(&resume::ResumeInput {
+            blocked_step: blocked.as_ref(),
+            replacement_candidates: &candidates,
+            pending_decision,
+            step_facts: &step_facts,
+            change: &change,
+        });
+
+        // Record the outcome as a whiteboard Decision event (ADR-65 §6/§7):
+        // reason + REAL evidence ids only — post-cursor task facts for a
+        // step outcome, the changed rows' observation ids for a workspace
+        // outcome. A fabricated id is rejected at append (acceptance 8), so
+        // never invent one.
+        let mut evidence_ids: Vec<String> = Vec::new();
+        if blocked.is_some() {
+            evidence_ids.extend(step_facts.progress_event_ids.iter().cloned());
+            evidence_ids.extend(step_facts.failure_event_ids.iter().cloned());
+        } else {
+            evidence_ids.extend(change.externally_changed.iter().filter_map(|(_, event_id)| {
+                event_id.as_ref().filter(|id| !id.is_empty()).cloned()
+            }));
+        }
+        evidence_ids.truncate(MAX_EVIDENCE_OBSERVATIONS);
+        self.append_resume_decision(task.session_id, &outcome, &evidence_ids).await;
+
+        match &outcome {
+            ResumeOutcome::Replan => ResumeApplication::Replan,
+            ResumeOutcome::RestoreAndContinue | ResumeOutcome::RefreshEvidence => {
+                ResumeApplication::Applied { ledger_entries: Vec::new(), re_armed: None }
+            }
+            ResumeOutcome::ContinueBlocked { .. }
+            | ResumeOutcome::ReplaceAgent { .. }
+            | ResumeOutcome::SkipStep { .. } => {
+                let ledger_entries = resume::apply_outcome(&mut *graph, &outcome, blocked.as_ref());
+                let re_armed = if outcome.dispatches() {
+                    blocked.as_ref().map(|step| step.task_id)
+                } else {
+                    None
+                };
+                ResumeApplication::Applied { ledger_entries, re_armed }
+            }
+        }
+    }
+
+    /// Append the whiteboard `Decision` event for a resume outcome
+    /// (ADR-65 §7): `selected_agent, reason, required_output,
+    /// supporting_evidence_ids` — real ids only (the append validates them,
+    /// acceptance 8) and fail-soft like every continuity write.
+    async fn append_resume_decision(
+        &self,
+        session_id: Ulid,
+        outcome: &ResumeOutcome,
+        evidence_ids: &[String],
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let required_output = match outcome {
+            ResumeOutcome::RestoreAndContinue => {
+                "Restored the graph; no blocked step to decide on".to_owned()
+            }
+            ResumeOutcome::ContinueBlocked { agent } => {
+                format!("Continue the blocked subtask with {agent} from the whiteboard cursor")
+            }
+            ResumeOutcome::ReplaceAgent { previous, replacement } => {
+                format!("Replace the blocked subtask's agent {previous} with {replacement}")
+            }
+            ResumeOutcome::SkipStep { agent } => {
+                format!("Skip the blocked subtask previously dispatched to {agent}")
+            }
+            ResumeOutcome::RefreshEvidence => {
+                "Refresh the workspace evidence (snapshot barrier re-ran); continue".to_owned()
+            }
+            ResumeOutcome::Replan => {
+                "Workspace objectively changed: the Coordinator re-decides on a fresh decompose"
+                    .to_owned()
+            }
+        };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": outcome.selected_agent().unwrap_or(""),
+                "reason": outcome.reason_code(),
+                "required_output": required_output,
+                "supporting_evidence_ids": evidence_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(error) = append_whiteboard_event(pool, &event).await {
+            warn!(%error, "ADR-65 §7: resume decision append failed (fail-soft)");
         }
     }
 
@@ -2116,10 +4605,14 @@ impl CoordinatorAgent {
         mut retry_feedback: HashMap<TaskId, Vec<AgentRunResult>>,
         mut model_assignments: HashMap<TaskId, String>,
         mut action_ledger: Vec<checkpoint::CheckpointAction>,
+        run_objective: String,
+        run_objective_hash: String,
+        loop_notes: Vec<String>,
+        requested_user_input: Option<String>,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
-        // ADR-52: the run-wide dispatch cap is per `execute_graph` invocation
-        // (a fresh run or a resume from checkpoint restarts the counter).
-        self.model_dispatch_count = 0;
+        // ADR-52: the run-wide dispatch cap is counted across the whole `run`
+        // invocation (the Coordinator decision loop + this graph loop share
+        // one ceiling); the counter is reset in `run`, never here.
         let mut terminal_subtask_failure = None;
         // When resuming from a checkpoint, blocked tasks with exhausted retry
         // attempts may already be present in the graph.  Populate
@@ -2153,7 +4646,12 @@ impl CoordinatorAgent {
             }
         }
         let mut non_recoverable_exit: Option<(TaskId, AgentId, OrchestratorError)> = None;
-        let mut recoverable_notes = Vec::new();
+        // Notes carried over from the Coordinator's decision loop (ADR-35
+        // amendment 2026-09-05): per-call zero-work flags, an empty dispatch
+        // session on an action-required run, and the cap/iteration-bound
+        // stops. They downgrade the run exit to `Partial` exactly like the
+        // in-loop notes below.
+        let mut recoverable_notes: Vec<String> = loop_notes;
         // Zero-file implement successes short-circuit to a revision subtask
         // only ONCE per lineage (reset per `execute_graph` invocation, like
         // `model_dispatch_count`). Keyed by the lineage root: the FIRST
@@ -2170,11 +4668,17 @@ impl CoordinatorAgent {
             session_id: task.session_id,
             root_task_id: task.id,
             project_id: context.session.project_id.0.clone(),
-            objective: task.description.clone(),
-            objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+            // Run-continuity Phase 1: the run objective (the ORIGINAL
+            // objective text on a resumed run, the task description on a
+            // fresh one) — never the (bare "continue") resume input.
+            objective: run_objective,
+            objective_hash: run_objective_hash,
             source_revision: self.source_revision.clone(),
             sequence_num: 0,
         };
+        // ADR-65 §3: stamp the run id (matching the checkpoint scope) so
+        // every dispatched agent records its tool evidence under this run.
+        self.run_id = Some(checkpoint_scope.run_id.to_string());
         refresh_working_memory(
             &mut context,
             &graph,
@@ -2183,7 +4687,7 @@ impl CoordinatorAgent {
             self.blueprint_facade.as_ref(),
         );
         checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-        let initial_execution_checkpoint = checkpoint::build_checkpoint(
+        let mut initial_execution_checkpoint = checkpoint::build_checkpoint(
             &checkpoint_scope,
             checkpoint::CheckpointStage::Executing,
             None,
@@ -2199,7 +4703,47 @@ impl CoordinatorAgent {
             &retry_feedback,
             &self.checkpoint_context(&model_assignments, &action_ledger),
         );
-        self.persist_checkpoint(&initial_execution_checkpoint).await;
+        self.persist_checkpoint(&mut initial_execution_checkpoint).await;
+
+        // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
+        // The Coordinator requested human input during its decision loop
+        // (`request_user_input`). The run stops HERE — before any further
+        // graph dispatch — with the execution checkpoint preserved so a
+        // resume can continue after the operator answers (the interactive
+        // answer channel is TODO #22/#23). The reason rides the final
+        // message; the status is `AwaitingUser`.
+        if let Some(reason) = requested_user_input {
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
+            );
+            let checkpoint_json = serde_json::to_string(&initial_execution_checkpoint).ok();
+            // Exact-reset the settled mirror like the success tail: the
+            // output's vec is the single source of truth.
+            self.settled_metrics.clear();
+            self.settled_metrics.extend(provider_metrics.iter().cloned());
+            return Ok((
+                AgentOutput {
+                    task_id: task.id,
+                    session_id: task.session_id,
+                    final_message: reason,
+                    files_modified: crate::tool_facts::sanitize_files_modified(
+                        &context.session.project_dir,
+                        &all_files,
+                    ),
+                    tool_call_count: total_tool_calls,
+                    eval_result: None,
+                    tool_events: Vec::new(),
+                    verification: Vec::new(),
+                    project_root: None,
+                    completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
+                    provider_metrics,
+                    checkpoint_json,
+                },
+                recoverable_notes,
+            ));
+        }
 
         // ADR-35 §5: lifecycle stages are resolved from the registry rather
         // than hardcoded role ids. A pipeline without a design-stage agent
@@ -2208,11 +4752,15 @@ impl CoordinatorAgent {
         // already rejects that case). Tags are resolved through the facade
         // by kind, so renamed Planning/Execution stages keep their replan
         // and revision machinery (issue #150).
+        // In-memory starvation-aging counters for the #58 scheduler: cycles
+        // each task waited ready without being dispatched. Recomputed from
+        // graph state, never persisted (stateless across resume by design).
         let design_tag =
             kind_stage_tag(self.blueprint_facade.as_ref(), StageKind::Planning, AgentStage::DESIGN);
         let design_role = self.first_agent_for_stage(&AgentStage::new(design_tag));
         let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
         let implement_ids = self.registry.ids_for_stage(&AgentStage::new(implement_tag));
+        let mut scheduler_aging: HashMap<TaskId, u32> = HashMap::new();
 
         loop {
             if cancel.is_cancelled() {
@@ -2232,7 +4780,7 @@ impl CoordinatorAgent {
                     self.blueprint_facade.as_ref(),
                 );
                 checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let interrupted = checkpoint::build_checkpoint(
+                let mut interrupted = checkpoint::build_checkpoint(
                     &checkpoint_scope,
                     checkpoint::CheckpointStage::Executing,
                     None,
@@ -2248,13 +4796,225 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&interrupted).await;
+                self.persist_checkpoint(&mut interrupted).await;
                 return Err(OrchestratorError::Cancelled);
             }
 
-            // Clone IDs to avoid borrow conflicts with mutable graph access
-            let ready_ids: Vec<(TaskId, AgentId)> =
-                graph.ready_tasks().iter().map(|st| (st.id, st.role.clone())).collect();
+            // ── Issue #58: deterministic critical-path-ready batch order ──
+            // `ready_tasks()` yields in HashMap order; the batch used to be
+            // dispatched in that raw order. It is now ranked by the pure
+            // scheduler (live graph re-derived each cycle, so #57 splits and
+            // merges are naturally reflected) and each pick carries a WHY
+            // reason, surfaced as one whiteboard thought per cycle. The
+            // whole batch still dispatches, so the aging reset below is the
+            // "everything was picked" branch of the starvation protocol.
+            let ready_ids: Vec<(TaskId, AgentId)> = {
+                let registered: HashSet<AgentId> = self.registry.ids().into_iter().collect();
+                let scheduling = crate::scheduler::SchedulerContext {
+                    attempts: &subtask_attempts,
+                    available_roles: Some(&registered),
+                    aging: &scheduler_aging,
+                };
+                let picks = crate::scheduler::schedule_batch(&graph, &scheduling, None);
+                scheduler_aging.clear();
+                if picks.len() > 1 {
+                    let summary = picks
+                        .iter()
+                        .map(|pick| format!("{} — {}", pick.task_id, pick.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    tracing::info!(
+                        target: "orchestrator::scheduler",
+                        picks = picks.len(),
+                        "ready batch ranked by critical-path priority"
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: format!("Task scheduling ranked the ready batch: {summary}"),
+                        },
+                    );
+                }
+                picks
+                    .into_iter()
+                    .filter_map(|pick| {
+                        graph.get(&pick.task_id).map(|subtask| (pick.task_id, subtask.role.clone()))
+                    })
+                    .collect()
+            };
+
+            // ADR-64 Phase 5: capsule projection — clone the timeline
+            // projection out of the resolver block so it is available
+            // for capsule building in the dispatch futures below.
+            let mut projection_for_capsule: Option<crate::timeline::TimelineProjection> = None;
+
+            // ── ADR-64 Phase 6: resolver short-circuit ──────────────
+            // Before dispatching any ready tasks, check whether the
+            // resolver can prove a task is *reusable* from the timeline.
+            // Reuse = zero model dispatch: the cached result is injected
+            // directly.  All other verdicts flow through normal dispatch.
+            let ready_ids = if !ready_ids.is_empty() {
+                if let Some(pool) = self.review_store.as_ref() {
+                    // Build the timeline projection from durable sources.
+                    let projection_opt = match crate::timeline::build_timeline(
+                        pool,
+                        Some(&task.session_id.to_string()),
+                        self.last_plan_id.as_deref(),
+                        u64::MAX,
+                    )
+                    .await
+                    {
+                        Ok(proj) => Some(proj),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "orchestrator::coordinator",
+                                error = %e,
+                                "resolver: failed to build timeline projection, skipping reuse short-circuit"
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(projection) = projection_opt {
+                        // ADR-64 Phase 5: keep a clone for capsule building.
+                        projection_for_capsule = Some(projection.clone());
+                        // Derive plan_version: design_doc content hash → objective_hash.
+                        let plan_version = {
+                            let design_doc =
+                                self.design_doc.lock().unwrap_or_else(|error| error.into_inner());
+                            if let Some(ref doc) = *design_doc {
+                                // Hash the serialized design doc to get a stable
+                                // content hash, matching plan_approval.rs:173.
+                                serde_json::to_string(doc)
+                                    .ok()
+                                    .map(|s| blake3::hash(s.as_bytes()).to_hex().to_string())
+                                    .unwrap_or_else(|| checkpoint_scope.objective_hash.clone())
+                            } else {
+                                checkpoint_scope.objective_hash.clone()
+                            }
+                        };
+
+                        let expected_map = self.expected_artifacts_snapshot();
+
+                        let pass = resolver_integration::resolve_batch(
+                            &ready_ids,
+                            &graph,
+                            &completed_results,
+                            &projection,
+                            &checkpoint_scope.objective_hash,
+                            &plan_version,
+                            &expected_map,
+                        );
+
+                        // Inject cached results for reused tasks.
+                        for (tid, outcome) in &pass.reused {
+                            if let ResolverOutcome::Reused { result, audit } = outcome {
+                                // 1. Inject cached result.
+                                completed_results.insert(*tid, *result.clone());
+                                // 1b. Accumulate files_modified so the final
+                                //     AgentOutput is complete.
+                                all_files.extend(result.files_modified.clone());
+                                // 2. Mark graph node done.
+                                graph.mark_done(tid);
+                                // 3. Set deliverable on the SubTask.
+                                if let Some(subtask) = graph.get_mut(tid) {
+                                    subtask.deliverable = Some(result.summary.clone());
+                                }
+                                // 4. Clear retry feedback.
+                                retry_feedback.remove(tid);
+                                // 5. Record in the checkpoint action ledger.
+                                action_ledger.push(checkpoint::CheckpointAction {
+                                    kind: "resolver-reuse".into(),
+                                    task_id: Some(*tid),
+                                    timestamp: time::OffsetDateTime::now_utc(),
+                                    evidence: None,
+                                });
+                                // 6. Publish audit via event bus for real-time
+                                //    visibility.  The checkpoint action ledger
+                                //    provides durability across resume.
+                                let _ = self.bus.publish_for_session(
+                                    task.session_id,
+                                    tid.0,
+                                    EventKind::AgentThought {
+                                        agent_id: "coordinator".into(),
+                                        content: format!(
+                                            "ADR-64 resolver: Reuse short-circuit for task {tid} \
+                                             (semantic_key={}, reason: {})",
+                                            audit.semantic_key_hex, audit.reason,
+                                        ),
+                                    },
+                                );
+                                // 7. Add a working-memory decision so the
+                                //    timeline enrichment sees the audit.
+                                context.working_memory.decisions.push(
+                                    concerto_core::memory::Decision {
+                                        id: concerto_core::memory::DecisionId(
+                                            concerto_core::ids::Ulid::new(),
+                                        ),
+                                        session_id: task.session_id,
+                                        task_id: Some(*tid),
+                                        what: "ADR-64 resolver: Reuse".into(),
+                                        why: audit.reason.clone(),
+                                        outcome: Some(result.summary.chars().take(500).collect()),
+                                        category:
+                                            concerto_core::memory::DecisionCategory::Implementation,
+                                        confidence: 1.0,
+                                        superseded_by: None,
+                                        created_at: time::OffsetDateTime::now_utc(),
+                                    },
+                                );
+                            }
+                        }
+
+                        // Return only the non-reused task IDs for normal dispatch.
+                        pass.dispatch_ids
+                    } else {
+                        // Projection build failed — dispatch all.
+                        ready_ids
+                    }
+                } else {
+                    // No pool available — skip resolver, dispatch all.
+                    ready_ids
+                }
+            } else {
+                ready_ids
+            };
+
+            // ── Issue #52: batch-validate the ready set BEFORE dispatch ──
+            // Deterministic execution, but the invariant is enforced — every
+            // ready target must still be a registered agent. A role the
+            // registry no longer holds is blocked structurally (never
+            // silently dropped the batch's work): the step is marked
+            // blocked with a run note, keeping the DAG resumable.
+            let (ready_ids, batch_invalid): (Vec<_>, Vec<_>) = {
+                let mut ok = Vec::new();
+                let mut bad = Vec::new();
+                for pair in ready_ids.into_iter() {
+                    if self.registry.get(&pair.1).is_some() {
+                        ok.push(pair);
+                    } else {
+                        bad.push(pair);
+                    }
+                }
+                (ok, bad)
+            };
+            for (task_id, role) in batch_invalid {
+                warn!(%role, %task_id, "ready batch contains an unregistered role; \
+                     blocking the step (issue #52 batch validation)");
+                graph.mark_blocked(&task_id);
+                action_ledger.push(checkpoint::CheckpointAction {
+                    kind: "decision-rejected".into(),
+                    task_id: Some(task_id),
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    evidence: None,
+                });
+                recoverable_notes.push(format!(
+                    "Ready step {task_id} was blocked before dispatch: its role {role} is \
+                     no longer a registered agent (issue #52 decision validation)."
+                ));
+            }
 
             if ready_ids.is_empty() {
                 if graph.all_completed() {
@@ -2273,7 +5033,7 @@ impl CoordinatorAgent {
                         },
                     );
                     checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                    let cp = checkpoint::build_checkpoint(
+                    let mut cp = checkpoint::build_checkpoint(
                         &checkpoint_scope,
                         checkpoint::CheckpointStage::Executing,
                         None,
@@ -2289,14 +5049,17 @@ impl CoordinatorAgent {
                         &retry_feedback,
                         &self.checkpoint_context(&model_assignments, &action_ledger),
                     );
-                    self.persist_checkpoint(&cp).await;
+                    self.persist_checkpoint(&mut cp).await;
                     let checkpoint_json = serde_json::to_string(&cp).ok();
                     return Ok((
                         AgentOutput {
                             task_id: task.id,
                             session_id: task.session_id,
                             final_message,
-                            files_modified: all_files,
+                            files_modified: crate::tool_facts::sanitize_files_modified(
+                                &context.session.project_dir,
+                                &all_files,
+                            ),
                             tool_call_count: total_tool_calls,
                             eval_result: None,
                             tool_events: Vec::new(),
@@ -2334,7 +5097,7 @@ impl CoordinatorAgent {
                     EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
                 );
                 checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let cp = checkpoint::build_checkpoint(
+                let mut cp = checkpoint::build_checkpoint(
                     &checkpoint_scope,
                     checkpoint::CheckpointStage::Executing,
                     None,
@@ -2350,14 +5113,17 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&cp).await;
+                self.persist_checkpoint(&mut cp).await;
                 let checkpoint_json = serde_json::to_string(&cp).ok();
                 return Ok((
                     AgentOutput {
                         task_id: task.id,
                         session_id: task.session_id,
                         final_message,
-                        files_modified: all_files,
+                        files_modified: crate::tool_facts::sanitize_files_modified(
+                            &context.session.project_dir,
+                            &all_files,
+                        ),
                         tool_call_count: total_tool_calls,
                         eval_result: None,
                         tool_events: Vec::new(),
@@ -2372,7 +5138,7 @@ impl CoordinatorAgent {
             }
 
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-            let progress_checkpoint = checkpoint::build_checkpoint(
+            let mut progress_checkpoint = checkpoint::build_checkpoint(
                 &checkpoint_scope,
                 checkpoint::CheckpointStage::Executing,
                 None,
@@ -2388,7 +5154,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&progress_checkpoint).await;
+            self.persist_checkpoint(&mut progress_checkpoint).await;
 
             // ── 2a. Check budget once per batch ─────────────────────
             if self.spend_tracker.check(0.001).is_err() {
@@ -2465,6 +5231,22 @@ impl CoordinatorAgent {
                     })
                     .collect()
             };
+            // ADR-64 Phase 5: pre-compute workspace capsules for each task
+            // in the batch. The projection was cloned out of the resolver
+            // block; build_capsule is pure (no I/O, no LLM calls).
+            let capsules_for_batch: Vec<(TaskId, Option<concerto_core::types::WorkspaceCapsule>)> =
+                if let Some(ref projection) = projection_for_capsule {
+                    expected_for_batch
+                        .iter()
+                        .map(|(tid, artifacts)| {
+                            let capsule =
+                                crate::capsule::build_capsule(projection, tid, &graph, artifacts);
+                            (*tid, Some(capsule))
+                        })
+                        .collect()
+                } else {
+                    batch.iter().map(|ready| (ready.id, None)).collect()
+                };
             let futures = batch.iter().map(|ready| {
                 let tid = ready.id;
                 let rl = ready.role.clone();
@@ -2481,6 +5263,10 @@ impl CoordinatorAgent {
                     .find(|(id, _)| *id == tid)
                     .map(|(_, a)| a.clone())
                     .unwrap_or_default();
+                let task_capsule = capsules_for_batch
+                    .iter()
+                    .find(|(id, _)| *id == tid)
+                    .and_then(|(_, c)| c.clone());
                 async move {
                     let profile = match this.model_selector.select_for_session(
                         &rl,
@@ -2511,6 +5297,10 @@ impl CoordinatorAgent {
                         previous_results,
                         budget_remaining_usd: None,
                         expected_artifacts: task_artifacts,
+                        workspace_capsule: task_capsule,
+                        workspace_snapshot_digest: this.snapshot_digest(&cancel_clone).await,
+                        run_id: this.run_id.clone(),
+                        workspace_generation: this.snapshot_generation(),
                     };
                     // ADR-35 §8 trigger 1 (stage absence): implement subtasks
                     // planned for the reserved `coordinator` role are executed
@@ -2566,7 +5356,21 @@ impl CoordinatorAgent {
                             cancelled_during_batch = true;
                             continue;
                         }
-                        match classify_subtask_error(&e) {
+                        // Issue #54: normalize the error into ONE structured
+                        // diagnosis at the point the failure surfaces; the
+                        // recovery below is deterministic from it (the class
+                        // mapping preserves ADR-42 §1 behavior), and the
+                        // diagnosis rides the audit trail (events + whiteboard
+                        // + the checkpointed history).
+                        let diagnosis = crate::failure_diagnosis::diagnose(&e);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &diagnosis,
+                        )
+                        .await;
+                        match SubtaskFailureClass::from(&diagnosis) {
                             // Transient errors retry the same agent/model
                             // while attempts remain (ADR-42 §1 Recoverable).
                             SubtaskFailureClass::Recoverable
@@ -2623,7 +5427,7 @@ impl CoordinatorAgent {
                                 // counter would drift to MAX + 1, skewing the
                                 // `attempt {attempt}/{MAX}` reporting.
                                 let is_recoverable = matches!(
-                                    classify_subtask_error(&e),
+                                    SubtaskFailureClass::from(&diagnosis),
                                     SubtaskFailureClass::Recoverable
                                 );
                                 if is_recoverable && !self.escalation_attempted.contains(&task_id) {
@@ -2686,6 +5490,10 @@ impl CoordinatorAgent {
                                     previous_results: ladder_entry.previous_results.clone(),
                                     budget_remaining_usd: None,
                                     expected_artifacts: ladder_artifacts,
+                                    workspace_capsule: None,
+                                    workspace_snapshot_digest: self.snapshot_digest(&cancel).await,
+                                    run_id: self.run_id.clone(),
+                                    workspace_generation: self.snapshot_generation(),
                                 };
                                 match self
                                     .attempt_fallback_ladder(
@@ -2765,6 +5573,13 @@ impl CoordinatorAgent {
                 };
 
                 // Record the outcome in the checkpoint action ledger.
+                // ADR-65 §7: the dispatched step settled — the pending
+                // decision it recorded no longer awaits completion.
+                if self.last_dispatch_decision.as_ref().and_then(|pending| pending.task_id)
+                    == Some(task_id)
+                {
+                    self.last_dispatch_decision = None;
+                }
                 action_ledger.push(checkpoint::CheckpointAction {
                     kind: if matches!(result.outcome, AgentOutcome::Success) {
                         "completed".into()
@@ -2807,6 +5622,10 @@ impl CoordinatorAgent {
                         completed_results.insert(task_id, result.clone());
                         retry_feedback.remove(&task_id);
                         graph.mark_done(&task_id);
+                        // Issue #61: the subtask settled completed — the role's
+                        // ownerships release (evented via the attached gate).
+                        self.settle_release_task_ownership(&role, "subtask settled: completed")
+                            .await;
 
                         // ── Replan fallback: design-stage redesign complete ──
                         // When a design-stage replan subtask finishes
@@ -3065,36 +5884,6 @@ impl CoordinatorAgent {
                                     last_error: zero_file_error,
                                 });
                             continue;
-                        } else if implement_phase {
-                            // Any implement-stage agent's success triggers the
-                            // review cycle (ADR-35 §5), not just the built-in
-                            // Coder.
-                            let review_context = context.clone();
-                            let desc_for_review = desc.clone();
-                            let review_result = self
-                                .run_review_cycle(
-                                    &mut graph,
-                                    task_id,
-                                    desc_for_review,
-                                    sid,
-                                    &result,
-                                    &review_context,
-                                    task.clone(),
-                                    &cancel,
-                                )
-                                .await?;
-                            total_cost += review_result.cost_usd;
-                            total_tool_calls += review_result.tool_call_count;
-                            all_files.extend(review_result.files_modified.clone());
-                            let settled = metrics_from_result(&review_result);
-                            provider_metrics.push(settled.clone());
-                            self.settled_metrics.push(settled);
-                            if !matches!(review_result.outcome, AgentOutcome::Success) {
-                                recoverable_notes.push(format!(
-                                    "Review remains unresolved: {}",
-                                    review_result.summary
-                                ));
-                            }
                         }
                     }
                     AgentOutcome::NeedsRevision { reason } => {
@@ -3112,6 +5901,10 @@ impl CoordinatorAgent {
                         self.queue_revision_subtask(&mut graph, task_id, sid, role.clone(), reason);
                     }
                     AgentOutcome::Failed { error } => {
+                        // Issue #61: failure is a settle — release the role's
+                        // leases; a retrying generation re-acquires on its
+                        // first write.
+                        self.settle_release_task_ownership(&role, "subtask settled: failed").await;
                         let _ = self.bus.publish_for_session(
                             task.session_id,
                             task_id.0,
@@ -3121,6 +5914,20 @@ impl CoordinatorAgent {
                                 error: error.clone(),
                             },
                         );
+                        // Issue #54: normalize the settled failure into the
+                        // structured diagnosis (artifact-contract misses,
+                        // malformed output, generic agent failures) and put
+                        // it on the audit trail; the retry/escalation/replan/
+                        // ladder flow below is the recovery the diagnosis's
+                        // flags map onto.
+                        let diagnosis = crate::failure_diagnosis::diagnose_outcome_failure(&error);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &diagnosis,
+                        )
+                        .await;
                         if attempt < self.max_subtask_attempts {
                             retry_feedback.entry(task_id).or_default().push(result.clone());
                             graph.mark_pending(&task_id);
@@ -3300,6 +6107,10 @@ impl CoordinatorAgent {
                             previous_results: ladder_entry.previous_results.clone(),
                             budget_remaining_usd: None,
                             expected_artifacts: ladder_artifacts,
+                            workspace_capsule: None,
+                            workspace_snapshot_digest: self.snapshot_digest(&cancel).await,
+                            run_id: self.run_id.clone(),
+                            workspace_generation: self.snapshot_generation(),
                         };
                         let classify_err = OrchestratorError::AgentLoopError(error.clone());
                         match self
@@ -3380,6 +6191,20 @@ impl CoordinatorAgent {
                         }
                     }
                     AgentOutcome::Blocked { on } => {
+                        // Issue #61: a blocked settle also frees the leases
+                        // (recoverable later — a retried task re-acquires).
+                        self.settle_release_task_ownership(&role, "subtask settled: blocked").await;
+                        // Issue #54: a blocked outcome is the Dependency
+                        // dimension — diagnosed and audited before the
+                        // existing dependency-attach/retry handling.
+                        let diagnosis = crate::failure_diagnosis::diagnose_blocked(&on);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &diagnosis,
+                        )
+                        .await;
                         if attempt < self.max_subtask_attempts {
                             let mut attached = 0usize;
                             let mut failures = Vec::new();
@@ -3486,7 +6311,7 @@ impl CoordinatorAgent {
                 self.blueprint_facade.as_ref(),
             );
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-            let completed_batch_checkpoint = checkpoint::build_checkpoint(
+            let mut completed_batch_checkpoint = checkpoint::build_checkpoint(
                 &checkpoint_scope,
                 checkpoint::CheckpointStage::Executing,
                 None,
@@ -3502,7 +6327,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&completed_batch_checkpoint).await;
+            self.persist_checkpoint(&mut completed_batch_checkpoint).await;
 
             if cancelled_during_batch {
                 return Err(OrchestratorError::Cancelled);
@@ -3529,7 +6354,7 @@ impl CoordinatorAgent {
                     EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
                 );
                 checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let cp = checkpoint::build_checkpoint(
+                let mut cp = checkpoint::build_checkpoint(
                     &checkpoint_scope,
                     checkpoint::CheckpointStage::Executing,
                     None,
@@ -3545,14 +6370,17 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&cp).await;
+                self.persist_checkpoint(&mut cp).await;
                 let checkpoint_json = serde_json::to_string(&cp).ok();
                 return Ok((
                     AgentOutput {
                         task_id: task.id,
                         session_id: task.session_id,
                         final_message,
-                        files_modified: all_files,
+                        files_modified: crate::tool_facts::sanitize_files_modified(
+                            &context.session.project_dir,
+                            &all_files,
+                        ),
                         tool_call_count: total_tool_calls,
                         eval_result: None,
                         tool_events: Vec::new(),
@@ -3567,45 +6395,106 @@ impl CoordinatorAgent {
             }
         }
 
-        // ── 3. Run validation suite ──────────────────────────────────────
-        // C-06: acceptance of a run that contained implement-stage work is
-        // coordinator-owned; the validation loop needs to know whether this
-        // was a build task so it can enforce artifact + verification
-        // evidence.
-        let build_task = graph.all_tasks().iter().any(|subtask| {
-            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
-        });
-        let validation_result = self
-            .run_validation_loop(&task, &context, &cancel, build_task, &mut action_ledger)
-            .await?;
-        total_cost += validation_result.cost_usd;
-        total_tool_calls += validation_result.tool_call_count;
-        all_files.extend(validation_result.files_modified.clone());
-        let settled = metrics_from_result(&validation_result);
-        provider_metrics.push(settled.clone());
-        self.settled_metrics.push(settled);
-        if !matches!(validation_result.outcome, AgentOutcome::Success) {
-            recoverable_notes
-                .push(format!("Validation remains unresolved: {}", validation_result.summary));
-        }
-
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
             EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
         );
 
-        let completion_status = if recoverable_notes.is_empty() {
+        // ── ADR-60 D7 (interrupt-safe resume, 2026-09-05): zero-work guard ─
+        // An action-required (build-classified) run that reaches the success
+        // exit with ZERO executed tool calls never performed the work it
+        // reports completing: subtasks were dispatched, every one answered in
+        // prose, and no tool ever ran — the live F1 acceptance failure (a
+        // "build" prompt produced a "completed" message with zero tool work
+        // past the single-agent and zero-file guards). Run-level mirror of
+        // the single-agent loop's zero-tool guard, evaluated where the whole
+        // run's tool count is known:
+        // - fully resolver-served runs are exempt — no subtask was
+        //   dispatched (the work was proven done from the timeline);
+        // - checkpoint-resumed runs keep the checkpoint's own tool count, so
+        //   only a run with genuinely zero tool work trips;
+        // - answer-only root tasks are out of scope by construction.
+        // The note downgrades the exit to Partial, and the stall gate below
+        // keeps the checkpoint resumable for a later resume.
+        let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
+        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && dispatched_subtasks
+            && total_tool_calls == 0
+        {
+            recoverable_notes.push(
+                "Zero-work guard: the task required tool work but zero tool calls executed \
+                 across the run; the completion claim was not backed by any executed tool."
+                    .to_owned(),
+            );
+        }
+
+        let mut completion_status = if recoverable_notes.is_empty() {
             concerto_core::types::AgentCompletionStatus::Completed
         } else {
             concerto_core::types::AgentCompletionStatus::Partial
         };
-        // Only serialise a checkpoint when the run was not fully completed.
-        let checkpoint_json = if completion_status
-            == concerto_core::types::AgentCompletionStatus::Partial
+        // ── C-06 completion-time acceptance gate ─────────────────────────
+        // ADR-35 amendment (2026-09-16 §4): a build task may only be
+        // reported Completed when the Coordinator actually invoked
+        // verification and the artifacts passed acceptance. The gate
+        // detects "declared verification evidence" — a successful
+        // acceptance-stage dispatch in the ledger (subtask settled with
+        // kind "completed" whose role resolves to StageKind::Acceptance) —
+        // and invokes `acceptance_rejection` to enforce artifact checks
+        // and record the accepted/rejected decision. Without declared
+        // verification evidence the completion claim is downgraded to
+        // Partial with a recoverable note.
+        let build_task = graph.all_tasks().iter().any(|subtask| {
+            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
+        });
+        let has_declared_verification = graph.all_tasks().iter().any(|subtask| {
+            self.role_in_kind_stage(&subtask.role, StageKind::Acceptance, AgentStage::is_validate)
+                && action_ledger
+                    .iter()
+                    .any(|action| action.task_id == Some(subtask.id) && action.kind == "completed")
+        });
+        if build_task && completion_status == concerto_core::types::AgentCompletionStatus::Completed
         {
+            if has_declared_verification {
+                // ADR-35 §4: the Coordinator dispatched a validator that
+                // succeeded. Invoke acceptance_rejection to enforce artifact
+                // checks and record the accepted/rejected decision in the
+                // action ledger.
+                let project_root =
+                    camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+                        .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
+                if let Some(rejected) =
+                    self.acceptance_rejection(&task, build_task, &project_root, &mut action_ledger)
+                {
+                    recoverable_notes.push(rejected.summary.clone());
+                    completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                }
+            } else {
+                // No verification evidence was declared for this run.
+                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                recoverable_notes.push(
+                    "Acceptance gate C-06: the run contained implement-stage work but no \
+                     verification evidence was declared for this run; the completion claim \
+ is reported Partial."
+                        .to_owned(),
+                );
+            }
+        }
+        // ── Run-continuity Phase 1: stall gate at the final exit ────────
+        // A stalled run (declared-Completion false, declared deliverables
+        // unproduced, or a Failed/Blocked subtask) KEEPS its resumable
+        // checkpoint — persisted with completed=false — instead of
+        // clearing it; only a clean success clears, byte-identical to the
+        // pre-Phase-1 behavior.
+        let project_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+            .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
+        let deliverables_missing =
+            expected_artifacts_unproduced(&project_root, &self.expected_artifacts_snapshot());
+        let stalled = run_is_stalled(completion_status, deliverables_missing, &graph);
+        let checkpoint_json = if stalled {
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-            let cp = checkpoint::build_checkpoint(
+            let mut cp = checkpoint::build_checkpoint(
                 &checkpoint_scope,
                 checkpoint::CheckpointStage::Validating,
                 None,
@@ -3621,7 +6510,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&cp).await;
+            self.persist_checkpoint(&mut cp).await;
             serde_json::to_string(&cp).ok()
         } else {
             if let Some(store) = &self.session_store {
@@ -3648,7 +6537,10 @@ impl CoordinatorAgent {
                     recoverable_notes.join(" ")
                 )
                 },
-                files_modified: all_files,
+                files_modified: crate::tool_facts::sanitize_files_modified(
+                    &context.session.project_dir,
+                    &all_files,
+                ),
                 tool_call_count: total_tool_calls,
                 eval_result: None,
                 tool_events: Vec::new(),
@@ -3671,6 +6563,13 @@ impl CoordinatorAgent {
     ) -> Result<AgentOutput, OrchestratorError> {
         // Fresh run: forget settlements from any prior run on this instance.
         self.settled_metrics.clear();
+        // Fresh run: no pending human-input request carries across runs.
+        self.requested_user_input = None;
+        // ADR-52: the run-wide dispatch cap is per `run` invocation (a fresh
+        // run or a resume restarts the counter). The Coordinator's decision
+        // loop counts toward it too, so loop + graph dispatches share one
+        // ceiling.
+        self.model_dispatch_count = 0;
         // Phase 0: Retrieve project memory context
         self.retrieve_memory_context(&task, &mut context, cancel.clone()).await;
 
@@ -3686,12 +6585,18 @@ impl CoordinatorAgent {
             retry_feedback,
             model_assignments,
             action_ledger,
+            dispatch_summary,
+            loop_notes,
+            requested_user_input,
+            objective: run_objective,
+            objective_hash: run_objective_hash,
         } = match self.decompose_or_restore(&task, &context, &cancel, resume_checkpoint_json).await
         {
             Ok(result) => result,
             Err(e) => {
-                // If decomposition fails (e.g. Architect parser error) return
-                // a clean Partial result rather than crashing the session.
+                // If decomposition fails (e.g. a provider error inside the
+                // decision loop) return a clean Partial result rather than
+                // crashing the session.
                 return Ok(AgentOutput {
                     task_id: task.id,
                     session_id: task.session_id,
@@ -3713,12 +6618,17 @@ impl CoordinatorAgent {
 
         // ADR-55 Phase 2b: planning-only orchestration. The plan was just
         // produced (resume is always `None` on this path, so nothing was
-        // restored); render it as the run's final message and return without
-        // dispatching any subtask, review, or validation. No checkpoint is
-        // written or cleared here: a stale partial-run checkpoint stays
-        // untouched for the caller to resolve (M2).
+        // restored); the Coordinator's decision-loop summary IS the plan.
+        // Render it as the run's final message and return without dispatching
+        // any subtask, review, or validation. No checkpoint is written or
+        // cleared here: a stale partial-run checkpoint stays untouched for
+        // the caller to resolve (M2).
         if self.orchestration_depth == OrchestrationDepth::PlanningOnly {
-            let final_message = self.render_plan(&task, &graph);
+            let final_message = if dispatch_summary.is_empty() {
+                self.render_plan(&task, &graph)
+            } else {
+                dispatch_summary
+            };
             let _ = self.bus.publish_for_session(
                 task.session_id,
                 task.id.0,
@@ -3755,6 +6665,10 @@ impl CoordinatorAgent {
             retry_feedback,
             model_assignments,
             action_ledger,
+            run_objective,
+            run_objective_hash,
+            loop_notes,
+            requested_user_input,
         )
         .await
         .map(|(output, _notes)| output)
@@ -3770,6 +6684,28 @@ impl CoordinatorAgent {
         &self.settled_metrics
     }
 
+    /// ADR-60 Deferred 3: persist one review-cycle snapshot (fail-soft).
+    ///
+    /// Returns the stored row's `gate_seq` for cursor chaining, or `None`
+    /// when persistence degraded (no pool attached / append error). The
+    /// review continues either way — continuity bookkeeping must never fail
+    /// a run — and every degradation is logged, never silent.
+    async fn persist_review_state(&self, payload: &ReviewStatePayload) -> Option<u64> {
+        let pool = self.review_store.as_ref()?;
+        match append_review_state_event(pool, payload).await {
+            Ok(stored) => Some(stored.gate_seq),
+            Err(error) => {
+                warn!(
+                    %error,
+                    plan_id = %payload.plan_id,
+                    "failed to persist review state; the review continues without \
+                     resumability (ADR-60 Deferred 3 degradation)"
+                );
+                None
+            }
+        }
+    }
+
     /// Run the review loop: a review-stage agent checks implement output,
     /// re-runs the implement-stage agent if revision is needed, up to
     /// `max_cycles`. The cycle limit is governed by the `CollaborationRule`
@@ -3777,6 +6713,23 @@ impl CoordinatorAgent {
     ///
     /// ADR-35 §5: review participants are resolved by stage tag from the
     /// registry. Pipelines without a review-stage agent skip review.
+    ///
+    /// ADR-60 Deferred 3: with a review store AND an approved-plan binding
+    /// attached, every cycle transition is a full-state whiteboard snapshot
+    /// committed BEFORE the work it describes (WAL-before-invoke), and an
+    /// entry after a restart resumes the interrupted cycle group — ledger,
+    /// retry counters, and cursor rehydrated and validated — instead of
+    /// running a duplicate second review. Costs spent by the crashed attempt
+    /// are gone with it (only verdicts are durable) and are honestly absent
+    /// from the resumed run's totals.
+    ///
+    /// ADR-35 amendment (2026-09-16 §2): review is now a Coordinator
+    /// DECISION (`call_specialist` to the review-stage agent), not an
+    /// automatic post-implement pipeline gate, so no call site remains in
+    /// `execute_graph`. The method is retained (unused) for the Coordinator
+    /// self-review/resumption paths that follow; removing it would delete a
+    /// deliberate, resumable capability.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     async fn run_review_cycle(
         &mut self,
@@ -3841,6 +6794,158 @@ impl CoordinatorAgent {
         let max_cycles =
             self.relationships.max_cycles(&reviewer_role, &implement_role, kind_default);
         self.review_cycles.set_max_cycles(max_cycles);
+        // ── ADR-60 Deferred 3: durable review-cycle state ───────────────────
+        // Identity of THIS cycle group: the approved plan id (the only
+        // identity that survives a process restart) plus a restart-stable
+        // hash of `(implement role, target description)` — approved-plan runs
+        // decompose from the seeded DesignDoc, so the description repeats
+        // byte-identically after a restart. Everything here is fail-soft:
+        // any rehydration or persistence problem degrades to pre-Phase 3
+        // behavior with an observable log, never a run failure.
+        let review_key = match (&self.review_store, self.approved_plan_seed.as_ref()) {
+            (Some(pool), Some(seed)) => Some((
+                pool.clone(),
+                seed.plan_id.clone(),
+                review_target_identity(implement_role.as_str(), &description),
+            )),
+            _ => None,
+        };
+        if review_key.is_none() {
+            tracing::debug!(
+                task_id = %task_id.0,
+                "review cycle not resumable (ADR-60 Deferred 3): no whiteboard store \
+                 attached or no approved-plan binding for this run"
+            );
+        }
+        let mut ledger: Vec<ReviewFeedbackEntry> = Vec::new();
+        let mut retry_count = 0_u32;
+        let mut last_review_event_seq = 0_u64;
+        let mut start_cycle = 1_u32;
+        if let Some((pool, plan_id, target_hash)) = &review_key {
+            match load_review_resume(pool, plan_id, target_hash, &session_id.to_string()).await {
+                Ok(ReviewResume::Resolved { status, feedback_ledger }) => {
+                    // Oracle comment 3 (idempotency): a previous attempt
+                    // already settled this cycle group — its recorded outcome
+                    // stands and NO second reviewer call may run for the same
+                    // target, even though this attempt's implement subtask
+                    // re-entered the review gate.
+                    tracing::info!(
+                        %plan_id,
+                        cycles = feedback_ledger.len(),
+                        ?status,
+                        "review cycle already settled per the whiteboard; suppressing \
+                         duplicate review (ADR-60 Deferred 3)"
+                    );
+                    if status == ReviewCycleStatus::Escalated {
+                        let _ = self.bus.publish_for_session(
+                            session_id,
+                            task_id.0,
+                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                        );
+                    } else {
+                        let _ = self.bus.publish_for_session(
+                            session_id,
+                            task_id.0,
+                            EventKind::ReviewCycleCompleted {
+                                task_id,
+                                cycle_num: u32::try_from(feedback_ledger.len() + 1).unwrap_or(1),
+                                verdict: "pass".into(),
+                            },
+                        );
+                    }
+                    let last_reason = feedback_ledger.last().and_then(|entry| entry.reason.clone());
+                    let summary = match status {
+                        ReviewCycleStatus::Escalated => format!(
+                            "Review remains unresolved: {} (settled before the restart; \
+                             resumed from whiteboard)",
+                            last_reason.unwrap_or_else(|| "max cycles reached".to_owned())
+                        ),
+                        _ => "Review previously completed for this deliverable \
+                              (resumed from whiteboard); no new review run"
+                            .to_owned(),
+                    };
+                    return Ok(AgentRunResult {
+                        task_id: TaskId::new(),
+                        role: source_result.role.clone(),
+                        outcome: AgentOutcome::Success,
+                        summary,
+                        files_modified: Vec::new(),
+                        tool_call_count: 0,
+                        cost_usd: 0.0,
+                        latency_ms: 0,
+                        provider: String::new(),
+                        model: String::new(),
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    });
+                }
+                Ok(ReviewResume::Resume {
+                    resume_cycle,
+                    retry_count: persisted_retries,
+                    feedback_ledger: persisted_ledger,
+                    from_gate_seq,
+                }) => {
+                    if resume_cycle > max_cycles {
+                        // The cap shrank between attempts (config change):
+                        // every slot is spent; settle unresolved without
+                        // another reviewer call rather than exceeding the cap.
+                        warn!(
+                            %plan_id,
+                            %resume_cycle,
+                            %max_cycles,
+                            "persisted review cycle is beyond the current cycle cap; \
+                             settling unresolved without another reviewer call"
+                        );
+                        let _ = self.bus.publish_for_session(
+                            session_id,
+                            task_id.0,
+                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                        );
+                        return Ok(AgentRunResult {
+                            task_id: TaskId::new(),
+                            role: source_result.role.clone(),
+                            outcome: AgentOutcome::Success,
+                            summary: format!(
+                                "Review remains unresolved after {max_cycles} cycles \
+                                 (resumed beyond the configured cap from whiteboard)"
+                            ),
+                            files_modified: Vec::new(),
+                            tool_call_count: 0,
+                            cost_usd: 0.0,
+                            latency_ms: 0,
+                            provider: String::new(),
+                            model: String::new(),
+                            tokens_in: 0,
+                            tokens_out: 0,
+                        });
+                    }
+                    // Fast-forward the in-memory gate counter so `next_cycle`
+                    // inside the loop stays consistent with the persisted
+                    // position (a restart rebuilt this manager empty).
+                    for _ in 1..resume_cycle {
+                        let _ = self.review_cycles.next_cycle(task_id);
+                    }
+                    start_cycle = resume_cycle;
+                    retry_count = persisted_retries;
+                    ledger = persisted_ledger;
+                    last_review_event_seq = from_gate_seq;
+                    tracing::info!(
+                        %plan_id,
+                        %resume_cycle,
+                        retries = retry_count,
+                        "resuming interrupted review cycle from whiteboard state \
+                         (ADR-60 Deferred 3)"
+                    );
+                }
+                // Nothing trustworthy persisted — start fresh (pre-Phase 3).
+                Ok(ReviewResume::Fresh) => {}
+                Err(error) => warn!(
+                    %error,
+                    "review-state lookup failed; proceeding without resumability \
+                     (ADR-60 Deferred 3 degradation)"
+                ),
+            }
+        }
         let mut review_input = source_result.clone();
         let mut revision_cost = 0.0;
         let mut revision_tool_calls = 0_u32;
@@ -3848,7 +6953,7 @@ impl CoordinatorAgent {
         let mut revision_tokens_in = 0_u64;
         let mut revision_tokens_out = 0_u64;
 
-        for cycle in 1..=max_cycles {
+        for cycle in start_cycle..=max_cycles {
             if cancel.is_cancelled() {
                 return Err(OrchestratorError::Cancelled);
             }
@@ -3859,12 +6964,53 @@ impl CoordinatorAgent {
                 EventKind::ReviewCycleStarted { task_id, cycle_num: cycle },
             );
 
+            // ADR-60 Deferred 3 (WAL-before-invoke): commit the FULL snapshot
+            // — ledger, counters, cursor — BEFORE spawning the reviewer, so a
+            // crash can only ever land between durable snapshots. A verdict
+            // lost in that gap leaves the snapshot open and the resumed run
+            // replays exactly one reviewer call with the ledger carried over.
+            if let Some((_pool, plan_id, target_hash)) = &review_key {
+                let snapshot = review_snapshot(
+                    plan_id,
+                    session_id,
+                    implement_role.as_str(),
+                    &description,
+                    target_hash,
+                    ReviewCycleStatus::Started,
+                    max_cycles,
+                    retry_count,
+                    &ledger,
+                    last_review_event_seq,
+                );
+                if let Some(stored_seq) = self.persist_review_state(&snapshot).await {
+                    last_review_event_seq = stored_seq;
+                }
+            }
+
+            // On a resumed cycle the reviewer must see the feedback the
+            // previous attempt already collected — otherwise it would redo
+            // settled work (the redundant cost Phase 3 exists to avoid).
+            let mut review_description = format!("Review cycle {cycle} for: {description}");
+            if !ledger.is_empty() {
+                review_description.push_str(
+                    "\n\nPrior review feedback carried over from before the restart \
+                     (ADR-60 Deferred 3); verify these were addressed instead of \
+                     redoing settled work:",
+                );
+                for entry in &ledger {
+                    let reason = entry.reason.as_deref().unwrap_or("unspecified");
+                    review_description.push_str(&format!(
+                        "\n- cycle {}: needs revision: {reason}",
+                        entry.cycle_num
+                    ));
+                }
+            }
             let review_task = SubTask {
                 id: TaskId::new(),
                 parent_id: Some(task_id),
                 session_id,
                 role: reviewer_role.clone(),
-                description: format!("Review cycle {cycle} for: {description}"),
+                description: review_description,
                 status: concerto_core::types::SubTaskStatus::Pending,
                 dependencies: vec![task_id],
                 deliverable: None,
@@ -3892,6 +7038,10 @@ impl CoordinatorAgent {
                 previous_results: vec![review_input.clone()],
                 budget_remaining_usd: None,
                 expected_artifacts: Vec::new(),
+                workspace_capsule: None,
+                workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+                run_id: self.run_id.clone(),
+                workspace_generation: self.snapshot_generation(),
             };
 
             let result = self
@@ -3903,7 +7053,26 @@ impl CoordinatorAgent {
             }
             graph.mark_done(&review_task_id);
 
-            self.review_cycles.next_cycle(task_id)?;
+            // ADR-35 amendment (2026-09-16 §2): an exceeded review-cycle
+            // count is informational evidence, never a terminal stop. Publish
+            // the escalation event and return the reviewer's verdict as a
+            // recoverable result so the Coordinator decides the next move
+            // (re-dispatch, re-plan, or request_user_input).
+            if self.review_cycles.next_cycle(task_id).is_err() {
+                let _ = self.bus.publish_for_session(
+                    session_id,
+                    task_id.0,
+                    EventKind::ReviewCycleEscalated { task_id, max_cycles },
+                );
+                let mut escalated = result;
+                escalated.cost_usd += revision_cost;
+                escalated.tool_call_count =
+                    escalated.tool_call_count.saturating_add(revision_tool_calls);
+                escalated.files_modified.extend(revision_files);
+                escalated.tokens_in = escalated.tokens_in.saturating_add(revision_tokens_in);
+                escalated.tokens_out = escalated.tokens_out.saturating_add(revision_tokens_out);
+                return Ok(escalated);
+            }
 
             match &result.outcome {
                 AgentOutcome::Success => {
@@ -3916,6 +7085,25 @@ impl CoordinatorAgent {
                             verdict: "pass".into(),
                         },
                     );
+                    // ADR-60 Deferred 3: settle the cycle group durably so a
+                    // restart reports it resolved instead of re-reviewing
+                    // (oracle comment 3). No cursor update needed — this arm
+                    // returns immediately.
+                    if let Some((_pool, plan_id, target_hash)) = &review_key {
+                        let snapshot = review_snapshot(
+                            plan_id,
+                            session_id,
+                            implement_role.as_str(),
+                            &description,
+                            target_hash,
+                            ReviewCycleStatus::Completed,
+                            max_cycles,
+                            retry_count,
+                            &ledger,
+                            last_review_event_seq,
+                        );
+                        let _ = self.persist_review_state(&snapshot).await;
+                    }
                     let mut completed = result.clone();
                     completed.cost_usd += revision_cost;
                     completed.tool_call_count =
@@ -3926,12 +7114,37 @@ impl CoordinatorAgent {
                     return Ok(completed);
                 }
                 AgentOutcome::NeedsRevision { reason } => {
+                    // ADR-60 Deferred 3: the verdict is durable BEFORE any
+                    // follow-up work, so a resumed run never replays a cycle
+                    // that already produced one.
+                    ledger.push(ReviewFeedbackEntry {
+                        cycle_num: cycle,
+                        verdict: "needs-revision".to_owned(),
+                        reason: Some(reason.clone()),
+                    });
+                    retry_count = retry_count.saturating_add(1);
                     if cycle >= max_cycles {
                         let _ = self.bus.publish_for_session(
                             session_id,
                             task_id.0,
                             EventKind::ReviewCycleEscalated { task_id, max_cycles },
                         );
+                        if let Some((_pool, plan_id, target_hash)) = &review_key {
+                            let snapshot = review_snapshot(
+                                plan_id,
+                                session_id,
+                                implement_role.as_str(),
+                                &description,
+                                target_hash,
+                                ReviewCycleStatus::Escalated,
+                                max_cycles,
+                                retry_count,
+                                &ledger,
+                                last_review_event_seq,
+                            );
+                            // Terminal arm — returns below, no cursor update.
+                            let _ = self.persist_review_state(&snapshot).await;
+                        }
                         let mut unresolved = result.clone();
                         unresolved.cost_usd += revision_cost;
                         unresolved.tool_call_count =
@@ -3961,6 +7174,27 @@ impl CoordinatorAgent {
                             rationale: handoff.rationale.clone(),
                         },
                     );
+                    // ADR-60 Deferred 3: durably record the queued revision
+                    // before dispatching it — a crash here resumes AFTER this
+                    // verdict (one fresh implement pass + next review), never
+                    // re-asking the same reviewer question.
+                    if let Some((_pool, plan_id, target_hash)) = &review_key {
+                        let snapshot = review_snapshot(
+                            plan_id,
+                            session_id,
+                            implement_role.as_str(),
+                            &description,
+                            target_hash,
+                            ReviewCycleStatus::RevisionQueued,
+                            max_cycles,
+                            retry_count,
+                            &ledger,
+                            last_review_event_seq,
+                        );
+                        if let Some(stored_seq) = self.persist_review_state(&snapshot).await {
+                            last_review_event_seq = stored_seq;
+                        }
+                    }
                     let coder_task = SubTask {
                         id: TaskId::new(),
                         parent_id: Some(task_id),
@@ -3973,6 +7207,13 @@ impl CoordinatorAgent {
                         created_at: time::OffsetDateTime::now_utc(),
                         completed_at: None,
                     };
+                    let coder_artifacts = self
+                        .expected_artifacts
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&task_id)
+                        .cloned()
+                        .unwrap_or_default();
                     let coder_ctx = AgentContext {
                         session: context.session.clone(),
                         parent_task: Some(task.clone()),
@@ -3980,13 +7221,11 @@ impl CoordinatorAgent {
                         retrieved_chunks: context.retrieved_chunks.clone(),
                         previous_results: vec![result],
                         budget_remaining_usd: None,
-                        expected_artifacts: self
-                            .expected_artifacts
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .get(&task_id)
-                            .cloned()
-                            .unwrap_or_default(),
+                        expected_artifacts: coder_artifacts,
+                        workspace_capsule: None,
+                        workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+                        run_id: self.run_id.clone(),
+                        workspace_generation: self.snapshot_generation(),
                     };
                     // Select routing profile for coder revision
                     let coder_profile = self.model_selector.select_for_session(
@@ -4092,14 +7331,7 @@ impl CoordinatorAgent {
         }
         // Collect the run's expected artifacts across all implement
         // subtasks, de-duplicated.
-        let mut seen = HashSet::new();
-        let expected: Vec<camino::Utf8PathBuf> = self
-            .expected_artifacts_snapshot()
-            .values()
-            .flatten()
-            .filter(|path| seen.insert((*path).clone()))
-            .cloned()
-            .collect();
+        let expected = expected_artifact_list(&self.expected_artifacts_snapshot());
 
         match verify_expected_artifacts(project_root, &expected) {
             Ok(verified) => {
@@ -4135,6 +7367,14 @@ impl CoordinatorAgent {
     /// those runs acceptance is coordinator-owned (audit C-06) and requires
     /// artifact + verification evidence (see [`Self::acceptance_rejection`]).
     /// `action_ledger` records the acceptance decision for the checkpoint.
+    ///
+    /// ADR-35 amendment (2026-09-16 §2): validation is now a Coordinator
+    /// DECISION (`call_specialist` to the acceptance-stage agent), not an
+    /// automatic post-graph pipeline gate, so no call site remains in
+    /// `execute_graph`. The method is retained (unused) for the Coordinator
+    /// self-validation/resumption paths that follow; removing it would delete
+    /// a deliberate, resumable capability.
+    #[allow(dead_code)]
     async fn run_validation_loop(
         &mut self,
         task: &AgentTask,
@@ -4293,8 +7533,24 @@ impl CoordinatorAgent {
                 task.id.0,
                 EventKind::ValidationCycleStarted { task_id: task.id, cycle_num: cycle },
             );
-            // Advance validation cycle counter
-            self.validation_cycles.next_cycle(task.id)?;
+            // ADR-35 amendment (2026-09-16 §2): an exceeded validation-cycle
+            // count is informational evidence, never a terminal stop. Publish
+            // the escalation event and return a recoverable Failed verdict so
+            // the Coordinator decides the next move.
+            if self.validation_cycles.next_cycle(task.id).is_err() {
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    task.id.0,
+                    EventKind::ValidationEscalated { task_id: task.id, max_cycles },
+                );
+                return Ok(acceptance_failure_result(
+                    task,
+                    format!(
+                        "Validation cycle ceiling ({max_cycles}) reached; escalation is \
+                         informational per ADR-35 amendment (2026-09-16 §2)."
+                    ),
+                ));
+            }
 
             // Use the validation-stage agent to run the test suite
             let agent = self.registry.get(&validator_role).ok_or_else(|| {
@@ -4472,392 +7728,3849 @@ impl CoordinatorAgent {
             .join("\n")
     }
 
-    // ── task decomposition ───────────────────────────────────────────────
+    // ── task decomposition — the Coordinator decides (ADR-35 amendment
+    //    2026-09-05) ──────────────────────────────────────────────────────
 
-    /// Run a single design-stage (architect) attempt, folding model-selection
-    /// and run failures into one `Result`. A model-selection failure (e.g.
-    /// `NoAffordableModel` / `PinnedModelNotFound` — classified as
-    /// `LimitReached`) is folded into the same recovery path as a run failure,
-    /// resolved once per attempt inside the retry loop. Returns the completed
-    /// design task plus a validated, non-empty `DesignDoc` on a genuine
-    /// Success; otherwise the failure that the caller's recovery loop class
-    /// decides on.
-    async fn design_stage_attempt(
-        &self,
-        arch_task: &SubTask,
-        role: &AgentId,
+    /// Decompose a user task into the run's initial graph and the
+    /// Coordinator's decision-loop ledger.
+    ///
+    /// ADR-35 amendment (2026-09-05): there is NO compiled dispatch policy.
+    /// No planner output is materialized as `SubTask` roles, no scheduler
+    /// selects agents, and no blueprint staffing gates the roster. The
+    /// Coordinator itself decides — through the policy-gated
+    /// [`CALL_SPECIALIST_TOOL`] tool — which registered specialist to call
+    /// and when, working from the roster context injected into its prompt
+    /// plus the run's recorded evidence. Every `call_specialist` appends an
+    /// evidence-backed whiteboard `Decision` event (ADR-65 §6/§7) and
+    /// materializes a chained `SubTask` node, so the graph is the RECORD of
+    /// what the Coordinator did, not a pre-planned workload.
+    ///
+    /// Kept unchanged by the amendment:
+    /// - the ADR-60 D7 approved-plan seed — a seeded DesignDoc binds
+    ///   unconditionally (the approval IS the evidence) and the architect is
+    ///   NOT re-invoked on the same objective;
+    /// - the DesignDoc verifier chain (ADR-65 §5) — an OPTIONAL policy-gated
+    ///   check the loop runs when the Coordinator's call produces a
+    ///   DesignDoc, never a mandatory stage.
+    async fn decompose_task(
+        &mut self,
         task: &AgentTask,
-        base_ctx: &AgentContext,
+        context: &AgentContext,
         cancel: &CancellationToken,
-        retry_feedback: &[AgentRunResult],
-    ) -> Result<(SubTask, DesignDoc), OrchestratorError> {
-        let arch_ctx = AgentContext {
-            session: base_ctx.session.clone(),
-            parent_task: Some(task.clone()),
-            working_memory: base_ctx.working_memory.clone(),
-            retrieved_chunks: base_ctx.retrieved_chunks.clone(),
-            previous_results: retry_feedback.to_vec(),
-            budget_remaining_usd: None,
-            expected_artifacts: Vec::new(),
-        };
-        let profile = self.model_selector.select_for_session(
-            role,
-            None,
-            arch_task.id,
-            Some(task.session_id),
-        )?;
-        let result =
-            self.runner.run(role.clone(), arch_task, arch_ctx, &profile, cancel.clone()).await?;
+    ) -> Result<(TaskGraph, Option<PlanArtifact>, DispatchLedger, String), OrchestratorError> {
+        let mut graph = TaskGraph::new();
 
-        // A genuine Success carrying a non-empty, parseable DesignDoc completes
-        // the design stage.
-        if let Some(doc) = crate::prompts::parse_json_substring(&result.summary) {
-            if !Self::is_empty_design_doc(&doc) {
-                let mut completed_arch = arch_task.clone();
-                completed_arch.status = SubTaskStatus::Completed;
-                completed_arch.deliverable = Some(result.summary.clone());
-                return Ok((completed_arch, doc));
-            }
+        // ── ADR-60 D7 (#152): an approved-plan Execute seeds its structured
+        // DesignDoc from the whiteboard and skips the architect — re-invoking
+        // the architect with the same objective is exactly the silent
+        // re-decompose D7 forbids. A seed without a stored doc (text-only
+        // plans) falls back to the normal loop rather than inventing a
+        // document.
+        let design_doc: Option<DesignDoc> = self
+            .approved_plan_seed
+            .take()
+            .map(|seed| {
+                tracing::info!(
+                    plan_id = %seed.plan_id,
+                    "executing an approved plan: seeding the whiteboard DesignDoc \
+                     and skipping the architect (ADR-60 D7)"
+                );
+                seed.design_doc
+            })
+            .unwrap_or(None);
+        // Keep the doc so checkpoints and expected-artifact derivation carry
+        // it (C-05).
+        *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = design_doc.clone();
+
+        // The lifecycle role below is OUTPUT-MODE TYPING and relationship
+        // resolution only (ADR-35 amendment §1: stage tags are informational
+        // vocabulary) — it never selects who is dispatched.
+        let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
+
+        let intro = self.dispatch_context_intro(design_doc.as_ref(), None, cancel).await;
+        let mut state =
+            DispatchSessionState { doc: design_doc, doc_verdict: None, last_node: None };
+        let mut ledger = DispatchLedger::default();
+        let mut scope = self.fresh_checkpoint_scope(task, context);
+        let (summary, advisory_plan) = self
+            .run_dispatch_session(
+                &mut graph,
+                task,
+                context,
+                cancel,
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                design_role.as_ref(),
+                &intro,
+            )
+            .await?;
+
+        Ok((graph, advisory_plan, ledger, summary))
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): decompose a
+    /// checkpointless `continue` run from the logged evidence chain.
+    ///
+    /// The CONTEXT comes from the log, not from a fresh model decompose: the
+    /// seed's hash-verified `plan-approved` payload re-anchors the verified
+    /// design (a carried DesignDoc binds unconditionally — the approval IS
+    /// the evidence, exactly like the #152 seeded-doc path; a text-only plan
+    /// rides the run-continuity section) and the seed's REAL event id is
+    /// offered to the Coordinator as citable evidence.
+    ///
+    /// The DECISION, though, is the Coordinator's (ADR-35 amendment
+    /// 2026-09-05): the decision loop re-runs and the Coordinator chooses the
+    /// next dispatch from the restored context and the session's recorded
+    /// evidence — no planner re-entry, no scheduler. Every dispatch is a
+    /// whiteboard `Decision` event citing REAL evidence ids, so ADR-65 §7
+    /// holds on the resume path too: an architect/researcher re-dispatch here
+    /// is impossible without its own recorded, evidence-backed decision.
+    ///
+    /// Mirror of the fresh decompose / checkpoint-restore tail obligations
+    /// (graph validation, a durable plan artifact, the `MultiAgentModeStarted`
+    /// lifecycle event) with the checkpoint objective taken from the seed:
+    /// the recorded objective is the approved plan text and the objective hash
+    /// is the payload's ORIGINAL objective hash, so a later implicit resume
+    /// still matches the original objective text.
+    async fn decompose_from_evidence(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        seed: HeadlessResumeSeed,
+    ) -> Result<DecomposeResult, OrchestratorError> {
+        tracing::info!(
+            plan_approved_event = %seed.plan_approved_event_id,
+            has_design_doc = seed.design_doc.is_some(),
+            "ADR-60 D7: headless resume — the Coordinator re-decides from the logged \
+             evidence chain instead of re-entering design"
+        );
+        let doc = seed.design_doc.clone();
+        // Keep the doc so checkpoints and expected-artifact derivation carry
+        // it, exactly like the seeded approved-plan path.
+        *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = doc.clone();
+        self.last_doc_resolution = Some(match &doc {
+            Some(doc) => checkpoint::CheckpointDocResolution::Active {
+                contract_paths: doc
+                    .proposed_files
+                    .iter()
+                    .map(|path| path.as_str().to_owned())
+                    .collect(),
+                claim_event_id: Some(seed.plan_approved_event_id.clone()),
+                verdict_event_id: None,
+            },
+            None => checkpoint::CheckpointDocResolution::Skipped {
+                claim_event_id: Some(seed.plan_approved_event_id.clone()),
+                verdict_event_id: None,
+            },
+        });
+
+        // The lifecycle role below is OUTPUT-MODE TYPING and relationship
+        // resolution only — it never selects who is dispatched.
+        let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
+
+        let intro = self.dispatch_context_intro(doc.as_ref(), Some(&seed), cancel).await;
+        let mut graph = TaskGraph::new();
+        let mut state = DispatchSessionState { doc, doc_verdict: None, last_node: None };
+        let mut ledger = DispatchLedger::default();
+        let mut scope = checkpoint::CheckpointScope {
+            run_id: Ulid::new(),
+            session_id: task.session_id,
+            root_task_id: task.id,
+            project_id: context.session.project_id.0.clone(),
+            objective: seed.plan_text.clone(),
+            objective_hash: seed.objective_hash.clone(),
+            source_revision: self.source_revision.clone(),
+            sequence_num: 0,
+        };
+        let (summary, advisory_plan) = self
+            .run_dispatch_session(
+                &mut graph,
+                task,
+                context,
+                cancel,
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                design_role.as_ref(),
+                &intro,
+            )
+            .await?;
+        // An empty graph is a legal decompose result (see decompose_task).
+        if !graph.is_empty() {
+            TaskGraphValidator::validate(&graph)?;
         }
 
-        // The model completed a run but produced no usable plan — a Failed /
-        // Blocked outcome or a Success with an empty/unparseable DesignDoc. Any
-        // of these is a recoverable attempt that the recovery loop may retry,
-        // escalate, or rescue via the ladder.
-        Err(match &result.outcome {
-            AgentOutcome::Failed { .. } => OrchestratorError::AgentLoopError(format!(
-                "Design agent failed: {}",
-                result.summary
-            )),
-            outcome if !matches!(outcome, AgentOutcome::Success) => {
-                OrchestratorError::AgentLoopError(format!(
-                    "Design agent failed: {}",
-                    result.summary
-                ))
-            }
-            _ => OrchestratorError::AgentLoopError(
-                "Design agent produced an empty DesignDoc".to_string(),
+        // Mirror the fresh decompose / checkpoint-restore tail: a durable
+        // plan artifact + the lifecycle event.
+        let plan = match advisory_plan {
+            Some(plan) => plan,
+            None => PlanArtifact::from_graph(
+                Ulid::new().to_string(),
+                task,
+                &graph,
+                &self.expected_artifacts_snapshot(),
             ),
+        };
+        let plan_id = self.persist_plan_artifact(&plan);
+        self.last_plan_id = plan_id.clone();
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeStarted {
+                task_id: task.id,
+                subtask_count: graph.len(),
+                plan_id,
+            },
+        );
+        Ok(DecomposeResult {
+            graph,
+            completed_results: ledger.completed_results,
+            total_cost: ledger.total_cost,
+            total_tool_calls: ledger.total_tool_calls,
+            all_files: ledger.all_files,
+            provider_metrics: ledger.provider_metrics,
+            subtask_attempts: ledger.subtask_attempts,
+            retry_feedback: HashMap::new(),
+            model_assignments: ledger.model_assignments,
+            action_ledger: ledger.action_ledger,
+            dispatch_summary: summary,
+            loop_notes: ledger.notes,
+            requested_user_input: self.requested_user_input.take(),
+            objective: seed.plan_text,
+            objective_hash: seed.objective_hash,
         })
     }
 
-    /// Run the design-stage architect through the SAME classify → retry →
-    /// escalate → fallback-ladder recovery the execution-phase dispatch loop
-    /// uses (ADR-42/45). This gives the planning phase the resilience a model
-    /// or provider failure gets during subtask dispatch, instead of a bare
-    /// `.await?` that abandons the whole plan.
+    /// The Coordinator's decision loop (ADR-35 amendment 2026-09-05 §1).
     ///
-    /// Recovery semantics (mirroring the dispatch error arm):
-    /// - any run error → classify; a Recoverable error retries the same
-    ///   agent/model while attempts remain (default `max_subtask_attempts`),
-    ///   with prior failures surfaced via `previous_results`;
-    /// - Recoverable-exhausted or `LimitReached` → one escalation retry (once
-    ///   per task, `Recoverable` only) before the ladder;
-    /// - then the ADR-42 fallback ladder (tier 1 default model → tier 1b
-    ///   default provider → tier 2 coordinator self-execution), isolated from
-    ///   execution-phase walks by the per-`arch_id` guards (`arch_id` is a
-    ///   fresh `TaskId`);
-    /// - only an exhausted ladder surfaces the original error — the caller
-    ///   degrades that to a graceful `Partial` plan, never a hard crash.
+    /// A bounded LLM loop on the planning provider whose toolset is the
+    /// policy-gated [`CALL_SPECIALIST_TOOL`] dispatch (plus the optional
+    /// [`DRAFT_PLAN_TOOL`] advisor and — when the coordinator holds the
+    /// shared executor — the executor's own tools for ADR-35 §8
+    /// self-execution). The loop ends when the model replies without a tool
+    /// call (its final text is the run's dispatch summary), or at the
+    /// structural iteration bound. Every iteration is a model dispatch and
+    /// counts toward the ADR-52 run-wide doom guard.
     ///
-    /// Cancellation propagates immediately and non-recoverable structural
-    /// errors exit without a ladder walk.
-    async fn run_design_stage_with_recovery(
+    /// `PlanningOnly` depth (ADR-55 Phase 2b) offers NO tools: the single
+    /// planning response IS the plan — advisory prose, nothing is
+    /// dispatched, no tools are touched (M1).
+    ///
+    /// Provider failures propagate so the caller degrades to a graceful
+    /// `Partial` result. Cancellation propagates immediately.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_dispatch_session(
         &mut self,
-        role: &AgentId,
+        graph: &mut TaskGraph,
         task: &AgentTask,
         base_ctx: &AgentContext,
         cancel: &CancellationToken,
-        planning_repair: &str,
-    ) -> Result<(SubTask, DesignDoc), OrchestratorError> {
-        let arch_task = SubTask {
-            id: TaskId::new(),
-            parent_id: None,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        design_role: Option<&AgentId>,
+        intro: &str,
+    ) -> Result<(String, Option<PlanArtifact>), OrchestratorError> {
+        let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
+        // Issue #56: rebuild the world model BEFORE the decision prompt is
+        // rendered so the injected block reflects the state the decisions
+        // run against (restored checkpoint state included).
+        self.refresh_world_model(task, &[], Vec::new(), cancel).await;
+        let system_prompt = self.render_dispatch_system_prompt(task, intro, dispatching);
+        let mut tool_defs: Vec<ToolDefinition> = Vec::new();
+        if dispatching {
+            tool_defs.push(call_specialist_tool_definition());
+            tool_defs.push(draft_plan_tool_definition());
+            // Issue #57: the task-restructuring surfaces ride beside the
+            // dispatch decision; they are deterministic graph transforms,
+            // not dispatch paths.
+            tool_defs.push(split_task_tool_definition());
+            tool_defs.push(merge_tasks_tool_definition());
+            // Issue #59: the typed CONSULT surface — read-only advisory,
+            // findings become evidence, never task work.
+            tool_defs.push(consult_tool_definition());
+            // Issue #62: the speculative investigation surface — concurrent
+            // bounded read-only consultations; findings are advisory.
+            tool_defs.push(investigate_tool_definition());
+            // Issue #63: the declarative wait surface — parks the decision
+            // loop on conditions/deadline with zero model turns.
+            tool_defs.push(wait_tool_definition());
+            // ADR-35 amendment (2026-09-16 §2): the human-input request
+            // surface — stops the run AwaitingUser for the operator's answer.
+            tool_defs.push(request_user_input_tool_definition());
+            // Issue #64: the reconsideration surface — supersede a decision
+            // and freeze only its affected pending tasks.
+            tool_defs.push(reconsider_tool_definition());
+            // Issue #61: the mediated ownership-transfer surface — only
+            // lawful when a write gate is attached to the run.
+            if self.write_gate.is_some() {
+                tool_defs.push(transfer_ownership_tool_definition());
+            }
+            if let Some(executor) = &self.tool_executor {
+                tool_defs.extend(executor.tool_definitions());
+            }
+        }
+
+        let profile = match self.planning_profile.clone() {
+            Some(profile) => profile,
+            None => self.model_selector.select_for_session(
+                &AgentId::new("coordinator"),
+                None,
+                task.id,
+                Some(task.session_id),
+            )?,
+        };
+        let model = profile.model_name().to_string();
+
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: system_prompt,
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }];
+        // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
+        // A checkpoint-restored in-flight wait is NEVER re-entered into the
+        // park loop; instead it is re-evaluated exactly once against the
+        // current world and the outcome is handed to the model as the first
+        // dispatch message, so it can continue (woken), re-decide (expired /
+        // still-waiting), or abort (cancelled).
+        if let Some(record) = self.active_wait.take() {
+            let view = self.wake_view_for(graph, task.session_id, &record, cancel).await;
+            let outcome = check_wake(&record, &WakeState::from_view(&view));
+            let (status, outcome_text) = match outcome {
+                WakeOutcome::Woken(WakeReason::Cancelled) => {
+                    (crate::decisions::DecisionStatus::Rejected, "cancelled".to_owned())
+                }
+                WakeOutcome::Woken(reason) => (
+                    crate::decisions::DecisionStatus::Settled,
+                    format!("woken: {}", wake_reason_label(reason)),
+                ),
+                WakeOutcome::Expired => (
+                    crate::decisions::DecisionStatus::Rejected,
+                    "expired (deadline passed unmet)".to_owned(),
+                ),
+                WakeOutcome::StillWaiting => (
+                    crate::decisions::DecisionStatus::Rejected,
+                    "still_waiting (internal cap reached without a tripped condition)".to_owned(),
+                ),
+            };
+            self.decision_journal.transition(&record.decision_id, status);
+            // The resumed session's next persist clears `active_wait` (it was
+            // taken above); a crash before that persist re-runs this one-shot
+            // review, which is idempotent via the forward-only journal guard.
+            messages.push(Message {
+                role: Role::User,
+                content: format!(
+                    "The wait '{reason}' that parked the previous dispatch session was \
+                     re-evaluated against the current world: {outcome_text}. Its decision is \
+                     journaled {status:?}. Continue the work it was parked for, re-decide, or \
+                     abort.",
+                    reason = record.reason,
+                ),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            });
+        }
+        let mut summary = String::new();
+        let mut advisory_plan: Option<PlanArtifact> = None;
+        // Whether the loop ran out of iterations (as opposed to stopping in
+        // prose) — only then is the structural-bound note warranted.
+        let mut hit_iteration_bound = true;
+        // Issue #59: question ids the deterministic consultation request has
+        // already been injected for (once per question per session).
+        let mut consult_nudged_questions: HashSet<String> = HashSet::new();
+        // Issue #53: set when the progress guard escalates (recovery budget
+        // exhausted) — the loop then stops through the recoverable-note
+        // machinery, so the tail must not add a second, misleading
+        // structural-bound note.
+        let mut stall_escalated = false;
+
+        for _iteration in 0..MAX_DISPATCH_ITERATIONS {
+            if cancel.is_cancelled() {
+                return Err(OrchestratorError::Cancelled);
+            }
+            // The ADR-52 run-wide doom guard counts THIS loop's model
+            // dispatches too — `execute_graph` no longer resets the counter
+            // (the reset moved to `run`), so loop + graph dispatches share
+            // one ceiling.
+            if self.iteration_cap_reached() {
+                ledger.notes.push(format!(
+                    "Run-wide dispatch cap reached inside the coordinator decision loop \
+                     ({} total model dispatches); the loop stopped and preserved its \
+                     recorded dispatches.",
+                    self.max_total_iterations.unwrap_or(0)
+                ));
+                break;
+            }
+            self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+            if self.spend_tracker.check(0.001).is_err() {
+                return Err(OrchestratorError::NoBudgetForDelegation);
+            }
+
+            let request = CompletionRequest {
+                model: model.clone(),
+                messages: messages.clone(),
+                tools: (!tool_defs.is_empty()).then_some(tool_defs.clone()),
+                tool_choice: None,
+                temperature: Some(0.7),
+                max_tokens: Some(8192),
+                stream: false,
+            };
+            let (text, reasoning, tool_calls, _usage) = crate::prompts::complete_provider_request(
+                &self.planning_provider,
+                &request,
+                &self.retry_policy,
+                &self.bus,
+                task.session_id,
+                task.id,
+                cancel,
+            )
+            .await?;
+
+            messages.push(Message {
+                role: Role::Assistant,
+                content: text.clone(),
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
+                tool_results: None,
+                reasoning_content: reasoning,
+                tokens_in: None,
+                tokens_out: None,
+            });
+
+            if tool_calls.is_empty() {
+                summary = text;
+                hit_iteration_bound = false;
+                break;
+            }
+
+            // ── Issue #53: per-cycle observables ────────────────────────
+            // One full observe→decide→dispatch cycle completes when this
+            // iteration's tool calls have all run to settlement. Baselines
+            // are captured now; the summary is finalized after the tool
+            // loop below and consulted by the progress tracker once per
+            // cycle.
+            let journal_len_before_cycle = self.decision_journal.len();
+            let cost_before_cycle = ledger.total_cost;
+            let mut observation = crate::progress::CycleObservation::default();
+
+            for tool_call in tool_calls {
+                if cancel.is_cancelled() {
+                    return Err(OrchestratorError::Cancelled);
+                }
+                let mut call_plan: Option<PlanArtifact> = None;
+                let result = match tool_call.name.as_str() {
+                    CALL_SPECIALIST_TOOL if dispatching => {
+                        let result = self
+                            .handle_call_specialist(
+                                graph,
+                                task,
+                                base_ctx,
+                                cancel,
+                                scope,
+                                ledger,
+                                state,
+                                design_role,
+                                &tool_call.arguments,
+                            )
+                            .await;
+                        crate::progress::observe_specialist_result(
+                            &tool_call.arguments,
+                            &result,
+                            &mut observation,
+                        );
+                        result
+                    }
+                    DRAFT_PLAN_TOOL if dispatching => {
+                        observation.draft_plan = true;
+                        let (result, plan) =
+                            self.handle_draft_plan(task, cancel, state.doc.as_ref()).await;
+                        call_plan = plan;
+                        result
+                    }
+                    // Issue #57: the deterministic task-restructuring
+                    // surfaces. Same failure discipline as the dispatch
+                    // decision: validate against the real graph BEFORE any
+                    // mutation; a rejected transform is a structured tool
+                    // error the model reads, never a crash.
+                    SPLIT_TASK_TOOL if dispatching => {
+                        self.handle_split_task(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    MERGE_TASKS_TOOL if dispatching => {
+                        self.handle_merge_tasks(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #59: the typed CONSULT operation. Read-only
+                    // advisory: validate → policy-gate → consult the named
+                    // specialist under the read-only grant boundary →
+                    // record the findings as evidence. No SubTask node, no
+                    // ownership/completion/ledger-task state.
+                    CONSULT_SPECIALIST_TOOL if dispatching => {
+                        self.handle_consult_specialist(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #62: concurrent speculative read-only
+                    // investigation. Multiple hypotheses run bounded
+                    // consultations in parallel via `join_all` (mirroring
+                    // the `execute_graph` concurrency precedent); findings
+                    // are advisory only, never auto-promoted to verified.
+                    INVESTIGATE_HYPOTHESES_TOOL if dispatching => {
+                        self.handle_investigate_hypotheses(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #63: the declarative wait surface. A typed,
+                    // validated decision; the loop parks inside the handler
+                    // (bounded, cancellable slices — no model turns while
+                    // parked), so the #53 progress guard never sees an
+                    // in-flight wait as a no-progress cycle.
+                    WAIT_TOOL if dispatching => {
+                        self.handle_wait(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // ADR-35 amendment (2026-09-16 §2): the human-input
+                    // request surface. The handler records the reason and the
+                    // loop unwinds (inner and outer breaks below); the run
+                    // ends AwaitingUser with the reason and a preserved
+                    // checkpoint. Dispatches nothing, touches no tools — the
+                    // operator-consent path itself applies no policy gate.
+                    REQUEST_USER_INPUT_TOOL if dispatching => {
+                        self.handle_request_user_input(&tool_call.arguments).await
+                    }
+                    // Issue #64: the explicit reconsideration surface — the
+                    // model supersedes a decision and freezes ONLY its
+                    // affected pending tasks (a deterministic transform,
+                    // like split/merge). Completed work is never touched.
+                    RECONSIDER_TOOL if dispatching => {
+                        self.handle_reconsider(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            state,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Issue #61: the mediated transfer operation — a typed,
+                    // validated decision applied by the attached gate. It
+                    // moves records only from their actual current owner;
+                    // rejected/unowned paths are structured errors; never a
+                    // dispatch surface.
+                    TRANSFER_OWNERSHIP_TOOL if dispatching => {
+                        self.handle_transfer_ownership(task, base_ctx, cancel, &tool_call.arguments)
+                            .await
+                    }
+                    // ADR-35 §8 self-execution: the coordinator's own tools
+                    // (shared executor — policy engine, VirtualFs, write
+                    // gates apply unchanged). Offered only while dispatching
+                    // is enabled.
+                    name if dispatching
+                        && tool_executor_offers(self.tool_executor.as_deref(), name) =>
+                    {
+                        let files_len_before = ledger.all_files.len();
+                        let result = self
+                            .handle_executor_tool(
+                                base_ctx,
+                                cancel,
+                                ledger,
+                                &tool_call.arguments,
+                                name,
+                            )
+                            .await;
+                        // Paths the executor tools touched this cycle are
+                        // observable artifacts (the ledger list is
+                        // append-only within a session).
+                        observation.artifacts.extend(
+                            ledger.all_files[files_len_before..]
+                                .iter()
+                                .map(|path| path.to_string()),
+                        );
+                        result
+                    }
+                    _ => {
+                        // Unknown tool, or a tool call while dispatching is
+                        // disabled (planning-only depth): answer as a tool
+                        // error and let the model finish in prose.
+                        serde_json::json!({
+                            "error": "unknown_tool",
+                            "message": format!(
+                                "tool {} is not available in this run",
+                                tool_call.name
+                            ),
+                        })
+                    }
+                };
+                if call_plan.is_some() {
+                    advisory_plan = call_plan;
+                }
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    task.id.0,
+                    EventKind::AgentThought {
+                        agent_id: "coordinator".into(),
+                        content: format!(
+                            "Tool {} → {}",
+                            tool_call.name,
+                            result
+                                .get("outcome")
+                                .or_else(|| result.get("error"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("completed")
+                        ),
+                    },
+                );
+                messages.push(Message {
+                    role: Role::Tool,
+                    content: String::new(),
+                    tool_calls: None,
+                    tool_results: Some(vec![ToolResult {
+                        id: tool_call.id,
+                        name: tool_call.name.clone(),
+                        content: result,
+                    }]),
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                });
+                // ADR-35 amendment (2026-09-16 §2): the tool result was just
+                // delivered and the Coordinator requested human input — stop
+                // this batch's remaining tool calls; the outer break below
+                // ends the loop.
+                if self.requested_user_input.is_some() {
+                    break;
+                }
+            }
+
+            // ── ADR-35 amendment (2026-09-16 §2): the Coordinator asked the
+            //       operator a question — the decision loop ends here. This is
+            //       a deliberate stop (not the iteration bound), so the tail's
+            //       structural-bound note is suppressed below.
+            if self.requested_user_input.is_some() {
+                hit_iteration_bound = false;
+                break;
+            }
+
+            // ── Issue #53: progress-aware stall detection ──────────────
+            // Finalize the cycle's summary from the real state and consult
+            // the tracker ONCE per completed cycle. Recovery reuses THIS
+            // loop (a bounded reconsideration prompt into the existing
+            // conversation); escalation stops the loop with a recoverable
+            // note — never a hard error. The hard iteration ceilings remain
+            // untouched complements.
+            observation.snapshot_generation = self.snapshot_generation();
+            observation.spend_delta_usd = ledger.total_cost - cost_before_cycle;
+            observation.timestamp_ms = crate::tool_facts::unix_ms();
+            for entry in self.decision_journal.entries().iter().skip(journal_len_before_cycle) {
+                observation.journal_transitions.push((
+                    crate::progress::decision_kind_label(entry.kind).to_owned(),
+                    crate::progress::decision_status_label(entry.status).to_owned(),
+                ));
+            }
+            // Issue #56: rebuild the world model once per completed cycle so
+            // every subsequent decision (the verified-clean skip check at
+            // dispatch time, the next session's prompt) consumes a CURRENT
+            // projection, not the session-entry snapshot.
+            if !stall_escalated {
+                let ledger_paths: Vec<camino::Utf8PathBuf> = ledger.all_files.clone();
+                let models: Vec<String> = ledger.model_assignments.values().cloned().collect();
+                self.refresh_world_model(task, &ledger_paths, models, cancel).await;
+                // Issue #59: the deterministic low-confidence trigger — a
+                // standing unresolved question aged past
+                // [`crate::consultation::CONSULT_TRIGGER_MIN_CYCLES`]
+                // requests a consultation BEFORE the next decision turn.
+                // Placement: immediately after the projection the next
+                // decision consumes, riding the same reconsideration-nudge
+                // pattern as issue #53 (a bounded user message into the
+                // existing conversation — never a forced tool call). A
+                // settled consultation resolves the question (issue #56
+                // Q-RESOLVE rules read the Settled consult decision), so
+                // the request stops once the advice lands.
+                if let Some((question_id, nudge)) =
+                    crate::consultation::consultation_nudge(&self.world_model)
+                {
+                    if consult_nudged_questions.insert(question_id) {
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task.id.0,
+                            EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: nudge.clone(),
+                            },
+                        );
+                        messages.push(Message {
+                            role: Role::User,
+                            content: nudge,
+                            tool_calls: None,
+                            tool_results: None,
+                            reasoning_content: None,
+                            tokens_in: None,
+                            tokens_out: None,
+                        });
+                    }
+                }
+            }
+            match self.progress_tracker.observe(&observation) {
+                crate::progress::CycleVerdict::Progressing => {}
+                crate::progress::CycleVerdict::Reconsider(nudge) => {
+                    tracing::info!(
+                        target: "orchestrator::coordinator",
+                        "progress guard: equivalent coordinator cycles detected; \
+                         injecting a bounded reconsideration"
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: nudge.clone(),
+                        },
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: nudge,
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                }
+                crate::progress::CycleVerdict::Escalate(note) => {
+                    tracing::warn!(
+                        target: "orchestrator::coordinator",
+                        "progress guard: recovery budget exhausted on equivalent \
+                         coordinator cycles; stopping the decision loop"
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: note.clone(),
+                        },
+                    );
+                    ledger.notes.push(note);
+                    stall_escalated = true;
+                    break;
+                }
+            }
+        }
+
+        if hit_iteration_bound && !stall_escalated && !cancel.is_cancelled() {
+            // The structural bound ran out with tool calls still pending.
+            // Finish in prose: the recorded dispatches stay, the loop stops.
+            ledger.notes.push(format!(
+                "Coordinator decision loop hit its structural iteration bound \
+                 ({MAX_DISPATCH_ITERATIONS} model turns) and stopped; the recorded \
+                 dispatches were preserved."
+            ));
+        }
+
+        Ok((summary, advisory_plan))
+    }
+
+    /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
+    /// validate → policy-gate → record the evidence-backed Decision event →
+    /// materialize the chained SubTask → dispatch through the existing
+    /// specialist-run plumbing → record the outcome → return it as the tool
+    /// result so the Coordinator can decide next.
+    ///
+    /// Failure discipline: an unknown/disabled agent id, a malformed
+    /// argument, or a policy denial returns a structured tool ERROR result —
+    /// never a crash. Cancellation propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_call_specialist(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        design_role: Option<&AgentId>,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = CallSpecialistArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "call_specialist requires string agent_id and task",
+            });
+        };
+
+        // ── Issue #52: validate the decision BEFORE any mutation ────────
+        // The model output is a proposition, not an instruction. Evidence
+        // existence is the real whiteboard-row check (dispatch-time, not
+        // only the append-side); the pure rules cover roster membership,
+        // bounds, and kind conflicts. Any failure is a structured tool
+        // error — no state changes, no dispatch.
+        let cited_ids = args.supporting_evidence_ids.clone();
+        let missing_evidence = self.missing_evidence_ids(&cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let decision = match validator.validate(
+            crate::decisions::DecisionKind::DispatchSpecialist,
+            Some(&args.agent_id),
+            &args.task,
+            args.notes.as_deref(),
+            &cited_ids,
+            &args.expected_artifacts,
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    agent = %args.agent_id,
+                    "call_specialist rejected an invalid Coordinator decision (structured \
+                     error, no state mutation)"
+                );
+                return rejection.tool_value();
+            }
+        };
+        let decision_id = decision.id.clone();
+        // Issue #60: the deterministic task class for the suitability
+        // record — derived from the task text + expected artifacts (never
+        // model-judged), attributed to the REQUESTED specialist.
+        let suitability_class =
+            crate::suitability::TaskClass::derive(&args.task, &args.expected_artifacts);
+        let suitability_now = time::OffsetDateTime::now_utc();
+        // Issue #56: the decision consumes the world model at DECISION time
+        // — the deterministic skip-recommendation for completed-verified
+        // work (every expected artifact already verified-clean in the
+        // projection), captured here and attached to the tool result the
+        // model reads back.
+        let world_model_advisory = self.world_model_decision_advisory(&args.expected_artifacts);
+        self.decision_journal.record(decision);
+
+        // ── The DAG frontier must be settled: the chain parent (when any)
+        // is done or definitively blocked — the model cannot back-chain a
+        // new dispatch out of order past open work (ready-set gate) ─────
+        if let Some(parent) = state.last_node {
+            let stall = match graph.get(&parent) {
+                None => Some("no longer in the graph"),
+                Some(node)
+                    if !matches!(
+                        node.status,
+                        SubTaskStatus::Completed | SubTaskStatus::Blocked | SubTaskStatus::Failed
+                    ) =>
+                {
+                    Some("still open")
+                }
+                Some(_) => None,
+            };
+            if stall.is_some() {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    parent = %parent,
+                    "call_specialist rejected: the decision's chain parent is not settled"
+                );
+                return serde_json::json!({
+                    "error": "decision_not_ready",
+                    "message": format!(
+                        "the decision's parent step {parent} is {stall:?}; the dispatch \
+                         would bypass the task DAG — wait for or close it first"
+                    ),
+                });
+            }
+        }
+
+        let agent_id = AgentId::new(&args.agent_id);
+        let Some(agent) = self.registry.get(&agent_id) else {
+            // Structural re-check (the roster can only shrink via
+            // configuration): unreachable through the validator — fail
+            // closed, identical to the historical rejection semantics.
+            return serde_json::json!({
+                "error": "unknown_agent",
+                "message": format!(
+                    "no specialist registered for id {agent_id}; the roster in your \
+                     context lists every callable agent"
+                ),
+            });
+        };
+
+        // ── Policy gate (the SAME engine the shared executor enforces) ────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; dispatch is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: CALL_SPECIALIST_TOOL,
+            input: arguments,
             session_id: task.session_id,
-            role: role.clone(),
-            description: format!(
-                "Design architecture for: {}{}",
-                task.description, planning_repair
-            ),
-            status: SubTaskStatus::Running,
-            dependencies: vec![],
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            // The coordinator loop carries no approval sink: a
+            // RequireApproval verdict is a denial here, mirroring the
+            // executor's requires-approval-no-sink semantics. Any non-`Allow`
+            // verdict (current or future) is likewise a denial.
+            Ok(_) => {
+                // Issue #60: a denied dispatch is a tool/permission
+                // compatibility miss for the requested specialist —
+                // recorded (derive-only history; spend is never scored).
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this specialist dispatch",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
+        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
+        let description = specialist_task_description(&args.task, args.notes.as_deref());
+        let subtask_id = TaskId::new();
+        self.append_dispatch_decision(
+            task.session_id,
+            &agent_id,
+            &reason,
+            &args.task,
+            &args.supporting_evidence_ids,
+            Some(subtask_id),
+        )
+        .await;
+
+        // ── Materialize the SubTask node — the graph RECORDS the decision ──
+        let subtask = SubTask {
+            id: subtask_id,
+            parent_id: state.last_node,
+            session_id: task.session_id,
+            role: agent_id.clone(),
+            description: description.clone(),
+            status: SubTaskStatus::Pending,
+            dependencies: state.last_node.iter().copied().collect(),
             deliverable: None,
             created_at: time::OffsetDateTime::now_utc(),
             completed_at: None,
         };
-        let arch_id = arch_task.id;
+        match state.last_node {
+            Some(parent) => {
+                let relationship =
+                    self.fallback_relationship(graph, parent, &agent_id, design_role);
+                graph.add_child_with_relationship(
+                    subtask,
+                    parent,
+                    Dependency::MustFinishBefore,
+                    relationship,
+                );
+            }
+            None => graph.add_root(subtask),
+        }
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            subtask_id.0,
+            EventKind::SubTaskCreated {
+                task_id: subtask_id,
+                role: agent_id.clone(),
+                description: description.clone(),
+            },
+        );
+        graph.mark_running(&subtask_id);
+        *ledger.subtask_attempts.entry(subtask_id).or_insert(0) += 1;
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "dispatched".into(),
+            task_id: Some(subtask_id),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
 
-        // A role with no registered agent is a configuration error; the caller
-        // surfaces the original failure without a (misdirected) ladder walk.
-        if self.registry.get(role).is_none() {
-            return Err(OrchestratorError::AgentLoopError(format!(
-                "no agent registered for design role {role}"
-            )));
+        // ── Expected artifacts: a BINDING doc's contract paths ride the
+        // implement-stage dispatch (C-06 acceptance). The implement roster
+        // check is output-mode typing only — it never selects dispatch. ────
+        let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
+        let is_implement_role =
+            agent.stage().as_ref().is_some_and(|stage| stage.as_str() == implement_tag);
+        if is_implement_role {
+            if let Some(doc) = binding_doc(state) {
+                self.expected_artifacts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(subtask_id, doc.proposed_files.clone());
+            }
         }
 
-        // Failure feedback accumulated across re-attempts and surfaced to each
-        // re-run through `previous_results` (mirrors the dispatch-loop
-        // `retry_feedback` map).
-        let mut retry_feedback: Vec<AgentRunResult> = Vec::new();
-        // One-shot escalation per task, guarded by the run-level set
-        // (checkpointed with the run).
-        let mut escalated = false;
-        // 1-indexed attempt counter; reset after escalation so the next read
-        // equals `max_subtask_attempts` again (dispatch-loop semantics).
-        let mut attempt: u32 = 0;
-
-        loop {
-            attempt += 1;
-
-            match self
-                .design_stage_attempt(&arch_task, role, task, base_ctx, cancel, &retry_feedback)
-                .await
-            {
-                Ok((completed_arch, doc)) => return Ok((completed_arch, doc)),
-                Err(err) => {
-                    // Cancellation short-circuits (NonRecoverable semantics).
-                    if is_cancellation_error(&err) {
-                        return Err(err);
+        // ── Dispatch through the EXISTING specialist-run plumbing ──────────
+        let run_subtask = SubTask {
+            id: subtask_id,
+            parent_id: state.last_node,
+            session_id: task.session_id,
+            role: agent_id.clone(),
+            description: description.clone(),
+            status: SubTaskStatus::Running,
+            dependencies: state.last_node.iter().copied().collect(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        // The expected-artifacts guard is dropped BEFORE any `.await` so the
+        // future stays `Send`.
+        let expected_for_dispatch = self
+            .expected_artifacts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&subtask_id)
+            .cloned()
+            .unwrap_or_default();
+        let run_ctx = AgentContext {
+            session: base_ctx.session.clone(),
+            parent_task: Some(task.clone()),
+            working_memory: base_ctx.working_memory.clone(),
+            retrieved_chunks: base_ctx.retrieved_chunks.clone(),
+            previous_results: state
+                .last_node
+                .and_then(|parent| ledger.completed_results.get(&parent).cloned())
+                .into_iter()
+                .collect(),
+            budget_remaining_usd: None,
+            expected_artifacts: expected_for_dispatch,
+            workspace_capsule: None,
+            workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+            run_id: self.run_id.clone(),
+            workspace_generation: self.snapshot_generation(),
+        };
+        let profile = match self.model_selector.select_for_session(
+            &agent_id,
+            None,
+            subtask_id,
+            Some(task.session_id),
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                warn!(
+                    %error, role = %agent_id,
+                    "call_specialist: model selection failed; returning the error to the \
+                     coordinator model"
+                );
+                // Issue #54: the diagnosis (Environment/model-unavailable,
+                // alternate viable) rides the tool result so the Coordinator's
+                // next decision is diagnosis-informed, and the audit trail.
+                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                self.record_failure_diagnosis(
+                    task.session_id,
+                    Some(subtask_id),
+                    &agent_id,
+                    &diagnosis,
+                )
+                .await;
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Failure,
+                    Some(diagnosis.kind.as_str()),
+                    suitability_now,
+                    0,
+                );
+                self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                return serde_json::json!({
+                    "error": "model_selection_failed",
+                    "message": format!("no model could be selected for {agent_id}: {error}"),
+                    "diagnosis": diagnosis.tool_summary(),
+                });
+            }
+        };
+        // The decision is dispatched (Deterministic execution never
+        // re-consults the model — the strategy is the record from here on).
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        let result = match self
+            .runner
+            .run(agent_id.clone(), &run_subtask, run_ctx, &profile, cancel.clone())
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                warn!(
+                    %error, role = %agent_id,
+                    "call_specialist: specialist dispatch failed; returning the error to \
+                      the coordinator model"
+                );
+                // Issue #54: normalize the dispatch failure (provider, tool,
+                // agent, environment, task dimensions) into the structured
+                // diagnosis; it rides the tool result and the audit trail,
+                // and the recovery decision is diagnosis-shaped.
+                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                self.record_failure_diagnosis(
+                    task.session_id,
+                    Some(subtask_id),
+                    &agent_id,
+                    &diagnosis,
+                )
+                .await;
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Failure,
+                    Some(diagnosis.kind.as_str()),
+                    suitability_now,
+                    0,
+                );
+                self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                return serde_json::json!({
+                    "error": "dispatch_failed",
+                    "message": error.to_string(),
+                    "diagnosis": diagnosis.tool_summary(),
+                });
+            }
+        };
+        // ── ADR-65 §5: a design-mode call may produce a DesignDoc — the
+        // verifier chain runs (an optional policy-gated check, never a
+        // mandatory stage) ─────────────────────────────────────────────────
+        let output_mode = self.registry.config(&agent_id).map(|config| config.output_mode);
+        if output_mode == Some(concerto_core::types::OutputMode::DesignDoc) {
+            if let Some(doc) = crate::prompts::parse_json_substring::<DesignDoc>(&result.summary) {
+                state.doc = Some(doc.clone());
+                *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) =
+                    Some(doc.clone());
+                let verdict = match self
+                    .verify_design_doc_claim(&doc, Some(&agent_id), task.session_id, cancel)
+                    .await
+                {
+                    Ok(verdict) => verdict,
+                    Err(error) if is_cancellation_error(&error) => {
+                        return serde_json::json!({ "error": "cancelled" });
                     }
-                    // Surface this attempt's failure to later re-runs.
-                    retry_feedback.push(failed_attempt_result(
-                        arch_id,
-                        role.clone(),
-                        err.to_string(),
-                    ));
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            "call_specialist: DesignDoc verification failed (fail-soft)"
+                        );
+                        degraded_verdict(
+                            &doc.proposed_files
+                                .iter()
+                                .map(|path| path.as_str().to_owned())
+                                .collect::<Vec<_>>(),
+                            0,
+                        )
+                    }
+                };
+                let doc_event_ids = self
+                    .append_design_doc_events(task.session_id, Some(&agent_id), &doc, &verdict)
+                    .await;
+                self.last_doc_resolution =
+                    checkpoint_doc_resolution(&Some(verdict.clone()), doc_event_ids.as_ref());
+                state.doc_verdict = Some(verdict);
+            }
+        }
 
-                    match classify_subtask_error(&err) {
-                        // Structural: exit immediately.
-                        SubtaskFailureClass::NonRecoverable => return Err(err),
-                        // Transient: retry the same agent/model while attempts
-                        // remain (ADR-42 §1).
-                        SubtaskFailureClass::Recoverable if attempt < self.max_subtask_attempts => {
-                            let _ = self.bus.publish_for_session(
-                                task.session_id,
-                                arch_id.0,
-                                EventKind::AgentThought {
-                                    agent_id: "coordinator".into(),
-                                    content: format!(
-                                        "Retrying design ({role}) after recoverable failure \
-                                         (attempt {attempt}/{}): {err}",
-                                        self.max_subtask_attempts
-                                    ),
-                                },
-                            );
-                            continue;
-                        }
-                        // Retries exhausted (Recoverable) or a provider/
-                        // model-specific hard failure (LimitReached): escalate
-                        // once, then walk the ladder.
-                        SubtaskFailureClass::Recoverable | SubtaskFailureClass::LimitReached => {
-                            // ── Escalation retry (Recoverable only) ───────
-                            let is_recoverable = matches!(
-                                classify_subtask_error(&err),
-                                SubtaskFailureClass::Recoverable
-                            );
-                            if is_recoverable
-                                && !escalated
-                                && !self.escalation_attempted.contains(&arch_id)
-                            {
-                                escalated = true;
-                                self.escalation_attempted.insert(arch_id);
-                                // Reset to `MAX - 1` so the next loop read is
-                                // exactly `MAX` (dispatch-path attempt-math).
-                                attempt = self.max_subtask_attempts.saturating_sub(1);
-                                let _ = self.bus.publish_for_session(
-                                    task.session_id,
-                                    arch_id.0,
-                                    EventKind::AgentThought {
-                                        agent_id: "coordinator".into(),
-                                        content: format!(
-                                            "Escalating design ({role}) — escalation retry \
-                                             (attempt {attempt}/{} exhausted)",
-                                            self.max_subtask_attempts
-                                        ),
-                                    },
-                                );
-                                continue;
-                            }
+        // ── Record the outcome ──────────────────────────────────────────────
+        let outcome_label = outcome_label(&result.outcome);
+        let zero_work = matches!(result.outcome, AgentOutcome::Success)
+            && result.tool_call_count == 0
+            && result.files_modified.is_empty();
+        let files = result.files_modified.clone();
+        let summary_text = result.summary.clone();
+        self.settle_dispatch_record(ledger, subtask_id, &result);
+        // The decision settled: the specialist outcome is the decision's
+        // outcome too (decision state mirrors — never replaces — the
+        // execution ledger).
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        let settled = metrics_from_result(&result);
+        ledger.provider_metrics.push(settled.clone());
+        self.settled_metrics.push(settled);
+        if !result.model.is_empty() {
+            ledger.model_assignments.insert(subtask_id, result.model.clone());
+        }
+        ledger.total_cost += result.cost_usd;
+        ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(result.tool_call_count);
+        ledger.all_files.extend(files.iter().cloned());
 
-                            // ── ADR-42 fallback ladder ────────────────────
-                            let ladder_ctx = AgentContext {
-                                session: base_ctx.session.clone(),
-                                parent_task: Some(task.clone()),
-                                working_memory: base_ctx.working_memory.clone(),
-                                retrieved_chunks: base_ctx.retrieved_chunks.clone(),
-                                previous_results: retry_feedback.clone(),
-                                budget_remaining_usd: None,
-                                expected_artifacts: Vec::new(),
-                            };
-                            match self
-                                .attempt_fallback_ladder(
-                                    &arch_task,
-                                    role,
-                                    &err,
-                                    &ladder_ctx,
-                                    cancel,
-                                )
-                                .await
-                            {
-                                FallbackOutcome::Success(result) => {
-                                    // A ladder tier produced a genuine Success;
-                                    // accept its DesignDoc when it is real.
-                                    match crate::prompts::parse_json_substring(&result.summary) {
-                                        Some(doc) if !Self::is_empty_design_doc(&doc) => {
-                                            let mut completed_arch = arch_task.clone();
-                                            completed_arch.status = SubTaskStatus::Completed;
-                                            completed_arch.deliverable = Some(result.summary);
-                                            return Ok((completed_arch, doc));
-                                        }
-                                        // The ladder could not produce a usable
-                                        // plan: the terminal failure drives the
-                                        // caller's graceful Partial exit.
-                                        _ => return Err(err),
-                                    }
-                                }
-                                FallbackOutcome::Cancelled => {
-                                    return Err(OrchestratorError::Cancelled);
-                                }
-                                FallbackOutcome::Exhausted => {
-                                    // `err` is the original failure the ladder
-                                    // failed to rescue; it drives the caller's
-                                    // graceful Partial exit.
-                                    return Err(err);
-                                }
-                            }
-                        }
+        // Issue #54: a failed/blocked settled outcome is diagnosed at this
+        // surface (specialist result handling) — the diagnosis rides the
+        // tool result so the Coordinator's next decision is diagnosis-
+        // informed, and the audit trail.
+        let mut outcome_diagnosis: Option<crate::failure_diagnosis::FailureDiagnosis> = None;
+        // Issue #60: the observed spend is captured before the outcome
+        // match can partially move the result — the recorded observation
+        // travels with the outcome record.
+        let result_cost_milli = settled_cost_milli(&result);
+        match result.outcome {
+            AgentOutcome::Success => {
+                // Issue #60: settled success — recorded with the observed
+                // spend (record-only; never a score input).
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Success,
+                    None,
+                    suitability_now,
+                    result_cost_milli,
+                );
+                if let Some(node) = graph.get_mut(&subtask_id) {
+                    node.deliverable = Some(summary_text.clone());
+                    node.completed_at = Some(time::OffsetDateTime::now_utc());
+                }
+                graph.mark_done(&subtask_id);
+                // Per-call zero-work guard (the run-level guard in
+                // `execute_graph` stays): an implement-stage call that
+                // "succeeded" with ZERO tool executions and no artifact
+                // produced no deliverable — flag it.
+                if zero_work && is_implement_role {
+                    let note = format!(
+                        "Zero-work guard: specialist {agent_id} reported success with zero \
+                         tool executions and no artifact; the completion claim was not \
+                         backed by executed work."
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        subtask_id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: note.clone(),
+                        },
+                    );
+                    ledger.notes.push(note);
+                }
+            }
+            AgentOutcome::NeedsRevision { ref reason } => {
+                // Issue #60: the need-correction cycle is observed —
+                // recorded against the specialist's standing.
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::NeedsRevision,
+                    None,
+                    suitability_now,
+                    result_cost_milli,
+                );
+                // The completed task stays done; the Coordinator decides the
+                // correction (it sees `needs_revision` in the tool result).
+                if let Some(node) = graph.get_mut(&subtask_id) {
+                    node.deliverable = Some(summary_text.clone());
+                    node.completed_at = Some(time::OffsetDateTime::now_utc());
+                }
+                graph.mark_done(&subtask_id);
+                ledger.notes.push(format!(
+                    "Specialist {agent_id} requested revision: {reason}. The Coordinator \
+                     decides whether to re-dispatch a correction."
+                ));
+            }
+            // Failed / Blocked / any other settled outcome: the node records
+            // the unsuccessful dispatch (`Blocked` — the ready-queue ignores
+            // it) at the attempts ceiling, so a run the Coordinator ends
+            // with an unresolved failure surfaces as `Partial`, never as a
+            // vacuous completion.
+            _ => {
+                let diagnosis = match &result.outcome {
+                    AgentOutcome::Failed { error } => {
+                        crate::failure_diagnosis::diagnose_outcome_failure(error)
+                    }
+                    AgentOutcome::Blocked { on } => crate::failure_diagnosis::diagnose_blocked(on),
+                    _ => crate::failure_diagnosis::diagnose_outcome_failure(&summary_text),
+                };
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Failure,
+                    Some(diagnosis.kind.as_str()),
+                    suitability_now,
+                    result_cost_milli,
+                );
+                self.record_failure_diagnosis(
+                    task.session_id,
+                    Some(subtask_id),
+                    &agent_id,
+                    &diagnosis,
+                )
+                .await;
+                outcome_diagnosis = Some(diagnosis);
+                graph.mark_blocked(&subtask_id);
+                if let Some(node) = graph.get_mut(&subtask_id) {
+                    node.completed_at = Some(time::OffsetDateTime::now_utc());
+                }
+                ledger.subtask_attempts.insert(subtask_id, self.max_subtask_attempts);
+                ledger.notes.push(format!(
+                    "Specialist {agent_id} settled with outcome {outcome_label}; the run \
+                     ends with this dispatch unresolved."
+                ));
+            }
+        }
+
+        // The dispatch settled — the pending decision no longer awaits
+        // completion (ADR-65 §7).
+        if self.last_dispatch_decision.as_ref().and_then(|pending| pending.task_id)
+            == Some(subtask_id)
+        {
+            self.last_dispatch_decision = None;
+        }
+        state.last_node = Some(subtask_id);
+
+        // ── Checkpoint the settled dispatch ─────────────────────────────────
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        let mut tool_result = serde_json::json!({
+            "outcome": outcome_label,
+            "agent_id": agent_id.as_str(),
+            "summary": bounded_text(&summary_text, 2_000),
+            "files_modified": files.iter().map(|path| path.as_str()).collect::<Vec<_>>(),
+            "tool_call_count": result.tool_call_count,
+            "cost_usd": result.cost_usd,
+        });
+        if let Some(diagnosis) = &outcome_diagnosis {
+            tool_result["diagnosis"] = diagnosis.tool_summary();
+        }
+        if let Some(advisory) = world_model_advisory {
+            tool_result["world_model"] = advisory;
+        }
+        tool_result
+    }
+
+    /// Issue #61: the whiteboard `Decision` record for a mediated ownership
+    /// transfer — the same payload shape as a consult decision plus the
+    /// `transfer_mediation: true` marker. Written directly (never via
+    /// [`Self::append_dispatch_decision`]: a transfer dispatches nothing and
+    /// leaves no pending continuation behind). Returns the REAL recorded
+    /// event id on success — it is the acquiring event the transferred
+    /// ownership stamps — and `None` on an append failure (fail-soft, as
+    /// with every Decision append here).
+    async fn append_transfer_decision(
+        &mut self,
+        session_id: Ulid,
+        to_agent: &AgentId,
+        artifacts: &[String],
+        reason: &str,
+        restart_evidence_ids: &[String],
+    ) -> Option<String> {
+        let pool = self.review_store.as_ref()?;
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "artifact_paths": artifacts,
+                "reason": reason,
+                "required_output": format!("relinquish the named artifacts to {to_agent}"),
+                "supporting_evidence_ids": evidence_ids,
+                "transfer_mediation": true,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        match append_whiteboard_event(pool, &event(restart_evidence_ids)).await {
+            Ok(stored) => Some(stored.event_id),
+            Err(err) => {
+                warn!(
+                    %err,
+                    "issue #61: transfer decision append rejected; re-appending without the \
+                     rejected citations (fail-soft, the record still lands)"
+                );
+                match append_whiteboard_event(pool, &event(&[])).await {
+                    Ok(stored) => Some(stored.event_id),
+                    Err(err) => {
+                        warn!(%err, "issue #61: transfer decision append failed (fail-soft)");
+                        None
                     }
                 }
             }
         }
     }
 
-    /// `true` when a parsed `DesignDoc` carries no meaningful content beyond
-    /// serde defaults (the empty shape the recovery loop treats as a failed
-    /// attempt).
-    fn is_empty_design_doc(doc: &DesignDoc) -> bool {
-        doc.proposed_files.is_empty()
-            && doc.goals.is_empty()
-            && doc.interface_sketch.trim().is_empty()
-    }
-
-    /// Decompose a user task into a DAG of `SubTask` nodes.
-    ///
-    /// ADR-35 §5: the pipeline shape comes from the registry. A design-stage
-    /// agent (if registered) runs first and produces a `DesignDoc`; the
-    /// planner then assigns research/implement/custom work; review and
-    /// validation stages run automatically after execution. A pipeline
-    /// without a design-stage agent skips the design step entirely.
-    async fn decompose_task(
+    /// Issue #61: handle ONE `transfer_ownership` tool call. The typed
+    /// reception is: validate (#52 flow, kind `TransferOwnership` — the
+    /// target names the RECEIVING agent from the roster, the
+    /// `expected_artifacts` name the artifacts) → policy-gate → record the
+    /// typed `Decision` event → apply the mediated transfer through the
+    /// attached gate, structurally rejecting every path that is not owned
+    /// by its actual current holder. Nothing is stolen.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_transfer_ownership(
         &mut self,
         task: &AgentTask,
-        context: &AgentContext,
+        base_ctx: &AgentContext,
         cancel: &CancellationToken,
-        planning_feedback: Option<&checkpoint::PlanningCheckpoint>,
-    ) -> Result<(TaskGraph, Option<PlanArtifact>), OrchestratorError> {
-        let mut graph = TaskGraph::new();
-
-        // ── Resolve lifecycle-stage participants from the registry ──────
-        let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
-        let research_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::RESEARCH));
-        // ADR-58 P2+P3 (R4): the implement roster keys the primary `Execution`
-        // stage's resolved tag — a custom blueprint that renames the stage
-        // keeps its staffing, and on the default blueprint the resolved tag
-        // is exactly `implement`, so behavior stays byte-identical (see the
-        // sentinel render below, which uses the same resolution).
-        let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
-        let mut implement_role = self.first_agent_for_stage(&AgentStage::new(&implement_tag));
-        let mut implement_ids = self.registry.ids_for_stage(&AgentStage::new(&implement_tag));
-        // ADR-35 §8 trigger 1 (stage absence): with no registered
-        // implement-stage agent, the coordinator carries implementation itself
-        // when it holds an executor. The reserved `coordinator` id is never
-        // registered (the registry skips it), so it cannot collide with a real
-        // agent and only reaches the planner roster / graph while this
-        // self-execution standby is active.
-        let coordinator_self_implements = implement_ids.is_empty() && self.self_execute_available();
-        if coordinator_self_implements {
-            implement_ids.push(AgentId::new("coordinator"));
-            implement_role = Some(AgentId::new("coordinator"));
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(gate) = self.write_gate.clone() else {
+            return serde_json::json!({
+                "error": "ownership_unavailable",
+                "message": "no write gate is attached to this run — there is no ownership to \
+                            mediate (plain-executor runs deploy no artifact ownership)",
+            });
+        };
+        let to_agent = arguments.get("agent_id").and_then(serde_json::Value::as_str);
+        let artifact_paths = parse_string_array(arguments, "expected_artifacts");
+        let Some(to_agent) = to_agent else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "transfer_ownership requires string agent_id and \
+                            expected_artifacts (the artifacts being handed over)",
+            });
+        };
+        if artifact_paths.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "transfer_ownership requires at least one artifact path in \
+                            expected_artifacts",
+            });
         }
-        let mut planner_agents: Vec<PlannerAgentInfo> = self
+
+        // ── Issue #52 flow: validate the transfer decision BEFORE any
+        // mutation. A transfer to-tune target: roster membership; artifact
+        // canonicalization; bounds (each validated decision shares one rule
+        // set). Fabricated evidence ids refuse.
+        let cited_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        let missing_evidence = self.missing_evidence_ids(&cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let decision = match validator.validate(
+            crate::decisions::DecisionKind::TransferOwnership,
+            Some(to_agent),
+            "artifact-ownership transfer mediation",
+            arguments
+                .get("notes")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|notes| !notes.is_empty()),
+            &cited_ids,
+            &artifact_paths,
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    to_agent = %to_agent,
+                    "transfer_ownership rejected an invalid Coordinator decision (structured \
+                     error, no state mutation)"
+                );
+                return rejection.tool_value();
+            }
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── Policy gate (the same engine every Coordinator decision
+        // evaluates under) ──
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; transfers are denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: TRANSFER_OWNERSHIP_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this ownership transfer",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── Record the typed Decision event FIRST (the audit trail / the
+        // acquiring event of the transfer), then apply the transfers ────
+        let reason = arguments
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|notes| !notes.is_empty())
+            .unwrap_or("coordinator_mediation")
+            .to_owned();
+        let Some(decision_event_id) = self
+            .append_transfer_decision(
+                task.session_id,
+                &AgentId::new(to_agent),
+                &artifact_paths,
+                &reason,
+                &cited_ids,
+            )
+            .await
+        else {
+            // No session store — the mediated handover cannot be audited;
+            // deny rather than move ownership without an audit trail.
+            self.decision_journal
+                .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+            return serde_json::json!({
+                "error": "evidence_unavailable",
+                "message": "no session log is attached — the transfer cannot be recorded; \
+                            retry after the store is re-attached",
+            });
+        };
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+
+        // ── Apply: move each record from its ACTUAL current owner (the
+        // gate proves ownership — the decision claims nothing). ─────────
+        let mut transferred: Vec<String> = Vec::new();
+        let mut rejected: Vec<serde_json::Value> = Vec::new();
+        for artifact in &artifact_paths {
+            let Some(from_owner) = gate.ownership_owner(artifact) else {
+                rejected.push(serde_json::json!({
+                    "artifact": artifact,
+                    "error": "artifact_not_owned",
+                }));
+                continue;
+            };
+            match gate.transfer_ownership(artifact, &from_owner, to_agent, &decision_event_id).await
+            {
+                Ok(_) => transferred.push(artifact.clone()),
+                Err(error) => rejected.push(serde_json::json!({
+                    "artifact": artifact,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        serde_json::json!({
+            "outcome": "settled",
+            "decision_id": decision_id,
+            "transferred": transferred,
+            "rejected": rejected,
+        })
+    }
+
+    /// Issue #59: handle ONE `consult_specialist` tool call — the typed
+    /// CONSULT operation beside dispatch. The named specialist answers a
+    /// bounded question in a READ-ONLY advisory capacity:
+    ///
+    /// validate (#52 flow, kind `Consult`) → policy-gate → record the
+    /// consultative Decision event → run the consultant under the read-only
+    /// grant boundary (its tool calls evaluate under
+    /// [`crate::consultation::ConsultReadOnlyPolicy`] — writes denied even
+    /// under an Acting run grant) → record the findings as a consultative
+    /// `Finding` evidence event → return the real evidence id the
+    /// Coordinator can cite in later decisions.
+    ///
+    /// HARD guardrails (the point of the operation): NO SubTask node is
+    /// created, the graph is untouched, ownership/completion/ledger-task
+    /// state never changes (only run-level cost/tool-call accounting and
+    /// consultative evidence/journal entries), and a workspace mutation
+    /// attempt inside the consultation fails closed with a structured
+    /// error. Findings are never task results.
+    ///
+    /// Failure discipline mirrors [`Self::handle_call_specialist`]:
+    /// structured tool errors, never a crash; cancellation propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_consult_specialist(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = crate::consultation::ConsultSpecialistArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "consult_specialist requires string agent_id and question",
+            });
+        };
+        // Consultations are read-only: declaring expected artifacts would
+        // imply a work contract — a conflicting decision, rejected.
+        if !parse_string_array(arguments, "expected_artifacts").is_empty() {
+            return serde_json::json!({
+                "error": "conflicting_decision",
+                "message": "consultations are read-only and never declare expected \
+                            artifacts; drop the field and re-decide",
+            });
+        }
+        let question_trimmed = args.question.trim();
+        if question_trimmed.chars().count() > crate::consultation::MAX_CONSULT_QUESTION_CHARS {
+            return serde_json::json!({
+                "error": "question_too_long",
+                "message": format!(
+                    "the consultation question exceeds {} characters ({}); shorten it \
+                     and re-decide",
+                    crate::consultation::MAX_CONSULT_QUESTION_CHARS,
+                    question_trimmed.chars().count(),
+                ),
+            });
+        }
+        let effort_cap =
+            args.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+        if effort_cap == 0 || effort_cap > crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS {
+            return serde_json::json!({
+                "error": "invalid_effort_cap",
+                "message": format!(
+                    "max_tool_calls must be between 1 and {} (got {effort_cap})",
+                    crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS,
+                ),
+            });
+        }
+
+        // ── Issue #52 flow: validate the consult decision BEFORE any
+        // mutation — roster membership, evidence existence (REAL log rows),
+        // bounds. Any failure is a structured tool error, no state change.
+        let cited_ids = args.supporting_evidence_ids.clone();
+        let missing_evidence = self.missing_evidence_ids(&cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut decision = match validator.validate(
+            crate::decisions::DecisionKind::Consult,
+            Some(&args.agent_id),
+            question_trimmed,
+            args.notes.as_deref(),
+            &cited_ids,
+            // A consult carries no artifact contract.
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    agent = %args.agent_id,
+                    "consult_specialist rejected an invalid Coordinator decision \
+                     (structured error, no state mutation)"
+                );
+                return rejection.tool_value();
+            }
+        };
+        // The effort cap rides the journaled decision (additive field).
+        decision.max_tool_calls = Some(effort_cap);
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── Policy gate (the SAME engine the dispatch decisions evaluate
+        // under) — the consult op itself is gated like any tool call ──────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; consultation is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: CONSULT_SPECIALIST_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            // The coordinator loop carries no approval sink: any non-`Allow`
+            // verdict is a denial here, mirroring the dispatch semantics.
+            Ok(_) => {
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this consultation",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── Consultative Decision event (audit trail; never a pending
+        // dispatch continuation — consultations dispatch nothing) ─────────
+        let agent_id = AgentId::new(&args.agent_id);
+        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_consultation".to_owned());
+        self.append_consult_decision(
+            task.session_id,
+            &agent_id,
+            question_trimmed,
+            &reason,
+            &args.supporting_evidence_ids,
+            None,
+        )
+        .await;
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+
+        // ── The consultant: the target role in advisory capacity — the
+        // persona (name/stage/prompt sections) comes from the registry
+        // config, the output mode is forced Freeform (findings are prose),
+        // and the tool executor is the READ-ONLY facade (issue #59): a
+        // minimal filesystem-read toolset whose every call evaluates under
+        // the consultation gate BEFORE the run's policy. The consultant
+        // runs on the coordinator's planning provider stack (like the
+        // draft_plan advisor) — model selection machinery is untouched.
+        let profile = match self.planning_profile.clone() {
+            Some(profile) => profile,
+            None => match self.model_selector.select_for_session(
+                &AgentId::new("coordinator"),
+                None,
+                task.id,
+                Some(task.session_id),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    if is_cancellation_error(&error) || cancel.is_cancelled() {
+                        return serde_json::json!({ "error": "cancelled" });
+                    }
+                    warn!(
+                        %error,
+                        "consult_specialist: model selection failed; returning the error \
+                         to the coordinator model"
+                    );
+                    self.decision_journal
+                        .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                    return serde_json::json!({
+                        "error": "model_selection_failed",
+                        "message": format!("no model could be selected for the consultation: {error}"),
+                    });
+                }
+            },
+        };
+        let config = self.registry.config(&agent_id);
+        let name = config.map(|config| config.name.clone()).unwrap_or_else(|| agent_id.to_string());
+        let stage = self.registry.get(&agent_id).and_then(|agent| agent.stage());
+        let prompt_sections =
+            config.map(|config| config.prompt_sections.clone()).unwrap_or_default();
+        let result = match run_consult_execution(ConsultExecutionInputs {
+            project_dir: base_ctx.session.project_dir.clone(),
+            agent_id: agent_id.clone(),
+            name,
+            stage,
+            profile,
+            planning_provider: self.planning_provider.clone(),
+            bus: self.bus.clone(),
+            retry_policy: self.retry_policy.clone(),
+            prompt_sections,
+            skills_section: self.skills_section.clone(),
+            policy,
+            spend_tracker: self.spend_tracker.clone(),
+            effort_cap,
+            question: question_trimmed.to_string(),
+            notes: args.notes.clone(),
+            task: task.clone(),
+            session: base_ctx.session.clone(),
+            working_memory: base_ctx.working_memory.clone(),
+            retrieved_chunks: base_ctx.retrieved_chunks.clone(),
+            snapshot_digest: self.snapshot_digest(cancel).await,
+            run_id: self.run_id.clone(),
+            workspace_generation: self.snapshot_generation(),
+            cancel: cancel.clone(),
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                warn!(
+                    %error, role = %agent_id,
+                    "consult_specialist: the consultation run failed; returning the \
+                     error to the coordinator model"
+                );
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                return serde_json::json!({
+                    "error": "consult_failed",
+                    "message": error.to_string(),
+                    "diagnosis": diagnosis.tool_summary(),
+                });
+            }
+        };
+
+        // ── Settle: the consult decision is journaled Settled (which the
+        // issue-#56 question lifecycle reads as recovery evidence for
+        // standing questions), the findings become a consultative Finding
+        // evidence event, and the run-level cost accounting stays honest.
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        ledger.total_cost += result.cost_usd;
+        ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(result.tool_call_count);
+        // Findings are NEVER task results: no completed_results entry, no
+        // graph node, no files-ledger merge (the read-only gate denies
+        // workspace mutation; any claimed file list is dropped).
+        let findings =
+            bounded_text(&result.summary, crate::consultation::MAX_CONSULT_FINDINGS_CHARS);
+        let evidence_id = self
+            .append_consult_finding(
+                task.session_id,
+                &agent_id,
+                question_trimmed,
+                &findings,
+                &decision_id,
+                &args.supporting_evidence_ids,
+                None,
+            )
+            .await;
+
+        // ── Checkpoint the consultative journal state (the graph itself is
+        // unchanged) ────────────────────────────────────────────────────────
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        let tool_result = serde_json::json!({
+            "outcome": "consulted",
+            "agent_id": agent_id.as_str(),
+            "consultative": true,
+            "findings": findings,
+            "evidence_id": evidence_id,
+            "effort_cap": effort_cap,
+            "cost_usd": result.cost_usd,
+            "tool_call_count": result.tool_call_count,
+        });
+        tool_result
+    }
+
+    /// Issue #62: handle one `investigate_hypotheses` tool call — the
+    /// speculative read-only investigation surface.
+    ///
+    /// Flow (mirrors `handle_consult_specialist` failure + checkpoint
+    /// discipline):
+    ///
+    /// 1. Parse args + batch-level arg validation (count bounds,
+    ///    per-hypothesis effort caps, question/notes bounds, total effort
+    ///    ceiling, `expected_artifacts` rejection, duplicate id check).
+    /// 2. Per-hypothesis Consult validation (`missing_evidence_ids` +
+    ///    `DecisionValidator` with `DecisionKind::Consult`) — ANY invalid
+    ///    hypothesis rejects the whole batch (fail fast, no state mutation).
+    /// 3. Policy gate (`investigate_hypotheses`, same engine as consult) —
+    ///    once for the batch; denied → `policy_denied` with `state_log`
+    ///    containing the rejected decision payload.
+    /// 4. Batch `Investigate` decision + per-hypothesis `Consult` decisions
+    ///    journaled; consultative Decision events carry `hypothesis_id`
+    ///    attribution.
+    /// 5. Pre-spawn cancellation check.
+    /// 6. Build N concurrent futures via [`futures::future::join_all`] (same
+    ///    concurrency shape as `execute_graph`), each calling the free
+    ///    [`run_consult_execution`] with its own read-only
+    ///    policy-gated executor. Findings NEVER become task results.
+    /// 7. Sequential settle: per-hypothesis journal transitions, ledger
+    ///    cost/tool calls, consultative Finding events, comparator input.
+    /// 8. ONE checkpoint persist.
+    /// 9. Comparator output (advisory, `speculative: true`).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_investigate_hypotheses(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── Local types ──────────────────────────────────────────────────
+        // Per-hypothesis record built during validation and consumed during
+        // future construction. Carries all owned data needed for the
+        // concurrent execution future and the sequential settle phase.
+        struct PerHypothesisRecord {
+            hypothesis_id: String,
+            agent_id: AgentId,
+            question: String,
+            notes: Option<String>,
+            cited_ids: Vec<String>,
+            effort_cap: u32,
+            decision_id: String,
+        }
+
+        /// Result of one hypothesis execution future, consumed during settle.
+        struct PerHypothesisResult {
+            hypothesis_id: String,
+            decision_id: String,
+            agent_id: AgentId,
+            question: String,
+            cited_ids: Vec<String>,
+            outcome: Result<AgentRunResult, OrchestratorError>,
+        }
+
+        // ── 1. Parse + batch-level arg validation ────────────────────────
+        let Some(args) = InvestigateHypothesesArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "investigate_hypotheses requires a hypotheses array of \
+                            {hypothesis_id, agent_id, question} specs",
+            });
+        };
+        // Investigations are read-only: declaring expected artifacts would
+        // imply a work contract — a conflicting decision, rejected.
+        if !parse_string_array(arguments, "expected_artifacts").is_empty() {
+            return serde_json::json!({
+                "error": "conflicting_decision",
+                "message": "speculative investigations are read-only and never declare \
+                            expected artifacts; drop the field and re-decide",
+            });
+        }
+        if args.hypotheses.len() < MIN_SPECULATIVE_HYPOTHESES {
+            return serde_json::json!({
+                "error": "too_few_hypotheses",
+                "message": format!(
+                    "investigate_hypotheses requires at least {} competing hypotheses \
+                     (got {}); for a single question use consult_specialist",
+                    MIN_SPECULATIVE_HYPOTHESES,
+                    args.hypotheses.len(),
+                ),
+            });
+        }
+        if args.hypotheses.len() > MAX_SPECULATIVE_HYPOTHESES {
+            return serde_json::json!({
+                "error": "too_many_hypotheses",
+                "message": format!(
+                    "investigate_hypotheses accepts at most {} hypotheses (got {})",
+                    MAX_SPECULATIVE_HYPOTHESES,
+                    args.hypotheses.len(),
+                ),
+            });
+        }
+
+        // ── 2. Per-hypothesis batch-level validation (pre-state-mutation) ─
+        let mut total_effort: u32 = 0;
+        let mut seen_ids = std::collections::HashSet::new();
+        for h in &args.hypotheses {
+            let q = h.question.trim();
+            if q.chars().count() > crate::consultation::MAX_CONSULT_QUESTION_CHARS {
+                return serde_json::json!({
+                    "error": "question_too_long",
+                    "message": format!(
+                        "hypothesis {} question exceeds {} characters ({}); \
+                         shorten and re-decide",
+                        h.hypothesis_id,
+                        crate::consultation::MAX_CONSULT_QUESTION_CHARS,
+                        q.chars().count(),
+                    ),
+                });
+            }
+            if let Some(notes) = h.notes.as_deref() {
+                if notes.chars().count() > crate::decisions::MAX_DECISION_NOTES_CHARS {
+                    return serde_json::json!({
+                        "error": "notes_too_long",
+                        "message": format!(
+                            "hypothesis {} notes exceeds {} characters ({}); \
+                             shorten and re-decide",
+                            h.hypothesis_id,
+                            crate::decisions::MAX_DECISION_NOTES_CHARS,
+                            notes.chars().count(),
+                        ),
+                    });
+                }
+            }
+            let cap =
+                h.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+            if cap == 0 || cap > crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS {
+                return serde_json::json!({
+                    "error": "invalid_effort_cap",
+                    "message": format!(
+                        "hypothesis {} max_tool_calls must be 1..={} (got {})",
+                        h.hypothesis_id,
+                        crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS,
+                        cap,
+                    ),
+                });
+            }
+            total_effort = total_effort.saturating_add(cap);
+            if !seen_ids.insert(&h.hypothesis_id) {
+                return serde_json::json!({
+                    "error": "duplicate_hypothesis_id",
+                    "message": format!(
+                        "each hypothesis_id in the batch must be unique; \
+                         duplicate: {}",
+                        h.hypothesis_id,
+                    ),
+                });
+            }
+        }
+        if total_effort > MAX_SPECULATION_TOTAL_TOOL_CALLS {
+            return serde_json::json!({
+                "error": "total_effort_exceeded",
+                "message": format!(
+                    "the summed per-hypothesis max_tool_calls {} exceeds the batch \
+                     ceiling {}; lower per-hypothesis caps and re-decide",
+                    total_effort,
+                    MAX_SPECULATION_TOTAL_TOOL_CALLS,
+                ),
+            });
+        }
+
+        // ── 3. Per-hypothesis Consult validation (DecisionValidator) ──────
+        //    ANY invalid hypothesis rejects the whole batch (fail fast,
+        //    no state mutation). This mirrors the consult handler's early
+        //    validation block.
+        let roster_ids = self.decision_roster();
+        let mut per_hyp: Vec<PerHypothesisRecord> = Vec::with_capacity(args.hypotheses.len());
+        for h in &args.hypotheses {
+            let agent_id = AgentId::new(&h.agent_id);
+            let question_trimmed = h.question.trim().to_owned();
+            let missing = self.missing_evidence_ids(&h.supporting_evidence_ids, cancel).await;
+            let known_evidence: std::collections::HashSet<String> = h
+                .supporting_evidence_ids
+                .iter()
+                .filter(|id| !missing.contains(id))
+                .cloned()
+                .collect();
+            let validator = crate::decisions::DecisionValidator {
+                roster_ids: &roster_ids,
+                known_event_ids: &known_evidence,
+                project_root: Some(base_ctx.session.project_dir.as_path()),
+            };
+            let mut decision = match validator.validate(
+                crate::decisions::DecisionKind::Consult,
+                Some(&h.agent_id),
+                &question_trimmed,
+                h.notes.as_deref(),
+                &h.supporting_evidence_ids,
+                // A consult carries no artifact contract.
+                &[],
+            ) {
+                Ok(decision) => decision,
+                Err(rejection) => {
+                    warn!(
+                        code = %rejection.code,
+                        hypothesis_id = %h.hypothesis_id,
+                        agent = %h.agent_id,
+                        "investigate_hypotheses rejected an invalid Coordinator decision \
+                         (structured error, no state mutation)"
+                    );
+                    return rejection.tool_value();
+                }
+            };
+            // The effort cap rides the journaled decision (additive field).
+            let effort_cap =
+                h.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+            decision.max_tool_calls = Some(effort_cap);
+            let decision_id = decision.id.clone();
+            self.decision_journal.record(decision);
+
+            per_hyp.push(PerHypothesisRecord {
+                hypothesis_id: h.hypothesis_id.clone(),
+                agent_id,
+                question: question_trimmed,
+                notes: h.notes.clone(),
+                cited_ids: h.supporting_evidence_ids.clone(),
+                effort_cap,
+                decision_id,
+            });
+        }
+
+        // ── 3b. Batch-level Investigate decision (journal) ────────────────
+        // One Investigate-kind decision covers the whole batch; the
+        // per-hypothesis Consult decisions carry the detail. Validated like
+        // any decision against the same roster + evidence sets used above
+        // (every cited id was already proven real — a missing id rejects the
+        // whole batch before this point).
+        let batch_evidence: Vec<String> = per_hyp
+            .iter()
+            .flat_map(|h| h.cited_ids.iter().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let known_ids: std::collections::HashSet<String> =
+            per_hyp.iter().flat_map(|h| h.cited_ids.iter().cloned()).collect();
+        let batch_task_text = {
+            let ids: Vec<&str> = per_hyp.iter().map(|h| h.hypothesis_id.as_str()).collect();
+            format!(
+                "speculative investigation across hypotheses [{}]; each runs \
+                 bounded read-only consultation under a distinct question",
+                ids.join(", "),
+            )
+        };
+        let batch_reason = "coordinator_speculative_investigation".to_owned();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_ids,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut batch_decision = match validator.validate(
+            crate::decisions::DecisionKind::Investigate,
+            None,
+            &batch_task_text,
+            Some(&batch_reason),
+            &batch_evidence,
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => return rejection.tool_value(),
+        };
+        // The summed effort ceiling rides the journaled batch decision
+        // (additive field), mirroring how each hypothesis' own cap rides its
+        // consult decision.
+        batch_decision.max_tool_calls = Some(total_effort);
+        let batch_decision_id = batch_decision.id.clone();
+        self.decision_journal.record(batch_decision);
+
+        // ── 4. Policy gate (SINGLE evaluation for the batch) ─────────────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; speculative investigation is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: INVESTIGATE_HYPOTHESES_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this speculative investigation",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── 5. Batch Investigate decision → Dispatched + event ──────────
+        //    The batch decision was journaled (Validated) at step 3b; the
+        //    whiteboard event names the batch; per-hypothesis consultative
+        //    Decision events carry the attribution detail.
+        self.decision_journal
+            .transition(&batch_decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.append_consult_decision(
+            task.session_id,
+            &AgentId::new("coordinator"),
+            &batch_task_text,
+            &batch_reason,
+            &batch_evidence,
+            None,
+        )
+        .await;
+        // Per-hypothesis consultative Decision events (attribution via
+        // hypothesis_id in the payload).
+        for h in &per_hyp {
+            let reason = h.notes.clone().unwrap_or_else(|| "coordinator_consultation".to_owned());
+            self.append_consult_decision(
+                task.session_id,
+                &h.agent_id,
+                &h.question,
+                &reason,
+                &h.cited_ids,
+                Some(&h.hypothesis_id),
+            )
+            .await;
+            self.decision_journal
+                .transition(&h.decision_id, crate::decisions::DecisionStatus::Dispatched);
+        }
+
+        // ── 6. Pre-spawn cancellation check ──────────────────────────────
+        if cancel.is_cancelled() {
+            return serde_json::json!({ "error": "cancelled" });
+        }
+
+        // ── 7. Build concurrent futures ──────────────────────────────────
+        //    Same concurrency shape as `execute_graph`: one future per
+        //    hypothesis, all owned data, `join_all` waits for all.
+        let snapshot_digest = self.snapshot_digest(cancel).await;
+        let workspace_generation = self.snapshot_generation();
+        let planning_provider = self.planning_provider.clone();
+        let bus = self.bus.clone();
+        let retry_policy = self.retry_policy.clone();
+        let skills_section = self.skills_section.clone();
+        let policy = Arc::clone(&policy);
+        let spend_tracker = self.spend_tracker.clone();
+        let project_dir = base_ctx.session.project_dir.clone();
+        let session = base_ctx.session.clone();
+        let working_memory = base_ctx.working_memory.clone();
+        let retrieved_chunks = base_ctx.retrieved_chunks.clone();
+        let run_id = self.run_id.clone();
+
+        // ── 6a. Profile resolution (once for the whole batch) ───────────
+        // The coordinator's planning profile is shared across all hypotheses.
+        // If model selection fails, the whole batch fails — mirroring the
+        // single-consult error shape.
+        let profile = match self.planning_profile.clone() {
+            Some(profile) => profile,
+            None => match self.model_selector.select_for_session(
+                &AgentId::new("coordinator"),
+                None,
+                task.id,
+                Some(task.session_id),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    if is_cancellation_error(&error) || cancel.is_cancelled() {
+                        return serde_json::json!({ "error": "cancelled" });
+                    }
+                    warn!(
+                        %error,
+                        "investigate_hypotheses: model selection failed; returning the \
+                         error to the coordinator model"
+                    );
+                    return serde_json::json!({
+                        "error": "model_selection_failed",
+                        "message": format!(
+                            "no model could be selected for the investigation: {error}"
+                        ),
+                    });
+                }
+            },
+        };
+
+        let this: &CoordinatorAgent = &*self;
+        let registry = &this.registry;
+
+        // ── 6b. Build concurrent futures ─────────────────────────────────
+        //    Same concurrency shape as `execute_graph`: one future per
+        //    hypothesis, all owned data, `join_all` waits for all.
+        let futures: Vec<_> = per_hyp
+            .into_iter()
+            .map(|h| {
+                let config = registry.config(&h.agent_id);
+                let name = config.map(|c| c.name.clone()).unwrap_or_else(|| h.agent_id.to_string());
+                let stage = registry.get(&h.agent_id).and_then(|a| a.stage());
+                let prompt_sections = config.map(|c| c.prompt_sections.clone()).unwrap_or_default();
+                let inputs = ConsultExecutionInputs {
+                    project_dir: project_dir.clone(),
+                    agent_id: h.agent_id.clone(),
+                    name,
+                    stage,
+                    profile: profile.clone(),
+                    planning_provider: planning_provider.clone(),
+                    bus: bus.clone(),
+                    retry_policy: retry_policy.clone(),
+                    prompt_sections,
+                    skills_section: skills_section.clone(),
+                    policy: Arc::clone(&policy),
+                    spend_tracker: Arc::clone(&spend_tracker),
+                    effort_cap: h.effort_cap,
+                    question: h.question.clone(),
+                    notes: h.notes.clone(),
+                    task: task.clone(),
+                    session: session.clone(),
+                    working_memory: working_memory.clone(),
+                    retrieved_chunks: retrieved_chunks.clone(),
+                    snapshot_digest: snapshot_digest.clone(),
+                    run_id: run_id.clone(),
+                    workspace_generation: workspace_generation.clone(),
+                    cancel: cancel.clone(),
+                };
+                let hypothesis_id = h.hypothesis_id.clone();
+                let decision_id = h.decision_id.clone();
+                let agent_id = h.agent_id.clone();
+                let cited_ids = h.cited_ids.clone();
+                async move {
+                    let outcome = run_consult_execution(inputs).await;
+                    PerHypothesisResult {
+                        hypothesis_id,
+                        decision_id,
+                        agent_id,
+                        question: h.question,
+                        cited_ids,
+                        outcome,
+                    }
+                }
+            })
+            .collect();
+
+        let run_results = join_all(futures).await;
+
+        // ── 8. Settle ────────────────────────────────────────────────────
+        //    Sequential post-join: per-hypothesis journal transitions,
+        //    ledger cost/tool calls, consultative Finding events.
+        let batch_cancelled = cancel.is_cancelled();
+        let mut compare_inputs: Vec<HypothesisCompareInput> = Vec::with_capacity(run_results.len());
+        for r in run_results {
+            match r.outcome {
+                Ok(result) => {
+                    self.decision_journal
+                        .transition(&r.decision_id, crate::decisions::DecisionStatus::Settled);
+                    ledger.total_cost += result.cost_usd;
+                    ledger.total_tool_calls =
+                        ledger.total_tool_calls.saturating_add(result.tool_call_count);
+                    let findings = bounded_text(
+                        &result.summary,
+                        crate::consultation::MAX_CONSULT_FINDINGS_CHARS,
+                    );
+                    let evidence_id = self
+                        .append_consult_finding(
+                            task.session_id,
+                            &r.agent_id,
+                            &r.question,
+                            &findings,
+                            &r.decision_id,
+                            &r.cited_ids,
+                            Some(&r.hypothesis_id),
+                        )
+                        .await;
+                    compare_inputs.push(HypothesisCompareInput {
+                        hypothesis_id: r.hypothesis_id,
+                        agent_id: r.agent_id,
+                        terminal: HypothesisTerminal::Completed,
+                        evidence_id,
+                        findings: Some(findings),
+                        tool_call_count: result.tool_call_count,
+                        cost_usd: result.cost_usd,
+                        reasons: Vec::new(),
+                    });
+                }
+                Err(error) => {
+                    let mut reasons: Vec<String> = Vec::new();
+                    if is_cancellation_error(&error) || cancel.is_cancelled() {
+                        reasons.push("cancelled".to_owned());
+                        self.decision_journal
+                            .transition(&r.decision_id, crate::decisions::DecisionStatus::Rejected);
+                    } else {
+                        warn!(
+                            %error,
+                            hypothesis_id = %r.hypothesis_id,
+                            "investigate_hypotheses: hypothesis run failed; \
+                             recording failure and continuing with remaining hypotheses"
+                        );
+                        let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                        reasons.push(error.to_string());
+                        reasons.push(diagnosis.tool_summary().to_string());
+                        self.decision_journal
+                            .transition(&r.decision_id, crate::decisions::DecisionStatus::Rejected);
+                    }
+                    compare_inputs.push(HypothesisCompareInput {
+                        hypothesis_id: r.hypothesis_id,
+                        agent_id: r.agent_id,
+                        terminal: HypothesisTerminal::Failed,
+                        evidence_id: None,
+                        findings: None,
+                        tool_call_count: 0,
+                        cost_usd: 0.0,
+                        reasons,
+                    });
+                }
+            }
+        }
+
+        // ── 9. Batch Investigate decision → Settled / Rejected ──────────
+        if batch_cancelled {
+            self.decision_journal
+                .transition(&batch_decision_id, crate::decisions::DecisionStatus::Rejected);
+        } else {
+            self.decision_journal
+                .transition(&batch_decision_id, crate::decisions::DecisionStatus::Settled);
+            // ONE checkpoint persist (the graph itself is unchanged;
+            // consultative journal state is the only mutation).
+            self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+        }
+
+        // ── 10. Comparator output ────────────────────────────────────────
+        let outcome = if batch_cancelled { "investigated_cancelled" } else { "investigated" };
+        let mut result = compare_hypotheses(&compare_inputs);
+        result["outcome"] = serde_json::json!(outcome);
+        result["speculative"] = serde_json::json!(true);
+        result["advisory"] = serde_json::json!(true);
+        if batch_cancelled {
+            result["cancelled"] = serde_json::json!(true);
+        }
+        result
+    }
+
+    /// Issue #57: the decision-validation preamble shared by the split/merge
+    /// handlers — evidence existence check against the REAL whiteboard log,
+    /// then typed decision validation with NO target (transforms inherit /
+    /// reuse specialist roles; naming a target is a `conflicting_decision`
+    /// rejection by [`crate::decisions::DecisionKind::rejects_target`]).
+    /// Returns the validated decision with its transform payload attached.
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_transform_decision(
+        &mut self,
+        kind: crate::decisions::DecisionKind,
+        transform: Option<crate::task_transform::TaskTransformSpec>,
+        summary_task: &str,
+        notes: Option<&str>,
+        cited_ids: &[String],
+        artifact_paths: &[String],
+        cancel: &CancellationToken,
+        base_ctx: &AgentContext,
+    ) -> Result<crate::decisions::CoordinatorDecision, serde_json::Value> {
+        let missing_evidence = self.missing_evidence_ids(cited_ids, cancel).await;
+        let known_evidence: HashSet<String> =
+            cited_ids.iter().filter(|id| !missing_evidence.contains(id)).cloned().collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_evidence,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        match validator.validate(kind, None, summary_task, notes, cited_ids, artifact_paths) {
+            Ok(mut decision) => {
+                decision.transform = transform;
+                Ok(decision)
+            }
+            Err(rejection) => {
+                warn!(
+                    code = %rejection.code,
+                    "a split/merge decision failed validation (structured error, no state \
+                     mutation)"
+                );
+                Err(rejection.tool_value())
+            }
+        }
+    }
+
+    /// Issue #57: the whiteboard Decision record for a split/merge. Written
+    /// directly (never via [`Self::append_dispatch_decision`], which drives
+    /// the ADR-65 §7 pending-dispatch continuation — a transform dispatches
+    /// nothing to continue behind).
+    async fn append_transform_decision(
+        &mut self,
+        session_id: Ulid,
+        task_id: Option<TaskId>,
+        reason: &str,
+        required_output: &str,
+        supporting_evidence_ids: &[String],
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": "coordinator",
+                "reason": reason,
+                "required_output": required_output,
+                "supporting_evidence_ids": supporting_evidence_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        let _ = task_id; // transforms record no per-node continuation
+        if let Err(err) = append_whiteboard_event(pool, &event).await {
+            warn!(%err, "issue #57: transform decision append failed (fail-soft)");
+        }
+    }
+
+    /// Issue #59: the whiteboard `Decision` record for one consultation —
+    /// the same payload shape as a dispatch decision plus the
+    /// `consultative: true` marker, written directly (never via
+    /// [`Self::append_dispatch_decision`], which drives the ADR-65 §7
+    /// pending-dispatch continuation — a consultation dispatches nothing
+    /// and leaves no pending continuation behind). Fail-soft: a rejected
+    /// citation set is re-appended without its citations so the record
+    /// always lands, mirroring the dispatch decision discipline.
+    async fn append_consult_decision(
+        &mut self,
+        session_id: Ulid,
+        agent_id: &AgentId,
+        question: &str,
+        reason: &str,
+        supporting_evidence_ids: &[String],
+        hypothesis_id: Option<&str>,
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": agent_id.as_str(),
+                "reason": reason,
+                "required_output": question,
+                "supporting_evidence_ids": evidence_ids,
+                "consultative": true,
+                "hypothesis_id": hypothesis_id,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(err) = append_whiteboard_event(pool, &event(supporting_evidence_ids)).await {
+            warn!(
+                %err,
+                "issue #59: consult decision append rejected; re-appending without the \
+                 rejected citations (fail-soft, the record still lands)"
+            );
+            if let Err(err) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(%err, "issue #59: consult decision append failed (fail-soft)");
+            }
+        }
+    }
+
+    /// Issue #59: append the consultation's findings as a consultative
+    /// `Finding` evidence event. The findings are an ASSERTION (F-ASSUME in
+    /// the issue-#56 world model — no executed observation behind them) and
+    /// the returned event id is the REAL evidence id later decisions cite.
+    /// `causation` names the consult decision that produced the findings.
+    /// Fail-soft: an append failure yields `None` (the findings still ride
+    /// the tool result; no evidence id is fabricated).
+    #[allow(clippy::too_many_arguments)] // 7 params + self; the extra `hypothesis_id` attribution
+    async fn append_consult_finding(
+        &self,
+        session_id: Ulid,
+        agent_id: &AgentId,
+        question: &str,
+        findings: &str,
+        consult_decision_id: &str,
+        cited_evidence_ids: &[String],
+        hypothesis_id: Option<&str>,
+    ) -> Option<String> {
+        let pool = self.review_store.as_ref()?;
+        let event_id = Ulid::new().to_string();
+        let event = NewWhiteboardEvent {
+            event_id: event_id.clone(),
+            agent_id: agent_id.as_str().to_owned(),
+            kind: WhiteboardKind::Finding,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: Some(consult_decision_id.to_owned()),
+            payload: serde_json::json!({
+                "consultative": true,
+                "question": bounded_text(question, 512),
+                "findings": findings,
+                "supporting_evidence_ids": cited_evidence_ids,
+                "hypothesis_id": hypothesis_id,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        match append_whiteboard_event(pool, &event).await {
+            Ok(_) => Some(event_id),
+            Err(err) => {
+                warn!(%err, "issue #59: consult findings append failed (fail-soft)");
+                None
+            }
+        }
+    }
+
+    /// Issue #63: build the world snapshot one wait re-evaluation consumes.
+    ///
+    /// All inputs are injected from the caller's live state — the graph's
+    /// current task statuses, the workspace-digest generation, whiteboard
+    /// events appended after the wait's cursor, and the decision journal's
+    /// superseding `Replan`s — so both the park loop and a resume
+    /// re-evaluation read the same view. `new-evidence` reads events appended
+    /// STRICTLY after the wait's own Decision marker (`start_gate_seq`), so
+    /// the marker can never self-trigger.
+    async fn wake_view_for(
+        &self,
+        graph: &TaskGraph,
+        session_id: Ulid,
+        record: &WaitingRecord,
+        cancel: &CancellationToken,
+    ) -> WakeView {
+        let resolved_task_ids: HashSet<TaskId> = graph
+            .all_tasks()
+            .into_iter()
+            .filter(|subtask| task_is_resolved(&subtask.status))
+            .map(|subtask| subtask.id)
+            .collect();
+        // Issue #65: a `workspace-generation-changed` wait is evaluated
+        // against a FRESH generation capture — the run-start generation is
+        // static, so without this the condition could only ever trip across
+        // a resume. The capture is paid only when the wait actually watches
+        // the workspace, never per-slice for other conditions. Fail-soft: a
+        // capture failure degrades to the static generation — no detectable
+        // change, so no spurious wake and no drift from today's behavior.
+        let workspace_generation =
+            if record.conditions.iter().any(|condition| {
+                matches!(condition, WakeCondition::WorkspaceGenerationChanged { .. })
+            }) {
+                self.capture_fresh_generation(cancel).await.or_else(|| self.snapshot_generation())
+            } else {
+                self.snapshot_generation()
+            };
+
+        let mut new_evidence_kinds: Vec<String> = Vec::new();
+        if let Some(pool) = self.review_store.as_ref() {
+            let after_gate_seq = record.start_gate_seq.unwrap_or(0);
+            match load_whiteboard_events(
+                pool,
+                &WhiteboardLoadOpts {
+                    after_gate_seq,
+                    session_id: Some(session_id.to_string()),
+                    scope: None,
+                    limit: 500,
+                },
+            )
+            .await
+            {
+                Ok(events) => {
+                    for event in events {
+                        let kind = event.kind.as_str().to_owned();
+                        if !new_evidence_kinds.contains(&kind) {
+                            new_evidence_kinds.push(kind);
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "issue #63: wait evidence-cursor read failed; \
+                         new-evidence conditions see no fresh events this slice");
+                }
+            }
+        }
+
+        // A `Replan` recorded AFTER the wait supersedes it; the wait's own
+        // entry is never a superseding signal.
+        let entries = self.decision_journal.entries();
+        let wait_index = entries.iter().position(|entry| entry.id == record.decision_id);
+        let replan_signaled = wait_index
+            .map(|start| {
+                entries
+                    .iter()
+                    .skip(start.saturating_add(1))
+                    .any(|entry| entry.kind == crate::decisions::DecisionKind::Replan)
+            })
+            .unwrap_or(false);
+
+        WakeView {
+            resolved_task_ids,
+            workspace_generation,
+            new_evidence_kinds,
+            replan_signaled,
+            now_ms: crate::tool_facts::unix_ms(),
+        }
+    }
+
+    /// Issue #63: the whiteboard `Decision` record for one WAIT. Written
+    /// directly (never via [`Self::append_dispatch_decision`], which drives
+    /// the ADR-65 §7 pending-dispatch continuation — a wait dispatches
+    /// nothing to continue behind). Returns the stored marker's `gate_seq`
+    /// (the wait's evidence cursor) or `None` when no log is wired or the
+    /// append ultimately fails. Fail-soft: a rejected citation set is
+    /// re-appended without its citations so the record always lands.
+    async fn append_wait_decision(
+        &mut self,
+        session_id: Ulid,
+        reason: &str,
+        supporting_evidence_ids: &[String],
+        affected_task_ids: &[TaskId],
+        affected_resource_ids: &[String],
+        deadline_ms: Option<i64>,
+    ) -> Option<u64> {
+        let pool = self.review_store.as_ref()?;
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": "coordinator",
+                "decision_kind": "wait",
+                "reason": reason,
+                "required_output": reason,
+                "supporting_evidence_ids": evidence_ids,
+                "wait_deadline_ms": deadline_ms,
+                "affected_task_ids": affected_task_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<String>>(),
+                "affected_resource_ids": affected_resource_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        match append_whiteboard_event(pool, &event(supporting_evidence_ids)).await {
+            Ok(stored) => Some(stored.gate_seq),
+            Err(err) => {
+                warn!(%err, "issue #63: wait decision append failed (fail-soft)");
+                // Re-append without citations: evidence references are
+                // validated inside the append transaction; a citation set
+                // rejected there must not lose the decision record.
+                match append_whiteboard_event(pool, &event(&[])).await {
+                    Ok(stored) => Some(stored.gate_seq),
+                    Err(err) => {
+                        warn!(%err, "issue #63: wait decision re-append without citations failed");
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #63: handle ONE `wait` tool call — parse → exit-bounds checks →
+    /// decision validation (Wait rejects a target and requires the reason via
+    /// the task text) → journal → policy gate → whiteboard `Decision` event
+    /// → park the decision loop in bounded, cancellable slices
+    /// ([`execute_wait`]) → settle the journaled decision from the outcome.
+    ///
+    /// The wait parks INSIDE this single tool call: the #53 no-progress
+    /// tracker only observes between tool-call loops, so the park is never
+    /// flagged as a stalled turn and consumes zero model turns.
+    ///
+    /// A crash mid-wait is resumable: `active_wait` is checkpointed BEFORE
+    /// the sleep loop starts and cleared after it settles; a resumed dispatch
+    /// session re-evaluates the restored record once against the current
+    /// world.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_wait(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse + exit-bounds checks (no partial wait) ───────────────
+        let Some(args) = WaitArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "wait requires a non-empty reason and well-formed conditions \
+                            (event-resolved / workspace-generation-changed / new-evidence / \
+                            replan-or-cancel)",
+            });
+        };
+        // A wait with no condition and no deadline can only run to the
+        // internal cap and then report still-waiting — a self-contradictory
+        // park, rejected before any state mutation.
+        if args.conditions.is_empty() && args.deadline_ms.is_none() {
+            return serde_json::json!({
+                "error": "degenerate_wait",
+                "message": "a wait must declare at least one wake condition or a deadline; \
+                            name what you are waiting for and re-decide",
+            });
+        }
+        let affected_id_count =
+            args.affected_task_ids.len().saturating_add(args.affected_resource_ids.len());
+        if affected_id_count > MAX_WAIT_AFFECTED_IDS {
+            return serde_json::json!({
+                "error": "too_many_affected_ids",
+                "message": format!(
+                    "a wait may name at most {MAX_WAIT_AFFECTED_IDS} affected task/resource \
+                     ids (got {affected_id_count}); trim and re-decide",
+                ),
+            });
+        }
+
+        // ── 2. Decision validation (Wait rejects a target; the reason rides
+        //       the task text; cited evidence is verified like any decision) ─
+        let missing = self.missing_evidence_ids(&args.supporting_evidence_ids, cancel).await;
+        let known_ids: HashSet<String> = args
+            .supporting_evidence_ids
+            .iter()
+            .filter(|id| !missing.contains(id))
+            .cloned()
+            .collect();
+        let roster_ids = self.decision_roster();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids: &roster_ids,
+            known_event_ids: &known_ids,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut decision = match validator.validate(
+            crate::decisions::DecisionKind::Wait,
+            None,
+            &args.reason,
+            Some(&args.reason),
+            &args.supporting_evidence_ids,
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => return rejection.tool_value(),
+        };
+        let decision_id = decision.id.clone();
+        let started_at_ms = crate::tool_facts::unix_ms();
+        let reference_generation = self.snapshot_generation();
+        // `workspace-generation-changed` never wears a model-supplied
+        // generation: the executor stamps the CURRENT one at wait start so
+        // the park and a resume re-evaluate against the same boundary.
+        let WaitArgs {
+            reason,
+            conditions,
+            deadline_ms,
+            supporting_evidence_ids,
+            affected_task_ids,
+            affected_resource_ids,
+        } = args;
+        let conditions: Vec<WakeCondition> = conditions
+            .into_iter()
+            .map(|condition| match condition {
+                WakeCondition::WorkspaceGenerationChanged { .. } => {
+                    WakeCondition::WorkspaceGenerationChanged {
+                        generation_at_wait: reference_generation.clone(),
+                    }
+                }
+                other => other,
+            })
+            .collect();
+        let mut record = WaitingRecord {
+            decision_id: decision_id.clone(),
+            reason: reason.clone(),
+            supporting_evidence_ids: supporting_evidence_ids.clone(),
+            conditions,
+            affected_task_ids: affected_task_ids.clone(),
+            affected_resource_ids: affected_resource_ids.clone(),
+            started_at_ms,
+            deadline_ms,
+            start_gate_seq: None,
+        };
+        decision.wait_record = Some(record.clone());
+        self.decision_journal.record(decision);
+
+        // ── 3. Policy gate ────────────────────────────────────────────────
+        let Some(policy) = self.policy.clone() else {
+            return serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; the wait decision is denied",
+            });
+        };
+        let action = PolicyAction {
+            tool_name: WAIT_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this wait decision",
+                });
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return serde_json::json!({ "error": "cancelled" });
+                }
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                });
+            }
+        }
+
+        // ── 4. Dispatched + whiteboard Decision event ─────────────────────
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        // The stored marker's own gate_seq is the wait's evidence cursor, so
+        // `new-evidence` conditions read events appended STRICTLY after the
+        // wait began and the marker can never self-trigger.
+        let marker_gate_seq = self
+            .append_wait_decision(
+                task.session_id,
+                &reason,
+                &supporting_evidence_ids,
+                &affected_task_ids,
+                &affected_resource_ids,
+                deadline_ms,
+            )
+            .await;
+        record.start_gate_seq = match marker_gate_seq {
+            Some(seq) => Some(seq),
+            None => match self.review_store.as_ref() {
+                Some(pool) => match latest_gate_seq(pool).await {
+                    Ok(seq) => Some(seq),
+                    Err(error) => {
+                        warn!(%error, "issue #63: gate-seq read failed at wait start; the wait's \
+                             evidence cursor degrades to None (conservative)");
+                        None
+                    }
+                },
+                None => None,
+            },
+        };
+        self.active_wait = Some(record.clone());
+
+        // ── 5. Crash-safe checkpoint BEFORE the park ──────────────────────
+        // If the process dies mid-wait, a resumed run re-evaluates this
+        // record once instead of losing the park.
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        // ── 6. Park the loop (bounded, cancellable slices) ────────────────
+        let outcome = {
+            // Reborrow `&self` and `graph` immutably for the wait duration;
+            // the block ends and the borrows drop before `&mut self` resumes
+            // for the settle + checkpoint below.
+            let refiner = CoordinatorWakeRefiner {
+                coordinator: &*self,
+                graph: &*graph,
+                session_id: task.session_id,
+                record: &record,
+                cancel: cancel.clone(),
+            };
+            execute_wait(&record, &refiner, &WaitConfig::default(), cancel).await
+        };
+
+        // ── 7. Settle: clear the park, journal, checkpoint ────────────────
+        self.active_wait = None;
+        let result = match outcome {
+            WakeOutcome::Woken(WakeReason::Cancelled) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({ "error": "cancelled" })
+            }
+            WakeOutcome::Woken(reason) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+                let label = wake_reason_label(reason);
+                let mut payload = serde_json::json!({
+                    "outcome": "woken",
+                    "reason": label,
+                    "decision_id": decision_id,
+                    "message": format!(
+                        "the wait cleared: {label} — continue the work that was parked",
+                    ),
+                });
+                // Issue #65: a workspace-generation-changed wake is the LIVE
+                // detection vector — capture the diff now and record every
+                // changed path the run cannot explain (own writes excluded,
+                // ownership table first). Fail-soft: a failed scan adds no
+                // records; the wait decision is already settled.
+                if reason == WakeReason::WorkspaceGenerationChanged {
+                    let own_written = own_write_paths(
+                        &ledger.all_files,
+                        &ledger.completed_results,
+                        &[],
+                        &base_ctx.session.project_dir,
+                    );
+                    let expected = self.expected_artifact_paths();
+                    let records =
+                        self.scan_external_changes(graph, &own_written, &expected, cancel).await;
+                    if !records.is_empty() {
+                        let listed: Vec<serde_json::Value> = records
+                            .iter()
+                            .map(|record| {
+                                serde_json::json!({
+                                    "path": record.first_path(),
+                                    "known_owner": record.known_owner,
+                                    "known_task": record.known_task,
+                                    "conflicts_with_coordinator_work":
+                                        record.conflicts_with_coordinator_work,
+                                })
+                            })
+                            .collect();
+                        for record in records {
+                            self.upsert_external_change(record);
+                        }
+                        payload["external_changes"] = serde_json::Value::Array(listed);
+                    }
+                }
+                payload
+            }
+            WakeOutcome::Expired => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({
+                    "outcome": "expired",
+                    "decision_id": decision_id,
+                    "message": "the wait's deadline passed unmet — re-decide: the condition \
+                                never held, so defer, retry, or re-wait with updated assumptions",
+                })
+            }
+            WakeOutcome::StillWaiting => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                serde_json::json!({
+                    "outcome": "still_waiting",
+                    "decision_id": decision_id,
+                    "message": "the wait hit the absolute internal cap without a condition \
+                                tripping or a deadline passing — re-decide or re-wait with a \
+                                deadline",
+                })
+            }
+        };
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+        result
+    }
+
+    /// Issue #57: handle ONE `split_task` tool call — parse → decision
+    /// validation (no target; evidence-backed) → transform proof-and-apply
+    /// against the REAL graph (a proof COPY takes any rejection; never the
+    /// live DAG) → whiteboard/ledger/journal trail → structured result.
+    ///
+    /// Failure discipline mirrors [`Self::handle_call_specialist`]:
+    /// structured tool errors, never a crash; cancellation propagates.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_split_task(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = SplitTaskArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "split_task requires string task_id and a children array                             of {description, expected_artifacts?, after?} specs",
+            });
+        };
+        let Ok(parent) = Ulid::from_string(&args.task_id).map(TaskId) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!("split_task: task_id {} is not a task id", args.task_id),
+            });
+        };
+
+        // Artifact canonicalization: every child-specified path resolves
+        // INSIDE the project root before it reaches the transform spec
+        // (model paths are never trusted).
+        let path_validator = crate::decisions::DecisionValidator {
+            roster_ids: &HashSet::new(),
+            known_event_ids: &HashSet::new(),
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut child_specs = Vec::with_capacity(args.children.len());
+        let mut all_artifacts: Vec<String> = Vec::new();
+        for child in &args.children {
+            let mut expected_artifacts: Vec<String> = Vec::new();
+            for raw in &child.expected_artifacts {
+                let Some(canonical) = path_validator.canonical_artifact_path(raw) else {
+                    return serde_json::json!({
+                        "error": "invalid_artifact_path",
+                        "message": format!(
+                            "split_task: expected-artifact path {raw:?} escapes the                              workspace; give a workspace-root-relative path"
+                        ),
+                    });
+                };
+                if !expected_artifacts.contains(&canonical) {
+                    expected_artifacts.push(canonical.clone());
+                }
+                if !all_artifacts.contains(&canonical) {
+                    all_artifacts.push(canonical);
+                }
+            }
+            child_specs.push(crate::task_transform::SplitChildSpec {
+                description: child.description.clone(),
+                expected_artifacts,
+                after: child.after.clone(),
+            });
+        }
+
+        let summary = format!("split of open task {parent}");
+        let transform_spec =
+            crate::task_transform::TaskTransformSpec::Split { parent, children: child_specs };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Split,
+                Some(transform_spec.clone()),
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &all_artifacts,
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        let children = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Split(outcome)) => outcome.children,
+            Ok(
+                crate::task_transform::TransformOutcome::Merge(_)
+                | crate::task_transform::TransformOutcome::Freeze(_),
+            ) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the split decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    task = %parent,
+                    "split_task rejected by the deterministic transform validation"
+                );
+                ledger.notes.push(format!("Split of {parent} rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── The trail: journal transitions, whiteboard decision + events,
+        // ledger rows, attempt baselines. ──────────────────────────────────
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        let baseline = ledger.subtask_attempts.get(&parent).copied().unwrap_or(0);
+        ledger.subtask_attempts.remove(&parent);
+        ledger.model_assignments.remove(&parent);
+        for child in &children {
+            *ledger.subtask_attempts.entry(*child).or_insert(0) = baseline;
+            let role = graph
+                .get(child)
+                .map(|child_task| child_task.role.clone())
+                .unwrap_or_else(|| AgentId::new("coder"));
+            let description = graph
+                .get(child)
+                .map(|child_task| child_task.description.clone())
+                .unwrap_or_default();
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                child.0,
+                EventKind::SubTaskCreated { task_id: *child, role, description },
+            );
+        }
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "split".into(),
+            task_id: Some(parent),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            Some(parent),
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // The chain frontier (when this split consumed the chain head)
+        // resets: the children re-enter through the ordinary ready queue,
+        // not through the chain-parent slot.
+        if state.last_node == Some(parent) {
+            state.last_node = None;
+        }
+        // Expected-artifact ownership stays single-owner: declared children
+        // own only their declared paths; unspecified children inherit the
+        // parent's artifact set (and its ownership); the parent leaves.
+        let inherited_artifacts = self
+            .expected_artifacts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&parent)
+            .cloned();
+        {
+            let mut expected =
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+            expected.remove(&parent);
+            // args.children aligns index-for-index with the committed
+            // children list (the transform never reorders child specs).
+            for (child, spec) in children.iter().zip(args.children.iter()) {
+                let inherited = if spec.expected_artifacts.is_empty() {
+                    inherited_artifacts.clone().unwrap_or_default()
+                } else {
+                    spec.expected_artifacts.iter().map(camino::Utf8PathBuf::from).collect()
+                };
+                expected.insert(*child, inherited);
+            }
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "split",
+            "parent": parent.to_string(),
+            "children": children.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "children_attempt_baseline": baseline,
+        })
+    }
+
+    /// Issue #57: handle ONE `merge_tasks` tool call — same failure
+    /// discipline as [`Self::handle_split_task`]: parse → decision
+    /// validation → proof-and-apply against the REAL graph → trail →
+    /// structured result. Compatibility is deterministic: ≥ 2 DISTINCT
+    /// pending tasks of the SAME specialist role; the survivor is the
+    /// LOWEST task id (same input ⇒ same survivor, spec, edge set).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_merge_tasks(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = MergeTaskArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "merge_tasks requires task_ids (>= 2) and merged_description",
+            });
+        };
+        let mut parsed_ids: Vec<TaskId> = Vec::with_capacity(args.task_ids.len());
+        for raw in &args.task_ids {
+            let Ok(id) = Ulid::from_string(raw).map(TaskId) else {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": format!("merge_tasks: {} is not a task id", raw),
+                });
+            };
+            parsed_ids.push(id);
+        }
+
+        // Artifact canonicalization for the merged artifact set.
+        let path_validator = crate::decisions::DecisionValidator {
+            roster_ids: &HashSet::new(),
+            known_event_ids: &HashSet::new(),
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut merged_artifacts = Vec::new();
+        for raw in &args.merged_artifacts {
+            let Some(canonical) = path_validator.canonical_artifact_path(raw) else {
+                return serde_json::json!({
+                    "error": "invalid_artifact_path",
+                    "message": format!(
+                        "merge_tasks: expected-artifact path {raw:?} escapes the workspace; \
+                         give a workspace-root-relative path"
+                    ),
+                });
+            };
+            if !merged_artifacts.contains(&canonical) {
+                merged_artifacts.push(canonical);
+            }
+        }
+
+        let summary = format!("merge of {} open tasks into one survivor", parsed_ids.len());
+        let transform_spec = crate::task_transform::TaskTransformSpec::Merge {
+            task_ids: parsed_ids,
+            merged_description: args.merged_description.clone(),
+            merged_artifacts: merged_artifacts.clone(),
+        };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Merge,
+                Some(transform_spec.clone()),
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &args.merged_artifacts,
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        let (survivor, removed) = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Merge(outcome)) => {
+                (outcome.survivor, outcome.removed)
+            }
+            Ok(
+                crate::task_transform::TransformOutcome::Split(_)
+                | crate::task_transform::TransformOutcome::Freeze(_),
+            ) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the merge decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    "merge_tasks rejected by the deterministic transform validation"
+                );
+                ledger.notes.push(format!("Merge rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── The trail: journal transitions, whiteboard decision, ledger
+        // rows, attempt counters, artifact ownership. ──────────────────────
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        // Attempt counters: the MAXIMUM of the merged group — no extra
+        // budget is granted by folding. Loser counters leave the ledger.
+        let attempts = std::mem::take(&mut ledger.subtask_attempts);
+        let mut kept_attempts = attempts;
+        let survivor_attempts = kept_attempts.get(&survivor).copied();
+        let merged_attempts = removed
+            .iter()
+            .filter_map(|id| kept_attempts.remove(id))
+            .chain(survivor_attempts)
+            .max()
+            .unwrap_or(0);
+        *kept_attempts.entry(survivor).or_insert(0) = merged_attempts;
+        ledger.subtask_attempts = kept_attempts;
+        // Artifact ownership stays single-owner: the survivor unions the
+        // removed members' artifact sets (deterministic in task id order)
+        // plus the merged artifact set; the losers leave the map entirely.
+        {
+            let mut expected =
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+            let mut union = expected.get(&survivor).cloned().unwrap_or_default();
+            for id in &removed {
+                if let Some(loser_artifacts) = expected.remove(id) {
+                    for path in loser_artifacts {
+                        if !union.contains(&path) {
+                            union.push(path);
+                        }
+                    }
+                }
+            }
+            for path in &merged_artifacts {
+                let path = camino::Utf8PathBuf::from(path);
+                if !union.contains(&path) {
+                    union.push(path);
+                }
+            }
+            expected.insert(survivor, union);
+        }
+        let role = graph
+            .get(&survivor)
+            .map(|task| task.role.clone())
+            .unwrap_or_else(|| AgentId::new("coder"));
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            survivor.0,
+            EventKind::SubTaskCreated {
+                task_id: survivor,
+                role,
+                description: args.merged_description.clone(),
+            },
+        );
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "merge".into(),
+            task_id: Some(survivor),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            Some(survivor),
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // A chain frontier that pointed at a removed member now points at
+        // the survivor (deterministic continuation).
+        if state.last_node.is_some_and(|head| removed.contains(&head)) {
+            state.last_node = Some(survivor);
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "merged",
+            "survivor": survivor.to_string(),
+            "removed": removed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// ADR-35 amendment (2026-09-16 §2): handle ONE `request_user_input`
+    /// tool call. The Coordinator asks the operator a question — the reason
+    /// is recorded and the decision loop unwinds on it (the inner/outer
+    /// breaks in `run_dispatch_session`), so `execute_graph` returns an
+    /// `AwaitingUser` output with the reason as the final message and a
+    /// preserved checkpoint. No policy gate: this is the human-in-the-loop
+    /// consent path itself, not a workspace mutation, and no agent is named
+    /// or dispatched. Touches no graph, journal, or ledger state — the
+    /// run-level outcome (status + message + checkpoint) is the record.
+    async fn handle_request_user_input(
+        &mut self,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial request) ────────────────────────────────
+        let Some(reason) = arguments
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "request_user_input requires a non-empty string reason",
+            });
+        };
+        self.requested_user_input = Some(reason.to_string());
+        serde_json::json!({
+            "status": "awaiting_human_input",
+            "message": "The run is paused awaiting your input.",
+        })
+    }
+
+    /// Issue #64: handle ONE `reconsider` tool call — supersede a decision
+    /// whose assumptions proved wrong and freeze only the affected pending
+    /// tasks. Same failure discipline as the sibling decision surfaces:
+    /// parse → journal lookup → decision validation → proof-and-apply the
+    /// deterministic `Freeze` against the REAL graph → trail (the new
+    /// decision settles, the superseded decision is marked `Superseded`)
+    /// → structured result. Completed work, valid evidence, and accepted
+    /// artifacts are never touched; the frozen tasks never re-enter the
+    /// ready queue on their own, so the next strategy decision comes from
+    /// the model against the current world state.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_reconsider(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial reconsideration) ─────────────────────────
+        let Some(args) = ReconsiderArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider requires a non-empty decision_id (a decision from this \
+                            run's journal), a non-empty reason, and at least one affected \
+                            pending task id",
+            });
+        };
+        let decision_id = args.decision_id.trim();
+        if decision_id.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider requires a non-empty decision_id",
+            });
+        }
+
+        // ── 2. The superseded decision must exist in the journal; a
+        //       rejected decision has nothing in operation to void ────────
+        let target_status =
+            match self.decision_journal.entries().iter().find(|entry| entry.id == decision_id) {
+                Some(entry) => entry.status,
+                None => {
+                    return serde_json::json!({
+                        "error": "unknown_decision",
+                        "message": format!(
+                            "no decision {decision_id} exists in this run's journal; cite a real \
+                             decision id from the context"
+                        ),
+                    });
+                }
+            };
+        if target_status == crate::decisions::DecisionStatus::Rejected {
+            return serde_json::json!({
+                "error": "decision_not_reconsiderable",
+                "message": format!(
+                    "decision {decision_id} is already rejected — it has nothing in operation \
+                     to supersede"
+                ),
+            });
+        }
+        // A Superseded target is allowed: re-reconsidering is idempotent (the
+        // journal re-mark is a forward-only no-op).
+
+        // ── 3. affected_task_ids parse as ULIDs (deduplicated) ─────────────
+        let mut affected: Vec<TaskId> = Vec::new();
+        for raw in &args.affected_task_ids {
+            let Ok(id) = Ulid::from_string(raw).map(TaskId) else {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": format!(
+                        "affected_task_ids entries must be task ULIDs; {raw:?} is not"
+                    ),
+                });
+            };
+            if !affected.contains(&id) {
+                affected.push(id);
+            }
+        }
+        if affected.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "reconsider must name at least one affected pending task id",
+            });
+        }
+
+        // ── 4. Decision validation (Reconsider rejects a target; the reason
+        //       rides the task text; fabricated evidence is rejected). The
+        //       Freeze payload is attached here, validated against the REAL
+        //       graph by the next step. ─────────────────────────────────────
+        // The model's `reason` becomes the decision's task text (like the
+        // WAIT reason); the superseded decision id lives in the freeze
+        // payload so the journal entry is fully self-describing.
+        let summary = args.reason.trim();
+        let transform_spec = crate::task_transform::TaskTransformSpec::Freeze {
+            decision_id: decision_id.to_owned(),
+            task_ids: affected.clone(),
+        };
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::Reconsider,
+                Some(transform_spec.clone()),
+                summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &[],
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id_new = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── 5. Deterministic freeze against the REAL graph ────────────────
+        let frozen = match crate::task_transform::apply_transform(
+            graph,
+            &transform_spec,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(crate::task_transform::TransformOutcome::Freeze(outcome)) => outcome.frozen,
+            Ok(
+                crate::task_transform::TransformOutcome::Split(_)
+                | crate::task_transform::TransformOutcome::Merge(_),
+            ) => {
+                self.decision_journal
+                    .transition(&decision_id_new, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "conflicting_decision",
+                    "message": "the reconsider decision kind does not match its payload",
+                });
+            }
+            Err(rejection) => {
+                self.decision_journal
+                    .transition(&decision_id_new, crate::decisions::DecisionStatus::Rejected);
+                warn!(
+                    code = %rejection.code,
+                    %decision_id,
+                    "reconsider rejected by the deterministic freeze validation"
+                );
+                ledger
+                    .notes
+                    .push(format!("Reconsider of {decision_id} rejected: {}", rejection.message));
+                return rejection.tool_value();
+            }
+        };
+
+        // ── 6. The trail: the reconsideration settles, the superseded
+        //       decision is marked Superseded (forward-only, idempotent);
+        //       whiteboard Decision record; ledger row. ────────────────────
+        self.decision_journal
+            .transition(&decision_id_new, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal
+            .transition(&decision_id_new, crate::decisions::DecisionStatus::Settled);
+        self.decision_journal.transition(decision_id, crate::decisions::DecisionStatus::Superseded);
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "reconsidered".into(),
+            task_id: None, // the freeze spans tasks; the decision's entry names them
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            None, // a reconsideration leaves no per-node continuation behind
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        // A chain frontier that froze the chain head resets: the frozen node
+        // never re-enters via the chain-parent slot.
+        if state.last_node.is_some_and(|head| frozen.contains(&head)) {
+            state.last_node = None;
+        }
+        // A pending dispatch continuation must not stand behind a frozen
+        // task (ADR-65 §7: nothing to continue behind anymore).
+        if self
+            .last_dispatch_decision
+            .as_ref()
+            .and_then(|pending| pending.task_id)
+            .is_some_and(|pending_task| frozen.contains(&pending_task))
+        {
+            self.last_dispatch_decision = None;
+        }
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "reconsidered",
+            "decision_id": decision_id_new,
+            "superseded_decision_id": decision_id,
+            "frozen": frozen.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "message": format!(
+                "superseded decision {decision_id} and froze {} pending task(s); re-plan the \
+                 frozen work under fresh decisions",
+                frozen.len()
+            ),
+        })
+    }
+
+    /// Mark a dispatch that never produced a run result (model-selection or
+    /// transport failure) as an unresolved graph node: `Blocked` at the
+    /// attempts ceiling, so the run surfaces `Partial` rather than a vacuous
+    /// completion.
+    fn settle_unresolved_dispatch(
+        &mut self,
+        graph: &mut TaskGraph,
+        ledger: &mut DispatchLedger,
+        role: &AgentId,
+        subtask_id: TaskId,
+    ) {
+        graph.mark_blocked(&subtask_id);
+        if let Some(node) = graph.get_mut(&subtask_id) {
+            node.completed_at = Some(time::OffsetDateTime::now_utc());
+        }
+        ledger.subtask_attempts.insert(subtask_id, self.max_subtask_attempts);
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "failed".into(),
+            task_id: Some(subtask_id),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        ledger.notes.push(format!(
+            "Specialist {role} could not be dispatched (model selection or transport \
+             failure); the run ends with this dispatch unresolved."
+        ));
+        if self.last_dispatch_decision.as_ref().and_then(|pending| pending.task_id)
+            == Some(subtask_id)
+        {
+            self.last_dispatch_decision = None;
+        }
+    }
+
+    /// Record one settled specialist dispatch into the ledger mirrors
+    /// `execute_graph` maintains (completed results + the action ledger).
+    fn settle_dispatch_record(
+        &self,
+        ledger: &mut DispatchLedger,
+        subtask_id: TaskId,
+        result: &AgentRunResult,
+    ) {
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: if matches!(result.outcome, AgentOutcome::Success) {
+                "completed".into()
+            } else {
+                "failed".into()
+            },
+            task_id: Some(subtask_id),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        let mut recorded = result.clone();
+        recorded.task_id = subtask_id;
+        ledger.completed_results.insert(subtask_id, recorded);
+    }
+
+    /// Persist a checkpoint over the loop's graph + ledger state (the
+    /// checkpoint/resume ledger stays authoritative across the decision
+    /// loop). Fail-soft like every checkpoint write.
+    async fn persist_dispatch_checkpoint(
+        &mut self,
+        graph: &TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &DispatchLedger,
+    ) {
+        scope.sequence_num = scope.sequence_num.saturating_add(1);
+        let checkpoint_context =
+            self.checkpoint_context(&ledger.model_assignments, &ledger.action_ledger);
+        let mut cp = checkpoint::build_checkpoint(
+            scope,
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &base_ctx.working_memory,
+            graph,
+            &ledger.completed_results,
+            ledger.total_cost,
+            ledger.total_tool_calls,
+            &ledger.provider_metrics,
+            &ledger.all_files,
+            &self.expected_artifacts_snapshot(),
+            &ledger.subtask_attempts,
+            &HashMap::new(),
+            &checkpoint_context,
+        );
+        self.persist_checkpoint(&mut cp).await;
+        let _ = task;
+    }
+
+    /// Handle the optional `draft_plan` advisor (ADR-35 amendment §2 / ADR-52
+    /// amendment 2026-09-05): the planner runs as an ADVISOR and its output
+    /// is returned as context text. Its draft is NEVER materialized as
+    /// `SubTask` roles or dependencies and dispatches nothing.
+    async fn handle_draft_plan(
+        &mut self,
+        task: &AgentTask,
+        cancel: &CancellationToken,
+        doc: Option<&DesignDoc>,
+    ) -> (serde_json::Value, Option<PlanArtifact>) {
+        // Issue #52: the advisor invocation is itself a journaled decision —
+        // no target, advisory only, deterministic bounds (a draft_plan call
+        // carries no model-controlled ids, so validation cannot fail here).
+        let decision_id = self.record_side_decision(
+            crate::decisions::DecisionKind::DraftPlan,
+            "request the bounded advisory work breakdown",
+        );
+        let roster: Vec<PlannerAgentInfo> = self
             .registry
             .ids()
             .iter()
             .map(|id| {
-                // The stage tag always comes from the registered agent
-                // (trait = source of truth); capabilities/description come
-                // from the retained merged config when present (ADR-35
-                // phase 4, roster enrichment).
                 let stage = self.registry.get(id).and_then(|agent| agent.stage());
                 let (capabilities, description) = match self.registry.config(id) {
-                    Some(cfg) => (cfg.capabilities.clone(), config_description(cfg)),
-                    None => (AgentCapabilities::default(), String::new()),
+                    Some(config) => (config.capabilities.clone(), config_description(config)),
+                    None => (concerto_config::AgentCapabilities::default(), String::new()),
                 };
                 PlannerAgentInfo { id: id.clone(), stage, capabilities, description }
             })
             .collect();
-        if coordinator_self_implements {
-            // ADR-58 P2+P3 (R4/§3): the sentinel's roster entry mirrors the
-            // self-implement render — the unstaffed-`Execution` fallback
-            // persona (`implement_fallback_persona`) supplies the description
-            // and the narrowed write flags, with the engine-owned
-            // `fs_read`/`git`/`lsp` defaults overlaid (review F1) and the
-            // reserved `coordinator` id never registered (F2). The stage tag
-            // follows the primary `Execution` stage, falling back to
-            // `implement` (planner.rs partitions on the same resolution).
-            let persona = self.implement_fallback_persona();
-            planner_agents.push(PlannerAgentInfo {
-                id: AgentId::new("coordinator"),
-                stage: Some(AgentStage::new(execution_stage_tag(self.blueprint_facade.as_ref()))),
-                capabilities: sentinel_capabilities(&persona, StageKind::Execution),
-                description: persona.label.clone(),
-            });
-        }
-
-        let planning_repair = planning_feedback
-            .filter(|feedback| !feedback.validation_error.trim().is_empty())
-            .map(|feedback| {
-                format!(
-                    "\n\nResume the existing planning attempt. The last response failed validation: {}\nLast response excerpt:\n{}",
-                    feedback.validation_error,
-                    feedback.last_response.chars().take(2_000).collect::<String>()
-                )
-            })
-            .unwrap_or_default();
-
-        // ── Design stage (optional) ──────────────────────────────────────
-        let mut design_doc: Option<DesignDoc> = None;
-        let design_id: Option<TaskId> = match &design_role {
-            Some(role) => {
-                // The architect run is dispatched through the SAME
-                // classify → retry → escalate → fallback-ladder recovery the
-                // execution-phase dispatch loop uses (ADR-42/45). A provider
-                // failure during planning (e.g. a non-retryable stream-idle
-                // timeout) therefore walks the ladder instead of abandoning
-                // the run with a bare `?`. Only an exhausted ladder surfaces
-                // as a graceful Partial plan via the caller.
-                let (completed_arch, doc) = self
-                    .run_design_stage_with_recovery(role, task, context, cancel, &planning_repair)
-                    .await?;
-                design_doc = Some(doc);
-                let arch_id = completed_arch.id;
-                graph.add_root(completed_arch);
-                Some(arch_id)
-            }
-            // No design-stage agent: the graph starts directly at the
-            // planned subtasks.
-            None => None,
-        };
-        // Keep the plan (or lack of one) so checkpoints capture the DesignDoc
-        // without re-running the Architect on resume (C-05).
-        *self.design_doc.lock().unwrap_or_else(|error| error.into_inner()) = design_doc.clone();
-
         let planner = TaskPlanner;
         match planner
             .plan(
                 task,
-                design_doc.as_ref(),
-                &planner_agents,
+                doc,
+                &roster,
                 self.planning_provider.clone(),
                 &self.retry_policy,
                 &self.bus,
@@ -4868,223 +11581,603 @@ impl CoordinatorAgent {
             .await
         {
             Ok(outcome) => {
-                let planned_subtasks = outcome.tasks;
-                for pst in &planned_subtasks {
-                    let subtask = SubTask {
-                        id: pst.id,
-                        parent_id: design_id,
-                        session_id: task.session_id,
-                        role: pst.role.clone(),
-                        description: pst.description.clone(),
-                        status: SubTaskStatus::Pending,
-                        dependencies: pst.dependencies.clone(),
-                        deliverable: None,
-                        created_at: time::OffsetDateTime::now_utc(),
-                        completed_at: None,
-                    };
-                    graph.add_root(subtask);
-                    if implement_ids.contains(&pst.role) {
-                        self.expected_artifacts
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .insert(pst.id, pst.expected_artifacts.clone());
-                    }
-                }
-
-                for pst in &planned_subtasks {
-                    if pst.dependencies.is_empty() {
-                        if let Some(design_id) = design_id {
-                            self.add_managed_dependency(
-                                &mut graph,
-                                pst.id,
-                                design_id,
-                                Dependency::MustFinishBefore,
-                            )?;
-                        }
-                    } else {
-                        for dep_id in &pst.dependencies {
-                            self.add_managed_dependency(
-                                &mut graph,
-                                pst.id,
-                                *dep_id,
-                                Dependency::MustFinishBefore,
-                            )?;
-                        }
-                    }
-                }
-                // Emit creation events.
-                for subtask in graph.all_tasks() {
-                    let _ = self.bus.publish_for_session(
-                        task.session_id,
-                        subtask.id.0,
-                        EventKind::SubTaskCreated {
-                            task_id: subtask.id,
-                            role: subtask.role.clone(),
-                            description: subtask.description.clone(),
-                        },
-                    );
-                }
-
-                return Ok((graph, Some(outcome.artifact)));
-            }
-            Err(e) => {
-                tracing::warn!("Task planning failed: {:?}, falling back to heuristic pipeline", e);
-            }
-        }
-
-        // ── Heuristic fallback pipeline ──────────────────────────────────
-        // Multiple proposed files or named risks => needs a research pass
-        // to gather context before implementation runs. Single-file,
-        // no-risk changes go straight from design to implementation. An
-        // unparseable plan (LLM didn't return valid JSON) is treated
-        // conservatively as needing research.
-        let needs_research = match &design_doc {
-            Some(doc) => doc.proposed_files.len() > 1 || !doc.risks.is_empty(),
-            None => true,
-        };
-
-        // A pipeline without any implement-stage agent cannot build the
-        // fallback pipeline either.
-        let Some(implement_role) = implement_role else {
-            return Err(OrchestratorError::AgentLoopError(
-                "no implementation-stage agent is registered; cannot plan implementation work"
-                    .into(),
-            ));
-        };
-
-        let research_id: Option<TaskId> = if needs_research {
-            match &research_role {
-                Some(role) => {
-                    let res_task = SubTask {
-                        id: TaskId::new(),
-                        parent_id: design_id,
-                        session_id: task.session_id,
-                        role: role.clone(),
-                        description: format!("Research context for: {}", task.description),
-                        status: SubTaskStatus::Pending,
-                        dependencies: design_id.into_iter().collect(),
-                        deliverable: None,
-                        created_at: time::OffsetDateTime::now_utc(),
-                        completed_at: None,
-                    };
-                    let res_id = res_task.id;
-                    let relationship = match &design_role {
-                        Some(d) => self
-                            .relationships
-                            .rule(d, role)
-                            .map(|rule| rule.relationship)
-                            .unwrap_or(crate::relationship::AgentRelationship::OwnsDesign),
-                        None => crate::relationship::AgentRelationship::ProvidesContextTo,
-                    };
-                    if let Some(design_id) = design_id {
-                        graph.add_child_with_relationship(
-                            res_task,
-                            design_id,
-                            Dependency::MustFinishBefore,
-                            relationship,
-                        );
-                    } else {
-                        graph.add_root(res_task);
-                    }
-                    Some(res_id)
-                }
-                // No research agent registered: skip the research pass.
-                None => None,
-            }
-        } else {
-            None
-        };
-        let coder_parent_id = research_id.or(design_id);
-
-        let code_task = SubTask {
-            id: TaskId::new(),
-            parent_id: coder_parent_id,
-            session_id: task.session_id,
-            role: implement_role.clone(),
-            description: format!("Implement: {}", task.description),
-            status: SubTaskStatus::Pending,
-            dependencies: coder_parent_id.into_iter().collect(),
-            deliverable: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            completed_at: None,
-        };
-        match coder_parent_id {
-            Some(parent) => {
-                let parent_role = graph.get(&parent).map(|p| p.role.clone());
-                let relationship = match parent_role {
-                    Some(p) => self
-                        .relationships
-                        .rule(&p, &implement_role)
-                        .map(|rule| rule.relationship)
-                        .unwrap_or_else(|| {
-                            if design_role.as_ref() == Some(&p) {
-                                crate::relationship::AgentRelationship::OwnsDesign
-                            } else {
-                                crate::relationship::AgentRelationship::ProvidesContextTo
-                            }
-                        }),
-                    None => crate::relationship::AgentRelationship::ProvidesContextTo,
-                };
-                graph.add_child_with_relationship(
-                    code_task,
-                    parent,
-                    Dependency::MustFinishBefore,
-                    relationship,
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+                let mut rendered = String::from(
+                    "Advisory draft work breakdown (context only — you decide; nothing \
+                     here is scheduled):\n",
                 );
-            }
-            None => {
-                graph.add_root(code_task);
-            }
-        }
-
-        // Emit creation events and populate expected artifacts for every
-        // implement-stage subtask from the DesignDoc's proposed_files.
-        for subtask in graph.all_tasks() {
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                subtask.id.0,
-                EventKind::SubTaskCreated {
-                    task_id: subtask.id,
-                    role: subtask.role.clone(),
-                    description: subtask.description.clone(),
-                },
-            );
-            if implement_ids.contains(&subtask.role) {
-                if let Some(ref doc) = design_doc {
-                    self.expected_artifacts
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .insert(subtask.id, doc.proposed_files.clone());
+                for (index, planned) in outcome.tasks.iter().enumerate() {
+                    rendered.push_str(&format!(
+                        "{}. [{}] {}\n",
+                        index + 1,
+                        planned.role,
+                        planned.description
+                    ));
                 }
+                (
+                    serde_json::json!({
+                        "plan": rendered,
+                        "note": "advisory only — never scheduled; the Coordinator decides",
+                    }),
+                    Some(outcome.artifact),
+                )
+            }
+            Err(error) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                (
+                    serde_json::json!({
+                        "error": "planner_unavailable",
+                        "message": format!("the planner advisor produced no usable draft: {error}"),
+                    }),
+                    None,
+                )
             }
         }
-
-        Ok((graph, None))
     }
 
-    fn add_managed_dependency(
-        &self,
-        graph: &mut TaskGraph,
-        task_id: TaskId,
-        depends_on: TaskId,
-        dependency: Dependency,
-    ) -> Result<(), OrchestratorError> {
-        let roles = graph
-            .get(&depends_on)
-            .zip(graph.get(&task_id))
-            .map(|(from, to)| (from.role.clone(), to.role.clone()));
-        if let Some((from, to)) = roles {
-            if let Some(rule) = self.relationships.rule(&from, &to) {
-                graph.add_dependency_with_relationship(
-                    task_id,
-                    depends_on,
-                    dependency,
-                    rule.relationship,
-                )?;
-                return Ok(());
+    /// Run ONE of the coordinator's OWN tools through the shared executor
+    /// (ADR-35 §8 self-execution). The executor is the run's real, fully
+    /// policy-gated executor — `SimplePolicyEngine`, `VirtualFs`, write
+    /// gates, and cancellation apply unchanged.
+    async fn handle_executor_tool(
+        &mut self,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+        tool_name: &str,
+    ) -> serde_json::Value {
+        let Some(executor) = self.tool_executor.clone() else {
+            return serde_json::json!({
+                "error": "no_executor",
+                "message": "the coordinator has no tool executor attached for self-execution",
+            });
+        };
+        // Issue #52: self-execution is a journaled decision (ADR-35 §8);
+        // validation is structural only (no target, bounded description).
+        let decision_id = self.record_side_decision(
+            crate::decisions::DecisionKind::SelfExecute,
+            &format!("execute own tool {tool_name}"),
+        );
+        ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(1);
+        match executor
+            .execute(tool_name, arguments.clone(), &base_ctx.session, cancel.clone())
+            .await
+        {
+            Ok(output) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+                // Collect the paths the coordinator's own work touched so
+                // the run's file ledger stays complete.
+                for key in ["destination", "path", "file_path"] {
+                    if let Some(path) = output.data.get(key).and_then(serde_json::Value::as_str) {
+                        let path = camino::Utf8PathBuf::from(path);
+                        if !ledger.all_files.contains(&path) {
+                            ledger.all_files.push(path);
+                        }
+                        break;
+                    }
+                }
+                serde_json::to_value(&output).unwrap_or(serde_json::json!({
+                    "summary": output.summary,
+                }))
+            }
+            Err(error) => {
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                // Issue #54: the tool fault is normalized into the
+                // structured diagnosis (Tool/Environment dimension) so the
+                // Coordinator's next decision is diagnosis-informed; the
+                // audit trail records it too.
+                let diagnosis = crate::failure_diagnosis::diagnose_tool(&error);
+                self.record_failure_diagnosis(
+                    base_ctx.session.session_id,
+                    None,
+                    &AgentId::new("coordinator"),
+                    &diagnosis,
+                )
+                .await;
+                serde_json::json!({
+                    "error": "tool_execution_failed",
+                    "message": error.to_string(),
+                    "retryable": diagnosis.retryable,
+                    "diagnosis": diagnosis.tool_summary(),
+                })
             }
         }
-        graph.add_dependency(task_id, depends_on, dependency)
+    }
+
+    /// Issue #54: record ONE normalized failure diagnosis at the surface it
+    /// surfaced. Pushes the bounded diagnosis history (checkpointed
+    /// additively), publishes a coordinator thought so the run's UI/events
+    /// show the diagnosis, and appends a fail-soft `Failure` whiteboard
+    /// event carrying the diagnosis payload — the audit trail the recovery
+    /// decision cites. Never fails the run (every append is fail-soft,
+    /// mirroring [`Self::append_dispatch_decision`]).
+    async fn record_failure_diagnosis(
+        &mut self,
+        session_id: Ulid,
+        task_id: Option<TaskId>,
+        role: &AgentId,
+        diagnosis: &crate::failure_diagnosis::FailureDiagnosis,
+    ) {
+        self.failure_diagnoses.push(diagnosis.clone());
+        let excess = self
+            .failure_diagnoses
+            .len()
+            .saturating_sub(crate::failure_diagnosis::MAX_DIAGNOSIS_HISTORY);
+        self.failure_diagnoses.drain(0..excess);
+
+        let brief = diagnosis.brief();
+        let _ = self.bus.publish_for_session(
+            session_id,
+            task_id.map(|id| id.0).unwrap_or_default(),
+            EventKind::AgentThought { agent_id: "coordinator".into(), content: brief.clone() },
+        );
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Failure,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                // The evidence excerpt under the `error` key the
+                // run-continuity ledger folds (one grammar with the gate's
+                // failure rows), plus the full structured diagnosis.
+                "error": bounded_text(&diagnosis.evidence, 512),
+                "role": role.as_str(),
+                "task_id": task_id.map(|id| id.0),
+                "diagnosis": diagnosis.tool_summary(),
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(err) = append_whiteboard_event(pool, &event).await {
+            warn!(
+                %err,
+                "issue #54: failure-diagnosis whiteboard append failed (fail-soft, the \
+                 diagnosis still rides the events and the checkpoint history)"
+            );
+        }
+    }
+
+    /// Append the whiteboard `Decision` event for one Coordinator dispatch
+    /// (ADR-65 §6/§7): `selected_agent, reason, required_output,
+    /// supporting_evidence_ids`. The ids the Coordinator cites are validated
+    /// by the append side (ADR-65 §1, acceptance 8: a fabricated id is
+    /// rejected); on rejection the decision is re-appended WITHOUT its
+    /// citations so the ledger always carries the record, and the failure is
+    /// fail-soft for the dispatch. When the dispatch's subtask id is known it
+    /// is recorded as the coordinator's PENDING decision, captured into
+    /// every checkpoint so a resume can continue behind it.
+    async fn append_dispatch_decision(
+        &mut self,
+        session_id: Ulid,
+        selected_agent: &AgentId,
+        reason: &str,
+        required_output: &str,
+        supporting_evidence_ids: &[String],
+        task_id: Option<TaskId>,
+    ) {
+        self.last_dispatch_decision =
+            task_id.map(|task_id| checkpoint::CheckpointPendingDecision {
+                selected_agent: selected_agent.as_str().to_owned(),
+                reason: reason.to_owned(),
+                required_output: required_output.to_owned(),
+                supporting_evidence_ids: supporting_evidence_ids.to_vec(),
+                task_id: Some(task_id),
+            });
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": selected_agent.as_str(),
+                "reason": reason,
+                "required_output": required_output,
+                "supporting_evidence_ids": evidence_ids,
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(err) = append_whiteboard_event(pool, &event(supporting_evidence_ids)).await {
+            warn!(
+                %err,
+                "ADR-65 §6: dispatch decision append rejected; re-appending without the \
+                 rejected citations (fail-soft, the record still lands)"
+            );
+            if let Err(err) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(%err, "ADR-65 §6: dispatch decision append failed (fail-soft)");
+            }
+        }
+    }
+
+    /// The roster the Coordinator decides from (ADR-35 amendment 2026-09-05
+    /// §1): every REGISTERED agent's id, name, role, stage (informational
+    /// metadata), declared capabilities, output mode, and a bounded
+    /// system-instruction excerpt. Deleted/disabled agents are absent by
+    /// construction (the registry never holds them) — this is how the
+    /// Coordinator "knows" who to call: context, not policy.
+    fn render_specialist_roster(&self, task: &AgentTask) -> String {
+        let mut ids = self.registry.ids();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut out = String::from("[Available specialists]\n");
+        for id in ids {
+            let Some(agent) = self.registry.get(&id) else { continue };
+            let config = self.registry.config(&id);
+            let name = config.map(|config| config.name.clone()).unwrap_or_else(|| id.to_string());
+            let role = config.map(|config| config.role.clone()).unwrap_or_default();
+            let stage = agent
+                .stage()
+                .map(|stage| stage.as_str().to_owned())
+                .unwrap_or_else(|| "freeform".into());
+            let capabilities = config
+                .map(|config| render_agent_capabilities(&config.capabilities))
+                .unwrap_or_else(|| "none".to_owned());
+            let output_mode =
+                config.map(|config| render_output_mode(config.output_mode)).unwrap_or("freeform");
+            let instructions = config
+                .map(|config| bounded_text(&config.prompt_sections.system_instructions, 400))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- id: {id}\n  name: {name}\n  role: {role}\n  stage: {stage} \
+                 (informational — never a dispatch rule)\n  capabilities: {capabilities}\n  \
+                 output_mode: {output_mode}\n  instructions: {instructions}\n"
+            ));
+        }
+        out.push_str(&self.render_suitability_advisory(task));
+        out
+    }
+
+    /// Issue #60: the suitability ranking as ADVISORY context under the
+    /// roster — the deterministic, decayed dispatch-outcome evidence for
+    /// the run's task class, ranked with bounded reasons (no cost/spend/
+    /// latency/model-quality inputs exist on the scoring path). ADVICE,
+    /// NOT a gate: the Coordinator's model still decides who to call, and
+    /// a candidate absent from the section (fresh history) is not
+    /// disadvantaged — the ranking ordering only ranks; no dispatch rule
+    /// reacts to it. Rendered ONCE per decision session, exactly where
+    /// the candidate roles live.
+    fn render_suitability_advisory(&self, task: &AgentTask) -> String {
+        let ids = self.registry.ids();
+        if ids.is_empty() || self.suitability.is_empty() {
+            return String::new();
+        }
+        let class = crate::suitability::TaskClass::derive(&task.description, &[]);
+        let candidate_ids: Vec<String> = ids.iter().map(|id| id.as_str().to_owned()).collect();
+        let now = time::OffsetDateTime::now_utc();
+        let ranking = self.suitability.rank(&candidate_ids, class, now);
+        let mut out = String::from(
+            "\n[Suitability signal (advisory — measured from past dispatch outcomes for              this task class; not a rule, never a dispatch requirement; contains no cost,              spend, or workload inputs)]\n",
+        );
+        for entry in ranking {
+            let score = if entry.score_milli < 0 {
+                format!("-{}", entry.score_milli.abs())
+            } else {
+                format!("+{}", entry.score_milli)
+            };
+            let reasons = crate::suitability::bound_reasons(&entry.reasons);
+            out.push_str(&format!("- {}: score {} — {reasons}\n", entry.agent_id, score));
+        }
+        out
+    }
+
+    /// The full system prompt for the Coordinator's decision loop: built-in
+    /// instructions, the roster, the run's evidence/provenance intro, the
+    /// session skills section, and the Studio's supplemental prompt.
+    fn render_dispatch_system_prompt(
+        &self,
+        task: &AgentTask,
+        intro: &str,
+        dispatching: bool,
+    ) -> String {
+        let mut prompt = String::new();
+        if dispatching {
+            prompt.push_str(COORDINATOR_DISPATCH_PROMPT);
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.render_specialist_roster(task));
+        } else {
+            prompt.push_str(
+                "You are the Coordinator. This run is PLANNING-ONLY: produce the plan for \
+                 the objective below as structured prose. Do NOT attempt to dispatch or \
+                 execute anything — no tools are available to you.\n\n",
+            );
+        }
+        if !intro.is_empty() {
+            prompt.push_str(intro);
+            prompt.push_str("\n\n");
+        }
+        if !self.skills_section.is_empty() {
+            prompt.push_str(&self.skills_section);
+            prompt.push_str("\n\n");
+        }
+        // OS/shell identity card (custom-ai-shell plan, Phase C): the
+        // coordinator dispatches shell-capable specialists, so its decision
+        // prompt names the host OS and the selected agent shell. Only
+        // appended when the runtime supplied a card.
+        if !self.environment_card.is_empty() {
+            prompt.push_str(&self.environment_card);
+            prompt.push_str("\n\n");
+        }
+        // ── Dispatch budget advisory (ADR-35 amendment 2026-09-16 §6) ────
+        // The run-wide dispatch ceiling (ADR-52 `max_total_iterations`) is
+        // the Coordinator's hard budget. Publishing it up front lets the
+        // model decide early whether to invoke `request_user_input` for
+        // operator guidance instead of spending its remaining specialist
+        // calls on low-confidence work. Emitted only while dispatching and
+        // only when a ceiling is configured.
+        if dispatching {
+            if let Some(cap) = self.max_total_iterations {
+                let used = self.model_dispatch_count.min(cap);
+                let remaining = cap - used;
+                prompt.push_str(&format!(
+                    "<dispatch_budget>\nRun-wide ceiling: {cap} specialist calls; {used} used, \
+                     {remaining} remaining. Budget them — prefer request_user_input when the \
+                     path ahead is low-confidence rather than spending the remaining calls on \
+                     speculative work.\n</dispatch_budget>\n\n"
+                ));
+            }
+        }
+        prompt.push_str(&format!("Objective: {}\n", task.description));
+        // Issue #56: the Coordinator's decisions consume the structured
+        // world model — a bounded rendered block rides every dispatch-
+        // decision prompt (the projection is refreshed by the session
+        // entry; the block is character-bounded by the builder's render).
+        if !self.world_model.is_empty_beyond_objective() {
+            prompt.push_str(&self.world_model.render());
+            prompt.push('\n');
+        }
+        if !self.supplemental_prompt.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.supplemental_prompt);
+        }
+        prompt
+    }
+
+    /// The run's evidence/provenance section for the decision prompt: the
+    /// workspace snapshot digest, where the DesignDoc claim stands, and — on
+    /// a checkpointless `continue` — the approved-plan payload the resume
+    /// continues (with its REAL event id the Coordinator may cite).
+    async fn dispatch_context_intro(
+        &self,
+        doc: Option<&DesignDoc>,
+        seed: Option<&HeadlessResumeSeed>,
+        cancel: &CancellationToken,
+    ) -> String {
+        let mut intro = String::new();
+        if let Some(digest) = self.snapshot_digest(cancel).await {
+            intro.push_str("<workspace_snapshot>\n");
+            intro.push_str(&digest);
+            intro.push_str("\n</workspace_snapshot>\n");
+        }
+        match (doc, seed) {
+            (_, Some(seed)) => {
+                intro.push_str(&format!(
+                    "<resume_context>\nThis run continues an interrupted run. The approved \
+                     plan below governs (its `plan-approved` whiteboard event id is {} — \
+                     cite it in supporting_evidence_ids when your decision rests on \
+                     it):\n{}\n</resume_context>\n",
+                    seed.plan_approved_event_id, seed.plan_text
+                ));
+            }
+            (Some(doc), None) => {
+                intro.push_str(
+                    "<design_document>\nA DesignDoc already binds this run (do not \
+                     re-derive it; implementation work should honor its proposed \
+                     files):\n",
+                );
+                for goal in &doc.goals {
+                    intro.push_str(&format!("- Goal: {goal}\n"));
+                }
+                for file in &doc.proposed_files {
+                    intro.push_str(&format!("- Proposed file: {file}\n"));
+                }
+                intro.push_str("</design_document>\n");
+            }
+            (None, None) => {}
+        }
+        intro
+    }
+
+    /// A fresh checkpoint scope for the decision-loop phase (the graph
+    /// machinery re-scopes per invocation as before; the loop's checkpoints
+    /// share the run's objective/hash so a resume names the same work).
+    fn fresh_checkpoint_scope(
+        &self,
+        task: &AgentTask,
+        context: &AgentContext,
+    ) -> checkpoint::CheckpointScope {
+        checkpoint::CheckpointScope {
+            run_id: Ulid::new(),
+            session_id: task.session_id,
+            root_task_id: task.id,
+            project_id: context.session.project_id.0.clone(),
+            objective: task.description.clone(),
+            objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+            source_revision: self.source_revision.clone(),
+            sequence_num: 0,
+        }
+    }
+    /// The relationship between a fallback step and its graph parent — the
+    /// same resolution the replaced heuristic fallback used: a configured
+    /// collaboration rule first, then `OwnsDesign` under the design agent,
+    /// else `ProvidesContextTo`.
+    fn fallback_relationship(
+        &self,
+        graph: &TaskGraph,
+        parent: TaskId,
+        child_role: &AgentId,
+        design_role: Option<&AgentId>,
+    ) -> crate::relationship::AgentRelationship {
+        match graph.get(&parent).map(|parent_task| parent_task.role.clone()) {
+            Some(parent_role) => self
+                .relationships
+                .rule(&parent_role, child_role)
+                .map(|rule| rule.relationship)
+                .unwrap_or_else(|| {
+                    if design_role == Some(&parent_role) {
+                        crate::relationship::AgentRelationship::OwnsDesign
+                    } else {
+                        crate::relationship::AgentRelationship::ProvidesContextTo
+                    }
+                }),
+            None => crate::relationship::AgentRelationship::ProvidesContextTo,
+        }
+    }
+
+    // ── ADR-65 §5: DesignDoc claim resolution (read/write whiteboard) ───
+
+    /// Resolve a DesignDoc claim against deterministic evidence — the
+    /// pre-planning workspace snapshot plus the session's `ToolExecuted`
+    /// facts — via the model-free verifier, and return the verdict.
+    ///
+    /// Fail-soft by contract: an evidence-store failure degrades the claim to
+    /// a Quarantined (non-empty) / Skipped (empty) verdict with a warning —
+    /// planning must never crash because the whiteboard read failed. Only an
+    /// explicit cancellation propagates as an error.
+    async fn verify_design_doc_claim(
+        &self,
+        doc: &DesignDoc,
+        author: Option<&AgentId>,
+        session_id: Ulid,
+        cancel: &CancellationToken,
+    ) -> Result<DesignDocVerdict, OrchestratorError> {
+        let proposed: Vec<String> =
+            doc.proposed_files.iter().map(|path| path.as_str().to_owned()).collect();
+        match collect_design_doc_evidence(
+            self.review_store.as_ref(),
+            session_id,
+            author,
+            self.workspace_snapshot.as_ref(),
+            cancel,
+        )
+        .await
+        {
+            Ok(mut input) => {
+                // The evidence gatherer shapes the workspace facts; the doc's
+                // own claim (its proposed paths) is filled in here so the pure
+                // verifier resolves the ACTUAL design, not an empty one.
+                input.proposed_paths = proposed;
+                Ok(verify_design_doc(&input))
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(OrchestratorError::Cancelled);
+                }
+                tracing::warn!(
+                    %err,
+                    author = ?author,
+                    "ADR-65 §5: evidence store unavailable; design doc advisory (fail-soft)"
+                );
+                Ok(degraded_verdict(&proposed, 0))
+            }
+        }
+    }
+
+    /// Persist a DesignDoc claim and its verdict as whiteboard events
+    /// (ADR-65 §5 write side): a `DesignDoc` kind event carries the serialized
+    /// doc, and a `Decision` kind event (causation = the claim's `event_id`)
+    /// carries the verdict. Both appends are fail-soft by contract — evidence
+    /// logging must never break planning — and a failed claim append suppresses
+    /// the orphaned decision append.
+    ///
+    /// Returns the `(claim_event_id, decision_event_id)` pair when BOTH events
+    /// landed — the real ids downstream scheduling cites as supporting
+    /// evidence (ADR-65 §6); `None` when either append failed (ids are never
+    /// fabricated).
+    async fn append_design_doc_events(
+        &self,
+        session_id: Ulid,
+        author: Option<&AgentId>,
+        doc: &DesignDoc,
+        verdict: &DesignDocVerdict,
+    ) -> Option<(String, String)> {
+        let pool = self.review_store.as_ref()?;
+        let created_at = crate::tool_facts::unix_ms();
+        // The claim is authored by the architect that produced the doc (or the
+        // coordinator when attribution is unavailable); the decision is always
+        // the coordinator's finding.
+        let claim_author =
+            author.map(|id| id.as_str().to_owned()).unwrap_or_else(|| "coordinator".to_owned());
+        let claim_id = Ulid::new().to_string();
+        let doc_payload = match serde_json::to_value(doc) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "ADR-65 §5: design-doc claim serialization failed; claim not recorded"
+                );
+                return None;
+            }
+        };
+        if let Err(err) = append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: claim_id.clone(),
+                agent_id: claim_author,
+                kind: WhiteboardKind::DesignDoc,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: doc_payload,
+                pre_image_hash: None,
+                created_at,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                %err,
+                "ADR-65 §5: design-doc claim append failed (fail-soft); decision not recorded"
+            );
+            return None;
+        }
+        let verdict_payload = match serde_json::to_value(verdict) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "ADR-65 §5: design-doc verdict serialization failed; decision not recorded"
+                );
+                return None;
+            }
+        };
+        let decision_id = Ulid::new().to_string();
+        if let Err(err) = append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: decision_id.clone(),
+                agent_id: "coordinator".to_owned(),
+                kind: WhiteboardKind::Decision,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: Some(claim_id.clone()),
+                payload: verdict_payload,
+                pre_image_hash: None,
+                created_at,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                %err,
+                "ADR-65 §5: design-doc decision append failed (fail-soft)"
+            );
+            return None;
+        }
+        Some((claim_id, decision_id))
     }
 }
 
@@ -5097,7 +12190,8 @@ mod tests {
     use concerto_core::policy::SimplePolicyEngine;
     use concerto_core::traits::memory::NullMemoryStore;
     use concerto_core::traits::policy::{AuditEntry, AuditLog};
-    use concerto_core::types::{Condition, PolicyRule, ToolRegistry};
+    use concerto_core::types::{Condition, PolicyRule};
+    use concerto_core::types::{ToolCall, ToolRegistry};
     use concerto_providers::mock::MockProvider;
     use concerto_providers::model_registry::ModelRegistry;
     use concerto_providers::routing::RoutingEngine;
@@ -5126,6 +12220,40 @@ mod tests {
         }
     }
 
+    /// A recording audit probe for the consultation tests (issue #59): the
+    /// read-only gate records every denial through the run's audit log, so
+    /// the test observes "denied + recorded" end-to-end.
+    #[derive(Default)]
+    struct ConsultAuditProbe {
+        entries: std::sync::Mutex<Vec<AuditEntry>>,
+    }
+
+    impl ConsultAuditProbe {
+        fn rows(&self) -> Vec<AuditEntry> {
+            self.entries.lock().unwrap_or_else(|error| error.into_inner()).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLog for ConsultAuditProbe {
+        async fn record(
+            &self,
+            entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            self.entries.lock().unwrap_or_else(|error| error.into_inner()).push(entry);
+            Ok(())
+        }
+    }
+
+    /// The allow-all policy wired to a recording audit probe.
+    fn coordinator_policy_with_audit(
+        audit: Arc<ConsultAuditProbe>,
+    ) -> Arc<dyn concerto_core::traits::policy::PolicyEngine> {
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        Arc::new(SimplePolicyEngine::new(allow_all, audit))
+    }
+
     // Pin the three-way failure classification that the dispatch loop relies
     // on (ADR-42 §1). Transient provider errors (rate limits, network,
     // timeouts, 5xx) are Recoverable and subject to subtask retry.
@@ -5133,24 +12261,34 @@ mod tests {
     // rate-limit ceiling, no-affordable-model) are LimitReached and walk the
     // fallback ladder. Cancellation and structural errors are NonRecoverable
     // and exit immediately.
+    //
+    // Issue #54: the classification is now DERIVED from the structured
+    // failure diagnosis — [`subtask_class_from_diagnosis`] is the bridge
+    // the dispatch loop keys on (`SubtaskFailureClass::from(&diagnose(e))`),
+    // so the pins below prove the diagnosis normalization preserved the
+    // historical partition for every asserted family.
+    fn subtask_class_from_diagnosis(error: &OrchestratorError) -> SubtaskFailureClass {
+        SubtaskFailureClass::from(&crate::failure_diagnosis::diagnose(error))
+    }
+
     #[test]
     fn classify_subtask_error_partition() {
         // Recoverable: AgentLoopError, Memory, any Tool error that isn't
         // Cancelled, and transient Provider errors.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::AgentLoopError(
+            subtask_class_from_diagnosis(&OrchestratorError::AgentLoopError(
                 "transient loop issue".into()
             )),
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Memory(
+            subtask_class_from_diagnosis(&OrchestratorError::Memory(
                 concerto_core::MemoryError::NotFound("chunk".into())
             )),
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Tool(
+            subtask_class_from_diagnosis(&OrchestratorError::Tool(
                 concerto_core::ToolError::ExecutionFailed { message: "oops".into() }
             )),
             SubtaskFailureClass::Recoverable
@@ -5158,7 +12296,7 @@ mod tests {
 
         // Transient provider errors — will be retried
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::RateLimit {
                     retry_after: std::time::Duration::from_secs(1)
                 }
@@ -5166,13 +12304,13 @@ mod tests {
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::Network("connection reset".into())
             )),
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::Timeout {
                     phase: "request",
                     timeout: std::time::Duration::from_secs(30),
@@ -5181,7 +12319,7 @@ mod tests {
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::HttpStatus {
                     status: 503,
                     retry_after: None,
@@ -5191,7 +12329,7 @@ mod tests {
             SubtaskFailureClass::Recoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::InvalidResponse("bad json".into())
             )),
             SubtaskFailureClass::Recoverable
@@ -5202,13 +12340,13 @@ mod tests {
         // different model or agent may still complete the task, so the
         // fallback ladder is walked before any Partial exit.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::AuthFailure
             )),
             SubtaskFailureClass::LimitReached
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::ContextOverflow {
                     tokens_in: 200_000,
                     capacity: 128_000,
@@ -5219,7 +12357,7 @@ mod tests {
         // RetryExhausted is the rate-limit ceiling: the provider's own retry
         // layer is done, but the subtask may still be solvable elsewhere.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Provider(
+            subtask_class_from_diagnosis(&OrchestratorError::Provider(
                 concerto_core::error::ProviderError::RetryExhausted {
                     attempts: 3,
                     elapsed: std::time::Duration::from_secs(30),
@@ -5229,13 +12367,13 @@ mod tests {
             SubtaskFailureClass::LimitReached
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::NoAffordableModel {
+            subtask_class_from_diagnosis(&OrchestratorError::NoAffordableModel {
                 role: AgentId::new("coder")
             }),
             SubtaskFailureClass::LimitReached
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::PinnedModelNotFound {
+            subtask_class_from_diagnosis(&OrchestratorError::PinnedModelNotFound {
                 role: AgentId::new("coder"),
                 provider_config_id: None,
                 model: "claude-3.5-sonnet".into(),
@@ -5246,68 +12384,96 @@ mod tests {
         // NonRecoverable: cancellation and structural errors — retrying or
         // re-routing within a single task won't fix them.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Cancelled),
+            subtask_class_from_diagnosis(&OrchestratorError::Cancelled),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Tool(concerto_core::ToolError::Cancelled)),
+            subtask_class_from_diagnosis(&OrchestratorError::Tool(
+                concerto_core::ToolError::Cancelled
+            )),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::NoBudgetForDelegation),
+            subtask_class_from_diagnosis(&OrchestratorError::NoBudgetForDelegation),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::MultiAgentPlanFailed {
+            subtask_class_from_diagnosis(&OrchestratorError::MultiAgentPlanFailed {
                 reason: "no model available".into()
             }),
             SubtaskFailureClass::NonRecoverable
         ));
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::TaskGraphError("no such task".into())),
+            subtask_class_from_diagnosis(&OrchestratorError::TaskGraphError("no such task".into())),
             SubtaskFailureClass::NonRecoverable
         ));
     }
 
     // ------------------------------------------------------------------
-    // Regression: Fix 5 — DesignDoc content validation rejects empty doc
+    // Regression: Fix 5 — DesignDoc content validation accepts empty doc
+    // (ADR-65 §5: an empty claim is SKIPPED, never rejected)
     // ------------------------------------------------------------------
 
     /// The empty DesignDoc JSON has no proposed_files, no goals, and an
     /// empty interface_sketch — all default values.
     const EMPTY_DESIGN_DOC_JSON: &str = r#"{"goals":[],"proposed_files":[],"interface_sketch":""}"#;
 
+    /// A DesignDoc-typed architect call with an EMPTY doc: the verifier
+    /// resolves the claim to Skipped (ADR-65 §5) and the run continues —
+    /// the Coordinator may dispatch implementation work afterwards. An empty
+    /// claim is a VALID outcome, never a rejection.
     #[tokio::test]
-    async fn decompose_task_rejects_empty_design_doc() {
-        // Create a mock Architect whose summary is an empty DesignDoc.
-        let mocks =
-            vec![MockExpertAgent::always_succeed(AgentId::new("architect"), EMPTY_DESIGN_DOC_JSON)];
-
-        let plan = crate::graph::TaskGraph::default();
-        let budget = BudgetScenarioBuilder::generous();
-        let mut harness = AgentFlowTestHarness::new(mocks, plan, budget);
-        let task = AgentTask::new(concerto_core::ids::Ulid::new(), "test task");
-        let result = harness.run(task).await;
-
-        let output = result.expect("Architect failure should return Partial, not hard error");
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "empty DesignDoc should produce Partial completion"
+    async fn empty_design_doc_is_skipped_not_rejected() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), EMPTY_DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
         );
+
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Text("empty claim resolved as skipped".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
         assert!(
-            output.final_message.contains("could not produce a valid plan"),
-            "expected 'could not produce a valid plan' in final_message, got: {}",
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "an empty DesignDoc must not fail the run, got: {}",
             output.final_message
         );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskFailed { .. })),
+            "an empty DesignDoc is Skipped, never rejected: {events:?}"
+        );
+        let architect_ran = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("architect"))
+        });
+        assert!(architect_ran, "the Coordinator's design call must dispatch the architect");
     }
 
     // ------------------------------------------------------------------
     // ADR-35 phase 2: custom agents from the planner are dispatched
     // ------------------------------------------------------------------
 
-    /// Planning provider that serves one canned response per request, in
-    /// order. The coordinator only calls the planner once per run.
+    // ------------------------------------------------------------------
+    // Coordinator decision-loop test plumbing (ADR-35 amendment 2026-09-05)
+    // ------------------------------------------------------------------
+
+    /// Planning provider that serves one canned TEXT response per request,
+    /// in order. Used by the fallback-ladder tests for the tier-2
+    /// coordinator self-execute re-dispatch (the self-executor's summary),
+    /// which is independent of the decision loop.
     struct SeqProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
     }
@@ -5345,27 +12511,407 @@ mod tests {
         }
     }
 
-    /// Build a fully-wired coordinator whose planning provider serves one
-    /// canned plan response. `registry` carries the agents the run may use.
-    fn coordinator_with(
-        bus: EventBus,
-        registry: Arc<AgentRegistry>,
-        plan_json: String,
-    ) -> CoordinatorAgent {
-        coordinator_with_responses(bus, registry, vec![plan_json])
+    /// One Coordinator decision-loop turn served by the mock planning
+    /// provider: either tool calls (dispatches) or the final text.
+    enum CoordinatorTurn {
+        Calls(Vec<ToolCall>),
+        Text(String),
     }
 
-    /// Like [`coordinator_with`], but the planning provider serves multiple
-    /// canned responses in order — used when the coordinator self-executes
-    /// implement subtasks on the planning provider (ADR-35 §8) and the second
-    /// response is the self-executor's summary.
-    fn coordinator_with_responses(
+    /// A `call_specialist` tool call for a test turn.
+    fn call_specialist(agent_id: &str, task: &str) -> ToolCall {
+        call_specialist_with(agent_id, task, None, &[])
+    }
+
+    /// A `call_specialist` tool call with notes and cited evidence ids.
+    fn call_specialist_with(
+        agent_id: &str,
+        task: &str,
+        notes: Option<&str>,
+        evidence: &[&str],
+    ) -> ToolCall {
+        ToolCall {
+            id: format!("call-{agent_id}"),
+            name: CALL_SPECIALIST_TOOL.to_string(),
+            arguments: {
+                let mut arguments = serde_json::json!({ "agent_id": agent_id, "task": task });
+                if let Some(notes) = notes {
+                    arguments["notes"] = serde_json::json!(notes);
+                }
+                if !evidence.is_empty() {
+                    arguments["supporting_evidence_ids"] = serde_json::json!(evidence
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>());
+                }
+                arguments
+            },
+
+            ..Default::default()
+        }
+    }
+
+    /// A `consult_specialist` tool call for a test turn (issue #59).
+    fn consult_specialist(agent_id: &str, question: &str) -> ToolCall {
+        consult_specialist_with(agent_id, question, None, &[], None)
+    }
+
+    /// A `consult_specialist` tool call with notes, cited evidence ids, and
+    /// an optional effort cap.
+    fn consult_specialist_with(
+        agent_id: &str,
+        question: &str,
+        notes: Option<&str>,
+        evidence: &[&str],
+        max_tool_calls: Option<u32>,
+    ) -> ToolCall {
+        ToolCall {
+            id: format!("consult-{agent_id}"),
+            name: CONSULT_SPECIALIST_TOOL.to_string(),
+            arguments: {
+                let mut arguments =
+                    serde_json::json!({ "agent_id": agent_id, "question": question });
+                if let Some(notes) = notes {
+                    arguments["notes"] = serde_json::json!(notes);
+                }
+                if !evidence.is_empty() {
+                    arguments["supporting_evidence_ids"] = serde_json::json!(evidence
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>());
+                }
+                if let Some(cap) = max_tool_calls {
+                    arguments["max_tool_calls"] = serde_json::json!(cap);
+                }
+                arguments
+            },
+
+            ..Default::default()
+        }
+    }
+
+    /// A read-only filesystem read tool call (the consultant's allowed
+    /// operation shape).
+    fn filesystem_read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("read-{path}"),
+            name: "filesystem".to_string(),
+            arguments: serde_json::json!({ "operation": "read", "path": path }),
+
+            ..Default::default()
+        }
+    }
+
+    /// One hypothesis spec for an `investigate_hypotheses` tool call
+    /// (issue #62).
+    fn hypothesis_spec(
+        hypothesis_id: &str,
+        agent_id: &str,
+        question: &str,
+        notes: Option<&str>,
+        evidence: &[&str],
+        max_tool_calls: Option<u32>,
+    ) -> serde_json::Value {
+        let mut spec = serde_json::json!({
+            "hypothesis_id": hypothesis_id,
+            "agent_id": agent_id,
+            "question": question,
+        });
+        if let Some(notes) = notes {
+            spec["notes"] = serde_json::json!(notes);
+        }
+        if !evidence.is_empty() {
+            spec["supporting_evidence_ids"] =
+                serde_json::json!(evidence.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+        }
+        if let Some(cap) = max_tool_calls {
+            spec["max_tool_calls"] = serde_json::json!(cap);
+        }
+        spec
+    }
+
+    /// An `investigate_hypotheses` tool call for a test turn (issue #62).
+    fn investigate_with(specs: Vec<serde_json::Value>) -> ToolCall {
+        ToolCall {
+            id: "inv-batch".to_string(),
+            name: INVESTIGATE_HYPOTHESES_TOOL.to_string(),
+            arguments: serde_json::json!({ "hypotheses": specs }),
+
+            ..Default::default()
+        }
+    }
+
+    /// Planning provider that serves one scripted Coordinator turn per
+    /// request, in order. Beyond the script it returns an empty final text
+    /// (the loop then stops in prose). Captures every request it receives so
+    /// tests can assert on the injected prompt (roster, evidence) and count
+    /// the loop's model turns.
+    struct TurnProvider {
+        turns: std::sync::Mutex<std::collections::VecDeque<CoordinatorTurn>>,
+        requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
+    }
+
+    impl TurnProvider {
+        fn new(turns: Vec<CoordinatorTurn>) -> Self {
+            Self {
+                turns: std::sync::Mutex::new(turns.into()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The prompts this provider has seen so far (first message content).
+        fn prompts(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    request
+                        .messages
+                        .first()
+                        .map(|message| message.content.clone())
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+
+        /// Every message content the provider has observed (prompts, tool
+        /// results, injected user messages) in arrival order.
+        fn message_contents(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| request.messages.iter().map(|message| message.content.clone()))
+                .collect()
+        }
+
+        /// Every tool-result JSON payload observed in Tool messages of the
+        /// captured requests — the results the coordinator loop and the
+        /// consult agent read back (issue #59 observability).
+        fn tool_result_contents(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.tool_results.as_ref())
+                        .flat_map(|results| results.iter().map(|result| result.content.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        /// How many model turns the provider has served.
+        fn turn_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for TurnProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            let turn = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(CoordinatorTurn::Text(String::new()));
+            let chunks: Vec<concerto_core::types::CompletionChunk> = match turn {
+                CoordinatorTurn::Text(text) => {
+                    vec![concerto_core::types::CompletionChunk {
+                        reasoning: None,
+                        delta: text,
+                        tool_call: None,
+                        is_final: true,
+                        usage: None,
+                    }]
+                }
+                CoordinatorTurn::Calls(calls) => {
+                    let total = calls.len();
+                    calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, call)| concerto_core::types::CompletionChunk {
+                            reasoning: None,
+                            delta: String::new(),
+                            tool_call: Some(call),
+                            is_final: index + 1 == total,
+                            usage: None,
+                        })
+                        .collect()
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "turns"
+        }
+    }
+
+    /// A planning provider that drives the full consult→evidence→dispatch
+    /// chain (issue #59 end-to-end acceptance): the first request consults;
+    /// once the consult tool result (carrying the REAL finding event id)
+    /// appears in the conversation, the next coordinator turn dispatches a
+    /// specialist citing that id; afterwards it finishes in prose. The
+    /// consultant's own requests (which share this provider) fall through
+    /// to the prose branch — they never carry a consult tool result.
+    #[derive(Default)]
+    struct EvidenceChainProvider {
+        requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
+        dispatch_served: std::sync::atomic::AtomicBool,
+    }
+
+    impl EvidenceChainProvider {
+        /// Every tool-result JSON payload observed in Tool messages of the
+        /// captured requests (issue #59 observability).
+        fn tool_result_contents(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.tool_results.as_ref())
+                        .flat_map(|results| results.iter().map(|result| result.content.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        /// The consult tool result's evidence id, once it has appeared in
+        /// any observed conversation.
+        fn evidence_id(&self) -> Option<String> {
+            self.requests.lock().unwrap().iter().find_map(|request| {
+                request.messages.iter().find_map(|message| {
+                    message.tool_results.as_ref().and_then(|results| {
+                        results.iter().find_map(|result| {
+                            if result.name != CONSULT_SPECIALIST_TOOL {
+                                return None;
+                            }
+                            result
+                                .content
+                                .get("evidence_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                    })
+                })
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for EvidenceChainProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            use std::sync::atomic::Ordering;
+            self.requests.lock().unwrap().push(request);
+            let chunk = if self.requests.lock().unwrap().len() == 1 {
+                // First coordinator turn: consult.
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(consult_specialist(
+                        "researcher",
+                        "is the module graph sound before we implement?",
+                    )),
+                    is_final: true,
+                    usage: None,
+                }
+            } else if let (Some(id), false) =
+                (self.evidence_id(), self.dispatch_served.load(Ordering::SeqCst))
+            {
+                // The consult result is in the conversation: dispatch citing
+                // the REAL finding event id (once).
+                self.dispatch_served.store(true, Ordering::SeqCst);
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(call_specialist_with(
+                        "coder",
+                        "implement the thing",
+                        None,
+                        &[id.as_str()],
+                    )),
+                    is_final: true,
+                    usage: None,
+                }
+            } else {
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: "advisory findings: the module graph is sound".to_string(),
+                    tool_call: None,
+                    is_final: true,
+                    usage: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "evidence-chain"
+        }
+    }
+
+    /// Build a fully-wired coordinator whose planning provider serves the
+    /// scripted decision-loop turns. `registry` carries the agents the run
+    /// may call; the allow-all policy gates every `call_specialist`.
+    fn coordinator_with_turns(
         bus: EventBus,
         registry: Arc<AgentRegistry>,
-        responses: Vec<String>,
+        turns: Vec<CoordinatorTurn>,
+    ) -> CoordinatorAgent {
+        coordinator_with_turns_and_policy(bus, registry, turns, coordinator_allow_all_policy())
+    }
+
+    /// [`coordinator_with_turns`] with an explicit policy engine (issue #59
+    /// tests wire a recording audit probe so gate denials are observable).
+    fn coordinator_with_turns_and_policy(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+        policy: Arc<dyn concerto_core::traits::policy::PolicyEngine>,
     ) -> CoordinatorAgent {
         let planning_provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
-            Arc::new(SeqProvider::new(responses));
+            Arc::new(TurnProvider::new(turns));
+        coordinator_with_provider_and_policy(bus, registry, planning_provider, policy)
+    }
+
+    /// Build a fully-wired coordinator over an ARBITRARY planning provider
+    /// (issue #59: the consult agent shares the planning provider, so tests
+    /// that need dynamic turn behavior or extra builder steps construct
+    /// through here).
+    fn coordinator_with_provider_and_policy(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        planning_provider: Arc<dyn concerto_core::traits::provider::LlmProvider>,
+        policy: Arc<dyn concerto_core::traits::policy::PolicyEngine>,
+    ) -> CoordinatorAgent {
         let spend_tracker = Arc::new(SpendTracker::default());
         let runner = AgentRunner::new(registry.clone(), bus.clone(), spend_tracker.clone());
         let profiles: Vec<concerto_core::types::RoutingProfile> = vec![
@@ -5423,6 +12969,250 @@ mod tests {
             planning_provider,
             Arc::new(NullMemoryStore),
         )
+        .with_policy_engine(policy)
+    }
+
+    /// The allow-all policy the coordinator test helpers wire: every
+    /// `call_specialist` dispatch is allowed through the SAME engine shape
+    /// production uses.
+    fn coordinator_allow_all_policy() -> Arc<dyn concerto_core::traits::policy::PolicyEngine> {
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)))
+    }
+
+    /// Build a fully-wired coordinator whose planning provider serves one
+    /// canned final text (no tool calls). `registry` carries the agents.
+    fn coordinator_with(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        final_text: String,
+    ) -> CoordinatorAgent {
+        coordinator_with_turns(bus, registry, vec![CoordinatorTurn::Text(final_text)])
+    }
+
+    /// [`coordinator_with_turns`] plus a handle on the mock provider, so a
+    /// test can assert on the injected prompt (roster/evidence) and the
+    /// loop's model-turn count.
+    fn coordinator_with_turns_captured(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+    ) -> (CoordinatorAgent, Arc<TurnProvider>) {
+        let provider = Arc::new(TurnProvider::new(turns));
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let runner = AgentRunner::new(registry.clone(), bus.clone(), spend_tracker.clone());
+        let profiles: Vec<concerto_core::types::RoutingProfile> = vec![
+            concerto_core::types::RoutingProfile {
+                provider_config_id: "test".into(),
+                provider: "test".into(),
+                model: "cheap".into(),
+                cost_per_1k_tokens: 0.001,
+                avg_latency_ms: 100,
+                context_window: 8192,
+                supports_tool_calling: true,
+                base_url: None,
+                description: None,
+            },
+            concerto_core::types::RoutingProfile {
+                provider_config_id: "test".into(),
+                provider: "test".into(),
+                model: "mid".into(),
+                cost_per_1k_tokens: 0.005,
+                avg_latency_ms: 100,
+                context_window: 8192,
+                supports_tool_calling: true,
+                base_url: None,
+                description: None,
+            },
+        ];
+        let routing = Arc::new(RoutingEngine::new(
+            profiles.clone(),
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig {
+                pins: std::collections::HashMap::new(),
+                ..Default::default()
+            },
+            EventBus::default(),
+        ));
+        let model_registry = Arc::new(ModelRegistry::from_profiles(profiles));
+        let model_selector = Arc::new(ModelSelector::new(model_registry, routing));
+        let coordinator = CoordinatorAgent::new(
+            registry,
+            runner,
+            model_selector,
+            spend_tracker,
+            bus.clone(),
+            Arc::clone(&provider) as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(NullMemoryStore),
+        )
+        .with_policy_engine(coordinator_allow_all_policy());
+        (coordinator, provider)
+    }
+
+    /// A pre-planning `WorkspaceSnapshot` whose inventory grounds the given
+    /// proposed paths, so the ADR-65 §5 verifier resolves a DesignDoc claiming
+    /// them to Verified (Active) — the doc BINDS and the coordinator reaches
+    /// the planner with `Some`, recreating the pre-Phase-5 harness where a
+    /// design doc reached the planner unconditionally.
+    ///
+    /// Without this, the no-evidence unit harness degrades every non-empty doc
+    /// to Quarantined (nothing binds: `expected_artifacts` stays empty, the
+    /// proposed_files membership check is off) and coordinator-level tests
+    /// (C-06 artifact gates, review/validation cycles, zero-file guard, custom
+    /// dispatch, checkpoint resume) would silently exercise the passive path
+    /// instead of their intended gates. The evidence pipeline only reads
+    /// `entry.path`, so a synthetic inventory is a faithful stand-in for a
+    /// real workspace walk here.
+    fn grounded_snapshot(proposed: &[&str]) -> crate::workspace_snapshot::WorkspaceSnapshotRecord {
+        crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "g1".to_owned(),
+            entries: proposed
+                .iter()
+                .map(|path| concerto_sessions::ObservedPath {
+                    path: (*path).to_owned(),
+                    size_bytes: Some(1),
+                    mtime_ms: Some(1),
+                    content_hash: Some("deadbeef".to_owned()),
+                })
+                .collect(),
+            captured_at_ms: 1,
+            project_root: "work".into(),
+        }
+    }
+
+    /// `coordinator_with` plus a grounded workspace snapshot for the design
+    /// doc's proposed files — see [`grounded_snapshot`].
+    fn coordinator_with_grounded(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        plan_json: String,
+        proposed: &[&str],
+    ) -> CoordinatorAgent {
+        coordinator_with(bus, registry, plan_json)
+            .with_workspace_snapshot(grounded_snapshot(proposed))
+    }
+
+    /// `coordinator_with_turns` plus a grounded workspace snapshot for the
+    /// DesignDoc's proposed files — see [`grounded_snapshot`].
+    fn coordinator_with_grounded_turns(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+        proposed: &[&str],
+    ) -> CoordinatorAgent {
+        coordinator_with_turns(bus, registry, turns)
+            .with_workspace_snapshot(grounded_snapshot(proposed))
+    }
+
+    /// A `CustomAgentConfig` marking `id` as a DesignDoc-mode design-stage
+    /// agent, so the decision loop routes its call through the ADR-65 §5
+    /// verifier chain.
+    fn design_doc_config(id: &str) -> concerto_config::CustomAgentConfig {
+        concerto_config::CustomAgentConfig {
+            id: id.to_string(),
+            name: "Architect".to_string(),
+            role: "architect".to_string(),
+            stage: Some(concerto_core::AgentStage::new("design")),
+            prompt_sections: concerto_config::PromptSections::default(),
+            model_override: None,
+            provider_id: None,
+            capabilities: concerto_config::AgentCapabilities::default(),
+            is_custom: false,
+            disabled: false,
+            output_mode: concerto_core::types::OutputMode::DesignDoc,
+        }
+    }
+
+    /// A minimal filesystem-write tool for the coordinator's own
+    /// self-execution toolset (ADR-35 §8). Writes through the test
+    /// workspace; mirrors a real filesystem tool's output shape.
+    struct TestWriteTool;
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for TestWriteTool {
+        fn name(&self) -> &str {
+            "test_write_file"
+        }
+        fn description(&self) -> &str {
+            "writes a file into the project"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            let path = input.get("path").and_then(serde_json::Value::as_str).unwrap_or("out.txt");
+            let content =
+                input.get("content").and_then(serde_json::Value::as_str).unwrap_or("// test");
+            let target = session.project_dir.join(path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&target, content).map_err(|error| {
+                concerto_core::ToolError::ExecutionFailed { message: error.to_string() }
+            })?;
+            Ok(concerto_core::types::ToolOutput {
+                summary: format!("wrote {path}"),
+                data: serde_json::json!({ "path": path }),
+            })
+        }
+    }
+
+    /// An executor carrying [`TestWriteTool`] under an allow-all policy —
+    /// the coordinator's own self-execution toolset for the §8 tests.
+    fn self_execute_executor() -> Arc<ToolExecutor> {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(TestWriteTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        Arc::new(ToolExecutor::new(Arc::new(registry), policy))
+    }
+
+    /// A `test_write_file` tool call for the coordinator's own toolset.
+    fn test_write_tool_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("write-{path}"),
+            name: "test_write_file".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
+        }
+    }
+
+    /// [`run_for_test`] with an explicit workspace directory (for tests that
+    /// assert on real files the coordinator's own tools wrote).
+    async fn run_for_test_in_dir(
+        mut coordinator: CoordinatorAgent,
+        bus: EventBus,
+        project_dir: &std::path::Path,
+    ) -> (AgentOutput, Vec<EventKind>) {
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        (output, events)
     }
 
     /// Run a wired coordinator to completion and collect all bus events.
@@ -5450,25 +13240,16 @@ mod tests {
         (output, events)
     }
 
-    /// A plan containing a custom role must dispatch that role to the
-    /// registered `GenericSpecialistAgent` through the runner, and the
-    /// orchestration must complete successfully.
+    /// A Coordinator calling a never-planned custom role dispatches that
+    /// role to its registered agent through the runner, and the run
+    /// completes (ADR-35 amendment 2026-09-05: dispatch follows the
+    /// Coordinator's `call_specialist` decision, never a planner roster).
     #[tokio::test]
     async fn custom_agent_from_plan_is_dispatched_via_runner() {
         use crate::agents::GenericSpecialistAgent;
 
         let bus = EventBus::new(256);
-        // Planner response: Researcher, custom docs-writer, Coder.
-        let plan_json = r#"[
-            {"role":"Researcher","description":"inspect docs","depends_on":[]},
-            {"role":"docs-writer","description":"write release notes","depends_on":[0]},
-            {"role":"Coder","description":"implement feature","depends_on":[0]}
-        ]"#;
         let mocks = vec![
-            MockExpertAgent::always_succeed(
-                AgentId::new("architect"),
-                r#"{"goals":["ship release notes"],"proposed_files":["src/auth.rs"],"interface_sketch":"login form"}"#,
-            ),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found docs"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
                 .with_artifact_writer(),
@@ -5488,8 +13269,20 @@ mod tests {
             concerto_config::AgentCapabilities::default(),
         )));
 
+        // The Coordinator calls the custom agent from context alone — no
+        // planner, no scheduler.
         let (output, events) = run_for_test(
-            coordinator_with(bus.clone(), Arc::new(registry), plan_json.into()),
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "docs-writer",
+                        "write release notes",
+                    )]),
+                    CoordinatorTurn::Text("release notes written".into()),
+                ],
+            ),
             bus.clone(),
         )
         .await;
@@ -5510,6 +13303,1169 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Issue #59: the typed CONSULT operation
+    // ------------------------------------------------------------------
+
+    /// Issue #59 acceptance — a consulting agent that ATTEMPTS a workspace
+    /// write fails closed: the write is denied (the file never appears on
+    /// disk), the denial is recorded through the run's audit log, the
+    /// consultation still settles with consultative findings, and no
+    /// SubTask node is ever created for the consult.
+    #[tokio::test]
+    async fn consultation_cannot_mutate_adversarial_write_denied() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![consult_specialist(
+                "researcher",
+                "assess the module graph",
+            )]),
+            // The consultant's first turn: attempt a WRITE through the
+            // filesystem tool — the read-only gate must deny it.
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "write-attempt".to_string(),
+                name: "filesystem".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "write",
+                    "path": "injected.rs",
+                    "content": "// pwned",
+                }),
+
+                ..Default::default()
+            }]),
+            CoordinatorTurn::Text("I could not write; here is my advisory answer.".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        let (output, events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_policy_with_audit(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+
+        // The write NEVER landed (fail closed).
+        assert!(
+            !workspace.path().join("injected.rs").exists(),
+            "a consultation must never mutate the workspace"
+        );
+        // The denial is recorded (audit row: consult_read_only).
+        let rows = audit.rows();
+        assert!(
+            rows.iter().any(|row| {
+                row.rule_matched.as_deref() == Some("consult_read_only")
+                    && row.tool_name == "filesystem"
+                    && row.verdict == "Deny"
+            }),
+            "the write denial must be recorded: {rows:?}"
+        );
+        // The consultation settled with consultative findings (never task
+        // results): the tool result the model read back carries the
+        // consultative marker and the consultant's answer.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        assert!(
+            consult_result["findings"]
+                .as_str()
+                .is_some_and(|findings| { findings.contains("advisory answer") }),
+            "the consultant's answer rides the tool result: {consult_result:?}"
+        );
+        // No SubTask node was ever created for the consultation.
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "a consultation must not create SubTask nodes: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #59 acceptance (end to end): a consultation's findings become
+    /// REAL evidence — the consult tool result carries a real finding event
+    /// id, the event is on the whiteboard marked consultative, and a
+    /// subsequent dispatch decision cites it (the #52 validator accepts the
+    /// REAL id; fabricated ids are rejected).
+    #[tokio::test]
+    async fn consult_findings_become_citable_evidence_for_dispatch() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let provider = Arc::new(EvidenceChainProvider::default());
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        let (_output, _events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+        // The run's tail may surface recovery notes (zero-work/validation
+        // guards on the mocked dispatch) — the acceptance facts are the
+        // evidence chain on the whiteboard, asserted below.
+
+        // The consultative Finding event is on the whiteboard.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let finding = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .expect("a consultative finding event was recorded");
+        // The consult tool result carried the REAL evidence id.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(
+            consult_result["evidence_id"].as_str(),
+            Some(finding.event_id.as_str()),
+            "the tool result's evidence id is the REAL finding event id"
+        );
+        // A subsequent dispatch decision CITES the consult findings.
+        let dispatch_decision = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"] == serde_json::Value::String("coder".into())
+            })
+            .expect("the follow-up dispatch decision was recorded");
+        let cited: Vec<&str> = dispatch_decision.payload["supporting_evidence_ids"]
+            .as_array()
+            .expect("citations array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            cited.contains(&finding.event_id.as_str()),
+            "the dispatch must cite the consult findings as evidence: {cited:?}"
+        );
+    }
+
+    /// Issue #59 acceptance: the consultation effort cap is enforced. With
+    /// `max_tool_calls = 2`, exactly two read-only executions run and the
+    /// third is denied (`consult_effort_capped`, recorded); the
+    /// consultation still settles.
+    #[tokio::test]
+    async fn consultation_effort_cap_enforced() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![consult_specialist_with(
+                "researcher",
+                "read the notes and summarize",
+                None,
+                &[],
+                Some(2),
+            )]),
+            CoordinatorTurn::Calls(vec![filesystem_read_call("notes.md")]),
+            CoordinatorTurn::Calls(vec![filesystem_read_call("notes.md")]),
+            CoordinatorTurn::Calls(vec![filesystem_read_call("notes.md")]),
+            CoordinatorTurn::Text("I was capped; here is what I could read.".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        std::fs::write(workspace.path().join("notes.md"), "hello").expect("seed the read target");
+        let (output, _events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_policy_with_audit(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+
+        let rows = audit.rows();
+        let allowed_reads = rows
+            .iter()
+            .filter(|row| row.tool_name == "filesystem" && row.verdict == "Allow")
+            .count();
+        assert_eq!(allowed_reads, 2, "exactly the capped number of reads ran: {rows:?}");
+        assert!(
+            rows.iter().any(|row| {
+                row.rule_matched.as_deref() == Some("consult_effort_capped")
+                    && row.tool_name == "filesystem"
+            }),
+            "the cap denial is recorded: {rows:?}"
+        );
+        // The consultation still settled with findings.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        assert_eq!(consult_result["effort_cap"], 2);
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #59 acceptance: the deterministic low-confidence trigger. A
+    /// failed dispatch whose diagnosis requires replanning opens an
+    /// unresolved question (issue #56); once it has stood
+    /// [`CONSULT_TRIGGER_MIN_CYCLES`] rebuilds, the decision loop injects
+    /// the consultation request BEFORE the next decision turn (exactly
+    /// once), and a settled consultation resolves the question (the #56
+    /// lifecycle reads the Settled consult decision as recovery evidence).
+    #[tokio::test]
+    async fn low_confidence_question_triggers_consultation_deterministically() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_fail(
+                AgentId::new("coder"),
+                "expected artifacts not produced: src/lib.rs",
+            ),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            // Cycle 1: a dispatch whose failure requires replanning — the
+            // OpenProblem question opens (age 1, below the trigger).
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the feature")]),
+            // Cycle 2: a REJECTED decision (fabricated evidence — no journal
+            // record, no settled work) so the question stands another
+            // rebuild and crosses the trigger age.
+            CoordinatorTurn::Calls(vec![call_specialist_with(
+                "coder",
+                "implement the feature",
+                None,
+                &["ev-fabricated"],
+            )]),
+            // The model obeys the consultation request.
+            CoordinatorTurn::Calls(vec![consult_specialist(
+                "researcher",
+                "why do implementations keep missing the artifacts?",
+            )]),
+            // The consultant's answer (the consult agent shares the
+            // planning provider).
+            CoordinatorTurn::Text(
+                "the artifacts miss because the design contract was never grounded".into(),
+            ),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            coordinator_allow_all_policy(),
+        )
+        .with_review_store(Some(pool.clone()));
+        let _rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the coordinator run completes");
+
+        // The consultation request was injected into the decision loop
+        // (deterministically, once the question crossed the trigger age).
+        let nudge_count = provider
+            .message_contents()
+            .iter()
+            .filter(|content| content.contains("CONSULTATION REQUEST"))
+            .count();
+        assert!(nudge_count >= 1, "the consultation request must be injected");
+        // The consult settled with findings recorded as consultative
+        // evidence on the whiteboard.
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the consult tool result was observed");
+        assert_eq!(consult_result["outcome"], "consulted");
+        let evidence_id = consult_result["evidence_id"].as_str().expect("a real evidence id");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let finding = logged
+            .iter()
+            .find(|event| event.event_id == evidence_id)
+            .expect("the finding event exists on the whiteboard");
+        assert_eq!(finding.kind, WhiteboardKind::Finding);
+        assert_eq!(finding.payload["consultative"], serde_json::Value::Bool(true));
+        // The settled consultation RESOLVED the standing question (the #56
+        // lifecycle consumes the Settled consult decision as recovery
+        // evidence). The finding event's causation IS the consult decision
+        // id the resolution recorded.
+        let resolved = coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.state == crate::world_model::QuestionState::Resolved)
+            .expect("the standing question was resolved by the consultation");
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            finding.causation.as_deref(),
+            "the question was resolved by the consult decision"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #62: speculative read-only investigation
+    // ------------------------------------------------------------------
+
+    /// Issue #62 acceptance: `investigate_hypotheses` runs the competing
+    /// hypotheses as bounded read-only consultations concurrently (inside ONE
+    /// handler turn), records each finding on the whiteboard WITH its
+    /// hypothesis id (attribution), and returns the comparator ranking
+    /// carrying the REAL finding-event id for every completed hypothesis —
+    /// advisory evidence, never task results.
+    #[tokio::test]
+    async fn investigation_runs_hypotheses_concurrently_with_attributed_findings() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("hyp-1", "researcher", "why is the build red?", None, &[], None),
+                hypothesis_spec("hyp-2", "coder", "is the migration additive?", None, &[], None),
+            ])]),
+            // The two consultants share the planning provider and finish in
+            // prose; the pop order between them is concurrent/racy but the
+            // turns are interchangeable — each settles with its own text.
+            CoordinatorTurn::Text("the build is red because the lockfile is stale".into()),
+            CoordinatorTurn::Text("the migration only adds a column".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, events) = run.await;
+
+        // Exactly the scripted model turns were consumed (dispatch turn +
+        // two consultant turns + final) — both consults ran INSIDE the single
+        // investigate turn and nothing else was invoked.
+        assert_eq!(provider.turn_count(), 4, "dispatch + 2 consultants + coordinator final");
+
+        // The comparator result the model read back.
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert_eq!(result["speculative"], true);
+        assert_eq!(result["advisory"], true);
+        let hypotheses = result["hypotheses"].as_array().expect("hypotheses array");
+        assert_eq!(hypotheses.len(), 2, "both hypotheses ranked");
+        let evidence_ids: Vec<String> = hypotheses
+            .iter()
+            .map(|h| h["evidence_id"].as_str().expect("real evidence id").to_owned())
+            .collect();
+        assert_eq!(
+            result["recommended_hypothesis_id"].as_str(),
+            Some("hyp-1"),
+            "both completed-with-evidence tie-break by creation order"
+        );
+
+        // The whiteboard carries the attributed, consultative findings.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let findings: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .collect();
+        assert_eq!(findings.len(), 2, "one finding per hypothesis");
+        let attributed: Vec<&str> = findings
+            .iter()
+            .map(|event| event.payload["hypothesis_id"].as_str().expect("attributed finding"))
+            .collect();
+        assert!(
+            attributed.contains(&"hyp-1") && attributed.contains(&"hyp-2"),
+            "findings carry their hypothesis id: {attributed:?}"
+        );
+        // Every evidence id the comparator returned is REAL.
+        for id in &evidence_ids {
+            assert!(
+                logged.iter().any(|event| event.event_id == *id),
+                "the finding event for {id} is on the whiteboard"
+            );
+        }
+        // The batch Investigate decision event names the whole investigation.
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("coordinator".into())
+            }),
+            "the batch Investigate decision is recorded"
+        );
+        // Advisory only: no SubTask node was ever created.
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "an investigation must not create SubTask nodes"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 acceptance: hypotheses with CONFLICTING findings still
+    /// settle side-by-side; the comparator only RANKS them — nothing is
+    /// auto-promoted to verified, and every finding stays consultative (an
+    /// assertion, never a task result).
+    #[tokio::test]
+    async fn conflicting_hypotheses_stay_advisory_and_are_never_promoted() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "advisory"),
+        ];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec(
+                    "hyp-a",
+                    "researcher",
+                    "does the API change break callers?",
+                    None,
+                    &[],
+                    None,
+                ),
+                hypothesis_spec(
+                    "hyp-b",
+                    "validator",
+                    "does the API change break callers?",
+                    None,
+                    &[],
+                    None,
+                ),
+            ])]),
+            CoordinatorTurn::Text("the API change is source-compatible".into()),
+            CoordinatorTurn::Text("the API change breaks two callers".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, events) = run.await;
+
+        // Both contradictory findings landed side by side.
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert_eq!(
+            result["hypotheses"].as_array().map(Vec::len),
+            Some(2),
+            "conflicting hypotheses are ranked, not resolved"
+        );
+        assert_eq!(result["advisory"], true);
+        assert!(
+            result["recommended_hypothesis_id"].as_str().is_some(),
+            "the comparator recommends (rank) without promoting"
+        );
+        // Nothing was promoted: every finding is consultative and no SubTask
+        // node exists anywhere in the run.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let consultative_findings = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .count();
+        assert_eq!(consultative_findings, 2);
+        assert!(
+            logged.iter().all(|event| event.kind != WhiteboardKind::Finding
+                || event.payload["consultative"] == serde_json::Value::Bool(true)),
+            "no finding is ever non-consultative (not a task result)"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "no hypothesis was auto-promoted into the execution graph"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 acceptance: investigations inherit the read-only gate — a
+    /// hypothesis that attempts a workspace write is denied fail-closed
+    /// (recorded), the finding still settles, and the batch completes.
+    #[tokio::test]
+    async fn investigation_write_attempt_is_denied_read_only() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec(
+                    "hyp-w",
+                    "researcher",
+                    "would a patched lockfile help?",
+                    None,
+                    &[],
+                    None,
+                ),
+                hypothesis_spec("hyp-ro", "coder", "is the schema additive?", None, &[], None),
+            ])]),
+            // One hypothesis attempts a WRITE through the filesystem tool.
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "write-attempt".to_string(),
+                name: "filesystem".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "write",
+                    "path": "injected.rs",
+                    "content": "// pwned",
+                }),
+
+                ..Default::default()
+            }]),
+            // Whichever consultant popped the write still settles in prose,
+            // then the other conclusion, then the coordinator.
+            CoordinatorTurn::Text("the write was denied; the lockfile patch helps".into()),
+            CoordinatorTurn::Text("the schema is additive".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_policy_with_audit(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        // Fail closed: the write never landed and the denial is recorded.
+        assert!(
+            !workspace.path().join("injected.rs").exists(),
+            "an investigation must never mutate the workspace"
+        );
+        let rows = audit.rows();
+        assert!(
+            rows.iter().any(|row| {
+                row.rule_matched.as_deref() == Some("consult_read_only")
+                    && row.tool_name == "filesystem"
+                    && row.verdict == "Deny"
+            }),
+            "the write denial must be recorded: {rows:?}"
+        );
+        // Both hypotheses still settled with consultative findings.
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert_eq!(
+            result["hypotheses"].as_array().map(Vec::len),
+            Some(2),
+            "the batch completes even when a hypothesis is denied a write"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 guardrail: fewer than two competing hypotheses cannot be
+    /// investigated — the tool answers a structured error and nothing runs.
+    #[tokio::test]
+    async fn investigation_requires_at_least_two_hypotheses() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![hypothesis_spec(
+                "hyp-1",
+                "researcher",
+                "is the plan sound?",
+                None,
+                &[],
+                None,
+            )])]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            ),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("error").is_some())
+            .expect("the structured rejection was observed");
+        assert_eq!(result["error"], "too_few_hypotheses");
+        // No consultant ever spawned: exactly two model turns (dispatch +
+        // final), and no speculative result was produced.
+        assert_eq!(provider.turn_count(), 2, "validation rejects before any spawn");
+        assert!(
+            provider.tool_result_contents().iter().all(|value| value.get("speculative").is_none()),
+            "no investigation result was produced"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 guardrail: the summed per-hypothesis effort caps are bounded
+    /// by the batch ceiling — exceeding it answers a structured error before
+    /// anything runs.
+    #[tokio::test]
+    async fn investigation_enforces_the_batch_effort_ceiling() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("h1", "researcher", "q1", None, &[], Some(16)),
+                hypothesis_spec("h2", "researcher", "q2", None, &[], Some(16)),
+                hypothesis_spec("h3", "researcher", "q3", None, &[], Some(16)),
+            ])]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            ),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("error").is_some())
+            .expect("the structured rejection was observed");
+        assert_eq!(result["error"], "total_effort_exceeded");
+        assert_eq!(provider.turn_count(), 2, "the ceiling rejects before any spawn");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 guardrail: an unregistered hypothesis agent rejects the WHOLE
+    /// batch with a structured error, before any state mutation or spawn — no
+    /// finding, no decision event lands on the whiteboard.
+    #[tokio::test]
+    async fn investigation_rejects_unregistered_agent_without_state_mutation() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("hyp-1", "researcher", "q1", None, &[], None),
+                hypothesis_spec("hyp-2", "ghost", "q2", None, &[], None),
+            ])]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, _events) = run.await;
+
+        let result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("error").is_some())
+            .expect("the structured rejection was observed");
+        assert_eq!(result["error"], "unknown_agent");
+        assert_eq!(provider.turn_count(), 2, "validation rejects before any spawn");
+        // No mutation: the evidence spine gained nothing.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            logged.iter().all(|event| event.kind != WhiteboardKind::Finding),
+            "an invalid batch must not record findings"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// A delegating planning provider that answers every request from the
+    /// inner [`TurnProvider`] EXCEPT one consultant's turn, which it fails
+    /// with a non-retryable [`ProviderError`] — a scripted provider fault,
+    /// the sanctioned issue-#62 failure route (an effort-cap exhaustion is
+    /// NOT fatal to a consultant run: it only denies the next tool call, and
+    /// the loop feeds the denial back as a corrective message).
+    ///
+    /// The failing consultant is identified by its question. The consult
+    /// prompt embeds the question verbatim
+    /// ([`crate::consultation::consult_task_description`]) and no other
+    /// message CONTENT in the run repeats it — the coordinator's
+    /// continuation request carries the investigate tool result, whose JSON
+    /// never quotes the question back (it stays inside the tool_call
+    /// arguments, which are not message content).
+    struct FailsOneConsultProvider {
+        inner: Arc<TurnProvider>,
+        fail_question: String,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for FailsOneConsultProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            let is_failing_consult = request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&self.fail_question));
+            if is_failing_consult {
+                // Non-retryable: `with_provider_retry` fails fast (no retry
+                // budget consumed), so the consultant's run errors
+                // deterministically on its first and only completion turn.
+                return Err(ProviderError::InvalidResponse(format!(
+                    "scripted provider fault for the question '{}'",
+                    self.fail_question
+                )));
+            }
+            self.inner.stream_completion(request, cancel).await
+        }
+        fn context_capacity(&self, model: &str) -> concerto_core::types::TokenBudget {
+            self.inner.context_capacity(model)
+        }
+        fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
+            self.inner.approximate_cost(tokens_in, tokens_out)
+        }
+        fn provider_name(&self) -> &'static str {
+            "failing-consult"
+        }
+    }
+
+    /// A delegating planning provider that serves exactly the single dispatch
+    /// turn, then fails every later call with [`ProviderError::Cancelled`] —
+    /// cancelling the shared [`CancellationToken`] on the FIRST concurrent
+    /// consultant call. Which hypothesis occupies that first slot is racy
+    /// but immaterial: both consultants error before any completing turn, so
+    /// both hypotheses settle `failed` with `reasons == ["cancelled"]`,
+    /// `batch_cancelled` is latched, and the coordinator aborts at its next
+    /// loop-top cancellation check.
+    struct CancelOnConsultProvider {
+        inner: Arc<TurnProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for CancelOnConsultProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                // The initiating dispatch turn that produces the investigate
+                // tool call — the handler (and therefore both consultants)
+                // can only start after this stream is fully assembled, so the
+                // cancellation lands strictly AFTER the spawn.
+                self.inner.stream_completion(request, cancel).await
+            } else {
+                if call == 1 {
+                    cancel.cancel();
+                }
+                Err(ProviderError::Cancelled)
+            }
+        }
+        fn context_capacity(&self, model: &str) -> concerto_core::types::TokenBudget {
+            self.inner.context_capacity(model)
+        }
+        fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
+            self.inner.approximate_cost(tokens_in, tokens_out)
+        }
+        fn provider_name(&self) -> &'static str {
+            "cancelling-consult"
+        }
+    }
+
+    /// Issue #62 acceptance: one hypothesis failing inside concurrent
+    /// investigation (a scripted, non-retryable provider fault on the
+    /// researcher's consultant) settles that hypothesis `failed` WITH
+    /// reasons and WITHOUT evidence, while the coder's hypothesis still
+    /// completes with attributed findings — the batch completes and the
+    /// comparator recommends the healthy hypothesis.
+    #[tokio::test]
+    async fn one_failed_hypothesis_leaves_sibling_completed() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let fail_question = "will the lockfile patch fix the red build?";
+        let inner = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![investigate_with(vec![
+                hypothesis_spec("hyp-a", "researcher", fail_question, None, &[], None),
+                hypothesis_spec(
+                    "hyp-b",
+                    "coder",
+                    "does the schema change stay additive?",
+                    None,
+                    &[],
+                    None,
+                ),
+            ])]),
+            // Only the coder's consultant consumes a turn; the researcher's
+            // consultant errors before it can take a completing turn.
+            CoordinatorTurn::Text("the schema change stays additive".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let provider = Arc::new(FailsOneConsultProvider {
+            inner: inner.clone(),
+            fail_question: fail_question.to_owned(),
+        });
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_allow_all_policy(),
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+            workspace.path(),
+        );
+        let (output, events) = run.await;
+
+        // Exactly three model turns were served by the inner provider:
+        // dispatch + the surviving coder consultant + the coordinator's
+        // continuation. The failing consultant consumed none.
+        assert_eq!(inner.turn_count(), 3, "dispatch + surviving consultant + coordinator final");
+
+        let result = inner
+            .tool_result_contents()
+            .into_iter()
+            .find(|value| value.get("speculative").is_some())
+            .expect("the investigate tool result was observed");
+        assert_eq!(result["outcome"], "investigated");
+        assert!(
+            result.get("cancelled").is_none(),
+            "a one-sided failure is not a batch cancellation"
+        );
+        let hypotheses = result["hypotheses"].as_array().expect("hypotheses array");
+        assert_eq!(hypotheses.len(), 2, "both hypotheses are ranked");
+
+        let failed = hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis["hypothesis_id"] == "hyp-a")
+            .expect("the failed hypothesis is ranked");
+        assert_eq!(failed["status"], "failed");
+        assert!(failed["evidence_id"].is_null(), "a failed hypothesis carries no evidence");
+        assert!(failed["findings"].is_null(), "a failed hypothesis carries no findings");
+        assert_eq!(failed["tool_call_count"], 0);
+        assert_eq!(failed["cost_usd"].as_f64(), Some(0.0));
+        let reasons = failed["reasons"].as_array().expect("the failure reasons array");
+        assert!(
+            reasons.iter().any(|reason| {
+                reason.as_str().unwrap_or_default().contains("invalid response from provider")
+            }),
+            "the failure reason names the provider fault: {reasons:?}"
+        );
+
+        let completed = hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis["hypothesis_id"] == "hyp-b")
+            .expect("the completed hypothesis is ranked");
+        assert_eq!(completed["status"], "completed");
+        let evidence_id =
+            completed["evidence_id"].as_str().expect("the completed hypothesis has evidence");
+        assert!(completed["findings"].as_str().is_some(), "the completed hypothesis has findings");
+        assert_eq!(
+            result["recommended_hypothesis_id"].as_str(),
+            Some("hyp-b"),
+            "the comparator recommends the only completed-with-evidence hypothesis"
+        );
+
+        // Whiteboard: exactly one consultative Finding (attributed to hyp-b
+        // and REAL — its event id is the comparator's evidence id), while
+        // BOTH per-hypothesis consult decisions — the failed one included —
+        // were recorded before spawn, plus the batch decision.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let consult_findings: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Finding
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+            })
+            .collect();
+        assert_eq!(consult_findings.len(), 1, "only the completed hypothesis produced findings");
+        assert_eq!(consult_findings[0].payload["hypothesis_id"].as_str(), Some("hyp-b"));
+        assert!(
+            logged.iter().any(|event| event.event_id == evidence_id),
+            "the comparator's evidence id is the real finding event"
+        );
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["consultative"] == serde_json::Value::Bool(true)
+                    && event.payload["hypothesis_id"].as_str() == Some("hyp-a")
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("researcher".into())
+            }),
+            "the failed hypothesis's consult decision was still recorded pre-spawn"
+        );
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("coordinator".into())
+            }),
+            "the batch Investigate decision is recorded"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "an investigation must not create SubTask nodes"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #62 acceptance: a mid-batch cancellation that fires exactly
+    /// AFTER the investigation spawns (the first consultant call, never the
+    /// pre-spawn check) cancels BOTH hypotheses — each settles `failed` with
+    /// `reasons == ["cancelled"]` — and aborts the coordinator run
+    /// deterministically at the next loop-top cancellation check: a
+    /// `Partial` `AgentOutput` with an "Automation paused … cancelled" final
+    /// message. No partial evidence state is left behind: the per-hypothesis
+    /// consult decisions (pre-spawn) exist but NO finding lands, and no
+    /// subtask is ever dispatched.
+    #[tokio::test]
+    async fn mid_batch_cancellation_aborts_without_partial_state() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "advisory"),
+        ];
+        let inner =
+            Arc::new(TurnProvider::new(vec![CoordinatorTurn::Calls(vec![investigate_with(
+                vec![
+                    hypothesis_spec(
+                        "hyp-a",
+                        "researcher",
+                        "will the lockfile patch fix the red build?",
+                        None,
+                        &[],
+                        None,
+                    ),
+                    hypothesis_spec(
+                        "hyp-b",
+                        "coder",
+                        "does the schema change stay additive?",
+                        None,
+                        &[],
+                        None,
+                    ),
+                ],
+            )])]));
+        let provider = Arc::new(CancelOnConsultProvider {
+            inner: inner.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let workspace = tempfile::tempdir().expect("tempdir for the investigation workspace");
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_for_test_in_dir(
+                coordinator_with_provider_and_policy(
+                    bus.clone(),
+                    Arc::new(AgentRegistry::from_mocks(mocks)),
+                    provider as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                    coordinator_allow_all_policy(),
+                )
+                .with_review_store(Some(pool.clone())),
+                bus.clone(),
+                workspace.path(),
+            ),
+        );
+        let (output, events) = run.await.expect("the cancelled run terminates (no hang)");
+
+        // The run preserves partial progress instead of hanging or failing.
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "mid-batch cancellation yields a Partial outcome"
+        );
+        assert!(
+            output.final_message.contains("Automation paused"),
+            "the final message explains the pause: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.to_lowercase().contains("cancelled"),
+            "the final message names the cancellation: {}",
+            output.final_message
+        );
+
+        // Only the single dispatch turn was served by the inner provider:
+        // both consultants errored before any completing turn, and the
+        // coordinator aborted before its continuation turn.
+        assert_eq!(inner.turn_count(), 1, "the dispatch turn only");
+        assert!(
+            inner.tool_result_contents().is_empty(),
+            "the aborted coordinator never read a tool result back"
+        );
+
+        // No partial evidence/journal state: the consult decisions landed
+        // (pre-spawn attribution) but no finding exists for either
+        // hypothesis — nothing settled.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            logged.iter().all(|event| event.kind != WhiteboardKind::Finding),
+            "a cancelled batch must not record any finding"
+        );
+        for (hypothesis_id, agent) in [("hyp-a", "researcher"), ("hyp-b", "coder")] {
+            assert!(
+                logged.iter().any(|event| {
+                    event.kind == WhiteboardKind::Decision
+                        && event.payload["consultative"] == serde_json::Value::Bool(true)
+                        && event.payload["hypothesis_id"].as_str() == Some(hypothesis_id)
+                        && event.payload["selected_agent"]
+                            == serde_json::Value::String(agent.into())
+                }),
+                "the consult decision for {hypothesis_id} ({agent}) is recorded pre-spawn"
+            );
+        }
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["selected_agent"]
+                        == serde_json::Value::String("coordinator".into())
+            }),
+            "the batch Investigate decision is recorded"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "a cancelled investigation never dispatches subtasks"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // ADR-35 phase 3: pipeline shape follows the registry's stage tags
     // ------------------------------------------------------------------
 
@@ -5524,17 +14480,19 @@ mod tests {
     async fn no_review_agent_skips_review_cycle() {
         let bus = EventBus::new(256);
         let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
-                .with_artifact_writer(),
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
+        // The Coordinator dispatches research from its own decision; the
+        // roster has no review-stage agent to call.
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
             ),
             bus.clone(),
         )
@@ -5551,6 +14509,11 @@ mod tests {
         );
     }
 
+    /// ADR-35 amendment (2026-09-05): the per-call zero-work guard. An
+    /// implement-stage call that "succeeds" with zero tool executions and no
+    /// artifact is FLAGGED (AgentThought + recoverable note), so the run
+    /// surfaces as Partial — the completion claim was not backed by executed
+    /// work. The run-level guard in `execute_graph` stays as the second net.
     #[tokio::test]
     async fn no_design_agent_plans_without_design_step() {
         let bus = EventBus::new(256);
@@ -5561,55 +14524,105 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Text("nothing more to do".into()),
+                ],
             ),
             bus.clone(),
         )
         .await;
 
-        // Without a design stage there is no DesignDoc to seed the coder's
-        // expected artifacts, so the (mock) coder completes with no files.
-        // The zero-file implement guard fires exactly once per lineage: the
-        // first zero-file success short-circuits the reviewer and queues a
-        // revision, and the revision's own zero-file success (same lineage
-        // root) FAILS the subtask — no second review cycle, no further
-        // revision — so the run ends Partial with the missing-deliverable
-        // failure surfaced to the user.
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
-            "a zero-file coder with a review-stage agent must end the run as Partial after the post-revision zero-file failure, got: {:?}",
+            "a zero-work implement success must be flagged and downgrade the exit, got: {:?}",
             output.completion_status,
         );
+        let zero_work_note = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("Zero-work guard")
+            )
+        });
         assert!(
-            output.final_message.contains("required deliverables were not produced"),
-            "expected the post-revision zero-file failure in the final message, got: {}",
-            output.final_message
+            zero_work_note,
+            "expected the per-call zero-work AgentThought flag, got: {events:?}"
         );
         assert!(
-            output.final_message.contains("completed with no file changes after revision"),
-            "expected the zero-file-after-revision wording in the final message, got: {}",
+            output.final_message.contains("Zero-work guard"),
+            "expected the zero-work note in the final message, got: {}",
             output.final_message
         );
-        let review_cycle_count = events
-            .iter()
-            .filter(|kind| matches!(kind, EventKind::ReviewCycleStarted { .. }))
-            .count();
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume, 2026-09-05) — live F1: an
+    /// action-required (build-classified) run whose dispatched subtasks all
+    /// answered in prose (zero tool calls across the whole run) must NOT
+    /// report Completed. The run-level zero-work guard downgrades the exit to
+    /// Partial and names the omission. A non-implement subtask role is used
+    /// deliberately: the per-subtask zero-file guard does not apply to it, so
+    /// the run reaches the success exit — exactly the route the F1 claim took.
+    #[tokio::test]
+    async fn zero_tool_action_required_run_stalls_instead_of_completing() {
+        let bus = EventBus::new(256);
+        // A research-stage subtask answers prose-only (zero tools, zero
+        // files) and "succeeds" — the per-subtask guards pass it.
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "done")];
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            mocks,
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _id) = single_pending_graph(session_id, "researcher");
+        let rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let (output, _notes) = coordinator
+            .execute_graph(
+                // The ROOT task is action-required (a build-classified run);
+                // this is what arms the run-level zero-work guard.
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                graph,
+                HashMap::new(), // completed_results
+                0.0,            // total_cost
+                0,              // total_tool_calls
+                vec![],         // all_files
+                vec![],         // provider_metrics
+                HashMap::new(), // subtask_attempts
+                HashMap::new(), // retry_feedback
+                HashMap::new(), // model_assignments
+                Vec::new(),     // action_ledger
+                "build the thing".to_string(),
+                blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+                Vec::new(), // loop_notes
+                None,       // requested_user_input
+            )
+            .await
+            .expect("execute_graph returns");
+        let _ = rx;
+
         assert_eq!(
-            review_cycle_count, 0,
-            "no review cycle may run: the revision's own zero-file success fails instead of falling through to the reviewer, got: {review_cycle_count}"
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a zero-tool action-required run must stall, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
         );
         assert!(
-            !events.iter().any(|kind| {
-                matches!(
-                    kind,
-                    EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("architect")
-                )
-            }),
-            "no design-stage agent should mean no design subtask runs"
+            output.final_message.contains("Zero-work guard"),
+            "the omission is named in the final message: {}",
+            output.final_message
         );
     }
 
@@ -5712,13 +14725,11 @@ mod tests {
         );
     }
 
-    /// A zero-file implement success that queues a revision does not doom
-    /// the lineage: the revision's own completion with real file changes
-    /// falls through to the normal review cycle and the graph completes.
-    /// The run still surfaces as Partial because the short-circuit note is
-    /// recorded as a recoverable issue (the pre-existing convention: any
-    /// recoverable note → Partial) — the key point is that the revision was
-    /// dispatched and no subtask failed.
+    /// The per-call zero-work flag does not doom the run: the Coordinator
+    /// sees the flagged zero-file implement success in the tool result,
+    /// re-dispatches the specialist with corrective notes, and the second
+    /// dispatch produces real files. No subtask fails; the run carries the
+    /// first call's zero-work note as a recoverable issue (Partial).
     #[tokio::test]
     async fn zero_file_revision_that_produces_files_recovers_and_completes() {
         let bus = EventBus::new(256);
@@ -5726,48 +14737,46 @@ mod tests {
             ok_result("coder", "implemented").expect("ok_result should not fail");
         revised_with_files.files_modified = vec![camino::Utf8PathBuf::from("src/a.rs")];
         let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            // First coder dispatch returns zero files; the queued revision
-            // (second dispatch, same role) returns real file changes.
+            // First coder dispatch returns zero files; the Coordinator's
+            // corrective re-dispatch (second dispatch, same role) returns
+            // real file changes.
             MockExpertAgent::sequence(
                 AgentId::new("coder"),
                 vec![ok_result("coder", "implemented"), Ok(revised_with_files)],
             ),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Calls(vec![call_specialist_with(
+                        "coder",
+                        "implement",
+                        Some("your previous call produced no files — write src/a.rs"),
+                        &[],
+                    )]),
+                    CoordinatorTurn::Text("files produced on the correction".into()),
+                ],
             ),
             bus.clone(),
         )
         .await;
 
-        // The graph recovered (the revision produced files, so no subtask
-        // failed), but the short-circuit note is a recoverable issue, so the
-        // run surfaces as Partial with the note — never as the terminal
-        // zero-file failure.
+        // The run carries the zero-work recoverable note, so it surfaces as
+        // Partial — but no subtask failed and both dispatches ran.
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
-            "the recovered run carries the short-circuit recoverable note, so it must surface as Partial (not Completed), got: {:?}",
+            "the recovered run carries the zero-work note, so it must surface as Partial, got: {:?}",
             output.completion_status,
         );
         assert!(
-            output.final_message.contains("revision queued without running the review cycle"),
-            "expected the short-circuit recovery note in the final message, got: {}",
+            output.final_message.contains("Zero-work guard"),
+            "expected the zero-work note in the final message, got: {}",
             output.final_message
         );
-        assert!(
-            !output.final_message.contains("required deliverables were not produced"),
-            "the recovery path must not fail the subtask, got: {}",
-            output.final_message
-        );
-        // Original coder dispatch + the queued revision = two coder
-        // dispatches, proving the revision was actually queued and ran.
         let coder_dispatch_count = events
             .iter()
             .filter(|kind| {
@@ -5779,47 +14788,207 @@ mod tests {
             .count();
         assert_eq!(
             coder_dispatch_count, 2,
-            "the queued revision must actually be dispatched, got: {coder_dispatch_count}"
-        );
-        // Exactly one review cycle — for the file-producing revision result.
-        let review_cycle_count = events
-            .iter()
-            .filter(|kind| matches!(kind, EventKind::ReviewCycleStarted { .. }))
-            .count();
-        assert_eq!(
-            review_cycle_count, 1,
-            "the file-producing revision must flow through the review cycle exactly once, got: {review_cycle_count}"
+            "the Coordinator's corrective re-dispatch must actually run, got: {coder_dispatch_count}"
         );
         assert!(
             !events.iter().any(|kind| matches!(kind, EventKind::SubTaskFailed { .. })),
-            "no subtask may fail on the revision recovery path"
+            "no subtask may fail on the Coordinator-driven correction path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #53: progress-aware stall detection in the decision loop
+    // ------------------------------------------------------------------
+
+    /// Whether the run's decision-loop events carry a progress-guard
+    /// AgentThought (nudge or escalation).
+    fn progress_guard_events(events: &[EventKind]) -> Vec<&String> {
+        events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::AgentThought { content, .. } if content.contains("Progress guard") => {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Issue #53 acceptance: repeated equivalent work is detected BEFORE
+    /// the maximum iteration budget is exhausted. Three identical
+    /// `researcher` dispatch cycles (same agent, same task, same outcome,
+    /// no file/workspace change) produce ONE bounded reconsideration
+    /// prompt — injected into the existing decision-loop conversation as a
+    /// user message — and the run finishes normally (4 model turns used,
+    /// nowhere near the structural bound; recovery budget unexhausted).
+    #[tokio::test]
+    async fn progress_guard_nudges_before_the_iteration_budget_when_work_repeats() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let turns: Vec<CoordinatorTurn> = (0..3)
+            .map(|_| {
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")])
+            })
+            .chain(std::iter::once(CoordinatorTurn::Text("done".into())))
+            .collect();
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            turns,
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        let guards = progress_guard_events(&events);
+        assert_eq!(
+            guards.len(),
+            1,
+            "exactly one reconsideration for three equivalent cycles, got: {guards:?}"
+        );
+        assert!(
+            guards[0].contains("reconsideration") || guards[0].contains("CHANGE"),
+            "the nudge is a prompt for the coordinator to reconsider: {}",
+            guards[0]
+        );
+
+        // The nudge was injected as a user message into the decision loop's
+        // conversation: the FOURTH model request carries it (after three
+        // dispatch cycles).
+        let requests = provider.requests.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        assert_eq!(requests.len(), 4, "3 dispatch turns + the final prose turn");
+        let nudge_injected = requests[3]
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, Role::User) && m.content.contains("Progress guard"));
+        assert!(
+            nudge_injected,
+            "the reconsideration prompt must be injected into the loop conversation"
+        );
+
+        // Not a hard stop: the run finishes normally on the following turn.
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "unexpected final message: {}",
+            output.final_message
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the nudge is a recovery attempt, not an exit downgrade, got: {:?}",
+            output.completion_status
+        );
+    }
+
+    /// Issue #53: recovery is BUDGETED — when the coordinator ignores the
+    /// bounded reconsideration prompts and keeps issuing equivalent work,
+    /// the guard escalates and the decision loop stops through the
+    /// existing note machinery (run surfaces Partial), well before the
+    /// structural 64-turn bound. Deterministic recovery, never a crash.
+    #[tokio::test]
+    async fn progress_guard_escalates_after_the_recovery_budget_is_exhausted() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let turns: Vec<CoordinatorTurn> = (0..9)
+            .map(|_| {
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")])
+            })
+            .collect();
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            turns,
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert!(
+            output.final_message.contains("Progress guard escalation"),
+            "expected the escalation note in the final message, got: {}",
+            output.final_message
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the escalation note downgrades the exit through the note machinery, got: {:?}",
+            output.completion_status
+        );
+        let guards = progress_guard_events(&events);
+        assert_eq!(
+            guards.len(),
+            3,
+            "two reconsideration prompts + one escalation, got: {guards:?}"
+        );
+        // The loop stopped after 7 model turns (stall → 2 ignored recovery
+        // cycles → stall → 2 ignored → escalation) — far below the
+        // structural 64-turn bound, which stays untouched as the hard
+        // safety ceiling.
+        let turn_count = provider.turn_count();
+        assert_eq!(
+            turn_count, 7,
+            "escalation stops the loop at the recovery budget, got: {turn_count} turns"
+        );
+        assert!(turn_count < 64);
+    }
+
+    /// Issue #53 acceptance: a failed operation followed by a valid
+    /// recovery is NOT falsely classified as a stall — the recovery's
+    /// differing outcome advances the fingerprint, so no guard event may
+    /// fire even though the task text repeats.
+    #[tokio::test]
+    async fn failed_dispatch_followed_by_recovery_is_not_flagged() {
+        let bus = EventBus::new(256);
+        let mut failed_attempt =
+            ok_result("researcher", "transient failure").expect("ok_result should not fail");
+        failed_attempt.outcome = AgentOutcome::Failed { error: "transient".into() };
+        let mocks = vec![MockExpertAgent::sequence(
+            AgentId::new("researcher"),
+            vec![Ok(failed_attempt), ok_result("researcher", "recovered and found it")],
+        )];
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("recovered".into()),
+            ],
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        let guards = progress_guard_events(&events);
+        assert!(guards.is_empty(), "failed-then-recovered must never flag: {guards:?}");
+        assert_eq!(
+            provider.turn_count(),
+            3,
+            "no guard interaction: two dispatch turns + the prose turn"
+        );
+        // The failed first dispatch surfaces through the existing
+        // failure/notes machinery — the run exits Partial, no guard event.
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the failed dispatch keeps its non-stall failure semantics, got: {}",
+            output.final_message
         );
     }
 
     /// A zero-file success from a research-stage (or any non-implement)
-    /// agent must never trigger the zero-file implement guard: the gate
-    /// stays on `implement_phase`, so a research agent that produces no
-    /// files is unaffected and the run completes normally.
+    /// agent must never trip the per-call zero-work guard: the guard is
+    /// scoped to implement-stage roles (write work), so a prose-answer
+    /// research call is unaffected and the run completes normally.
     #[tokio::test]
     async fn zero_file_research_stage_agent_is_unaffected() {
         let bus = EventBus::new(256);
         let mocks = vec![
-            // The architect seeds the coder's expected artifacts so the
-            // coder's artifact writer produces real file changes.
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            // Researcher completes with zero files — must NOT queue a
-            // revision or fail anything.
+            // Researcher completes with zero files — must NOT be flagged.
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
-                .with_artifact_writer(),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                    CoordinatorTurn::Text("research recorded".into()),
+                ],
             ),
             bus.clone(),
         )
@@ -5836,233 +15005,102 @@ mod tests {
             "unexpected final message: {}",
             output.final_message
         );
-        // Exactly one coder dispatch — no revision was queued for the
-        // researcher's zero-file result.
-        let coder_dispatch_count = events
-            .iter()
-            .filter(|kind| {
+        assert!(
+            !events.iter().any(|kind| {
                 matches!(
                     kind,
-                    EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("coder")
+                    EventKind::AgentThought { content, .. } if content.contains("Zero-work guard")
                 )
-            })
-            .count();
-        assert_eq!(
-            coder_dispatch_count, 1,
-            "no zero-file revision may be queued for a research-stage result, got: {coder_dispatch_count}"
+            }),
+            "the research-stage zero-file success must not be flagged: {events:?}"
         );
         assert!(
             !events.iter().any(|kind| matches!(kind, EventKind::SubTaskFailed { .. })),
             "no subtask may fail when the researcher produces zero files"
         );
-        // The file-producing coder still flows through the review cycle.
-        assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::ReviewCycleStarted { .. })),
-            "the file-producing coder must still trigger the review cycle"
-        );
     }
 
-    #[tokio::test]
-    async fn no_implement_agent_returns_partial_with_clear_error() {
-        let bus = EventBus::new(256);
-        let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
-        ];
-        let (output, _events) = run_for_test(
-            coordinator_with(
-                bus.clone(),
-                Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
-            ),
-            bus.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "no implement agent should yield Partial, got: {:?}",
-            output.completion_status
-        );
-        assert!(
-            output.final_message.contains("no implementation-stage agent"),
-            "expected a clear no-implement-agent error, got: {}",
-            output.final_message
-        );
-    }
-
-    /// ADR-35 §8 trigger 1 (stage absence): a pipeline with no registered
-    /// implement-stage agent and an executor-carrying coordinator plans the
-    /// implement subtask to the reserved `coordinator` role, which the
-    /// coordinator then executes itself on its planning provider through the
-    /// shared executor. Successes carry the `coordinator-self-execute`
-    /// provider sentinel (ADR-42/45) so audit and UI consumers can identify
-    /// the self-dispatch.
+    /// ADR-35 §8 (stage absence) under the amended contract: with NO
+    /// implement-stage agent registered and the shared executor attached,
+    /// the Coordinator does the work itself — the decision loop offers the
+    /// executor's tools and the coordinator's own tool call performs the
+    /// write through the SAME policy engine, VirtualFs, and gates the
+    /// specialists use.
     #[tokio::test]
     async fn coordinator_self_executes_when_no_implement_agent_is_registered() {
         let bus = EventBus::new(256);
+        // Deliberately NO implement-stage agent: the coordinator carries the
+        // work itself through its own executor tool.
         let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            // Deliberately NO implement-stage agent: the coordinator carries
-            // the implement subtask itself. No reviewer either — with a
-            // review-stage agent the zero-file guard would queue a revision
-            // for the synthetic success (it modifies no files), which is a
-            // different code path from the one under test.
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
-        // The planner roster includes the coordinator as the sole
-        // implement-stage participant, so the canned plan names it.
-        let plan_json = r#"[
-            {"role":"Researcher","description":"inspect","depends_on":[]},
-            {"role":"coordinator","description":"implement","depends_on":[0]}
-        ]"#;
-        let mut coordinator = coordinator_with_responses(
+        let mut coordinator = coordinator_with_turns(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(mocks)),
-            vec![plan_json.to_string(), "implemented by the coordinator self".into()],
+            vec![
+                CoordinatorTurn::Calls(vec![test_write_tool_call("src/hand.rs")]),
+                CoordinatorTurn::Text("implemented by the coordinator self".into()),
+            ],
         );
-        coordinator = coordinator.with_executor(coordinator_self_executor());
-        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+        coordinator = coordinator.with_executor(self_execute_executor());
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, _events) =
+            run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
 
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
-            "coordinator self-execution must complete the run, got: {:?}",
-            output.completion_status
-        );
-        assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "unexpected final message: {}",
+            "coordinator self-execution must complete the run, got: {:?} — {}",
+            output.completion_status,
             output.final_message
         );
-        // The self-dispatch is recorded with the sentinel serving provider.
+        // The coordinator's own tool call actually wrote through the
+        // executor (the run's file ledger carries the path).
         assert!(
-            output
-                .provider_metrics
-                .iter()
-                .any(|metrics| metrics.provider == "coordinator-self-execute"),
-            "expected the coordinator-self-execute provider sentinel in metrics: {:?}",
-            output.provider_metrics
-        );
-        // The coordinator-role subtask was created by the decomposition, and
-        // the coordinator persona actually ran (its freeform loop publishes
-        // AgentThought events under the reserved id).
-        assert!(
-            events.iter().any(|kind| matches!(
-                kind,
-                EventKind::SubTaskCreated { role, .. } if role == &AgentId::new("coordinator")
-            )),
-            "expected a coordinator-role subtask to be created"
-        );
-        assert!(
-            events.iter().any(|kind| matches!(
-                kind,
-                EventKind::AgentThought { agent_id, .. } if agent_id == "coordinator"
-            )),
-            "expected the coordinator persona to run via AgentThought events"
-        );
-        // The self-execution is metered exactly like a runner-dispatched
-        // subtask: a SubTaskStarted / SubTaskCompleted lifecycle pair under
-        // the coordinator role and a live spend snapshot after the run
-        // settles (published by the shared publish_spend_events helper).
-        assert!(
-            events.iter().any(|kind| matches!(
-                kind,
-                EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("coordinator")
-            )),
-            "expected SubTaskStarted for the coordinator-role subtask"
-        );
-        assert!(
-            events.iter().any(|kind| matches!(
-                kind,
-                EventKind::SubTaskCompleted { role, .. } if role == &AgentId::new("coordinator")
-            )),
-            "expected SubTaskCompleted for the coordinator-role subtask"
-        );
-        assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::SpendUpdated { .. })),
-            "expected a SpendUpdated snapshot after the self-run settled"
-        );
-    }
-
-    #[tokio::test]
-    async fn custom_implement_stage_agent_triggers_review() {
-        let bus = EventBus::new(256);
-        // The plan names the custom implement-stage agent "copilot" instead
-        // of the built-in Coder.
-        let plan_json = r#"[
-            {"role":"Researcher","description":"inspect","depends_on":[]},
-            {"role":"copilot","description":"implement","depends_on":[0]}
-        ]"#;
-        let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("copilot"), "implemented")
-                .with_stage(Some(concerto_core::AgentStage::new("implement")))
-                .with_artifact_writer(),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
-        ];
-        let (output, events) = run_for_test(
-            coordinator_with(
-                bus.clone(),
-                Arc::new(AgentRegistry::from_mocks(mocks)),
-                plan_json.into(),
-            ),
-            bus.clone(),
-        )
-        .await;
-
-        assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "unexpected final message: {}",
-            output.final_message
-        );
-        assert!(
-            events.iter().any(|kind| {
-                matches!(
-                    kind,
-                    EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("copilot")
-                )
-            }),
-            "expected the custom implement-stage agent to be dispatched"
-        );
-        assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::ReviewCycleStarted { .. })),
-            "implement-stage success should trigger the review cycle"
+            output.files_modified.iter().any(|path| path.as_str().ends_with("src/hand.rs")),
+            "expected the coordinator's own tool write in files_modified: {:?}",
+            output.files_modified
         );
     }
 
     /// A build task (contains implement-stage work) whose pipeline has no
     /// validation-stage agent must not be silently accepted: with no declared
-    /// verification, acceptance is a failure (audit C-06).
+    /// verification evidence the C-06 acceptance gate reports the completion
+    /// claim Partial (audit C-06). No validation cycle may run and no
+    /// validation-stage specialist may ever be dispatched.
     #[tokio::test]
     async fn build_task_without_validator_is_not_silently_accepted() {
         let bus = EventBus::new(256);
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
                 .with_artifact_writer(),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
         ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded_turns(
                 bus.clone(),
-                Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design it"),
+                        call_specialist("coder", "implement"),
+                    ]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
         .await;
 
         assert!(
-            output.final_message.contains("Acceptance rejected: no validation-stage agent"),
-            "unexpected final message: {}",
+            output.final_message.contains("Acceptance gate C-06"),
+            "no declared verification evidence must leave the completion claim Partial: {}",
             output.final_message
         );
         assert!(
@@ -6073,31 +15111,19 @@ mod tests {
 
     #[tokio::test]
     async fn decompose_task_accepts_non_empty_design_doc() {
-        // A DesignDoc with at least one goal should pass validation.
+        // Smoke: a decision-loop run over a DesignDoc-carrying roster never
+        // errors on DesignDoc validation (the loop's run completes with the
+        // coordinator's own summary when it dispatches nothing).
         let mocks = vec![MockExpertAgent::always_succeed(
             AgentId::new("architect"),
             r#"{"goals":["implement login"],"proposed_files":["src/auth.rs"],"interface_sketch":"login form"}"#,
         )];
-
-        // We also need other agents because the planner will create subtasks
-        // and the execution loop will dispatch them.
         let plan = crate::graph::TaskGraph::default();
         let budget = BudgetScenarioBuilder::generous();
         let mut harness = AgentFlowTestHarness::new(mocks, plan, budget);
         let task = AgentTask::new(concerto_core::ids::Ulid::new(), "test task");
         let result = harness.run(task).await;
-
-        // Should not error on DesignDoc validation.  It may error later if
-        // planner-created subtasks reference agents we don't have, but the
-        // validation itself should pass.
-        if let Err(OrchestratorError::AgentLoopError(msg)) = &result {
-            assert!(
-                !msg.contains("empty DesignDoc"),
-                "unexpected empty DesignDoc error for valid doc: {msg}"
-            );
-        }
-        // Any other outcome is acceptable (error from planner or success).
-        assert!(result.is_ok() || result.is_err(), "expected ok or err, got: {result:?}");
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
     /// Verify that `metrics_from_result` correctly extracts fields from
@@ -6149,13 +15175,15 @@ mod tests {
         assert_eq!(result.cost_usd, 0.0);
     }
 
-    /// Verify that `classify_subtask_error` correctly classifies edge-case
-    /// error variants (budget, cycle, task-graph, and exhausted-retry errors).
+    /// Verify that `SubtaskFailureClass::from(&diagnose(e))` — the
+    /// diagnosis-derived class bridge the dispatch loop now keys on —
+    /// correctly classifies edge-case error variants (budget, cycle,
+    /// task-graph, and exhausted-retry errors).
     #[test]
     fn classify_subtask_error_edge_cases() {
         // SubTaskRetriesExhausted is a terminal condition — no ladder.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::SubTaskRetriesExhausted {
+            subtask_class_from_diagnosis(&OrchestratorError::SubTaskRetriesExhausted {
                 task_id: TaskId::new(),
                 role: AgentId::new("coder"),
                 attempts: 3,
@@ -6165,14 +15193,14 @@ mod tests {
         ));
         // InvalidTaskGraph is structural — graph corruption needs a human.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::InvalidTaskGraph {
+            subtask_class_from_diagnosis(&OrchestratorError::InvalidTaskGraph {
                 reason: "missing node".into(),
             }),
             SubtaskFailureClass::NonRecoverable
         ));
         // CycleDetected is structural — needs human intervention.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::CycleDetected {
+            subtask_class_from_diagnosis(&OrchestratorError::CycleDetected {
                 tool_name: "reviewer".into(),
                 count: 3,
             }),
@@ -6180,14 +15208,16 @@ mod tests {
         ));
         // MultiAgentPlanFailed is structural.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::MultiAgentPlanFailed {
+            subtask_class_from_diagnosis(&OrchestratorError::MultiAgentPlanFailed {
                 reason: "architect failed".into(),
             }),
             SubtaskFailureClass::NonRecoverable
         ));
         // Unrecoverable is structural by construction.
         assert!(matches!(
-            classify_subtask_error(&OrchestratorError::Unrecoverable { message: "fatal".into() }),
+            subtask_class_from_diagnosis(&OrchestratorError::Unrecoverable {
+                message: "fatal".into()
+            }),
             SubtaskFailureClass::NonRecoverable
         ));
     }
@@ -6204,9 +15234,10 @@ mod tests {
     /// Verify that when a Coder subtask exhausts retries with an
     /// artifact-production failure, the coordinator creates an Architect
     /// replan subtask, and when the Architect completes with a valid
-    /// DesignDoc, a new Coder subtask is spawned.  The run completes
-    /// successfully because the follow-up Coder (populated from the
-    /// mock's default success) passes.
+    /// DesignDoc, a new Coder subtask is spawned. The follow-up Coder
+    /// (populated from the mock's default success) passes, so the graph
+    /// normalizes — but the run still exits Partial because no
+    /// validation-stage evidence was declared (audit C-06).
     #[tokio::test]
     async fn coder_artifact_failure_triggers_replan_and_spawns_new_coder() {
         // ── 1. Coordinator with mocks ───────────────────────────────
@@ -6338,6 +15369,8 @@ mod tests {
             ));
 
         // ── 3. Execute graph — replan should fire ───────────────────
+        let run_objective = task.description.clone();
+        let run_objective_hash = blake3::hash(run_objective.as_bytes()).to_hex().to_string();
         let result = coordinator
             .execute_graph(
                 task,
@@ -6353,6 +15386,10 @@ mod tests {
                 HashMap::new(), // retry_feedback
                 HashMap::new(), // model_assignments
                 Vec::new(),     // action_ledger
+                run_objective,
+                run_objective_hash,
+                Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await;
 
@@ -6360,14 +15397,20 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got error: {result:?}");
         let (output, _notes) = result.unwrap();
 
-        // The new Coder from replan gets a default-success from the mock,
-        // so the overall run should be Completed (not Partial).
+        // The new Coder from replan gets a default-success from the mock, so
+        // the graph normalizes — but no validation-stage evidence was ever
+        // declared, so the C-06 gate reports the completion Partial.
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Completed,
-            "replan fallback should produce Completed status when the \
-             follow-up Coder succeeds, got: {:?}",
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the replan resolves the graph, but no verification evidence means \
+             the run must not claim full completion, got: {:?}",
             output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("Acceptance gate C-06"),
+            "an unverified build-task completion must be reported Partial: {}",
+            output.final_message
         );
 
         // Smoke-check that the replan occurred: the coordinator's
@@ -6436,28 +15479,6 @@ mod tests {
             estimated: 1.0,
             remaining: 0.01,
         })
-    }
-
-    /// A transient provider failure (503 → `Recoverable`, ADR-42 §1) — the
-    /// error class that triggers a same-agent/model retry rather than the
-    /// fallback ladder.
-    fn err_transient() -> Result<AgentRunResult, OrchestratorError> {
-        Err(OrchestratorError::Provider(ProviderError::HttpStatus {
-            status: 503,
-            retry_after: None,
-            message: "upstream busy".into(),
-        }))
-    }
-
-    /// A hard provider limit (stream-idle timeout → `RetryExhausted`, which
-    /// `is_transient()` reports as false) — the class that enters the fallback
-    /// ladder directly (ADR-42 §1 LimitReached).
-    fn err_stream_idle() -> Result<AgentRunResult, OrchestratorError> {
-        Err(OrchestratorError::Provider(ProviderError::RetryExhausted {
-            attempts: 3,
-            elapsed: std::time::Duration::ZERO,
-            last_error: "stream-idle timeout".into(),
-        }))
     }
 
     /// A completed run whose `outcome` is `Failed` — used to exercise the
@@ -6646,6 +15667,10 @@ mod tests {
                 HashMap::new(), // retry_feedback
                 HashMap::new(), // model_assignments
                 Vec::new(),     // action_ledger
+                "test task".to_string(),
+                blake3::hash("test task".as_bytes()).to_hex().to_string(),
+                Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await
             .expect("execute_graph should succeed");
@@ -6654,6 +15679,288 @@ mod tests {
             events.push(event.kind.clone());
         }
         (output, events)
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #54: structured failure diagnosis and recovery
+    // ------------------------------------------------------------------
+
+    /// A transient provider fault (network loss) is diagnosed, retried on
+    /// the same agent within the existing attempt budget, and the run
+    /// completes WITHOUT losing coordinator state (the graph completes, the
+    /// diagnosis is on the record). Issue acceptance: "A provider/network
+    /// failure can be retried without losing coordinator state."
+    #[tokio::test]
+    async fn network_failure_is_diagnosed_and_retried_without_losing_state() {
+        let bus = EventBus::new(256);
+        let architect = MockExpertAgent::sequence(
+            AgentId::new("architect"),
+            vec![
+                Err(OrchestratorError::Provider(ProviderError::Network(
+                    "connection reset by peer".into(),
+                ))),
+                ok_result("architect", "recovered after network loss"),
+            ],
+        );
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![architect],
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _task_id) = single_pending_graph(session_id, "architect");
+
+        let events = {
+            let (output, events) = run_graph_for_test(
+                &mut coordinator,
+                bus.clone(),
+                graph,
+                session_id,
+                HashMap::new(),
+            )
+            .await;
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Completed,
+                "a retried network failure must not lose the run: {:?}",
+                output.completion_status
+            );
+            assert!(
+                output.final_message.contains("Multi-agent orchestration completed"),
+                "completed run, not a partial one: {}",
+                output.final_message
+            );
+            events
+        };
+
+        // The failure was normalized into the Provider/network-loss
+        // diagnosis at the dispatch settlement.
+        assert_eq!(coordinator.failure_diagnoses.len(), 1, "one diagnosed failure");
+        let diagnosis = &coordinator.failure_diagnoses[0];
+        assert_eq!(diagnosis.kind, crate::failure_diagnosis::FailureKind::Provider);
+        assert_eq!(diagnosis.code, "network-loss");
+        assert!(diagnosis.transient && diagnosis.retryable);
+
+        // And the diagnosis is observable in the run's event stream.
+        let diagnosed = events.iter().any(|kind| {
+            matches!(kind, EventKind::AgentThought { content, .. }
+                if content.contains("failure diagnosis: provider [network-loss]"))
+        });
+        assert!(diagnosed, "the diagnosis rides the coordinator's event stream");
+    }
+
+    /// A failed subtask degrades to a retry while its independent sibling
+    /// in the SAME ready batch keeps running — no hard stop on a
+    /// single-specialist failure (issue #54's "siblings continuing").
+    #[tokio::test]
+    async fn mixed_batch_failure_degrades_to_retry_and_siblings_continue() {
+        let bus = EventBus::new(256);
+        let flaky = MockExpertAgent::sequence(
+            AgentId::new("researcher"),
+            vec![
+                Err(OrchestratorError::Tool(concerto_core::ToolError::ExecutionFailed {
+                    message: "transient tool fault".into(),
+                })),
+                ok_result("researcher", "recovered after tool failure"),
+            ],
+        );
+        let steady = MockExpertAgent::always_succeed(AgentId::new("docs"), "sibling succeeded");
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![flaky, steady],
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        // Two independent roots enter the SAME first batch.
+        let mut graph = TaskGraph::new();
+        for (role, description) in
+            [("researcher", "flaky work"), ("docs", "independent sibling work")]
+        {
+            let id = TaskId::new();
+            graph.add_root(SubTask {
+                id,
+                parent_id: None,
+                session_id,
+                role: AgentId::new(role),
+                description: description.into(),
+                status: SubTaskStatus::Pending,
+                dependencies: vec![],
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            });
+        }
+
+        let (output, _events) =
+            run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the tool-failed subtask retried and both subtasks completed: {:?}",
+            output.completion_status
+        );
+        // The tool fault was diagnosed as the Tool dimension.
+        assert!(coordinator.failure_diagnoses.iter().any(|diagnosis| {
+            diagnosis.kind == crate::failure_diagnosis::FailureKind::Tool
+                && diagnosis.code == "tool-failed"
+        }));
+    }
+
+    /// Permanent-failure + exhausted-ladder escalation is BOUNDED: the
+    /// provider-auth diagnosis (permanent, alternate-only viable) walks the
+    /// fallback ladder at most once per tier and then escalates to a
+    /// graceful Partial exit with a preserved checkpoint — never an
+    /// infinite retry. Issue acceptance: "Permanent failures
+    /// escalate/replan instead of infinite retry" + boundedness.
+    #[tokio::test]
+    async fn permanent_failure_escalates_bounded_not_infinite() {
+        let bus = EventBus::new(256);
+        // Every attempt fails hard (auth): the queue default would
+        // eventually succeed, so over-provision errors to prove the run
+        // STOPS within its budget.
+        let architect = MockExpertAgent::sequence(
+            AgentId::new("architect"),
+            (0..6).map(|_| Err(OrchestratorError::Provider(ProviderError::AuthFailure))).collect(),
+        );
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![architect],
+            concerto_config::ModelPinConfig {
+                default_model: Some("mid".into()),
+                ..Default::default()
+            },
+            Arc::new(MockProvider::default()),
+        );
+        let (graph, _task_id) = single_pending_graph(session_id, "architect");
+
+        let (output, _events) =
+            run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a permanently failing subtask escalates to the graceful Partial exit"
+        );
+        // BOUNDED: exactly the primary dispatch + the two ladder dispatches
+        // (tier-1 default-model and tier-2 self-execute) ran — 3 total, not
+        // an unbounded retry loop. The mock queue held 6 errors, but the
+        // recovery machinery can never consume them all.
+        assert_eq!(
+            coordinator.model_dispatch_count, 3,
+            "the escalation is bounded by the existing ladder guards"
+        );
+        assert!(output.checkpoint_json.is_some(), "the stalled run keeps its resumable checkpoint");
+        // Every failure surfaced carried the provider-auth diagnosis.
+        assert!(
+            coordinator.failure_diagnoses.iter().all(|diagnosis| diagnosis.code == "provider-auth"),
+            "each escalation re-diagnosed the same permanent failure: {:?}",
+            coordinator.failure_diagnoses
+        );
+    }
+
+    /// In the Coordinator's decision loop, a failed specialist dispatch
+    /// returns a diagnosis-carrying tool result — the model decides the
+    /// recovery (retry / alternate / replan) from structured data, and the
+    /// diagnosis is recorded on the coordinator (issue #54's "specialist
+    /// result handling" surface).
+    #[tokio::test]
+    async fn call_specialist_failure_carries_the_diagnosis() {
+        let bus = EventBus::new(256);
+        let consultant = MockExpertAgent::sequence(
+            AgentId::new("consultant"),
+            vec![
+                Err(OrchestratorError::AgentLoopError("specialist crashed mid-run".into())),
+                ok_result("consultant", "recovered on the model's retry"),
+            ],
+        );
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![consultant]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("consultant", "advise on the plan")]),
+                CoordinatorTurn::Calls(vec![call_specialist("consultant", "retry with notes")]),
+                CoordinatorTurn::Text("recovered".into()),
+            ],
+        );
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("run completes");
+        assert_eq!(provider.turn_count(), 3, "the loop served all three scripted turns");
+
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        // The failed dispatch was diagnosed at the specialist result
+        // handling surface: Agent dimension, agent-crash code.
+        assert!(
+            coordinator.failure_diagnoses.iter().any(|diagnosis| {
+                diagnosis.kind == crate::failure_diagnosis::FailureKind::Agent
+                    && diagnosis.code == "agent-crash"
+            }),
+            "the crash diagnosis is recorded: {:?}",
+            coordinator.failure_diagnoses
+        );
+    }
+
+    /// The failure-diagnosis history is recorded to the WHITEBOARD as
+    /// `failure` events carrying the structured diagnosis payload (the
+    /// audit trail the recovery decision cites).
+    #[tokio::test]
+    async fn failure_diagnosis_is_appended_to_the_whiteboard() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let architect = MockExpertAgent::sequence(
+            AgentId::new("architect"),
+            vec![
+                Err(OrchestratorError::Provider(ProviderError::RateLimit {
+                    retry_after: std::time::Duration::from_secs(1),
+                })),
+                ok_result("architect", "recovered after rate limit"),
+            ],
+        );
+        let session_id = Ulid::new();
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            vec![architect],
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_review_store(Some(pool.clone()));
+        let (graph, _task_id) = single_pending_graph(session_id, "architect");
+        run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new()).await;
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let diagnosed_failures: Vec<_> = logged
+            .iter()
+            .filter(|event| event.kind == WhiteboardKind::Failure)
+            .filter(|event| event.payload.get("diagnosis").is_some())
+            .collect();
+        assert!(
+            diagnosed_failures.iter().any(|event| {
+                event.payload["diagnosis"]["code"] == "rate-limit"
+                    && event.payload["diagnosis"]["kind"] == "provider"
+                    && event.payload["diagnosis"]["retryable"] == true
+            }),
+            "the whiteboard carries the structured diagnosis: {:?}",
+            logged.iter().map(|event| (event.kind, &event.payload)).collect::<Vec<_>>()
+        );
     }
 
     /// ADR-42 tier 1: when the first dispatch hits a hard provider limit
@@ -6728,8 +16035,9 @@ mod tests {
         // The coder mock declares the implement stage, so the run is a
         // build task: the C-06 acceptance gate requires verification
         // evidence from a registered validation-stage agent. A succeeding
-        // validator mock supplies it (the run has no expected artifacts,
-        // so the artifact check is vacuous).
+        // validator subtask (added to the graph below) supplies that
+        // dispatch, and the run has no expected artifacts, so the artifact
+        // check is vacuous.
         let validator = MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok");
         let session_id = Ulid::new();
         let mut coordinator = coordinator_for_ladder(
@@ -6741,7 +16049,28 @@ mod tests {
             },
             Arc::new(MockProvider::default()),
         );
-        let (graph, _task_id) = single_pending_graph(session_id, "coder");
+        let (mut graph, coder_id) = single_pending_graph(session_id, "coder");
+        // The coder declares the implement stage, so this is a build task and
+        // the C-06 acceptance gate requires declared verification evidence.
+        // Add the succeeding validator as the coder's child so the run has a
+        // completed acceptance-stage dispatch after the tier-1 rescue.
+        let validator_id = TaskId::new();
+        graph.add_child(
+            SubTask {
+                id: validator_id,
+                parent_id: Some(coder_id),
+                session_id,
+                role: AgentId::new("validator"),
+                description: "verify".into(),
+                status: SubTaskStatus::Pending,
+                dependencies: vec![coder_id],
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            },
+            coder_id,
+            crate::graph::Dependency::MustFinishBefore,
+        );
 
         let (output, events) =
             run_graph_for_test(&mut coordinator, bus.clone(), graph, session_id, HashMap::new())
@@ -7272,10 +16601,10 @@ mod tests {
     }
 
     /// ADR-52: a run-wide dispatch cap stops the run at the batch boundary.
-    /// Build a chained two-subtask graph (researcher → coder); with no cap the
-    /// run completes with both dispatches; with a cap of 1 the run pauses with
-    /// a Partial outcome (and a clear message) rather than dispatching the
-    /// second subtask.
+    /// Build a chained three-subtask graph (researcher → coder → validator);
+    /// with no cap the run completes with all three dispatches; with a cap
+    /// of 1 the run pauses with a Partial outcome (and a clear message)
+    /// rather than dispatching the next subtask.
     #[tokio::test]
     async fn max_total_iterations_caps_dispatch_at_batch_boundary() {
         let session_id = Ulid::new();
@@ -7294,7 +16623,9 @@ mod tests {
             )
             .with_max_total_iterations(cap);
             drop(bus);
-            // Chained graph: researcher → coder (no other ready set).
+            // Chained graph: researcher → coder → validator (one ready
+            // task per batch: the validator is the run's declared
+            // verification evidence for C-06).
             let mut graph = TaskGraph::new();
             let researcher_id = TaskId::new();
             let coder_id = TaskId::new();
@@ -7324,6 +16655,23 @@ mod tests {
                     completed_at: None,
                 },
                 researcher_id,
+                crate::graph::Dependency::MustFinishBefore,
+            );
+            let validator_id = TaskId::new();
+            graph.add_child(
+                SubTask {
+                    id: validator_id,
+                    parent_id: Some(coder_id),
+                    session_id,
+                    role: AgentId::new("validator"),
+                    description: "verify".into(),
+                    status: SubTaskStatus::Pending,
+                    dependencies: vec![coder_id],
+                    deliverable: None,
+                    created_at: time::OffsetDateTime::now_utc(),
+                    completed_at: None,
+                },
+                coder_id,
                 crate::graph::Dependency::MustFinishBefore,
             );
             let (output, _events) = run_graph_for_test(
@@ -7372,8 +16720,10 @@ mod tests {
 
         // A cap that exactly covers the needed dispatches must NOT pause the
         // run: the batch boundary check happens before the next batch, so
-        // `count >= cap` only trips when there is still ready work.
-        let output = run_case(Some(2)).await;
+        // `count >= cap` only trips when there is still ready work. The graph
+        // dispatches three subtasks (researcher → coder → validator), so the
+        // exact-coverage cap is 3.
+        let output = run_case(Some(3)).await;
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
@@ -8120,190 +17470,6 @@ mod tests {
         assert!(exhausted_note, "expected the ladder-exhaustion note to be published");
     }
 
-    // ------------------------------------------------------------------
-    // Design-stage recovery: the planner's architect run goes through the
-    // same classify → retry → escalate → fallback-ladder path as subtask
-    // dispatch, instead of a bare `?` abandoning the whole plan.
-    // ------------------------------------------------------------------
-
-    /// Full-pipeline ladder fixture for design-stage tests: registers the
-    /// architect (design) plus a minimal research/implement/validate set so
-    /// the planner's plan can execute to completion, and wires a `SeqProvider`
-    /// as the planning provider (it serves the canned plan). The ladder config
-    /// (`coordinator_for_ladder_with`) keeps tier 1/2 semantics identical to
-    /// the execution-phase ladder tests.
-    fn coordinator_for_design_stage(
-        bus: EventBus,
-        architect: MockExpertAgent,
-        pin_config: concerto_config::ModelPinConfig,
-        plan_json: String,
-    ) -> CoordinatorAgent {
-        let mocks = vec![
-            architect,
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "gathered"),
-            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
-                .with_artifact_writer(),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
-        ];
-        coordinator_for_ladder(bus, mocks, pin_config, Arc::new(SeqProvider::new(vec![plan_json])))
-    }
-
-    /// Design-stage: a transient provider error during the architect run is
-    /// retried (same agent/model, `previous_results` feedback) and the second
-    /// attempt succeeds — the run completes instead of failing the plan.
-    #[tokio::test]
-    async fn design_stage_recoverable_retry_then_succeeds() {
-        let bus = EventBus::new(256);
-        let architect = MockExpertAgent::sequence(
-            AgentId::new("architect"),
-            vec![err_transient(), ok_result("architect", DESIGN_DOC_JSON)],
-        );
-        let (output, events) = run_for_test(
-            coordinator_for_design_stage(
-                bus.clone(),
-                architect,
-                concerto_config::ModelPinConfig::default(),
-                PLAN_RESEARCH_CODER.into(),
-            ),
-            bus.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Completed,
-            "a retried design stage should complete the run, got: {:?}",
-            output.completion_status,
-        );
-        let retry_note = events.iter().any(|kind| {
-            matches!(
-                kind,
-                EventKind::AgentThought { content, .. }
-                    if content.contains("Retrying design (architect)")
-                        && content.contains("after recoverable failure")
-            )
-        });
-        assert!(retry_note, "expected a design-stage retry note to be published");
-    }
-
-    /// Design-stage: a stream-idle timeout (`RetryExhausted` → `LimitReached`)
-    /// cannot be retried (non-transient), so the architect run enters the
-    /// fallback ladder; tier 1 (global default model) rescues it and the run
-    /// completes.
-    #[tokio::test]
-    async fn design_stage_stream_idle_ladder_tier1_rescues() {
-        let bus = EventBus::new(256);
-        // Response 1 fails hard (stream-idle); response 2 is the tier-1
-        // re-dispatch on the global default model, returning a valid doc.
-        let architect = MockExpertAgent::sequence(
-            AgentId::new("architect"),
-            vec![err_stream_idle(), ok_result("architect", DESIGN_DOC_JSON)],
-        );
-        let (output, events) = run_for_test(
-            coordinator_for_design_stage(
-                bus.clone(),
-                architect,
-                concerto_config::ModelPinConfig {
-                    default_model: Some("mid".into()),
-                    ..Default::default()
-                },
-                PLAN_RESEARCH_CODER.into(),
-            ),
-            bus.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Completed,
-            "tier-1 fallback should rescue the design stage, got: {:?}",
-            output.completion_status,
-        );
-        let used_default_model = events.iter().any(|kind| {
-            matches!(kind, EventKind::AgentThought { content, .. } if content.contains("test/mid"))
-        });
-        assert!(
-            used_default_model,
-            "expected the tier-1 re-dispatch on the default model (test/mid)"
-        );
-    }
-
-    /// Design-stage: with no default model, the ladder exhausts and the
-    /// coordinator surfaces a graceful Partial plan (never a hard crash).
-    #[tokio::test]
-    async fn design_stage_ladder_exhausted_returns_partial() {
-        let bus = EventBus::new(256);
-        // First architect response fails hard (stream-idle); the tier-2
-        // takeover hits the second scripted auth error. No default model
-        // means tier 1 is unavailable and tier 1b has no provider to rebuild.
-        let architect = MockExpertAgent::sequence(
-            AgentId::new("architect"),
-            vec![err_stream_idle(), err_auth()],
-        );
-        let (output, events) = run_for_test(
-            coordinator_for_design_stage(
-                bus.clone(),
-                architect,
-                concerto_config::ModelPinConfig::default(),
-                PLAN_RESEARCH_CODER.into(),
-            ),
-            bus.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "an exhausted design-stage ladder must degrade to Partial, got: {:?}",
-            output.completion_status,
-        );
-        assert!(
-            output.final_message.contains("could not produce a valid plan"),
-            "unexpected final message: {}",
-            output.final_message,
-        );
-        let exhausted_note = events.iter().any(|kind| {
-            matches!(
-                kind,
-                EventKind::AgentThought { content, .. } if content.contains("Fallback ladder exhausted")
-            )
-        });
-        assert!(exhausted_note, "expected the ladder-exhaustion note to be published");
-    }
-
-    /// Design-stage: an empty/non-parseable DesignDoc is treated as a failed
-    /// attempt (Recoverable) and retried; the second attempt returns a valid
-    /// doc and the run completes.
-    #[tokio::test]
-    async fn design_stage_empty_doc_retried_until_valid() {
-        let bus = EventBus::new(256);
-        // Empty doc first (Recoverable → retried), then a populated doc.
-        let architect = MockExpertAgent::sequence(
-            AgentId::new("architect"),
-            vec![
-                ok_result("architect", EMPTY_DESIGN_DOC_JSON),
-                ok_result("architect", DESIGN_DOC_JSON),
-            ],
-        );
-        let (output, _events) = run_for_test(
-            coordinator_for_design_stage(
-                bus.clone(),
-                architect,
-                concerto_config::ModelPinConfig::default(),
-                PLAN_RESEARCH_CODER.into(),
-            ),
-            bus.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Completed,
-            "a retried empty design doc should complete once a valid doc lands, got: {:?}",
-            output.completion_status,
-        );
-    }
-
     #[tokio::test]
     async fn resume_checkpoint_exhausted_blocked_returns_partial() {
         // ── 1. Minimal coordinator wiring (unused in the fast exit) ──
@@ -8362,6 +17528,8 @@ mod tests {
             ));
 
         // ── 3. Execute graph — should hit Partial fast-exit ─────────
+        let run_objective = task.description.clone();
+        let run_objective_hash = blake3::hash(run_objective.as_bytes()).to_hex().to_string();
         let result = coordinator
             .execute_graph(
                 task,
@@ -8377,6 +17545,10 @@ mod tests {
                 HashMap::new(), // retry_feedback
                 HashMap::new(), // model_assignments
                 Vec::new(),     // action_ledger
+                run_objective,
+                run_objective_hash,
+                Vec::new(), // loop_notes
+                None,       // requested_user_input
             )
             .await;
 
@@ -8615,10 +17787,11 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
         let (output, _events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
                 PLAN_RESEARCH_CODER.into(),
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -8638,23 +17811,36 @@ mod tests {
         let bus = EventBus::new(256);
         // The coder mock claims to have written `src/a.rs` but does not
         // actually write it, so the artifact never appears on disk. (A
-        // zero-file coder would trip the zero-file implement guard instead,
+        // zero-file coder would trip the per-call zero-work guard instead,
         // never reaching the C-06 acceptance gate this test exercises.)
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::sequence(
                 AgentId::new("coder"),
                 vec![claimed_files("coder", "implemented", &["src/a.rs"])],
             ),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         let (output, _events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded_turns(
                 bus.clone(),
-                Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design it"),
+                        call_specialist("coder", "implement"),
+                    ]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
@@ -8676,18 +17862,20 @@ mod tests {
         let bus = EventBus::new(256);
         // The coder mock claims to have written `src/a.rs` without actually
         // writing it, so the seeded placeholder marker stays untouched. (A
-        // zero-file coder would trip the zero-file implement guard instead,
+        // zero-file coder would trip the per-call zero-work guard instead,
         // never reaching the C-06 acceptance gate this test exercises.)
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::sequence(
                 AgentId::new("coder"),
                 vec![claimed_files("coder", "implemented", &["src/a.rs"])],
             ),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         // Seed the workspace with a marker-only file where the design doc
         // declares `src/a.rs`; the coder mock leaves it untouched.
         let dir = tempfile::tempdir().expect("tempdir for test workspace");
@@ -8695,10 +17883,18 @@ mod tests {
         std::fs::write(dir.path().join("src/a.rs"), "TODO: implement\n")
             .expect("write placeholder file");
         let rx = bus.subscribe();
-        let mut coordinator = coordinator_with(
+        let mut coordinator = coordinator_with_grounded_turns(
             bus.clone(),
-            Arc::new(AgentRegistry::from_mocks(mocks)),
-            PLAN_RESEARCH_CODER.into(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            &["src/a.rs"],
         );
         let task = AgentTask::new(Ulid::new(), "test task");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
@@ -8720,9 +17916,10 @@ mod tests {
         );
     }
 
-    /// C-06: when the validator errors because the eval capability is
-    /// disabled, verification never ran and a build task is rejected even
-    /// though the coder produced files.
+    /// C-06: when the validator cannot run (the eval capability is disabled),
+    /// verification never completes and a build task must not be silently
+    /// accepted: the exhausted validator dispatch blocks the subtask and the
+    /// run ends Partial with the recovery note — never Completed.
     #[tokio::test]
     async fn build_task_with_disabled_verification_is_rejected() {
         let bus = EventBus::new(256);
@@ -8740,18 +17937,40 @@ mod tests {
             ),
         ];
         let (output, _events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design it"),
+                        call_specialist("coder", "implement"),
+                    ]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+                &["src/a.rs"],
             ),
             bus.clone(),
         )
         .await;
 
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an unverifiable build task must not complete: {}",
+            output.final_message
+        );
         assert!(
-            output.final_message.contains("Acceptance rejected: verification did not run"),
-            "unexpected final message: {}",
+            output.final_message.contains("paused after exhausting recovery attempts"),
+            "the unavailable validator must surface as an exhausted, blocked dispatch: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("remained blocked after 3 attempts"),
+            "the validator subtask must block at the attempt ceiling: {}",
             output.final_message
         );
     }
@@ -8929,8 +18148,9 @@ mod tests {
     /// `src/main.rs` exists (no Cargo.toml, so the eval engine selects the
     /// `make` runner — no cargo/network). A real eval-mode validator runs
     /// `make test`; the coordinator's C-06 gate then rejects a marker-only
-    /// artifact and accepts a substantive one, recording both decisions in
-    /// the checkpoint ledger.
+    /// artifact (Phase 1 — the rejection lands in the stalled checkpoint's
+    /// ledger) and accepts a substantive one (Phase 2 — the verified build
+    /// completes, since a clean Completed clears its checkpoint).
     #[tokio::test]
     async fn real_disk_build_cycle_rejects_placeholder_and_accepts_real_artifact() {
         let dir = tempfile::tempdir().expect("tempdir for real project workspace");
@@ -8948,13 +18168,27 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
         ];
         let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         registry.register(Arc::new(DiskCoder::new(
             vec!["TODO: implement\n".into()],
             "TODO: implement\n".into(),
         )));
         registry.register(Arc::new(real_eval_validator(&bus, &project_root)));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into());
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            &["src/main.rs"],
+        );
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -8995,23 +18229,42 @@ mod tests {
         assert_eq!(evidence.artifacts, vec![camino::Utf8PathBuf::from("src/main.rs")]);
 
         // ── Phase 2: same project, now with a real artifact → accepted ──
-        // The reviewer stays unsatisfied so the run ends Partial and still
-        // serialises the ledger — letting the test observe the accepted
-        // decision and its evidence (artifacts + verification_passed).
+        // ── Phase 2: same project, now with a real artifact → accepted ──
+        // A clean, verified build run lets the C-06 gate fire over the
+        // declared verification evidence: the artifact passes, the gate
+        // records the acceptance, and the run completes — no rejection
+        // note, no C-06 downgrade. (The accepted decision lives in the
+        // in-memory action ledger; a clean Completed clears its checkpoint,
+        // so acceptance is observed here as the completing outcome, while
+        // the reject path above exposes the ledger through the stalled
+        // checkpoint.)
         let bus = EventBus::new(256);
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_MAIN),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
         ];
         let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         registry.register(Arc::new(DiskCoder::new(
             vec!["// real implementation\npub fn main() {}\n".into()],
             "// real implementation\npub fn main() {}\n".into(),
         )));
-        registry.register(Arc::new(AlwaysRevise));
         registry.register(Arc::new(real_eval_validator(&bus, &project_root)));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into());
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            &["src/main.rs"],
+        );
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -9022,32 +18275,24 @@ mod tests {
             .await
             .expect("coordinator run should succeed");
 
-        // Acceptance passed (the ledger says so); the run is Partial only
-        // because the review stayed unresolved.
+        // Acceptance passed: the verified build task completes with no
+        // rejection note and no C-06 downgrade.
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "an unresolved review keeps the run Partial even though acceptance passed"
-        );
-        assert!(
-            output.final_message.contains("Review remains unresolved"),
-            "expected the unresolved-review note, got: {}",
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a verified build task with a real artifact completes: {}",
             output.final_message
         );
-        let decisions = acceptance_decisions(&output);
-        assert_eq!(
-            decisions.len(),
-            1,
-            "exactly one acceptance decision expected on the accept path"
-        );
-        assert_eq!(decisions[0].kind, "accepted", "real artifact must be accepted");
         assert!(
-            !decisions.iter().any(|action| action.kind == "rejected"),
-            "no rejected entry may exist on the accept path"
+            !output.final_message.contains("Acceptance rejected"),
+            "a real artifact must not be rejected: {}",
+            output.final_message
         );
-        let evidence = decisions[0].evidence.as_ref().expect("acceptance entry carries evidence");
-        assert!(evidence.verification_passed, "acceptance requires the eval pass");
-        assert_eq!(evidence.artifacts, vec![camino::Utf8PathBuf::from("src/main.rs")]);
+        assert!(
+            !output.final_message.contains("Acceptance gate C-06"),
+            "declared verification evidence must satisfy the C-06 gate: {}",
+            output.final_message
+        );
 
         // The artifact the coder wrote is substantive on real disk.
         let disk = std::fs::read_to_string(dir.path().join("src/main.rs")).expect("read artifact");
@@ -9069,17 +18314,17 @@ mod tests {
 
     const DESIGN_DOC_MAIN: &str = r#"{"goals":["implement main"],"proposed_files":["src/main.rs"],"interface_sketch":"entry point"}"#;
 
-    /// A build task with no validation-stage agent is self-verified by the
-    /// coordinator: the eval engine runs a REAL passing `make test` against
-    /// the workspace and the C-06 artifact gate records the acceptance. The
-    /// reviewer stays unsatisfied so the run ends Partial and still
-    /// serialises the checkpoint ledger — letting the test observe the
-    /// accepted decision and its evidence (artifacts + verification_passed).
+    /// ADR-35 amendment (2026-09-16 §5): coordinator self-verification is
+    /// REMOVED. Even when the coordinator holds a real eval engine (over a
+    /// passing `make test`) and a coder produced a real artifact, a build
+    /// task with NO validation-stage dispatch is never evaluated or accepted
+    /// by the coordinator itself: no `ValidationCycleStarted` event, no
+    /// acceptance decision, and no Completed claim.
     #[tokio::test]
-    async fn coordinator_self_verifies_build_task_when_no_validator_registered() {
+    async fn eval_engine_without_validator_does_not_self_verify() {
         let dir = tempfile::tempdir().expect("tempdir for real project workspace");
-        // `detect_runner` selects the `make` runner via the Makefile; the
-        // passing `test` target lets the coordinator's eval engine verify.
+        // A passing test target: if any self-verification remnant ran, it
+        // would succeed — and the run must still show no validation fired.
         std::fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").expect("write Makefile");
         let project_root = dir.path().to_path_buf();
 
@@ -9090,18 +18335,31 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
         ];
         let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         // A real implement-stage agent writes a substantive artifact; the
         // reviewer always asks for revisions (keeps the run Partial). NO
-        // validate-stage agent is registered — the coordinator carries
-        // verification itself.
+        // validate-stage agent is registered and NO validator is dispatched.
         registry.register(Arc::new(DiskCoder::new(
             vec!["// real implementation\npub fn main() {}\n".into()],
             "// real implementation\npub fn main() {}\n".into(),
         )));
         registry.register(Arc::new(AlwaysRevise));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into())
-                .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            &["src/main.rs"],
+        )
+        .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -9119,78 +18377,72 @@ mod tests {
             collected
         };
 
-        // The coordinator self-verify cycle DID run (stage feed + replay see
-        // the single ValidationCycleStarted event).
+        // The eval engine must NOT run: the self-verify fallback is gone.
         assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
-            "the coordinator self-verify must publish a ValidationCycleStarted event"
+            !events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
+            "the eval engine must not self-verify a build task without a validator"
         );
+        // No acceptance decision can be recorded without verification evidence.
         let decisions = acceptance_decisions(&output);
-        assert_eq!(
-            decisions.len(),
-            1,
-            "exactly one acceptance decision expected on the self-verify path"
-        );
-        assert_eq!(decisions[0].kind, "accepted", "passing self-verification must be accepted");
         assert!(
-            !decisions.iter().any(|action| action.kind == "rejected"),
-            "no rejected entry may exist when self-verification passed"
-        );
-        let evidence = decisions[0].evidence.as_ref().expect("acceptance entry carries evidence");
-        assert!(evidence.verification_passed, "acceptance requires the verification pass");
-        assert_eq!(evidence.artifacts, vec![camino::Utf8PathBuf::from("src/main.rs")]);
-        // The run is Partial only because the review stayed unresolved — the
-        // validation itself passed and no acceptance rejection is present.
-        assert_eq!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "an unresolved review keeps the run Partial even though self-verification passed"
-        );
-        assert!(
-            output.final_message.contains("Review remains unresolved"),
-            "expected the unresolved-review note, got: {}",
-            output.final_message
+            decisions.is_empty(),
+            "no validator dispatch means no acceptance decision may be recorded: {decisions:?}"
         );
         assert!(
             !output.final_message.contains("Acceptance rejected"),
-            "self-verified acceptance must not be rejected: {}",
+            "the amended pipeline records no artifact rejection here: {}",
+            output.final_message
+        );
+        assert!(
+            !matches!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Completed
+            ),
+            "an unverified build task must never claim full completion: {:?} — {}",
+            output.completion_status,
             output.final_message
         );
     }
 
-    /// A build task with no validation-stage agent and a FAILING test runner
-    /// is rejected by the coordinator's self-verification: verification ran
-    /// but did not pass, so acceptance fails and the ledger records the
-    /// rejection (verification_passed = false, no artifacts).
+    /// ADR-35 amendment (2026-09-16 §5): a run that completed its
+    /// implement-stage work but declared NO verification evidence is reported
+    /// Partial by the C-06 gate — even when nothing else is unresolved. This
+    /// is the canonical case: architect + coder complete cleanly, no review,
+    /// no validator, no eval engine, so the pre-gate outcome is Completed and
+    /// the gate's "no verification evidence" note is what moves it to Partial.
     #[tokio::test]
-    async fn coordinator_self_verification_failure_rejects_build_task() {
+    async fn completion_without_verification_evidence_is_partial() {
         let dir = tempfile::tempdir().expect("tempdir for real project workspace");
-        // `detect_runner` selects the `make` runner; the failing `test`
-        // target makes the coordinator's self-verification fail.
-        std::fs::write(dir.path().join("Makefile"), "test:\n\t@false\n").expect("write Makefile");
         let project_root = dir.path().to_path_buf();
 
         let bus = EventBus::new(256);
-        let mut rx = bus.subscribe();
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_MAIN),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
         ];
         let mut registry = AgentRegistry::from_mocks(mocks);
-        // Implement-stage coder writes a real artifact; the reviewer passes
-        // (so the run's Partial status comes from the validation failure, not
-        // an unresolved review). NO validate-stage agent is registered.
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        // A real implement-stage agent writes a substantive artifact. No
+        // reviewer, no validator, no eval engine: the implementation work
+        // completes cleanly and the run would otherwise claim Completed.
         registry.register(Arc::new(DiskCoder::new(
             vec!["// real implementation\npub fn main() {}\n".into()],
             "// real implementation\npub fn main() {}\n".into(),
         )));
-        registry.register(Arc::new(MockExpertAgent::always_succeed(
-            AgentId::new("reviewer"),
-            "approved",
-        )));
-        let mut coordinator =
-            coordinator_with(bus.clone(), Arc::new(registry), PLAN_RESEARCH_CODER.into())
-                .with_eval_engine(Arc::new(concerto_eval::EvalEngine::new(project_root.clone())));
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            &["src/main.rs"],
+        );
         let task = AgentTask::new(Ulid::new(), "build a main");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
@@ -9200,45 +18452,30 @@ mod tests {
             .run(task, context, CancellationToken::new(), None)
             .await
             .expect("coordinator run should succeed");
-        let events = {
-            let mut collected = Vec::new();
-            while let Ok(event) = rx.try_recv() {
-                collected.push(event.kind.clone());
-            }
-            collected
-        };
 
-        assert!(
-            events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
-            "the coordinator self-verify must publish a ValidationCycleStarted event"
-        );
-        assert!(
-            output
-                .final_message
-                .contains("Acceptance rejected: coordinator self-verification failed"),
-            "unexpected final message: {}",
-            output.final_message
-        );
+        // The C-06 gate: implement-stage work with no declared verification
+        // evidence must not claim full completion.
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
-            "a failing self-verification must not complete the build task"
-        );
-        let decisions = acceptance_decisions(&output);
-        assert!(
-            !decisions.is_empty(),
-            "at least one acceptance decision expected on the self-verify reject path"
+            "a completed-but-unverified build task must exit Partial: {}",
+            output.final_message
         );
         assert!(
-            decisions.iter().all(|action| action.kind == "rejected"),
-            "every acceptance decision on the reject path must be a rejection, got: {decisions:?}"
+            output.final_message.contains("Acceptance gate C-06"),
+            "the C-06 no-evidence note must be present: {}",
+            output.final_message
         );
-        let evidence = decisions[0].evidence.as_ref().expect("acceptance entry carries evidence");
         assert!(
-            !evidence.verification_passed,
-            "self-verification ran but did not pass, so verification_passed must be false"
+            !output.final_message.contains("Acceptance rejected"),
+            "no artifact rejection occurred here: {}",
+            output.final_message
         );
-        assert!(evidence.artifacts.is_empty(), "a rejected run records no verified artifacts");
+        // No validation ever ran and no acceptance decision was recorded.
+        assert!(
+            acceptance_decisions(&output).is_empty(),
+            "no verification evidence means no acceptance decision"
+        );
     }
 
     /// A NON-build task (no implement-stage work) with no validation-stage
@@ -9262,10 +18499,13 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
         ];
         // No coder, reviewer, or validator — deliberately no eval engine.
-        let mut coordinator = coordinator_with_responses(
+        let mut coordinator = coordinator_with_turns(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(mocks)),
-            vec![plan_json.to_string(), "implemented by the coordinator self".into()],
+            vec![
+                CoordinatorTurn::Text(plan_json.to_string()),
+                CoordinatorTurn::Text("implemented by the coordinator self".into()),
+            ],
         );
         coordinator = coordinator.with_executor(coordinator_self_executor());
         let (output, _events) = run_for_test(coordinator, bus.clone()).await;
@@ -9293,26 +18533,26 @@ mod tests {
     // ADR-55 Phase 2b: planning-only orchestration depth
     // ------------------------------------------------------------------
 
-    /// T1/T2/T3 (coordinator side): a planning-only run renders the produced
-    /// plan as its final message, completes, and NEVER dispatches a subtask —
-    /// zero tool calls, no SubTaskStarted, no review/validation cycles.
-    /// Full-depth behavior is unchanged for every existing `run_for_test`
-    /// caller, which still defaults to `OrchestrationDepth::Full` (T8).
+    /// ADR-55 Phase 2b + ADR-35 amendment (2026-09-05): a planning-only run
+    /// is the Coordinator's OWN plan (advisory prose — the plan is context,
+    /// never a workload). It completes, surfaces the plan as the final
+    /// message, and NEVER dispatches a subtask — zero tool calls, no
+    /// SubTaskStarted, no review/validation cycles.
     #[tokio::test]
     async fn planning_only_renders_plan_and_never_executes() {
         let bus = EventBus::new(256);
         let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
             MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
+        let plan_prose = "# Plan\n1. inspect the workspace\n2. implement the change\n3. review";
         let (output, events) = run_for_test(
             coordinator_with(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                plan_prose.into(),
             )
             .with_orchestration_depth(OrchestrationDepth::PlanningOnly),
             bus.clone(),
@@ -9327,24 +18567,13 @@ mod tests {
         );
         assert_eq!(output.tool_call_count, 0, "planning-only never invokes tools");
         assert!(
-            !output.final_message.contains("Multi-agent orchestration completed"),
-            "the placeholder must be replaced by the rendered plan"
-        );
-        assert!(
-            output.final_message.contains("[coder]"),
-            "the rendered plan names the planned coder subtask: {}",
+            output.final_message.contains("implement the change"),
+            "the Coordinator's plan IS the final message: {}",
             output.final_message,
         );
         assert!(
-            output.final_message.contains("[researcher]"),
-            "the rendered plan names the planned researcher subtask: {}",
-            output.final_message,
-        );
-        assert!(
-            !events.iter().any(|kind| {
-                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() != "architect")
-            }),
-            "planning-only must never dispatch an implement/subtask role"
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "planning-only must never dispatch a subtask"
         );
         assert!(
             !events.iter().any(|kind| {
@@ -9361,75 +18590,1703 @@ mod tests {
         );
     }
 
-    /// T5: the only agent dispatched during planning-only is the design
-    /// (architect) stage agent; the planner runs as a provider call and every
-    /// other registered role stays untouched.
+    /// ADR-60 D7 (#152): a seeded approved-plan DesignDoc drives the run
+    /// directly — the architect is NOT re-invoked on the same objective
+    /// (silent re-decompose is forbidden). The Coordinator still decides the
+    /// dispatch (calling the coder here), and the approved doc's proposed
+    /// files bind as the implement dispatch's expected artifacts.
     #[tokio::test]
-    async fn planning_only_dispatch_limited_to_design_stage() {
+    async fn approved_plan_seed_skips_the_architect() {
         let bus = EventBus::new(256);
         let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
-            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
+            // A poisoned architect: if the seed did NOT suppress re-decompose,
+            // a Coordinator architect call would fail the run and the
+            // assertions below would catch the dispatch itself.
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
             MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
         ];
+        let seed = ApprovedPlanSeed {
+            plan_id: "plan-d7".to_owned(),
+            design_doc: Some(DesignDoc {
+                goals: vec!["approved goal".to_owned()],
+                constraints: vec![],
+                proposed_files: vec![camino::Utf8PathBuf::from("src/approved.rs")],
+                interface_sketch: "approved interface".to_owned(),
+                risks: vec![],
+            }),
+        };
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_turns(
                 bus.clone(),
                 Arc::new(AgentRegistry::from_mocks(mocks)),
-                PLAN_RESEARCH_CODER.into(),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
+                    CoordinatorTurn::Text("approved plan executed".into()),
+                ],
             )
-            .with_orchestration_depth(OrchestrationDepth::PlanningOnly),
+            .with_approved_plan_seed(seed),
             bus.clone(),
         )
         .await;
 
+        assert!(
+            !events.iter().any(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            }),
+            "the architect must never be re-invoked for an approved plan"
+        );
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Completed
-        );
-        let started_roles = events
-            .iter()
-            .filter_map(|kind| match kind {
-                EventKind::SubTaskStarted { role, .. } => Some(role.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            started_roles.contains(&"architect"),
-            "the architect must have been dispatched once for the design stage"
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the seeded plan still executes to completion: {}",
+            output.final_message
         );
         assert!(
-            started_roles.iter().all(|role| *role == "architect"),
-            "only the design-stage agent may be dispatched in planning-only, got: {started_roles:?}"
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the implement subtask still dispatches off the seeded doc"
+        );
+        // The Coordinator's written artifact is on disk (the seeded doc's
+        // proposed file bound as the expected artifact and the mock wrote it).
+        assert!(
+            output.files_modified.iter().any(|path| path.as_str() == "src/approved.rs"),
+            "the seeded doc's proposed file must bind as the dispatch's artifact: {:?}",
+            output.files_modified
         );
     }
 
-    /// T7: when the planner cannot parse its response, the heuristic fallback
-    /// pipeline still builds a graph and planning-only still renders a plan.
-    /// T7 + live-fix: when the planner backend fails JSON parsing, the
-    /// heuristic pipeline still produces a planning-only plan AND persists a
-    /// durable PlanArtifact — the live run showed `plans/` empty and a null
-    /// `plan_id` on this path, which left the rendered plan unbound.
+    // ------------------------------------------------------------------
+    // ADR-60 D7 (interrupt-safe resume, 2026-09-05): a checkpointless
+    // `continue` run restores CONTEXT from the logged evidence chain (the
+    // hash-verified `plan-approved` payload) and the COORDINATOR re-decides
+    // the dispatch — no planner re-entry, no scheduler. Every dispatch is an
+    // evidence-backed `Decision` event (ADR-65 §7); a cited id is validated
+    // at append (acceptance 8).
+    // ------------------------------------------------------------------
+
+    /// Build a headless-resume fixture: a real workspace, its snapshot
+    /// barrier record, an evidence pool, and a hash-verified `plan-approved`
+    /// event. Returns everything the headless-resume tests need.
+    async fn headless_resume_fixture(
+        session_id: Ulid,
+        barrier_applies_observations: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        sqlx::SqlitePool,
+        crate::workspace_snapshot::WorkspaceSnapshotRecord,
+        String, // plan-approved event id
+        HeadlessResumeSeed,
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let src = workspace.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(src.join("main.rs"), b"fn main() {}\n").expect("write src/main.rs");
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let cancel = CancellationToken::new();
+        // Production runs the barrier before planning; with a pool it also
+        // applies the inventory as observations. `barrier_applies_observations`
+        // = false simulates a resume whose evidence chain carries no research
+        // facts (the rule-(b) exploration arm).
+        let pool_for_barrier = barrier_applies_observations.then_some(&pool);
+        let snapshot = crate::workspace_snapshot::run_snapshot_barrier(
+            pool_for_barrier,
+            workspace.path(),
+            &session_id.to_string(),
+            &cancel,
+        )
+        .await
+        .expect("the barrier captures a readable project");
+
+        // The verified design: a structured doc proposing the grounded path.
+        let doc = DesignDoc {
+            goals: vec!["continue the build".to_owned()],
+            constraints: vec![],
+            proposed_files: vec![camino::Utf8PathBuf::from("src/main.rs")],
+            interface_sketch: String::new(),
+            risks: vec![],
+        };
+        let objective_hash = blake3::hash("build the thing".as_bytes()).to_hex().to_string();
+        let binding = crate::plan_approval::PlanBinding::new(
+            "plan-resume".to_owned(),
+            objective_hash.clone(),
+            None,
+            "# Plan\nstep 1: continue the build".to_owned(),
+        );
+        let stored = crate::plan_approval::append_plan_approved_event(
+            &pool,
+            session_id,
+            &binding,
+            Some(&doc),
+        )
+        .await
+        .expect("plan-approved event lands");
+        let seed = HeadlessResumeSeed {
+            objective_hash,
+            plan_text: binding.plan_text().to_owned(),
+            design_doc: Some(doc),
+            plan_approved_event_id: stored.event_id.clone(),
+        };
+        // The evidence pool's backing tempdir must outlive the caller's use
+        // of the pool (a closed file breaks every new SQLite connection), so
+        // it is returned alongside.
+        (workspace, _store_dir, pool, snapshot, stored.event_id, seed)
+    }
+
+    /// A checkpointless `continue` whose session log carries a hash-verified
+    /// `plan-approved` payload restores that CONTEXT, and the Coordinator
+    /// re-decides: here it dispatches the coder (the architect stays
+    /// untouched — a re-design would need its own recorded decision), and the
+    /// dispatch is a `Decision` event citing the REAL plan-approved event id
+    /// (ADR-65 §7; a fabricated id is rejected at append — acceptance 8).
     #[tokio::test]
-    async fn planning_only_planner_fallback_still_renders() {
+    async fn headless_resume_dispatches_the_coder_not_the_architect() {
+        let session_id = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, plan_event_id, seed) =
+            headless_resume_fixture(session_id, true).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            // Poisoned: a resume that re-enters design dispatches this and
+            // fails the run — the assertion below catches the dispatch.
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        // The Coordinator cites the plan-approved event id from its restored
+        // context — a REAL id, accepted at append.
+        let (output, events) = run_for_test(
+            coordinator_with_grounded_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist_with(
+                        "coder",
+                        "implement",
+                        None,
+                        &[plan_event_id.as_str()],
+                    )]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
+                    CoordinatorTurn::Text("resumed build finished".into()),
+                ],
+                &["src/main.rs"],
+            )
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect"
+            )),
+            "the headless resume must never re-enter design (the architect is poisoned)"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the Coordinator re-decides the implement dispatch from the restored context"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the resumed build completes: {}",
+            output.final_message
+        );
+
+        // The dispatch Decision cites the REAL plan-approved event id.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(decisions.len(), 2, "two recorded dispatch decisions: {decisions:?}");
+        let decision = &decisions[0];
+        assert_eq!(decision.payload["selected_agent"], "coder");
+        let validation_decision = &decisions[1];
+        assert_eq!(validation_decision.payload["selected_agent"], "validator");
+        assert!(
+            decision.payload["supporting_evidence_ids"]
+                .as_array()
+                .expect("supporting ids array")
+                .iter()
+                .any(|id| id == &plan_event_id),
+            "the Decision cites the plan-approved event as evidence: {:?}",
+            decision.payload
+        );
+    }
+
+    /// A checkpointless `continue` whose evidence chain has NO research
+    /// facts: the Coordinator grounds the workspace FIRST (researcher),
+    /// then dispatches the implement step — a chained pair it chose from the
+    /// restored context. Both dispatches are recorded as `Decision` events
+    /// in order, and every cited evidence id is a REAL log row.
+    #[tokio::test]
+    async fn headless_resume_without_research_facts_explores_first_then_implements() {
+        let session_id = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(session_id, false).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (output, events) = run_for_test(
+            coordinator_with_grounded_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("researcher", "ground first")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Text("resumed with fresh evidence".into()),
+                ],
+                &["src/main.rs"],
+            )
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect"
+            )),
+            "no evidence-chain resume re-enters design"
+        );
+        let started: Vec<&AgentId> = events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::SubTaskStarted { role, .. } => Some(role),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            started.iter().any(|role| role.as_str() == "researcher"),
+            "the Coordinator grounds first: {started:?}"
+        );
+        assert!(
+            started.iter().any(|role| role.as_str() == "coder"),
+            "the exploration is followed by the implement step: {started:?}"
+        );
+
+        // BOTH dispatches are recorded, in order, with real-evidence
+        // discipline.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let decisions: Vec<&concerto_sessions::whiteboard::WhiteboardEvent> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(decisions.len(), 2, "explore + implement both recorded: {decisions:?}");
+        assert_eq!(decisions[0].payload["selected_agent"], "researcher");
+        assert_eq!(decisions[1].payload["selected_agent"], "coder");
+        assert!(
+            decisions.iter().all(|decision| decision.payload["supporting_evidence_ids"]
+                .as_array()
+                .is_none_or(|ids| ids
+                    .iter()
+                    .all(|id| logged.iter().any(|event| &event.event_id == id)))),
+            "every cited evidence id is a REAL log row"
+        );
+        let _ = output;
+    }
+
+    // ------------------------------------------------------------------
+    // Run-continuity Phase 1: stall gate + resume objective continuity
+    // ------------------------------------------------------------------
+
+    /// A wired coordinator whose orchestration checkpoints persist to an
+    /// in-memory SQLite store, so tests can assert the stall gate's
+    /// persist-vs-clear behavior on real storage. A session row is created
+    /// first — the checkpoint table FK-references it — and its id is
+    /// returned alongside the store so tests can read back what the
+    /// coordinator persisted.
+    async fn coordinator_with_store(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+        project_dir: &std::path::Path,
+    ) -> (CoordinatorAgent, Arc<concerto_sessions::SqliteSessionStore>, Ulid) {
+        let store = Arc::new(
+            concerto_sessions::SqliteSessionStore::connect_in_memory()
+                .await
+                .expect("in-memory session store"),
+        );
+        let project = camino::Utf8PathBuf::from_path_buf(project_dir.to_path_buf())
+            .expect("test project dir is UTF-8");
+        let session_id = store
+            .create_session(&project, "mock", "test-model", CancellationToken::new())
+            .await
+            .expect("create session row")
+            .id;
+        // Every caller pairs this helper with the standard `DESIGN_DOC_JSON`
+        // (proposes `src/a.rs`), so ground that path once here: without a
+        // snapshot the ADR-65 §5 verifier degrades the doc to Quarantined and
+        // the checkpoint/resume tests would exercise the passive path instead
+        // of their intended artifact gates. Callers attach the architect's
+        // DesignDoc config themselves (the roster typing surface).
+        let coordinator = coordinator_with_turns(bus, registry, turns)
+            .with_workspace_snapshot(grounded_snapshot(&["src/a.rs"]))
+            .with_checkpoint_store(
+                Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+                None,
+            );
+        (coordinator, store, session_id)
+    }
+
+    /// A coordinator wired to an EXISTING checkpoint store + session — used
+    /// for the resume phase of two-phase tests, which must share the first
+    /// phase's storage (and therefore its session row) to exercise the
+    /// persist/clear cycle across runs.
+    fn coordinator_on_store(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        turns: Vec<CoordinatorTurn>,
+        store: Arc<concerto_sessions::SqliteSessionStore>,
+    ) -> CoordinatorAgent {
+        coordinator_with_turns(bus, registry, turns)
+            .with_checkpoint_store(Some(store as Arc<dyn concerto_sessions::SessionStore>), None)
+    }
+
+    /// A stalled run (review unresolved → Partial) with a DesignDoc KEEPS its
+    /// orchestration checkpoint: persisted with completed=false, carrying the
+    /// original objective text + hash and the design doc, so a later bare
+    /// "continue" can restore it.
+    #[tokio::test]
+    async fn stalled_run_persists_checkpoint_with_design_doc() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
         let bus = EventBus::new(256);
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
         ];
-        let plans_dir = tempfile::tempdir().expect("tempdir for plans artifacts");
-        let plans = concerto_sessions::plans::PlansManager::at(plans_dir.path().join("plans"));
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the unresolved review leaves the run stalled: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "a stalled run surfaces its checkpoint");
+
+        // The store row survives the stalled run, marked not-completed.
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("a stalled run must persist its checkpoint");
+        assert!(!record.completed, "the stalled checkpoint is resumable");
+
+        let cp: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid persisted checkpoint");
+        assert!(!cp.completed && cp.stage != checkpoint::CheckpointStage::Completed);
+        assert_eq!(
+            cp.objective, "build the thing",
+            "the persisted objective is the run objective, not a resume input"
+        );
+        assert_eq!(
+            cp.objective_hash,
+            blake3::hash("build the thing".as_bytes()).to_hex().to_string()
+        );
+        assert!(cp.design_doc.is_some(), "the DesignDoc is preserved for the resume");
+    }
+
+    /// A fully-successful run CLEARS its orchestration checkpoint —
+    /// byte-identical to the pre-Phase-1 behavior — even though the run
+    /// persisted interim checkpoints along the way.
+    #[tokio::test]
+    async fn successful_run_clears_orchestration_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+
+        // Seed a stale row from an earlier partial run of this session — the
+        // successful run must leave NO row behind when it finishes.
+        store
+            .save_orchestration_checkpoint(&concerto_sessions::OrchestrationCheckpointRecord {
+                session_id,
+                run_id: Ulid::new(),
+                root_task_id: TaskId::new(),
+                project_id: "stale".into(),
+                objective_hash: "stale".into(),
+                schema_version: checkpoint::GRAPH_CHECKPOINT_SCHEMA_VERSION,
+                source_revision: None,
+                sequence_num: 1,
+                state_json: r#"{"stale":true}"#.into(),
+                completed: false,
+                updated_at: time::OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("seed stale checkpoint");
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the clean run completes: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_none(), "a completed run carries no checkpoint");
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "a clean success clears the orchestration checkpoint"
+        );
+    }
+
+    /// Run-continuity Phase 1 (Task A): a resumed run keeps recording the
+    /// ORIGINAL objective text + hash in every checkpoint it persists — the
+    /// resume input ("continue") never replaces it, so a later resume still
+    /// names the same work.
+    #[tokio::test]
+    async fn resumed_run_keeps_original_objective_in_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+
+        // ── Phase 1: fresh run stalls (review unresolved) ────────────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let first = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("first run should succeed");
+        let stored =
+            first.checkpoint_json.clone().expect("the stalled first run carries a checkpoint");
+
+        // ── Phase 2: bare "continue" resumes from the stored checkpoint ──
+        let bus2 = EventBus::new(256);
+        // The architect is a canary: the resume path restores the graph and
+        // must never re-derive it.
+        let mocks2 = vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry2 = AgentRegistry::from_mocks(mocks2);
+        registry2.register(Arc::new(AlwaysRevise));
+        let registry2 = Arc::new(registry2);
+        // The resume phase shares phase 1's store and session row — the
+        // checkpoint cycle must survive across runs on the same session.
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            registry2,
+            vec![CoordinatorTurn::Text(String::new())],
+            store.clone(),
+        );
+        let continue_task = AgentTask::new(session_id, "continue");
+        let continue_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let second = coordinator2
+            .run(continue_task, continue_ctx, CancellationToken::new(), Some(stored))
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the resumed run stalls again on the unresolved review"
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stalled resume keeps its checkpoint");
+        let cp: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid resumed checkpoint");
+        assert_eq!(cp.objective, "build the thing", "the original objective survives the resume");
+        assert_eq!(
+            cp.objective_hash,
+            blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "the objective hash is the ORIGINAL objective's hash, not the resume input's"
+        );
+        // ADR-65 §7: the resumed run's checkpoints keep carrying the §7
+        // state — the doc resolution captured by the verifier and the
+        // snapshot generation both survive into the post-resume row.
+        assert_eq!(
+            cp.schema_version,
+            checkpoint::GRAPH_CHECKPOINT_SCHEMA_VERSION,
+            "resumed checkpoints are canonical v4"
+        );
+        assert!(
+            cp.doc_resolution.is_some(),
+            "the doc resolution captured at verify time rides every persist"
+        );
+    }
+
+    // ── ADR-65 §7: continuation restores state at the whiteboard cursor ──
+
+    /// A hermetic review-store pool (the ADR-65 §7 evaluation's log source).
+    async fn resume_log_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let db_path = dir.path().join("resume_evidence_test.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("test pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+        (dir, pool)
+    }
+
+    /// A v4-shaped checkpoint JSON with one blocked/failed subtask (and an
+    /// optional failed-ledger count). The §7 fields sit behind the additive
+    /// schema surface exactly as `persist_checkpoint` writes them.
+    fn blocked_step_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        subtask_id: Ulid,
+        role: &str,
+        status: &str,
+        ledger_failed_entries: usize,
+        cursor: Option<u64>,
+    ) -> String {
+        let ledger: Vec<serde_json::Value> = (0..ledger_failed_entries)
+            .map(|_| {
+                serde_json::json!({
+                    "kind": "failed",
+                    "task_id": subtask_id.to_string(),
+                    "timestamp": [2026, 254, 0, 0, 0, 0, 0, 0, 0],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": Ulid::new().to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [{
+                "id": subtask_id.to_string(),
+                "parent_id": null,
+                "session_id": session_id.to_string(),
+                "role": role,
+                "description": "the blocked work",
+                "status": status,
+                "dependencies": [],
+                "deliverable": null,
+            }],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": ledger,
+            "whiteboard_cursor_gate_seq": cursor,
+        })
+        .to_string()
+    }
+
+    /// Issue #52: the same shape with an explicit `pending_decision` — the
+    /// additive §7 field a real v4 writer produces.
+    #[allow(clippy::too_many_arguments)]
+    fn blocked_step_checkpoint_json_with_pending(
+        project_id: &str,
+        session_id: Ulid,
+        subtask_id: Ulid,
+        role: &str,
+        status: &str,
+        ledger_failed_entries: usize,
+        cursor: Option<u64>,
+        pending: serde_json::Value,
+    ) -> String {
+        let base = blocked_step_checkpoint_json(
+            project_id,
+            session_id,
+            subtask_id,
+            role,
+            status,
+            ledger_failed_entries,
+            cursor,
+        );
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&base).expect("base checkpoint json parses");
+        parsed["pending_decision"] = pending;
+        parsed.to_string()
+    }
+
+    /// Append a `ToolExecuted` fact row attributed to a task (real id,
+    /// session-scoped — the shape the fact writer produces).
+    async fn append_tool_fact(
+        pool: &sqlx::SqlitePool,
+        session_id: Ulid,
+        event_id: &str,
+        task_id: &str,
+        success: bool,
+    ) -> WhiteboardEvent {
+        append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: event_id.to_owned(),
+                agent_id: "coder".to_owned(),
+                kind: WhiteboardKind::ToolExecuted,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "agent_id": "coder",
+                    "task_id": task_id,
+                    "tool": "filesystem",
+                    "args": { "operation": "read", "path": "src/main.rs" },
+                    "success": success,
+                    "generation": "",
+                    "paths": [],
+                }),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("fact row appended")
+    }
+
+    /// Resume decisions are recorded with reason codes and REAL evidence
+    /// ids; a restore-and-continue resets its graph in place.
+    #[tokio::test]
+    async fn resume_continues_progressing_blocked_step_from_the_cursor() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Pre-cursor: one failure fact BEFORE the cursor — checkpoint-era
+        // state, never replayed into the evidence view.
+        append_tool_fact(&pool, session_id, "ev-pre-fail", &subtask_id.to_string(), false).await;
+        // Post-cursor: a successful tool execution — the agent made progress.
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = Arc::new(AgentRegistry::new()); // no candidates
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+
+        // The step was re-armed for the SAME agent (facts show progress).
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "Continue re-arms the step");
+        assert_eq!(graph_task.role.as_str(), "coder", "progress ⇒ the same agent continues");
+        assert!(
+            result.action_ledger.iter().any(|entry| entry.kind == "resume-continued"),
+            "the decision lands in the checkpoint ledger"
+        );
+
+        // The evidence view is the log AFTER the cursor: the pre-cursor
+        // failure is not cited (no replay), the post-cursor progress fact
+        // is.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(decisions.len(), 1, "exactly one resume decision, got: {decisions:?}");
+        assert_eq!(decisions[0].payload["reason"], "resume-continue-blocked");
+        assert_eq!(decisions[0].payload["selected_agent"], "coder");
+        let cited: Vec<&str> = decisions[0].payload["supporting_evidence_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            cited,
+            vec!["ev-post-progress"],
+            "cited ids are the REAL post-cursor facts only (cursor respected), got: {cited:?}"
+        );
+    }
+
+    /// ADR-65 §8 / acceptance 9: a memory store that FORBIDS writes — wired
+    /// into the continuation loop to prove no path touches vector memory
+    /// while restoring an evidenced checkpoint. Retrieve mirrors the
+    /// disabled behavior (empty).
+    struct ForbiddenMemoryStore;
+
+    #[async_trait::async_trait]
+    impl MemoryStore for ForbiddenMemoryStore {
+        async fn retrieve(
+            &self,
+            _query: &concerto_core::memory::MemoryQuery,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<concerto_core::memory::MemoryChunk>, concerto_core::MemoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _entry: concerto_core::memory::MemoryEntry,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::memory::MemoryId, concerto_core::MemoryError> {
+            panic!("vector memory write attempted with memory disabled (ADR-65 acceptance 9)")
+        }
+
+        async fn invalidate(
+            &self,
+            _id: concerto_core::memory::MemoryId,
+            _cancel: CancellationToken,
+        ) -> Result<(), concerto_core::MemoryError> {
+            Ok(())
+        }
+    }
+
+    /// ADR-65 acceptance 9: the blocked-step continuation loop completes with
+    /// vector memory entirely DISABLED, and no path ever writes a memory
+    /// entry (the store panics on any write — the run's success is the proof).
+    #[tokio::test]
+    async fn continuation_loop_completes_with_vector_memory_disabled() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Pre-cursor failure (checkpoint-era, never replayed) + post-cursor
+        // progress fact: the same evidence shape the Phase 7 continue test
+        // uses.
+        append_tool_fact(&pool, session_id, "ev-pre-fail", &subtask_id.to_string(), false).await;
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = Arc::new(AgentRegistry::new()); // no candidates
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds without vector memory");
+
+        // The restore still reads the log, re-arms the step, and appends its
+        // decision — projected memory was simply never consulted for state.
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "Continue re-arms the step");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(decisions.len(), 1, "exactly one resume decision");
+        assert_eq!(decisions[0].payload["selected_agent"], "coder");
+        assert_eq!(decisions[0].payload["reason"], "resume-continue-blocked");
+    }
+
+    /// No progress ⇒ replace the agent, never a blind same-agent
+    /// re-dispatch (the 5-repeat live failure's first guard).
+    #[tokio::test]
+    async fn resume_replaces_the_blocked_step_agent_without_progress() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(MockExpertAgent::always_succeed(AgentId::new("coder"), "x")));
+        registry.register(Arc::new(
+            MockExpertAgent::always_succeed(AgentId::new("coder2"), "done")
+                .with_stage(Some(AgentStage::new("implement"))),
+        ));
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let registry = Arc::new(registry);
+        let mut coordinator = CoordinatorAgent::new(
+            registry.clone(),
+            AgentRunner::new(registry, bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            1, // one failed outcome before the checkpoint
+            None,
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(
+            graph_task.role.as_str(),
+            "coder2",
+            "no progress ⇒ replace the agent, never a blind same-coder re-dispatch"
+        );
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "the replacement re-arms");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decision = logged
+            .iter()
+            .find(|event| event.kind == WhiteboardKind::Decision)
+            .expect("the replace decision is recorded");
+        assert_eq!(decision.payload["reason"], "resume-replace-agent");
+        assert_eq!(decision.payload["selected_agent"], "coder2");
+        assert!(result.action_ledger.iter().any(|entry| entry.kind == "resume-replaced"));
+    }
+
+    /// Repeated identical failures with no alternative left ⇒ skip — the
+    /// bound that kills the documented 5-repeat failure: at most ONE bounded
+    /// same-agent continue is ever granted, then the step is skipped.
+    #[tokio::test]
+    async fn resume_skips_after_repeated_identical_failures() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // One more failure AFTER the checkpoint (2 in the ledger → 3 total),
+        // a real row the decision may cite.
+        let fact =
+            append_tool_fact(&pool, session_id, "ev-post-fail", &subtask_id.to_string(), false)
+                .await;
+
+        let registry = Arc::new(AgentRegistry::new()); // no alternative agent
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            2,
+            Some(fact.gate_seq - 1),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+
+        let graph_task = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("restored step");
+        assert_eq!(
+            graph_task.status,
+            SubTaskStatus::Failed,
+            "the step is skipped (honest terminal state), never re-dispatched again"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decision = logged
+            .iter()
+            .find(|event| event.kind == WhiteboardKind::Decision)
+            .expect("the skip decision is recorded");
+        assert_eq!(decision.payload["reason"], "resume-skip-step");
+        // The skip cites the REAL post-cursor failure fact.
+        assert_eq!(
+            decision.payload["supporting_evidence_ids"],
+            serde_json::json!(["ev-post-fail"]),
+        );
+        assert!(result.action_ledger.iter().any(|entry| entry.kind == "resume-skipped"));
+    }
+
+    /// Acceptance 7 (e2e): with NO recorded, evidence-backed decision
+    /// selecting the architect, a blocked architect step is never re-armed
+    /// for dispatch — and with a recorded scheduler decision (a logged
+    /// Decision row explicitly selecting the researcher) plus progress
+    /// facts, the dispatch IS allowed.
+    #[tokio::test]
+    async fn resume_never_dispatches_architect_or_researcher_without_recorded_decision() {
+        // ── Negative: no recorded decision ⇒ the architect step stays
+        //    terminated, never re-armed. ──────────────────────────────────
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // The architect is registered with its design stage so the
+        // evaluation classifies the step as architect work (acceptance 7).
+        let mut architect_registry = AgentRegistry::new();
+        architect_registry
+            .register(Arc::new(MockExpertAgent::always_succeed(AgentId::new("architect"), "x")));
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            Arc::new(architect_registry),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            subtask_id,
+            "architect",
+            "Failed",
+            0,
+            None,
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+        let step = result.graph.all_tasks().into_iter().next().expect("the blocked step");
+        assert_ne!(
+            step.status,
+            SubTaskStatus::Pending,
+            "the architect step is NEVER re-armed for dispatch without a recorded decision"
+        );
+        assert_eq!(step.status, SubTaskStatus::Failed, "the step is skipped instead");
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let decision = logged
+            .iter()
+            .find(|event| event.kind == WhiteboardKind::Decision)
+            .expect("the skip decision is recorded");
+        assert_eq!(decision.payload["reason"], "resume-skip-step");
+
+        // ── Positive: a recorded, evidence-backed decision (the Phase-6
+        //    scheduler's logged dispatch decision) explicitly selects the
+        //    researcher, and post-cursor progress facts exist: the resume
+        //    continues the dispatch behind that decision. ─────────────────
+        let researcher_id = Ulid::new();
+        let progress = append_tool_fact(
+            &pool,
+            session_id,
+            "ev-research-progress",
+            &researcher_id.to_string(),
+            true,
+        )
+        .await;
+        // The scheduler's dispatch decision cites a REAL evidence id.
+        let scheduled_decision = append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "ev-scheduled-exploration".to_owned(),
+                agent_id: "coordinator".to_owned(),
+                kind: WhiteboardKind::Decision,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "selected_agent": "researcher",
+                    "reason": "evidence-gap-explore",
+                    "required_output": "Grounded fact inventory (tool reads only)",
+                    "supporting_evidence_ids": ["ev-research-progress"],
+                }),
+                pre_image_hash: None,
+                created_at: 2,
+            },
+        )
+        .await
+        .expect("the scheduler decision is recorded");
+
+        let cp_json = blocked_step_checkpoint_json(
+            &project_id,
+            session_id,
+            researcher_id,
+            "researcher",
+            "Blocked",
+            0,
+            Some(progress.gate_seq - 1),
+        );
+        let result = coordinator
+            .decompose_or_restore(&task, &context, &CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("restore succeeds");
+        let step = result
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == researcher_id)
+            .expect("the blocked researcher step");
+        assert_eq!(
+            step.status,
+            SubTaskStatus::Pending,
+            "with a recorded, evidence-backed decision the dispatch is allowed"
+        );
+        assert_eq!(step.role.as_str(), "researcher");
+        let _ = scheduled_decision;
+    }
+
+    /// Run-continuity Phase 1 (Task D): a bare "continue" over a stored
+    /// checkpoint restores the graph AND the DesignDoc — the architect is
+    /// NOT re-invoked (the poisoned canary would fail the run if it were) —
+    /// and the resumed run completes and clears the checkpoint.
+    #[tokio::test]
+    async fn continue_with_stored_checkpoint_skips_architect() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+
+        // ── Phase 1: fresh run stalls (review unresolved) ────────────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let first = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("first run should succeed");
+        let stored =
+            first.checkpoint_json.clone().expect("the stalled first run carries a checkpoint");
+
+        // ── Phase 2: "continue" restores and completes ───────────────
+        let bus2 = EventBus::new(256);
+        let mut rx = bus2.subscribe();
+        let mocks2 = vec![
+            // Poisoned canary: any architect dispatch fails the run.
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        // The resume phase shares phase 1's store and session row.
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(mocks2)),
+            vec![CoordinatorTurn::Text(String::new())],
+            store.clone(),
+        );
+        let continue_task = AgentTask::new(session_id, "continue");
+        let continue_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let second = coordinator2
+            .run(continue_task, continue_ctx, CancellationToken::new(), Some(stored))
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the resumed run completes off the restored graph: {}",
+            second.final_message
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        assert!(
+            !events.iter().any(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            }),
+            "the architect must never be re-invoked on a checkpoint resume"
+        );
+        let doc = coordinator2
+            .design_doc_snapshot()
+            .expect("the DesignDoc is restored from the checkpoint");
+        assert_eq!(doc.goals, vec!["do the thing".to_owned()]);
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "the successful resumed run clears the checkpoint"
+        );
+    }
+
+    /// Fail-soft fallback: a resume-shaped run with NO stored checkpoint
+    /// decomposes fresh — the Coordinator's decision loop runs and its
+    /// architect dispatch happens exactly once; the run completes like a
+    /// first run.
+    #[tokio::test]
+    async fn continue_without_checkpoint_falls_back_to_fresh_decompose() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+
+        // A bare "continue" whose session holds NO orchestration checkpoint.
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the fallback run completes like a fresh run: {}",
+            output.final_message
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let architect_dispatches = events
+            .iter()
+            .filter(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            })
+            .count();
+        assert_eq!(
+            architect_dispatches, 1,
+            "with nothing stored, a continue falls back to a fresh decompose (one architect pass)"
+        );
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "the successful fallback run still clears its checkpoint"
+        );
+    }
+
+    /// Unit test of the stall predicate: declared-Completion false, declared
+    /// deliverables unproduced, or a Failed/Blocked subtask each stall an
+    /// otherwise-completed run; only the clean combination does not.
+    #[test]
+    fn run_is_stalled_predicate() {
+        let completed = concerto_core::types::AgentCompletionStatus::Completed;
+        let partial = concerto_core::types::AgentCompletionStatus::Partial;
+
+        let mut graph = TaskGraph::default();
+        graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("researcher"),
+            description: "research".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+
+        // 1. declared Completion false → stalled.
+        assert!(run_is_stalled(partial, false, &graph));
+        // Clean success → not stalled.
+        assert!(!run_is_stalled(completed, false, &graph));
+        // 2. declared deliverables unproduced → stalled even when Completed.
+        assert!(run_is_stalled(completed, true, &graph));
+        // 3. a Blocked or Failed subtask → stalled even when Completed.
+        let mut blocked_graph = TaskGraph::default();
+        blocked_graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "blocked".into(),
+            status: SubTaskStatus::Blocked,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        assert!(run_is_stalled(completed, false, &blocked_graph));
+        let mut failed_graph = TaskGraph::default();
+        failed_graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "failed".into(),
+            status: SubTaskStatus::Failed,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        assert!(run_is_stalled(completed, false, &failed_graph));
+    }
+
+    /// The missing-deliverables clause: a non-empty declared set with an
+    /// unproduced file stalls; a produced file or an empty declared set
+    /// (vacuous) does not.
+    #[test]
+    fn expected_artifacts_unproduced_matches_c06_semantics() {
+        let dir = tempfile::tempdir().expect("tempdir for artifact check");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("tempdir path is valid UTF-8");
+
+        // Nothing declared → vacuously produced.
+        assert!(!expected_artifacts_unproduced(&root, &HashMap::new()));
+
+        // Declared but missing → unproduced.
+        let mut declared = HashMap::new();
+        declared.insert(TaskId::new(), vec![root.join("src/missing.rs")]);
+        assert!(expected_artifacts_unproduced(&root, &declared));
+
+        // Declared and produced with real content → produced.
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n")
+            .expect("write produced artifact");
+        let mut produced = HashMap::new();
+        produced.insert(TaskId::new(), vec![root.join("src/main.rs")]);
+        assert!(!expected_artifacts_unproduced(&root, &produced));
+    }
+
+    /// A real SQLite evidence pool (the whiteboard log) for the
+    /// decision-loop evidence tests.
+    async fn fallback_evidence_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let dir = tempfile::tempdir().expect("tempdir for the evidence store");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("evidence.db"))
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+        (dir, pool)
+    }
+
+    /// ADR-35 amendment (2026-09-05) + ADR-65 §5/§6 kept invariants: a
+    /// grounded pre-planning snapshot lets the DesignDoc claim VERIFY, the
+    /// Coordinator dispatches the implement step, and its `Decision` cites
+    /// only REAL log event ids (a fabricated id is rejected at append —
+    /// acceptance 8).
+    #[tokio::test]
+    async fn fallback_with_grounded_snapshot_executes_implement_and_records_decision() {
+        // Real project root + real file: the snapshot barrier grounds the
+        // architect's proposed path, so the Phase-5 verifier marks the doc
+        // Verified and its contract binds the implement dispatch.
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let src = workspace.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(src.join("main.rs"), b"fn main() {}\n").expect("write src/main.rs");
+
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let cancel = CancellationToken::new();
+        let snapshot = crate::workspace_snapshot::run_snapshot_barrier(
+            Some(&pool),
+            workspace.path(),
+            "fallback-grounded-session",
+            &cancel,
+        )
+        .await
+        .expect("the barrier captures a readable project");
+
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            // The architect proposes src/main.rs — GROUNDED by the barrier's
+            // inventory (and by the rows the barrier applied).
+            MockExpertAgent::always_succeed(
+                AgentId::new("architect"),
+                r#"{"goals":["grounded"],"proposed_files":["src/main.rs"],"interface_sketch":"s"}"#,
+            ),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
         let (output, events) = run_for_test(
-            coordinator_with(
+            coordinator_with_grounded_turns(
                 bus.clone(),
-                Arc::new(AgentRegistry::from_mocks(mocks)),
-                "this is not a plan".into(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "validator",
+                        "validate the build",
+                    )]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+                &["src/main.rs"],
             )
-            .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
-            .with_plans(Some(plans)),
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone())),
             bus.clone(),
         )
         .await;
@@ -9437,80 +20294,1503 @@ mod tests {
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
-            "the fallback pipeline must still produce a planning-only plan, got: {:?}",
-            output.completion_status,
+            "the grounded design binds and the implement dispatch completes: {}",
+            output.final_message
         );
         assert!(
-            output.final_message.contains("[coder]"),
-            "the fallback graph renders its implement subtask: {}",
-            output.final_message,
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the Implement step dispatched to the implement-stage agent"
         );
-        let plan_ids: Vec<&String> = events
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "researcher"
+            )),
+            "the Coordinator chose a direct design→implement chain"
+        );
+        // The doc claim landed on the log, and both dispatch Decisions cite
+        // REAL ids only.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let dispatch_decisions: Vec<_> = logged
             .iter()
-            .filter_map(|event| match event {
-                concerto_core::event::EventKind::MultiAgentModeStarted { plan_id, .. } => {
-                    plan_id.as_ref()
-                }
-                _ => None,
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
             })
             .collect();
         assert_eq!(
-            plan_ids.len(),
-            1,
-            "exactly one MultiAgentModeStarted on the planning path, got: {plan_ids:?}"
+            dispatch_decisions.len(),
+            3,
+            "all three Coordinator dispatches are recorded as Decisions: {dispatch_decisions:?}"
+        );
+        assert_eq!(dispatch_decisions[0].payload["selected_agent"], "architect");
+        assert_eq!(dispatch_decisions[1].payload["selected_agent"], "coder");
+        assert_eq!(dispatch_decisions[2].payload["selected_agent"], "validator");
+        assert!(
+            logged.iter().any(|event| event.kind == WhiteboardKind::DesignDoc),
+            "the DesignDoc claim event landed on the log"
         );
         assert!(
-            !plan_ids[0].is_empty(),
-            "the heuristic fallback must still persist a durable artifact id"
-        );
-        let persisted: Vec<_> = std::fs::read_dir(plans_dir.path().join("plans"))
-            .expect("plans dir must exist")
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(
-            persisted.len(),
-            1,
-            "the fallback plan artifact must be persisted to the plans dir"
+            dispatch_decisions.iter().all(|decision| decision.payload["supporting_evidence_ids"]
+                .as_array()
+                .is_none_or(|ids| ids
+                    .iter()
+                    .all(|id| logged.iter().any(|event| &event.event_id == id)))),
+            "every cited evidence id is a REAL log row (acceptance 8)"
         );
     }
 
-    /// T6: when the design stage exhausts its recovery ladder, planning-only
-    /// surfaces a graceful Partial with the standard paused message and NO
-    /// rendered plan (the empty-final-message guard keeps it unbound).
+    /// ADR-65 §5 kept invariant under the amended contract: an UNGROUNDED
+    /// DesignDoc claim is quarantined — advisory context, never a binding
+    /// contract. The Coordinator may still dispatch implementation (it
+    /// decides), the doc claim + verdict land on the log, and the dispatch
+    /// decisions cite only REAL ids.
     #[tokio::test]
-    async fn planning_only_design_failure_returns_partial_without_plan() {
+    async fn fallback_quarantined_doc_explores_then_implements_without_contract() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
         let bus = EventBus::new(256);
-        let architect = MockExpertAgent::sequence(
-            AgentId::new("architect"),
-            vec![err_stream_idle(), err_auth()],
+        let mocks = vec![
+            // DESIGN_DOC_JSON proposes src/a.rs, which nothing grounds here:
+            // the verifier quarantines the doc (ungrounded + no observations).
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
         );
         let (output, _events) = run_for_test(
-            coordinator_for_design_stage(
+            coordinator_with_turns(
                 bus.clone(),
-                architect,
-                concerto_config::ModelPinConfig::default(),
-                PLAN_RESEARCH_CODER.into(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
             )
-            .with_orchestration_depth(OrchestrationDepth::PlanningOnly),
+            .with_review_store(Some(pool.clone())),
             bus.clone(),
         )
         .await;
 
+        // Hermetic mocks produce no files and the roster has no validator,
+        // so the run exits Partial by the C-06/zero-work gates — orthogonal
+        // to the doc-quarantine contract under test here.
+        let _ = output;
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        // The doc claim AND the verifier's quarantine verdict both landed.
+        assert!(
+            logged.iter().any(|event| event.kind == WhiteboardKind::DesignDoc),
+            "the doc claim is on the log"
+        );
+        let verdict_decisions: Vec<&concerto_sessions::whiteboard::WhiteboardEvent> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("state").is_some()
+                    && event.payload.get("reject_count").is_some()
+            })
+            .collect();
+        assert!(
+            verdict_decisions
+                .iter()
+                .any(|decision| { decision.payload["state"].as_str() == Some("quarantined") }),
+            "the ungrounded claim resolves to a quarantine verdict: {:?}",
+            verdict_decisions.iter().map(|decision| &decision.payload).collect::<Vec<_>>()
+        );
+        // Every dispatch Decision cites only REAL ids (or none).
+        let dispatch_decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(dispatch_decisions.len(), 2, "both dispatches recorded");
+        assert!(
+            dispatch_decisions.iter().all(|decision| decision.payload["supporting_evidence_ids"]
+                .as_array()
+                .is_none_or(|ids| ids
+                    .iter()
+                    .all(|id| logged.iter().any(|event| &event.event_id == id)))),
+            "every cited evidence id is a REAL log row"
+        );
+    }
+
+    /// ADR-35 amendment (2026-09-05), arbitrary-dispatch contract: from
+    /// context alone (an evidence gap, no designer registered) the
+    /// Coordinator grounds the workspace FIRST (researcher), then dispatches
+    /// implementation — a chained pair it chose itself. Both dispatches are
+    /// whiteboard `Decision` events; an evidence ABSENCE cites nothing (no
+    /// id is ever fabricated).
+    #[tokio::test]
+    async fn fallback_evidence_gap_dispatches_exploration_inline_then_implements() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            // NO architect: the design is undecided — the Coordinator
+            // grounds first, then implements.
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "grounded"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (output, _events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "researcher",
+                        "ground the workspace",
+                    )]),
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+        )
+        .await;
+
+        // Hermetic mocks produce no files and the roster has no validator,
+        // so the run exits Partial by the C-06/zero-work gates — orthogonal
+        // to the dispatch-chaining contract under test here.
+        let _ = output;
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload.get("selected_agent").is_some()
+            })
+            .collect();
+        assert_eq!(decisions.len(), 2, "explore + implement both recorded: {decisions:?}");
+        assert_eq!(decisions[0].payload["selected_agent"], "researcher");
+        assert_eq!(decisions[1].payload["selected_agent"], "coder");
+        // The gap's decision is an absence: nothing is fabricated to cite.
+        assert!(
+            decisions[0].payload["supporting_evidence_ids"]
+                .as_array()
+                .expect("supporting ids array")
+                .is_empty(),
+            "no snapshot event: no ids are fabricated for the gap decision"
+        );
+        // The default reason (no notes) is the coordinator's own choice.
+        assert_eq!(decisions[0].payload["reason"], "coordinator_choice");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-35 amendment (2026-09-05) contract tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Contract 1b (updated by issue #52): a dispatch citing a FABRICATED
+    /// evidence id is rejected at DECISION-validation time — a structured
+    /// `fabricated_evidence` tool error, NO dispatch, and NO mutation (never
+    /// accepted to the ledger). The append-side acceptance-8 check stays on
+    /// as defense-in-depth (covered by the `concerto-sessions` tests).
+    ///
+    /// Contrast with the real id: `fabricated_evidence_real_document` below
+    /// dispatches fine.
+    #[tokio::test]
+    async fn fabricated_evidence_id_is_rejected_at_dispatch() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist_with(
+                        "researcher",
+                        "inspect",
+                        None,
+                        &["ev-fabricated-0001"],
+                    )]),
+                    CoordinatorTurn::Text("adjusted after the rejection".into()),
+                ],
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+        )
+        .await;
+        // The dispatch never happens: no specialist ran.
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "researcher"
+            )),
+            "a fabricated-evidence dispatch is rejected before any dispatch: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("fabricated_evidence")
+            )),
+            "the structured rejection surfaces to the Coordinator: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "a rejected citation must not crash the run, got: {}",
+            output.final_message
+        );
+
+        // The whiteboard never gains a decision record for the rejected
+        // dispatch (constraint: no state mutation on validation failure).
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        assert!(
+            !logged.iter().any(|event| event.kind == WhiteboardKind::Decision),
+            "a rejected decision leaves no ledger record: {logged:?}"
+        );
+    }
+
+    /// Issue #52 (gap 2, positive control): a dispatch citing REAL log rows
+    /// passes decision validation and dispatches with the citations intact.
+    #[tokio::test]
+    async fn real_evidence_document_dispatches() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        // Seed ONE real row the Coordinator can cite.
+        let real = concerto_sessions::NewWhiteboardEvent {
+            event_id: format!("ev-real-{}", Ulid::new()),
+            agent_id: "researcher".into(),
+            kind: WhiteboardKind::Finding,
+            scope: "test".into(),
+            session_id: None,
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({ "note": "real evidence row" }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        let stored = concerto_sessions::whiteboard::append_whiteboard_event(&pool, &real)
+            .await
+            .expect("real evidence row appends");
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist_with(
+                        "researcher",
+                        "inspect",
+                        None,
+                        &[stored.event_id.as_str()],
+                    )]),
+                    CoordinatorTurn::Text("done citing real evidence".into()),
+                ],
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "researcher"
+            )),
+            "a REAL-evidence decision dispatches: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "real citations never block: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52 (gap 1): the decision session's DAG-frontier gate. A
+    /// dispatch whose chain parent is NOT settled (Pending) is a
+    /// structured `decision_not_ready` tool error — the model cannot
+    /// back-chain a new dispatch out of order past open work (the
+    /// ready-set bypass is gone), and no state mutates.
+    #[tokio::test]
+    async fn call_specialist_with_unsettled_chain_parent_rejects() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+
+        // A chain parent that is still Pending — the model must not be able
+        // to dispatch behind it (bounded, resumable state, never a crash).
+        let open_parent = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: open_parent,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "open work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(open_parent) };
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let decision_value = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "next step" }),
+            )
+            .await;
+
+        assert_eq!(
+            decision_value["error"], "decision_not_ready",
+            "structured, yes: {decision_value:?}"
+        );
+        // No state mutation: the graph stays untouched, nothing dispatched.
+        assert!(
+            ledger.action_ledger.is_empty() && ledger.completed_results.is_empty(),
+            "a rejected dispatch mutates nothing: {ledger:?}"
+        );
+        assert_eq!(graph.len(), 1, "no new node materializes: only the open parent");
+    }
+
+    // ── Issue #57: dynamic task splitting and merging ────────────────────
+
+    /// Build a split_task tool call for a test turn.
+    fn split_task_call(task_id: &str, children: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call-split".into(),
+            name: SPLIT_TASK_TOOL.to_string(),
+            arguments: serde_json::json!({
+                "task_id": task_id,
+                "children": children,
+            }),
+
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn split_task_handler_materializes_children_with_state_preserved() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+
+        // The graph: completed(1) → open(2) → pending depend(3), where 1
+        // carried 2 attempts and 2 ran once already.
+        let completed = TaskId::new();
+        let open = TaskId::new();
+        let depend = TaskId::new();
+        let mut graph = TaskGraph::new();
+        for (id, status) in [
+            (completed, SubTaskStatus::Completed),
+            (open, SubTaskStatus::Pending),
+            (depend, SubTaskStatus::Pending),
+        ] {
+            let mut subtask = SubTask {
+                id,
+                parent_id: None,
+                session_id,
+                role: AgentId::new("coder"),
+                description: format!("task {id}"),
+                status,
+                dependencies: vec![],
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            };
+            if status == SubTaskStatus::Completed {
+                subtask.deliverable = Some("settled work".into());
+            }
+            graph.add_root(subtask);
+        }
+        graph.add_dependency(open, completed, Dependency::MustFinishBefore).unwrap();
+        graph.add_dependency(depend, open, Dependency::MustFinishBefore).unwrap();
+        let mut ledger = DispatchLedger::default();
+        ledger.subtask_attempts.insert(completed, 2);
+        ledger.subtask_attempts.insert(open, 3);
+        ledger.completed_results.insert(
+            completed,
+            AgentRunResult {
+                task_id: completed,
+                role: AgentId::new("coder"),
+                outcome: AgentOutcome::Success,
+                summary: "settled work".into(),
+                files_modified: vec![],
+                tool_call_count: 0,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                provider: "test".into(),
+                model: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
+            },
+        );
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(open) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_split_task(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_id": open.to_string(),
+                    "children": [
+                        { "description": "write the module" },
+                        { "description": "test the module", "after": [0] },
+                    ],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "split", "structured success: {result:?}");
+        let children: Vec<String> = result["children"]
+            .as_array()
+            .expect("children ids")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(children.len(), 2);
+        // The graph: parent gone, children in, cycle-free, edges right.
+        assert!(graph.get(&open).is_none());
+        assert!(TaskGraphValidator::validate(&graph).is_ok(), "DAG stays valid");
+        for child in &children {
+            let child_id = TaskId(Ulid::from_string(child).expect("child id parses"));
+            let node = graph.get(&child_id).expect("child node");
+            assert_eq!(node.role.as_str(), "coder", "the role is inherited");
+            assert_eq!(node.status, SubTaskStatus::Pending);
+            assert!(
+                node.dependencies.contains(&completed),
+                "the parent's dependency is inherited by EVERY child"
+            );
+        }
+        // Attempt baseline: each child starts at the parent's 3.
+        for child in &children {
+            let child_id = TaskId(Ulid::from_string(child).expect("parses"));
+            assert_eq!(ledger.subtask_attempts.get(&child_id), Some(&3));
+        }
+        assert!(!ledger.subtask_attempts.contains_key(&open), "parent baseline moves");
+        // Completed work never invalidated (byte-identical deliverable).
+        assert_eq!(
+            graph.get(&completed).map(|task| task.deliverable.clone()).unwrap_or_default(),
+            Some("settled work".into())
+        );
+        assert_eq!(ledger.subtask_attempts.get(&completed), Some(&2));
+        assert!(ledger.completed_results.contains_key(&completed));
+        // The journal carries a SPLIT decision with its payload.
+        let entry =
+            coordinator.decision_journal.entries().last().expect("the split decision is journaled");
+        assert!(matches!(entry.kind, crate::decisions::DecisionKind::Split));
+        assert!(entry.transform.is_some(), "the split payload rides the decision");
+        assert_eq!(entry.status, crate::decisions::DecisionStatus::Settled);
+        // The chain frontier reset (the split consumed the chain head).
+        assert_eq!(state.last_node, None);
+        // The action ledger records the split.
+        assert!(ledger
+            .action_ledger
+            .iter()
+            .any(|action| action.kind == "split" && action.task_id == Some(open)));
+    }
+
+    #[tokio::test]
+    async fn split_task_handler_rejects_completed_parent_structurally() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let completed = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: completed,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "done work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_split_task(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_id": completed.to_string(),
+                    "children": [ { "description": "never" } ],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "not_splittable", "structured: {result:?}");
+        assert_eq!(graph.len(), 1, "nothing mutates");
+        {
+            let entries = coordinator.decision_journal.entries();
+            let rejected = entries
+                .iter()
+                .rev()
+                .find(|entry| matches!(entry.kind, crate::decisions::DecisionKind::Split))
+                .expect("the rejected split decision is journaled");
+            assert_eq!(
+                rejected.status,
+                crate::decisions::DecisionStatus::Rejected,
+                "the journal shows the rejection, never a settled fake split"
+            );
+        }
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_tasks_handler_is_deterministic_survivor_and_state() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+
+        // Two overlapping pending tasks + a dependent waiting on the loser.
+        // Fixed ids make the deterministic survivor rule observable.
+        let survivor = TaskId(Ulid::from(4_000));
+        let loser = TaskId(Ulid::from(9_000));
+        let depend = TaskId(Ulid::from(5_000));
+        let mut graph = TaskGraph::new();
+        let base = |id: &TaskId, status| SubTask {
+            id: *id,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "overlapping work".into(),
+            status,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        graph.add_root(base(&survivor, SubTaskStatus::Pending));
+        graph.add_root(base(&loser, SubTaskStatus::Pending));
+        graph.add_root(base(&depend, SubTaskStatus::Pending));
+        graph.add_dependency(depend, survivor, Dependency::MustFinishBefore).unwrap();
+        graph.add_dependency(depend, loser, Dependency::MustFinishBefore).unwrap();
+        let mut ledger = DispatchLedger::default();
+        ledger.subtask_attempts.insert(survivor, 1);
+        ledger.subtask_attempts.insert(loser, 5);
+        {
+            let mut expected =
+                coordinator.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+            expected.insert(survivor, vec![camino::Utf8PathBuf::from("src/ours.rs")]);
+            expected.insert(loser, vec![camino::Utf8PathBuf::from("src/theirs.rs")]);
+        }
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(loser) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_merge_tasks(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_ids": [loser.to_string(), survivor.to_string()],
+                    "merged_description": "one merged work item",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "merged", "structured: {result:?}");
+        assert!(graph.get(&loser).is_none(), "the loser leaves the graph");
+        let merged = graph.get(&survivor).expect("the survivor stays");
+        assert_eq!(merged.description, "one merged work item");
+        assert_eq!(merged.status, SubTaskStatus::Pending);
+        assert_eq!(merged.dependencies.len(), 0);
+        // Attempt counter = MAX of the group (no extra budget granted).
+        assert_eq!(ledger.subtask_attempts.get(&survivor), Some(&5));
+        assert!(!ledger.subtask_attempts.contains_key(&loser));
+        // The artifact union is single-owner and carries both sides.
+        let expected =
+            coordinator.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner());
+        let survivor_artifacts = expected.get(&survivor).cloned().unwrap_or_default();
+        let as_strings: Vec<String> =
+            survivor_artifacts.iter().map(|path| path.to_string()).collect();
+        assert!(as_strings.contains(&"src/ours.rs".to_owned()), "{as_strings:?}");
+        assert!(as_strings.contains(&"src/theirs.rs".to_owned()), "{as_strings:?}");
+        drop(expected);
+        // The frontier that pointed at a removed member now points at the
+        // survivor.
+        assert_eq!(state.last_node, Some(survivor));
+        // The journal carries the MERGE decision, settled.
+        let entry =
+            coordinator.decision_journal.entries().last().expect("the merge decision is journaled");
+        assert!(matches!(entry.kind, crate::decisions::DecisionKind::Merge));
+        assert!(matches!(
+            entry.transform,
+            Some(crate::task_transform::TaskTransformSpec::Merge { .. })
+        ));
+        assert!(TaskGraphValidator::validate(&graph).is_ok());
+    }
+
+    #[tokio::test]
+    async fn merge_tasks_handler_rejects_role_mismatch_structurally() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let a = TaskId::new();
+        let b = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: a,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "code work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.add_root(SubTask {
+            id: b,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("reviewer"),
+            description: "review work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_merge_tasks(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "task_ids": [a.to_string(), b.to_string()],
+                    "merged_description": "cannot merge roles",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "merge_role_mismatch", "structured: {result:?}");
+        assert_eq!(graph.len(), 2, "nothing mutates");
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    /// The decision-loop wiring: the split tool call surfaces through the
+    /// SAME decision loop, journaled and answered structurally.
+    #[tokio::test]
+    async fn split_task_tool_rides_the_decision_loop() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![split_task_call(
+                        "01-NoSuchTaskId-000000000000",
+                        serde_json::json!([{ "description": "child" }]),
+                    )]),
+                    CoordinatorTurn::Text("after the rejection".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            events.iter().any(|kind| matches!(kind, EventKind::AgentThought { content, .. }
+                if content.contains("invalid_arguments")
+                    || content.contains("unknown_task"))),
+            "the rejection surfaces through the loop: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "a rejected split never crashes the run: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52 (structured malformed arguments): an empty agent_id is an
+    /// `incomplete_decision` rejection — no dispatch, no crash.
+    #[tokio::test]
+    async fn call_specialist_incomplete_empty_target_rejects() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("", "dispatch me")]),
+                    CoordinatorTurn::Text("after the rejection".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "an empty target never dispatches: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("incomplete_decision")
+            )),
+            "the structured rejection surfaces: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "an incomplete decision never crashes the run: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52: a model-supplied `expected_artifacts` path that escapes
+    /// the workspace (traversal) rejects the decision structurally — model
+    /// paths are never trusted, canonicalized at validation time only.
+    #[tokio::test]
+    async fn call_specialist_artifact_traversal_rejects() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![ToolCall {
+                        id: "call-coder".into(),
+                        name: CALL_SPECIALIST_TOOL.to_string(),
+                        arguments: serde_json::json!({
+                            "agent_id": "coder",
+                            "task": "implement",
+                            "expected_artifacts": ["../../etc/passwd"],
+                        }),
+
+                        ..Default::default()
+                    }]),
+                    CoordinatorTurn::Text("after the rejection".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "a traversal artifact never dispatches: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("invalid_artifact_path")
+            )),
+            "the rejection surfaces: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "{}",
+            output.final_message
+        );
+    }
+
+    /// Issue #52: the stale-pending-decision resume gate. A checkpoint whose
+    /// pending decision (a fabricated evidence id or an unregistered
+    /// target) cannot stand: the resume deterministically forces Replan —
+    /// the restored graph is discarded for a FRESH decompose (never a model
+    // repair loop) — even though the step facts alone would have continued.
+    #[tokio::test]
+    async fn resume_with_stale_pending_decision_forces_replan() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Post-cursor progress fact: WITHOUT the stale gate the resume
+        // would continue behind it — the Replan below is attributable ONLY
+        // to the stale pending decision.
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = AgentRegistry::from_mocks(vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not re-design"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ]);
+        let registry = Arc::new(registry);
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        // The pending decision cites a FABRICATED id — stale by the exact
+        // acceptance-8 predicate (per-id existence), validated BEFORE the
+        // resume evaluation consumes the decision.
+        let cp_json = blocked_step_checkpoint_json_with_pending(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+            serde_json::json!({
+                "selected_agent": "coder",
+                "reason": "resume-continue-blocked",
+                "required_output": "the blocked work",
+                "supporting_evidence_ids": ["ev-fabricated-0001"],
+                "task_id": subtask_id.to_string(),
+            }),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .restore_and_evaluate(&cp_json, &task, &context, &CancellationToken::new())
+            .await
+            .expect("stale pending never crashes the restore");
+
+        // Forced Replan: the restored graph is thrown away (Ok(None)) — the
+        // model is never asked to repair coordinator state, and the restored
+        // step is never re-dispatched behind a stale decision.
+        assert!(
+            result.is_none(),
+            "a stale pending decision forces Replan; the restored graph must not resume"
+        );
+
+        // No resume-decision decision event lands for a forced Replan (the
+        // staleness gate runs BEFORE the resume evaluation writes anything).
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("log loads");
+        let holder: Vec<serde_json::Value> = logged
+            .iter()
+            .filter(|event| event.payload.get("reason").is_some())
+            .map(|event| event.payload.clone())
+            .collect();
+        assert!(
+            !holder.iter().any(|payload| payload["reason"] == "resume-continue-blocked"),
+            "a stale decision is never continued: {holder:?}"
+        );
+    }
+
+    /// Issue #52 (control): a pending decision whose evidence is REAL and
+    /// whose target is on the roster re-validates cleanly — the resume
+    /// proceeds exactly like the pre-#52 evaluation (continue-behind).
+    #[tokio::test]
+    async fn resume_with_valid_pending_decision_still_continues() {
+        let (_dir, pool) = resume_log_pool().await;
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let subtask_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+
+        // Post-cursor progress fact — the SAME id the pending decision cites.
+        append_tool_fact(&pool, session_id, "ev-post-progress", &subtask_id.to_string(), true)
+            .await;
+
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let bus = EventBus::new(16);
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let mut coordinator = CoordinatorAgent::new(
+            registry,
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            provider,
+            Arc::new(NullMemoryStore),
+        )
+        .with_review_store(Some(pool.clone()));
+
+        let cp_json = blocked_step_checkpoint_json_with_pending(
+            &project_id,
+            session_id,
+            subtask_id,
+            "coder",
+            "Blocked",
+            0,
+            Some(1),
+            serde_json::json!({
+                "selected_agent": "coder",
+                "reason": "resume-continue-blocked",
+                "required_output": "the blocked work",
+                "supporting_evidence_ids": ["ev-post-progress"],
+                "task_id": subtask_id.to_string(),
+            }),
+        );
+        let task = AgentTask::new(session_id, "continue");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let restored = coordinator
+            .restore_and_evaluate(&cp_json, &task, &context, &CancellationToken::new())
+            .await
+            .expect("a valid pending decision still restores");
+        assert!(restored.is_some(), "a FRESH pending decision does not force Replan");
+        let restored = restored.expect("checked");
+        let graph_task = restored
+            .graph
+            .all_tasks()
+            .into_iter()
+            .find(|subtask| subtask.id.0 == subtask_id)
+            .expect("the restored step");
+        assert_eq!(graph_task.status, SubTaskStatus::Pending, "continue re-arms the step");
+    }
+
+    /// Contract 2: the Coordinator's prompt carries EVERY registered agent's
+    /// context (id, name, role, stage, capabilities, output_mode,
+    /// instructions) — and an agent that is not registered (deleted or
+    /// disabled) is ABSENT: context, not policy.
+    #[tokio::test]
+    async fn roster_injection_lists_every_registered_agent_and_omits_deleted() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            vec![
+                (
+                    AgentId::new("researcher"),
+                    concerto_config::CustomAgentConfig {
+                        id: "researcher".into(),
+                        name: "Researcher".into(),
+                        role: "evidence gathering".into(),
+                        stage: Some(concerto_core::AgentStage::new("research")),
+                        prompt_sections: concerto_config::PromptSections {
+                            system_instructions: "Ground the workspace with tool reads."
+                                .to_string(),
+                            ..Default::default()
+                        },
+                        capabilities: concerto_config::AgentCapabilities {
+                            fs_read: Some(true),
+                            ..Default::default()
+                        },
+                        ..design_doc_config("researcher")
+                    },
+                ),
+                (
+                    AgentId::new("coder"),
+                    concerto_config::CustomAgentConfig {
+                        id: "coder".into(),
+                        name: "Coder".into(),
+                        role: "implementation".into(),
+                        stage: Some(concerto_core::AgentStage::new("implement")),
+                        prompt_sections: concerto_config::PromptSections {
+                            system_instructions: "Implement the requested change.".to_string(),
+                            ..Default::default()
+                        },
+                        capabilities: concerto_config::AgentCapabilities {
+                            fs_read: Some(true),
+                            fs_write: Some(true),
+                            ..Default::default()
+                        },
+                        ..design_doc_config("coder")
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // `ghost` is deliberately NOT registered (a deleted/disabled agent).
+
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("nothing to dispatch".into())],
+        );
+        let mut coordinator = coordinator;
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            dir.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("run should succeed");
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 1, "one model turn");
+        let prompt = &prompts[0];
+        // Every REGISTERED agent's context is present.
+        for (id, name, role, stage, capability, mode) in [
+            ("researcher", "Researcher", "evidence gathering", "research", "fs_read", "design_doc"),
+            ("coder", "Coder", "implementation", "implement", "fs_read", "design_doc"),
+        ] {
+            assert!(prompt.contains(&format!("id: {id}")), "roster lists {id}: {prompt}");
+            assert!(prompt.contains(&format!("name: {name}")), "roster lists {id}'s name");
+            assert!(prompt.contains(&format!("role: {role}")), "roster lists {id}'s role");
+            assert!(
+                prompt.contains(&format!("stage: {stage}")),
+                "roster lists {id}'s stage as informational metadata"
+            );
+            assert!(prompt.contains(capability), "roster lists {id}'s declared capabilities");
+            assert!(prompt.contains(&format!("output_mode: {mode}")), "roster lists {id}'s mode");
+            assert!(prompt.contains("instructions:"), "roster carries the instruction excerpt");
+        }
+        // The deleted/disabled agent is absent.
+        assert!(!prompt.contains("ghost"), "an unregistered agent must not appear in the roster");
+    }
+
+    /// Contract 3: arbitrary-agent acceptance — an agent with NO stage tag
+    /// (`auditor`, never seen by any lifecycle machinery) is fully callable
+    /// from context alone: the Coordinator's call dispatches it and the run
+    /// completes.
+    #[tokio::test]
+    async fn stageless_custom_agent_is_callable_by_the_coordinator() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("auditor"), "audited")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("auditor", "audit the run")]),
+                    CoordinatorTurn::Text("audit recorded".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        let dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "auditor")
+        });
+        assert!(dispatched, "the stageless custom agent must be dispatchable: {events:?}");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "the run completes off the Coordinator's own decision: {}",
+            output.final_message
+        );
+    }
+
+    /// Contract 4: a `call_specialist` for an unregistered (deleted or
+    /// disabled) agent returns a structured tool ERROR — no crash, no
+    /// dispatch — and the Coordinator finishes its run.
+    #[tokio::test]
+    async fn call_specialist_for_a_deleted_agent_is_a_tool_error_not_a_crash() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                vec![
+                    // The roster has no `reviewer` — a deleted/disabled id.
+                    CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review")]),
+                    CoordinatorTurn::Text("adjusted after the refusal".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "reviewer"
+            )),
+            "a deleted agent is never dispatched: {events:?}"
+        );
+        let refused = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("unknown_agent")
+            )
+        });
+        assert!(refused, "the tool error surfaces to the Coordinator: {events:?}");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "the tool error must not crash the run, got: {}",
+            output.final_message
+        );
+    }
+
+    /// Contract 5 (run level, through the decision loop): an action-required
+    /// run whose only dispatch executed ZERO tool calls trips the run-level
+    /// zero-work guard at the exit — the per-call guard flagged the
+    /// implement-stage call too (both nets hold).
+    #[tokio::test]
+    async fn decision_loop_zero_tool_action_required_run_stalls() {
+        let bus = EventBus::new(256);
+        // A researcher answers prose-only (zero tools) and "succeeds".
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "done")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("nothing more to do".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                // The ROOT task is action-required: this arms the run-level
+                // zero-work guard at the exit.
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
-            "an exhausted design-stage ladder degrades to Partial, got: {:?}",
+            "a zero-tool action-required run must stall, got: {:?} — {}",
             output.completion_status,
+            output.final_message
         );
         assert!(
-            output.final_message.contains("could not produce a valid plan"),
-            "unexpected final message: {}",
-            output.final_message,
+            output.final_message.contains("Zero-work guard"),
+            "the run-level guard names the omission: {}",
+            output.final_message
+        );
+        let flagged = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("Zero-work guard")
+            )
+        });
+        assert!(
+            !flagged,
+            "the research-stage call is NOT flagged per-call (the per-call guard is \
+             implement-scoped); the run-level guard is the net here"
+        );
+    }
+
+    /// Contract 6: a checkpointless `continue` re-enters ONLY the
+    /// Coordinator's decision loop — the planner is never re-invoked (the
+    /// mock provider's turn script would desync if an extra planning call
+    /// happened) and the Coordinator re-decides from the restored context.
+    #[tokio::test]
+    async fn headless_resume_re_enters_the_decision_loop_not_the_planner() {
+        let session_id = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(session_id, true).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("resumed build finished".into()),
+            ],
+        );
+        let coordinator = coordinator
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed);
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the resumed build completes: {}",
+            output.final_message
+        );
+        // Exactly THREE model turns: the two dispatch turns and the final summary.
+        // A planner re-entry would add provider calls and desync the script.
+        assert_eq!(
+            provider.turn_count(),
+            3,
+            "the resume runs the decision loop only — no planner re-entry"
+        );
+    }
+
+    /// ADR-35 amendment (2026-09-16): when the Coordinator calls the
+    /// `request_user_input` tool, the run ends with `AwaitingUser` — it is
+    /// NOT Completed and NOT Partial, and the preserved checkpoint lets a
+    /// later resume continue exactly where the user response is awaited.
+    #[tokio::test]
+    async fn request_user_input_returns_awaiting_user() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        // Empty registry: nothing may be dispatched — the single tool call
+        // is the whole run.
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Calls(vec![ToolCall {
+                id: "call-user-1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL.to_string(),
+                arguments: serde_json::json!({ "reason": "confirm the module boundary" }),
+
+                ..Default::default()
+            }])],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "clarify before building");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the async-awaiting run returns Ok");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "the run must stop in AwaitingUser, not complete: {:?}",
+            output.completion_status
         );
         assert!(
-            !output.final_message.contains("# Plan"),
-            "a failed planning-only run must not render a plan: {}",
-            output.final_message,
+            output.final_message.contains("confirm the module boundary"),
+            "the awaited reason must surface in the final message: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "an AwaitingUser run must carry a checkpoint so a resume can continue"
+        );
+    }
+
+    /// Contract 1c (ADR-35 amendment §2 / ADR-52 amendment): the optional
+    /// `draft_plan` advisor is ADVISORY ONLY — the Coordinator may invoke it,
+    /// the draft comes back as context text, and NOTHING is materialized:
+    /// no SubTask roles, no dispatch, no graph nodes. The graph stays the
+    /// record of what the Coordinator actually did (here: nothing).
+    #[tokio::test]
+    async fn draft_plan_advisor_never_materializes_roles() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![ToolCall {
+                    id: "call-draft".to_string(),
+                    name: DRAFT_PLAN_TOOL.to_string(),
+                    arguments: serde_json::json!({}),
+
+                    ..Default::default()
+                }]),
+                CoordinatorTurn::Text("I considered the draft; dispatching nothing yet".into()),
+            ],
+        );
+        let (output, events) = run_for_test(coordinator, bus.clone()).await;
+
+        // The advisor ran (the provider saw a second planning turn for the
+        // draft) but NO specialist was dispatched and the graph is empty.
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "the advisor dispatches nothing: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskCreated { .. })),
+            "no SubTask node may be materialized from the draft: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "an advisory-only turn completes without dispatching, got: {}",
+            output.final_message
+        );
+        // The advisor consumed planning-provider turns beyond the loop's own
+        // (loop turn 1 + the advisor's internal planner call), and the loop
+        // still stopped in prose after the tool result.
+        assert!(
+            provider.turn_count() >= 2,
+            "the advisor runs its own planning turn: {}",
+            provider.turn_count()
         );
     }
 
@@ -9845,5 +22125,1893 @@ mod tests {
             stage_fallback_persona(None, AgentStage::VALIDATE, coordinator_fallback()),
             coordinator_fallback(),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-65 §4: action digest (snapshot ⨁ observations)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn format_action_digest_renders_clean_and_dirty_rows_deterministically() {
+        let rows = vec![
+            ResourceFactRow {
+                project_root_hash: "root-a".to_owned(),
+                path: "src/main.rs".to_owned(),
+                generation: "g1".to_owned(),
+                size_bytes: Some(10),
+                mtime_ms: Some(1),
+                content_hash: Some("0123456789abcdef".to_owned()),
+                last_event_id: Some("ev-2".to_owned()),
+                last_agent_id: Some("coder".to_owned()),
+                observed_at: 200,
+                dirty: false,
+            },
+            ResourceFactRow {
+                project_root_hash: "root-a".to_owned(),
+                path: "gen/config.yaml".to_owned(),
+                generation: "g1".to_owned(),
+                size_bytes: Some(5),
+                mtime_ms: Some(3),
+                content_hash: Some("fedcba9876543210".to_owned()),
+                last_event_id: Some("ev-1".to_owned()),
+                last_agent_id: Some("researcher".to_owned()),
+                observed_at: 100,
+                dirty: false,
+            },
+            ResourceFactRow {
+                project_root_hash: "root-a".to_owned(),
+                path: "notes/todo.md".to_owned(),
+                generation: "g2".to_owned(),
+                size_bytes: Some(4),
+                mtime_ms: Some(2),
+                content_hash: None,
+                last_event_id: Some("ev-3".to_owned()),
+                last_agent_id: Some("coder".to_owned()),
+                observed_at: 150,
+                dirty: true,
+            },
+        ];
+        let digest = super::format_action_digest(&rows);
+        assert_eq!(
+            digest,
+            "<action_digest>\n\
+             src/main.rs | unchanged-since ev-2 | hash-01234567\n\
+             gen/config.yaml | unchanged-since ev-1 | hash-fedcba98\n\
+             notes/todo.md | changed\n\
+             </action_digest>"
+        );
+    }
+
+    #[test]
+    fn format_action_digest_omits_hash_when_unhashed_row_is_clean() {
+        let rows = vec![ResourceFactRow {
+            project_root_hash: "root-a".to_owned(),
+            path: "big.bin".to_owned(),
+            generation: "g1".to_owned(),
+            size_bytes: Some(200 * 1024),
+            mtime_ms: Some(1),
+            content_hash: None,
+            last_event_id: Some("ev-9".to_owned()),
+            last_agent_id: Some("coder".to_owned()),
+            observed_at: 100,
+            dirty: false,
+        }];
+        assert_eq!(
+            super::format_action_digest(&rows),
+            "<action_digest>\nbig.bin | unchanged-since ev-9\n</action_digest>"
+        );
+    }
+
+    /// The augmented digest injects an action block after the snapshot digest
+    /// when a `review_store` pool with observations is present, and the row
+    /// still carries the snapshot digest as a prefix (the injection is
+    /// additive, purely for context — ADR-65 §4). Rows are reconciled fresh
+    /// (ADR-65 F3) against real files under the snapshot's project root.
+    #[tokio::test]
+    async fn snapshot_digest_appends_action_digest_when_store_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("action_digest_test.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+
+        // Real project root + real files: F3 re-stats each row NOW, so the
+        // observation must carry the file's ACTUAL metadata (size + mtime) —
+        // otherwise the freshness fold would (correctly) re-brand it dirty and
+        // the "unchanged-since" render below would be impossible to observe.
+        let root = tempfile::tempdir().expect("project root");
+        let lib_dir = root.path().join("src");
+        let data_dir = root.path().join("gen");
+        std::fs::create_dir_all(&lib_dir).expect("src dir");
+        std::fs::create_dir_all(&data_dir).expect("gen dir");
+        std::fs::write(lib_dir.join("lib.rs"), b"0123456789").expect("write lib.rs");
+        std::fs::write(data_dir.join("data.json"), br#"{"ok":true}"#).expect("write data.json");
+        let lib_meta = std::fs::metadata(lib_dir.join("lib.rs")).expect("lib.rs meta");
+        let data_meta = std::fs::metadata(data_dir.join("data.json")).expect("data.json meta");
+
+        let facts = ResourceFacts::new(pool.clone());
+        let cancel = CancellationToken::new();
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let observed = |path: &str,
+                        size: u64,
+                        mtime: Option<u64>,
+                        content_hash: Option<&str>,
+                        generation: &str| {
+            concerto_sessions::ToolExecutedPayload {
+                agent_id: Some("coder".to_owned()),
+                task_id: None,
+                run_id: None,
+                tool: "filesystem".to_owned(),
+                args: serde_json::json!({ "operation": "read", "path": path }),
+                success: true,
+                exit_code: Some(0),
+                generation: generation.to_owned(),
+                project_root_hash: root_hash.clone(),
+                served_from: None,
+                paths: vec![concerto_sessions::ObservedPath {
+                    path: path.to_owned(),
+                    size_bytes: Some(size),
+                    mtime_ms: mtime,
+                    content_hash: content_hash.map(String::from),
+                }],
+            }
+        };
+        // Row 1: clean, content-hashed observation whose metadata matches the
+        // real file — the F3 freshness fold leaves it unchanged.
+        facts
+            .apply_observed(
+                "ev-1",
+                "coder",
+                100,
+                &observed(
+                    "src/lib.rs",
+                    lib_meta.len(),
+                    crate::tool_facts::mtime_ms(&lib_meta),
+                    Some("deadbeef00cafe01"),
+                    "g1",
+                ),
+                &cancel,
+            )
+            .await
+            .expect("observe row 1");
+        // Row 2: dirty (write uncertainty) — must render `changed` even though
+        // it carries a content hash and its file is fresh.
+        facts
+            .apply_observed(
+                "ev-2",
+                "coder",
+                200,
+                &observed(
+                    "gen/data.json",
+                    data_meta.len(),
+                    crate::tool_facts::mtime_ms(&data_meta),
+                    Some("0123456789abcdef"),
+                    "g1",
+                ),
+                &cancel,
+            )
+            .await
+            .expect("observe row 2");
+        facts.mark_dirty(&root_hash, "gen/data.json", &cancel).await.expect("dirty row 2");
+
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_workspace_snapshot(crate::workspace_snapshot::WorkspaceSnapshotRecord {
+                    generation: "gen-1".to_owned(),
+                    entries: vec![],
+                    captured_at_ms: 0,
+                    project_root: root.path().to_string_lossy().into_owned().into(),
+                })
+                .with_review_store(Some(pool));
+
+        let digest = coordinator.snapshot_digest(&cancel).await.expect("snapshot present");
+        assert!(
+            digest.starts_with("workspace-snapshot generation=gen-1"),
+            "the snapshot digest remains the prefix: {digest}"
+        );
+        assert!(
+            digest.contains("<action_digest>"),
+            "the clean row injects into the action digest: {digest}"
+        );
+        assert!(
+            digest.contains("src/lib.rs | unchanged-since ev-1 | hash-deadbeef"),
+            "clean content-hashed row renders with the abbreviated hash: {digest}"
+        );
+        assert!(
+            digest.contains("gen/data.json | changed"),
+            "dirty rows render as changed: {digest}"
+        );
+    }
+
+    /// A row whose file diverged from the observation — or vanished — is
+    /// folded DIRTY by the F3 freshness reconciliation, so the action digest
+    /// never claims an unchanged state the disk no longer matches.
+    #[tokio::test]
+    async fn snapshot_digest_reconciles_diverged_rows_as_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("action_digest_f3.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+
+        let root = tempfile::tempdir().expect("project root");
+        std::fs::write(root.path().join("lib.rs"), b"ORIGINAL-BYTES").expect("write lib.rs");
+        let meta = std::fs::metadata(root.path().join("lib.rs")).expect("meta");
+        let facts = ResourceFacts::new(pool.clone());
+        let cancel = CancellationToken::new();
+        let root_hash = crate::tool_facts::project_root_hash(root.path());
+        let payload = concerto_sessions::ToolExecutedPayload {
+            agent_id: Some("coder".to_owned()),
+            task_id: None,
+            run_id: None,
+            tool: "filesystem".to_owned(),
+            args: serde_json::json!({ "operation": "read", "path": "lib.rs" }),
+            success: true,
+            exit_code: Some(0),
+            generation: "g1".to_owned(),
+            project_root_hash: root_hash.clone(),
+            served_from: None,
+            paths: vec![concerto_sessions::ObservedPath {
+                path: "lib.rs".to_owned(),
+                size_bytes: Some(meta.len()),
+                mtime_ms: crate::tool_facts::mtime_ms(&meta),
+                content_hash: Some("cafecafecafecafe".to_owned()),
+            }],
+        };
+        facts.apply_observed("ev-1", "coder", 100, &payload, &cancel).await.expect("observe");
+
+        // Second row: a file that is observed clean and then DELETED — the F3
+        // freshness fold must render it changed (the metadata probe fails).
+        std::fs::write(root.path().join("gone.md"), b"will vanish").expect("write gone.md");
+        let gone_meta = std::fs::metadata(root.path().join("gone.md")).expect("meta gone");
+        let gone_payload = concerto_sessions::ToolExecutedPayload {
+            agent_id: Some("coder".to_owned()),
+            task_id: None,
+            run_id: None,
+            tool: "filesystem".to_owned(),
+            args: serde_json::json!({ "operation": "read", "path": "gone.md" }),
+            success: true,
+            exit_code: Some(0),
+            generation: "g1".to_owned(),
+            project_root_hash: root_hash.clone(),
+            served_from: None,
+            paths: vec![concerto_sessions::ObservedPath {
+                path: "gone.md".to_owned(),
+                size_bytes: Some(gone_meta.len()),
+                mtime_ms: crate::tool_facts::mtime_ms(&gone_meta),
+                content_hash: Some("feedfacefeedface".to_owned()),
+            }],
+        };
+        facts.apply_observed("ev-2", "coder", 150, &gone_payload, &cancel).await.expect("observe");
+
+        // The file changes (size divergence is deterministic) AFTER the
+        // observation — this is exactly the staleness F3 must surface.
+        std::fs::write(root.path().join("lib.rs"), b"LONGER THAN BEFORE").expect("rewrite");
+        // And the second file vanishes entirely.
+        std::fs::remove_file(root.path().join("gone.md")).expect("remove gone.md");
+
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_workspace_snapshot(crate::workspace_snapshot::WorkspaceSnapshotRecord {
+                    generation: "gen-1".to_owned(),
+                    entries: vec![],
+                    captured_at_ms: 0,
+                    project_root: root.path().to_string_lossy().into_owned().into(),
+                })
+                .with_review_store(Some(pool));
+
+        let digest = coordinator.snapshot_digest(&cancel).await.expect("snapshot present");
+        assert!(
+            digest.contains("lib.rs | changed"),
+            "a row whose file diverged from the observation renders changed (F3): {digest}"
+        );
+        assert!(
+            digest.contains("gone.md | changed"),
+            "a row whose file vanished renders changed (F3): {digest}"
+        );
+        assert!(
+            !digest.contains("unchanged-since"),
+            "no row may claim unchanged after divergence: {digest}"
+        );
+    }
+
+    /// Without a store pool the digest degrades to the bare snapshot digest —
+    /// the action block is an optimization, never a dispatch requirement.
+    #[tokio::test]
+    async fn snapshot_digest_falls_back_to_snapshot_without_store() {
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_workspace_snapshot(crate::workspace_snapshot::WorkspaceSnapshotRecord {
+                    generation: "gen-1".to_owned(),
+                    entries: vec![],
+                    captured_at_ms: 0,
+                    // Unused without a store (no root-hash lookup happens), but
+                    // the record type now always carries the root identity.
+                    project_root: "/proj".into(),
+                });
+        let digest = coordinator.snapshot_digest(&CancellationToken::new()).await;
+        let digest = digest.expect("snapshot present");
+        assert!(!digest.contains("<action_digest>"));
+        assert!(digest.starts_with("workspace-snapshot generation=gen-1"));
+    }
+
+    /// ADR-65 §5 binding-state contract at the coordinator seam: the
+    /// `binding_doc` handed to the planner is `Some` ONLY when the
+    /// model-free verifier marks the claim active (Verified). A Quarantined
+    /// doc resolves to a passive verdict — the coordinator then feeds the
+    /// planner `None`, so the proposed_files membership check is NOT applied
+    /// (the planner-side ON/OFF semantics are pinned by the planner's own
+    /// `design_doc_contract_enforces_proposed_files_membership` test).
+    #[tokio::test]
+    async fn verify_design_doc_claim_active_only_when_grounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("binding_state.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("pool connects");
+        sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations apply");
+
+        let root = std::path::Path::new("/proj/binding");
+        let root_hash = crate::tool_facts::project_root_hash(root);
+        let session_id = Ulid::new();
+        let project_root = camino::Utf8PathBuf::from(root.to_string_lossy().into_owned());
+        let snapshot = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "gen-1".to_owned(),
+            entries: vec![concerto_sessions::ObservedPath {
+                path: "src/main.rs".to_owned(),
+                size_bytes: Some(1024),
+                mtime_ms: Some(1),
+                content_hash: None,
+            }],
+            captured_at_ms: 0,
+            project_root: project_root.clone(),
+        };
+
+        // The author's grounded read fact: counts as evidence AND grounds
+        // nothing new (the snapshot already carries src/main.rs), but proves
+        // the coordinator's claim resolution runs against the session log.
+        let executed_payload = concerto_sessions::ToolExecutedPayload {
+            agent_id: Some("architect".to_owned()),
+            task_id: None,
+            run_id: None,
+            tool: "read_file".to_owned(),
+            args: serde_json::json!({}),
+            success: true,
+            exit_code: Some(0),
+            generation: "gen-1".to_owned(),
+            project_root_hash: root_hash.clone(),
+            served_from: None,
+            paths: vec![concerto_sessions::ObservedPath {
+                path: "src/main.rs".to_owned(),
+                size_bytes: Some(1024),
+                mtime_ms: Some(1),
+                content_hash: None,
+            }],
+        };
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "ev-arch-read".to_owned(),
+                agent_id: "architect".to_owned(),
+                kind: WhiteboardKind::ToolExecuted,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::to_value(executed_payload).expect("payload serializes"),
+                pre_image_hash: None,
+                created_at: 100,
+            },
+        )
+        .await
+        .expect("append author read fact");
+
+        let coordinator =
+            coordinator_with(EventBus::new(256), Arc::new(AgentRegistry::default()), "[]".into())
+                .with_review_store(Some(pool))
+                .with_workspace_snapshot(snapshot);
+        let cancel = CancellationToken::new();
+        let author = AgentId::new("architect");
+
+        // Grounded claim → Verified → active → the doc BINDS (enforced).
+        let grounded = DesignDoc {
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            proposed_files: vec![camino::Utf8PathBuf::from("src/main.rs")],
+            interface_sketch: String::new(),
+            risks: Vec::new(),
+        };
+        let verdict = coordinator
+            .verify_design_doc_claim(&grounded, Some(&author), session_id, &cancel)
+            .await
+            .expect("claim resolves");
+        assert_eq!(verdict.state, crate::design_doc_verifier::DesignDocState::Verified);
+        assert!(verdict.state.is_active(), "a verified doc must be a binding contract");
+        assert_eq!(verdict.contract_paths, vec!["src/main.rs"]);
+        assert_eq!(verdict.author_read_count, 1, "the author's read fact was counted");
+        coordinator.append_design_doc_events(session_id, Some(&author), &grounded, &verdict).await;
+
+        // Ungrounded claim → Quarantined → NOT active → the doc stays ADVISORY
+        // (the planner receives `binding_doc = None` and enforces nothing).
+        let hallucinated = DesignDoc {
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            proposed_files: vec![camino::Utf8PathBuf::from("src/hallucinated.rs")],
+            interface_sketch: String::new(),
+            risks: Vec::new(),
+        };
+        let verdict = coordinator
+            .verify_design_doc_claim(&hallucinated, Some(&author), session_id, &cancel)
+            .await
+            .expect("claim resolves");
+        assert_eq!(verdict.state, crate::design_doc_verifier::DesignDocState::Quarantined);
+        assert!(!verdict.state.is_active(), "a quarantined doc must stay passive");
+        assert!(verdict.contract_paths.is_empty(), "no contract paths from an ungrounded doc");
+        assert_eq!(verdict.reject_count, 1);
+        coordinator
+            .append_design_doc_events(session_id, Some(&author), &hallucinated, &verdict)
+            .await;
+
+        // Lifecycle (ADR-65 §5): both claims were recorded as `DesignDoc`
+        // events and each decision as a `Decision` event carrying the verdict
+        // state — verified for the grounded claim, quarantined for the other.
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            coordinator.review_store.as_ref().expect("review store attached"),
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        let claims: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::DesignDoc).collect();
+        assert_eq!(claims.len(), 2, "both claims recorded: {:?}", claims.len());
+        let decisions: Vec<_> =
+            events.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(decisions.len(), 2, "both decisions recorded: {:?}", decisions.len());
+        let states: Vec<Option<&str>> = decisions
+            .iter()
+            .map(|event| event.payload.get("state").and_then(|value| value.as_str()))
+            .collect();
+        assert!(
+            states.contains(&Some("verified")),
+            "the grounded claim's decision must be verified, got: {states:?}"
+        );
+        assert!(
+            states.contains(&Some("quarantined")),
+            "the ungrounded claim's decision must be quarantined, got: {states:?}"
+        );
+        for claim in &claims {
+            assert!(
+                decisions
+                    .iter()
+                    .any(|decision| decision.causation.as_deref() == Some(claim.event_id.as_str())),
+                "every claim event has a decision caused by it"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #56: the coordinator's decisions CONSUME the structured world
+    // model — a bounded rendered block rides the dispatch-decision prompt,
+    // and the dispatch decision query answers the verified-clean question.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A `call_specialist` tool call carrying model-supplied expected
+    /// artifacts (the advisory surface consumes them).
+    fn call_specialist_with_artifacts(agent_id: &str, task: &str, artifacts: &[&str]) -> ToolCall {
+        ToolCall {
+            id: format!("call-with-artifacts-{agent_id}"),
+            name: CALL_SPECIALIST_TOOL.to_string(),
+            arguments: serde_json::json!({
+                "agent_id": agent_id,
+                "task": task,
+                "expected_artifacts": artifacts,
+            }),
+
+            ..Default::default()
+        }
+    }
+
+    /// The displatch-decision prompt carries the structured world-model
+    /// block (issue acceptance: decisions consume the model), derived from
+    /// the session's real recorded facts — here one WriteApplied event the
+    /// test seeds into the evidence store — and the block stays within its
+    /// pinned character bound even when the model is large.
+    #[tokio::test]
+    async fn world_model_block_rides_the_dispatch_decision_prompt() {
+        let (_dir, pool) = resume_log_pool().await;
+        let session_id = Ulid::new();
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: "ev-write".to_owned(),
+                agent_id: "coder".to_owned(),
+                kind: WhiteboardKind::WriteApplied,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({ "input": { "path": "src/main.rs" } }),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("world-model fact appended");
+
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let mut coordinator = coordinator.with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(session_id, "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+        assert!(
+            output.final_message.contains("Multi-agent orchestration completed"),
+            "run completes: {}",
+            output.final_message
+        );
+
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 1, "one model turn (text-only script)");
+        let prompt = &prompts[0];
+        let Some(start) = prompt.find("<world_model>") else {
+            panic!("the dispatch-decision prompt must carry the world-model block: {prompt}")
+        };
+        let Some(end) = prompt.find("</world_model>") else {
+            panic!("the world-model block must close");
+        };
+        let block = &prompt[start..=end];
+        let block_chars = block.chars().count();
+        assert!(
+            block_chars <= crate::world_model::MAX_RENDER_CHARS,
+            "the pinned prompt bound: {block_chars} > {}",
+            crate::world_model::MAX_RENDER_CHARS
+        );
+        assert!(
+            prompt.contains("wrote src/main.rs by coder"),
+            "the block renders the session's real recorded facts"
+        );
+        assert!(
+            prompt.contains("status: Verified"),
+            "freshness statuses are explicit in the block (issue #56)"
+        );
+    }
+
+    /// The verified-clean consumption: a decision whose expected artifacts
+    /// were produced by the run's own completed work gets the deterministic
+    /// skip-recommendation advisory attached to its tool result — the world
+    /// model queried at decision time in a real decision path.
+    #[tokio::test]
+    async fn decision_advises_skip_for_completed_verified_artifacts() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::clone(&registry),
+            vec![
+                CoordinatorTurn::Calls(vec![test_write_tool_call("src/main.rs")]),
+                CoordinatorTurn::Calls(vec![call_specialist_with_artifacts(
+                    "coder",
+                    "re-implement the module",
+                    &["src/main.rs"],
+                )]),
+                CoordinatorTurn::Text("the artifact was already produced".into()),
+            ],
+        );
+        let mut coordinator = coordinator.with_executor(self_execute_executor());
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let _output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        while rx.try_recv().is_ok() {}
+
+        let prompts = provider.prompts();
+        assert!(
+            prompts.len() >= 3,
+            "two scripted tool turns plus the final text, got {}",
+            prompts.len()
+        );
+        // The advisory rides the call_specialist TOOL RESULT the model reads
+        // back (tool_results on the conversation's message list), not the
+        // first-message prompt text — inspect the captured requests.
+        let requests = provider.requests.lock().unwrap();
+        let advisory = requests
+            .iter()
+            .find_map(|request| {
+                request.messages.iter().find_map(|message| {
+                    message.tool_results.as_ref()?.iter().find_map(|result| {
+                        result
+                            .content
+                            .get("world_model")
+                            .and_then(serde_json::Value::as_object)
+                            .and_then(|world_model| {
+                                world_model.get("advisory").and_then(serde_json::Value::as_str)
+                            })
+                            .map(str::to_owned)
+                    })
+                })
+            })
+            .expect("the skip advisory reached the conversation");
+        assert!(
+            advisory.contains("verified clean in the world model"),
+            "the advisory names the world-model basis"
+        );
+        assert!(advisory.contains("src/main.rs"), "the advisory names the verified-clean artifact");
+    }
+
+    // ── Issue #63: declarative WAIT decisions ────────────────────────
+
+    /// Issue #63 acceptance (handler level): a wait whose `event-resolved`
+    /// condition ALREADY holds wakes with zero sleep. The tool result names
+    /// `outcome: woken`, the journaled Wait decision settles, the park
+    /// clears, and the wait's Decision record lands on the whiteboard as
+    /// real evidence (with its own gate_seq as the evidence cursor).
+    #[tokio::test]
+    async fn wait_handler_wakes_immediately_when_condition_holds() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        // The whiteboard log the wait's Decision record is written to (the
+        // checkpoint store from `coordinator_with_store` is a separate
+        // in-memory DB; the review store is the resume log pool).
+        let (_dir, pool) = resume_log_pool().await;
+        coordinator = coordinator.with_review_store(Some(pool.clone()));
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // The wait's target: an ALREADY-resolved subtask, so the first
+        // refine (before any sleep) trips the condition.
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("the artifact".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "review gate pending",
+                    "conditions": [{ "type": "event-resolved", "task_ids": [done.to_string()] }],
+                    "affected_task_ids": [done.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "woken", "immediate satisfaction wakes: {result}");
+        assert_eq!(result["reason"], "event-resolved", "the tripped condition is named: {result}");
+        let decision_id = result["decision_id"].as_str().expect("the result names the decision id");
+        let entry = coordinator
+            .decision_journal
+            .entries()
+            .iter()
+            .find(|entry| entry.id == decision_id)
+            .expect("the wait decision is journaled");
+        assert_eq!(entry.kind, crate::decisions::DecisionKind::Wait);
+        assert_eq!(entry.status, crate::decisions::DecisionStatus::Settled, "a woken wait settles");
+        assert!(coordinator.active_wait.is_none(), "the park clears after settle");
+
+        // The wait's Decision record is real evidence on the whiteboard.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: Some(session_id.to_string()),
+                scope: None,
+                limit: 200,
+            },
+        )
+        .await
+        .expect("the whiteboard loads");
+        let wait = logged
+            .iter()
+            .find(|event| event.payload["decision_kind"] == serde_json::json!("wait"))
+            .expect("a wait Decision event is recorded");
+        assert_eq!(wait.payload["reason"], "review gate pending");
+        assert_eq!(
+            wait.payload["affected_task_ids"],
+            serde_json::json!([done.to_string()]),
+            "wait payload mismatch: {}",
+            serde_json::to_string_pretty(&wait.payload).expect("payload is json")
+        );
+        // The marker's own gate_seq is the evidence cursor: the wait's
+        // Decision event is never counted as new evidence.
+        assert!(wait.gate_seq > 0, "the whiteboard stamps a positive gate_seq on the wait record");
+    }
+
+    /// Issue #63 acceptance (argument discipline): waits that cannot make
+    /// progress are rejected before ANY state mutation — no journal entry,
+    /// no ledger writes, no whiteboard record, no parked wait.
+    #[tokio::test]
+    async fn wait_handler_rejects_self_contradictory_and_over_bounded_waits() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let journal_before = coordinator.decision_journal.entries().len();
+
+        // No condition, no deadline: a park that can only run to the cap and
+        // then still-wait — self-contradictory, rejected before mutation.
+        let degenerate = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "reason": "waiting" }),
+            )
+            .await;
+        assert_eq!(degenerate["error"], "degenerate_wait", "{degenerate}");
+
+        // 33 affected ids (32 max): bounded, trimmed, re-decided.
+        let too_many: Vec<String> = (0..33).map(|_| Ulid::new().to_string()).collect();
+        let over_bounded = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "experimental wait",
+                    "conditions": [{ "type": "replan-or-cancel" }],
+                    "affected_task_ids": too_many,
+                }),
+            )
+            .await;
+        assert_eq!(
+            over_bounded["error"], "too_many_affected_ids",
+            "a wait may name at most {MAX_WAIT_AFFECTED_IDS} ids: {over_bounded}"
+        );
+
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            journal_before,
+            "rejected waits journal nothing"
+        );
+        assert!(coordinator.active_wait.is_none(), "rejected waits never park");
+        assert!(ledger.action_ledger.is_empty(), "rejected waits mutate no ledger: {ledger:?}");
+    }
+
+    /// Issue #63 acceptance (policy): the wait decision passes through the
+    /// run's policy engine exactly like any other coordinator operation —
+    /// a denial rejects the decision and never parks.
+    #[tokio::test]
+    async fn wait_handler_respects_policy_denial() {
+        let deny: Arc<dyn concerto_core::traits::policy::PolicyEngine> =
+            Arc::new(SimplePolicyEngine::new(
+                vec![PolicyRule::RequireApproval(Condition::Always)],
+                Arc::new(TestAudit),
+            ));
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the wait workspace");
+        let mut coordinator = coordinator_with_turns_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            deny,
+        );
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_wait(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "reason": "policy-gated wait",
+                    "conditions": [{ "type": "replan-or-cancel" }],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "policy_denied", "denials are structured: {result}");
+        let last = coordinator
+            .decision_journal
+            .entries()
+            .last()
+            .expect("the denied decision is still journaled");
+        assert_eq!(last.status, crate::decisions::DecisionStatus::Rejected);
+        assert!(coordinator.active_wait.is_none(), "a denied wait never parks");
+    }
+
+    // ── Issue #65: external workspace changes ─────────────────────────────
+
+    /// A real captured workspace: four files that exist at run start, so
+    /// each test's snapshot barrier captures a truthful invoice
+    /// (mtime/size/hash) to diff later edits against.
+    fn external_change_fixture(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/owned.rs"), b"v1\n").expect("owned.rs at start");
+        std::fs::write(root.join("src/held.rs"), b"v1\n").expect("held.rs at start");
+        std::fs::write(root.join("src/expected.rs"), b"v1\n").expect("expected.rs at start");
+        std::fs::write(root.join("src/unrelated.rs"), b"v1\n").expect("unrelated.rs at start");
+    }
+
+    /// Requirement (a/c/d): the live scan detects edits made DURING an
+    /// execution, excludes the run's own writes, and flags a gate-held path
+    /// or a planned artifact as a conflict while unrelated changes surface
+    /// conflict-free.
+    #[tokio::test]
+    async fn external_change_scan_detects_edits_during_execution_and_excludes_own_writes() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let cancel = CancellationToken::new();
+        external_change_fixture(workspace.path());
+
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+        // A path HOLD owned from a previous run (ownership is checkpointed):
+        // the gate owns it, but THIS run never wrote it.
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/held.rs".to_owned(),
+                owner: "coder".to_owned(),
+                acquiring_event_id: "ev-held".to_owned(),
+                acquired_at_ms: 1,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_workspace_snapshot(
+            crate::workspace_snapshot::run_snapshot_barrier(
+                None,
+                workspace.path(),
+                &Ulid::new().to_string(),
+                &cancel,
+            )
+            .await
+            .expect("snapshot re-captures for the coordinator"),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        // A graph whose coder role matches the held path's owner — the record
+        // attributes the conflict to the in-flight task.
+        let task_id = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: task_id,
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "held work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: Some("src/held.rs".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        // The run's own write set + a planned-artifact set.
+        let mut own_written: std::collections::HashSet<String> = std::collections::HashSet::new();
+        own_written.insert(
+            crate::tool_facts::canonical_project_path(workspace.path(), "src/owned.rs")
+                .expect("owned.rs canonicalizes"),
+        );
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        expected.insert(
+            crate::tool_facts::canonical_project_path(workspace.path(), "src/expected.rs")
+                .expect("expected.rs canonicalizes"),
+        );
+
+        // The user edits while the run is executing: the held path, an
+        // unrelated path, a planned artifact, and (invisibly to the run's
+        // write set accounting) a path the run DID write.
+        std::fs::write(workspace.path().join("src/held.rs"), b"v2 user edit on held\n")
+            .expect("external edit on held");
+        std::fs::write(workspace.path().join("src/unrelated.rs"), b"v2 unrelated edit\n")
+            .expect("external edit on unrelated");
+        std::fs::write(workspace.path().join("src/expected.rs"), b"v2 expected edit\n")
+            .expect("external edit on expected");
+        std::fs::write(workspace.path().join("src/owned.rs"), b"v2 owned edit\n")
+            .expect("edit on the run's own path");
+
+        let records =
+            coordinator.scan_external_changes(&graph, &own_written, &expected, &cancel).await;
+        let paths: Vec<&str> = records.iter().filter_map(|record| record.first_path()).collect();
+
+        assert_eq!(paths.len(), 3, "three external changes detected: {paths:?}");
+        assert!(
+            !paths.contains(&"src/owned.rs"),
+            "the run's OWN write is never classified external: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/expected.rs"),
+            "planned artifact change is external: {paths:?}"
+        );
+
+        let held = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/held.rs"))
+            .expect("the held path is recorded");
+        assert_eq!(held.known_owner.as_deref(), Some("coder"));
+        assert_eq!(held.known_task.as_deref(), Some(task_id.to_string().as_str()));
+        assert!(
+            held.conflicts_with_coordinator_work(),
+            "a held artifact changed externally conflicts"
+        );
+
+        let expected_record = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/expected.rs"))
+            .expect("the planned artifact is recorded");
+        assert_eq!(expected_record.known_owner, None);
+        assert!(
+            expected_record.conflicts_with_coordinator_work(),
+            "a planned artifact changed externally conflicts even without an owner"
+        );
+
+        let unrelated = records
+            .iter()
+            .find(|record| record.first_path() == Some("src/unrelated.rs"))
+            .expect("the unrelated change is recorded");
+        assert_eq!(unrelated.known_owner, None);
+        assert_eq!(unrelated.known_task, None);
+        assert!(
+            !unrelated.conflicts_with_coordinator_work(),
+            "an unrelated external change never conflicts"
+        );
+
+        // The upsert side: the scan's records land in coordinator state, the
+        // checkpoint projection carries them, and the world model surfaces
+        // them as risks.
+        for record in records {
+            coordinator.upsert_external_change(record);
+        }
+        assert_eq!(coordinator.external_changes.len(), 3);
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        assert_eq!(context.external_changes.len(), 3, "records ride the checkpoint context");
+    }
+
+    /// Requirement (b): the F3 resume reconciliation's external evidence
+    /// becomes explicit, conflict-flagged records instead of a one-shot
+    /// verdict — and re-detection of the same change upserts, not duplicates.
+    #[tokio::test]
+    async fn resume_f3_evidence_becomes_explicit_reconcilable_records() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let cancel = CancellationToken::new();
+        external_change_fixture(workspace.path());
+
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/held-resume.rs".to_owned(),
+                owner: "coder".to_owned(),
+                acquiring_event_id: "ev-held-resume".to_owned(),
+                acquired_at_ms: 1,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_workspace_snapshot(
+            crate::workspace_snapshot::run_snapshot_barrier(
+                None,
+                workspace.path(),
+                &Ulid::new().to_string(),
+                &cancel,
+            )
+            .await
+            .expect("snapshot re-captures for the coordinator"),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        let task_id = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: task_id,
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "held work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: Some("src/held-resume.rs".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        let change = resume::WorkspaceChange {
+            generation_mismatch: true,
+            externally_changed: vec![
+                ("src/held-resume.rs".to_owned(), Some("ev-1".to_owned())),
+                ("src/other.rs".to_owned(), None),
+            ],
+        };
+        coordinator
+            .record_resume_external_changes(
+                &change,
+                &graph,
+                Some("gen-checkpoint".to_owned()),
+                &cancel,
+            )
+            .await;
+
+        let held = coordinator
+            .external_changes
+            .iter()
+            .find(|record| record.first_path() == Some("src/held-resume.rs"))
+            .expect("the F3 evidence for the held path becomes a record");
+        assert_eq!(held.known_owner.as_deref(), Some("coder"));
+        assert_eq!(held.known_task.as_deref(), Some(task_id.to_string().as_str()));
+        assert!(held.conflicts_with_coordinator_work(), "held + changed externally conflicts");
+        assert_eq!(held.previous_generation.as_deref(), Some("gen-checkpoint"));
+
+        let other = coordinator
+            .external_changes
+            .iter()
+            .find(|record| record.first_path() == Some("src/other.rs"))
+            .expect("the unrelated F3 evidence becomes a record");
+        assert_eq!(other.known_owner, None);
+        assert!(!other.conflicts_with_coordinator_work(), "unrelated change never conflicts");
+
+        assert_eq!(coordinator.external_changes.len(), 2);
+
+        // A resumed run re-detects the SAME evidence (same previous
+        // generation): upsert dedups instead of accumulating duplicates.
+        coordinator
+            .record_resume_external_changes(
+                &change,
+                &graph,
+                Some("gen-checkpoint".to_owned()),
+                &cancel,
+            )
+            .await;
+        assert_eq!(
+            coordinator.external_changes.len(),
+            2,
+            "re-detecting the same change upserts, never duplicates"
+        );
+
+        // And the records ride the checkpoint projection (requirement 5).
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        assert_eq!(context.external_changes.len(), 2);
+        let checkpoint = crate::checkpoint::build_checkpoint(
+            &checkpoint::CheckpointScope {
+                run_id: Ulid::new(),
+                session_id: Ulid::new(),
+                root_task_id: TaskId::new(),
+                project_id: "test".into(),
+                objective: "test objective".into(),
+                objective_hash: "hash".into(),
+                source_revision: None,
+                sequence_num: 0,
+            },
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &concerto_core::memory::WorkingMemorySnapshot {
+                id: Ulid::new(),
+                session_id: Ulid::new(),
+                decisions: vec![],
+                task_tree: vec![],
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            &graph,
+            &HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &context,
+        );
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let restored =
+            crate::checkpoint::GraphCheckpoint::from_json(&json).expect("checkpoint loads");
+        assert_eq!(restored.external_changes.len(), 2, "records survive the checkpoint JSON");
+    }
+
+    // ── Issue #64: reconsider — supersede a decision + freeze its pending ──
+
+    /// A settled dispatch decision the model supersedes in these tests — the
+    /// journal is seeded before the handler runs so the call can cite a real
+    /// decision id deterministically.
+    fn settled_reconsider_target() -> crate::decisions::CoordinatorDecision {
+        crate::decisions::CoordinatorDecision {
+            id: "d-design".to_owned(),
+            kind: crate::decisions::DecisionKind::DispatchSpecialist,
+            target_agent: Some(AgentId::new("coder")),
+            task_description: "implement the design".to_owned(),
+            notes: None,
+            supporting_evidence_ids: vec![],
+            expected_artifacts: vec![],
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            status: crate::decisions::DecisionStatus::Settled,
+        }
+    }
+
+    /// Issue #64 acceptance: a reconsideration supersedes the seeded decision
+    /// and deterministically freezes ONLY the named pending task; completed
+    /// work stays byte-identical and the chain frontier resets.
+    #[tokio::test]
+    async fn reconsider_supersedes_a_decision_and_freezes_only_pending_tasks() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_reconsider_target());
+
+        let pending = TaskId::new();
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work under the superseded decision".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("reviewer"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled work".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state =
+            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(pending) };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "the settle showed the API assumption no longer holds",
+                    "affected_task_ids": [pending.to_string()],
+                    "notes": "re-plan under fresh decisions",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "reconsidered", "structured success: {result}");
+        assert_eq!(result["superseded_decision_id"], "d-design");
+        assert_eq!(result["frozen"][0], pending.to_string(), "{result}");
+        // The pending task is frozen (Blocked + tombstone); completed work
+        // and its deliverable are untouched.
+        let frozen = graph.get(&pending).expect("the frozen task stays in the graph");
+        assert_eq!(frozen.status, SubTaskStatus::Blocked, "frozen pending work is Blocked");
+        assert!(frozen.completed_at.is_some(), "a Blocked task carries a tombstone");
+        let settled = graph.get(&done).expect("the completed task is not touched");
+        assert_eq!(settled.status, SubTaskStatus::Completed);
+        assert_eq!(settled.deliverable.as_deref(), Some("settled work"));
+        assert!(TaskGraphValidator::validate(&graph).is_ok(), "the DAG stays valid");
+        // The trail: target decision Superseded, the reconsider decision
+        // settles, and the ledger records the reconsideration.
+        let entries = coordinator.decision_journal.entries();
+        let superseded = entries.iter().find(|entry| entry.id == "d-design").expect("target entry");
+        assert_eq!(superseded.status, crate::decisions::DecisionStatus::Superseded);
+        let reconsider = entries.last().expect("the reconsider decision is journaled");
+        assert!(matches!(reconsider.kind, crate::decisions::DecisionKind::Reconsider));
+        assert!(matches!(
+            reconsider.transform,
+            Some(crate::task_transform::TaskTransformSpec::Freeze { .. })
+        ));
+        assert_eq!(reconsider.status, crate::decisions::DecisionStatus::Settled);
+        assert!(
+            ledger.action_ledger.iter().any(|action| action.kind == "reconsidered"),
+            "the ledger mirrors the reconsideration: {ledger:?}"
+        );
+        // The frontier that pointed at a frozen task resets — the frozen node
+        // is never the chain parent of the next dispatch.
+        assert_eq!(state.last_node, None);
+    }
+
+    /// Issue #64: the structured rejections — absence of the cited decision,
+    /// an already-rejected target, and malformed arguments. Every rejection
+    /// journals nothing and mutates nothing.
+    #[tokio::test]
+    async fn reconsider_rejects_unknown_rejected_and_malformed_inputs() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let mut graph = TaskGraph::new();
+        let pending = TaskId::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+
+        // Unknown decision id: nothing in this run's journal, structured
+        // rejection, nothing journaled, nothing mutated.
+        let unknown = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "no-such-decision",
+                    "reason": "reconsider",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_decision", "{unknown}");
+        assert_eq!(coordinator.decision_journal.entries().len(), 0, "rejections journal nothing");
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Pending);
+
+        // An already-rejected target has nothing in operation to supersede.
+        let mut rejected = settled_reconsider_target();
+        rejected.status = crate::decisions::DecisionStatus::Rejected;
+        coordinator.decision_journal.record(rejected);
+        let not_reconsiderable = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider anyway",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+        assert_eq!(
+            not_reconsiderable["error"], "decision_not_reconsiderable",
+            "{not_reconsiderable}"
+        );
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            1,
+            "rejections journal nothing beyond the seeded entry"
+        );
+
+        // A second, still-operational target: the purely-malformed cases must
+        // fail on the arguments themselves, not on the journal lookup.
+        let mut operational = settled_reconsider_target();
+        operational.id = "d-other".to_owned();
+        coordinator.decision_journal.record(operational);
+
+        // Malformed arguments: missing reason / no affected ids / non-ULID.
+        for arguments in [
+            serde_json::json!({ "decision_id": "d-other", "affected_task_ids": [pending.to_string()] }),
+            serde_json::json!({ "decision_id": "d-other", "reason": "reconsider" }),
+            serde_json::json!({
+                "decision_id": "d-other",
+                "reason": "reconsider",
+                "affected_task_ids": ["not-a-ulid"],
+            }),
+        ] {
+            let malformed = coordinator
+                .handle_reconsider(
+                    &mut graph,
+                    &task,
+                    &context,
+                    &CancellationToken::new(),
+                    &mut scope,
+                    &mut ledger,
+                    &mut state,
+                    &arguments,
+                )
+                .await;
+            assert_eq!(malformed["error"], "invalid_arguments", "{malformed}");
+        }
+        assert_eq!(
+            coordinator.decision_journal.entries().len(),
+            2,
+            "malformed calls never reach validation"
+        );
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Pending);
+        assert!(ledger.action_ledger.is_empty());
+    }
+
+    /// Issue #64: freezing completed work is a deterministic rejection — the
+    /// reconsider decision records as Rejected and no task state changes.
+    #[tokio::test]
+    async fn reconsider_rejects_freezing_completed_work() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_reconsider_target());
+
+        let done = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: done,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "settled work".into(),
+            status: SubTaskStatus::Completed,
+            dependencies: vec![],
+            deliverable: Some("settled work".into()),
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: Some(time::OffsetDateTime::now_utc()),
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider",
+                    "affected_task_ids": [done.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "not_freezeable", "structured rejection: {result}");
+        // The completed task is untouched — the freeze never fires.
+        let settled = graph.get(&done).expect("the completed task stays");
+        assert_eq!(settled.status, SubTaskStatus::Completed);
+        assert_eq!(settled.deliverable.as_deref(), Some("settled work"));
+        // The rejected reconsider decision is journaled as Rejected; the
+        // target decision keeps its status (nothing was superseded).
+        let entries = coordinator.decision_journal.entries();
+        assert_eq!(entries.len(), 2);
+        let reconsider = entries.last().expect("the reconsider decision is journaled");
+        assert_eq!(reconsider.status, crate::decisions::DecisionStatus::Rejected);
+        assert!(ledger.action_ledger.is_empty(), "a rejected freeze mutates no ledger");
+    }
+
+    /// Issue #64: re-reconsidering an already-superseded decision is
+    /// idempotent — the re-mark is a forward-only no-op and freezing the
+    /// already-frozen task re-applies harmlessly.
+    #[tokio::test]
+    async fn reconsider_is_idempotent_on_an_already_superseded_target() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut target = settled_reconsider_target();
+        target.status = crate::decisions::DecisionStatus::Superseded;
+        coordinator.decision_journal.record(target);
+
+        let pending = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-design",
+                    "reason": "reconsider again",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            result["outcome"], "reconsidered",
+            "a repeated reconsider is not an error: {result}"
+        );
+        assert_eq!(graph.get(&pending).expect("task").status, SubTaskStatus::Blocked);
+        assert_eq!(
+            coordinator
+                .decision_journal
+                .entries()
+                .iter()
+                .find(|entry| entry.id == "d-design")
+                .expect("target entry")
+                .status,
+            crate::decisions::DecisionStatus::Superseded,
+            "the Superseded mark is stable"
+        );
+    }
+
+    // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────
+
+    /// A gate over the coordinator's own hermetic pool + workspace root,
+    /// with FilesystemTool wired so writes materialize.
+    async fn transfer_test_gate(
+        pool: sqlx::SqlitePool,
+        root: &std::path::Path,
+    ) -> Arc<crate::gate::WriteGate> {
+        let policy: Arc<dyn concerto_core::traits::policy::PolicyEngine> =
+            Arc::new(SimplePolicyEngine::new(
+                vec![PolicyRule::AutoApprove(Condition::Always)],
+                Arc::new(TestAudit),
+            ));
+        let mut registry = concerto_core::types::ToolRegistry::default();
+        registry.register(Box::new(concerto_tools::filesystem::FilesystemTool::new(
+            camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+                .expect("workspace root is utf-8"),
+        )));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy.clone()));
+        Arc::new(crate::gate::WriteGate::new(
+            policy,
+            executor,
+            pool,
+            Arc::new(crate::gate::FilePreImageReader::new(root.to_path_buf())),
+            root.to_path_buf(),
+            1,
+        ))
+    }
+
+    /// Issue #61: the mediated transfer flow — request → validation (typed
+    /// `TransferOwnership` decision) → whiteboard Decision event → gate
+    /// transfer → the receiving agent may write, the former owner may not.
+    #[tokio::test]
+    async fn transfer_ownership_mediation_moves_an_owned_artifact_to_the_receiving_agent() {
+        use concerto_core::CancellationToken;
+
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+
+        // agent-a's first write auto-acquires ownership.
+        let acquire = crate::gate::GateRequest {
+            call_id: "med-1".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            tool: "filesystem".to_owned(),
+            input: serde_json::json!({
+                "operation": "write", "path": "shared.txt", "content": "v1"
+            }),
+            session_id: None,
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: std::collections::BTreeMap::new(),
+        };
+        gate.submit(acquire, CancellationToken::new()).await.expect("owner acquires");
+        assert_eq!(gate.ownership_owner("shared.txt").as_deref(), Some("agent-a"));
+
+        // A coordinator over the same pool + gate, with a roster holding the
+        // receiver.
+        let bus = EventBus::new(16);
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let registry = AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("agent-b"),
+            "received",
+        )]);
+        let coordinator = CoordinatorAgent::new(
+            Arc::new(registry),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            Arc::new(MockProvider::default())
+                as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_policy_engine(Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Arc::new(TestAudit),
+        )))
+        .with_review_store(Some(pool.clone()))
+        .with_write_gate(Some(gate.clone()));
+        let mut coordinator = coordinator;
+
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "mediation");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let result = coordinator
+            .handle_transfer_ownership(
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &serde_json::json!({
+                    "agent_id": "agent-b",
+                    "expected_artifacts": ["shared.txt"],
+                    "notes": "agent-b owns the next revision",
+                }),
+            )
+            .await;
+        assert_eq!(result["outcome"], serde_json::json!("settled"));
+        assert_eq!(result["transferred"], serde_json::json!(["shared.txt"]));
+        assert!(result["rejected"].as_array().map(Vec::is_empty).unwrap_or(true));
+        assert_eq!(gate.ownership_owner("shared.txt").as_deref(), Some("agent-b"));
+        let decision_id = result["decision_id"].as_str().expect("decision id");
+        assert!(
+            coordinator.decision_journal.entries().iter().any(|entry| entry.id == decision_id),
+            "the mediation is journaled"
+        );
+
+        // The typed Decision event (audit) carries a real id and the marker.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("log loads");
+        let transfer_decision = logged
+            .iter()
+            .find(|event| event.payload.get("transfer_mediation") == Some(&serde_json::json!(true)))
+            .expect("transfer decision recorded");
+
+        // The transferred record's acquiring event is the decision event id.
+        let records = gate.ownership_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].acquiring_event_id, transfer_decision.event_id);
+        assert_eq!(records[0].owner, "agent-b");
+    }
+
+    /// Issue #61: settle release — when a subtask settles (completed /
+    /// failed / cancelled), the coordinator releases the role's leases
+    /// (evented) so the artifacts go back on the table.
+    #[tokio::test]
+    async fn subtask_settle_releases_the_role_ownerships_and_audits_the_release() {
+        use concerto_core::CancellationToken;
+
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let (_dir, pool) = resume_log_pool().await;
+        let gate = transfer_test_gate(pool.clone(), workspace.path()).await;
+
+        let acquire = crate::gate::GateRequest {
+            call_id: "srel-1".to_owned(),
+            agent_id: "coder".to_owned(),
+            tool: "filesystem".to_owned(),
+            input: serde_json::json!({
+                "operation": "write", "path": "multi.txt", "content": "v1"
+            }),
+            session_id: None,
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: std::collections::BTreeMap::new(),
+        };
+        gate.submit(acquire, CancellationToken::new()).await.expect("owner acquires");
+        assert_eq!(gate.ownership_owner("multi.txt").as_deref(), Some("coder"));
+
+        let bus = EventBus::new(16);
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let coordinator = CoordinatorAgent::new(
+            Arc::new(AgentRegistry::new()),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            Arc::new(MockProvider::default())
+                as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_write_gate(Some(gate.clone()));
+
+        // The settle path (completed / failed / cancelled alike) releases.
+        coordinator
+            .settle_release_task_ownership(&AgentId::new("coder"), "subtask settled: failed")
+            .await;
+        assert_eq!(
+            gate.ownership_owner("multi.txt"),
+            None,
+            "a settled subtask's leases go back on the table"
+        );
+
+        // The release is audited with an ownership-event row.
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("log loads");
+        let release = logged
+            .iter()
+            .find(|event| {
+                event.kind == concerto_sessions::whiteboard::WhiteboardKind::OwnershipEvent
+            })
+            .expect("the release is audited");
+        assert_eq!(
+            release.payload.get("reason"),
+            Some(&serde_json::json!("subtask settled: failed"))
+        );
+    }
+
+    /// Issue #61: the ownership table round-trips through the checkpoint
+    /// projection and a resume restores it into a fresh gate.
+    #[tokio::test]
+    async fn ownership_survives_checkpoint_projection_and_resume_restore() {
+        let gate = transfer_test_gate(
+            sqlx::pool::PoolOptions::new()
+                .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true)),
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        // Direct-table acquires (no submissions needed for the projection
+        // shape): rely on the ownership table API for the checkpoint data.
+        gate.restore_ownership_state(&crate::ownership::OwnershipState {
+            records: vec![crate::ownership::OwnershipRecord {
+                artifact: "src/main.rs".into(),
+                owner: "coder".into(),
+                acquiring_event_id: "w-1".into(),
+                acquired_at_ms: 7,
+                status: crate::ownership::OwnershipStatus::Owned,
+            }],
+        });
+
+        let bus = EventBus::new(16);
+        let spend_tracker = Arc::new(SpendTracker::default());
+        let routing = Arc::new(RoutingEngine::new(
+            vec![],
+            spend_tracker.clone(),
+            concerto_config::ModelPinConfig::default(),
+            EventBus::default(),
+        ));
+        let model_selector =
+            Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(vec![])), routing));
+        let coordinator = CoordinatorAgent::new(
+            Arc::new(AgentRegistry::new()),
+            AgentRunner::new(Arc::new(AgentRegistry::new()), bus.clone(), spend_tracker.clone()),
+            model_selector,
+            spend_tracker.clone(),
+            bus.clone(),
+            Arc::new(MockProvider::default())
+                as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            Arc::new(ForbiddenMemoryStore),
+        )
+        .with_write_gate(Some(gate.clone()));
+        let saved = coordinator.ownership_state();
+        assert_eq!(saved.records.len(), 1);
+        let json = serde_json::to_string(&saved).expect("ownership serializes");
+
+        // Resume: a fresh gate (new run) restores the projection.
+        let restored_gate = transfer_test_gate(
+            sqlx::pool::PoolOptions::new()
+                .connect_lazy_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true)),
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        let state: crate::ownership::OwnershipState =
+            serde_json::from_str(&json).expect("ownership deserializes");
+        restored_gate.restore_ownership_state(&state);
+        let record = restored_gate.ownership_records().first().expect("restored record").clone();
+        assert_eq!(record.artifact, "src/main.rs");
+        assert_eq!(record.owner, "coder");
+        assert_eq!(record.acquiring_event_id, "w-1");
+        assert_eq!(restored_gate.ownership_owner("src/main.rs").as_deref(), Some("coder"));
+        let _ = gate; // silence moved-value lint chafing
     }
 }

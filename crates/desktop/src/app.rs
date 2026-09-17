@@ -13,6 +13,9 @@ use crate::widgets::circuit_background;
 use crate::services::session_handler::DesktopSessionHandler;
 use crate::views::memory::MemoryStatus;
 use crate::views::spend::CapUiState;
+use crate::views::studio_runtime::{
+    CheckpointStudioRuntimeReader, StudioRuntimeReader, StudioRuntimeSnapshot,
+};
 use camino::Utf8PathBuf;
 use concerto_config::AppConfig;
 use concerto_config::CredentialStore;
@@ -34,15 +37,15 @@ use concerto_orchestrator::runtime_runner::{
     init_memory_system, memory_enabled, run_shared_agent, ActiveMemoryServices,
 };
 use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
+use concerto_plugins::manager::SharedPluginManager;
 use concerto_providers::factory::ProviderFactory;
 use concerto_providers::provider_defs::{
-    model_options_for, provider_definition, provider_readiness,
+    picker_model_options, provider_definition, provider_readiness,
 };
 use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ui::feedback::{ToastLevel, ToastManager};
@@ -122,6 +125,21 @@ pub enum Message {
     AgentGraph(views::agent_graph::Message),
     Terminal(views::terminal::Message),
     OrchestrationStudio(views::orchestration_studio::StudioMessage),
+    /// Read-only observability snapshot loaded from the session's persisted
+    /// orchestration checkpoint when the Runtime modal (Ctrl+R) or the Studio
+    /// opens. The `Option<Ulid>` is the session the load was for, so a result
+    /// arriving after the active session changed is discarded.
+    StudioRuntimeLoaded(Option<Ulid>, Box<StudioRuntimeSnapshot>),
+    /// Explicit import action (global-only orchestration enforcement): copy
+    /// the ignored project-layer orchestration keys
+    /// (`[orchestration]`, `[multi_agent.custom_agents]`,
+    /// `[multi_agent.model_pins]`) into the GLOBAL config via the
+    /// merge-aware atomic seams, remove them from the project file, then
+    /// reload. One user action, logged + toasted; never silent.
+    ImportProjectOrchestration,
+    /// Session-scoped dismissal of the project orchestration import banner:
+    /// hidden until the next launch (not persisted).
+    DismissOrchestrationBanner,
     Editor(views::code_editor::Message),
     ThemeChanged,
     HelpToggled,
@@ -168,6 +186,10 @@ pub enum Message {
     GitSummaryLoaded(Option<concerto_tools::git::RepositorySummary>),
     /// Result of a manual memory re-index (triggered from the Memory view).
     ReindexResult(ReindexResult),
+    /// Result of a post-SaveSettings plugin re-discovery pass against the
+    /// retained plugin manager (log-only today; kept as a message so the task
+    /// can later surface per-plugin outcomes without changing the wiring).
+    PluginProvidersRefreshed,
     MemoryEntriesLoaded(Result<Vec<views::memory::MemoryRow>, String>),
     MemoryEntryDeleted {
         id: String,
@@ -272,6 +294,12 @@ pub struct App {
     /// Project-scoped memory services (store, indexer, sync, cancel).
     /// Switched when the active project changes.
     pub memory_services: Arc<Mutex<Option<ActiveMemoryServices>>>,
+    /// Process-lifetime WASM plugin-manager handle (plugin liveness). Passed
+    /// to every run's `ServicesBuilder` and shared with the Settings state so
+    /// the revoke and provider re-refresh paths act on the same plugin
+    /// instances a running agent uses. The manager itself is materialised on
+    /// the first agent run (its epoch ticker needs a tokio runtime context).
+    pub plugin_manager: SharedPluginManager,
     pub cancel_token: concerto_core::CancellationToken,
     pub run_status: RunStatus,
     /// Current intent-router stage of the active run (ADR-55 Phase 2a),
@@ -294,6 +322,13 @@ pub struct App {
     /// Passed to `AgentRunRequest` on the next submit so the coordinator can
     /// resume the graph without re-architecting.
     pub resume_checkpoint_json: Option<String>,
+
+    /// ADR-60 D7 (interrupt-safe resume): bumped every time an in-flight run
+    /// settles (completion, failure, or the unwind after cancellation). The
+    /// window-close handler (project shell) polls this epoch to wait,
+    /// bounded, for the run's checkpoint to persist before the process
+    /// exits.
+    pub run_settle_epoch: Arc<AtomicU64>,
 
     /// Shared VirtualFs — the agent writes to this, and the diff viewer
     /// reads from it to show proposed changes and applies rejections.
@@ -410,6 +445,18 @@ pub struct App {
     /// (set alongside `pending_root_consent` when a tree session click is
     /// gated, or before an ungated switch from the tree).
     pub pending_tree_session: Option<String>,
+    /// Global-only orchestration enforcement (2026-09): the keys the project
+    /// config declares that the load path now IGNORES (the `[orchestration]`
+    /// table, `[multi_agent.custom_agents]`, `[multi_agent.model_pins]`).
+    /// Recomputed from the raw project file on every config reconcile; drives
+    /// the Studio import banner until the keys are relocated by the explicit
+    /// import action or the banner is dismissed for this session.
+    pub project_orchestration_keys: Vec<String>,
+    /// Session-scoped dismissal of the import banner: a dismissal hides the
+    /// banner until the next launch (new `App` instance) — never persisted,
+    /// and re-arming only when the declared keys change shape is neither
+    /// tracked nor needed (the keys list itself refreshes on reconcile).
+    pub orchestration_banner_dismissed: bool,
     /// Toast notification manager for user-facing errors and confirmations.
     pub toasts: ToastManager,
 }
@@ -640,6 +687,22 @@ fn orchestration_hides_relationships(config: &AppConfig) -> bool {
     config.orchestration.is_some()
 }
 
+/// Whether a provider is eligible for live model discovery: its type supports
+/// it and any required credential is present.
+///
+/// Shared by startup auto-discovery and the save-triggered pass so the two
+/// readiness gates can never drift. A provider type whose discovery is
+/// unsupported, or which needs a credential that is not stored, is skipped.
+fn provider_discovery_ready(
+    provider: &concerto_config::ProviderConfig,
+    credentials: &CredentialStore,
+) -> bool {
+    let definition = provider_definition(&provider.provider);
+    definition.supports_discovery()
+        && (!definition.requires_credential()
+            || provider.api_key(credentials).map(|key| !key.is_empty()).unwrap_or(false))
+}
+
 impl App {
     /// Best-effort persist of the current agent-graph view state to the active
     /// session's file. A write failure must never break the UI, so errors are
@@ -719,6 +782,10 @@ impl App {
             .map(|settings| settings.default_enabled)
             .unwrap_or(false);
         let initial_session_cap = initial_config.session_spend_cap_usd;
+        // Process-lifetime plugin-manager handle: shared with the Settings
+        // state (revoke) and passed to every run's ServicesBuilder (liveness).
+        // The inner manager is materialised on the first agent run.
+        let plugin_manager = concerto_plugins::manager::new_shared_plugin_manager();
         let mut app = Self {
             page: Page::Chat,
             current_theme: theme,
@@ -729,7 +796,9 @@ impl App {
             tool_log: views::tool_log::State::new(),
             settings: {
                 let cfg = global_config.clone();
-                views::settings::State::from_config(&cfg)
+                let mut state = views::settings::State::from_config(&cfg);
+                state.with_plugin_manager(plugin_manager.clone());
+                state
             },
             agent_graph: views::agent_graph::State::new(),
             terminal: {
@@ -751,6 +820,7 @@ impl App {
             config: Some(initial_config),
             global_config,
             memory_services: Arc::new(Mutex::new(None)),
+            plugin_manager,
             cancel_token: CancellationToken::new(),
             run_status: RunStatus::Idle,
             run_stage: None,
@@ -795,6 +865,9 @@ impl App {
             multi_agent: initial_multi_agent,
             fast: false,
             resume_checkpoint_json: None,
+            run_settle_epoch: Arc::new(AtomicU64::new(0)),
+            project_orchestration_keys: Vec::new(),
+            orchestration_banner_dismissed: false,
             toasts: ToastManager::new(),
         };
         // Spec §6 (startup-fallback toast): when config loading fell back to
@@ -808,6 +881,7 @@ impl App {
                 "Orchestration config fallback: loaded defaults due to load failure.".to_string(),
             );
         }
+        app.refresh_project_orchestration_keys();
         if let Some(config) = app.config.clone() {
             app.orchestration_studio.load_from_config(&config);
         }
@@ -826,22 +900,11 @@ impl App {
         // startup so the unified picker (and per-provider lists) are populated
         // without any manual "refresh" action (Option-1: configure providers,
         // models flow in automatically).
+        let discovery_credentials = CredentialStore::new();
         let ready_ids: Vec<String> = app
             .runtime_providers()
             .iter()
-            .filter(|p| {
-                let def = provider_definition(&p.provider);
-                if !def.supports_discovery() {
-                    return false;
-                }
-                if def.requires_credential() {
-                    let creds = CredentialStore::new();
-                    if !p.api_key(&creds).map(|k| !k.is_empty()).unwrap_or(false) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|p| provider_discovery_ready(p, &discovery_credentials))
             .map(|p| p.id.clone())
             .collect();
         let mut discovery_tasks = Vec::new();
@@ -890,12 +953,13 @@ impl App {
                     }
                 }
                 if page == Page::OrchestrationStudio {
-                    // ADR-58/59 (rewritten) Slice 2 (first-run bootstrap): auto-seed the
-                    // orchestration roster into the PROJECT config before the
-                    // Studio first renders, so the blueprint surface is active
-                    // from the very first open — no splash, no manual init.
-                    // Idempotent: a config that already owns its roster is
-                    // never touched.
+                    // ADR-58/59 (rewritten) Slice 2 (first-run bootstrap), AMENDED
+                    // (global-only orchestration): auto-seed the orchestration
+                    // roster into the GLOBAL config before the Studio first
+                    // renders, so the blueprint surface is active from the very
+                    // first open — no splash, no manual init. Idempotent: a
+                    // config that already owns its roster is never touched, and
+                    // no project `.concerto.toml` is ever created here.
                     self.ensure_orchestration_seeded();
                     // Do not replace an in-progress Studio draft when the user
                     // briefly visits another page. Saved state may be reloaded
@@ -910,6 +974,11 @@ impl App {
                     // (only updates dropdown options, not agent assignments).
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
+                    // Read-only Coordinator 2.0 observability: refresh the
+                    // runtime snapshot from the active session's persisted
+                    // checkpoint. No polling — Studio open and the Runtime
+                    // modal (Ctrl+R) are the only triggers.
+                    return self.load_studio_runtime();
                 }
                 iced::Task::none()
             }
@@ -928,6 +997,12 @@ impl App {
                 if sub_view == views::chat::SubView::SpendLog {
                     return self.load_spend_log();
                 }
+                // Opening the Runtime modal refreshes the active session's
+                // read-only observability snapshot through the existing
+                // checkpoint reader (idempotent re-open).
+                if sub_view == views::chat::SubView::Runtime {
+                    return self.load_studio_runtime();
+                }
                 iced::Task::none()
             }
             Message::OpenSpendLog => {
@@ -936,6 +1011,7 @@ impl App {
             Message::Shortcut(shortcut) => self.handle_shortcut(shortcut),
             Message::AgentRunCompleted(session_id, res) => {
                 self.run_status = RunStatus::Idle;
+                self.note_run_settled();
                 // ADR-57 §3a: memory teardown may have been deferred while the
                 // run was active (a config edit that disables memory is not
                 // hot-applied mid-run); the run is over, so complete it now.
@@ -1244,6 +1320,12 @@ impl App {
                 }
                 iced::Task::none()
             }
+            Message::PluginProvidersRefreshed => {
+                // Log-only outcome (the refresh task logs its own results);
+                // kept as a message so future UI feedback needs no wiring
+                // change.
+                iced::Task::none()
+            }
             Message::MemoryEntryDeleted { id, result } => {
                 match result {
                     Ok(()) => self.memory.remove_entry(&id),
@@ -1346,7 +1428,15 @@ impl App {
                     // or model-discovery results).
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
-                    task
+                    // Populate model lists for any provider added by this save
+                    // that has never been fetched, so it is usable immediately
+                    // (no manual refresh / restart). Computed before the
+                    // immutable plugin-refresh call below.
+                    let discovery_task = self.discover_unfetched_models();
+                    // Plugin liveness: after a save (which may have added a
+                    // provider or dropped a `.wasm` into the search path),
+                    // re-discover plugins in the retained manager. Log-only.
+                    iced::Task::batch(vec![task, self.refresh_plugin_providers(), discovery_task])
                 }
                 views::settings::Message::ProviderModelsRefreshed {
                     provider_id,
@@ -1361,6 +1451,7 @@ impl App {
                     // Drop results for a provider that was deleted meanwhile.
                     if !self.runtime_providers().iter().any(|p| p.id == *provider_id) {
                         self.pending_refresh.remove(provider_id);
+                        self.settings.end_provider_refresh(provider_id);
                         return iced::Task::none();
                     }
                     self.pending_refresh.remove(provider_id);
@@ -1387,22 +1478,53 @@ impl App {
                         .sync_models(self.settings.cached_models_by_provider());
                     task
                 }
+                views::settings::Message::ProviderModelsRefreshRequested(provider_id) => {
+                    // Manual per-provider model refresh. Only live rows whose
+                    // provider type actually supports discovery get a tracked
+                    // request; anything else (stale id, deleted mid-flight) is
+                    // a silent no-op.
+                    let supported = self.runtime_providers().iter().any(|p| {
+                        p.id == *provider_id
+                            && provider_definition(&p.provider).supports_discovery()
+                    });
+                    if !supported {
+                        return iced::Task::none();
+                    }
+                    self.settings.begin_provider_refresh(provider_id);
+                    let provider_id = provider_id.clone();
+                    self.refresh_seq = self.refresh_seq.wrapping_add(1);
+                    let req_id = self.refresh_seq;
+                    self.pending_refresh.insert(provider_id.clone(), req_id);
+                    self.fetch_models_for_provider(provider_id, req_id)
+                }
                 _ => self.settings.update(msg).map(Message::Settings),
             },
             Message::AgentGraph(msg) => self.agent_graph.update(msg).map(Message::AgentGraph),
             Message::Terminal(msg) => {
                 self.terminal.update(msg, &self.current_theme).map(Message::Terminal)
             }
+            Message::ImportProjectOrchestration => {
+                self.run_project_orchestration_import();
+                iced::Task::none()
+            }
+            Message::DismissOrchestrationBanner => {
+                self.orchestration_banner_dismissed = true;
+                iced::Task::none()
+            }
             Message::OrchestrationStudio(msg) => {
-                // ADR-58/59 (rewritten) Slice 2 (single-arm Save): `SaveOrchestration`
-                // persists the Studio's editable blueprint via
-                // `persist_orchestration`, which routes by the loaded
-                // selection's source (inline → rewrite in the config, include
-                // → guarded include write, name → materialize inline into the
-                // project config), validates, writes, and reloads — never
-                // navigating, never switching the surface, and never touching
-                // the global config. There is no init path anymore: the roster
-                // auto-seeds on Studio open.
+                // ADR-58/59 (rewritten) Slice 2 (single-arm Save), AMENDED
+                // (global-only orchestration): `SaveOrchestration` persists
+                // the Studio's editable blueprint via `persist_orchestration`,
+                // which writes to the GLOBAL config (include → guarded include
+                // write, name/inline → materialize inline into the global
+                // config) + the roster to the global config, validates,
+                // writes, and reloads — never navigating, never switching the
+                // surface, and never creating a project `.concerto.toml`
+                // (project-layer orchestration keys are now ignored at load;
+                // a Save is refused while a project file still declares
+                // `[orchestration]` — the banner import owns the relocation).
+                // There is no init path anymore: the
+                // roster auto-seeds globally on Studio open.
                 let persist =
                     matches!(msg, views::orchestration_studio::StudioMessage::SaveOrchestration);
                 let task = self.orchestration_studio.update(msg);
@@ -1422,6 +1544,14 @@ impl App {
                     }
                 }
                 task
+            }
+            Message::StudioRuntimeLoaded(session_id, snapshot) => {
+                // Discard a stale load: only apply the snapshot whose session
+                // still matches the active one.
+                if session_id == self.active_session_id {
+                    self.orchestration_studio.set_runtime_snapshot(*snapshot);
+                }
+                iced::Task::none()
             }
             Message::Editor(msg) => self
                 .editor
@@ -1889,6 +2019,16 @@ impl App {
                 self.update(Message::SetSubView(new_sub))
             }
             Shortcut::Terminal => self.update(Message::ToggleTerminalPanel),
+            Shortcut::RuntimePanels => {
+                let new_sub = if self.page == Page::Chat
+                    && self.chat.sub_view == views::chat::SubView::Runtime
+                {
+                    views::chat::SubView::Main
+                } else {
+                    views::chat::SubView::Runtime
+                };
+                self.update(Message::SetSubView(new_sub))
+            }
             Shortcut::UndoRun => {
                 // On the Editor page with an open file, Ctrl+Z is text undo.
                 if self.page == Page::Editor && self.editor.active_file().is_some() {
@@ -1937,6 +2077,11 @@ impl App {
                 self.show_help = false;
                 // Esc also dismisses the Memory explorer modal.
                 self.memory_view_open = false;
+                // Esc dismisses the Runtime panels modal (memory-modal parity;
+                // the Diff / Tool Log overlays stay close-button-only).
+                if self.page == Page::Chat && self.chat.sub_view == views::chat::SubView::Runtime {
+                    return self.update(Message::SetSubView(views::chat::SubView::Main));
+                }
                 // On the Editor page, Esc also dismisses the find/goto bars.
                 if self.page == Page::Editor {
                     let close_find =
@@ -2024,23 +2169,14 @@ impl App {
             .unwrap_or(&[])
     }
 
+    /// Model names selectable for the active provider in the chat header,
+    /// resolved through the shared picker resolver (selected / default / known
+    /// / discovered / config-first `extra_models`) so every picker agrees.
     fn runtime_model_names(&self, provider_id: &str) -> Vec<String> {
         self.runtime_providers()
             .iter()
             .find(|provider| provider.id == provider_id)
-            .map(|provider| {
-                let definition = provider_definition(&provider.provider);
-                let mut models = model_options_for(provider, &definition, None);
-                let mut seen =
-                    models.iter().map(|model| model.to_lowercase()).collect::<HashSet<_>>();
-                for model in &provider.cached_models {
-                    let model = model.trim().to_string();
-                    if !model.is_empty() && seen.insert(model.to_lowercase()) {
-                        models.push(model);
-                    }
-                }
-                models
-            })
+            .map(picker_model_options)
             .unwrap_or_default()
     }
 
@@ -2138,6 +2274,7 @@ impl App {
             let bus = self.bus.clone();
             let config = cfg.clone();
             let memory = self.memory_services.clone();
+            let plugin_manager = self.plugin_manager.clone();
             let vfs = self.vfs.clone();
             let approval_sink = desktop_approval_sink(
                 self.cap_pending.clone(),
@@ -2235,6 +2372,7 @@ impl App {
                             .with_vfs(vfs)
                             .with_session_manager(handler.manager())
                             .with_memory(memory)
+                            .with_plugins(plugin_manager)
                             .build();
 
                         run_shared_agent(request, services).await
@@ -2246,6 +2384,7 @@ impl App {
             )
         } else {
             self.run_status = RunStatus::Idle;
+            self.note_run_settled();
             let _ = self.chat.update(views::chat::Message::AddAssistant(
                 "Concerto could not load its configuration. Open Settings, configure a provider, and save the settings before starting a task."
                     .to_string(),
@@ -2253,6 +2392,60 @@ impl App {
             self.page = Page::Settings;
             iced::Task::none()
         }
+    }
+
+    /// Re-run WASM plugin discovery against the retained plugin manager after
+    /// a Settings save (interim "provider added" re-collect hook). A newly
+    /// dropped-in `.wasm` provider plugin becomes active in the
+    /// process-lifetime manager so the next run — and any future picker work —
+    /// sees it, without displacing already-loaded plugins. Gated on plugins
+    /// being enabled with `auto_load`, the same condition the runtime uses to
+    /// auto-approve at run time. A full `.wasm` filesystem watcher is a
+    /// documented follow-up; until then this save-time pass is the trigger.
+    fn refresh_plugin_providers(&self) -> iced::Task<Message> {
+        let Some(config) = self.config.clone() else {
+            return iced::Task::none();
+        };
+        let Some(ref plugin_cfg) = config.plugins else {
+            return iced::Task::none();
+        };
+        if !plugin_cfg.enabled || !plugin_cfg.auto_load {
+            return iced::Task::none();
+        }
+        let manager = self.plugin_manager.clone();
+        let search_paths = plugin_cfg.search_paths.clone();
+        iced::Task::perform(
+            async move {
+                let mut guard = manager.lock().await;
+                let Some(manager) = guard.as_mut().map(|(_, manager)| manager) else {
+                    // No run has materialised the manager yet; the first run
+                    // discovers any new plugin anyway.
+                    tracing::debug!("plugin refresh: manager not materialised yet — skipped");
+                    return;
+                };
+                let config = concerto_plugins::discovery::DiscoveryConfig {
+                    search_paths: search_paths.into_iter().map(std::path::PathBuf::from).collect(),
+                    bundled_path: None,
+                };
+                // Newly discovered plugins are initialised with an EMPTY grant
+                // set on purpose: host functions stay fail-closed until the
+                // next run re-initialises the plugin with its run-scoped,
+                // auto-approved grants.
+                match manager
+                    .refresh_new_plugins(config, |_| {
+                        concerto_plugins::capability::GrantedCapabilities::new()
+                    })
+                    .await
+                {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "plugin refresh: loaded newly discovered plugins");
+                    }
+                    Ok(_) => tracing::debug!("plugin refresh: no new plugins"),
+                    Err(error) => tracing::warn!(error = %error, "plugin refresh failed"),
+                }
+            },
+            |_| Message::PluginProvidersRefreshed,
+        )
     }
 
     /// Resolve the default chat model for the active provider.
@@ -2326,6 +2519,39 @@ impl App {
         self.chat_model_options = self.runtime_model_names(&self.active_provider_id);
     }
 
+    /// Kick off live model discovery for ready providers that have never been
+    /// fetched successfully, so a provider added in Settings populates its
+    /// model lists on save — no manual refresh or restart required.
+    ///
+    /// Eligible providers pass the same readiness gate startup auto-discovery
+    /// uses: the provider type must support discovery and any required
+    /// credential must be present. Providers already in flight (startup or a
+    /// manual refresh) are skipped, and so are providers with a cached catalog,
+    /// so a save never re-hits an already-populated provider.
+    fn discover_unfetched_models(&mut self) -> iced::Task<Message> {
+        let credentials = CredentialStore::new();
+        let ids: Vec<String> = self
+            .runtime_providers()
+            .iter()
+            .filter(|p| {
+                provider_discovery_ready(p, &credentials)
+                    && p.cached_models.is_empty()
+                    && p.cached_models_fetched_at == 0
+                    && !self.pending_refresh.contains_key(&p.id)
+            })
+            .map(|p| p.id.clone())
+            .collect();
+        let mut tasks = Vec::with_capacity(ids.len());
+        for id in ids {
+            self.refresh_seq = self.refresh_seq.wrapping_add(1);
+            let request_id = self.refresh_seq;
+            self.pending_refresh.insert(id.clone(), request_id);
+            self.settings.begin_provider_refresh(&id);
+            tasks.push(self.fetch_models_for_provider(id, request_id));
+        }
+        iced::Task::batch(tasks)
+    }
+
     fn fetch_models_for_provider(
         &self,
         provider_id: String,
@@ -2351,76 +2577,163 @@ impl App {
                 .await
             },
             move |models| {
+                // The providers crate collapses every discovery failure
+                // (network, auth, …) into an empty list. Surfacing that as
+                // `Err` keeps BOTH cache writers (config + settings state)
+                // preserving the previous model list during an outage instead
+                // of silently wiping it.
+                let result = if models.is_empty() {
+                    Err("Discovery returned no models — check credentials/network.".to_string())
+                } else {
+                    Ok(models)
+                };
                 Message::Settings(views::settings::Message::ProviderModelsRefreshed {
                     provider_id: provider_id.clone(),
                     request_id,
-                    result: Ok(models),
+                    result,
                 })
             },
         )
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (first-run bootstrap + orphan self-heal):
-    /// ensure the PROJECT config materializes the orchestration roster before
-    /// the Studio first renders, so the blueprint surface — and the searchable
-    /// agent library — is active from the very first open. No splash, no
-    /// manual init.
+    /// ADR-58/59 (rewritten) Slice 2, AMENDED (global-only orchestration,
+    /// smoke follow-up round 2 2026-09): orchestration is persisted to the
+    /// GLOBAL config only, and the auto-seed never creates a project config
+    /// file — creating a file is an explicit user save, never a side effect
+    /// of opening the Studio. Global-only enforcement 2026-09 AMENDED again:
+    /// the load path now IGNORES project-layer orchestration keys, so when
+    /// the project file declares any of them the seed is skipped entirely —
+    /// the Studio banner + the explicit import action own moving those keys
+    /// project→global.
     ///
-    /// Seeding runs ONLY when the roster was never materialized: the raw-Toml
-    /// signal is the `[multi_agent.custom_agents]` key being present in the
-    /// file, even as `[]` (= all agents deleted) — "key present" means owned
-    /// and deletions stick, so nothing is ever written back over it. Three
-    /// shapes:
+    /// Two independent fills run ONLY against the global config file: the
+    /// roster seed (only when its roster was never materialized) and the
+    /// blueprint-selection fill (only when `[orchestration]` exists with no
+    /// selector). Three global-file shapes for the roster seed:
     ///
-    /// 1. **Key present** (`roster_materialized`) → strict no-op: whether the
-    ///    array is empty (all agents deleted) or populated, the config owns
-    ///    its roster and the seed is skipped.
-    /// 2. **Orphan shape** — `[orchestration]` present (the Studio's stage
-    ///    cards staff from the blueprint) but the roster key never
-    ///    materialized: `seed_agent_roster_only` writes ONLY
-    ///    `[multi_agent.custom_agents]`, preserving the existing — possibly
-    ///    user-edited — `[orchestration]` table byte-for-byte, so the Studio's
-    ///    searchable library matches the blueprint's staffing without
-    ///    clobbering the blueprint.
-    /// 3. **Fresh project** — no config at all (or none loaded): the full
-    ///    `seed_orchestration_roster` writes `[orchestration]` standard-inline
-    ///    + the five agents, unchanged first-run bootstrap.
+    /// 1. **Key present** (`roster_materialized` on the global file) →
+    ///    strict no-op for the ROSTER: whether the array is empty (all agents
+    ///    deleted) or populated, the global config owns its roster and the
+    ///    seed is skipped. The blueprint fill below still runs — roster
+    ///    ownership and selection ownership are independent.
+    /// 2. Orphan shape — `[orchestration]` present in the global file but
+    ///    the roster key never materialized: `seed_agent_roster_only`
+    ///    writes ONLY `[multi_agent.custom_agents]` into the global file,
+    ///    preserving the existing — possibly user-edited — `[orchestration]`
+    ///    table byte-for-byte.
+    /// 3. Fresh — no global orchestration at all: the full
+    ///    `seed_orchestration_roster` writes `[orchestration]`
+    ///    standard-inline + the five agents, unchanged first-run bootstrap.
     ///
-    /// A `None` config (fresh project with no file) is still handed to the
-    /// seed: the writers create the file when missing, and a genuinely broken
-    /// file makes `roster_materialized` report owned so the seed is never
-    /// attempted over it (`config_broken` already surfaces dirty config
-    /// elsewhere). After seeding, state re-derives from disk so the first
-    /// render already resolves the seeded blueprint.
+    /// Independently of the roster, `ensure_default_blueprint` fills a TOTAL
+    /// absence of `name`/`include`/`inline` under an existing
+    /// `[orchestration]` with the default standard selection, so the Studio
+    /// surface can always activate; any declared selector is never touched.
+    ///
+    /// A broken global file makes `roster_materialized` report owned so the
+    /// seed is never attempted over it (`config_broken` already surfaces
+    /// dirty config elsewhere). After either fill, state re-derives from disk
+    /// so the first render already resolves the seeded blueprint.
     fn ensure_orchestration_seeded(&mut self) {
-        let config_path = self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        // Raw-file ownership test: the `custom_agents` key exists in the TOML
-        // (even `[]` = every agent deleted). "Key present" means owned —
-        // deletions stick and nothing is ever written.
-        if concerto_config::roster_materialized(&config_path) {
+        // Global-only orchestration (2026-09): when the project file declares
+        // ANY load-ignored orchestration key — its old `[orchestration]`
+        // table, roster, or model pins — the seed stays silent and the banner
+        // + explicit import action own the migration project→global. Seeding
+        // the global layer while declared (even though load-ignored now)
+        // would race the user's file edits for no benefit. Note the
+        // `roster_materialized` (custom_agents key) check alone is no longer
+        // sufficient — a project declaring ONLY `[orchestration]` must skip
+        // too, and the broader key set covers that shape.
+        let project_config =
+            self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        if !concerto_config::declared_project_orchestration_keys(&project_config).is_empty() {
             return;
         }
-        // Orphan shape: `[orchestration]` present but the roster was never
-        // materialized. Seed ONLY the agents so the searchable library matches
-        // the blueprint's staffing; the existing (possibly user-edited)
-        // `[orchestration]` table is preserved byte-for-byte. A failed seed
-        // leaves the previous file at the target intact.
-        if self.config.as_ref().is_some_and(|config| config.orchestration.is_some()) {
-            if concerto_config::seed_agent_roster_only(&config_path).is_err() {
+        let Some(config_path) = concerto_config::default_config_path() else {
+            return;
+        };
+        // Raw-file ownership test on the global layer: the `custom_agents`
+        // key exists in the TOML (even `[]` = every agent deleted). "Key
+        // present" means owned — deletions stick and nothing is ever written.
+        // The roster seed is skipped then, but the blueprint fill below still
+        // runs: roster ownership and blueprint-selection ownership are
+        // independent, and a config may own a roster while never having
+        // selected a blueprint (the old early return left the Studio in the
+        // degraded fallback forever).
+        let mut wrote = false;
+        if !concerto_config::roster_materialized(&config_path) {
+            // Orphan shape (global `[orchestration]` present, roster never
+            // materialized) seeds ONLY the agents so the searchable library
+            // matches the blueprint's staffing; the existing (possibly
+            // user-edited) `[orchestration]` table is preserved byte-for-byte.
+            // The raw presence signal avoids re-parsing the merged config —
+            // the orphan decision must key on the GLOBAL file only. A failed
+            // seed leaves the previous file at the target intact.
+            let global_has_orchestration = concerto_config::orchestration_declared(&config_path);
+            let seeded = if global_has_orchestration {
+                concerto_config::seed_agent_roster_only(&config_path)
+            } else {
+                concerto_config::seed_orchestration_roster(&config_path)
+            };
+            if seeded.is_err() {
+                // A failed seed leaves the previous file at the target intact;
+                // nothing to reconcile then. Broken config is surfaced
+                // elsewhere.
                 return;
             }
-        } else if concerto_config::seed_orchestration_roster(&config_path).is_err() {
-            // A failed seed leaves the previous file at the target intact;
-            // nothing to reconcile then. Broken config is surfaced elsewhere.
-            return;
+            wrote = true;
         }
-        self.reconcile_config_from_reload();
+        // Blueprint content fill (global-only, roster-independent): when
+        // `[orchestration]` exists with NO selector (`name`/`include`/`inline`
+        // all absent) write the default standard selection so the Studio
+        // surface can always activate. Only total absence is filled — any
+        // declared selector is left untouched, so the exactly-one load
+        // invariant is safe by construction. A failure (broken/unreadable
+        // file) is ignored here; broken config is surfaced via `config_broken`.
+        if matches!(concerto_config::ensure_default_blueprint(&config_path), Ok(true)) {
+            wrote = true;
+        }
+        // Per-agent config files (single source of truth): materialize the
+        // agents directory once. When it is absent the roster is exported from
+        // the just-seeded inline roster (or an existing one), or seeded from
+        // the builtin defaults. If it already exists this is a strict no-op —
+        // files rule and deletions stick. A failure is logged and ignored: the
+        // inline roster stays authoritative for this session (readable, never
+        // dropped).
+        match concerto_config::ensure_agent_files(&config_path, Some(&project_config)) {
+            Ok(outcome) => {
+                if outcome.dir_created {
+                    wrote = true;
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "failed to materialize per-agent config files; the inline roster remains authoritative"
+                );
+            }
+        }
+        if wrote {
+            self.reconcile_config_from_reload();
+        }
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save): persist the Studio's editable
-    /// [`Blueprint`] by the active selection's source, then reload so App
-    /// state re-derives from the fresh file (the watcher equality
-    /// short-circuit makes the reload a no-op rebuild when nothing moved).
+    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save), AMENDED (global-only
+    /// orchestration, smoke follow-up round 2 2026-09): the Studio persists
+    /// the blueprint and the agent roster to the GLOBAL config file
+    /// (`default_config_path()`), never `<project>/.concerto.toml`. Creating
+    /// that file is an explicit user save, and orchestration is global-only
+    /// going forward; a project `.concerto.toml` declaring orchestration
+    /// keys is ignored at load, and the explicit banner import owns moving
+    /// those keys project→global (a Save is refused while they remain).
+    ///
+    /// While a project config still DECLARES `[orchestration]`, the inline
+    /// save is refused with the draft kept: writing the fresher selection to
+    /// the global file would leave the stale project-layer selection
+    /// merged on top of it (figment layers project over global) and the
+    /// exactly-one load seam would reject the mixed selection. The include
+    /// path is unaffected — it writes the include file the selection already
+    /// loads from, so no project-layer conflict can arise.
     ///
     /// The generic guards run before routing — the draft is kept and nothing
     /// is written when either fails:
@@ -2428,23 +2741,23 @@ impl App {
     /// 1. **Validation** — the UI already disables Save while the draft is
     ///    invalid; this belt-and-braces check guards stale queued messages.
     /// 2. **No editable blueprint** — nothing to write (defensive).
+    /// 3. **Project-layer conflict** — a project `.concerto.toml` carrying
+    ///    `[orchestration]` blocks the inline save (see above).
     ///
     /// Then, by selection source (exactly one of name/include/inline is
     /// guaranteed by `BlueprintSelection`):
     ///
-    /// - **inline** → rewrite the blueprint back into the project config's
-    ///   `[orchestration].blueprint.inline` (`save_inline_blueprint`,
-    ///   merge-aware, atomic).
     /// - **include** → the guarded include write (`persist_include_blueprint`,
     ///   target-shadow + unparseable guards), the only path that touches a
     ///   blueprint file.
-    /// - **name** → materialize the edited blueprint inline into the project
-    ///   config. The catalog is seed-only: once the user edits, the config
-    ///   owns the blueprint (the dangling `name` selector is removed so the
-    ///   selection stays exactly-one). Covers a defensively-absent
-    ///   `[orchestration]` too.
+    /// - **name** (materialize), **inline**, or a defensively-absent
+    ///   `[orchestration]` → write the blueprint inline into the global
+    ///   config's `[orchestration].blueprint.inline` (`save_inline_blueprint`,
+    ///   merge-aware, atomic).
     ///
-    /// Never navigates and never switches the surface (Slice 2).
+    /// The agent roster always goes to the global config (`save_agent_roster`
+    /// after the blueprint write succeeds). Never navigates and never
+    /// switches the surface (Slice 2).
     fn persist_orchestration(&mut self) -> Result<(), String> {
         let Some(blueprint) = self.orchestration_studio.blueprint() else {
             return Err("no editable blueprint loaded; nothing was written".to_string());
@@ -2461,7 +2774,23 @@ impl App {
             .and_then(|config| config.orchestration.as_ref())
             .map(|orchestration| &orchestration.blueprint);
 
-        let config_path = self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        // Conflict guard: a project config that still declares
+        // `[orchestration]` owns its selection until the user moves or
+        // removes it — we never silently delete project data on save.
+        let project_config =
+            self.project_dir.clone().join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        if !matches!(selection, Some(selection) if selection.include.is_some())
+            && concerto_config::orchestration_declared(&project_config)
+        {
+            return Err(format!(
+                "the project config '{}' still declares an [orchestration] selection; \
+                 orchestration is saved to the global config only — move that section \
+                 into the global config or remove it from the project file first",
+                project_config.display()
+            ));
+        }
+        let config_path = concerto_config::default_config_path()
+            .ok_or_else(|| "no global config path available; nothing was written".to_string())?;
         match selection {
             // The blueprint lives in the include file the selection
             // references: the guarded include write, then reload.
@@ -2477,19 +2806,119 @@ impl App {
             }
         }
 
-        // ADR-58/59 (rewritten) Slice 3: the agent roster. Written only after the
-        // blueprint write above succeeds — the roster has no rulebook of its own,
-        // so it is gated on the same blueprint validation that ran up front (a
-        // failed blueprint never reaches the config). `persisted_parts` maps the
-        // Studio's authoritative agent list to config types (coordinator + the
-        // five seeds as `is_custom: false` mirrors + user agents). The write is
-        // merge-aware and atomic; deletion is permanent (`owns_agent_roster`).
+        // ADR-58/59 (rewritten) Slice 3, per-agent files: the agent roster is
+        // written to its own files (`<global-config-dir>/agents/<id>.toml`) —
+        // the single source of truth. Additions create files; deletions remove
+        // them (deletion sticks: the directory stays initialized). The write is
+        // atomic per file. The roster has no rulebook of its own, so it is
+        // gated on the same blueprint validation that ran up front (a failed
+        // blueprint never reaches the files).
         let (roster, _, _) = self.orchestration_studio.persisted_parts();
-        concerto_config::save_agent_roster(&config_path, &roster)
+        let agents_dir = concerto_config::agents_dir_for_config(&config_path)
+            .map_err(|error| error.to_string())?;
+        concerto_config::save_agent_roster_files(&agents_dir, &roster)
             .map_err(|error| error.to_string())?;
 
         self.reconcile_config_from_reload();
         Ok(())
+    }
+
+    /// The global-only orchestration enforcement banner (2026-09): rendered
+    /// above the Studio while the project file declares load-ignored
+    /// orchestration keys. Explicit import + session-scoped dismiss; the same
+    /// palette/toast idiom as the settings feedback for the danger-family
+    /// notice (no hardcoded colors — palette colors, computed alpha only).
+    fn orchestration_import_banner_view(&self) -> Element<'_, Message> {
+        let ts = &self.current_theme.type_scale;
+        let sp = &self.current_theme.spacing;
+        let palette = &self.current_theme.palette;
+        row![
+            text(format!(
+                "Project config declares orchestration settings ignored at load: {}. \
+                 Orchestration is global-only.",
+                self.project_orchestration_keys.join(", ")
+            ))
+            .size(ts.body)
+            .color(palette.danger)
+            .width(Length::Fill),
+            button("Import to global")
+                .style(crate::ui::button::primary)
+                .on_press(Message::ImportProjectOrchestration),
+            button("Dismiss")
+                .style(crate::ui::button::secondary)
+                .on_press(Message::DismissOrchestrationBanner),
+        ]
+        .spacing(sp.md)
+        .align_y(iced::Alignment::Center)
+        .padding(sp.md)
+        .into()
+    }
+
+    /// The explicit import action for the global-only orchestration
+    /// enforcement (2026-09): one user action, started by the Studio's
+    /// import banner ([`Message::ImportProjectOrchestration`]). The raw-file
+    /// relocation lives in
+    /// [`concerto_config::import_project_orchestration_to_global`] (atomic on
+    /// both sides, refuses on global-conflict); this handler adds the
+    /// user-visible side effects: logging, toast, and a config reload so the
+    /// global keys take effect immediately. On conflict nothing moves and
+    /// the refusal is toasted with the colliding keys named — user global
+    /// data is never silently overwritten, and the stale project keys stay
+    /// load-ignored while the user resolves it manually.
+    fn run_project_orchestration_import(&mut self) {
+        let project_config =
+            self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        let Some(global_path) = concerto_config::default_config_path() else {
+            self.toasts
+                .push(ToastLevel::Error, "No global config path available; import failed".into());
+            return;
+        };
+        match concerto_config::import_project_orchestration_to_global(&project_config, &global_path)
+        {
+            Ok(concerto_config::ImportOrchestrationOutcome::Imported { imported }) => {
+                tracing::info!(
+                    keys = %imported.join(", "),
+                    project = %project_config.display(),
+                    global = %global_path.display(),
+                    "project orchestration keys imported into the global config at user request"
+                );
+                self.orchestration_banner_dismissed = false;
+                self.toasts.push(
+                    ToastLevel::Success,
+                    format!(
+                        "Imported project orchestration keys into the global config: {}",
+                        imported.join(", ")
+                    ),
+                );
+                self.reconcile_config_from_reload();
+            }
+            Ok(concerto_config::ImportOrchestrationOutcome::Conflict { keys }) => {
+                tracing::warn!(
+                    keys = %keys.join(", "),
+                    project = %project_config.display(),
+                    "project-orchestration import refused: the global config already declares them"
+                );
+                self.toasts.push(
+                    ToastLevel::Error,
+                    format!(
+                        "Import refused: the global config already declares {}; orchestration \
+                         keys cannot be overwritten — remove them from the project file \
+                         manually if intended",
+                        keys.join(", ")
+                    ),
+                );
+            }
+            Ok(concerto_config::ImportOrchestrationOutcome::NothingToImport) => {
+                self.toasts.push(
+                    ToastLevel::Info,
+                    "Nothing to import — the project config declares no orchestration keys".into(),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "project-orchestration import failed");
+                self.toasts.push(ToastLevel::Error, format!("Import failed: {error}"));
+            }
+        }
     }
 
     /// The include-file half of [`Self::persist_orchestration`]: write the
@@ -2502,6 +2931,9 @@ impl App {
     ///    would actually load (project dir first, global second, bare-name
     ///    cwd last, mirroring `load_config`'s resolution order). Saving
     ///    anywhere else would silently write a file a later load never reads.
+    ///    The project file, the global-dir file (global-first of the same
+    ///    resolution), and the bare fallback are allowed; anything else is a
+    ///    shadow and refuses.
     /// 2. **Unparseable include** — `save_blueprint` serializes from the
     ///    in-memory model, so a round-trip would silently DROP unknown keys
     ///    the on-disk file carries (`deny_unknown_fields`). The file must
@@ -2529,17 +2961,22 @@ impl App {
             }
         }
         let target = concerto_config::include_write_target(&config_dirs, &include_name);
-        let project_target = self.project_dir.join(&include_name);
-        if target != project_target
-            && target.as_path() != std::path::Path::new(include_name.as_str())
-        {
-            // The bare fallback means no candidate file exists anywhere (a
-            // watcher may have removed it) — nothing can be shadowed then,
-            // so saving is safe. Any other target that is not the project
-            // file would shadow the file the config actually loads.
+        let bare_fallback = std::path::Path::new(include_name.as_str()).to_path_buf();
+        // A path that is not the project file is only the bare fallback
+        // (no candidate exists anywhere, nothing to shadow) or the global-dir
+        // include file — which IS a load-time candidate (global-first of the
+        // same resolution order). Global-only orchestration 2026-09: with
+        // include-file orchestration selectable only from the global layer,
+        // the global-dir include file is the common Save target and must be
+        // allowed; anything else would shadow the file the config loads.
+        let global_dir_target = config_dirs.get(1).map(|dir| dir.join(&include_name));
+        let shadowed = target != self.project_dir.join(&include_name)
+            && target != bare_fallback
+            && Some(&target) != global_dir_target.as_ref();
+        if shadowed {
             return Err(format!(
-                "the blueprint was loaded from {}; saving to the project directory would \
-                 shadow it — move the file into the project directory first",
+                "the blueprint was loaded from {}; saving would write a file a later load \
+                 never reads — save over the loaded file instead",
                 target.display()
             ));
         }
@@ -2595,7 +3032,23 @@ impl App {
             tracing::warn!("config reload failed; keeping last-good config");
             return;
         };
+        // Global-only orchestration enforcement: the ignored-key set is
+        // derived from the raw PROJECT file (not the merged config) and must
+        // refresh on every reconcile — including a project switch that yields
+        // a byte-identical merged config (the short-circuit below would
+        // otherwise leave the previous project's keys showing).
+        self.refresh_project_orchestration_keys();
         self.apply_reloaded_config(reloaded_global, reloaded);
+    }
+
+    /// Recompute the ignored project-layer orchestration keys from the raw
+    /// project file. Shared by [`App::new`],
+    /// [`Self::reconcile_config_from_reload`], and the import/dismiss tests.
+    fn refresh_project_orchestration_keys(&mut self) {
+        let project_config =
+            self.project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        self.project_orchestration_keys =
+            concerto_config::declared_project_orchestration_keys(&project_config);
     }
 
     /// Apply already-parsed configs: equality short-circuit plus the full
@@ -2750,6 +3203,8 @@ impl App {
                         Arc::new(Mutex::new(None));
                     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> =
                         Arc::new(Mutex::new(None));
+                    let lock_temp: Arc<Mutex<Option<Arc<concerto_core::lock::DataDirLock>>>> =
+                        Arc::new(Mutex::new(None));
                     match init_memory_system(
                         bus,
                         &app_config,
@@ -2757,6 +3212,7 @@ impl App {
                         &reindex_temp,
                         &reindex_sync_temp,
                         &cancel_temp,
+                        &lock_temp,
                     )
                     .await
                     {
@@ -2770,6 +3226,8 @@ impl App {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .take()
                                 .unwrap_or_default();
+                            let data_dir_lock =
+                                lock_temp.lock().unwrap_or_else(|e| e.into_inner()).take();
                             match (indexer, sync) {
                                 (Some(indexer), Some(sync)) => {
                                     let active = ActiveMemoryServices {
@@ -2778,6 +3236,7 @@ impl App {
                                         reindex: indexer.clone(),
                                         reindex_sync: sync.clone(),
                                         cancel: cancel.clone(),
+                                        data_dir_lock,
                                     };
                                     *memory.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(active);
@@ -2859,6 +3318,8 @@ impl App {
                         Arc::new(Mutex::new(None));
                     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> =
                         Arc::new(Mutex::new(None));
+                    let lock_temp: Arc<Mutex<Option<Arc<concerto_core::lock::DataDirLock>>>> =
+                        Arc::new(Mutex::new(None));
                     let store = init_memory_system(
                         bus,
                         &config,
@@ -2866,6 +3327,7 @@ impl App {
                         &reindex_temp,
                         &reindex_sync_temp,
                         &cancel_temp,
+                        &lock_temp,
                     )
                     .await
                     .map_err(|error| error.to_string())?;
@@ -2886,12 +3348,14 @@ impl App {
                         .unwrap_or_else(|e| e.into_inner())
                         .take()
                         .unwrap_or_default();
+                    let data_dir_lock = lock_temp.lock().unwrap_or_else(|e| e.into_inner()).take();
                     let active = ActiveMemoryServices {
                         project_id,
                         store: store.clone(),
                         reindex,
                         reindex_sync,
                         cancel,
+                        data_dir_lock,
                     };
                     *memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
                     store
@@ -2955,6 +3419,7 @@ impl App {
                             age: String::new(),
                             score: chunk.score as f32,
                             entry_type,
+                            stale: chunk.stale,
                         }
                     })
                     .collect())
@@ -3205,6 +3670,57 @@ impl App {
         )
     }
 
+    /// Load the read-only Coordinator 2.0 runtime snapshot for the chat
+    /// Runtime modal's observability panels from the active session's
+    /// persisted checkpoint.
+    ///
+    /// Fail-soft: a missing session, a store failure, or a checkpoint parse
+    /// failure yields an empty snapshot (with a muted note) rather than an
+    /// error. The read is outside the run lifecycle, so it carries a fresh
+    /// cancellation token (the reader still honors it at the seam) — the
+    /// run's own token must not permanently disable the panel after a cancel.
+    fn load_studio_runtime(&self) -> iced::Task<Message> {
+        let session_id = self.active_session_id;
+        let session_manager = self.session_manager.clone();
+        let app_config = self.config.clone().unwrap_or_default();
+        iced::Task::perform(
+            async move {
+                let Some(session_id) = session_id else {
+                    // No active session yet: empty panels, no error.
+                    return (None, Box::new(StudioRuntimeSnapshot::default()));
+                };
+                let handler = {
+                    let existing =
+                        session_manager.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    match existing {
+                        Some(handler) => handler,
+                        None => match DesktopSessionHandler::connect_with_config(&app_config).await
+                        {
+                            Ok(handler) => Arc::new(handler),
+                            Err(error) => {
+                                return (
+                                    Some(session_id),
+                                    Box::new(StudioRuntimeSnapshot::unavailable(format!(
+                                        "runtime state unavailable: {error}"
+                                    ))),
+                                );
+                            }
+                        },
+                    }
+                };
+                let reader = CheckpointStudioRuntimeReader::new(handler.manager().store());
+                let snapshot = match reader.load(session_id, CancellationToken::new()).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => StudioRuntimeSnapshot::unavailable(format!(
+                        "runtime state unavailable: {error}"
+                    )),
+                };
+                (Some(session_id), Box::new(snapshot))
+            },
+            |(session_id, snapshot)| Message::StudioRuntimeLoaded(session_id, snapshot),
+        )
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let sidebar = views::nav::sidebar_view(self);
 
@@ -3243,7 +3759,22 @@ impl App {
                     self.config.as_ref().is_some_and(orchestration_hides_relationships);
                 self.settings.view(&self.current_theme, hide_relationships).map(Message::Settings)
             }
-            Page::OrchestrationStudio => self.orchestration_studio.view(&self.current_theme),
+            Page::OrchestrationStudio => {
+                let studio = self.orchestration_studio.view(&self.current_theme);
+                match (
+                    self.project_orchestration_keys.as_slice(),
+                    self.orchestration_banner_dismissed,
+                ) {
+                    ([], _) | (_, true) => studio,
+                    _ => {
+                        let banner: Element<'_, Message> = self.orchestration_import_banner_view();
+                        column![banner, container(studio).height(Length::Fill).width(Length::Fill),]
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into()
+                    }
+                }
+            }
             Page::Editor => self.editor.view(&self.current_theme).map(Message::Editor),
         };
 
@@ -3335,6 +3866,10 @@ impl App {
                         &self.current_theme,
                     )
                     .map(Message::Chat),
+                    views::chat::SubView::Runtime => views::studio_runtime::runtime_modal_view(
+                        &self.orchestration_studio.runtime_snapshot,
+                        &self.current_theme,
+                    ),
                 }
             } else {
                 // Fade-out placeholder: a text-free empty body so the card can
@@ -3353,6 +3888,7 @@ impl App {
                 views::chat::SubView::AgentGraph => "Agent Graph",
                 views::chat::SubView::ToolLog => "Tool Log",
                 views::chat::SubView::SpendLog => "Spend Log",
+                views::chat::SubView::Runtime => "Runtime",
             };
 
             let header = row![text(title).size(18), iced::widget::space::horizontal(), close_btn]
@@ -3370,6 +3906,7 @@ impl App {
                     .into()
             } else if self.chat.sub_view == views::chat::SubView::ToolLog
                 || self.chat.sub_view == views::chat::SubView::SpendLog
+                || self.chat.sub_view == views::chat::SubView::Runtime
             {
                 // Centered modal with max-width — let the child determine its
                 // natural height; never force Length::Shrink on the container
@@ -3593,6 +4130,25 @@ impl App {
 
     pub fn theme(&self) -> iced::Theme {
         self.current_theme.iced.clone()
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): whether a run is in flight — the
+    /// window-close handler cancels it and waits for settlement instead of
+    /// exiting over it.
+    pub fn is_run_active(&self) -> bool {
+        self.run_status != RunStatus::Idle
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): the run-settlement epoch — bumped
+    /// every time an in-flight run settles. The window-close handler polls
+    /// this (bounded) so the coordinator's cancel path can persist the
+    /// interrupted checkpoint before the process exits.
+    pub fn run_settle_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.run_settle_epoch)
+    }
+
+    fn note_run_settled(&mut self) {
+        self.run_settle_epoch.fetch_add(1, Ordering::Release);
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -4006,6 +4562,27 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    // ── ADR-60 D7 (interrupt-safe resume): the graceful window-close path ──
+
+    /// `is_run_active` reflects the run status, and every settle point bumps
+    /// the settlement epoch the window-close handler polls.
+    #[test]
+    fn run_settle_epoch_tracks_run_settlement() {
+        let (mut app, _) = App::new();
+        assert!(!app.is_run_active(), "idle at construction");
+        let before = app.run_settle_epoch().load(Ordering::Acquire);
+
+        app.run_status = RunStatus::Running;
+        assert!(app.is_run_active(), "a running run is active");
+
+        // The completion settle point: status back to Idle + epoch bump.
+        app.run_status = RunStatus::Idle;
+        app.note_run_settled();
+        assert!(!app.is_run_active());
+        let after = app.run_settle_epoch().load(Ordering::Acquire);
+        assert_eq!(after, before + 1, "a settled run bumps the epoch");
+    }
+
     /// Serializes tests that redirect `XDG_CONFIG_HOME` (which `dirs` reads
     /// for the config directory on Linux) against each other — env vars are
     /// process-global and cargo runs tests in parallel threads. Mirrors
@@ -4025,6 +4602,35 @@ mod tests {
         assert_eq!(app.page, Page::Settings);
     }
 
+    /// The read-only Studio runtime snapshot is applied only for the active
+    /// session; a result for a session the user has left is discarded.
+    #[test]
+    fn studio_runtime_loaded_applies_only_for_the_active_session() {
+        use crate::views::studio_runtime::StudioRuntimeSnapshot;
+
+        let (mut app, _) = App::new();
+        let active = Ulid::new();
+        app.active_session_id = Some(active);
+        assert!(app.orchestration_studio.runtime_snapshot.load_error.is_none());
+
+        // A result for a different session is dropped.
+        let _ = app.update(Message::StudioRuntimeLoaded(
+            Some(Ulid::new()),
+            Box::new(StudioRuntimeSnapshot::unavailable("stale")),
+        ));
+        assert!(
+            app.orchestration_studio.runtime_snapshot.load_error.is_none(),
+            "a stale-session result must be discarded"
+        );
+
+        // A result for the active session is applied.
+        let _ = app.update(Message::StudioRuntimeLoaded(
+            Some(active),
+            Box::new(StudioRuntimeSnapshot::unavailable("fresh")),
+        ));
+        assert_eq!(app.orchestration_studio.runtime_snapshot.load_error.as_deref(), Some("fresh"));
+    }
+
     #[test]
     fn help_toggle_works() {
         let (mut app, _) = App::new();
@@ -4041,6 +4647,31 @@ mod tests {
         let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::DiffViewer));
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Diff);
+    }
+
+    /// Ctrl+R opens the per-session Runtime modal in the chat canvas, and
+    /// pressing it again closes it (toggle, mirroring Ctrl+D / Ctrl+L).
+    #[test]
+    fn runtime_shortcut_toggles_the_runtime_subview() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::RuntimePanels));
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Runtime);
+
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::RuntimePanels));
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Main);
+    }
+
+    /// Esc closes the Runtime modal in the chat canvas (mirrors the Memory
+    /// modal's Esc dismissal).
+    #[test]
+    fn escape_closes_the_runtime_modal() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::SetSubView(crate::views::chat::SubView::Runtime));
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Runtime);
+
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::CancelDialog));
+        assert_eq!(app.chat.sub_view, crate::views::chat::SubView::Main);
     }
 
     // ── ADR-57 — config reload reconciliation ──────────────────────────────
@@ -4229,22 +4860,19 @@ mod tests {
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        // Global config: schema only — must stay untouched. Project dir is
+        // Global config: schema only — the seed lands here. Project dir is
         // empty: no config file, no include file (a brand-new project).
         let global_dir = dir.path().join("concerto");
         std::fs::create_dir_all(&global_dir).expect("create global config dir");
         let global_config_path = global_dir.join("config.toml");
         std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
-        let global_before = std::fs::read_to_string(&global_config_path).expect("read global");
         let project_dir = dir.path().join("project");
         std::fs::create_dir_all(&project_dir).expect("create project dir");
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
-        // The persisted project registry (data dir) may already point at a
-        // seeded project on this machine; force the fresh-project shape so
-        // `ensure_orchestration_seeded` must really write (the doc contract:
-        // a `None` config is still handed to the seed).
+        // Force the no-roster shape (global has no materialized roster) so
+        // `ensure_orchestration_seeded` must really write.
         app.config = None;
         // The first Studio open is exactly what triggers the auto-seed.
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
@@ -4255,9 +4883,9 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
-        // The seed landed in the PROJECT config layer.
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        let raw = std::fs::read_to_string(&project_config).expect("project config read back");
+        // The seed landed in the GLOBAL config layer (global-only
+        // orchestration — never a project file).
+        let raw = std::fs::read_to_string(&global_config_path).expect("global config read back");
         assert!(raw.contains("[orchestration]"), "roster section written\n{raw}");
         assert!(
             raw.contains("blueprint = { inline = {") && raw.contains("name = \"standard\""),
@@ -4268,9 +4896,12 @@ mod tests {
             5,
             "five seeded agents expected\n{raw}"
         );
-        // The global config is never rewritten by the seed.
-        let global_after = std::fs::read_to_string(&global_config_path).expect("global read back");
-        assert_eq!(global_before, global_after, "the global config must stay untouched");
+        // No project config file may be created by the seed — creating a
+        // file is an explicit user save only.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the seed must never create a project .concerto.toml"
+        );
         // No include file is created — the seed is inline, not include-based.
         assert!(
             !project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE).exists(),
@@ -4294,6 +4925,66 @@ mod tests {
             config.resolved_blueprint.as_ref().map(|r| r.blueprint.pipeline.stages.len()),
             Some(5),
             "the seeded standard blueprint resolves with a five-stage pipeline"
+        );
+        assert!(
+            app.orchestration_studio.blueprint().is_some(),
+            "the Studio must hold the editable blueprint from the first open"
+        );
+    }
+
+    /// Global-only blueprint fill on Studio open: a global config that owns
+    /// its roster (`custom_agents` present) but declares `[orchestration]`
+    /// with NO selector used to hit the old early return and stay
+    /// blueprint-selection-less forever. The seed flow now fills the default
+    /// standard selection into the global file (never a project file), so the
+    /// Studio activates the blueprint surface from the first open.
+    #[test]
+    fn ensure_orchestration_seeded_fills_a_missing_blueprint_selection() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        // Roster owned (custom_agents key present, no agents), orchestration
+        // declared, but no name/include/inline selection.
+        std::fs::write(
+            &global_config_path,
+            "schema_version = 7\n\n[orchestration]\nschema_version = 1\n\n[multi_agent]\ncustom_agents = []\n",
+        )
+        .expect("seed global config");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let raw = std::fs::read_to_string(&global_config_path).expect("global config read back");
+        assert!(
+            raw.contains("name = \"standard\""),
+            "the missing selection must be filled with the standard default\n{raw}"
+        );
+        // The roster was already owned — the fill must not have re-seeded it.
+        assert!(raw.contains("custom_agents = []"), "the owned roster must be preserved\n{raw}");
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the fill must never create a project .concerto.toml"
+        );
+
+        let config = app.config.as_ref().expect("config loaded after the fill");
+        assert_eq!(
+            config.resolved_blueprint.as_ref().map(|r| r.blueprint.name.as_str()),
+            Some("standard"),
+            "the filled selection must resolve to the standard blueprint"
         );
         assert!(
             app.orchestration_studio.blueprint().is_some(),
@@ -4326,9 +5017,10 @@ mod tests {
         assert!(app.config_broken, "startup config fallback must surface via config_broken");
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (orphan contract): when the raw file
-    /// carries the `custom_agents` key — even as `[]`, meaning every agent was
-    /// deleted — the auto-seed is a strict no-op: nothing is written and the
+    /// ADR-58/59 (rewritten) Slice 2 (orphan contract), AMENDED (global-only):
+    /// when the GLOBAL config owns its roster — the raw file carries the
+    /// `custom_agents` key, even as `[]` meaning every agent was deleted —
+    /// the auto-seed is a strict no-op: nothing is written and the global
     /// file stays byte-identical ("key present" = owned; deletions stick).
     #[test]
     fn ensure_orchestration_seeded_is_a_noop_when_key_present_even_empty() {
@@ -4365,16 +5057,24 @@ custom_agents = []
         );
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (orphan self-heal): a config carrying
-    /// `[orchestration]` (a custom blueprint) but NO materialized `custom_agents`
-    /// key is the orphan shape — the auto-seed writes ONLY the five seed
-    /// agents under `[multi_agent.custom_agents]` and preserves the existing
-    /// orchestration blueprint text unchanged, so the Studio's searchable
-    /// library matches the blueprint's staffing.
+    /// ADR-58/59 (rewritten) Slice 2 (orphan self-heal), AMENDED (global-only
+    /// orchestration): a GLOBAL config carrying `[orchestration]` (a custom
+    /// blueprint) but NO materialized `custom_agents` key is the orphan
+    /// shape — the auto-seed writes ONLY the five seed agents under
+    /// `[multi_agent.custom_agents]` of the global config and preserves the
+    /// existing orchestration blueprint text unchanged, so the Studio's
+    /// searchable library matches the blueprint's staffing. The project
+    /// directory stays untouched (no project file is created).
     #[test]
     fn ensure_orchestration_seeded_self_heals_the_orphan_shape() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let config_path = global_dir.join("config.toml");
         let content = r#"schema_version = 7
 
 [orchestration]
@@ -4385,15 +5085,20 @@ name = "custom-blueprint"
 description = "keep me"
 "#;
         std::fs::write(&config_path, content).expect("seed orphan-shape config");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
 
         let (mut app, _) = App::new();
-        app.project_dir = dir.path().to_path_buf();
-        app.config = Some(AppConfig {
-            orchestration: Some(concerto_config::OrchestrationConfig::default()),
-            ..AppConfig::default()
-        });
+        app.project_dir = project_dir.clone();
+        app.reconcile_config_from_reload();
 
         app.ensure_orchestration_seeded();
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
 
         let after = std::fs::read_to_string(&config_path).expect("read back");
         // The agents-only seed preserves the existing orchestration blueprint.
@@ -4410,33 +5115,74 @@ description = "keep me"
         for id in ["architect", "researcher", "coder", "reviewer", "validator"] {
             assert!(after.contains(&format!("id = \"{id}\"")), "seed agent {id} missing\n{after}");
         }
+        // The seed never creates a project config file.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the seed must never create a project .concerto.toml\n"
+        );
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, name source): a config whose
-    /// selection is a bare catalog `name` (the code-catalog is seed-only) is
-    /// materialized — Save writes the edited blueprint inline into the
-    /// PROJECT config, the dangling `name` selector is removed (exactly-one
-    /// selection), the global `config.toml` stays untouched, and a full
-    /// reload consumes the EDITS (the B1 property: the runtime reads what
-    /// Save wrote, not the catalog).
+    /// Back-compat seed no-op: when a PROJECT config owns its roster (the
+    /// raw `custom_agents` key is present there), the auto-seed is skipped
+    /// entirely — the project keeps being authoritative for itself (its
+    /// orchestration keeps loading as today) and neither the project file
+    /// nor the global config is written.
     #[test]
-    fn save_materializes_a_name_selection_inline_into_the_project_config() {
+    fn seed_is_skipped_and_global_untouched_when_the_project_owns_the_roster() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_config = dir.path().join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        let content = r#"# sentinel comment
+schema_version = 7
+
+[orchestration]
+schema_version = 1
+
+[multi_agent]
+custom_agents = []
+"#;
+        std::fs::write(&project_config, content).expect("seed owned-roster config");
+        let before = std::fs::read_to_string(&project_config).expect("read before");
+
+        let (mut app, _) = App::new();
+        app.project_dir = dir.path().to_path_buf();
+        app.config = Some(AppConfig {
+            orchestration: Some(concerto_config::OrchestrationConfig::default()),
+            ..AppConfig::default()
+        });
+        let owned = app.config.as_ref().and_then(|config| config.orchestration.as_ref()).cloned();
+
+        app.ensure_orchestration_seeded();
+
+        let after = std::fs::read_to_string(&project_config).expect("read back");
+        assert_eq!(after, before, "an owned roster (even empty) must never trigger a write");
+        assert_eq!(
+            app.config.as_ref().and_then(|config| config.orchestration.as_ref()),
+            owned.as_ref(),
+            "the owned orchestration selection is left untouched"
+        );
+    }
+
+    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, name source), AMENDED
+    /// (global-only orchestration): a selection that is a bare catalog
+    /// `name` (the code-catalog is seed-only) is materialized — Save writes
+    /// the edited blueprint inline into the GLOBAL config, the dangling
+    /// `name` selector is removed (exactly-one selection), the project
+    /// directory stays file-free, and a full reload consumes the EDITS
+    /// (the B1 property: the runtime reads what Save wrote, not the catalog).
+    #[test]
+    fn save_materializes_a_name_selection_inline_into_the_global_config() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        std::fs::create_dir_all(dir.path().join("concerto")).expect("create global config dir");
-        let global_config_path = dir.path().join("concerto").join("config.toml");
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
         std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
-        let global_before = std::fs::read_to_string(&global_config_path).expect("read global");
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).expect("create project dir");
-        // A bare name-based selection in the project layer (catalog shape).
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
+        // A bare name-based selection in the global layer (catalog shape).
         concerto_config::save_blueprint_selection(
-            &project_config,
+            &global_config_path,
             &concerto_config::BlueprintSelection {
                 name: Some("standard".to_string()),
                 include: None,
@@ -4444,6 +5190,8 @@ description = "keep me"
             },
         )
         .expect("seed name selection");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
@@ -4456,7 +5204,103 @@ description = "keep me"
         );
         app.orchestration_studio.load_from_config(&config);
 
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save is not pre-empted.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
+
         // Edit the first stage's label, then Save.
+        let _ = app.orchestration_studio.update(
+            crate::views::orchestration_studio::StudioMessage::StageLabelEdited(
+                0,
+                "planning".into(),
+            ),
+        );
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
+        ));
+
+        // All app operations stay under the XDG redirect — whole-config
+        // persistence paths serialize the app's in-memory global config, and
+        // running them against the real machine config would leak test state
+        // there. The env is restored only after every app call below.
+        app.reconcile_config_from_reload();
+        let reloaded = app.config.clone().expect("config after reload");
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
+        let after = std::fs::read_to_string(&global_config_path).expect("global config read back");
+        assert!(after.contains("inline = {"), "save must write the blueprint inline\n{after}");
+        // Save is global-only: no project config file may appear.
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "creating a project file is an explicit user save, not a Save side effect"
+        );
+
+        // The materialized selection is exactly-one (inline) — the load seam
+        // rejects any dangling sibling selector, so a successful reload is
+        // itself the proof the `name` selector was removed.
+        let selection = reloaded.orchestration.as_ref().expect("[orchestration] present");
+        assert!(selection.blueprint.name.is_none(), "the name selector must be removed");
+        assert!(selection.blueprint.include.is_none(), "no include selector may appear");
+        assert!(selection.blueprint.inline.is_some(), "the selection must be inline");
+        let reloaded_label = reloaded
+            .resolved_blueprint
+            .as_ref()
+            .map(|r| r.blueprint.pipeline.stages[0].label.as_str());
+        assert_eq!(
+            reloaded_label,
+            Some("planning"),
+            "the runtime must load the edited blueprint — not the catalog standard"
+        );
+    }
+
+    /// Global-only Save conflict guard: while a project `.concerto.toml`
+    /// still declares `[orchestration]`, the inline save is refused (draft
+    /// kept, NOTHING written) — writing the fresher selection to the global
+    /// file would leave the stale project selection merged on top and the
+    /// exactly-one load seam would reject the mixed selection. Project
+    /// orchestration data is never silently deleted by a save.
+    #[test]
+    fn save_is_refused_when_the_project_config_still_declares_orchestration() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
+        let global_before = std::fs::read_to_string(&global_config_path).expect("read global");
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
+        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
+        concerto_config::save_blueprint_selection(
+            &project_config,
+            &concerto_config::BlueprintSelection {
+                name: Some("standard".to_string()),
+                include: None,
+                inline: None,
+            },
+        )
+        .expect("seed project name selection");
+        let project_before = std::fs::read_to_string(&project_config).expect("read project");
+
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        app.reconcile_config_from_reload();
+        let config = app.config.clone().expect("config loaded after reconcile");
+        app.orchestration_studio.load_from_config(&config);
         let _ = app.orchestration_studio.update(
             crate::views::orchestration_studio::StudioMessage::StageLabelEdited(
                 0,
@@ -4473,35 +5317,24 @@ description = "keep me"
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
-        assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
-        let after = std::fs::read_to_string(&project_config).expect("project config read back");
-        assert!(after.contains("inline = {"), "save must write the blueprint inline\n{after}");
-        let global_after = std::fs::read_to_string(&global_config_path).expect("global read back");
-        assert_eq!(global_before, global_after, "the global config must stay untouched");
-
-        // The materialized selection is exactly-one (inline) — the load seam
-        // rejects any dangling sibling selector, so a successful reload is
-        // itself the proof the `name` selector was removed.
-        app.reconcile_config_from_reload();
-        let reloaded = app.config.clone().expect("config after reload");
-        let selection = reloaded.orchestration.as_ref().expect("[orchestration] present");
-        assert!(selection.blueprint.name.is_none(), "the name selector must be removed");
-        assert!(selection.blueprint.include.is_none(), "no include selector may appear");
-        assert!(selection.blueprint.inline.is_some(), "the selection must be inline");
-        let reloaded_label = reloaded
-            .resolved_blueprint
-            .as_ref()
-            .map(|r| r.blueprint.pipeline.stages[0].label.as_str());
-        assert_eq!(
-            reloaded_label,
-            Some("planning"),
-            "the runtime must load the edited blueprint — not the catalog standard"
+        // The save is refused with the failure surfaced, nothing written.
+        assert!(
+            app.orchestration_studio.save_error.is_some(),
+            "the save conflict must surface on the studio"
         );
+        assert!(app.toasts.has_toasts(), "the save conflict must surface as a toast");
+        let global_after = std::fs::read_to_string(&global_config_path).expect("read global");
+        assert_eq!(global_before, global_after, "the global config must stay untouched");
+        let project_after = std::fs::read_to_string(&project_config).expect("read project");
+        assert_eq!(project_before, project_after, "the project config must stay untouched");
     }
 
-    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, guard): a validation-invalid draft is
-    /// rejected on the inline path too — nothing is written, the draft is
-    /// kept, and the failure is surfaced (studio error + error toast).
+    /// ADR-58/59 (rewritten) Slice 2 (single-arm Save, guard), AMENDED
+    /// (global-only): a validation-invalid draft is rejected on the inline
+    /// path too — nothing is written, the draft is kept, and the failure is
+    /// surfaced (studio error + error toast). The auto-seed that ran on the
+    /// Studio open wrote the GLOBAL config; the project directory must stay
+    /// file-free after the failed save.
     #[test]
     fn save_rejects_an_invalid_draft_on_the_inline_path() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -4517,14 +5350,15 @@ description = "keep me"
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
-        // Same fresh-project shape as the seed matrix (see the first-open
-        // test): the machine's persisted registry must not pre-own a roster,
-        // or the seed short-circuits and no project file is written.
+        // Same shape as the seed matrix (see the first-open test): the
+        // machine's persisted registry must not pre-own a roster, or the
+        // seed short-circuits.
         app.config = None;
-        // First Studio open auto-seeds the inline roster.
+        // First Studio open auto-seeds the inline roster — globally now.
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        let before = std::fs::read_to_string(&project_config).expect("read project config before");
+        let global_config_path = dir.path().join("concerto").join("config.toml");
+        let before =
+            std::fs::read_to_string(&global_config_path).expect("read global config before");
 
         // Force a rulebook violation the UI would flag: an empty stage tag
         // (rule (g), "stage tag must be non-empty").
@@ -4545,8 +5379,12 @@ description = "keep me"
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
-        let after = std::fs::read_to_string(&project_config).expect("read project config after");
+        let after = std::fs::read_to_string(&global_config_path).expect("read global config after");
         assert_eq!(before, after, "an invalid draft must never reach the config");
+        assert!(
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the seed and a failed save must never create a project config"
+        );
         assert!(
             app.orchestration_studio.save_error.is_some(),
             "the save failure must surface on the studio"
@@ -4554,12 +5392,14 @@ description = "keep me"
         assert!(app.toasts.has_toasts(), "the save failure must surface as a toast");
     }
 
-    /// ADR-58/59 (rewritten) Slice 3: a valid Save writes the agent roster —
-    /// the Studio's authoritative agent list (mirrors of the seeds plus user
-    /// agents) — into `[multi_agent.custom_agents]` of the PROJECT config,
-    /// atomically and merge-aware. The roster has no rulebook of its own, so
-    /// it is gated on the same blueprint validation that gates the blueprint
-    /// write (an invalid draft never reaches the config at all — covered by
+    /// ADR-58/59 (rewritten) Slice 3, AMENDED (global-only): a valid Save
+    /// writes the agent roster — the Studio's authoritative agent list
+    /// (mirrors of the seeds plus user agents) — into
+    /// `[multi_agent.custom_agents]` of the GLOBAL config, atomically and
+    /// merge-aware, while the project directory stays file-free. The roster
+    /// has no rulebook of its own, so it is gated on the same blueprint
+    /// validation that gates the blueprint write (an invalid draft never
+    /// reaches the config at all — covered by
     /// `save_rejects_an_invalid_draft_on_the_inline_path`).
     #[test]
     fn save_writes_the_agent_roster_alongside_the_blueprint() {
@@ -4576,11 +5416,10 @@ description = "keep me"
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
-        // Same fresh-project shape as the seed matrix: the machine's persisted
-        // registry must not pre-own a roster, or the seed short-circuits.
+        // Same shape as the seed matrix: the machine's persisted registry
+        // must not pre-own a roster, or the seed short-circuits.
         app.config = None;
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
 
         // Add a user agent to the roster (mirrors Add/Rename in the library).
         let _ = app.orchestration_studio.update(
@@ -4595,29 +5434,40 @@ description = "keep me"
             crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
         ));
 
-        // Env restored before assertions so a panic cannot leak the redirect.
-        match previous {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-
         assert!(
             !app.orchestration_studio.unsaved,
             "a successful save marks the studio clean (blueprint + roster)"
         );
-        let after = std::fs::read_to_string(&project_config).expect("project config read back");
+        // The roster is written to per-agent files, never inline into the
+        // config (single source of truth).
+        let agents_dir = dir.path().join("concerto").join(concerto_config::AGENTS_DIR_NAME);
+        let after_agents: Vec<String> = std::fs::read_dir(&agents_dir)
+            .expect("read agents dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect();
         assert!(
-            after.contains("[[multi_agent.custom_agents]]"),
-            "the roster table must be written\n{after}"
+            after_agents.iter().any(|raw| raw.contains("Planner")),
+            "the added roster agent must exist as a per-agent file"
         );
         assert!(
-            after.contains("Planner"),
-            "the added roster agent must appear in [[multi_agent.custom_agents]]\n{after}"
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the save must never create a project .concerto.toml"
         );
-        // The roster owns the config (owns_agent_roster): a reload keeps it.
+        // The roster owns the config (owns_agent_roster): a reload keeps it —
+        // performed under the redirect (see the round-trip test note) so the
+        // reconcile consumes the redirected global file.
         app.reconcile_config_from_reload();
         let reloaded = app.config.clone().expect("config after reload");
-        assert!(reloaded.owns_agent_roster(), "the project config must own the agent roster");
+
+        // Env restored after every app operation, before the final assertions.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(reloaded.owns_agent_roster(), "the global config must own the agent roster");
     }
 
     /// Slice 4a (spec §7): the Settings Relationships-hide flag is a pure
@@ -4800,6 +5650,7 @@ description = "keep me"
             age: String::new(),
             score: 0.9,
             entry_type: crate::views::memory::MemoryEntryType::Fact,
+            stale: false,
         }
     }
 
@@ -5116,6 +5967,21 @@ description = "keep me"
         });
     }
 
+    /// Mirror the Settings rows into `config.model_settings.providers` so
+    /// `runtime_providers` resolves them. Tests push rows into
+    /// `settings.providers`, but on a host with a real user config
+    /// `App::new()` loads it and `runtime_providers` prefers the config list —
+    /// without this mirror the refresh handlers treat every pushed row as
+    /// deleted and silently drop its results.
+    fn sync_config_providers(app: &mut App) {
+        let ms = app
+            .config
+            .get_or_insert_with(AppConfig::default)
+            .model_settings
+            .get_or_insert_with(concerto_config::ModelSettings::default);
+        ms.providers = app.settings.providers.clone();
+    }
+
     #[test]
     fn dispatch_blocked_when_active_provider_missing_credential() {
         let (mut app, _) = App::new();
@@ -5206,6 +6072,33 @@ description = "keep me"
         );
     }
 
+    #[test]
+    fn save_discovery_queues_only_unfetched_ready_providers() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        app.pending_refresh.clear();
+        // `ollama` needs no credential and supports discovery, so it is ready
+        // without touching the keychain (keeps this test hermetic).
+        push_provider(&mut app, "fresh", "ollama", "");
+        push_provider(&mut app, "populated", "ollama", "");
+        app.settings.providers[1].cached_models = vec!["llama3".into()];
+        app.settings.providers[1].cached_models_fetched_at = 1;
+        sync_config_providers(&mut app);
+
+        let before = app.refresh_seq;
+        let _ = app.discover_unfetched_models();
+
+        assert!(
+            app.pending_refresh.contains_key("fresh"),
+            "an unfetched discoverable provider must be queued on save"
+        );
+        assert!(
+            !app.pending_refresh.contains_key("populated"),
+            "a provider with a cached catalog must not be re-fetched on save"
+        );
+        assert!(app.refresh_seq > before, "queuing a fetch must issue a request id");
+    }
+
     // ── Refresh concurrency (plan §13 Refresh concurrency) ─────────────────
 
     #[test]
@@ -5239,6 +6132,7 @@ description = "keep me"
         let (mut app, _) = App::new();
         app.settings.providers.clear();
         push_provider(&mut app, "prov1", "openai", "gpt-4");
+        sync_config_providers(&mut app);
         app.settings.providers[0].cached_models = vec!["gpt-4".into()];
         app.settings.providers[0].cached_models_fetched_at = 1;
 
@@ -5277,11 +6171,14 @@ description = "keep me"
         app.settings.providers.clear();
         push_provider(&mut app, "provA", "openai", "gpt-4");
         push_provider(&mut app, "provB", "openai", "gpt-4");
-        app.refresh_seq = 1;
-        app.pending_refresh.insert("provA".into(), 1);
 
         // Delete provA while the refresh is "in flight".
         app.settings.providers.retain(|p| p.id != "provA");
+        // Mirror AFTER the deletion so runtime_providers agrees provA is gone
+        // (a host's real user config would otherwise keep it resolvable).
+        sync_config_providers(&mut app);
+        app.refresh_seq = 1;
+        app.pending_refresh.insert("provA".into(), 1);
 
         // The result for the deleted provider must be ignored, and provB must
         // be untouched.
@@ -5307,6 +6204,7 @@ description = "keep me"
         let (mut app, _) = App::new();
         app.settings.providers.clear();
         push_provider(&mut app, "prov1", "ollama", "llama3");
+        sync_config_providers(&mut app);
         app.active_provider_id = "prov1".into();
         app.refresh_seq = 1;
         app.pending_refresh.insert("prov1".into(), 1);
@@ -5324,6 +6222,135 @@ description = "keep me"
                 .map(|models| models.iter().any(|m| m == "discovered-model"))
                 .unwrap_or(false),
             "discovered model must appear in the per-provider model cache"
+        );
+    }
+
+    #[test]
+    fn manual_refresh_request_registers_tracked_in_flight_fetch() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+
+        // Startup auto-discovery may already have consumed request ids.
+        let seq_before = app.refresh_seq;
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshRequested(
+            "prov1".into(),
+        )));
+
+        assert_eq!(
+            app.pending_refresh.get("prov1"),
+            Some(&seq_before.wrapping_add(1)),
+            "manual refresh must register a tracked request id"
+        );
+        assert!(
+            app.settings.refreshing_providers.contains("prov1"),
+            "the provider row must report its refresh as in flight"
+        );
+    }
+
+    #[test]
+    fn manual_refresh_request_for_unknown_or_nondiscovering_provider_is_ignored() {
+        let (mut app, _) = App::new();
+        // Startup auto-discovery may legitimately hold tracked requests; only
+        // the unknown id must stay untouched.
+        let pending_before = app.pending_refresh.len();
+
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshRequested(
+            "ghost".into(),
+        )));
+
+        assert_eq!(
+            app.pending_refresh.len(),
+            pending_before,
+            "unknown providers must not spawn fetches"
+        );
+        assert!(!app.pending_refresh.contains_key("ghost"));
+        assert!(app.settings.refreshing_providers.is_empty());
+    }
+
+    #[test]
+    fn completed_manual_refresh_updates_cache_and_clears_in_flight_state() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshRequested(
+            "prov1".into(),
+        )));
+        let request_id = *app.pending_refresh.get("prov1").expect("tracked request");
+
+        // The spawned task is dropped in tests; simulate its completion with
+        // the request id the handler assigned.
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id,
+            result: Ok(vec!["ox-alpha".into(), "gpt-4o".into()]),
+        }));
+
+        assert!(
+            !app.settings.refreshing_providers.contains("prov1"),
+            "the in-flight marker must clear when the result arrives"
+        );
+        assert!(!app.pending_refresh.contains_key("prov1"));
+        assert!(!app.settings.provider_refresh_errors.contains_key("prov1"));
+        let cache = app.settings.cached_models_by_provider();
+        assert!(
+            cache.get("prov1").map(|m| m.iter().any(|n| n == "ox-alpha")).unwrap_or(false),
+            "newly released models must appear in the picker cache immediately"
+        );
+    }
+
+    #[test]
+    fn failed_manual_refresh_preserves_cache_and_reports_inline_error() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+        app.settings.providers[0].cached_models = vec!["gpt-4".into()];
+        app.settings.providers[0].cached_models_fetched_at = 1;
+
+        // An explicit Err (network outage) must preserve the cache, clear the
+        // in-flight marker, and surface the error inline.
+        app.refresh_seq = 1;
+        app.pending_refresh.insert("prov1".into(), 1);
+        app.settings.begin_provider_refresh("prov1");
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id: 1,
+            result: Err("connection refused".into()),
+        }));
+        let p = app.settings.providers.iter().find(|p| p.id == "prov1").unwrap();
+        assert!(
+            p.cached_models.contains(&"gpt-4".to_string()),
+            "failed refresh must preserve the previous cache"
+        );
+        assert!(!app.settings.refreshing_providers.contains("prov1"));
+        assert_eq!(
+            app.settings.provider_refresh_errors.get("prov1").map(String::as_str),
+            Some("connection refused")
+        );
+
+        // A later empty discovery result — the shape every providers-crate
+        // failure collapses to before this handler — must likewise never wipe
+        // the cached list.
+        app.refresh_seq = 2;
+        app.pending_refresh.insert("prov1".into(), 2);
+        app.settings.begin_provider_refresh("prov1");
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id: 2,
+            result: Ok(Vec::new()),
+        }));
+        let p = app.settings.providers.iter().find(|p| p.id == "prov1").unwrap();
+        assert!(
+            p.cached_models.contains(&"gpt-4".to_string()),
+            "an empty discovery result must not wipe the cached model list"
+        );
+        assert!(
+            app.settings.provider_refresh_errors.contains_key("prov1"),
+            "an empty discovery result must be surfaced as a failure"
         );
     }
 
@@ -5407,8 +6434,19 @@ description = "keep me"
     /// Navigation to Studio page works.
     #[test]
     fn navigate_to_studio_changes_page() {
+        // Redirect XDG before App::new: navigating to the Studio auto-seeds
+        // the GLOBAL orchestration config now (global-only seeding), so this
+        // test must never touch the machine's real config file.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
         let (mut app, _) = App::new();
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         assert_eq!(app.page, Page::OrchestrationStudio);
     }
 
@@ -6381,9 +7419,14 @@ description = "keep me"
     // global config dir for its target-shadow guard, and the save re-loads
     // config on success.
 
-    /// Save on the include source writes the edited blueprint to the project
-    /// include file — and only there: the global `config.toml` is never
-    /// rewritten (the legacy wholesale persist is gone).
+    /// Save on the include source writes the edited blueprint to the PROJECT
+    /// include file the selection points at — and only there — plus (global-
+    /// only roster) the agent roster into the global config: the inline
+    /// edited blueprint NEVER reaches the global `[orchestration]` (global-
+    /// only enforcement 2026-09: the include selection itself is seeded into
+    /// the GLOBAL config — project-layer orchestration keys are ignored at
+    /// load; the include file the selection points at is not a config key,
+    /// so keeping the file in the project directory stays valid).
     #[test]
     fn save_on_blueprint_path_writes_the_edited_blueprint_to_the_project_include() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -6391,32 +7434,33 @@ description = "keep me"
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        // Global config file: schema only — must stay byte-identical.
+        // Global config file: the include selection is seeded here (global-
+        // only orchestration) and the roster save lands here, but the edited
+        // inline blueprint must never.
         let global_dir = dir.path().join("concerto");
         std::fs::create_dir_all(&global_dir).expect("create global config dir");
         let global_config_path = global_dir.join("config.toml");
         std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
-        let global_before =
-            std::fs::read_to_string(&global_config_path).expect("read global config");
-
-        // Project include + project-layer selection pointing at it.
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).expect("create project dir");
-        let include_target = project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE);
-        let standard =
-            concerto_config::named_blueprint("standard").expect("standard named blueprint");
-        concerto_config::save_blueprint(&standard, &include_target).expect("seed project include");
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
         concerto_config::save_blueprint_selection(
-            &project_config,
+            &global_config_path,
             &concerto_config::BlueprintSelection {
                 name: None,
                 include: Some(concerto_config::BLUEPRINT_INCLUDE_FILE.to_string()),
                 inline: None,
             },
         )
-        .expect("seed project selection");
+        .expect("seed global include selection");
+
+        // The include file the selection points at lives in the GLOBAL config
+        // dir: `load_global_config` (settings editor + reconcile) resolves
+        // include paths without a project root, so a global-layer selection
+        // with a project-dir include file would leave the global load broken.
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let include_target = global_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE);
+        let standard =
+            concerto_config::named_blueprint("standard").expect("standard named blueprint");
+        concerto_config::save_blueprint(&standard, &include_target).expect("seed include file");
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
@@ -6424,13 +7468,28 @@ description = "keep me"
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
 
-        // The Studio draft: edit the first stage's label, then Save.
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save is not pre-empted.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
+
+        // The Studio draft: edit the first stage's label, add a roster agent
+        // (a roster edit alongside the blueprint — exactly one agent list is
+        // persisted), then Save.
         let _ = app.orchestration_studio.update(
             crate::views::orchestration_studio::StudioMessage::StageLabelEdited(
                 0,
                 "planning".into(),
             ),
         );
+        let _ = app.orchestration_studio.update(
+            crate::views::orchestration_studio::StudioMessage::NewAgentName("Planner".into()),
+        );
+        let _ = app
+            .orchestration_studio
+            .update(crate::views::orchestration_studio::StudioMessage::AddAgent);
         let _ = app.update(Message::OrchestrationStudio(
             crate::views::orchestration_studio::StudioMessage::SaveOrchestration,
         ));
@@ -6454,9 +7513,32 @@ description = "keep me"
         assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
         let global_after =
             std::fs::read_to_string(&global_config_path).expect("global config read back");
-        assert_eq!(
-            global_before, global_after,
-            "the global config must stay untouched — no [orchestration] persist\n{global_after}"
+        assert!(
+            !global_after.contains("inline = {"),
+            "the edited inline blueprint must never reach the global file (global-only \
+             roster aside; the include selection itself is there)\n{global_after}"
+        );
+        // The roster now lives in per-agent files (single source of truth):
+        // the added agent reaches `<global-config-dir>/agents/`, not the config
+        // file.
+        let agents_dir = global_dir.join(concerto_config::AGENTS_DIR_NAME);
+        assert!(
+            agents_dir.is_dir(),
+            "the per-agent roster directory must exist next to the global config"
+        );
+        let planner = std::fs::read_dir(&agents_dir)
+            .expect("read agents dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("toml"))
+            .any(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .map(|raw| raw.contains("Planner"))
+                    .unwrap_or(false)
+            });
+        assert!(planner, "the added roster agent must exist as a per-agent file");
+        assert!(
+            !global_after.contains("[[multi_agent.custom_agents]]"),
+            "the roster must no longer be written inline into the config\n{global_after}"
         );
     }
 
@@ -6470,26 +7552,28 @@ description = "keep me"
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        std::fs::create_dir_all(dir.path().join("concerto")).expect("create global config dir");
-        std::fs::write(dir.path().join("concerto").join("config.toml"), "schema_version = 7\n")
-            .expect("seed global config");
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).expect("create project dir");
-        let include_target = project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE);
-        let standard =
-            concerto_config::named_blueprint("standard").expect("standard named blueprint");
-        concerto_config::save_blueprint(&standard, &include_target).expect("seed project include");
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
         concerto_config::save_blueprint_selection(
-            &project_config,
+            &global_config_path,
             &concerto_config::BlueprintSelection {
                 name: None,
                 include: Some(concerto_config::BLUEPRINT_INCLUDE_FILE.to_string()),
                 inline: None,
             },
         )
-        .expect("seed project selection");
+        .expect("seed global include selection");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        // The include file lives in the GLOBAL config dir so the global-layer
+        // include selection loads with and without a project root
+        // (`load_global_config` has no project dir to resolve through).
+        let include_target = global_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE);
+        let standard =
+            concerto_config::named_blueprint("standard").expect("standard named blueprint");
+        concerto_config::save_blueprint(&standard, &include_target).expect("seed include file");
         let before = std::fs::read_to_string(&include_target).expect("read include before");
 
         let (mut app, _) = App::new();
@@ -6534,32 +7618,42 @@ description = "keep me"
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
-        std::fs::create_dir_all(dir.path().join("concerto")).expect("create global config dir");
-        std::fs::write(dir.path().join("concerto").join("config.toml"), "schema_version = 7\n")
-            .expect("seed global config");
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).expect("create project dir");
-        let include_target = project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE);
-        let standard =
-            concerto_config::named_blueprint("standard").expect("standard named blueprint");
-        concerto_config::save_blueprint(&standard, &include_target).expect("seed project include");
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        std::fs::write(&project_config, "schema_version = 7\n").expect("seed project config");
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
         concerto_config::save_blueprint_selection(
-            &project_config,
+            &global_config_path,
             &concerto_config::BlueprintSelection {
                 name: None,
                 include: Some(concerto_config::BLUEPRINT_INCLUDE_FILE.to_string()),
                 inline: None,
             },
         )
-        .expect("seed project selection");
+        .expect("seed global include selection");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        // The include file lives in the GLOBAL config dir so the global-layer
+        // include selection loads with and without a project root
+        // (`load_global_config` has no project dir to resolve through).
+        let include_target = global_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE);
+        let standard =
+            concerto_config::named_blueprint("standard").expect("standard named blueprint");
+        concerto_config::save_blueprint(&standard, &include_target).expect("seed include file");
 
         let (mut app, _) = App::new();
         app.project_dir = project_dir.clone();
         app.reconcile_config_from_reload();
         let config = app.config.clone().expect("config loaded after reconcile");
         app.orchestration_studio.load_from_config(&config);
+
+        // Seed the specialist roster (production does this on Studio open via
+        // `ensure_orchestration_seeded`) so the standard blueprint's staffing
+        // satisfies the roster-membership rule and Save reaches the include
+        // guard under test.
+        let _ = app.update(Message::OrchestrationStudio(
+            crate::views::orchestration_studio::StudioMessage::RestoreDefaultAgents,
+        ));
 
         // The watcher (or a hand edit) replaced the include with garbage
         // AFTER the load: the on-disk file no longer parses.
@@ -6583,11 +7677,15 @@ description = "keep me"
         );
     }
 
-    /// Save refuses when the loaded blueprint would be shadowed: the include
-    /// lives in the global config dir while Save would write the project dir
-    /// — a file a later load would never read.
+    /// Save writes the global-dir include the selection points at — the
+    /// same file the config would load. (Global-only enforcement 2026-09
+    /// AMENDED the former shadow-refusal: with the include living in the
+    /// global config dir and resolved by the same project-first/global-second
+    /// order, saving over it is exactly right; the bare fallback and the
+    /// project file are the other two allowed targets. The guard remains for
+    /// any other target shape.)
     #[test]
-    fn save_refuses_when_the_loaded_blueprint_would_be_shadowed() {
+    fn save_writes_the_global_dir_include_the_selection_points_at() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let previous = std::env::var_os("XDG_CONFIG_HOME");
@@ -6637,12 +7735,15 @@ description = "keep me"
 
         assert!(
             !project_include.exists(),
-            "no file may be created in the project dir that would shadow the loaded include"
+            "no file may be created in the project dir — the include lives in the global dir"
         );
-        let error = app.orchestration_studio.save_error.as_deref().expect("save_error set");
-        assert!(
-            error.contains("shadow"),
-            "the target-shadow guard must refuse with a shadowing message: {error}"
+        assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
+        let saved = concerto_config::parse_blueprint_file(&global_include)
+            .expect("the saved include must parse");
+        assert_eq!(
+            saved.schema_version,
+            concerto_config::ORCHESTRATION_SCHEMA_VERSION,
+            "the global-dir include the selection points at must be rewritten by Save"
         );
     }
 
@@ -6655,7 +7756,7 @@ description = "keep me"
     fn default_auto_seed_then_save_then_reload_round_trips_the_edited_blueprint() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let mut previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
         let global_dir = dir.path().join("concerto");
@@ -6671,13 +7772,11 @@ description = "keep me"
         // must really write for this round-trip to prove anything.
         app.config = None;
         // First-run bootstrap: opening the Studio seeds the roster inline.
+        // All app operations stay under the XDG redirect — whole-config
+        // persistence paths serialize the app's in-memory global config, so
+        // any app call against the real machine config would leak test state
+        // there. The env is restored only before the final assertions.
         let _ = app.update(Message::Navigate(Page::OrchestrationStudio));
-
-        // Env restored before assertions so a panic cannot leak the redirect.
-        match previous {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
 
         // The auto-seed activates the blueprint path through an INLINE
         // selection (the Slice-2 default shape).
@@ -6709,21 +7808,37 @@ description = "keep me"
         ));
         assert!(!app.orchestration_studio.unsaved, "a successful save marks the studio clean");
 
-        // Save rewrote the inline in the PROJECT config — not an include file.
-        let project_config = project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE);
-        let raw_project = std::fs::read_to_string(&project_config).expect("project config read");
+        // Save rewrote the inline in the GLOBAL config (global-only
+        // orchestration); the project directory stays file-free — not an
+        // include file either. Reload the fresh file while the redirect is
+        // still active — whole-config persistence paths serialize the app's
+        // in-memory global config, and running them against the real machine
+        // config would leak test state there.
         assert!(
-            raw_project.contains("inline = {"),
-            "save must write the edited blueprint inline\n{raw_project}"
+            !project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE).exists(),
+            "the save must never create a project .concerto.toml"
         );
         assert!(
             !project_dir.join(concerto_config::BLUEPRINT_INCLUDE_FILE).exists(),
             "no include file is created on the default inline path"
         );
+        let global_config_path = dir.path().join("concerto").join("config.toml");
+        let raw_global = std::fs::read_to_string(&global_config_path).expect("global config read");
+        assert!(
+            raw_global.contains("inline = {"),
+            "save must write the edited blueprint inline into the global file\n{raw_global}"
+        );
 
         // A full reload from disk must now load the EDITS — the B1 property:
         // the runtime consumes the inline Save wrote, not an unedited default.
         app.reconcile_config_from_reload();
+
+        // Env restored after every app operation, before the final assertions.
+        let previous = previous.take();
+        match &previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         let reloaded = app.config.clone().expect("config after reload");
         assert!(
             reloaded.orchestration.as_ref().is_some(),
@@ -6738,5 +7853,202 @@ description = "keep me"
             Some("planning"),
             "the runtime must load the edited inline — not the unedited standard blueprint"
         );
+    }
+
+    // ---- global-only orchestration enforcement (2026-09): banner + import ----
+
+    /// The banner condition tests (keys present ⇒ keys non-empty; absent ⇒
+    /// suppressed; dismissed ⇒ suppressed for the session). The rendered
+    /// banner is an opaque iced element in headless tests, so the
+    /// rendered-state predicate lives here, exactly like
+    /// `views::orchestration_studio::modified_caption`.
+    #[test]
+    fn banner_condition_ignores_and_dismissal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        app.orchestration_banner_dismissed = false;
+        app.project_orchestration_keys = Vec::new();
+
+        // No orchestration keys in the project file → banner suppressed.
+        app.refresh_project_orchestration_keys();
+        assert!(app.project_orchestration_keys.is_empty());
+
+        std::fs::write(
+            project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE),
+            "schema_version = 7\n[orchestration]\nschema_version = 1\n",
+        )
+        .expect("seed project orchestration");
+        app.refresh_project_orchestration_keys();
+        assert_eq!(app.project_orchestration_keys, vec!["orchestration"]);
+        let banner_visible =
+            !app.project_orchestration_keys.is_empty() && !app.orchestration_banner_dismissed;
+        assert!(banner_visible, "declared keys ⇒ banner shows");
+
+        // Dismiss hides it for this session only (new sessions re-show via a
+        // fresh `App` whose `orchestration_banner_dismissed` is `false`).
+        let _ = app.update(Message::DismissOrchestrationBanner);
+        assert!(app.orchestration_banner_dismissed);
+        let banner_visible =
+            !app.project_orchestration_keys.is_empty() && !app.orchestration_banner_dismissed;
+        assert!(!banner_visible, "dismissed ⇒ banner hidden in-session");
+    }
+
+    /// A project file with keys but no reconciliation must not accidentally
+    /// clear stale keys: `refresh_project_orchestration_keys` reflects the
+    /// CURRENT file state, including clearing when the keys disappear.
+    #[test]
+    fn banner_keys_clear_when_the_project_file_stops_declaring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        app.project_orchestration_keys = vec!["orchestration".into()];
+        std::fs::write(
+            project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE),
+            "schema_version = 7\nsession_spend_cap_usd = 2.0\n",
+        )
+        .expect("seed non-orchestration project config");
+        app.refresh_project_orchestration_keys();
+        assert!(app.project_orchestration_keys.is_empty(), "stale keys must clear");
+    }
+
+    /// Import round-trip (one explicit user action): the declared keys land
+    /// in the GLOBAL file, the project file loses them, the reload resolves
+    /// orchestration from the global layer while the project's unrelated
+    /// keys keep overriding — and the banner condition clears.
+    #[test]
+    fn import_round_trips_the_keys_to_global_and_off_the_project() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        std::fs::write(&global_config_path, "schema_version = 7\n").expect("seed global config");
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join(concerto_config::legacy::NEW_PROJECT_CONFIG_FILE),
+            r#"schema_version = 7
+session_spend_cap_usd = 2.5
+[orchestration]
+schema_version = 1
+[orchestration.blueprint]
+name = "tdd"
+[multi_agent]
+max_concurrent_agents = 3
+model_pins = { coder = "local-model" }
+"#,
+        )
+        .expect("seed project orchestration");
+
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        app.reconcile_config_from_reload();
+        assert_eq!(
+            app.project_orchestration_keys,
+            vec!["orchestration", "multi_agent.model_pins"],
+            "precondition: the banner is armed with the ignored keys"
+        );
+        let banner_visible =
+            !app.project_orchestration_keys.is_empty() && !app.orchestration_banner_dismissed;
+        assert!(banner_visible);
+
+        // The one explicit import action.
+        let _ = app.update(Message::ImportProjectOrchestration);
+
+        // Env restored before assertions so a panic cannot leak the redirect.
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        // The global file gained the keys; the project file lost them.
+        let gdoc = std::fs::read_to_string(&global_config_path).expect("global read back");
+        assert!(gdoc.contains("[orchestration]") && gdoc.contains("name = \"tdd\""), "{gdoc}");
+        assert!(gdoc.contains("local-model"), "the pins moved\n{gdoc}");
+        let pdoc =
+            std::fs::read_to_string(project_dir.join(".concerto.toml")).expect("project read back");
+        assert!(!pdoc.contains("[orchestration]"), "orchestration removed\n{pdoc}");
+        assert!(!pdoc.contains("local-model"), "pins removed\n{pdoc}");
+        assert!(pdoc.contains("session_spend_cap_usd = 2.5"), "unrelated project key kept\n{pdoc}");
+
+        // The reload consumed the import: orchestration resolves from the
+        // global layer, the project override still applies, and the banner
+        // condition cleared.
+        assert!(app.toasts.has_toasts(), "the import must be toasted");
+        let cfg = app.config.as_ref().expect("config reloaded");
+        assert_eq!(
+            cfg.orchestration.as_ref().expect("orchestration present").blueprint.name.as_deref(),
+            Some("tdd"),
+            "the imported selection resolves from the global layer"
+        );
+        assert_eq!(
+            cfg.session_spend_cap_usd,
+            Some(2.5),
+            "the unrelated project key still applies after import"
+        );
+        assert!(
+            app.project_orchestration_keys.is_empty(),
+            "the import clears the banner condition"
+        );
+    }
+
+    /// Conflict rule (pinned at the desktop layer): when the global config
+    /// ALREADY declares the keys, the import refuses — both files stay
+    /// byte-identical, the refusal is toasted naming the collision (user
+    /// global data is never silently overwritten).
+    #[test]
+    fn import_refuses_when_the_global_config_already_declares_the_keys() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let global_dir = dir.path().join("concerto");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        let global_config_path = global_dir.join("config.toml");
+        let global_before = "schema_version = 7\n[orchestration]\nschema_version = 1\n";
+        std::fs::write(&global_config_path, global_before).expect("seed global config");
+
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let project_config = project_dir.join(".concerto.toml");
+        let project_before = "schema_version = 7\n[orchestration]\nschema_version = 1\n";
+        std::fs::write(&project_config, project_before).expect("seed project config");
+
+        let (mut app, _) = App::new();
+        app.project_dir = project_dir.clone();
+        app.reconcile_config_from_reload();
+        let _ = app.update(Message::ImportProjectOrchestration);
+
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert!(app.toasts.has_toasts(), "the refusal must surface as a toast");
+        assert_eq!(
+            std::fs::read_to_string(&global_config_path).unwrap(),
+            global_before,
+            "the global config must stay untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&project_config).unwrap(),
+            project_before,
+            "the project config must stay untouched"
+        );
+        assert!(
+            !app.project_orchestration_keys.is_empty(),
+            "the keys stay declared (still ignored at load) until the user resolves it"
+        );
+        let _ = app;
     }
 }

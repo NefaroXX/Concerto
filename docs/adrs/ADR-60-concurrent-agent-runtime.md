@@ -1,6 +1,6 @@
 # ADR-60: Concurrent Agent Runtime — Process-per-Agent Supervisor, Event-Sourced Whiteboard, Memory Spine
 
-**Status:** Active (approved — see Revision)
+**Status:** Accepted (see Revision)
 **Date:** 2026-08-18
 **Deciders:** sol (product owner); architecture review pending per process
 **Supersedes:** none (new decision; ADR-35 §4/§5 coordinator contract is redefined below, not silently contradicted)
@@ -88,6 +88,10 @@ Per owner decision (2026-08-18): this is a new decision, not recovered intent. N
 - Execute phase: when a task references an approved `plan_id`, the Execute supervisor loads the structured `DesignDoc` object + prior ledger via the gate (not rendered prose), and seeds the carry-forward run state #152's fix #3 asks for (completed subtask results, files touched, failed commands with failure reasons) from the log.
 - Silent re-decompose is forbidden (issue fix #4): divergence from the approved plan requires explicit user re-approval.
 - One persistence layer total: the event log + its projections (checkpoints, hybrid memory store, transcript views). Explicitly resolves the issue's "do not conflate with the memory subsystem" note: RAG retrieval is *not* the continuity mechanism (the issue is correct on that); the log is. The memory store remains a projection on top of the log, and #152's fix rides the log.
+- **Amendment (run-continuity, session-keyed):** the D7 read also fires for explicit `continue`/resume runs that carry no approved-plan binding (a resume after a failed Execute, or a reopened project). It is read-side only: the gate already persists the substrate keyed by the run's session id (`write-applied` rows carry the files touched, `failure` rows the failed commands), and the session's newest hash-verified `plan-approved` payload re-anchors the last approved artifact. No new event kind and no summary row — the log stays the sole source of truth, folded at read time with the same ledger grammar as the plan-keyed path. Gated by the same `plan_binding_source` switch; `legacy` keeps the pre-D7 behavior. A fresh session or empty log seeds nothing (truthful empty state).
+- **Amendment (interrupt-safe resume, 2026-09-05):** live acceptance of the evidence-spine build exposed a gap on both sides of the 2026-08-24 amendment: a multi-agent build run, interrupted with Ctrl+C after the coder started, then re-run with `continue`, re-dispatched the **architect** instead of continuing the build. Two decisions close it:
+  - **Write side — checkpoint on graceful interrupt.** A graceful stop materializes the orchestration checkpoint before teardown, the same `completed=0` row the stall path writes. The terminal and desktop apps gain a signal/window-close handler (SIGINT/Ctrl+C, app close) that cancels the run and invokes the supervisor's `checkpoint_at_shutdown` (implemented today, exercised only by tests). A hard-killed run leaves no row, a later `continue` finds nothing to resume, and the run re-derives from scratch — the observed failure.
+  - **Read side — headless resume from the evidence chain.** When a `continue`/resume request finds **no** checkpoint row (a killed run, or a reopened project with prior whiteboard events), the coordinator seeds dispatch state from the logged evidence instead of re-entering design: the newest hash-verified `plan-approved` payload and the logged researcher/coder gate events determine the next dispatch (verified design + research done → dispatch the **coder**, not the architect). This extends the 2026-08-24 amendment from "fold the ledger prose" to "fold the ledger prose *and* the dispatch cursor". It does **not** relax ADR-65 §7: re-calling the architect or researcher still requires a recorded, evidence-backed `Decision` event; a resume path with no such decision continues the nearest non-redundant step.
 
 ### D8. Scope boundaries
 
@@ -140,6 +144,45 @@ Negative / costs:
   - D1/D2 claim verification completed: `agent_loop.rs` struct (:35–80) owns every dependency for a run, all injected at construction (`new` :180, `with_project_root` :215, `with_session_store` :292); `run` (:303) → `run_once` (:442) → provider → `execute_single_tool_call` (:1286) → single tool-executor call site (:1365) → `store_task_summary` (:1102) → persistence (:1185/:1232). AgentLoop is the agent-process entry; the slice swaps the executor call site for a gate-proxy client. `mcp/client.rs` confirms the transport precedent: `spawn` (:194, piped stdio, `kill_on_drop`, double-spawn guard :200), `initialize` (:266), JSON-RPC 2.0 newline-delimited framing (:495–511), `stop` (:439, cancel → stdin EOF → GRACE_PERIOD → kill escalation), `Drop` reap (:580); `GRACE_PERIOD = 2s` (:45).
   - `run_review_cycle` resumability promoted from a consequence footnote to an explicit Deferred/Sequencing item (item 3 above).
   - Approved to proceed to the vertical slice (Deferred item 1).
+- 2026-08-24 — v1.2, Status Active → Accepted. Implementation complete across
+  Phases 1–4 plus follow-up fixes: decisions D1–D8 are implemented and Deferred
+  items 1–3 are delivered (thin vertical slice, #152 plan binding, review-cycle
+  resumability); Deferred item 4 (scheduler/subscription generalization beyond
+  6 agents, real-embedder swap, multi-level disclosure) remains deferred per
+  ADR. Implementation commits: `5c9b269` (Phase 1 supervisor wiring),
+  `4dc2c67` (Phase 2 whiteboard-verified plan binding), `8e065d8` (Phase 3
+  review-cycle resumability), `787df6e` (Phase 4 consolidation and replay
+  harness), `b6ce712` (heartbeat liveness anchored on the supervisor clock),
+  `f75b4b7` (`PR_SET_PDEATHSIG` orphan cleanup); merged via PR #11 (`83d20cc`).
+- 2026-09-01 — v1.3, D4 fairness resolved (implementation notes below). The
+  delivered gate satisfies D4's "no chatty-agent starvation" requirement
+  structurally — per-agent in-flight isolation over a deliberately
+  non-serialized gate — so the weighted-round-robin *mechanism* named in D4
+  is superseded, not deferred: there is no cross-agent queue for it to
+  schedule, and inventing one (a global execution cap) would be a throughput
+  regression rationing a resource nobody contends for. Decision text above is
+  unchanged; the notes extend D4 the way the D3/D5/D6 notes do.
+- 2026-09-05 — v1.4, run-continuation amendment extended (interrupt-safe
+  resume). Live acceptance of the evidence-spine build (hexview smoke test)
+  failed: Ctrl+C after the coder started left no checkpoint (no app signal
+  handler; `checkpoint_at_shutdown` was test-only), so the `continue` rerun
+  re-dispatched the architect instead of continuing the build — and that
+  dispatch carried no recorded `Decision` event (ADR-65 §7). The D7
+  amendment above now covers both sides. Implementation on branch
+  `feat/interrupt-safe-resume`: `17998a5` (fix: the resume scope check
+  validates the checkpoint against its OWN project-id definition —
+  `ProjectId::resolve` — where the unrelated path hash rejected every real
+  row with "belongs to a different project" and then cleared it),
+  `0863f75` (read side: a checkpointless `continue` seeds the dispatch
+  cursor from the evidence chain — newest hash-verified `plan-approved`
+  payload + the §6 evidence scheduler; research done ⇒ the coder, every
+  dispatch a recorded `Decision` event), `c6b3468` (run-level zero-work
+  guard for action-required runs — the F1 zero-tool-completed route),
+  `ec27bdf` (CLI: SIGINT watcher + bounded graceful quit that persists the
+  interrupted checkpoint), `bc1ccd5` (desktop: window close waits, bounded,
+  for the run to settle before exit), `ef90c7e` (supervised run: user
+  cancellation wired into `run_until`, so the gate-boundary shutdown
+  checkpoint persists on cancel).
 
 ### D5 implementation notes — always-on injection & per-target claims (2026-08)
 
@@ -285,3 +328,81 @@ unchanged.
   backpressure signalling, and schedule-driven pushes all remain behind
   Deferred item 4. The raw log remains append-only and untouched; slices are
   projections.
+
+### D6 implementation notes — consolidation (2026-08)
+
+Minimal thin-slice consolidator as landed in Phase 4 (`787df6e`). These notes
+extend D6; the decision text above is unchanged.
+
+- **Out-of-band trigger, never blocking the gate.** The supervisor's write-path
+  handlers count appends; every `CONSOLIDATION_TRIGGER_APPENDS` (= 16) appends
+  detach ONE consolidation pass onto the tokio runtime, fire-and-forget. The
+  gated-write / publish reply path never awaits indexing work; triggers are
+  coalesced while a pass is in flight (at most one pass runs at a time).
+- **Fold into the hybrid store, bi-temporal.** Each pass folds foldable events
+  (`Decision`, `PlanApproved`, `ReviewState`) into `SqliteVectorStore` with
+  bi-temporal metadata (world-time from the folded events vs ingestion-time of
+  the projection). The raw log is never summarized away.
+- **Content-derived ids + bookmark watermark → idempotent.** Chunk ids derive
+  deterministically from project + group + watermark `gate_seq`, so a crash
+  between storing a chunk and recording its `Consolidation` bookmark converges
+  on re-run instead of duplicating; each pass records ONE bookmark event whose
+  watermark is where the next pass resumes.
+- **Invalidate-not-delete with provenance.** A newer projection tombstones the
+  previous chunk (rows retained) and cites `superseded_event_ids` /
+  `superseded_chunk_ids` in its own provenance, keeping the audit trail
+  unbroken.
+- **Deterministic feature-hash placeholder embedder.** Projections are
+  retrievable without a downloaded model via bag-of-tokens feature-hash vectors
+  (`model_id: "feature-hash"`); swapping in real embeddings later changes no
+  contract and stays behind Deferred item 4.
+- **Disclosure clamp.** The supervisor's `retrieve-memory` shortlist clamps to
+  `DISCLOSURE_MAX_CHUNKS` (= 10) chunks — one disclosure level, per D6.
+- **Files:** `crates/orchestrator/src/consolidation.rs` (`Consolidator`,
+  constants above), `crates/orchestrator/src/supervisor.rs` (write-path trigger,
+  retrieval clamp), `crates/memory/src/vector_store.rs` (`SqliteVectorStore`
+  projection target).
+
+### D4 implementation notes — gate fairness (2026-09)
+
+Closing the "weighted round-robin fairness across agents (D4)" deferral that
+the write-gate module docs carried since the vertical slice. These notes
+extend D4; the decision text above is unchanged.
+
+- **The requirement, verified against the delivered gate.** D4's fairness
+  requirement is "no chatty-agent starvation". The delivered `WriteGate`
+  satisfies it structurally: every agent owns a private FIFO in-flight
+  limiter (cap = `max_in_flight_per_agent`, 1 in production), demand beyond
+  the cap parks on the agent's *own* semaphore, agents never contend for one
+  another's permits, and tool execution runs concurrently across agents.
+  There is no cross-agent queue inside the gate, so one agent's backlog can
+  neither delay nor reorder a sibling's write. Pinned by
+  `per_agent_limiter_bounds_concurrency_but_agents_are_independent`
+  (`crates/orchestrator/src/gate.rs`): while a chatty agent holds its permit
+  with two writes parked behind it, a sibling's write completes within a
+  bounded wait and is sequenced (`gate_seq`) ahead of the parked backlog.
+- **Backpressure and caller shape.** In-flight gated ops are bounded per
+  agent (total bound: roster size × cap) and no other queue exists. The
+  wired callers add no buffering: the supervised child is a strictly
+  sequential one-request-at-a-time client (`gate_proxy.rs`), and the
+  in-process loop awaits each tool call, so each agent holds at most one
+  write in flight in practice; backpressure propagates to the agent loop
+  instead of accumulating at the gate. The supervisor's steady-state loop
+  additionally drains each agent at `MAX_EVENTS_PER_TICK` per tick —
+  per-agent fair by construction.
+- **The one cross-agent serialization point** is the whiteboard WAL append
+  (`gate_seq` assignment under SQLite's `BEGIN IMMEDIATE` write lock).
+  Appends are single short transactions; contention is bounded by the pool's
+  `busy_timeout` and surfaces as a `GateError::Whiteboard` error — never as
+  silent deferral or reordering.
+- **Why weighted round-robin is superseded, not shipped.** WRR presupposes a
+  serialized gate queue it can fairly interleave (the research brief's
+  "single-writer thread" gate). The implemented gate is deliberately
+  non-serialized: per-agent isolation plus concurrent cross-agent execution
+  was the chosen concurrency model (the module docs' "agents do not block
+  one another" contract). Scheduling WRR there would first require
+  inventing contention — a global execution cap serializing what today runs
+  concurrently — a throughput regression that rations a resource nobody
+  contends for, to fix a failure mode (cross-agent starvation) that
+  structurally cannot occur. The mechanism is therefore rejected; the
+  requirement it served is met and pinned by test.

@@ -351,6 +351,12 @@ pub enum EventKind {
         provider: String,
         model: String,
         reason: String,
+        /// ADR-55 Phase 2d §5: the intent-routing decision payload, present
+        /// only on the run loop's intent-routing emissions. The multi-agent
+        /// model-routing rows (`crates/providers/src/routing.rs`) carry
+        /// `None`. `#[serde(default)]` keeps pre-2d payloads deserializable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<IntentRouteDecision>,
     },
     BudgetDowngradeTriggered {
         role: AgentId,
@@ -527,6 +533,30 @@ pub enum EventKind {
     },
 }
 
+/// The intent-routing payload of an intent [`EventKind::RoutingDecided`]
+/// record (ADR-55 Phase 2d §5).
+///
+/// Mirrors the `{rule, confidence, route}` envelope of the matching
+/// `intent_router: auto_granted` audit row so the `session_events` record and
+/// the audit row tell the same story under one correlation id. Present only
+/// on the run loop's intent-routing emissions; the multi-agent model-routing
+/// rows carry none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentRouteDecision {
+    /// The effective outcome label (`Execute`, `Plan`, `Verify`, `Review`,
+    /// `Diagnose`, `Answer`).
+    pub outcome: String,
+    /// The rule that produced the decision (`execute_keyword`, ...,
+    /// `llm_classifier`, `ask_user`).
+    pub rule: String,
+    /// The routing confidence at decision time.
+    pub confidence: f32,
+    /// The routing path kind (`RuleHit` | `LlmClassifier` | `AskUser`).
+    pub route: String,
+    /// Whether the run auto-granted from this decision (2d §1).
+    pub auto_granted: bool,
+}
+
 impl EventKind {
     /// Sanitize all string fields in this event kind to redact secrets.
     ///
@@ -599,13 +629,20 @@ impl EventKind {
                     verdict: sanitizer.sanitize(&verdict),
                 }
             }
-            EventKind::RoutingDecided { task_id, role, provider, model, reason } => {
+            EventKind::RoutingDecided { task_id, role, provider, model, reason, intent } => {
                 EventKind::RoutingDecided {
                     task_id,
                     role,
                     provider: sanitizer.sanitize(&provider),
                     model: sanitizer.sanitize(&model),
                     reason: sanitizer.sanitize(&reason),
+                    intent: intent.map(|decision| IntentRouteDecision {
+                        outcome: sanitizer.sanitize(&decision.outcome),
+                        rule: sanitizer.sanitize(&decision.rule),
+                        confidence: decision.confidence,
+                        route: sanitizer.sanitize(&decision.route),
+                        auto_granted: decision.auto_granted,
+                    }),
                 }
             }
             EventKind::ProviderRetryScheduled {

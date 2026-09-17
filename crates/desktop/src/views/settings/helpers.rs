@@ -163,8 +163,71 @@ pub(crate) async fn probe_mcp_server(
     tools.map_err(|error| format!("tools/list failed: {error}"))
 }
 
+/// ADR-37 — Revoke a plugin's capability grants from the Settings UI. First
+/// removes the persisted grants via [`CapabilityManager::revoke_plugin`], then
+/// signals a best-effort live clear through [`PluginManager::revoke_grants`]
+/// so host-function checks fail closed while the plugin is still loaded.
+///
+/// `plugin_manager` is the desktop's process-lifetime manager handle (plugin
+/// liveness): when present and already materialised by a run, the LIVE plugin
+/// instance's in-memory grants are cleared. When it is absent (headless/tests)
+/// or not yet materialised (no run yet — inner `None`), a fresh manager bound
+/// to the same capability store is used and `NotActive` — the expected outcome
+/// when the plugin is not loaded in this process — is tolerated and logged,
+/// mirroring `concerto plugin revoke` in the CLI. Returns a human-readable
+/// outcome line for the Plugins section.
+pub(crate) async fn revoke_plugin_grants(
+    plugin_id: String,
+    plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>,
+) -> Result<String, String> {
+    let data_dir = concerto_plugins::capability::CapabilityManager::data_dir();
+    let cap_mgr = concerto_plugins::capability::CapabilityManager::open(&data_dir)
+        .map_err(|e| format!("could not open capability store: {e}"))?;
+    cap_mgr.revoke_plugin(&plugin_id).map_err(|e| e.to_string())?;
+
+    // Best-effort live revocation (ADR-37): clear the in-memory grant set of
+    // a loaded plugin. The desktop process keeps a retained manager handle
+    // since the runtime materialised it on the first run, so a live plugin's
+    // grants are actually cleared here; `NotActive` is tolerated whenever the
+    // plugin is not loaded and only unexpected failures are surfaced.
+    match plugin_manager {
+        Some(handle) => {
+            let mut guard = handle.lock().await;
+            match guard.as_mut().map(|(_, manager)| manager) {
+                Some(manager) => {
+                    manager.revoke_grants_best_effort(&plugin_id).await;
+                }
+                None => {
+                    tracing::debug!(
+                        plugin_id,
+                        "revoke_grants: no materialised plugin manager (no run yet) — skipped"
+                    );
+                }
+            }
+        }
+        None => {
+            // Headless / tests: no retained handle — fall back to a fresh
+            // best-effort manager against the same store. NotActive expected.
+            if let Ok(host) = concerto_plugins::host::PluginHost::new() {
+                let manager = concerto_plugins::manager::PluginManager::new(
+                    std::sync::Arc::new(host),
+                    cap_mgr,
+                    None,
+                    None,
+                );
+                manager.revoke_grants_best_effort(&plugin_id).await;
+            } else {
+                tracing::warn!("revoke_grants: could not construct plugin host — skipped");
+            }
+        }
+    }
+
+    Ok(format!("Revoked grants for '{plugin_id}'"))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::message::SectionId;
     use super::super::*;
     use super::super::{readable_provider_label, PolicyActionChoice, PolicyConditionChoice};
     use concerto_config::{
@@ -437,6 +500,51 @@ mod tests {
         assert!(state.key_edit_text.is_empty());
         assert_eq!(state.providers.len(), 1);
         assert_eq!(state.providers[0].id, "router");
+    }
+
+    #[test]
+    fn all_settings_sections_start_collapsed() {
+        let state = State::from_config(&AppConfig::default());
+        for section in SectionId::ALL {
+            assert!(
+                state.collapsed_sections.contains(&section),
+                "section {section:?} must start collapsed"
+            );
+        }
+    }
+
+    #[test]
+    fn jump_to_section_expands_but_never_folds() {
+        let mut state = State::from_config(&AppConfig::default());
+        // The sidebar jump expands its target...
+        let _ = state.update(Message::JumpToSection(SectionId::Mcp));
+        assert!(
+            !state.collapsed_sections.contains(&SectionId::Mcp),
+            "a sidebar jump must expand its target"
+        );
+        // ...and is idempotent: jumping again never folds it.
+        let _ = state.update(Message::JumpToSection(SectionId::Mcp));
+        assert!(!state.collapsed_sections.contains(&SectionId::Mcp));
+        // The section header keeps the toggle semantics.
+        let _ = state.update(Message::ToggleSection(SectionId::Mcp));
+        assert!(state.collapsed_sections.contains(&SectionId::Mcp));
+    }
+
+    #[test]
+    fn provider_model_options_include_extra_models() {
+        let mut gateway = provider("gateway", "openai", "gpt-4o");
+        gateway.extra_models = vec!["gateway-only".into(), "  ".into()];
+        let config = AppConfig {
+            model_settings: Some(ModelSettings { providers: vec![gateway], ..Default::default() }),
+            ..Default::default()
+        };
+        let mut state = State::from_config(&AppConfig::default());
+        state.refresh_provider_cache_from_config(&config);
+
+        assert!(
+            state.model_names_for_provider("gateway").contains(&"gateway-only".to_string()),
+            "config-first extra_models must become selectable in the Settings pickers"
+        );
     }
 
     #[test]

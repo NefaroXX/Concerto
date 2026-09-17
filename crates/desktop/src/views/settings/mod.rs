@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_input, tooltip,
 };
 use iced::{Alignment, Background, Border, Element, Length};
 use std::fmt;
@@ -28,6 +28,10 @@ const PROVIDER_TYPES: &[&str] = PROVIDER_TYPE_IDS;
 
 /// Sentinel option appended to model pickers to reveal a custom-model text input.
 const CUSTOM_MODEL_SENTINEL: &str = "Custom model ID…";
+
+/// Widget id of the Settings main content `scrollable`, targeted by
+/// [`Message::JumpToSection`] to scroll a section header into view.
+pub(crate) const MAIN_SCROLL_ID: &str = "settings_main_scroll";
 
 fn readable_provider_label(provider: &ProviderConfig) -> String {
     let definition = provider_definition(&provider.provider);
@@ -438,6 +442,47 @@ impl State {
                     .spacing(SPACING_XS)
                     .align_y(iced::Alignment::Center);
             provider_items.push(key_edit_row.into());
+
+            // Manual model-list refresh: re-runs discovery so newly released
+            // models appear without editing config or restarting. Only shown
+            // for providers that support discovery at all.
+            if def.supports_discovery() {
+                let refreshing = self.refreshing_providers.contains(&prov.id);
+                let refresh_button = if refreshing {
+                    // In flight: inert button, same disabled pattern as the
+                    // skills section's "Discovering…".
+                    button(text("Refreshing…").size(13))
+                        .style(crate::ui::button::secondary)
+                        .padding([6, 14])
+                } else {
+                    button(text("Refresh").size(13))
+                        .style(crate::ui::button::secondary)
+                        .padding([6, 14])
+                        .on_press(Message::ProviderModelsRefreshRequested(prov.id.clone()))
+                };
+                let refresh_control: Element<'_, Message> = tooltip::Tooltip::new(
+                    refresh_button,
+                    container(text("Refresh model list from provider").size(12)).padding(8),
+                    tooltip::Position::Top,
+                )
+                .gap(4)
+                .into();
+                let freshness = match prov.cached_models_age() {
+                    Some(age) => format!("{} models · updated {age}", prov.cached_model_count()),
+                    None => "model list not fetched yet".to_string(),
+                };
+                let mut model_row = row![
+                    text("Model list:").size(12).color(palette.text_muted),
+                    text(freshness).size(12).color(palette.text_muted),
+                    refresh_control,
+                ]
+                .spacing(SPACING_XS)
+                .align_y(iced::Alignment::Center);
+                if let Some(error) = self.provider_refresh_errors.get(&prov.id) {
+                    model_row = model_row.push(text(error.clone()).size(12).color(palette.danger));
+                }
+                provider_items.push(model_row.into());
+            }
         }
 
         // Add provider form
@@ -984,8 +1029,8 @@ impl State {
         );
 
         // ── Sidebar nav ──
-        // Quick navigation: each item toggles its section's collapsed state via
-        // the existing ToggleSection message. Labels intentionally repeat the
+        // Quick navigation: each entry jumps to its section (expand + scroll)
+        // via `Message::JumpToSection`. Labels intentionally repeat the
         // collapsible_section titles (minor duplication keeps both readable).
         let sidebar_items = vec![
             (message::SectionId::Theme, "Display"),
@@ -1018,7 +1063,7 @@ impl State {
             sidebar_buttons.push(crate::ui::list_item(
                 theme,
                 is_expanded,
-                Message::ToggleSection(id),
+                Message::JumpToSection(id),
                 text(label)
                     .size(13)
                     .style(move |_| crate::theme::sidebar_item_style(palette, is_expanded)),
@@ -1045,7 +1090,8 @@ impl State {
         ]);
         let main_content = column(main_sections).spacing(SPACING_MD).padding(20);
 
-        let main_scrollable = scrollable(container(main_content).width(Length::Fill));
+        let main_scrollable = scrollable(container(main_content).width(Length::Fill))
+            .id(iced::widget::Id::new(MAIN_SCROLL_ID));
 
         // ── Combined layout ──
         row![

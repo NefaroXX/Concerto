@@ -32,9 +32,12 @@
 //! refactoring`, and so on. Other inflections (past tense `wrote`, `built`)
 //! are deliberately excluded: they usually *describe* prior work rather than
 //! request a change, and an audit trail should not treat them as action
-//! requests. The negation corpus (routing step a, [`NEGATION_PHRASES`]) and
-//! question detection (routing step b) keep their original standalone /
-//! substring semantics — only the keyword matcher changed.
+//! requests. The negation corpus (routing step a, [`NEGATION_PHRASES`]) keeps
+//! its standalone substring semantics, but the veto it drives fires only for
+//! a **task-level prohibition** (ADR-55 Phase 2d §2a, [`negation_veto_fires`]):
+//! a constraint clause that follows an explicit action request passes through
+//! to the keyword rules instead of demoting the run. Question detection
+//! (routing step b) keeps its original substring semantics.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -208,7 +211,9 @@ impl fmt::Display for RunStage {
 /// Route `input` to a requested outcome with a deterministic, pure,
 /// negation-aware rule set.
 ///
-/// Order of evaluation (first match wins):
+/// The input is lowercased, then a leading glued `Label:` ahead of an
+/// explicit action keyword is detached (ADR-55 Phase 2e §6 — see
+/// [`strip_glued_label`]). Order of evaluation (first match wins):
 /// 1. **Negation corpus** — read-only directives (`don't`, `never`,
 ///    `without <verb>`, `just <answer|review|...>`, ...) override everything,
 ///    including execution keywords.
@@ -239,7 +244,11 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
         hinted_paths: extract_hinted_paths(input, &root),
     };
     let normalized = normalize_input(input);
-    let tokens = tokens_of(&normalized);
+    // ADR-55 Phase 2e §6: a leading glued `Label:` ahead of an explicit
+    // action keyword is detached before classification (see
+    // [`strip_glued_label`]).
+    let normalized = strip_glued_label(&normalized).unwrap_or(&normalized);
+    let tokens = tokens_of(normalized);
 
     // Empty/whitespace-only input: nothing to route.
     if normalized.is_empty() {
@@ -251,10 +260,13 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
         };
     }
 
-    // (a) Negation corpus first — wins over every other signal.
-    if NEGATION_PHRASES.iter().any(|phrase| contains_standalone(&normalized, phrase)) {
+    // (a) Negation corpus first — wins over every other signal, but only for
+    //     a task-level prohibition (ADR-55 Phase 2d §2a): a requirement clause
+    //     that follows an explicit action request constrains the artifact, not
+    //     the action, and falls through to the keyword rules below.
+    if negation_veto_fires(normalized, &tokens) {
         return RouterOutput {
-            outcome: read_only_outcome(&normalized, &tokens),
+            outcome: read_only_outcome(normalized, &tokens),
             scope,
             confidence: 0.9,
             route: RouterRoute::RuleHit { rule: RULE_NEGATION_OVERRIDE },
@@ -262,8 +274,8 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
     }
 
     // (b) Question detection.
-    if is_question(&normalized) {
-        let outcome = if contains_any(&normalized, DIAGNOSE_WORDS) {
+    if is_question(normalized) {
+        let outcome = if contains_any(normalized, DIAGNOSE_WORDS) {
             RequestedOutcome::Diagnose
         } else {
             RequestedOutcome::Answer
@@ -292,7 +304,7 @@ pub fn route(input: &str, project_dir: PathBuf) -> RouterOutput {
     //     start with a greeting (and may hide a real intent) still falls
     //     through to the AskUser sink below.
     if normalized.chars().count() <= SMALLTALK_MAX_INPUT_LEN
-        && SMALLTALK_PHRASES.iter().any(|phrase| contains_standalone(&normalized, phrase))
+        && SMALLTALK_PHRASES.iter().any(|phrase| contains_standalone(normalized, phrase))
     {
         return RouterOutput {
             outcome: RequestedOutcome::Answer,
@@ -320,6 +332,44 @@ fn normalize_input(input: &str) -> String {
     input.trim().to_lowercase().replace(['\u{2018}', '\u{2019}'], "'")
 }
 
+/// ADR-55 Phase 2e §6 (glue-strip): detach a leading glued `Label:` from the
+/// normalized input when ALL conditions hold:
+///
+/// 1. the label is purely alphabetic with more than one alphabetic
+///    character — excludes `C:` drive letters (alphabetic length 1);
+/// 2. the label is NOT itself an explicit outcome keyword — `plan:` and
+///    `verify:` are the documented intent idioms (ADR-55 Phase 2b §9/T11),
+///    so a keyword label is semantic, never glue to strip;
+/// 3. the remainder BEGINS with an explicit outcome keyword as whole
+///    token(s) — excludes `https://…` URLs, whose post-colon text never
+///    starts with a keyword.
+///
+/// A `Prompt:`-style label glued to the leading verb otherwise blinds the
+/// whole-token keyword matcher (`prompt:build` is one token, so `build`
+/// never matches) and drags an explicit action request into the AskUser
+/// sink. Returns the remainder to classify, or `None` to keep the input
+/// unchanged. Classification only — hinted-path extraction still runs on
+/// the original input.
+fn strip_glued_label(normalized: &str) -> Option<&str> {
+    let (label, remainder) = normalized.split_once(':')?;
+    if !label.chars().all(|c| c.is_alphabetic())
+        || label.chars().filter(|c| c.is_alphabetic()).count() <= 1
+    {
+        return None;
+    }
+    // A label that is itself an outcome keyword (`plan:`, `verify:`, ...)
+    // carries the intent — never treat it as glue (T11: `plan: build …`
+    // stays Plan).
+    let label_tokens = [label.to_owned()];
+    if explicit_outcome_keyword(&label_tokens).is_some() {
+        return None;
+    }
+    let remainder = remainder.trim_start();
+    // The earliest whole-token keyword match must sit at offset 0: the
+    // remainder has to START with the action keyword.
+    (earliest_action_keyword_start(remainder) == Some(0)).then_some(remainder)
+}
+
 /// Read-only negation/limiting corpus (routing step a). Matched FIRST and with
 /// priority over every other signal.
 const NEGATION_PHRASES: &[&str] = &[
@@ -342,6 +392,19 @@ const NEGATION_PHRASES: &[&str] = &[
     "just review",
     "no changes",
     "don't touch",
+];
+
+/// Reassurance markers that never fire the negation veto (ADR-55 Phase 2d
+/// §2a): "don't panic, build a tool" is an action request with a reassurance
+/// clause, not a prohibition. A [`NEGATION_PHRASES`] match whose span lies
+/// wholly inside one of these phrases is ignored by [`negation_veto_fires`].
+const NO_VETO_REASSURANCE_PHRASES: &[&str] = &[
+    "don't panic",
+    "do not panic",
+    "don't worry",
+    "do not worry",
+    "don't forget",
+    "do not forget",
 ];
 
 /// Small-talk corpus (routing step d). Greetings, pleasantries, thanks,
@@ -415,15 +478,13 @@ const DIAGNOSE_WORDS: &[&str] = &[
 /// wording is present, then `Review` when review wording is present, otherwise
 /// `Answer`.
 ///
-/// Planning is elevated BEFORE the diagnose/review checks and above the
-/// negation corpus's demotion because a plan is read-only by construction
-/// (ADR-55 Phase 2b planning-only runs carry zero grants) — a plan request
-/// like "plan the refactor but don't touch the parser" or a constraints-heavy
-/// prompt ("...no external crates, no `unsafe`, don't use unwrap...") must
-/// stay a Plan run, not be demoted to a text-only Diagnose/Answer merely
-/// because it names restrictions. Execution/verify keywords are deliberately
-/// ignored — the negation corpus means the user wants no changes, so the
-/// execute keyword is dropped (e.g. "fix it but don't touch the parser").
+/// Planning is elevated BEFORE the diagnose/review checks because a plan is
+/// read-only by construction (ADR-55 Phase 2b planning-only runs carry zero
+/// grants). Execution/verify keywords are deliberately ignored once the veto
+/// fires — the negation means the user wants no changes, so the execute
+/// keyword is dropped for prohibition-first requests. Constraint clauses that
+/// follow an explicit action request never reach this branch at all (see
+/// [`negation_veto_fires`]).
 ///
 /// Only the plan-family corpus elevates (not `design`/`architecture for`,
 /// which commonly appear in "without changing the design of ..."). Diagnostic
@@ -468,6 +529,98 @@ const REVIEW_KEYWORDS: &[&str] = &[
     "look over",
 ];
 
+/// Explicit Verify keywords — priority 1 of [`explicit_outcome_keyword`] and
+/// part of the earliest-action scan in [`negation_veto_fires`].
+const VERIFY_KEYWORDS: &[&str] = &[
+    "verify",
+    "verifies",
+    "verifying",
+    "ensure",
+    "ensures",
+    "ensuring",
+    "check that",
+    "confirm that",
+    "test that",
+    "run the tests",
+    "run tests",
+    "run the test",
+    "run the test suite",
+    "run cargo test",
+    "run the build",
+];
+
+/// Explicit Plan keywords — priority 2 of [`explicit_outcome_keyword`] and
+/// part of the earliest-action scan in [`negation_veto_fires`].
+const PLAN_KEYWORDS: &[&str] = &[
+    "plan",
+    "plans",
+    "planning",
+    "design",
+    "designs",
+    "designing",
+    "proposal",
+    "blueprint",
+    "architecture for",
+    "roadmap",
+];
+
+/// Explicit Diagnose keywords — priority 4 of [`explicit_outcome_keyword`] and
+/// part of the earliest-action scan in [`negation_veto_fires`]. Whole-token /
+/// word-boundary semantics (the [`contains_any_keyword`] matcher the priority
+/// loop uses), unlike the substring [`DIAGNOSE_WORDS`] elevation corpus.
+const DIAGNOSE_KEYWORDS: &[&str] = &[
+    "why is",
+    "what's wrong",
+    "diagnose",
+    "diagnosing",
+    "debug",
+    "debugging",
+    "crash",
+    "crashes",
+    "crashing",
+    "stack trace",
+    "failing",
+];
+
+/// Explicit Execute keywords — priority 5 of [`explicit_outcome_keyword`] and
+/// part of the earliest-action scan in [`negation_veto_fires`].
+const EXECUTE_KEYWORDS: &[&str] = &[
+    "implement",
+    "implementing",
+    "fix",
+    "fixes",
+    "fixing",
+    "add",
+    "adds",
+    "adding",
+    "create",
+    "creates",
+    "creating",
+    "write",
+    "writes",
+    "writing",
+    "build",
+    "builds",
+    "building",
+    "refactor",
+    "refactoring",
+    "update",
+    "updates",
+    "updating",
+    "remove",
+    "removes",
+    "removing",
+    "migrate",
+    "migrating",
+    "install",
+    "installing",
+    "execute",
+    "run",
+    "apply",
+    "approve",
+    "make it",
+];
+
 /// Explicit outcome keywords, evaluated in the documented priority order
 /// (first hit wins): Verify → Plan → Review → Diagnose → Execute.
 ///
@@ -478,85 +631,6 @@ const REVIEW_KEYWORDS: &[&str] = &[
 ///
 /// Returns the matched outcome plus the `RuleHit` rule-name constant for it.
 fn explicit_outcome_keyword(tokens: &[String]) -> Option<(RequestedOutcome, &'static str)> {
-    const VERIFY_KEYWORDS: &[&str] = &[
-        "verify",
-        "verifies",
-        "verifying",
-        "ensure",
-        "ensures",
-        "ensuring",
-        "check that",
-        "confirm that",
-        "test that",
-        "run the tests",
-        "run tests",
-        "run the test",
-        "run the test suite",
-        "run cargo test",
-        "run the build",
-    ];
-    const PLAN_KEYWORDS: &[&str] = &[
-        "plan",
-        "plans",
-        "planning",
-        "design",
-        "designs",
-        "designing",
-        "proposal",
-        "blueprint",
-        "architecture for",
-        "roadmap",
-    ];
-    const DIAGNOSE_KEYWORDS: &[&str] = &[
-        "why is",
-        "what's wrong",
-        "diagnose",
-        "diagnosing",
-        "debug",
-        "debugging",
-        "crash",
-        "crashes",
-        "crashing",
-        "stack trace",
-        "failing",
-    ];
-    const EXECUTE_KEYWORDS: &[&str] = &[
-        "implement",
-        "implementing",
-        "fix",
-        "fixes",
-        "fixing",
-        "add",
-        "adds",
-        "adding",
-        "create",
-        "creates",
-        "creating",
-        "write",
-        "writes",
-        "writing",
-        "build",
-        "builds",
-        "building",
-        "refactor",
-        "refactoring",
-        "update",
-        "updates",
-        "updating",
-        "remove",
-        "removes",
-        "removing",
-        "migrate",
-        "migrating",
-        "install",
-        "installing",
-        "execute",
-        "run",
-        "apply",
-        "approve",
-        "make it",
-    ];
-
     for (keywords, outcome, rule) in [
         (&VERIFY_KEYWORDS, RequestedOutcome::Verify, RULE_VERIFY),
         (&PLAN_KEYWORDS, RequestedOutcome::Plan, RULE_PLAN),
@@ -619,18 +693,144 @@ fn contains_any(text: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|keyword| text.contains(keyword))
 }
 
-/// True when `text` contains `phrase` as a standalone token/phrase — the
-/// characters immediately before and after the match are non-alphanumeric or
-/// absent. Used for the short negation words so `don't`/`never` do not match
-/// inside unrelated words (e.g. "nevertheless").
+/// Byte start offsets of every standalone occurrence of `phrase` in `text` —
+/// the characters immediately before and after each match must be
+/// non-alphanumeric or absent. This is the position-aware form of the
+/// boundary matcher the negation and small-talk corpora rely on, so
+/// `don't`/`never` do not match inside unrelated words (e.g. "nevertheless").
+fn standalone_match_spans(text: &str, phrase: &str) -> Vec<usize> {
+    text.match_indices(phrase)
+        .filter(|(start, matched)| {
+            let end = start + matched.len();
+            let before = text[..*start].chars().next_back();
+            let after = text[end..].chars().next();
+            let is_boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric());
+            is_boundary(before) && is_boundary(after)
+        })
+        .map(|(start, _)| start)
+        .collect()
+}
+
+/// True when `text` contains `phrase` as a standalone token/phrase — see
+/// [`standalone_match_spans`] for the exact boundary semantics.
 fn contains_standalone(text: &str, phrase: &str) -> bool {
-    text.match_indices(phrase).any(|(start, _)| {
-        let end = start + phrase.len();
-        let before = text[..start].chars().next_back();
-        let after = text[end..].chars().next();
-        let is_boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric());
-        is_boundary(before) && is_boundary(after)
-    })
+    !standalone_match_spans(text, phrase).is_empty()
+}
+
+/// Tokenize `text` exactly like [`tokens_of`] (whitespace split, surrounding
+/// punctuation stripped) while keeping each token's byte start offset in
+/// `text`, so keyword occurrences can be positioned against negation matches.
+fn token_spans(text: &str) -> Vec<(String, usize)> {
+    let mut pieces: Vec<(String, usize)> = Vec::new();
+    let mut piece = String::new();
+    let mut piece_start = 0;
+    for (index, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if !piece.is_empty() {
+                pieces.push((std::mem::take(&mut piece), piece_start));
+            }
+        } else {
+            if piece.is_empty() {
+                piece_start = index;
+            }
+            piece.push(c);
+        }
+    }
+    if !piece.is_empty() {
+        pieces.push((piece, piece_start));
+    }
+    pieces
+        .into_iter()
+        .filter_map(|(piece, start)| {
+            let core = piece.trim_matches(|c: char| !c.is_alphanumeric());
+            if core.is_empty() {
+                return None;
+            }
+            let leading =
+                piece.len() - piece.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
+            Some((core.to_owned(), start + leading))
+        })
+        .collect()
+}
+
+/// Byte offset of the earliest whole-token occurrence of any explicit outcome
+/// keyword (the five sets shared with [`explicit_outcome_keyword`]) in
+/// `normalized`, or `None` when no keyword is present. Matching reuses the
+/// [`contains_keyword`] whole-token semantics over [`token_spans`], so `write`
+/// inside `write-up` never yields a position.
+fn earliest_action_keyword_start(normalized: &str) -> Option<usize> {
+    let spans = token_spans(normalized);
+    let mut earliest: Option<usize> = None;
+    for keywords in
+        [VERIFY_KEYWORDS, PLAN_KEYWORDS, REVIEW_KEYWORDS, DIAGNOSE_KEYWORDS, EXECUTE_KEYWORDS]
+    {
+        for keyword in keywords {
+            let words: Vec<&str> = keyword.split_whitespace().collect();
+            for window in spans.windows(words.len()) {
+                if window.iter().zip(&words).all(|((token, _), word)| token.as_str() == *word) {
+                    let start = window[0].1;
+                    if earliest.is_none_or(|current| start < current) {
+                        earliest = Some(start);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    earliest
+}
+
+/// Earliest byte offset of a [`NEGATION_PHRASES`] match that is not wholly
+/// contained inside a [`NO_VETO_REASSURANCE_PHRASES`] span (reassurance
+/// markers never fire the veto), or `None` when no qualifying match exists.
+fn earliest_negation_start(normalized: &str) -> Option<usize> {
+    let reassurance: Vec<(usize, usize)> = NO_VETO_REASSURANCE_PHRASES
+        .iter()
+        .flat_map(|phrase| {
+            standalone_match_spans(normalized, phrase)
+                .into_iter()
+                .map(move |start| (start, start + phrase.len()))
+        })
+        .collect();
+    NEGATION_PHRASES
+        .iter()
+        .flat_map(|phrase| {
+            standalone_match_spans(normalized, phrase)
+                .into_iter()
+                .map(move |start| (start, start + phrase.len()))
+        })
+        .filter(|(start, end)| !reassurance.iter().any(|(from, to)| from <= start && end <= to))
+        .map(|(start, _)| start)
+        .min()
+}
+
+/// ADR-55 Phase 2d §2a: the negation veto fires only for a **task-level
+/// prohibition** — a negation-corpus match (outside reassurance phrases) that
+/// either stands alone (no explicit action keyword anywhere) or precedes
+/// every explicit action keyword. A constraint clause that follows an
+/// explicit action request ("build X, do NOT read it as UTF-8", "fix it but
+/// don't touch the parser") constrains the artifact, not the action, and
+/// passes through to the keyword rules instead of demoting the run.
+///
+/// `tokens` must be the [`tokens_of`] tokenization of `normalized` — the same
+/// list the routing steps share — so the presence check uses the exact
+/// matcher the keyword rules use.
+fn negation_veto_fires(normalized: &str, tokens: &[String]) -> bool {
+    let Some(negation_start) = earliest_negation_start(normalized) else {
+        return false;
+    };
+    // Presence check reuses the exact matcher of the keyword rules; the
+    // position scan then decides which began first.
+    if explicit_outcome_keyword(tokens).is_none() {
+        return true;
+    }
+    match earliest_action_keyword_start(normalized) {
+        // The action request began strictly before the negation: a
+        // subordinate constraint, not a prohibition.
+        Some(action_start) if action_start < negation_start => false,
+        // Prohibition-first or a pure prohibition: veto.
+        _ => true,
+    }
 }
 
 /// Leading-interrogative or trailing-`?` question detection (routing step b).
@@ -867,12 +1067,114 @@ mod tests {
         &out.scope.hinted_paths
     }
 
+    // ---- ADR-55 Phase 2e §6: glue-strip normalization (near-miss pins) ----
+
     #[test]
-    fn negation_overrides_execute_keywords() {
-        let out = route("implement the endpoint but don't touch the parser", project());
-        assert_eq!(out.outcome, RequestedOutcome::Answer);
-        assert_eq!(out.confidence, 0.9);
+    fn glued_label_with_action_keyword_is_stripped() {
+        // "Prompt:Build …" glued the label onto the leading verb, so the
+        // whole-token matcher saw one token ("prompt:build") and the explicit
+        // action request fell into the AskUser sink. The strip detaches the
+        // label and the remainder routes exactly like "Build …".
+        let glued = route("Prompt:Build a rust cli tool called hexview", project());
+        let bare = route("Build a rust cli tool called hexview", project());
+        assert_eq!(
+            glued.outcome,
+            RequestedOutcome::Execute,
+            "the glued label must not blind the keyword match"
+        );
+        assert_eq!(
+            glued.outcome, bare.outcome,
+            "the glued form routes identically to the bare form"
+        );
+        assert_eq!(glued.confidence, bare.confidence);
+        assert!(matches!(glued.route, RouterRoute::RuleHit { rule: "execute_keyword" }));
+    }
+
+    #[test]
+    fn glued_label_survives_to_negation_when_remainder_is_a_prohibition() {
+        // The strip requires the remainder to BEGIN with an action keyword:
+        // a prohibition never detaches, so the veto sees the full text and
+        // the hard read-only invariant is untouched (A8).
+        let out = route("Prompt:don't build accord", project());
         assert!(matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+        assert_eq!(out.outcome, RequestedOutcome::Answer);
+    }
+
+    #[test]
+    fn url_is_never_glue_stripped() {
+        // The post-colon text of a URL never begins with an action keyword
+        // as a whole token (`//example.com/…`), so `https://…` is never
+        // treated as `Label:` + action keyword — pinned directly on the
+        // strip predicate, since an outcome-level assertion cannot
+        // discriminate (an URL body may contain a keyword further in, which
+        // routes the same with or without the strip).
+        assert_eq!(strip_glued_label("https://example.com/build it"), None);
+        assert_eq!(strip_glued_label("https://example.com/verify the fix"), None);
+        assert_eq!(strip_glued_label("http://run.the.tests/now"), None);
+    }
+
+    #[test]
+    fn drive_letter_and_single_char_labels_are_never_stripped() {
+        assert_eq!(strip_glued_label("c:\\tools\\build"), None);
+        assert_eq!(strip_glued_label("x:build it now"), None);
+    }
+
+    #[test]
+    fn keyword_labels_are_semantic_not_glue() {
+        // `plan:` / `verify:` are the documented intent idioms (T11): a
+        // label that is itself an outcome keyword carries the intent and is
+        // never stripped, even when the remainder starts with an action
+        // keyword too.
+        assert_eq!(strip_glued_label("plan: build a minimal cli tool"), None);
+        assert_eq!(strip_glued_label("verify: build passes"), None);
+    }
+
+    #[test]
+    fn glue_strip_accepts_and_rejects() {
+        // NOTE: `strip_glued_label` operates on the NORMALIZED (lowercased)
+        // text `route()` produces — tests must feed normalized strings.
+        assert_eq!(strip_glued_label("prompt:build accord"), Some("build accord"));
+        assert_eq!(strip_glued_label("prompt: build accord"), Some("build accord"));
+        // No keyword at offset 0 of the remainder → no strip.
+        assert_eq!(strip_glued_label("note:please build accord"), None);
+        // A prohibition remainder never strips.
+        assert_eq!(strip_glued_label("note:don't build accord"), None);
+        // Non-alphabetic labels never strip.
+        assert_eq!(strip_glued_label("2024:build it"), None);
+        assert_eq!(strip_glued_label("don't:build it"), None);
+        assert_eq!(strip_glued_label("no colon here"), None);
+    }
+
+    #[test]
+    fn constraint_heavy_build_prompt_with_glued_label_stays_actionable() {
+        // Revised A6 shape (ADR-55 Phase 2e): constraint clauses after the
+        // explicit action request ("do NOT read it as UTF-8", "don't panic")
+        // must not demote the run, with or without a glued `Prompt:` label.
+        let smoke = "Build a Rust CLI tool called hexview that reads stdin as bytes. \
+                     do NOT read it as a UTF-8 string. it must not panic. don't panic. verify it";
+        let with_label = format!("Prompt:{smoke}");
+        for input in [smoke.to_string(), with_label] {
+            let out = route(&input, project());
+            assert!(
+                !matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }),
+                "constraint clauses must not fire the task-level veto: {out:?}"
+            );
+            assert_eq!(out.outcome, RequestedOutcome::Verify);
+            assert_eq!(out.confidence, 0.8);
+            assert!(matches!(out.route, RouterRoute::RuleHit { rule: "verify_keyword" }));
+        }
+    }
+
+    #[test]
+    fn constraint_clause_after_action_request_does_not_veto() {
+        // ADR-55 Phase 2d §2a: "don't touch the parser" follows the explicit
+        // action request "implement the endpoint" — it constrains the
+        // artifact instead of prohibiting the action, so the run stays on the
+        // execute rule and the constraint reaches the executor in the prompt.
+        let out = route("implement the endpoint but don't touch the parser", project());
+        assert_eq!(out.outcome, RequestedOutcome::Execute);
+        assert_eq!(out.confidence, 0.8);
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "execute_keyword" }));
     }
 
     #[test]
@@ -885,25 +1187,29 @@ mod tests {
 
     #[test]
     fn negation_with_plan_keyword_is_not_demoted() {
+        // The veto no longer fires for a constraint clause after the explicit
+        // plan request, so the run takes the normal plan-keyword rule
+        // (confidence 0.8) instead of the negation override (0.9).
         let out = route("plan the refactor but don't touch the parser", project());
         assert_eq!(out.outcome, RequestedOutcome::Plan);
-        assert_eq!(out.confidence, 0.9);
-        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+        assert_eq!(out.confidence, 0.8);
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "plan_keyword" }));
     }
 
     #[test]
     fn constraint_heavy_plan_prompt_stays_plan_despite_diagnose_words() {
-        // Verdict-style spec: negations ("don't") route through the read-only
-        // branch, and the word "error" alone would elevate to Diagnose — the
-        // explicit plan request must win because planning is read-only.
+        // Verdict-style spec: the constraint clauses ("no unsafe", "don't use
+        // unwrap") follow the explicit "plan:" request, so the veto never
+        // fires and the run takes the plan-keyword rule — the word "error"
+        // alone cannot demote it.
         let out = route(
             "plan: build a minimal cli tool with zero external crates, no unsafe, \
              don't use unwrap or expect, exit code 2 = error",
             project(),
         );
         assert_eq!(out.outcome, RequestedOutcome::Plan);
-        assert_eq!(out.confidence, 0.9);
-        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+        assert_eq!(out.confidence, 0.8);
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "plan_keyword" }));
     }
 
     #[test]
@@ -914,6 +1220,95 @@ mod tests {
         assert_eq!(out.outcome, RequestedOutcome::Review);
         assert_eq!(out.confidence, 0.9);
         assert!(matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+    }
+
+    // ------------------------------------------------------------------
+    // Negation veto trigger (ADR-55 Phase 2d §2a): the veto fires only for a
+    // task-level prohibition. Requirement clauses that follow an explicit
+    // action request are constraints on the artifact; reassurance markers
+    // never veto; prohibitions that stand alone or precede any action keyword
+    // veto exactly as before.
+    // ------------------------------------------------------------------
+
+    /// ADR-55 A6: the live smoke-test prompt — requirement clauses ("do NOT
+    /// read it as a UTF-8 string", "must not panic", "don't panic") after the
+    /// explicit build request — must route to a grantable, non-negation
+    /// outcome. `verify` is checked before `execute`, so the closing "verify
+    /// it against a test file" wins at confidence 0.8.
+    #[test]
+    fn hexview_shaped_prompt_routes_verify_not_negation() {
+        let out = route(
+            "Build a Rust CLI tool called hexview that dumps a file as hex. \
+             Do NOT read it as a UTF-8 string, it must not panic or error, \
+             don't panic. Verify it against a test file.",
+            project(),
+        );
+        assert_eq!(out.outcome, RequestedOutcome::Verify);
+        assert_eq!(out.confidence, 0.8);
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "verify_keyword" }));
+        assert!(!matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+    }
+
+    /// Same shape without any verify language: the build request must stay
+    /// Execute.
+    #[test]
+    fn build_request_with_must_not_clauses_routes_execute() {
+        let out = route(
+            "build a hexview tool that dumps files as hex, do not use regex, \
+             it must not panic",
+            project(),
+        );
+        assert_eq!(out.outcome, RequestedOutcome::Execute);
+        assert_eq!(out.confidence, 0.8);
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "execute_keyword" }));
+        assert!(!matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+    }
+
+    /// ADR-55 A3 preserved: a prohibition that precedes the action keyword is
+    /// a task-level prohibition, not a constraint clause.
+    #[test]
+    fn standalone_prohibition_still_vetoes() {
+        let out = route("don't build accord", project());
+        assert_eq!(out.outcome, RequestedOutcome::Answer);
+        assert_eq!(out.confidence, 0.9);
+        assert!(matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }));
+    }
+
+    /// ADR-55 A7: genuine prohibitions keep the hard read-only veto. "stop"
+    /// is also named by A7 but is NOT a [`NEGATION_PHRASES`] entry, so it
+    /// lands on the read-only AskUser sink (confidence 0.0) instead of
+    /// negation_override — surfaced deviation from the acceptance wording,
+    /// still a zero-write route by construction.
+    #[test]
+    fn genuine_prohibitions_still_veto() {
+        for input in ["don't do it", "no changes", "just answer"] {
+            let out = route(input, project());
+            assert_eq!(out.outcome, RequestedOutcome::Answer, "input: {input}");
+            assert_eq!(out.confidence, 0.9, "input: {input}");
+            assert!(
+                matches!(out.route, RouterRoute::RuleHit { rule: "negation_override" }),
+                "input: {input}"
+            );
+        }
+        let stop = route("stop", project());
+        assert_eq!(stop.outcome, RequestedOutcome::Answer);
+        assert_eq!(stop.confidence, 0.0);
+        assert!(matches!(stop.route, RouterRoute::AskUser));
+    }
+
+    /// Reassurance markers ("don't panic/worry/forget") never fire the veto in
+    /// any position (ADR-55 Phase 2d §2a).
+    #[test]
+    fn reassurance_markers_never_veto() {
+        for input in ["don't panic, build a tool", "don't worry about it, implement the parser"] {
+            let out = route(input, project());
+            assert_eq!(out.outcome, RequestedOutcome::Execute, "input: {input}");
+            assert_eq!(out.confidence, 0.8, "input: {input}");
+            assert!(
+                matches!(out.route, RouterRoute::RuleHit { rule: "execute_keyword" }),
+                "input: {input}"
+            );
+        }
     }
 
     #[test]

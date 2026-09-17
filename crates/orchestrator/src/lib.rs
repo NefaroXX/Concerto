@@ -14,39 +14,66 @@
 pub mod agent_loop;
 pub mod agent_runner;
 pub mod agents;
+pub mod capsule;
 pub mod checkpoint;
 pub mod conflict;
+pub mod consolidation;
+mod consultation;
 mod context_compaction;
 pub mod context_engine;
 pub mod coordinator;
 pub mod cost;
 pub mod cycle;
 pub mod cycle_manager;
+pub mod decisions;
 pub mod delta;
+pub mod design_doc_verifier;
 pub mod exec_backend;
+pub mod external_change;
+pub mod failure_diagnosis;
+pub mod fingerprint;
 pub mod gate;
 pub mod gate_proxy;
 pub mod graph;
 pub mod hash;
+pub mod hunk;
 pub mod in_process_gate;
 pub mod intent_classifier;
 pub mod intent_grants;
 pub mod ipc;
 mod memory_prompt;
 pub mod memory_serial;
+pub mod ownership;
 pub mod plan_approval;
 pub mod relationship;
+pub mod speculation;
 pub use relationship::{
     AgentHandoff, AgentRelationship, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
 pub mod planner;
+pub mod progress;
 pub mod prompts;
+mod read_cache;
 pub mod registry;
+pub mod resolver;
+pub mod resolver_integration;
+pub mod resume;
+pub mod scheduler;
+mod shell_repair;
 pub mod skills_context;
 pub mod state;
 pub mod subscriptions;
+pub mod suitability;
 pub mod supervisor;
+pub mod task_transform;
+pub mod timeline;
+pub mod tool_driver;
+mod tool_facts;
+mod tool_guard;
+pub mod wait;
 mod working_memory;
+pub mod workspace_snapshot;
+pub mod world_model;
 
 #[path = "runtime_runner_persistent.rs"]
 pub mod runtime_runner;
@@ -55,3 +82,9 @@ mod runtime_runner_impl;
 pub mod services;
 pub mod session_manager;
 pub mod testing;
+
+// Issue #55: the coordinator fault-injection and recovery evaluation
+// suite. Entirely test-support — gated out of production builds where it
+// would be dead code; never wired into any production path.
+#[cfg(test)]
+mod fault_injection;

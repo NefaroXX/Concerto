@@ -1035,6 +1035,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn design_doc_contract_enforces_proposed_files_membership() {
+        // The coordinator passes the DesignDoc to the planner ONLY as a
+        // `binding_doc` — `Some` for a Verified (active) claim, `None` for a
+        // Quarantined/Skipped one (ADR-65 §5). This test proves the ON/OFF
+        // semantics of that binding: with the doc attached, a Coder claiming a
+        // path the design never proposed is REJECTED; without it (the passive
+        // Quarantined/Skipped route) the same claim is accepted untouched.
+        let doc = DesignDoc {
+            goals: Vec::new(),
+            constraints: Vec::new(),
+            proposed_files: vec![camino::Utf8PathBuf::from("src/lib.rs")],
+            interface_sketch: String::new(),
+            risks: Vec::new(),
+        };
+        let response = r#"[
+            {"role":"Researcher","description":"inspect","depends_on":[]},
+            {"role":"Coder","description":"implement","depends_on":[0],"files":["src/lib.rs","src/hallucinated.rs"]}
+        ]"#;
+
+        // Bound (Verified binding_doc = Some): the unproposed claim is a plan
+        // failure — the contract is enforced.
+        let bound = plan_with_design_doc(response, Some(doc.clone()), builtin_agents()).await;
+        let Err(OrchestratorError::MultiAgentPlanFailed { reason }) = bound else {
+            panic!("a bound doc must reject an unproposed file claim, got: {bound:?}");
+        };
+        assert!(
+            reason.contains("src/hallucinated.rs"),
+            "the rejection must name the offending file: {reason}"
+        );
+        assert!(
+            reason.contains("not in DesignDoc proposed_files"),
+            "the rejection must cite the contract: {reason}"
+        );
+
+        // Unbound (Quarantined/Skipped binding_doc = None): no membership
+        // gate — the pipeline degrades to the pre-verification path without
+        // blocking planning.
+        let unbound = plan_with_design_doc(response, None, builtin_agents()).await;
+        let tasks = unbound.unwrap_or_else(|err| {
+            panic!("an unbound doc must not enforce proposed_files membership: {err}")
+        });
+        let coder = tasks
+            .iter()
+            .find(|task| task.role == AgentId::new("coder"))
+            .expect("the plan has a Coder");
+        assert!(
+            coder.expected_artifacts.iter().any(|path| path.as_str() == "src/hallucinated.rs"),
+            "the unbound Coder keeps its claimed artifact: {:?}",
+            coder.expected_artifacts
+        );
+    }
+
+    #[tokio::test]
     async fn coder_artifact_ownership_overlap_is_rejected() {
         // Two Coders must not both claim the same file — including a planning
         // artifact like PLAN.md, which is exempt from the proposed_files check

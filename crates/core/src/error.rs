@@ -194,6 +194,20 @@ pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
 
+    /// Transport failure while a completion stream was already in flight.
+    ///
+    /// The HTTP request succeeded and the response stream had opened, then
+    /// the connection broke mid-stream (reset, dropped socket, body read
+    /// error). Kept distinct from a pre-request [`ProviderError::Network`]
+    /// failure so the retry layer can retry it deliberately (ADR-55 Phase
+    /// 2e stream-retry): tools execute only after a stream is fully
+    /// assembled, so re-issuing the request is side-effect-free within the
+    /// bounded attempt budget. Framing and parse failures inside a healthy
+    /// stream stay fatal (`Serialization`/`InvalidResponse`) — retrying
+    /// cannot fix a broken wire format.
+    #[error("stream transport error: {0}")]
+    StreamTransport(String),
+
     /// A provider request stopped making progress at a specific phase.
     #[error("provider {phase} timed out after {timeout:?}")]
     Timeout { phase: &'static str, timeout: Duration },
@@ -234,6 +248,26 @@ pub enum ProviderError {
         /// Error message from the final failed attempt.
         last_error: String,
     },
+
+    /// A tool-requiring task was resolved onto a provider/model that cannot
+    /// express tool calls (ADR-66).
+    ///
+    /// Raised at a fail-loud seam — selection (before any spend) or request
+    /// building — whenever a request carrying tool declarations reaches a
+    /// wire path that cannot express them (e.g. the OpenCode Zen Responses
+    /// dialect, plugin providers without tool ops). The refusal names the
+    /// provider, the model, and the missing capability so the failure is
+    /// actionable. Never treated as transient: retrying cannot add a
+    /// capability the wire path lacks.
+    #[error("provider '{provider}' model '{model}' does not support the '{capability}' capability required by this task")]
+    CapabilityRefused {
+        /// The refusing provider (e.g. "opencode", "plugin:my-llm").
+        provider: String,
+        /// The resolved model name.
+        model: String,
+        /// The missing capability (always `"tool_calling"` today).
+        capability: String,
+    },
 }
 
 impl ProviderError {
@@ -249,6 +283,10 @@ impl ProviderError {
             ProviderError::RateLimit { .. } => true,
             ProviderError::HttpStatus { status, .. } => *status >= 500 || *status == 429,
             ProviderError::Network(_) => true,
+            // A mid-stream transport fault is as transient as a
+            // pre-request one — see the variant's docs (ADR-55 Phase 2e
+            // stream-retry).
+            ProviderError::StreamTransport(_) => true,
             ProviderError::Timeout { .. } => true,
             ProviderError::InvalidResponse(_) => true,
             // Generic catch-all — assume transient to avoid false fatal
@@ -257,6 +295,9 @@ impl ProviderError {
             ProviderError::Serialization(_) => false,
             // RetryExhausted is already a terminal retry signal
             ProviderError::RetryExhausted { .. } => false,
+            // A capability refusal is a permanent wire-path fact — retrying
+            // cannot add a capability the path lacks (ADR-66).
+            ProviderError::CapabilityRefused { .. } => false,
             // Everything below here is configuration, auth, or cancellation
             ProviderError::NotConfigured
             | ProviderError::CredentialMissing { .. }
@@ -536,10 +577,27 @@ pub enum MemoryError {
 
     /// Data directory is locked by another instance.
     ///
-    /// Another Concerto instance is already using the data directory. Only one
-    /// instance can access the data directory at a time to prevent corruption.
-    #[error("another instance holds the data directory lock")]
-    DataDirLocked,
+    /// ADR-11: exactly one `.concerto.lock` file lives in the Concerto data
+    /// root and is held via an OS advisory lock (`fd-lock`) by whichever
+    /// instance owns the directory, so only one instance can access it at a
+    /// time. `path` is the locked data directory; `pid_hint` (when known) is
+    /// the holder's PID read back from the lock file (best-effort).
+    #[error(
+        "another instance holds the data directory lock at {path}{}",
+        crate::lock::format_pid_hint(.pid_hint)
+    )]
+    DataDirLocked { path: std::path::PathBuf, pid_hint: Option<u32> },
+}
+
+impl From<crate::lock::LockError> for MemoryError {
+    fn from(error: crate::lock::LockError) -> Self {
+        match error {
+            crate::lock::LockError::Locked { path, pid_hint } => {
+                MemoryError::DataDirLocked { path, pid_hint }
+            }
+            other => MemoryError::Persistence(format!("data directory error: lock {other}")),
+        }
+    }
 }
 
 /// Session persistence and replay errors.

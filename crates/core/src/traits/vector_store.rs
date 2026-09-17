@@ -10,6 +10,17 @@ use crate::error::MemoryError;
 use crate::memory::{EmbeddingRecord, MemoryChunk, ProjectId, VectorResult};
 use crate::CancellationToken;
 
+/// Information about a stored row needed for lazy re-index decisions.
+#[derive(Debug, Clone)]
+pub struct RowIndexFact {
+    /// The chunk id.
+    pub id: String,
+    /// The model version that produced this row.
+    pub model_version: String,
+    /// `true` if this is an ADR-39 FTS-only sentinel (empty vector, no metadata).
+    pub is_sentinel: bool,
+}
+
 /// Vector similarity store.
 ///
 /// Implementations must support:
@@ -80,8 +91,10 @@ pub trait VectorStore: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<(), MemoryError>;
 
-    /// Mark all vectors stale for a project (triggered by model
-    /// version mismatch).
+    /// Mark stale every vector whose embedding model version no longer
+    /// matches the current one (`model_version != current_model_version`) — a
+    /// model bump leaves the CURRENT version's rows fresh and everything
+    /// produced by earlier versions gets re-indexed.
     async fn mark_stale(
         &self,
         project_id: &ProjectId,
@@ -107,4 +120,19 @@ pub trait VectorStore: Send + Sync {
         file_path: &Utf8PathBuf,
         cancel: CancellationToken,
     ) -> Result<Vec<String>, MemoryError>;
+
+    /// Return per-row index facts (id, model version, sentinel-ness) for a
+    /// project.  Used by lazy re-indexing to skip chunks that are already at
+    /// the live embedding model version.
+    ///
+    /// Backends that do not yet implement this return an empty list (the
+    /// default), which makes lazy re-indexing fall back to re-embedding
+    /// everything — correct, just not lazy.
+    async fn row_index_facts(
+        &self,
+        _project_id: &ProjectId,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<RowIndexFact>, MemoryError> {
+        Ok(Vec::new())
+    }
 }

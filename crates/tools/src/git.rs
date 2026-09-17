@@ -4,7 +4,10 @@
 //! CLI fallback operations are isolated in [`cli_fallback`] and documented
 //! per the ROADMAP.md risk-register entry on gix gaps.
 
+use crate::diff::compute_diff;
 use async_trait::async_trait;
+use camino::Utf8PathBuf;
+use concerto_api_types::diff::{DiffLine, DiffResult};
 use concerto_core::traits::PolicyEngine;
 use concerto_core::types::{CapabilitySet, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
@@ -306,50 +309,183 @@ fn gix_status(repo: &gix::Repository) -> Result<ToolOutput, ToolError> {
     })
 }
 
-/// Produce unified diff between HEAD and the index tree, using
-/// gix's tree-diff capabilities.
-fn gix_diff(repo: &gix::Repository) -> Result<ToolOutput, ToolError> {
+/// Decode blob bytes as text, tolerating binary content.
+///
+/// Mirrors the virtual FS reader policy: valid UTF-8 comes back verbatim,
+/// while non-UTF-8 (binary) content yields a short informative placeholder
+/// carrying the byte count instead of an error, so a staged binary file can
+/// never fail the diff tool.
+fn decode_text_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => format!("[binary file: {} bytes — contents not decoded]", bytes.len()),
+    }
+}
+
+/// Read the text content of a blob in `repo`, tolerating binary content.
+fn blob_to_text(repo: &gix::Repository, id: gix::hash::ObjectId) -> Result<String, ToolError> {
+    let blob = repo.find_blob(id).map_err(|e| ToolError::ExecutionFailed {
+        message: format!("failed to read blob {id}: {e}"),
+    })?;
+    Ok(decode_text_bytes(&blob.data))
+}
+
+/// Render a [`DiffResult`] as a unified-style diff snippet.
+///
+/// `has_old`/`has_new` say whether the corresponding side had content (a
+/// modification or rewrite, as opposed to an addition/deletion), which decides
+/// whether the header points at the file or at `/dev/null`. The string is a
+/// convenience payload preserving the legacy `data["diff"]` contract; the
+/// structured [`DiffResult`]s in `data["diffs"]` are the primary output.
+fn render_unified_diff(result: &DiffResult, has_old: bool, has_new: bool) -> String {
     use std::fmt::Write;
 
-    let head_tree = repo.head_tree().map_err(|e| ToolError::ExecutionFailed {
-        message: format!("failed to get HEAD tree: {e}"),
-    })?;
+    let path = result.path.as_str();
+    let old_prefix = if has_old { format!("a/{path}") } else { "/dev/null".to_string() };
+    let new_prefix = if has_new { format!("b/{path}") } else { "/dev/null".to_string() };
 
     let mut output = String::new();
-    let mut file_count = 0u32;
-
-    // Diff HEAD tree vs the index (None means index). Returns Vec<ChangeDetached>.
-    let changes = repo.diff_tree_to_tree(Some(&head_tree), None, None).map_err(|e| {
-        ToolError::ExecutionFailed { message: format!("failed to diff trees: {e}") }
-    })?;
-
-    for change in &changes {
-        use gix::diff::tree_with_rewrites::Change as DChange;
-        let path = match change {
-            DChange::Addition { location, .. }
-            | DChange::Deletion { location, .. }
-            | DChange::Modification { location, .. }
-            | DChange::Rewrite { location, .. } => {
-                std::str::from_utf8(location).unwrap_or("unknown")
+    let _ = writeln!(output, "diff --git a/{path} b/{path}");
+    let _ = writeln!(output, "--- {old_prefix}");
+    let _ = writeln!(output, "+++ {new_prefix}");
+    for hunk in &result.hunks {
+        let _ = writeln!(
+            output,
+            "@@ -{},{} +{},{} @@",
+            hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len
+        );
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Addition { content, .. } => {
+                    let _ = writeln!(output, "+{content}");
+                }
+                DiffLine::Deletion { content, .. } => {
+                    let _ = writeln!(output, "-{content}");
+                }
+                DiffLine::Context { content, .. } => {
+                    let _ = writeln!(output, " {content}");
+                }
+                // Remaining variants of the non-exhaustive enum carry no
+                // canonical unified-diff prefix yet.
+                _ => {}
             }
-        };
-        let (old_prefix, new_prefix, marker): (String, String, &str) = match change {
-            DChange::Addition { .. } => ("/dev/null".into(), format!("b/{path}"), "new"),
-            DChange::Deletion { .. } => (format!("a/{path}"), "/dev/null".into(), "deleted"),
-            DChange::Modification { .. } => (format!("a/{path}"), format!("b/{path}"), "modified"),
-            DChange::Rewrite { .. } => (format!("a/{path}"), format!("b/{path}"), "rewrite"),
-        };
-        let _ = writeln!(output, "diff --git a/{path} b/{path}");
-        let _ = writeln!(output, "--- {old_prefix}");
-        let _ = writeln!(output, "+++ {new_prefix}");
-        let _ = writeln!(output, "@@ -1,1 +1,1 @@");
-        let _ = writeln!(output, " {marker}");
-        file_count += 1;
+        }
+    }
+    output
+}
+
+/// Produce a typed per-file diff between HEAD and the index, using gix's status
+/// platform to enumerate staged changes and [`compute_diff`] for line-level
+/// hunks.
+///
+/// Scope: reports *staged* changes only (HEAD tree vs index), matching the
+/// original placeholder implementation. Unstaged worktree edits are outside
+/// this pass; they are surfaced by the `status` operation instead.
+///
+/// Each changed file is read from the object database on both sides — the old
+/// blob from the HEAD tree, the new blob from the index — and diffed with
+/// `imara-diff`'s Histogram algorithm (ADR-05). Binary or non-UTF-8 blobs are
+/// replaced with a descriptive placeholder rather than failing the tool. An
+/// unborn HEAD (fresh repository with no commits) diffs the index against the
+/// empty tree, so every staged file surfaces as an addition.
+fn gix_diff(repo: &gix::Repository) -> Result<ToolOutput, ToolError> {
+    use gix::diff::index::Change as IndexChange;
+    use gix::status::Item as StatusItem;
+
+    /// Whether an index entry mode points at diffable text (regular file or
+    /// symlink) rather than a tree or submodule git-link.
+    fn is_diffable_mode(mode: gix::index::entry::Mode) -> bool {
+        mode.to_tree_entry_mode().is_some_and(|m| m.is_blob_or_symlink())
     }
 
+    // Reuse the status platform (also backing `gix_status_lines`): its
+    // `TreeIndex` items are exactly the HEAD-tree-vs-index changes.
+    // `diff_tree_to_tree(.., None, ..)` does *not* mean "the index" — `None` is
+    // the empty tree — so it cannot be used for a staged diff.
+    let platform = repo.status(gix::progress::Discard).map_err(|e| ToolError::ExecutionFailed {
+        message: format!("failed to get status for diff: {e}"),
+    })?;
+    let iter = platform.into_iter(Vec::new()).map_err(|e| ToolError::ExecutionFailed {
+        message: format!("failed to create status iterator: {e}"),
+    })?;
+
+    let mut diffs: Vec<DiffResult> = Vec::new();
+    let mut rendered: Vec<String> = Vec::new();
+
+    for result in iter {
+        let item = result.map_err(|e| ToolError::ExecutionFailed {
+            message: format!("diff status iteration failed: {e}"),
+        })?;
+
+        // Only staged changes (HEAD tree vs index) participate in `diff`;
+        // unstaged index-vs-worktree items belong to `status`.
+        let change = match item {
+            StatusItem::TreeIndex(change) => change,
+            StatusItem::IndexWorktree(_) => continue,
+        };
+
+        // Extract the change path plus old/new blob ids. Rewrites (renames /
+        // copies) are diffed between their source and destination blob and
+        // reported under the destination path; submodule git-links and other
+        // non-blob entries carry no diffable text and are skipped.
+        let (location, old_id, new_id, old_present, new_present) = match change {
+            IndexChange::Addition { location, entry_mode, id, .. }
+                if is_diffable_mode(entry_mode) =>
+            {
+                (location, None, Some(id.into_owned()), false, true)
+            }
+            IndexChange::Deletion { location, entry_mode, id, .. }
+                if is_diffable_mode(entry_mode) =>
+            {
+                (location, Some(id.into_owned()), None, true, false)
+            }
+            IndexChange::Modification {
+                location,
+                previous_entry_mode,
+                previous_id,
+                entry_mode,
+                id,
+                ..
+            } if is_diffable_mode(entry_mode) && is_diffable_mode(previous_entry_mode) => {
+                (location, Some(previous_id.into_owned()), Some(id.into_owned()), true, true)
+            }
+            IndexChange::Rewrite {
+                location, source_entry_mode, source_id, entry_mode, id, ..
+            } if is_diffable_mode(entry_mode) && is_diffable_mode(source_entry_mode) => {
+                (location, Some(source_id.into_owned()), Some(id.into_owned()), true, true)
+            }
+            _ => continue,
+        };
+
+        // Paths that are not valid UTF-8 cannot be represented as a
+        // `Utf8PathBuf` DiffResult; skip rather than fail the whole tool call.
+        let location: &[u8] = &location;
+        let Ok(path) = std::str::from_utf8(location) else { continue };
+
+        let old = match old_id {
+            Some(id) => blob_to_text(repo, id)?,
+            None => String::new(),
+        };
+        let new = match new_id {
+            Some(id) => blob_to_text(repo, id)?,
+            None => String::new(),
+        };
+
+        let diff_result = compute_diff(Utf8PathBuf::from(path), &old, &new);
+        rendered.push(render_unified_diff(&diff_result, old_present, new_present));
+        diffs.push(diff_result);
+    }
+
+    let diffs_value = serde_json::to_value(&diffs).map_err(|e| ToolError::ExecutionFailed {
+        message: format!("failed to serialize diff results: {e}"),
+    })?;
+
     Ok(ToolOutput {
-        summary: format!("{file_count} files changed"),
-        data: serde_json::json!({"diff": output}),
+        summary: format!("{} files changed", diffs.len()),
+        data: serde_json::json!({
+            "diffs": diffs_value,
+            "diff": rendered.join("\n"),
+        }),
     })
 }
 
@@ -845,21 +981,43 @@ mod tests {
         AllowAllPolicy
     }
 
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().unwrap();
-        let repo = gix::init(dir.path()).unwrap();
+    /// Stage worktree changes via the system `git` binary (used only in tests,
+    /// mirroring `add_and_commit`; the gix-backed diff path itself never needs
+    /// `git` on PATH).
+    async fn stage(repo_path: &str, args: &[&str], cancel: &CancellationToken) {
+        cli_fallback::run_git(repo_path, args, cancel, Duration::from_secs(GIT_TIMEOUT_SECS))
+            .await
+            .expect("git CLI staging failed");
+    }
 
-        // Write README.md as a blob.
-        let blob_id = repo.write_blob(b"# Test").unwrap();
+    /// Whether any diff line in the serialized `hunks` array is an
+    /// `Addition`/`Deletion` (`DiffLine` serializes as an externally tagged
+    /// object like `{"Addition": {"content": ..}}`).
+    fn lines_of_kind(hunks: &serde_json::Value, kind: &str) -> bool {
+        hunks.as_array().is_some_and(|hunks| {
+            hunks.iter().any(|h| {
+                h["lines"].as_array().is_some_and(|lines| {
+                    lines.iter().any(|l| l.as_object().is_some_and(|o| o.contains_key(kind)))
+                })
+            })
+        })
+    }
 
-        // Create a tree containing the blob entry.
-        let tree = gix::objs::Tree {
-            entries: vec![gix::objs::tree::Entry {
-                mode: gix::objs::tree::EntryKind::Blob.into(),
-                filename: b"README.md".to_vec().into(),
-                oid: blob_id.into(),
-            }],
-        };
+    /// Extract the content string of the first `Addition` diff line, if any.
+    fn first_addition_content(hunks: &serde_json::Value) -> Option<String> {
+        hunks.as_array()?.iter().find_map(|h| {
+            h["lines"].as_array()?.iter().find_map(|l| {
+                l.as_object()?.get("Addition")?.get("content")?.as_str().map(String::from)
+            })
+        })
+    }
+
+    /// Commit `entries`-shaped tree as the initial commit on `refs/heads/main`.
+    ///
+    /// Builds a tree from the given blob entries — the same recipe `init_repo`
+    /// uses — so tests can seed HEAD with more than one tracked file.
+    fn write_initial_commit(repo: &gix::Repository, entries: Vec<gix::objs::tree::Entry>) {
+        let tree = gix::objs::Tree { entries };
         let tree_id = repo.write_object(&tree).unwrap();
 
         // Create a signature (committer and author are same).
@@ -881,6 +1039,63 @@ mod tests {
             [] as [gix::hash::ObjectId; 0],
         )
         .unwrap();
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = gix::init(dir.path()).unwrap();
+
+        // Write README.md as a blob.
+        let blob_id = repo.write_blob(b"# Test").unwrap();
+
+        // Create a tree containing the blob entry.
+        let entries = vec![gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: b"README.md".to_vec().into(),
+            oid: blob_id.into(),
+        }];
+        write_initial_commit(&repo, entries);
+
+        dir
+    }
+
+    /// Rebuild the on-disk index from the current HEAD tree, so the index matches
+    /// HEAD exactly and a HEAD-vs-index diff reports no changes.
+    ///
+    /// `init_repo`/`write_initial_commit` write the commit but never touch the
+    /// index, leaving it empty — fine for operations that don't compare HEAD
+    /// against the index, but wrong for `diff`. `State::from_tree` produces no
+    /// tree-cache extension, so the written index stays consistent.
+    fn seed_index_from_head(repo: &gix::Repository) {
+        let head_tree = repo.head_commit().unwrap().tree_id().unwrap();
+        let mut index = repo.index_from_tree(&head_tree).unwrap();
+        index.write(gix::index::write::Options::default()).unwrap();
+    }
+
+    /// Initialize a *clean* repository: `files` (name, contents) are committed,
+    /// materialized in the worktree, and seeded into the index. Unlike
+    /// [`init_repo`], `git status`/HEAD-vs-index diffs see a consistent state.
+    fn init_clean_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = gix::init(dir.path()).unwrap();
+
+        let entries = files
+            .iter()
+            .map(|(name, contents)| {
+                let blob_id = repo.write_blob(contents).unwrap();
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: name.as_bytes().to_vec().into(),
+                    oid: blob_id.into(),
+                }
+            })
+            .collect();
+        write_initial_commit(&repo, entries);
+
+        for (name, contents) in files {
+            std::fs::write(dir.path().join(name), contents).unwrap();
+        }
+        seed_index_from_head(&repo);
 
         dir
     }
@@ -1025,16 +1240,180 @@ mod tests {
 
     #[tokio::test]
     async fn diff_works() {
-        let dir = init_repo();
+        let dir = init_clean_repo(&[("README.md", b"# Test\n")]);
         let tool = GitTool;
         let policy = test_policy();
         let cancel = CancellationToken::new();
 
-        std::fs::write(dir.path().join("README.md"), "# Modified").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Modified\n").unwrap();
+        let repo_path = dir.path().to_str().unwrap();
+        stage(repo_path, &["add", "README.md"], &cancel).await;
 
         let result =
             tool.execute(input("diff"), &policy, &session(dir.path().to_path_buf()), cancel).await;
         assert!(result.is_ok(), "diff failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn diff_produces_structured_modification() {
+        let dir = init_clean_repo(&[("README.md", b"# Test\n")]);
+        let tool = GitTool;
+        let policy = test_policy();
+        let cancel = CancellationToken::new();
+        let ses = session(dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("README.md"), "# Modified\n").unwrap();
+        stage(dir.path().to_str().unwrap(), &["add", "README.md"], &cancel).await;
+
+        let output = tool.execute(input("diff"), &policy, &ses, cancel).await.unwrap();
+        assert_eq!(output.summary, "1 files changed");
+
+        let diffs = output.data["diffs"].as_array().expect("diffs must be an array");
+        assert_eq!(diffs.len(), 1, "expected one diff, got {diffs:?}");
+        assert_eq!(diffs[0]["path"].as_str(), Some("README.md"));
+        let hunks = diffs[0]["hunks"].as_array().expect("hunks must be an array");
+        assert!(
+            hunks.iter().any(|h| h["lines"].as_array().is_some_and(|lines| {
+                lines.iter().any(|l| {
+                    l.as_object()
+                        .is_some_and(|o| o.contains_key("Addition") || o.contains_key("Deletion"))
+                })
+            })),
+            "expected at least one changed line in the hunks"
+        );
+
+        // Back-compat text payload is a non-empty joined string.
+        let text = output.data["diff"].as_str().expect("diff must remain a string");
+        assert!(!text.is_empty());
+        assert!(text.contains("diff --git a/README.md b/README.md"));
+    }
+
+    #[tokio::test]
+    async fn diff_addition_and_deletion_marker() {
+        let dir = init_clean_repo(&[("README.md", b"# Test\n"), ("old.txt", b"old content\n")]);
+        let tool = GitTool;
+        let policy = test_policy();
+        let cancel = CancellationToken::new();
+        let repo_path = dir.path().to_str().unwrap().to_string();
+        let ses = session(dir.path().to_path_buf());
+
+        // Stage an addition (new.txt) and a deletion (old.txt).
+        std::fs::write(dir.path().join("new.txt"), "new content\n").unwrap();
+        stage(&repo_path, &["add", "new.txt"], &cancel).await;
+        stage(&repo_path, &["rm", "old.txt"], &cancel).await;
+
+        let output = tool.execute(input("diff"), &policy, &ses, cancel).await.unwrap();
+        assert_eq!(output.summary, "2 files changed");
+
+        let diffs = output.data["diffs"].as_array().expect("diffs must be an array");
+        assert_eq!(diffs.len(), 2, "expected two diffs, got {diffs:?}");
+        let paths: Vec<&str> = diffs.iter().filter_map(|d| d["path"].as_str()).collect();
+        assert!(paths.contains(&"new.txt"), "paths: {paths:?}");
+        assert!(paths.contains(&"old.txt"), "paths: {paths:?}");
+
+        // The addition's whole file is new lines; the deletion's whole file is
+        // removed lines.
+        let new_diff = diffs.iter().find(|d| d["path"].as_str() == Some("new.txt")).unwrap();
+        assert!(lines_of_kind(&new_diff["hunks"], "Addition"), "addition should carry added lines");
+        let text = output.data["diff"].as_str().unwrap();
+        assert!(text.contains("--- /dev/null\n+++ b/new.txt"), "text: {text}");
+        assert!(text.contains("--- a/old.txt\n+++ /dev/null"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn diff_multi_file_reports_all_changes() {
+        let dir = init_clean_repo(&[("README.md", b"# Test\n"), ("old.txt", b"old content\n")]);
+        let tool = GitTool;
+        let policy = test_policy();
+        let cancel = CancellationToken::new();
+        let repo_path = dir.path().to_str().unwrap().to_string();
+        let ses = session(dir.path().to_path_buf());
+
+        // Modify README.md, add new.txt, delete old.txt.
+        std::fs::write(dir.path().join("README.md"), "# Touched\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "fresh\ncontent\n").unwrap();
+        stage(&repo_path, &["add", "README.md", "new.txt"], &cancel).await;
+        stage(&repo_path, &["rm", "old.txt"], &cancel).await;
+
+        let output = tool.execute(input("diff"), &policy, &ses, cancel).await.unwrap();
+        let diffs = output.data["diffs"].as_array().expect("diffs must be an array");
+        let paths: Vec<&str> = diffs.iter().filter_map(|d| d["path"].as_str()).collect();
+        assert_eq!(paths.len(), 3, "paths: {paths:?}");
+        assert!(paths.contains(&"README.md"), "paths: {paths:?}");
+        assert!(paths.contains(&"new.txt"), "paths: {paths:?}");
+        assert!(paths.contains(&"old.txt"), "paths: {paths:?}");
+    }
+
+    #[tokio::test]
+    async fn diff_with_no_changes_is_empty() {
+        let dir = init_clean_repo(&[("README.md", b"# Test\n")]);
+        let tool = GitTool;
+        let policy = test_policy();
+        let result = tool
+            .execute(
+                input("diff"),
+                &policy,
+                &session(dir.path().to_path_buf()),
+                CancellationToken::new(),
+            )
+            .await;
+        let output = result.unwrap();
+        assert_eq!(output.summary, "0 files changed");
+        assert!(output.data["diffs"].as_array().unwrap().is_empty(), "expected empty diffs");
+        assert_eq!(output.data["diff"].as_str().unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn diff_unborn_head_reports_staged_file_as_addition() {
+        // Fresh repo with no commits: HEAD is unborn, so the index is diffed
+        // against the empty tree and every staged file is an addition.
+        let dir = tempfile::TempDir::new().unwrap();
+        let _repo = gix::init(dir.path()).unwrap();
+        let tool = GitTool;
+        let policy = test_policy();
+        let cancel = CancellationToken::new();
+
+        std::fs::write(dir.path().join("first.txt"), "hello\n").unwrap();
+        stage(dir.path().to_str().unwrap(), &["add", "first.txt"], &cancel).await;
+
+        let output = tool
+            .execute(input("diff"), &policy, &session(dir.path().to_path_buf()), cancel)
+            .await
+            .unwrap();
+        let diffs = output.data["diffs"].as_array().unwrap();
+        assert_eq!(diffs.len(), 1, "diffs: {diffs:?}");
+        assert_eq!(diffs[0]["path"].as_str(), Some("first.txt"));
+        assert!(
+            lines_of_kind(&diffs[0]["hunks"], "Addition"),
+            "unborn-head addition should show added lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_binary_file_falls_back_to_placeholder() {
+        let dir = init_clean_repo(&[("README.md", b"# Test\n")]);
+        let tool = GitTool;
+        let policy = test_policy();
+        let cancel = CancellationToken::new();
+
+        // Not valid UTF-8: must not fail the diff tool.
+        let bytes: Vec<u8> = vec![0x00, 0x01, 0xff, 0xfe, 0x00];
+        std::fs::write(dir.path().join("blob.bin"), &bytes).unwrap();
+        stage(dir.path().to_str().unwrap(), &["add", "blob.bin"], &cancel).await;
+
+        let output = tool
+            .execute(input("diff"), &policy, &session(dir.path().to_path_buf()), cancel)
+            .await
+            .expect("binary diff must not fail");
+        let diffs = output.data["diffs"].as_array().unwrap();
+        assert_eq!(diffs.len(), 1, "diffs: {diffs:?}");
+        assert_eq!(diffs[0]["path"].as_str(), Some("blob.bin"));
+        let content = first_addition_content(&diffs[0]["hunks"])
+            .expect("binary addition should have an added line");
+        assert!(
+            content.contains("[binary file:") && content.contains("bytes"),
+            "expected binary placeholder, got: {content}"
+        );
     }
 
     #[tokio::test]

@@ -167,6 +167,19 @@ the sentinel provider mechanism (`coordinator-self-execute`); intent
 classification (ADR-55/56). The coordinator sentinel identity itself is
 engine-owned — it is the one hardcoded actor by design.
 
+## Amendment (2026-09-05) — registry is the roster; blueprint staffing is never enforced
+
+Revised **in place** (per the project owner's standing instruction, no new ADR
+number). This document already states the config owns the roster and
+blueprint validation is "guardrails, not shape enforcement" (§5) — but the
+implementation kept a staffing-equality check (`first_agent_for_stage`'s
+`def.agents` comparison, coordinator.rs). **Deleted**: all blueprint staffing
+equality/participation asserts and drift failures. The registry built from
+`custom_agents` is the complete roster; a blueprint is advisory data at most
+and never binds dispatch (ADR-35 amendment 2026-09-05). §5's integrity/safety
+guardrails (cycles, uniqueness, reserved names, no self-fallback) are
+unchanged.
+
 ## Consequences
 
 - **Config file is the source of truth.** Agents, stages, blueprints, prompts,
