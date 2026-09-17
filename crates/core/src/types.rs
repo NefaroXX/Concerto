@@ -190,6 +190,11 @@ pub struct CompletionUsage {
 pub struct TokenBudget {
     pub capacity: u64,
     pub reserved_for_response: u64,
+    /// Tokens available for the request prompt (`capacity − reserved_for_response`).
+    ///
+    /// Context-budget allocators (e.g. the score-ordered RAG bound in
+    /// `concerto-memory`) must bound against `available` — never raw
+    /// `capacity`, which still includes the response reservation.
     pub available: u64,
 }
 

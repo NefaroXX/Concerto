@@ -1754,6 +1754,11 @@ async fn execute_agent_loop(
     // `None` keeps the mid-run message projection intact and is a safe no-op.
     // The `SummarizeOldest` type remains available for explicit opt-in use and
     // is exercised by `concerto-memory` tests.
+    //
+    // GATE: in-run overflow strategies must stay disabled. Re-enabling here
+    // (or anywhere in production) without a superseding ADR is a defect, not a
+    // tuning choice — `SummarizeOldest::apply` and the agent-loop apply site
+    // both log loudly if one ever reaches them.
     let overflow_strategy: Option<Arc<dyn concerto_core::ContextOverflowStrategy>> = {
         tracing::warn!(
             "in-run LLM overflow summarization disabled (audit C-03); context is bounded by \
@@ -1761,6 +1766,10 @@ async fn execute_agent_loop(
         );
         None
     };
+    debug_assert!(
+        overflow_strategy.is_none(),
+        "in-run LLM overflow summarization must remain disabled (audit C-03)"
+    );
 
     let undo_manager = Arc::new(Mutex::new(UndoManager::new(&req.project_dir)));
     let eval = {

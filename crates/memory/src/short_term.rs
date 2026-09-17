@@ -30,6 +30,13 @@ use crate::summarizer::{LLMSummarizer, SUMMARIZATION_PROMPT};
 /// 5. Insert the summary as a `System` message at the front of history.
 /// 6. Store the summary as a long-term `MemoryEntry`.
 /// 7. Emit `SummarizationCompleted` event.
+///
+/// **Gated path (audit C-03):** in-run LLM overflow summarization is disabled
+/// in production. The runtime never wires this strategy (`runtime_runner`
+/// forces `None`), and context overflow is handled by deterministic durable
+/// compaction (`ContextEngine` + `ContextGuardProvider`). This implementation
+/// is retained for test coverage of the strategy machinery only; wiring it
+/// back into production requires a superseding ADR.
 pub struct SummarizeOldest {
     summarizer: Arc<dyn LLMSummarizer>,
     chunk_selector: ChunkSelector,
@@ -62,6 +69,15 @@ impl concerto_core::ContextOverflowStrategy for SummarizeOldest {
         session_id: Ulid,
         _cancel: CancellationToken,
     ) -> usize {
+        // Audit C-03 gate: this strategy must never run in production. The
+        // production runtime forces `None` (runtime_runner) and bounds context
+        // deterministically via ContextEngine/ContextGuardProvider instead.
+        // Reaching this method means a miswire — log loudly rather than run
+        // silently. Diverging from this gate requires a superseding ADR.
+        tracing::warn!(
+            "SummarizeOldest::apply invoked — gated strategy (audit C-03); in-run LLM \
+             overflow summarization is disabled in production and retained for tests only"
+        );
         let capacity = budget.capacity;
 
         // 1. Select oldest messages to summarise

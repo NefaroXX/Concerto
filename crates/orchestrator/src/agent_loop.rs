@@ -75,9 +75,11 @@ pub struct AgentLoop {
     /// trigger ratio of the model's context capacity.
     overflow_strategy: Option<Arc<dyn ContextOverflowStrategy>>,
 
-    /// Optional context budget allocator for RAG chunk filtering.
+    /// Optional RAG-only context budget bound (ADR-16/ADR-48).
     /// When set, retrieved memory chunks are filtered through this
-    /// allocator before being injected into the prompt.
+    /// allocator's score-ordered `truncate_to_rag_limit` before being
+    /// injected into the prompt. The bound is derived from the provider
+    /// budget's `available` tokens — never raw total capacity.
     budget_allocator: Option<ContextBudgetAllocator>,
 
     /// Prior conversation messages (loaded from the persistent session) used
@@ -993,10 +995,12 @@ impl AgentLoop {
                 .unwrap_or_default()
         };
 
-        // Apply context budget allocation if configured
+        // Apply the RAG context budget if configured. The allocator derives
+        // its bound from the provider budget's `available` tokens (capacity
+        // minus the response reservation) — never the raw total capacity.
         if let Some(ref allocator) = self.budget_allocator {
-            let capacity = self.provider.context_capacity(&self.usage_model);
-            memory_chunks = allocator.truncate_to_rag_limit(memory_chunks, capacity.available);
+            let budget = self.provider.context_capacity(&self.usage_model);
+            memory_chunks = allocator.truncate_to_rag_limit(memory_chunks, &budget);
         }
 
         crate::memory_prompt::format_retrieved_memory(&memory_chunks)
@@ -1395,6 +1399,13 @@ impl AgentLoop {
     }
 
     /// Phase 7: Apply conversation-history overflow strategy if configured.
+    ///
+    /// Audit C-03 gate: in-run LLM overflow strategies are disabled in
+    /// production — the runtime forces `None` (see `runtime_runner`) and
+    /// context overflow is bounded deterministically before/after the run by
+    /// `ContextEngine` + `ContextGuardProvider`. Any strategy reaching this
+    /// point is a miswire; log it so it can never run silently, and never
+    /// re-enable without a superseding ADR.
     async fn trim_conversation_history(
         &self,
         messages: &mut Vec<Message>,
@@ -1402,6 +1413,10 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) {
         if let Some(ref strategy) = self.overflow_strategy {
+            tracing::warn!(
+                "overflow strategy applied inside agent loop — in-run overflow strategies are \
+                 gated (audit C-03); context should be bounded by deterministic compaction"
+            );
             let budget = self.provider.context_capacity("");
             strategy.apply(messages, &budget, session_id, cancel).await;
         }

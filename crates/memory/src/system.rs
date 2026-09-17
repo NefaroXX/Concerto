@@ -82,7 +82,14 @@ impl MemorySystem {
     pub fn task_tree(&self) -> &TaskTreeStore {
         &self.task_tree
     }
-    /// Access the budget allocator.
+    /// Access the RAG context budget allocator.
+    ///
+    /// RAG-only (ADR-16/ADR-48): the allocator provides the score-ordered RAG
+    /// bound via `truncate_to_rag_limit`. Working-memory and conversation
+    /// budgets are owned by the orchestrator's `ContextEngine` +
+    /// `ContextGuardProvider`, not by this system. `retrieve`/`store` never
+    /// apply the allocator themselves — the RAG bound is applied by the caller
+    /// that injects retrieved chunks into the prompt.
     pub fn budget(&self) -> &ContextBudgetAllocator {
         &self.budget
     }

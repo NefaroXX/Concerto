@@ -37,6 +37,11 @@ pub trait LlmProvider: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<CompletionStream, ProviderError>;
 
+    /// Provider context budget for `model`.
+    ///
+    /// Returns a [`TokenBudget`]; the prompt-side bound for context assembly
+    /// and RAG truncation is [`TokenBudget::available`] (`capacity` minus the
+    /// response reservation), never the raw total `capacity`.
     fn context_capacity(&self, model: &str) -> TokenBudget;
 
     fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64;
