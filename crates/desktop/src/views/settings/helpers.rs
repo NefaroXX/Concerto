@@ -227,6 +227,7 @@ pub(crate) async fn revoke_plugin_grants(
 
 #[cfg(test)]
 mod tests {
+    use super::super::message::SectionId;
     use super::super::*;
     use super::super::{readable_provider_label, PolicyActionChoice, PolicyConditionChoice};
     use concerto_config::{
@@ -499,6 +500,51 @@ mod tests {
         assert!(state.key_edit_text.is_empty());
         assert_eq!(state.providers.len(), 1);
         assert_eq!(state.providers[0].id, "router");
+    }
+
+    #[test]
+    fn all_settings_sections_start_collapsed() {
+        let state = State::from_config(&AppConfig::default());
+        for section in SectionId::ALL {
+            assert!(
+                state.collapsed_sections.contains(&section),
+                "section {section:?} must start collapsed"
+            );
+        }
+    }
+
+    #[test]
+    fn jump_to_section_expands_but_never_folds() {
+        let mut state = State::from_config(&AppConfig::default());
+        // The sidebar jump expands its target...
+        let _ = state.update(Message::JumpToSection(SectionId::Mcp));
+        assert!(
+            !state.collapsed_sections.contains(&SectionId::Mcp),
+            "a sidebar jump must expand its target"
+        );
+        // ...and is idempotent: jumping again never folds it.
+        let _ = state.update(Message::JumpToSection(SectionId::Mcp));
+        assert!(!state.collapsed_sections.contains(&SectionId::Mcp));
+        // The section header keeps the toggle semantics.
+        let _ = state.update(Message::ToggleSection(SectionId::Mcp));
+        assert!(state.collapsed_sections.contains(&SectionId::Mcp));
+    }
+
+    #[test]
+    fn provider_model_options_include_extra_models() {
+        let mut gateway = provider("gateway", "openai", "gpt-4o");
+        gateway.extra_models = vec!["gateway-only".into(), "  ".into()];
+        let config = AppConfig {
+            model_settings: Some(ModelSettings { providers: vec![gateway], ..Default::default() }),
+            ..Default::default()
+        };
+        let mut state = State::from_config(&AppConfig::default());
+        state.refresh_provider_cache_from_config(&config);
+
+        assert!(
+            state.model_names_for_provider("gateway").contains(&"gateway-only".to_string()),
+            "config-first extra_models must become selectable in the Settings pickers"
+        );
     }
 
     #[test]

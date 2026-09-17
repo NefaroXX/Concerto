@@ -9,7 +9,7 @@ use concerto_config::{
     PolicyConfig, PolicyRuleDef, ProviderConfig, ShellSettings, SkillsConfig,
 };
 use concerto_providers::provider_defs::{
-    model_options_for, provider_definition, PROVIDER_TYPE_IDS,
+    picker_model_options, provider_definition, PROVIDER_TYPE_IDS,
 };
 
 use crate::theme::AppTheme;
@@ -18,8 +18,8 @@ use super::helpers::default_managed_source;
 use super::message::SectionId;
 use super::{
     readable_provider_label, Message, PolicyActionChoice, PolicyConditionChoice,
-    CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, POLICY_ACTIONS, POLICY_CONDITION_KINDS,
-    POLICY_OPERATION_TOOLS, POLICY_TOOLS,
+    CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID, POLICY_ACTIONS,
+    POLICY_CONDITION_KINDS, POLICY_OPERATION_TOOLS, POLICY_TOOLS,
 };
 
 pub struct State {
@@ -299,18 +299,10 @@ impl State {
             shell_managed_export_path: String::new(),
             shell_managed_import_path: String::new(),
             shell_managed_result: None,
-            collapsed_sections: {
-                let mut s = HashSet::new();
-                s.insert(SectionId::Policy);
-                s.insert(SectionId::Retry);
-                s.insert(SectionId::Memory);
-                s.insert(SectionId::Relationships);
-                s.insert(SectionId::Shell);
-                s.insert(SectionId::Plugins);
-                s.insert(SectionId::Skills);
-                s.insert(SectionId::Mcp);
-                s
-            },
+            // Every section starts folded (ADR-57 §3d UX): the sidebar index is
+            // the navigation surface, and clicking an entry expands its section
+            // in place via `Message::JumpToSection`.
+            collapsed_sections: SectionId::ALL.iter().copied().collect(),
             plugin_granted_ids: Vec::new(),
             plugin_grants_summary: Vec::new(),
             plugin_revoke_result: None,
@@ -606,20 +598,11 @@ impl State {
         format!("prov_{}", concerto_core::ids::Ulid::new())
     }
 
-    /// Model options for a provider: static known models merged with any models
-    /// discovered at runtime and persisted in `ProviderConfig::cached_models`.
+    /// Model options for a provider: the shared picker resolver (selected /
+    /// default / static known models, plus discovered `cached_models` and
+    /// config-first `extra_models`) [ADR-57 §3d].
     fn model_options_with_discovered(p: &ProviderConfig) -> Vec<String> {
-        let def = provider_definition(&p.provider);
-        let mut opts = model_options_for(p, &def, None);
-        let mut seen: std::collections::HashSet<String> =
-            opts.iter().map(|s| s.to_lowercase()).collect();
-        for m in &p.cached_models {
-            let t = m.trim().to_string();
-            if !t.is_empty() && seen.insert(t.to_lowercase()) {
-                opts.push(t);
-            }
-        }
-        opts
+        picker_model_options(p)
     }
 
     fn rebuild_cache(&mut self) {
@@ -782,6 +765,29 @@ impl State {
             self.skills_enabled_ids =
                 self.skills_discovered.iter().map(|skill| skill.id.clone()).collect();
         }
+    }
+
+    /// Scroll the Settings main column so `section`'s header lands at the top.
+    ///
+    /// Uses a fractional [`RelativeOffset`] derived from the section's position
+    /// in the canonical [`SectionId::ALL`] order — a stable proxy for the
+    /// rendered column, whose per-section heights vary. The `+ 1` denominator
+    /// accounts for the trailing save footer and biases the jump slightly high,
+    /// so the target section's expanded body (which grows downward) stays
+    /// visible.
+    fn scroll_to_section(section: SectionId) -> iced::Task<Message> {
+        let Some(index) = SectionId::ALL.iter().position(|candidate| *candidate == section) else {
+            return iced::Task::none();
+        };
+        let fraction = index as f32 / (SectionId::ALL.len() + 1) as f32;
+        let offset = iced_core::widget::operation::scrollable::RelativeOffset {
+            x: Some(0.0),
+            y: Some(fraction),
+        };
+        iced::advanced::widget::operate(iced_core::widget::operation::scrollable::snap_to(
+            iced::widget::Id::new(MAIN_SCROLL_ID),
+            offset,
+        ))
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -1203,6 +1209,12 @@ impl State {
                 if !self.collapsed_sections.remove(&id) {
                     self.collapsed_sections.insert(id);
                 }
+            }
+            // Sidebar navigation: always expand the target (never fold it) and
+            // scroll the main column to its header.
+            Message::JumpToSection(id) => {
+                self.collapsed_sections.remove(&id);
+                return Self::scroll_to_section(id);
             }
 
             // ADR-37 — Plugin grant lifecycle. Grants are persisted in the

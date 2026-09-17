@@ -40,11 +40,10 @@ use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
 use concerto_plugins::manager::SharedPluginManager;
 use concerto_providers::factory::ProviderFactory;
 use concerto_providers::provider_defs::{
-    model_options_for, provider_definition, provider_readiness,
+    picker_model_options, provider_definition, provider_readiness,
 };
 use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -688,6 +687,22 @@ fn orchestration_hides_relationships(config: &AppConfig) -> bool {
     config.orchestration.is_some()
 }
 
+/// Whether a provider is eligible for live model discovery: its type supports
+/// it and any required credential is present.
+///
+/// Shared by startup auto-discovery and the save-triggered pass so the two
+/// readiness gates can never drift. A provider type whose discovery is
+/// unsupported, or which needs a credential that is not stored, is skipped.
+fn provider_discovery_ready(
+    provider: &concerto_config::ProviderConfig,
+    credentials: &CredentialStore,
+) -> bool {
+    let definition = provider_definition(&provider.provider);
+    definition.supports_discovery()
+        && (!definition.requires_credential()
+            || provider.api_key(credentials).map(|key| !key.is_empty()).unwrap_or(false))
+}
+
 impl App {
     /// Best-effort persist of the current agent-graph view state to the active
     /// session's file. A write failure must never break the UI, so errors are
@@ -885,22 +900,11 @@ impl App {
         // startup so the unified picker (and per-provider lists) are populated
         // without any manual "refresh" action (Option-1: configure providers,
         // models flow in automatically).
+        let discovery_credentials = CredentialStore::new();
         let ready_ids: Vec<String> = app
             .runtime_providers()
             .iter()
-            .filter(|p| {
-                let def = provider_definition(&p.provider);
-                if !def.supports_discovery() {
-                    return false;
-                }
-                if def.requires_credential() {
-                    let creds = CredentialStore::new();
-                    if !p.api_key(&creds).map(|k| !k.is_empty()).unwrap_or(false) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|p| provider_discovery_ready(p, &discovery_credentials))
             .map(|p| p.id.clone())
             .collect();
         let mut discovery_tasks = Vec::new();
@@ -1424,10 +1428,15 @@ impl App {
                     // or model-discovery results).
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
+                    // Populate model lists for any provider added by this save
+                    // that has never been fetched, so it is usable immediately
+                    // (no manual refresh / restart). Computed before the
+                    // immutable plugin-refresh call below.
+                    let discovery_task = self.discover_unfetched_models();
                     // Plugin liveness: after a save (which may have added a
                     // provider or dropped a `.wasm` into the search path),
                     // re-discover plugins in the retained manager. Log-only.
-                    iced::Task::batch(vec![task, self.refresh_plugin_providers()])
+                    iced::Task::batch(vec![task, self.refresh_plugin_providers(), discovery_task])
                 }
                 views::settings::Message::ProviderModelsRefreshed {
                     provider_id,
@@ -2160,23 +2169,14 @@ impl App {
             .unwrap_or(&[])
     }
 
+    /// Model names selectable for the active provider in the chat header,
+    /// resolved through the shared picker resolver (selected / default / known
+    /// / discovered / config-first `extra_models`) so every picker agrees.
     fn runtime_model_names(&self, provider_id: &str) -> Vec<String> {
         self.runtime_providers()
             .iter()
             .find(|provider| provider.id == provider_id)
-            .map(|provider| {
-                let definition = provider_definition(&provider.provider);
-                let mut models = model_options_for(provider, &definition, None);
-                let mut seen =
-                    models.iter().map(|model| model.to_lowercase()).collect::<HashSet<_>>();
-                for model in &provider.cached_models {
-                    let model = model.trim().to_string();
-                    if !model.is_empty() && seen.insert(model.to_lowercase()) {
-                        models.push(model);
-                    }
-                }
-                models
-            })
+            .map(picker_model_options)
             .unwrap_or_default()
     }
 
@@ -2517,6 +2517,39 @@ impl App {
     /// per-frame `view` borrow.
     fn sync_chat_model_options(&mut self) {
         self.chat_model_options = self.runtime_model_names(&self.active_provider_id);
+    }
+
+    /// Kick off live model discovery for ready providers that have never been
+    /// fetched successfully, so a provider added in Settings populates its
+    /// model lists on save — no manual refresh or restart required.
+    ///
+    /// Eligible providers pass the same readiness gate startup auto-discovery
+    /// uses: the provider type must support discovery and any required
+    /// credential must be present. Providers already in flight (startup or a
+    /// manual refresh) are skipped, and so are providers with a cached catalog,
+    /// so a save never re-hits an already-populated provider.
+    fn discover_unfetched_models(&mut self) -> iced::Task<Message> {
+        let credentials = CredentialStore::new();
+        let ids: Vec<String> = self
+            .runtime_providers()
+            .iter()
+            .filter(|p| {
+                provider_discovery_ready(p, &credentials)
+                    && p.cached_models.is_empty()
+                    && p.cached_models_fetched_at == 0
+                    && !self.pending_refresh.contains_key(&p.id)
+            })
+            .map(|p| p.id.clone())
+            .collect();
+        let mut tasks = Vec::with_capacity(ids.len());
+        for id in ids {
+            self.refresh_seq = self.refresh_seq.wrapping_add(1);
+            let request_id = self.refresh_seq;
+            self.pending_refresh.insert(id.clone(), request_id);
+            self.settings.begin_provider_refresh(&id);
+            tasks.push(self.fetch_models_for_provider(id, request_id));
+        }
+        iced::Task::batch(tasks)
     }
 
     fn fetch_models_for_provider(
@@ -6037,6 +6070,33 @@ custom_agents = []
             app.dispatch_validation_error().is_some(),
             "multi-agent runs must validate every assignment"
         );
+    }
+
+    #[test]
+    fn save_discovery_queues_only_unfetched_ready_providers() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        app.pending_refresh.clear();
+        // `ollama` needs no credential and supports discovery, so it is ready
+        // without touching the keychain (keeps this test hermetic).
+        push_provider(&mut app, "fresh", "ollama", "");
+        push_provider(&mut app, "populated", "ollama", "");
+        app.settings.providers[1].cached_models = vec!["llama3".into()];
+        app.settings.providers[1].cached_models_fetched_at = 1;
+        sync_config_providers(&mut app);
+
+        let before = app.refresh_seq;
+        let _ = app.discover_unfetched_models();
+
+        assert!(
+            app.pending_refresh.contains_key("fresh"),
+            "an unfetched discoverable provider must be queued on save"
+        );
+        assert!(
+            !app.pending_refresh.contains_key("populated"),
+            "a provider with a cached catalog must not be re-fetched on save"
+        );
+        assert!(app.refresh_seq > before, "queuing a fetch must issue a request id");
     }
 
     // ── Refresh concurrency (plan §13 Refresh concurrency) ─────────────────

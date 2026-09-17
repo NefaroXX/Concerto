@@ -162,6 +162,11 @@ pub enum Message {
     /// Toggle a collapsible section open/closed.
     #[allow(private_interfaces)]
     ToggleSection(SectionId),
+    /// Navigate to a section: expand it and scroll the main column to its
+    /// header. Sent by the sidebar index (which navigates); the section headers
+    /// keep sending [`Message::ToggleSection`], which only folds.
+    #[allow(private_interfaces)]
+    JumpToSection(SectionId),
 }
 
 /// Identifies a collapsible section in the Settings view.
@@ -178,4 +183,26 @@ pub(crate) enum SectionId {
     Plugins,
     Skills,
     Mcp,
+}
+
+impl SectionId {
+    /// Every section in the order it renders in the main column (and in the
+    /// sidebar index). This canonical order is what a sidebar jump uses to
+    /// derive a scroll position; it is intentionally independent of whether
+    /// the Relationships section is currently hidden (`[orchestration]`-gated),
+    /// because the resulting fractional offset stays within one section height
+    /// either way.
+    pub(crate) const ALL: [SectionId; 11] = [
+        SectionId::Theme,
+        SectionId::Providers,
+        SectionId::Assignments,
+        SectionId::Policy,
+        SectionId::Relationships,
+        SectionId::Retry,
+        SectionId::Memory,
+        SectionId::Shell,
+        SectionId::Plugins,
+        SectionId::Skills,
+        SectionId::Mcp,
+    ];
 }

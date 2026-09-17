@@ -29,6 +29,10 @@ const PROVIDER_TYPES: &[&str] = PROVIDER_TYPE_IDS;
 /// Sentinel option appended to model pickers to reveal a custom-model text input.
 const CUSTOM_MODEL_SENTINEL: &str = "Custom model ID…";
 
+/// Widget id of the Settings main content `scrollable`, targeted by
+/// [`Message::JumpToSection`] to scroll a section header into view.
+pub(crate) const MAIN_SCROLL_ID: &str = "settings_main_scroll";
+
 fn readable_provider_label(provider: &ProviderConfig) -> String {
     let definition = provider_definition(&provider.provider);
     let configured_name = provider.name.trim();
@@ -1025,8 +1029,8 @@ impl State {
         );
 
         // ── Sidebar nav ──
-        // Quick navigation: each item toggles its section's collapsed state via
-        // the existing ToggleSection message. Labels intentionally repeat the
+        // Quick navigation: each entry jumps to its section (expand + scroll)
+        // via `Message::JumpToSection`. Labels intentionally repeat the
         // collapsible_section titles (minor duplication keeps both readable).
         let sidebar_items = vec![
             (message::SectionId::Theme, "Display"),
@@ -1059,7 +1063,7 @@ impl State {
             sidebar_buttons.push(crate::ui::list_item(
                 theme,
                 is_expanded,
-                Message::ToggleSection(id),
+                Message::JumpToSection(id),
                 text(label)
                     .size(13)
                     .style(move |_| crate::theme::sidebar_item_style(palette, is_expanded)),
@@ -1086,7 +1090,8 @@ impl State {
         ]);
         let main_content = column(main_sections).spacing(SPACING_MD).padding(20);
 
-        let main_scrollable = scrollable(container(main_content).width(Length::Fill));
+        let main_scrollable = scrollable(container(main_content).width(Length::Fill))
+            .id(iced::widget::Id::new(MAIN_SCROLL_ID));
 
         // ── Combined layout ──
         row![
