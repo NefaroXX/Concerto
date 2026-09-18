@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::ProjectId;
+use sqlx::Row;
 use sqlx::SqlitePool;
-use sqlx::{AssertSqlSafe, Row};
 use time::OffsetDateTime;
 
 use crate::fts::FullTextStore;
 use crate::links::LinkStore;
-use crate::scoring::{chunk_link_score, ORPHAN_TRIM_SCORE};
+use crate::scoring::{chunk_link_score, parse_db_timestamp, ORPHAN_TRIM_SCORE};
 use crate::vector_store::VectorStore;
 
 /// Default TTL for different chunk types (in days).
@@ -92,54 +92,55 @@ impl TtlManager {
         project_id: &ProjectId,
         cancel: CancellationToken,
     ) -> Result<usize, MemoryError> {
-        // Build a SQL CASE expression that maps chunk_type debug strings
-        // to their TTL in days.  Unknown types get the default file TTL.
-        let ttl_case = self.default_ttl_days.map_or_else(
-            || {
-                format!(
-                    "CASE chunk_type \
-                WHEN 'Function' THEN {TTL_FUNCTION_DAYS} \
-                WHEN 'Struct' THEN {TTL_STRUCT_DAYS} \
-                WHEN 'Trait' THEN {TTL_FUNCTION_DAYS} \
-                WHEN 'Impl' THEN {TTL_FUNCTION_DAYS} \
-                WHEN 'SessionSummary' THEN {TTL_DECISION_DAYS} \
-                WHEN 'Fact' THEN {TTL_DECISION_DAYS} \
-                WHEN 'SlidingWindow' THEN {TTL_SLIDING_WINDOW_DAYS} \
-                ELSE {TTL_FILE_DAYS} \
-            END"
-                )
-            },
-            |days| days.to_string(),
-        );
-
-        // Find expired entries: created_at + TTL_days < now.
-        let query = format!(
-            "SELECT id FROM vector_store \
-             WHERE project_id = ? \
-               AND tombstone = 0 \
-               AND datetime(created_at, '+' || {ttl_case} || ' days') < datetime('now')"
-        );
-
-        // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is built from static fragments
-        // and the locally computed `{ttl_case}` CASE expression; no user input is
-        // interpolated — every filter value is bound via `?`.
-        let rows = sqlx::query(AssertSqlSafe(query))
-            .bind(&project_id.0)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
-
-        if rows.is_empty() {
+        if cancel.is_cancelled() {
             return Ok(0);
         }
 
-        let count = rows.len();
+        // Load every live row and decide expiry in Rust instead of comparing
+        // in SQL. The stored `created_at` is `OffsetDateTime::to_string()` — a
+        // suffixed format (e.g. `2023-11-14 22:13:20.0 +00:00:00`) SQLite's
+        // `datetime()` cannot parse, so the old
+        // `datetime(created_at, '+N days') < datetime('now')` predicate was a
+        // silent never-match. `parse_db_timestamp` handles the exact stored
+        // shape and normalizes any stored UTC offset before comparing.
+        let rows = sqlx::query(
+            "SELECT id, chunk_type, created_at FROM vector_store \
+             WHERE project_id = ? AND tombstone = 0",
+        )
+        .bind(&project_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        let mut expired: Vec<String> = Vec::new();
+        for row in rows {
+            let chunk_type: String = row.get("chunk_type");
+            let created_at: String = row.get("created_at");
+            let ttl_days = self
+                .default_ttl_days
+                .map_or_else(|| ttl_days_for_chunk_type(&chunk_type), i64::from);
+            // Fail-open: a row whose timestamp cannot be parsed is never
+            // purged (same contract as `TimedLink::from_db`).
+            let Some(created) = parse_db_timestamp(&created_at) else {
+                continue;
+            };
+            let cutoff_unix = now_unix - time::Duration::days(ttl_days).whole_seconds();
+            if created.unix_timestamp() < cutoff_unix {
+                expired.push(row.get("id"));
+            }
+        }
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let count = expired.len();
 
         // Tombstone each expired entry in the vector store and delete from FTS.
-        for row in &rows {
-            let chunk_id: String = row.get("id");
-            self.vector_store.tombstone(&chunk_id, project_id, cancel.clone()).await?;
-            let _ = self.fts_store.delete(&chunk_id, project_id, cancel.clone()).await;
+        for chunk_id in &expired {
+            self.vector_store.tombstone(chunk_id, project_id, cancel.clone()).await?;
+            let _ = self.fts_store.delete(chunk_id, project_id, cancel.clone()).await;
         }
 
         // Compact: permanently remove tombstoned entries.
@@ -416,6 +417,20 @@ fn summary_session_bucket(metadata: Option<&str>) -> String {
         })
         .filter(|session| !session.is_empty())
         .unwrap_or_else(|| DERIVED_SUMMARY_PROJECT_BUCKET.to_owned())
+}
+
+/// TTL (in days) for a `vector_store.chunk_type` debug string (the
+/// `{chunk_type:?}` the write path binds). Mirrors the SQL CASE
+/// `purge_expired` previously built — unknown types fall back to the file
+/// TTL. The per-type windows are identical to [`suggested_ttl_days`].
+fn ttl_days_for_chunk_type(chunk_type: &str) -> i64 {
+    match chunk_type {
+        "Function" | "Trait" | "Impl" => TTL_FUNCTION_DAYS,
+        "Struct" => TTL_STRUCT_DAYS,
+        "SessionSummary" | "Fact" => TTL_DECISION_DAYS,
+        "SlidingWindow" => TTL_SLIDING_WINDOW_DAYS,
+        _ => TTL_FILE_DAYS,
+    }
 }
 
 /// Suggested TTL for a given chunk type (in days).
@@ -706,6 +721,86 @@ mod tests {
         let gone =
             store.get_chunks(&project, &["old-1".into()], CancellationToken::new()).await.unwrap();
         assert!(gone.is_empty(), "the mismatching row drops out of search: {gone:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // purge_expired — Rust-side timestamp comparison (created_at is stored
+    // as `OffsetDateTime::to_string()`, which SQLite datetime() cannot parse)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn purge_expired_removes_only_rows_past_their_chunk_type_ttl() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+
+        seed_source(&store, "fn-old", offset_days_ago(200)).await;
+        seed_source(&store, "fn-fresh", OffsetDateTime::now_utc()).await;
+        seed(&store, "fact-tween", ChunkType::Fact, "s", "fact 200d", offset_days_ago(200)).await;
+        seed(&store, "sw-old", ChunkType::SlidingWindow, "s", "sw 60d", offset_days_ago(60)).await;
+        seed(&store, "struct-old", ChunkType::Struct, "s", "struct 95d", offset_days_ago(95)).await;
+
+        let purged = manager.purge_expired(&project, token.clone()).await.unwrap();
+        assert_eq!(
+            purged, 3,
+            "fn-old(200d>90), sw-old(60d>30) and struct-old(95d>90) expire; \
+             fn-fresh and the 200-day-old Fact (TTL 365) stay"
+        );
+
+        assert_eq!(count(&pool, "Function").await, 1, "fn-fresh survives");
+        assert_eq!(count(&pool, "Fact").await, 1, "fact-tween is inside its 365-day window");
+        assert_eq!(count(&pool, "SlidingWindow").await, 0, "sw-old hard-deleted");
+        assert_eq!(count(&pool, "Struct").await, 0, "struct-old hard-deleted");
+
+        // Reviewed: only rows past their own per-type TTL are removed — the
+        // freshly stored rows and in-window derived rows are intact.
+        let survivors = store
+            .get_chunks(&project, &["fn-fresh".into(), "fact-tween".into()], token)
+            .await
+            .unwrap();
+        assert_eq!(survivors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn purge_expired_skips_rows_with_unparseable_timestamps() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+
+        seed_source(&store, "fn-corrupt", OffsetDateTime::now_utc()).await;
+        seed_source(&store, "fn-expired", offset_days_ago(200)).await;
+        sqlx::query("UPDATE vector_store SET created_at = 'garbage' WHERE id = 'fn-corrupt'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let purged = manager.purge_expired(&project, token.clone()).await.unwrap();
+        assert_eq!(purged, 1, "the expired row is purged, the corrupt one is skipped");
+
+        assert_eq!(count(&pool, "Function").await, 1, "unparseable row survives (fail-open)");
+        let surviving = store.get_chunks(&project, &["fn-corrupt".into()], token).await.unwrap();
+        assert_eq!(surviving.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_expired_applies_the_default_ttl_to_every_chunk_type() {
+        let (pool, store, _manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+        let fts = Arc::new(SqliteFullTextStore::new(pool.clone()).await.unwrap());
+        let manager = TtlManager::with_default_ttl_days(store.clone(), fts, pool.clone(), 10);
+
+        // A 15-day-old Fact normally has a 365-day TTL, but the configured
+        // default (10 days) overrides every chunk type.
+        seed(&store, "fact-old", ChunkType::Fact, "s", "old", offset_days_ago(15)).await;
+        seed(&store, "fact-fresh", ChunkType::Fact, "s", "fresh", OffsetDateTime::now_utc()).await;
+        seed_source(&store, "fn-old", offset_days_ago(15)).await;
+        seed_source(&store, "fn-fresh", OffsetDateTime::now_utc()).await;
+
+        let purged = manager.purge_expired(&project, token.clone()).await.unwrap();
+        assert_eq!(purged, 2, "default TTL applies to both old rows regardless of type");
+        assert_eq!(count(&pool, "Fact").await, 1, "fact-fresh survives");
+        assert_eq!(count(&pool, "Function").await, 1, "fn-fresh survives");
     }
 
     // ---------------------------------------------------------------------
