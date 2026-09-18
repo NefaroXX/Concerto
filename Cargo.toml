@@ -79,7 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ---- HTTP / streaming (Phase 1, providers) ----
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # ---- Token counting (Phase 1, context budget) ----
 tiktoken-rs = "0.6"
