@@ -30,7 +30,8 @@ use crate::entities::{L1Candidate, L1DedupJudge, L1DedupVerdict};
 use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
 use crate::links::{links_from_metadata, LinkStore};
-use crate::rag::HybridRetriever;
+use crate::rag::{HybridRetriever, LinkCascadeConfig, LinkScorer};
+use crate::scoring::chunk_link_score;
 use crate::sync::ChunkSyncService;
 use crate::task_tree::TaskTreeStore;
 use crate::vector_store::VectorStore;
@@ -42,6 +43,48 @@ use crate::vector_store::VectorStore;
 const DEDUP_VECTOR_TOP_K: usize = 5;
 /// How many full-text candidates the L1 dedup judge may compare against.
 const DEDUP_FTS_TOP_K: usize = 5;
+
+/// ADR-69 slice 2 link scorer backed by the real link store.
+///
+/// Scores each chunk id from its INCOMING `memory_links` rows via
+/// [`chunk_link_score`] (kind weights × decay). This is the production
+/// [`LinkScorer`] the memory system's cascade uses; failures surface as
+/// errors so the rag layer's fail-open keeps results unchanged.
+pub struct StoreLinkScorer {
+    link_store: Arc<LinkStore>,
+    /// Decay window in days; `None` disables decay (`Some(0)` also disables).
+    decay_days: Option<u16>,
+}
+
+impl StoreLinkScorer {
+    /// Panics-free constructor; the scorer is inert until the link store
+    /// answers.
+    pub fn new(link_store: Arc<LinkStore>, decay_days: Option<u16>) -> Self {
+        Self { link_store, decay_days }
+    }
+}
+
+#[async_trait]
+impl LinkScorer for StoreLinkScorer {
+    async fn link_scores(
+        &self,
+        chunk_ids: &[String],
+        cancel: CancellationToken,
+    ) -> Result<HashMap<String, f64>, CoreMemoryError> {
+        let incoming = self.link_store.incoming_links(chunk_ids, cancel).await?;
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        Ok(chunk_ids
+            .iter()
+            .map(|id| {
+                let score = incoming
+                    .get(id)
+                    .map(|links| chunk_link_score(links, self.decay_days, now_unix))
+                    .unwrap_or(0.0);
+                (id.clone(), score)
+            })
+            .collect())
+    }
+}
 
 /// Outcome counters for the L1 dedup judge pass (ADR-46 symbolic offload).
 ///
@@ -92,6 +135,11 @@ pub struct MemorySystem {
     /// Fail-open: a link-store error logs a warning and never fails the
     /// memory store; a missing store simply writes no links.
     link_store: Option<Arc<LinkStore>>,
+    /// Optional ADR-69 slice 2 link cascade. When BOTH this and `link_store`
+    /// are set, `retrieve` re-ranks the fused top-k by link evidence through
+    /// [`StoreLinkScorer`]; when either is missing, `retrieve` keeps the
+    /// plain RRF path (unchanged).
+    link_cascade: Option<LinkCascadeConfig>,
 }
 
 impl MemorySystem {
@@ -120,6 +168,7 @@ impl MemorySystem {
             dedup_judge: None,
             dedup_counters: DedupJudgeCounters::default(),
             link_store: None,
+            link_cascade: None,
         }
     }
     /// Access the decision store.
@@ -183,6 +232,20 @@ impl MemorySystem {
     /// the memory is kept unchanged.
     pub fn with_link_store(mut self, link_store: Arc<LinkStore>) -> Self {
         self.link_store = Some(link_store);
+        self
+    }
+
+    /// Enable the ADR-69 slice 2 link cascade for [`MemoryStore::retrieve`].
+    ///
+    /// This is how `retrieve` consumes link evidence: the fused top-k is
+    /// re-ranked by `rank + γ·(10 − score)`, where the score comes from
+    /// [`StoreLinkScorer`] over the configured link store and the tier γ
+    /// comes from this config. Both this and [`Self::with_link_store`] must
+    /// be set for the cascade to engage — otherwise `retrieve` is the plain
+    /// RRF path, unchanged. Fail-open: link-store errors, scoring errors, or
+    /// scoring timeouts leave the fused order untouched.
+    pub fn with_link_cascade(mut self, config: LinkCascadeConfig) -> Self {
+        self.link_cascade = Some(config);
         self
     }
 
@@ -422,7 +485,22 @@ impl MemoryStore for MemorySystem {
             Vec::new()
         };
         let results =
-            self.retriever.retrieve(query, &embedding, Some(query.top_k), cancel.clone()).await;
+            if let (Some(link_store), Some(config)) = (&self.link_store, &self.link_cascade) {
+                let scorer = StoreLinkScorer::new(link_store.clone(), config.decay_days);
+                self.retriever
+                    .retrieve_with_cascade(
+                        query,
+                        &embedding,
+                        Some(query.top_k),
+                        config.start_tier,
+                        &scorer,
+                        config,
+                        cancel.clone(),
+                    )
+                    .await
+            } else {
+                self.retriever.retrieve(query, &embedding, Some(query.top_k), cancel.clone()).await
+            };
 
         let ids: Vec<String> = results.iter().map(|result| result.chunk_id.clone()).collect();
         let metadata = self.retriever.load_chunks(&query.project_id, &ids, cancel.clone()).await?;
@@ -1442,5 +1520,99 @@ mod tests {
         assert_eq!(records.len(), 1, "the chunk must still be written");
         assert_eq!(records[0].content, "the user's favorite city is paris");
         assert_eq!(counter_snapshot(&system), (0, 0, 1, 0, 0), "update is still counted");
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-69 slice 2 — link cascade routing (with_link_cascade)
+    // ---------------------------------------------------------------------
+
+    /// Two seeded chunks (`a_plain`, `b_linked`) in in-memory stores; the
+    /// vector store orders by chunk_id so the plain fused order is
+    /// `[a_plain, b_linked]`. Evidence INTO `b_linked` must promote it ahead.
+    async fn cascade_routing_system(enable_cascade: bool) -> (MemorySystem, Arc<LinkStore>) {
+        use concerto_core::memory::MemoryLink;
+
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(&project_id, "a_plain", "plain memory", vector_store.clone(), fts_store.clone())
+            .await;
+        dedup_seed(
+            &project_id,
+            "b_linked",
+            "linked memory",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let link_store = in_memory_link_store().await;
+        // Two positive-support links INTO `b_linked`. ADR-69 re-rank is
+        // deliberately conservative: with γ = 0.2 over a one-rank gap, a
+        // chunk needs score > 5.0 to promote (key_b < key_a ⟺
+        // 1 + 0.2·(10−score_b) < 2.0 ⟺ score_b > 5.0). Two weighted
+        // Supports links reach score 6.25; a single one (4.375) would not.
+        for source in ["evidence-a", "evidence-b"] {
+            link_store
+                .put(
+                    &MemoryLink {
+                        from: source.into(),
+                        to: "b_linked".into(),
+                        kind: MemoryLinkKind::Supports,
+                        weight: 1.0,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let system =
+            dedup_system(vector_store, fts_store, None).with_link_store(link_store.clone());
+        let system = if enable_cascade {
+            system.with_link_cascade(LinkCascadeConfig {
+                decay_days: Some(90),
+                start_tier: crate::rag::CascadeTier::Emergency,
+                score_timeout: std::time::Duration::from_millis(250),
+            })
+        } else {
+            system
+        };
+        (system, link_store)
+    }
+
+    #[tokio::test]
+    async fn retrieve_reorders_linked_chunk_when_cascade_configured() {
+        let (system, _link_store) = cascade_routing_system(true).await;
+        let mut query = make_query("anything");
+        query.top_k = 2;
+
+        let results = system.retrieve(&query, CancellationToken::new()).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].id, "b_linked",
+            "link evidence must promote the linked chunk above the plain one"
+        );
+        assert_eq!(results[1].id, "a_plain");
+    }
+
+    #[tokio::test]
+    async fn retrieve_keeps_rrf_order_with_links_but_no_cascade() {
+        let (system, link_store) = cascade_routing_system(false).await;
+        // Sanity: the evidence really exists — only the routing was off.
+        assert_eq!(
+            link_store.links_to("b_linked", CancellationToken::new()).await.unwrap().len(),
+            2
+        );
+        let mut query = make_query("anything");
+        query.top_k = 2;
+
+        let results = system.retrieve(&query, CancellationToken::new()).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].id, "a_plain",
+            "without the cascade, links must not change RRF order"
+        );
+        assert_eq!(results[1].id, "b_linked");
     }
 }

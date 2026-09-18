@@ -494,6 +494,18 @@ pub struct MemoryConfig {
     /// failures store the entry unchanged, never drop it.
     #[serde(default = "default_true")]
     pub dedup_judge: bool,
+    /// ADR-69 A2 per-chunk out-degree cap: a memory chunk may point at at
+    /// most this many other chunks before NEW `memory_links` rows are
+    /// rejected (advisory — a warning, never a failure). `None` uses the
+    /// link store's built-in default (32). `0` is rejected at validation:
+    /// a zero cap would disable link writing entirely.
+    #[serde(default)]
+    pub max_out_degree: Option<usize>,
+    /// ADR-69 slice 2 link-evidence decay window in days. `None` uses the
+    /// 90-day ADR A5 floor; `Some(0)` disables decay (evidence never cools).
+    /// Values above 365 are rejected at validation.
+    #[serde(default)]
+    pub cascade_decay_days: Option<u16>,
 }
 
 fn default_memory_enabled() -> bool {
@@ -522,6 +534,8 @@ impl Default for MemoryConfig {
             summary_keep_per_session: default_summary_keep_per_session(),
             summary_retention_days: default_summary_retention_days(),
             dedup_judge: true,
+            max_out_degree: None,
+            cascade_decay_days: None,
         }
     }
 }
@@ -536,6 +550,17 @@ impl MemoryConfig {
         if self.summary_retention_days > 365 {
             return Err(ConfigError::InvalidValue(
                 "memory.summary_retention_days must be 0 (disabled) or between 1 and 365".into(),
+            ));
+        }
+        if self.max_out_degree == Some(0) {
+            return Err(ConfigError::InvalidValue(
+                "memory.max_out_degree must be 0-free: 0 would disable link writing entirely"
+                    .into(),
+            ));
+        }
+        if self.cascade_decay_days.is_some_and(|days| days > 365) {
+            return Err(ConfigError::InvalidValue(
+                "memory.cascade_decay_days must be 0 (disabled) or between 1 and 365".into(),
             ));
         }
         Ok(())
@@ -2585,6 +2610,50 @@ mod tests {
 
         let cfg = MemoryConfig { ttl_days: 366, ..Default::default() };
         assert!(cfg.validate().is_err());
+    }
+
+    /// ADR-69 slice 2 defaults: both cascade knobs are `None` by default, which
+    /// at runtime means "link store default cap" and "90-day decay floor".
+    #[test]
+    fn memory_config_slice2_defaults_are_none() {
+        let cfg = MemoryConfig::default();
+        assert_eq!(cfg.max_out_degree, None);
+        assert_eq!(cfg.cascade_decay_days, None);
+    }
+
+    #[test]
+    fn memory_config_validate_accepts_slice2_boundaries() {
+        let cfg = MemoryConfig {
+            max_out_degree: Some(1),
+            cascade_decay_days: Some(0),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "cap 1 and decay-disabled (0) are valid");
+
+        let cfg = MemoryConfig { cascade_decay_days: Some(365), ..Default::default() };
+        assert!(cfg.validate().is_ok(), "decay window at the 365-day ceiling is valid");
+    }
+
+    #[test]
+    fn memory_config_validate_rejects_slice2_out_of_range() {
+        let cfg = MemoryConfig { max_out_degree: Some(0), ..Default::default() };
+        assert!(cfg.validate().is_err(), "a zero cap would disable link writing");
+
+        let cfg = MemoryConfig { cascade_decay_days: Some(366), ..Default::default() };
+        assert!(cfg.validate().is_err(), "decay window above 365 days is invalid");
+    }
+
+    #[test]
+    fn memory_config_parses_slice2_fields_from_toml() {
+        let parsed: MemoryConfig =
+            toml::from_str("max_out_degree = 16\ncascade_decay_days = 45").expect("must parse");
+        assert_eq!(parsed.max_out_degree, Some(16));
+        assert_eq!(parsed.cascade_decay_days, Some(45));
+
+        // Absent keys default to None (serde(default)).
+        let parsed: MemoryConfig = toml::from_str("").expect("must parse");
+        assert_eq!(parsed.max_out_degree, None);
+        assert_eq!(parsed.cascade_decay_days, None);
     }
 
     // ------------------------------------------------------------------

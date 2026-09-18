@@ -197,9 +197,9 @@ pub struct EmbeddingRecord {
 ///
 /// Slice 1 emits `Supersedes` and `Merges` from the L1 dedup judge's
 /// update/merge verdicts, and `References` for the `refs` / `result_ref`
-/// metadata carried on those paths. The ADR's broader vocabulary
-/// (`supports`, `contradicts`, `extends`) arrives with the slice-2 scoring
-/// work; `#[non_exhaustive]` keeps every downstream match explicit.
+/// metadata carried on those paths. Slice 2 adds the evidence vocabulary
+/// (`supports`, `contradicts`, `extends`) consumed by the cascade scorer.
+/// The enum is `#[non_exhaustive]` so every downstream match stays explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MemoryLinkKind {
@@ -209,6 +209,13 @@ pub enum MemoryLinkKind {
     Merges,
     /// The source references the target for context.
     References,
+    /// The source independently supports / corroborates the target
+    /// (ADR-69 slice 2 evidence).
+    Supports,
+    /// The source contradicts the target (ADR-69 slice 2 evidence).
+    Contradicts,
+    /// The source elaborates / extends the target (ADR-69 slice 2 evidence).
+    Extends,
 }
 
 impl MemoryLinkKind {
@@ -219,19 +226,25 @@ impl MemoryLinkKind {
             Self::Supersedes => "supersedes",
             Self::Merges => "merges",
             Self::References => "references",
+            Self::Supports => "supports",
+            Self::Contradicts => "contradicts",
+            Self::Extends => "extends",
         }
     }
 
     /// Parse a stored `link_type` string back into a link kind.
     ///
     /// Returns `None` for anything unrecognized (for example a future
-    /// slice-2 vocabulary read by an older binary) so callers fail open by
+    /// vocabulary read by an older binary) so callers fail open by
     /// skipping the link instead of failing the read.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "supersedes" => Some(Self::Supersedes),
             "merges" => Some(Self::Merges),
             "references" => Some(Self::References),
+            "supports" => Some(Self::Supports),
+            "contradicts" => Some(Self::Contradicts),
+            "extends" => Some(Self::Extends),
             _ => None,
         }
     }
@@ -452,11 +465,13 @@ mod tests {
             (MemoryLinkKind::Supersedes, "supersedes"),
             (MemoryLinkKind::Merges, "merges"),
             (MemoryLinkKind::References, "references"),
+            (MemoryLinkKind::Supports, "supports"),
+            (MemoryLinkKind::Contradicts, "contradicts"),
+            (MemoryLinkKind::Extends, "extends"),
         ] {
             assert_eq!(kind.as_str(), expected);
             assert_eq!(MemoryLinkKind::parse(kind.as_str()), Some(kind));
         }
-        assert_eq!(MemoryLinkKind::parse("supports"), None, "slice-2 kinds are not known yet");
         assert_eq!(MemoryLinkKind::parse(""), None);
         assert_eq!(MemoryLinkKind::parse("SUPERSEDES"), None, "kinds are lowercase");
     }

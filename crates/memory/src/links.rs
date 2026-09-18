@@ -1,21 +1,24 @@
-//! Symbolic link store (ADR-69 slice 1).
+//! Symbolic link store (ADR-69 slices 1–2).
 //!
 //! A pool-backed SQLite store for directed, typed edges between memory
 //! chunks — the `memory_links` table created by migration 002, sharing the
-//! project's SQLite pool with the vector store. Slice 1 only *writes* links
-//! (idempotently, fail-open); scoring, decay, and TTL belong to slice 2.
+//! project's SQLite pool with the vector store. Slice 1 writes links
+//! (idempotently, fail-open); slice 2 adds the out-degree cap on writes
+//! (ADR-69 A2) and the batched, timestamped in-degree read that the cascade
+//! scorer and orphan prune consume.
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::{MemoryLink, MemoryLinkKind};
 use concerto_core::CancellationToken;
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
-/// Default per-chunk out-degree cap (ADR-69 A2).
-///
-/// Slice 2 enforces this cap (and makes it configurable) — slice 1 only
-/// exposes the constant so the enforcement point has one obvious home and a
-/// cap is never skipped for lack of a number. Not enforced here.
+use crate::scoring::TimedLink;
+
+/// Default per-chunk out-degree cap (ADR-69 A2), applied by [`LinkStore::put`]
+/// when no explicit cap is configured: a chunk may point at at most this many
+/// other chunks before further NEW links are rejected with a warning.
 pub const DEFAULT_MAX_OUT_DEGREE: usize = 32;
 
 /// Mirrors migration 002 so a pool created directly (without the migration
@@ -32,9 +35,11 @@ CREATE TABLE IF NOT EXISTS memory_links (
 )
 "#;
 
-/// Pool-backed store for `memory_links` rows (ADR-69 slice 1).
+/// Pool-backed store for `memory_links` rows (ADR-69 slices 1–2).
 pub struct LinkStore {
     pool: SqlitePool,
+    /// New-link rejection threshold per source (ADR-69 A2). Always ≥ 1.
+    max_out_degree: usize,
 }
 
 impl LinkStore {
@@ -50,7 +55,17 @@ impl LinkStore {
         .execute(&pool)
         .await
         .map_err(|e| MemoryError::Persistence(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE })
+    }
+
+    /// Bound how many distinct NEW links a source may hold (ADR-69 A2).
+    ///
+    /// Re-writing an already-present `(source, target, type)` triple stays
+    /// allowed (idempotent update). The cap is floored at 1 — a zero cap would
+    /// make the store unusable rather than "no links".
+    pub fn with_max_out_degree(mut self, cap: usize) -> Self {
+        self.max_out_degree = cap.max(1);
+        self
     }
 
     /// Persist one link.
@@ -58,6 +73,11 @@ impl LinkStore {
     /// Idempotent (ADR-69 A1): re-writing the same `(source, target, type)`
     /// row upserts its weight instead of duplicating it. The first write's
     /// `created_at` is kept.
+    ///
+    /// Out-degree cap (ADR-69 A2): a NEW row is rejected with a warning once
+    /// the source already holds [`LinkStore::max_out_degree`] links. The
+    /// rejection is fail-open — `Ok(())`, nothing persisted — so callers
+    /// treat it as advisory, never as an error that could drop a memory.
     pub async fn put(
         &self,
         link: &MemoryLink,
@@ -66,6 +86,32 @@ impl LinkStore {
         if cancel.is_cancelled() {
             return Err(MemoryError::Cancelled);
         }
+        // Re-writing an already-present triple is an idempotent update and is
+        // always allowed — the cap only gates genuinely new edges.
+        let already_present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_links \
+             WHERE source_id = ? AND target_id = ? AND link_type = ?",
+        )
+        .bind(&link.from)
+        .bind(&link.to)
+        .bind(link.kind.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+
+        if already_present == 0
+            && self.out_degree(&link.from, cancel.clone()).await? >= self.max_out_degree
+        {
+            tracing::warn!(
+                source_id = %link.from,
+                target_id = %link.to,
+                link_type = link.kind.as_str(),
+                cap = self.max_out_degree,
+                "ADR-69 out-degree cap reached; link rejected (fail-open)"
+            );
+            return Ok(());
+        }
+
         let created_at = OffsetDateTime::now_utc().to_string();
         sqlx::query(
             r#"
@@ -141,6 +187,72 @@ impl LinkStore {
         .await
         .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
         rows.iter().map(row_to_link).collect()
+    }
+
+    /// In-degree for MANY chunk ids at once, with each link's creation moment
+    /// decoded to Unix seconds — the batched read the cascade scorer
+    /// ([`crate::rag::retrieve_with_cascade`]) and the orphan prune
+    /// ([`crate::ttl::prune_orphaned_derived`]) consume.
+    ///
+    /// One batched query per window of ids (bounded well under SQLite's bind
+    /// limit) instead of one query per id. Unknown link types and unparseable
+    /// `created_at` strings are skipped — never an error — matching the
+    /// fail-open read contract established by [`row_to_link`].
+    ///
+    /// Returns a map keyed by target chunk id; absent ids simply have no
+    /// entry.
+    pub async fn incoming_links(
+        &self,
+        chunk_ids: &[String],
+        cancel: CancellationToken,
+    ) -> Result<HashMap<String, Vec<TimedLink>>, MemoryError> {
+        if cancel.is_cancelled() {
+            return Err(MemoryError::Cancelled);
+        }
+        let mut by_target: HashMap<String, Vec<TimedLink>> = HashMap::new();
+        if chunk_ids.is_empty() {
+            return Ok(by_target);
+        }
+
+        // SQLite's default bind-parameter limit is 999; stay well under it so
+        // any caller-supplied batch size is safe.
+        const BATCH: usize = 200;
+        for window in chunk_ids.chunks(BATCH) {
+            let placeholders = vec!["?"; window.len()].join(", ");
+            let sql = format!(
+                "SELECT source_id, target_id, link_type, weight, created_at \
+                 FROM memory_links WHERE target_id IN ({placeholders}) \
+                 ORDER BY created_at ASC, rowid ASC"
+            );
+            // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is built from static
+            // fragments and a fixed `?` placeholder list; every filter value is
+            // bound below, so no user input reaches the statement text.
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for id in window {
+                query = query.bind(id.as_str());
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+            for row in &rows {
+                let kind_str: String = row.get("link_type");
+                let Some(kind) = MemoryLinkKind::parse(&kind_str) else {
+                    continue;
+                };
+                let link = MemoryLink {
+                    from: row.get("source_id"),
+                    to: row.get("target_id"),
+                    kind,
+                    weight: row.get("weight"),
+                };
+                let created_at: String = row.get("created_at");
+                if let Some(timed) = TimedLink::from_db(link, &created_at) {
+                    by_target.entry(timed.link.to.clone()).or_default().push(timed);
+                }
+            }
+        }
+        Ok(by_target)
     }
 
     /// Number of links leaving `chunk_id` — the measure slice 2's degree cap
@@ -302,5 +414,138 @@ mod tests {
         cancel.cancel();
         let link = MemoryLink::new("src-1", "tgt-1", MemoryLinkKind::References);
         assert!(matches!(store.put(&link, cancel).await, Err(MemoryError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn put_enforces_default_out_degree_cap_of_32() {
+        let store = test_store().await;
+        let cancel = CancellationToken::new();
+        // The 32nd edge fits; the 33rd is rejected fail-open with Ok(()).
+        for i in 0..DEFAULT_MAX_OUT_DEGREE {
+            store
+                .put(
+                    &MemoryLink::new("src-1", format!("tgt-{i}"), MemoryLinkKind::References),
+                    cancel.clone(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.out_degree("src-1", cancel.clone()).await.unwrap(),
+            DEFAULT_MAX_OUT_DEGREE
+        );
+        store
+            .put(&MemoryLink::new("src-1", "overflow", MemoryLinkKind::References), cancel.clone())
+            .await
+            .expect("cap rejection must be fail-open, not an error");
+        assert_eq!(
+            store.out_degree("src-1", cancel.clone()).await.unwrap(),
+            DEFAULT_MAX_OUT_DEGREE,
+            "the reject edge must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_respects_configured_cap_and_allows_idempotent_update_at_cap() {
+        let store = test_store().await.with_max_out_degree(2);
+        let cancel = CancellationToken::new();
+        store
+            .put(&MemoryLink::new("src-1", "a", MemoryLinkKind::References), cancel.clone())
+            .await
+            .unwrap();
+        store
+            .put(&MemoryLink::new("src-1", "b", MemoryLinkKind::References), cancel.clone())
+            .await
+            .unwrap();
+        store
+            .put(&MemoryLink::new("src-1", "c", MemoryLinkKind::References), cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.out_degree("src-1", cancel.clone()).await.unwrap(),
+            2,
+            "cap of 2 must hold"
+        );
+
+        // Re-writing an existing triple is an idempotent update, allowed even
+        // at the cap (weight update must land).
+        let mut updated = MemoryLink::new("src-1", "a", MemoryLinkKind::References);
+        updated.weight = 0.25;
+        store.put(&updated, cancel.clone()).await.unwrap();
+        let links = store.links_from("src-1", cancel.clone()).await.unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| link.weight == 0.25));
+    }
+
+    #[tokio::test]
+    async fn incoming_links_batches_timestamps_by_target() {
+        let store = test_store().await;
+        let cancel = CancellationToken::new();
+        store
+            .put(&MemoryLink::new("src-1", "tgt-a", MemoryLinkKind::Supports), cancel.clone())
+            .await
+            .unwrap();
+        store
+            .put(&MemoryLink::new("src-2", "tgt-a", MemoryLinkKind::References), cancel.clone())
+            .await
+            .unwrap();
+        store
+            .put(&MemoryLink::new("src-3", "tgt-b", MemoryLinkKind::Contradicts), cancel.clone())
+            .await
+            .unwrap();
+
+        let by_target = store
+            .incoming_links(&["tgt-a".into(), "tgt-b".into(), "unknown".into()], cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(by_target.len(), 2, "absent ids produce no entry");
+        assert_eq!(by_target["tgt-a"].len(), 2, "both incoming edges must be decoded");
+        assert_eq!(by_target["tgt-b"].len(), 1);
+        // Timestamps are future-stable decoded Unix seconds.
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        assert!(by_target["tgt-a"].iter().all(|timed| timed.created_unix <= now + 5));
+        assert_eq!(by_target["tgt-b"][0].link.kind, MemoryLinkKind::Contradicts);
+    }
+
+    #[tokio::test]
+    async fn incoming_links_skips_unknown_kinds_and_bad_timestamps() {
+        let store = test_store().await;
+        // Craft rows the normal write path never makes: an unknown link_type
+        // and a corrupt created_at. They are skipped, never an error.
+        sqlx::query(
+            "INSERT INTO memory_links (source_id, target_id, link_type, weight, created_at) \
+             VALUES ('src-x', 'tgt-a', 'future_kind', 1.0, ?)",
+        )
+        .bind(OffsetDateTime::now_utc().to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_links (source_id, target_id, link_type, weight, created_at) \
+             VALUES ('src-y', 'tgt-a', 'references', 1.0, 'not-a-timestamp')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let by_target =
+            store.incoming_links(&["tgt-a".into()], CancellationToken::new()).await.unwrap();
+        assert!(
+            by_target.is_empty(),
+            "both malformed rows are skipped so no target entry is created"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_links_empty_and_cancelled_are_cheap_and_checked() {
+        let store = test_store().await;
+        assert!(store.incoming_links(&[], CancellationToken::new()).await.unwrap().is_empty());
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            store.incoming_links(&["a".into()], cancel).await,
+            Err(MemoryError::Cancelled)
+        ));
     }
 }

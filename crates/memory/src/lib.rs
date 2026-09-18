@@ -341,6 +341,7 @@ pub mod indexer;
 pub mod links;
 pub mod prefs;
 pub mod rag;
+pub mod scoring;
 pub mod short_term;
 pub mod storage;
 pub mod summarizer;

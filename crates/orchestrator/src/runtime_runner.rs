@@ -453,6 +453,8 @@ use concerto_memory::entities::L1DedupJudge;
 use concerto_memory::fts::SqliteFullTextStore;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
 use concerto_memory::links::LinkStore;
+use concerto_memory::rag::{CascadeTier, LinkCascadeConfig};
+use concerto_memory::scoring::DECAY_FLOOR_DAYS;
 use concerto_memory::storage::MemoryDb;
 use concerto_memory::sync::ChunkSyncService;
 use concerto_memory::vector_store::SqliteVectorStore;
@@ -1341,9 +1343,22 @@ pub async fn init_memory_system_with_handles(
     // rows live in the same database as the chunks they reference. Fail-open:
     // an unopenable store leaves links off and memory behaves exactly as
     // before (plain writes).
-    let link_store = build_link_store(&pool).await;
+    let link_store = build_link_store(&pool, config.memory.max_out_degree).await;
     let system = match &link_store {
         Some(store) => system.with_link_store(store.clone()),
+        None => system,
+    };
+    // ADR-69 slice 2 link cascade: when the link store attached, consume
+    // link evidence at retrieval time. `cascade_decay_days` unset → the
+    // 90-day ADR A5 floor; Some(0) disables decay entirely. The cascade is
+    // fail-open (scoring errors/timeouts keep the plain RRF order), so it
+    // can never degrade a query.
+    let system = match &link_store {
+        Some(_) => system.with_link_cascade(LinkCascadeConfig {
+            decay_days: config.memory.cascade_decay_days.or(Some(DECAY_FLOOR_DAYS as u16)),
+            start_tier: CascadeTier::Mild,
+            score_timeout: std::time::Duration::from_millis(250),
+        }),
         None => system,
     };
     let system = Arc::new(system);
@@ -1467,9 +1482,18 @@ fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Optio
 /// as the chunks they reference. Slice 1 is write-only and advisory: a pool
 /// or schema problem logs a warning and yields `None`, leaving memory stores
 /// byte-identical to the pre-link behavior (no links are ever written).
-async fn build_link_store(pool: &sqlx::SqlitePool) -> Option<Arc<LinkStore>> {
+///
+/// `max_out_degree` applies the configured ADR-69 A2 per-chunk cap; `None`
+/// keeps the link store's built-in default.
+async fn build_link_store(
+    pool: &sqlx::SqlitePool,
+    max_out_degree: Option<usize>,
+) -> Option<Arc<LinkStore>> {
     match LinkStore::new(pool.clone()).await {
-        Ok(store) => Some(Arc::new(store)),
+        Ok(store) => match max_out_degree {
+            Some(cap) => Some(Arc::new(store.with_max_out_degree(cap))),
+            None => Some(Arc::new(store)),
+        },
         Err(error) => {
             tracing::warn!(%error, "memory link store not attached; ADR-69 links disabled");
             None
@@ -9041,7 +9065,7 @@ mod runtime_runner_tests {
         //    init path calls round-trips from the database the vector store
         //    indexes into.
         let link_store =
-            build_link_store(&pool).await.expect("production link-store helper must attach");
+            build_link_store(&pool, None).await.expect("production link-store helper must attach");
         let link = MemoryLink::new("src-init", "tgt-init", MemoryLinkKind::References);
         link_store
             .put(&link, CancellationToken::new())
