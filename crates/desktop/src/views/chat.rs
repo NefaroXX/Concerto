@@ -254,6 +254,31 @@ impl std::fmt::Display for ToolCallStatus {
     }
 }
 
+/// Provenance rail caption for a tool call (Blueprint texture `‖ ok`).
+/// Read-only derivation from the stored status + tool name — it never
+/// touches the policy engine, executor, or `VirtualFs`. Rendered as a tiny
+/// `text_muted` caption under the tool row; palette colors only.
+fn provenance_rail(status: &ToolCallStatus, tool_name: &str) -> String {
+    let policy = match status {
+        ToolCallStatus::Denied => "policy denied",
+        ToolCallStatus::Running | ToolCallStatus::Cancelled => "approval needed",
+        ToolCallStatus::Completed | ToolCallStatus::Allowed | ToolCallStatus::Failed => "policy ok",
+    };
+    let reversibility = if is_mutating_tool(tool_name) { "fs reversible" } else { "read-only" };
+    format!("‖ {policy} · {reversibility}")
+}
+
+/// Whether a tool stages mutations through the reversible `VirtualFs`
+/// overlay (file writes / shell / git roll back via stash/branch).
+/// Name-based heuristic, deliberately conservative: unknown tools read as
+/// read-only rather than promising reversibility.
+fn is_mutating_tool(tool_name: &str) -> bool {
+    let name = tool_name.to_ascii_lowercase();
+    ["write", "edit", "apply", "shell", "exec", "bash", "sh", "git", "mkdir", "patch", "commit"]
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
 pub struct State {
     entries: Vec<ChatEntry>,
     input: String,
@@ -1385,7 +1410,7 @@ impl State {
                 } else {
                     format!("[Tool] {} — {}", tool_name, detail)
                 };
-                button(
+                let tool_button: Element<'_, Message> = button(
                     container(
                         row![
                             text(icon).size(13).color(clr),
@@ -1409,7 +1434,11 @@ impl State {
                     background: None,
                     ..button::Style::default()
                 })
-                .into()
+                .into();
+                // Provenance rail (Blueprint `‖ ok`): tiny policy +
+                // reversibility caption under the tool row, palette only.
+                let rail = provenance_rail(status, tool_name);
+                column![tool_button, text(rail).size(11).color(muted),].spacing(2).into()
             }
             ChatEntry::Completion { id, summary, .. } => self.completion_card(
                 summary,
@@ -1912,8 +1941,10 @@ fn strip_agent_prefix(content: &str) -> &str {
 }
 
 /// Digest for a thinking bucket: the first line of the latest `Headline`
-/// entry when one exists, else the legacy movement-verb heuristic over the
-/// latest entry.
+/// entry when one exists, else the latest `Detail` line. `LowLevel` entries
+/// never feed the digest (they render only in the AgentGraph logs, and the
+/// expanded accordion skips them too); a bucket with neither falls back to
+/// the generic label.
 fn thinking_headline_from_entries(entries: &[ChatEntry], indices: &[usize]) -> String {
     let headline_content = indices
         .iter()
@@ -1931,7 +1962,9 @@ fn thinking_headline_from_entries(entries: &[ChatEntry], indices: &[usize]) -> S
                 .iter()
                 .rev()
                 .filter_map(|&idx| match &entries[idx] {
-                    ChatEntry::Thinking { content, .. } => Some(content.as_str()),
+                    ChatEntry::Thinking { content, kind: ThinkingKind::Detail, .. } => {
+                        Some(content.as_str())
+                    }
                     _ => None,
                 })
                 .next()
@@ -2276,6 +2309,10 @@ fn crosses_paragraph_boundary(content: &str, from: usize, to: usize) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Composer placeholder (V3 quick win): advertises the `/thinking`
+/// accordion toggle with zero behavior change.
+const COMPOSER_PLACEHOLDER: &str = "Type a message... (/thinking toggles thinking)";
+
 fn input_bar<'a>(
     input: &'a str,
     palette: &'a crate::theme::Palette,
@@ -2287,7 +2324,7 @@ fn input_bar<'a>(
     has_agent_assignments: bool,
     has_entries: bool,
 ) -> Element<'a, Message> {
-    let txt = text_input("Type a message...", input)
+    let txt = text_input(COMPOSER_PLACEHOLDER, input)
         .on_input(Message::InputChanged)
         .on_submit(Message::SubmitInput)
         .width(Length::Fill)
@@ -3125,6 +3162,59 @@ mod tests {
     }
 
     #[test]
+    fn headline_digest_falls_back_to_detail_and_skips_low_level() {
+        let entries = vec![
+            ChatEntry::Thinking {
+                id: 1,
+                agent: "coder".into(),
+                content: "older detail".into(),
+                kind: ThinkingKind::Detail,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+            ChatEntry::Thinking {
+                id: 2,
+                agent: "coder".into(),
+                content: "latest detail".into(),
+                kind: ThinkingKind::Detail,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+            ChatEntry::Thinking {
+                id: 3,
+                agent: "coder".into(),
+                content: "[system_instructions]".into(),
+                kind: ThinkingKind::LowLevel,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+        ];
+        assert_eq!(thinking_headline_from_entries(&entries, &[0, 1, 2]), "latest detail");
+    }
+
+    #[test]
+    fn headline_digest_low_level_only_stays_generic() {
+        let entries = vec![ChatEntry::Thinking {
+            id: 1,
+            agent: "coder".into(),
+            content: "[system_instructions]".into(),
+            kind: ThinkingKind::LowLevel,
+            collapsed: false,
+            created_at: None,
+            finished_at: None,
+        }];
+        assert_eq!(thinking_headline_from_entries(&entries, &[0]), "Thinking…");
+    }
+
+    #[test]
+    fn composer_placeholder_advertises_thinking_toggle() {
+        assert!(COMPOSER_PLACEHOLDER.contains("/thinking"));
+    }
+
+    #[test]
     fn headline_digest_prefers_latest_headline_entry() {
         let entries = vec![
             ChatEntry::Thinking {
@@ -3286,5 +3376,32 @@ mod tests {
         state.finalize_run();
         assert_eq!(state.handoff_hold, None);
         assert_eq!(state.revealed_chars, None);
+    }
+
+    #[test]
+    fn provenance_rail_derives_policy_and_reversibility() {
+        // Policy decision follows the stored status; mutating tools promise
+        // fs reversibility, unknown tools stay read-only (conservative).
+        assert_eq!(
+            provenance_rail(&ToolCallStatus::Completed, "fs_write"),
+            "‖ policy ok · fs reversible"
+        );
+        assert_eq!(
+            provenance_rail(&ToolCallStatus::Denied, "shell_exec"),
+            "‖ policy denied · fs reversible"
+        );
+        assert_eq!(
+            provenance_rail(&ToolCallStatus::Running, "search"),
+            "‖ approval needed · read-only"
+        );
+        assert_eq!(
+            provenance_rail(&ToolCallStatus::Cancelled, "mcp:server:read"),
+            "‖ approval needed · read-only"
+        );
+        // Failed execution still passed the policy gate.
+        assert_eq!(
+            provenance_rail(&ToolCallStatus::Failed, "git_commit"),
+            "‖ policy ok · fs reversible"
+        );
     }
 }

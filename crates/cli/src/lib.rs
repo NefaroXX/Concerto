@@ -6,6 +6,7 @@ pub mod app;
 pub mod approval;
 pub mod health;
 pub mod plugin_approval;
+pub mod theme;
 pub mod ui;
 pub mod update;
 
@@ -36,7 +37,32 @@ fn run_cli_inner(
     reduced_motion: Option<bool>,
     remaining: &[String],
 ) -> anyhow::Result<()> {
-    let (remaining, explicit_project) = invocation_args(remaining)?;
+    // `--no-terminal-title` is a display opt-out handled here (not in
+    // `parse_cli_args`) so `run_cli`'s signature stays stable: strip it from
+    // the raw args before subcommand dispatch. There is no `--terminal-title`
+    // opt-in; absence follows `CONCERTO_NO_TITLE` env, then config. `--theme`
+    // follows the same path (flag > `CONCERTO_THEME` env > `[display] theme`).
+    let mut no_terminal_title: Option<bool> = None;
+    let mut explicit_theme: Option<String> = None;
+    let mut filtered: Vec<String> = Vec::with_capacity(remaining.len());
+    let mut index = 0;
+    while index < remaining.len() {
+        let arg = remaining[index].as_str();
+        if arg == "--no-terminal-title" {
+            no_terminal_title = Some(true);
+        } else if arg == "--theme" {
+            index += 1;
+            if let Some(value) = remaining.get(index) {
+                explicit_theme = Some(value.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix("--theme=") {
+            explicit_theme = Some(value.to_string());
+        } else {
+            filtered.push(remaining[index].clone());
+        }
+        index += 1;
+    }
+    let (remaining, explicit_project) = invocation_args(&filtered)?;
     if remaining.first().map(String::as_str) == Some("logs") {
         return run_logs_subcommand(&remaining[1..]);
     }
@@ -168,6 +194,8 @@ fn run_cli_inner(
         multi_agent: multi_agent.then_some(true),
         fast: fast.then_some(true),
         reduced_motion,
+        no_terminal_title,
+        theme: explicit_theme,
     };
     let session_manager = std::sync::Arc::new(
         rt.block_on(
@@ -1085,6 +1113,12 @@ pub fn parse_cli_args<'a>(
                 eprintln!("  --reconfigure, -r   Re-run the setup wizard");
                 eprintln!("  --reduced-motion    Disable motion cues (first-token bold, handoff hold, wipe rule);");
                 eprintln!("                      flag beats CONCERTO_REDUCED_MOTION env, which beats config file");
+                eprintln!(
+                    "  --no-terminal-title Disable OSC terminal-title broadcasts (run stage);"
+                );
+                eprintln!("                      flag beats CONCERTO_NO_TITLE env, which beats config file");
+                eprintln!("  --theme NAME      CLI palette (Midnight/Slate/Chalk/Nebula);");
+                eprintln!("                      flag beats CONCERTO_THEME env, which beats [display] theme");
                 eprintln!("  --project, -p DIR   Select the project used by chat and commands");
                 eprintln!("  --help, -h          Print this help");
                 eprintln!("  subcommands: config, providers, sessions, projects, plugin, extensions, health, logs");

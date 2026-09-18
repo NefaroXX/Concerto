@@ -1,6 +1,6 @@
 # Outstanding Work — Score Accordion V2 + Signature Text Motion
 
-> Reference doc (not an ADR). Date: 2026-09-16. Branch: `feat/score-accordion-thinking`, base `ad4b400`.
+> Reference doc (not an ADR). Date: 2026-09-18. Branch: `feat/score-accordion-thinking`, base `4654109` (+ unstaged batch).
 
 ---
 
@@ -14,6 +14,10 @@
 - **Startup wordmark / staff**.
 - **[display] toggles** — `reduced_motion` + `scanline`.
 - **CLI markdown-lite** + role gutter.
+- **OSC title broadcaster** — Working/Thinking/Done + macOS flicker config flag.
+- **CLI theme bridge** — 4 palettes → ANSI sets.
+- **Desktop policy rail** — `‖ ok` bar-line provenance.
+- **CLI rail suffix + fence hardening** — multi-line fence edge cases in single-line reveal.
 - Lint fixes across workspace.
 
 ## V3 Gaps (oracle)
@@ -29,16 +33,16 @@
 
 ## Text Roadmap Left
 
-- OSC terminal-title broadcaster (Working/Thinking/Done + config flag for macOS flicker).
-- CLI theme bridge (4 palettes → ANSI sets).
-- Policy bar-line provenance rail (`‖ ok`).
-- Multi-line fence edge cases in single-line reveal.
+- Coordinator milestones (all-Detail runs still lack Headline).
+- Agent-ID case fragility (string equality).
+- Mute persistence across restarts.
 
 ## CI Must-Prove (Linux)
 
-- `cargo test -p concerto-cli --lib` 172/172 (incl. `reveal_line` settled assert fix).
+- `cargo test -p concerto-cli --lib` 183/183 (incl. `reveal_line` settled assert fix).
 - `cargo test -p concerto-desktop --lib views::chat` 52/52.
 - Full desktop suite (9 ENV `SchemaMismatch` + read-only fails locally).
+- Full CLI suite (183 tests).
 - `cargo clippy --workspace --all-targets`.
 - `cargo deny check`.
 - WASM plugin tests.

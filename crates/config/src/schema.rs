@@ -305,7 +305,7 @@ impl IntentConfig {
 /// and CLI. Additive serde-default only: a missing section (or missing knob)
 /// keeps both motion cues fully enabled, matching pre-section behavior. No
 /// schema migration is required.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayConfig {
     /// Skip scan-line pulse, first-token emphasis, paragraph handoff hold,
     /// and line wipe (desktop) / bold, hold, and wipe-analog rule (CLI).
@@ -316,6 +316,34 @@ pub struct DisplayConfig {
     /// (desktop only; the CLI has no scan-line). Default false.
     #[serde(default)]
     pub scanline_overlay_enabled: bool,
+    /// Broadcast the run stage to the terminal title via OSC (`ESC ] 0 ; … BEL`).
+    /// Default true; disable with `[display] animated_terminal_title = false`,
+    /// the CLI `--no-terminal-title` flag, or `CONCERTO_NO_TITLE=1`.
+    #[serde(default = "default_animated_terminal_title")]
+    pub animated_terminal_title: bool,
+    /// CLI theme name bridging the desktop palettes (`Midnight` / `Slate` /
+    /// `Chalk` / `Nebula`) to ANSI role colors. Additive serde-default only:
+    /// `None` (missing key) keeps the `Midnight` default; unknown names fall
+    /// back to `Midnight` at resolve time (same contract as the desktop
+    /// `AppTheme::by_name`). Precedence is flag > `CONCERTO_THEME` env >
+    /// this key > default — see `concerto_cli::theme::resolve_cli_theme`.
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+fn default_animated_terminal_title() -> bool {
+    true
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            reduced_motion: false,
+            scanline_overlay_enabled: false,
+            animated_terminal_title: default_animated_terminal_title(),
+            theme: None,
+        }
+    }
 }
 
 /// Resolve the effective reduced-motion flag.
@@ -335,6 +363,27 @@ pub fn resolve_reduced_motion(explicit: Option<bool>, config: &AppConfig) -> boo
         }
     }
     config.display.reduced_motion
+}
+
+/// Resolve whether the CLI may broadcast run stages to the terminal title.
+///
+/// Precedence: explicit `--no-terminal-title` flag > `CONCERTO_NO_TITLE` env >
+/// config file (`[display] animated_terminal_title`, default true). The env
+/// var is truthy for `1`/`true`/`yes`/`on` (case-insensitive); unset or any
+/// other value means "not set". `explicit_no_title` is `Some(true)` only when
+/// the flag was passed (there is no `--terminal-title` opt-in); `None`
+/// follows env, then config.
+pub fn resolve_terminal_title_enabled(explicit_no_title: Option<bool>, config: &AppConfig) -> bool {
+    if explicit_no_title.unwrap_or(false) {
+        return false;
+    }
+    if let Ok(raw) = std::env::var("CONCERTO_NO_TITLE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return false,
+            _ => {}
+        }
+    }
+    config.display.animated_terminal_title
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2928,6 +2977,7 @@ mod tests {
         let config = AppConfig::default();
         assert!(!config.display.reduced_motion);
         assert!(!config.display.scanline_overlay_enabled);
+        assert!(config.display.animated_terminal_title);
     }
 
     #[test]
