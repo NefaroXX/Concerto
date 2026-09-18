@@ -8,6 +8,7 @@
 use camino::Utf8PathBuf;
 use glob::{MatchOptions, Pattern};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -41,6 +42,28 @@ const DEDUP_VECTOR_TOP_K: usize = 5;
 /// How many full-text candidates the L1 dedup judge may compare against.
 const DEDUP_FTS_TOP_K: usize = 5;
 
+/// Outcome counters for the L1 dedup judge pass (ADR-46 symbolic offload).
+///
+/// Only judge-consulted store calls are counted: a store call that never
+/// reached the judge (no judge configured, or recall produced no candidates)
+/// leaves every counter untouched. `failures` counts every fail-open pass that
+/// skipped the judge without a verdict — a cancelled pass, a judge error, or an
+/// unresolvable merge target — which is exactly the signal that dedup silently
+/// degraded to a plain store.
+#[derive(Debug, Default)]
+pub struct DedupJudgeCounters {
+    /// The judge ruled `store` — keep the new memory as its own chunk.
+    pub store: AtomicUsize,
+    /// The judge ruled `skip` — the entry is already represented.
+    pub skip: AtomicUsize,
+    /// The judge ruled `update` — supersede the target chunk.
+    pub update: AtomicUsize,
+    /// The judge ruled `merge` — fold the entry into the target chunk.
+    pub merge: AtomicUsize,
+    /// Fail-open passes where the judge produced no verdict.
+    pub failures: AtomicUsize,
+}
+
 /// The integrated Phase 4 memory system.
 ///
 /// Wraps all memory layers and presents a unified `MemoryStore` interface.
@@ -61,6 +84,8 @@ pub struct MemorySystem {
     /// asks the judge whether to store / update / merge / skip. Fail-open:
     /// judge or recall errors store the entry unchanged.
     dedup_judge: Option<L1DedupJudge>,
+    /// L1 dedup judge outcome counters (see [`DedupJudgeCounters`]).
+    dedup_counters: DedupJudgeCounters,
 }
 
 impl MemorySystem {
@@ -87,6 +112,7 @@ impl MemorySystem {
             project_id,
             global_store,
             dedup_judge: None,
+            dedup_counters: DedupJudgeCounters::default(),
         }
     }
     /// Access the decision store.
@@ -138,6 +164,14 @@ impl MemorySystem {
         self
     }
 
+    /// Outcome counters for the L1 dedup judge pass (verdicts + fail-open
+    /// passes). Exposed for observability and tests: a caller holding the
+    /// concrete `MemorySystem` can read the counts without any metrics
+    /// infrastructure.
+    pub fn dedup_counters(&self) -> &DedupJudgeCounters {
+        &self.dedup_counters
+    }
+
     /// Decide how a project-namespace entry relates to already-stored chunks.
     ///
     /// Fail-open by construction: without a judge, on cancellation, when
@@ -153,6 +187,11 @@ impl MemorySystem {
             return DedupDecision::store(entry, vector);
         };
         if cancel.is_cancelled() {
+            // The dedup pass was cancelled — fail open to a plain store,
+            // and surface the pass as a counter so a cancelled worker that
+            // keeps dropping the judge shows up in observability.
+            self.dedup_counters.failures.fetch_add(1, Ordering::Relaxed);
+            tracing::info!("l1 dedup cancelled; storing memory unjudged");
             return DedupDecision::store(entry, vector);
         }
 
@@ -168,9 +207,11 @@ impl MemorySystem {
             )
             .await;
         if recalled.is_empty() {
-            // Nothing to compare against — no duplication possible.
+            // Nothing to compare against — no duplication possible. Not
+            // counted: the judge was never consulted.
             return DedupDecision::store(entry, vector);
         }
+        let candidate_count = recalled.len();
         let candidates: Vec<L1Candidate> = recalled
             .into_iter()
             .map(|candidate| L1Candidate {
@@ -182,25 +223,48 @@ impl MemorySystem {
         let verdict = match judge.judge(&entry.content, &candidates).await {
             Ok(verdict) => verdict,
             Err(error) => {
-                tracing::warn!(%error, "l1 dedup judge failed; storing memory unchanged");
+                self.dedup_counters.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    %error,
+                    candidates = candidate_count,
+                    "l1 dedup judge failed; storing memory unchanged"
+                );
                 return DedupDecision::store(entry, vector);
             }
         };
 
         match verdict {
-            L1DedupVerdict::Store => DedupDecision::store(entry, vector),
-            L1DedupVerdict::Skip => DedupDecision::Skip,
-            L1DedupVerdict::Update { target_id } => DedupDecision::Store {
-                content: entry.content.clone(),
-                vector: vector.to_vec(),
-                tombstone_after: Some(target_id),
-            },
+            L1DedupVerdict::Store => {
+                self.dedup_counters.store.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(candidates = candidate_count, "l1 dedup: store");
+                DedupDecision::store(entry, vector)
+            }
+            L1DedupVerdict::Skip => {
+                self.dedup_counters.skip.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(candidates = candidate_count, "l1 dedup: skip duplicate");
+                DedupDecision::Skip
+            }
+            L1DedupVerdict::Update { target_id } => {
+                self.dedup_counters.update.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    target_id = %target_id,
+                    candidates = candidate_count,
+                    "l1 dedup: update"
+                );
+                DedupDecision::Store {
+                    content: entry.content.clone(),
+                    vector: vector.to_vec(),
+                    tombstone_after: Some(target_id),
+                }
+            }
             L1DedupVerdict::Merge { target_id } => {
                 let Some(target) =
                     candidates.iter().find(|candidate| candidate.chunk_id == target_id)
                 else {
+                    self.dedup_counters.failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         target_id,
+                        candidates = candidate_count,
                         "l1 dedup merge target missing from candidates; storing unchanged"
                     );
                     return DedupDecision::store(entry, vector);
@@ -220,6 +284,12 @@ impl MemorySystem {
                 } else {
                     Vec::new()
                 };
+                self.dedup_counters.merge.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    target_id = %target_id,
+                    candidates = candidate_count,
+                    "l1 dedup: merge"
+                );
                 DedupDecision::Store {
                     content: merged_content,
                     vector: merged_vector,
@@ -890,6 +960,18 @@ mod tests {
         vector_store.search(project_id, &[0.1; 8], 100, CancellationToken::new()).await.unwrap()
     }
 
+    /// (store, skip, update, merge, failures) counter snapshot.
+    fn counter_snapshot(system: &MemorySystem) -> (usize, usize, usize, usize, usize) {
+        let counters = system.dedup_counters();
+        (
+            counters.store.load(Ordering::Relaxed),
+            counters.skip.load(Ordering::Relaxed),
+            counters.update.load(Ordering::Relaxed),
+            counters.merge.load(Ordering::Relaxed),
+            counters.failures.load(Ordering::Relaxed),
+        )
+    }
+
     #[tokio::test]
     async fn store_without_dedup_judge_writes_plainly() {
         let vector_store = Arc::new(InMemoryVectorStore::new());
@@ -902,6 +984,8 @@ mod tests {
         let records = stored_records(&vector_store, &ProjectId("test".into())).await;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].content, "the user prefers rust");
+        // Without a judge nothing is ever counted against the dedup pass.
+        assert_eq!(counter_snapshot(&system), (0, 0, 0, 0, 0));
     }
 
     #[tokio::test]
@@ -929,6 +1013,7 @@ mod tests {
         let records = stored_records(&vector_store, &project_id).await;
         assert_eq!(records.len(), 1, "skip must not write a second chunk");
         assert_eq!(records[0].chunk_id, "existing-1");
+        assert_eq!(counter_snapshot(&system), (0, 1, 0, 0, 0), "skip verdict is counted");
     }
 
     #[tokio::test]
@@ -962,6 +1047,7 @@ mod tests {
             "merged content must include the target's content: {}",
             records[0].content
         );
+        assert_eq!(counter_snapshot(&system), (0, 0, 0, 1, 0), "merge verdict is counted");
     }
 
     #[tokio::test]
@@ -991,6 +1077,35 @@ mod tests {
         assert_eq!(records.len(), 1, "update must supersede the target chunk");
         assert_eq!(records[0].content, "the user's favorite city is paris");
         assert!(!records[0].content.contains("london"));
+        assert_eq!(counter_snapshot(&system), (0, 0, 1, 0, 0), "update verdict is counted");
+    }
+
+    #[tokio::test]
+    async fn store_judge_rules_store_and_is_counted() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "the user's favorite food is tacos",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "store", "target_id": null}"#,
+        )));
+        let system = dedup_system(vector_store.clone(), fts_store, Some(judge));
+        system
+            .store(dedup_entry("the user likes to code in rust"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let records = stored_records(&vector_store, &project_id).await;
+        assert_eq!(records.len(), 2, "store verdict keeps the new chunk");
+        assert_eq!(counter_snapshot(&system), (1, 0, 0, 0, 0), "store verdict is counted");
     }
 
     #[tokio::test]
@@ -1015,5 +1130,6 @@ mod tests {
         let records = stored_records(&vector_store, &project_id).await;
         assert_eq!(records.len(), 2);
         assert!(records.iter().any(|r| r.content == "an entirely new fact"));
+        assert_eq!(counter_snapshot(&system), (0, 0, 0, 0, 1), "judge failure is counted");
     }
 }

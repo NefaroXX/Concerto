@@ -19,6 +19,7 @@ use crate::plan_approval::{
     PlanApprovedPayload, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
+use crate::services::ProviderSummarizer;
 use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
@@ -448,6 +449,7 @@ fn read_only_fallback_message(outcome: RequestedOutcome, route: &RouterRoute) ->
 const DEFAULT_MAX_ITERATIONS: u32 = 25;
 use concerto_eval::EvalEngine;
 use concerto_memory::embedder::{EmbeddingGenerator, ProviderEmbedder};
+use concerto_memory::entities::L1DedupJudge;
 use concerto_memory::fts::SqliteFullTextStore;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
 use concerto_memory::storage::MemoryDb;
@@ -1320,6 +1322,16 @@ pub async fn init_memory_system_with_handles(
         project_id.clone(),
         None, // global store (stubbed, ADR-54)
     );
+    // L1 dedup judge (ADR-46 symbolic offload): attach it inside this
+    // initializer so EVERY runtime path that builds a project memory system
+    // gets it — desktop pre-init, the persistent runner, and
+    // `run_shared_agent` alike (the store is cached per project and reused).
+    // Fail-open: dedup disabled by config or an unresolvable model provider
+    // leaves the judge off and stores behave exactly as before (plain writes).
+    let system = match build_dedup_judge(config, &lifecycle) {
+        Some(judge) => system.with_dedup_judge(judge),
+        None => system,
+    };
     let system = Arc::new(system);
 
     // Background project indexing — actually persists chunks (FTS + vectors).
@@ -1393,6 +1405,44 @@ pub async fn init_memory_system_with_handles(
     });
 
     Ok(MemorySystemHandles { store: system as Arc<dyn MemoryStore>, decision_store, task_tree })
+}
+
+/// Build the L1 dedup judge for project-namespace memory stores, or `None`.
+///
+/// The judge is wired from the *default* resolved model rather than the
+/// model a specific run selects: it is advisory (ADR-46 symbolic offload),
+/// so a cheap, stable judge model is preferable to chasing per-run parity.
+///
+/// Fail-open by construction:
+/// - `[memory] dedup_judge = false` disables the service entirely;
+/// - a provider that cannot be resolved at init time (e.g. plugin-backed
+///   only configs, or a missing model configuration) logs at debug and
+///   yields `None`, leaving `MemorySystem` stores byte-identical to the
+///   pre-judge behavior.
+fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Option<L1DedupJudge> {
+    if !config.memory.dedup_judge {
+        tracing::debug!("l1 dedup judge disabled by [memory] dedup_judge=false");
+        return None;
+    }
+    // No plugin providers are loaded inside memory init; resolution is
+    // best-effort and must never abort the memory subsystem.
+    let no_plugin_providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+    let (provider, model, _provider_config_id) =
+        match resolve_provider_and_model(config, None, None, &no_plugin_providers) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "l1 dedup judge not attached: no resolvable model provider at memory init"
+                );
+                return None;
+            }
+        };
+    Some(L1DedupJudge::new(Arc::new(ProviderSummarizer::new(
+        provider,
+        model,
+        lifecycle.child_token(),
+    ))))
 }
 
 /// Build a fresh WASM plugin host, capability store, and manager. Returns both

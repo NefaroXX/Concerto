@@ -2763,6 +2763,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::prompts::PromptBuilder;
+    use crate::services::ProviderSummarizer;
     use async_trait::async_trait;
     use concerto_core::error::{MemoryError, ProviderError};
     use concerto_core::event::EventBus;
@@ -2783,6 +2784,7 @@ mod tests {
     use concerto_core::CancellationToken;
     use concerto_eval::EvalEngine;
     use concerto_memory::decision_store::DecisionStore;
+    use concerto_memory::entities::L1DedupJudge;
     use concerto_memory::fts::FullTextStore;
     use concerto_memory::fts::SqliteFullTextStore;
     use concerto_memory::storage::MemoryDb;
@@ -3566,15 +3568,31 @@ mod tests {
         // Derive project_id from the same temp dir the agent loop will use,
         // so memory storage/retrieval inside the loop uses matching keys.
         let project_id = ProjectId::resolve(dir.path());
-        let memory: Arc<dyn MemoryStore> = Arc::new(MemorySystem::new(
-            vector_store,
-            fts_store,
-            decision_store,
-            task_tree_store,
-            None,
-            project_id.clone(),
-            None,
-        ));
+        // Wire the L1 dedup judge (ADR-46) onto the project-namespace store —
+        // the same `with_dedup_judge` path production uses in
+        // `init_memory_system_with_handles`. The judge is backed by the loop's
+        // own scripted provider: the scripted replies carry no verdict text,
+        // so any judge pass fails open to a plain store, which is exactly the
+        // production fail-open contract (judge/recall trouble never drops a
+        // memory).
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![], vec![], vec![]]));
+        let judge = L1DedupJudge::new(Arc::new(ProviderSummarizer::new(
+            provider.clone(),
+            "test-model".into(),
+            CancellationToken::new(),
+        )));
+        let memory: Arc<dyn MemoryStore> = Arc::new(
+            MemorySystem::new(
+                vector_store,
+                fts_store,
+                decision_store,
+                task_tree_store,
+                None,
+                project_id.clone(),
+                None,
+            )
+            .with_dedup_judge(judge),
+        );
 
         let entry = MemoryEntry {
             id: MemoryId(Ulid::new()),
@@ -3604,7 +3622,6 @@ mod tests {
             "retrieved content must match stored entry"
         );
 
-        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_dir(
             provider.clone(),

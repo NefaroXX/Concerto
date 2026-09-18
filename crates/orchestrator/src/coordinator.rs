@@ -5259,6 +5259,16 @@ impl CoordinatorAgent {
                                         created_at: time::OffsetDateTime::now_utc(),
                                     },
                                 );
+                                // Intentionally NO `write_back_memory_outcome`
+                                // here: the resolver injects a *cached* settled
+                                // outcome, not a fresh dispatch by this run.
+                                // The original settlement already recorded its
+                                // M3b decision/task rows, and re-writing them
+                                // here would duplicate the record as if this
+                                // run had dispatched the subtask. The
+                                // working-memory Decision above (session-scoped)
+                                // supplies the timeline's audit trail for the
+                                // reuse.
                             }
                         }
 
@@ -6473,6 +6483,15 @@ impl CoordinatorAgent {
                                 completed_results.insert(task_id, fb_result.clone());
                                 retry_feedback.remove(&task_id);
                                 graph.mark_done(&task_id);
+                                // Phase 6 M3b: the ladder settled this subtask
+                                // completed — persist the outcome like any
+                                // successful dispatch so the next Phase-0
+                                // retrieval (M3a) is grounded in what this run
+                                // ended up deciding. Best-effort (fail-soft),
+                                // mirroring the primary Success arm above.
+                                self.write_back_memory_outcome(
+                                    &task_id, &role, &fb_result, sid, &desc, &deps,
+                                );
                                 continue;
                             }
                             FallbackOutcome::Cancelled => {

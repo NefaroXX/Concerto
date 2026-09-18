@@ -486,6 +486,14 @@ pub struct MemoryConfig {
     /// age-based prune. Source chunks are never window-pruned here.
     #[serde(default = "default_summary_retention_days")]
     pub summary_retention_days: u16,
+    /// ADR-46 L1 dedup judge: before storing each project-namespace memory
+    /// entry, consult an LLM judge that rules store / update / merge / skip
+    /// against the already-stored chunks. Default: `true`. Set
+    /// `[memory] dedup_judge = false` to restore the plain always-store
+    /// behavior. The judge is advisory and fail-open — provider or judge
+    /// failures store the entry unchanged, never drop it.
+    #[serde(default = "default_true")]
+    pub dedup_judge: bool,
 }
 
 fn default_memory_enabled() -> bool {
@@ -513,6 +521,7 @@ impl Default for MemoryConfig {
             ignore_file: None,
             summary_keep_per_session: default_summary_keep_per_session(),
             summary_retention_days: default_summary_retention_days(),
+            dedup_judge: true,
         }
     }
 }
