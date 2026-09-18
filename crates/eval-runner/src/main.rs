@@ -152,7 +152,6 @@ async fn main() {
                         10,    // max_iterations
                         false, // fast mode
                         project_dir,
-                        None, // overflow_strategy
                         None, // budget_allocator
                     );
 

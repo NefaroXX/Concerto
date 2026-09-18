@@ -1,8 +1,8 @@
 //! LLM-based summarization trait and prompt constants.
 //!
-//! The `LLMSummarizer` trait is used by `SummarizeOldest` (short-term
-//! memory overflow strategy) and by the entity `FactExtractor` for
-//! LLM-based fact extraction.
+//! The `LLMSummarizer` trait is used by the entity `FactExtractor` for
+//! LLM-based fact extraction, and by the orchestrator's `ProviderSummarizer`
+//! for the L1 dedup judge.
 //!
 //! `SUMMARIZATION_PROMPT` is a named constant so it appears in ADRs,
 //! can be tested in snapshot tests, and cannot silently drift between
@@ -16,8 +16,7 @@ use concerto_core::types::Message;
 /// Pinned summarization prompt.
 ///
 /// Must match the ROADMAP spec exactly. Changing this prompt changes
-/// the behaviour of the short-term memory overflow strategy and the
-/// fact extractor. Update ADR-16 when modifying.
+/// the behaviour of the fact extractor. Update ADR-16 when modifying.
 pub const SUMMARIZATION_PROMPT: &str =
     "Summarize these messages as bullet points capturing all facts, decisions, \
      and code changes. Be concise. Preserve file names and line numbers.";

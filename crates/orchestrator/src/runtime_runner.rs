@@ -1951,32 +1951,12 @@ async fn execute_agent_loop(
     // the gates consume it.
     fact_pool: Option<sqlx::SqlitePool>,
 ) -> Result<AgentOutput, OrchestratorError> {
-    // Audit C-03 (immediate fix): the LLM `SummarizeOldest` strategy is no
-    // longer wired into the production runtime. Its failure path could delete
-    // the original messages, and in-run LLM summarization is superseded by the
-    // deterministic durable compaction in `context_compaction` —
-    // `create_session_and_recorder` bounds the active history via the
-    // context engine before the run; `maintain_context_after_run` checkpoints
-    // after it. Overflow is handled there; passing this per-call strategy is
-    // `None` keeps the mid-run message projection intact and is a safe no-op.
-    // The `SummarizeOldest` type remains available for explicit opt-in use and
-    // is exercised by `concerto-memory` tests.
-    //
-    // GATE: in-run overflow strategies must stay disabled. Re-enabling here
-    // (or anywhere in production) without a superseding ADR is a defect, not a
-    // tuning choice — `SummarizeOldest::apply` and the agent-loop apply site
-    // both log loudly if one ever reaches them.
-    let overflow_strategy: Option<Arc<dyn concerto_core::ContextOverflowStrategy>> = {
-        tracing::warn!(
-            "in-run LLM overflow summarization disabled (audit C-03); context is bounded by \
-             deterministic durable compaction"
-        );
-        None
-    };
-    debug_assert!(
-        overflow_strategy.is_none(),
-        "in-run LLM overflow summarization must remain disabled (audit C-03)"
-    );
+    // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
+    // removed from `AgentLoop`. Context overflow is bounded deterministically
+    // by the context engine — `create_session_and_recorder` bounds the active
+    // history before the run and `maintain_context_after_run` checkpoints
+    // after it. Re-introducing an in-run overflow strategy anywhere in
+    // production requires a superseding ADR.
 
     let undo_manager = Arc::new(Mutex::new(UndoManager::new(&req.project_dir)));
     let eval = {
@@ -2035,7 +2015,6 @@ async fn execute_agent_loop(
         DEFAULT_MAX_ITERATIONS,
         false,
         req.project_dir.clone(),
-        overflow_strategy,
         Some(concerto_memory::budget::ContextBudgetAllocator::default()),
     )
     .with_retry_policy(retry_policy)

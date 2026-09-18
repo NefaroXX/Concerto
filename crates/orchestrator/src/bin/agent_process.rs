@@ -177,7 +177,6 @@ async fn run() -> i32 {
         false,
         project_root,
         None,
-        None,
     );
 
     let task = AgentTask::new(Ulid::new(), description.clone());

@@ -1,8 +1,9 @@
 //! Selector for choosing which messages to summarise when the context
 //! window is under pressure.
 //!
-//! Extracted from `SummarizeOldest` so the selection algorithm is
-//! independently testable.
+//! Retained as an independent, tested selection utility. The overflow
+//! strategy it served (`SummarizeOldest`) was removed under ADR-67 M-01;
+//! the selector remains public API with its own tests.
 
 use concerto_core::types::{Message, Role};
 
