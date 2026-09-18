@@ -72,6 +72,24 @@ const ANTHROPIC_KNOWN: &[&str] = &[
 ];
 const GOOGLE_KNOWN: &[&str] = &["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash-exp"];
 const DEEPSEEK_KNOWN: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
+const GROQ_KNOWN: &[&str] =
+    &["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+const TOGETHER_KNOWN: &[&str] = &[
+    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+    "deepseek-ai/DeepSeek-V3",
+];
+const MISTRAL_KNOWN: &[&str] =
+    &["mistral-large-latest", "mistral-medium-latest", "mistral-small-latest", "codestral-latest"];
+const XAI_KNOWN: &[&str] = &["grok-4", "grok-4-fast", "grok-2-latest"];
+const FIREWORKS_KNOWN: &[&str] = &[
+    "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    "accounts/fireworks/models/llama-4-maverick",
+    "accounts/fireworks/models/deepseek-v3",
+];
+const CEREBRAS_KNOWN: &[&str] = &["llama-3.3-70b", "gpt-oss-120b", "llama3.1-8b", "qwen-3-32b"];
+const COHERE_KNOWN: &[&str] =
+    &["command-a-plus-05-2026", "command-a", "command-r-plus-08-2024", "command-r-08-2024"];
 
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///
@@ -152,6 +170,69 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             model_discovery: ModelDiscoverySupport::Supported,
             allows_custom_model: true,
         },
+        "groq" => ProviderDefinition {
+            id: "groq",
+            display_name: String::from("Groq"),
+            default_model: Some("llama-3.3-70b-versatile"),
+            known_models: GROQ_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "together" => ProviderDefinition {
+            id: "together",
+            display_name: String::from("Together AI"),
+            default_model: Some("meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+            known_models: TOGETHER_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "mistral" => ProviderDefinition {
+            id: "mistral",
+            display_name: String::from("Mistral"),
+            default_model: Some("mistral-large-latest"),
+            known_models: MISTRAL_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "xai" => ProviderDefinition {
+            id: "xai",
+            display_name: String::from("xAI"),
+            default_model: Some("grok-4"),
+            known_models: XAI_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "fireworks" => ProviderDefinition {
+            id: "fireworks",
+            display_name: String::from("Fireworks"),
+            default_model: Some("accounts/fireworks/models/llama-v3p3-70b-instruct"),
+            known_models: FIREWORKS_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "cerebras" => ProviderDefinition {
+            id: "cerebras",
+            display_name: String::from("Cerebras"),
+            default_model: Some("llama-3.3-70b"),
+            known_models: CEREBRAS_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "cohere" => ProviderDefinition {
+            id: "cohere",
+            display_name: String::from("Cohere"),
+            default_model: Some("command-a-plus-05-2026"),
+            known_models: COHERE_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
         _ => ProviderDefinition {
             id: "<unknown>",
             display_name: provider_type.to_string(),
@@ -165,8 +246,23 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
 }
 
 /// Recognized provider type ids, in UI display order.
-pub const PROVIDER_TYPE_IDS: &[&str] =
-    &["anthropic", "openai", "google", "openrouter", "nim", "ollama", "opencode", "deepseek"];
+pub const PROVIDER_TYPE_IDS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "openrouter",
+    "nim",
+    "ollama",
+    "opencode",
+    "deepseek",
+    "groq",
+    "together",
+    "mistral",
+    "xai",
+    "fireworks",
+    "cerebras",
+    "cohere",
+];
 
 /// Discovered model catalog for a provider.
 ///
@@ -424,6 +520,26 @@ mod tests {
         assert!(def.known_models.contains(&"deepseek-reasoner"));
         assert_eq!(def.credential_requirement, CredentialRequirement::Required);
         assert!(def.allows_custom_model);
+    }
+
+    /// Every Tier-1 OpenAI-compatible provider is fully defined: key-required,
+    /// discovery-supported, custom-model-allowed, with a default model and a
+    /// hand-maintained catalog of real API model IDs.
+    #[test]
+    fn tier1_openai_compatible_definitions_are_complete() {
+        for id in ["groq", "together", "mistral", "xai", "fireworks", "cerebras", "cohere"] {
+            let def = provider_definition(id);
+            assert_eq!(def.id, id);
+            assert_eq!(def.credential_requirement, CredentialRequirement::Required);
+            assert_eq!(def.model_discovery, ModelDiscoverySupport::Supported);
+            assert!(def.allows_custom_model);
+            assert!(def.default_model.is_some(), "{id} must have a default model");
+            assert!(!def.known_models.is_empty(), "{id} must ship a known-model catalog");
+            assert!(
+                def.default_model.is_some_and(|default| def.known_models.contains(&default)),
+                "{id} default model must be part of its known-model catalog"
+            );
+        }
     }
 
     #[test]

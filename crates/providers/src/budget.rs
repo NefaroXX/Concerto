@@ -39,6 +39,37 @@ static MODEL_CAPACITIES: LazyLock<HashMap<&'static str, u64>> = LazyLock::new(||
     // collide with it.
     m.insert("deepseek-chat", 1_000_000);
     m.insert("deepseek-reasoner", 1_000_000);
+    // Groq — api.groq.com model IDs
+    m.insert("llama-3.3-70b-versatile", 131_072);
+    m.insert("openai/gpt-oss-120b", 131_072);
+    m.insert("openai/gpt-oss-20b", 131_072);
+    // Together AI — api.together.xyz model IDs
+    m.insert("meta-llama/Llama-3.3-70B-Instruct-Turbo", 131_072);
+    m.insert("meta-llama/Llama-4-Scout-17B-16E-Instruct", 1_000_000);
+    m.insert("deepseek-ai/DeepSeek-V3", 128_000);
+    // Mistral — api.mistral.ai model IDs
+    m.insert("mistral-large-latest", 131_072);
+    m.insert("mistral-medium-latest", 131_072);
+    m.insert("mistral-small-latest", 131_072);
+    m.insert("codestral-latest", 256_000);
+    // xAI — api.x.ai model IDs
+    m.insert("grok-4", 256_000);
+    m.insert("grok-4-fast", 2_000_000);
+    m.insert("grok-2-latest", 131_072);
+    // Fireworks — api.fireworks.ai/inference model IDs
+    m.insert("accounts/fireworks/models/llama-v3p3-70b-instruct", 128_000);
+    m.insert("accounts/fireworks/models/llama-4-maverick", 1_000_000);
+    m.insert("accounts/fireworks/models/deepseek-v3", 128_000);
+    // Cerebras — api.cerebras.ai model IDs
+    m.insert("llama-3.3-70b", 128_000);
+    m.insert("gpt-oss-120b", 131_072);
+    m.insert("llama3.1-8b", 131_072);
+    m.insert("qwen-3-32b", 131_072);
+    // Cohere — api.cohere.com/compatibility model IDs
+    m.insert("command-a", 256_000);
+    m.insert("command-a-plus-05-2026", 128_000);
+    m.insert("command-r-plus-08-2024", 128_000);
+    m.insert("command-r-08-2024", 128_000);
     m
 });
 
@@ -94,6 +125,24 @@ mod tests {
         assert_eq!(capacity_for_model("deepseek-chat"), 1_000_000);
         assert_eq!(capacity_for_model("deepseek-reasoner"), 1_000_000);
         assert_eq!(capacity_for_model("deepseek/deepseek-chat"), 64_000);
+    }
+
+    /// The integrated Tier-1 OpenAI-compatible providers carry native model
+    /// capacities for the models they are configured with by default (the
+    /// provider-level tests assert the exact defaults; these are the budget
+    /// table's own contract).
+    #[test]
+    fn test_tier1_native_capacities() {
+        assert_eq!(capacity_for_model("llama-3.3-70b-versatile"), 131_072);
+        assert_eq!(capacity_for_model("meta-llama/Llama-3.3-70B-Instruct-Turbo"), 131_072);
+        assert_eq!(capacity_for_model("mistral-large-latest"), 131_072);
+        assert_eq!(capacity_for_model("grok-4"), 256_000);
+        assert_eq!(
+            capacity_for_model("accounts/fireworks/models/llama-v3p3-70b-instruct"),
+            128_000
+        );
+        assert_eq!(capacity_for_model("llama-3.3-70b"), 128_000);
+        assert_eq!(capacity_for_model("command-a-plus-05-2026"), 128_000);
     }
 
     #[test]

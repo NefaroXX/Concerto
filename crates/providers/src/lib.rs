@@ -24,14 +24,21 @@ pub mod tokenizer;
 pub mod adapters;
 pub mod anthropic;
 pub mod capability;
+pub mod cerebras;
+pub mod cohere;
 pub mod deepseek;
+pub mod fireworks;
 pub mod google;
+pub mod groq;
+pub mod mistral;
 pub mod nim;
 pub mod ollama;
 pub mod openai;
 pub mod opencode;
 pub mod openrouter;
 pub mod sse;
+pub mod together;
+pub mod xai;
 
 #[cfg(test)]
 pub mod testing;
@@ -157,6 +164,77 @@ pub async fn list_models_for_provider_async(
                 DEFAULT_TIMEOUT_SECS,
                 api_base.unwrap_or(deepseek::DEEPSEEK_API_BASE).to_string(),
             );
+            p.list_models(cancel.clone()).await
+        }
+        "groq" => {
+            let mut p =
+                groq::GroqProvider::new(api_key.to_string(), String::new(), DEFAULT_TIMEOUT_SECS);
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "together" => {
+            let mut p = together::TogetherProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "mistral" => {
+            let mut p = mistral::MistralProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "xai" => {
+            let mut p =
+                xai::XaiProvider::new(api_key.to_string(), String::new(), DEFAULT_TIMEOUT_SECS);
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "fireworks" => {
+            let mut p = fireworks::FireworksProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "cerebras" => {
+            let mut p = cerebras::CerebrasProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "cohere" => {
+            let mut p = cohere::CohereProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
             p.list_models(cancel.clone()).await
         }
         _ => return Vec::new(),

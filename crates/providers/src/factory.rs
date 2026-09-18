@@ -9,14 +9,21 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::RoutingProfile;
 
 use crate::anthropic::AnthropicProvider;
+use crate::cerebras::CerebrasProvider;
+use crate::cohere::CohereProvider;
 use crate::context_guard::ContextGuardProvider;
 use crate::deepseek::DeepSeekProvider;
+use crate::fireworks::FireworksProvider;
 use crate::google::GoogleProvider;
+use crate::groq::GroqProvider;
+use crate::mistral::MistralProvider;
 use crate::nim::NimProvider;
 use crate::ollama::OllamaProvider;
 use crate::openai::{OpenAiProvider, ReasoningEcho};
 use crate::opencode::OpenCodeZenProvider;
 use crate::openrouter::OpenRouterProvider;
+use crate::together::TogetherProvider;
+use crate::xai::XaiProvider;
 
 /// Resolve the `[providers.*] tool_schema_mode` dial for provider construction.
 ///
@@ -100,6 +107,13 @@ impl ProviderFactory {
                 | "nim"
                 | "ollama"
                 | "deepseek"
+                | "groq"
+                | "together"
+                | "mistral"
+                | "xai"
+                | "fireworks"
+                | "cerebras"
+                | "cohere"
         ) {
             return Err(ProviderError::UnsupportedProvider { provider: config.provider.clone() });
         }
@@ -221,6 +235,90 @@ impl ProviderFactory {
                 .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 Arc::new(provider)
             }
+            "groq" => {
+                let mut provider =
+                    GroqProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "together" => {
+                let mut provider =
+                    TogetherProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "mistral" => {
+                let mut provider =
+                    MistralProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "xai" => {
+                let mut provider =
+                    XaiProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "fireworks" => {
+                let mut provider =
+                    FireworksProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "cerebras" => {
+                let mut provider =
+                    CerebrasProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "cohere" => {
+                let mut provider =
+                    CohereProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
             other => {
                 return Err(ProviderError::UnsupportedProvider { provider: other.to_string() });
             }
@@ -310,6 +408,16 @@ impl ProviderFactory {
                     // DeepSeek V4 Flash: $0.14/$0.28 per MTok blended ≈
                     // $0.0002/1k tokens — the cheapest frontier tier.
                     "deepseek" => (0.0002, 800),
+                    // Tier-1 OpenAI-compatible providers (blended 3:1
+                    // in:out representative flagship pricing, see the docs
+                    // table in `ProviderRegistry::routing_profiles`).
+                    "groq" => (0.0006, 150),
+                    "together" => (0.001, 600),
+                    "mistral" => (0.0008, 700),
+                    "xai" => (0.003, 800),
+                    "fireworks" => (0.0009, 400),
+                    "cerebras" => (0.0009, 250),
+                    "cohere" => (0.004, 900),
                     _ => (0.005, 500),
                 };
                 let mut profile = RoutingProfile {
@@ -505,6 +613,88 @@ mod tests {
         std::env::remove_var("CONCERTO_DEEPSEEK_API_KEY");
 
         assert_eq!(provider.provider_name(), "deepseek");
+    }
+
+    /// Every Tier-1 OpenAI-compatible provider builds through the factory with
+    /// its env-backed test keyring key (`<PROVIDER>_API_KEY`, provider
+    /// uppercased via `ProviderConfig::effective_api_key`).
+    #[test]
+    fn build_tier1_openai_compatible_providers() {
+        let cases = [
+            ("groq", "groq-main", "llama-3.3-70b-versatile", "CONCERTO_GROQ_API_KEY"),
+            (
+                "together",
+                "together-main",
+                "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                "CONCERTO_TOGETHER_API_KEY",
+            ),
+            ("mistral", "mistral-main", "mistral-large-latest", "CONCERTO_MISTRAL_API_KEY"),
+            ("xai", "xai-main", "grok-4", "CONCERTO_XAI_API_KEY"),
+            (
+                "fireworks",
+                "fireworks-main",
+                "accounts/fireworks/models/llama-v3p3-70b-instruct",
+                "CONCERTO_FIREWORKS_API_KEY",
+            ),
+            ("cerebras", "cerebras-main", "llama-3.3-70b", "CONCERTO_CEREBRAS_API_KEY"),
+            ("cohere", "cohere-main", "command-a-plus-05-2026", "CONCERTO_COHERE_API_KEY"),
+        ];
+        for (provider, id, model, env_key) in cases {
+            let config = ProviderConfig {
+                id: id.into(),
+                name: "Tier-1".into(),
+                provider: provider.into(),
+                model: model.into(),
+                keyring_key: format!("{provider}/api_key"),
+                ..ProviderConfig::default()
+            };
+            std::env::set_var(env_key, format!("sk-test-{provider}"));
+            let built = ProviderFactory::build(&config, &test_creds());
+            std::env::remove_var(env_key);
+
+            assert_eq!(
+                built.expect("factory build succeeds").provider_name(),
+                provider,
+                "built provider_name must match the config provider type"
+            );
+        }
+    }
+
+    /// The Tier-1 routing profiles carry explicit (blended) costs rather than
+    /// the built-in `_` fallback, in lockstep with
+    /// `ProviderRegistry::routing_profiles`.
+    #[test]
+    fn build_profiles_tier1_explicit_costs() {
+        let providers = [
+            ("groq", "llama-3.3-70b-versatile", 0.0006),
+            ("together", "meta-llama/Llama-3.3-70B-Instruct-Turbo", 0.001),
+            ("mistral", "mistral-large-latest", 0.0008),
+            ("xai", "grok-4", 0.003),
+            ("fireworks", "accounts/fireworks/models/llama-v3p3-70b-instruct", 0.0009),
+            ("cerebras", "llama-3.3-70b", 0.0009),
+            ("cohere", "command-a-plus-05-2026", 0.004),
+        ];
+        let settings = ModelSettings {
+            providers: providers
+                .iter()
+                .map(|(provider, model, _)| ProviderConfig {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                    ..ProviderConfig::default()
+                })
+                .collect(),
+            ..ModelSettings::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        assert_eq!(profiles.len(), providers.len());
+        for ((provider, _, expected_cost), profile) in providers.iter().zip(&profiles) {
+            assert_eq!(profile.provider, *provider);
+            assert_eq!(profile.cost_per_1k_tokens, *expected_cost);
+            assert!(
+                profile.supports_tool_calling,
+                "{provider} defaults to native tool calling (ADR-66 §3)"
+            );
+        }
     }
 
     /// The DeepSeek routing profile carries an explicit (cheap) cost rather
