@@ -371,6 +371,16 @@ impl DedupDecision {
 #[async_trait]
 
 impl MemoryStore for MemorySystem {
+    /// ADR-69 slice 1 observability: report whether this system carries a
+    /// symbolic link store. Defaults to `false` on the trait (fail-open:
+    /// plain stores write no links, and tests that do not opt in keep
+    /// fanning out plain); this override surfaces the production wiring so
+    /// the init path can be asserted through an `Arc<dyn MemoryStore>`
+    /// handle without downcasting.
+    fn link_store_attached(&self) -> bool {
+        self.link_store.is_some()
+    }
+
     async fn retrieve(
         &self,
         query: &MemoryQuery,

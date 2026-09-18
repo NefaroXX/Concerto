@@ -452,6 +452,7 @@ use concerto_memory::embedder::{EmbeddingGenerator, ProviderEmbedder};
 use concerto_memory::entities::L1DedupJudge;
 use concerto_memory::fts::SqliteFullTextStore;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
+use concerto_memory::links::LinkStore;
 use concerto_memory::storage::MemoryDb;
 use concerto_memory::sync::ChunkSyncService;
 use concerto_memory::vector_store::SqliteVectorStore;
@@ -1332,6 +1333,19 @@ pub async fn init_memory_system_with_handles(
         Some(judge) => system.with_dedup_judge(judge),
         None => system,
     };
+    // ADR-69 slice 1 link store: attach it inside this initializer so EVERY
+    // runtime path that builds a project memory system gets it — desktop
+    // pre-init, the persistent runner, and `run_shared_agent` alike (the
+    // store is cached per project and reused). It borrows the SAME pool the
+    // vector store was built on (see `build_link_store`), so `memory_links`
+    // rows live in the same database as the chunks they reference. Fail-open:
+    // an unopenable store leaves links off and memory behaves exactly as
+    // before (plain writes).
+    let link_store = build_link_store(&pool).await;
+    let system = match &link_store {
+        Some(store) => system.with_link_store(store.clone()),
+        None => system,
+    };
     let system = Arc::new(system);
 
     // Background project indexing — actually persists chunks (FTS + vectors).
@@ -1443,6 +1457,24 @@ fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Optio
         model,
         lifecycle.child_token(),
     ))))
+}
+
+/// Build the ADR-69 slice-1 symbolic link store over the project memory pool,
+/// or `None` (fail-open).
+///
+/// The link store shares the SAME SQLite pool the vector store was built on,
+/// so `memory_links` rows live in the same database — and same write space —
+/// as the chunks they reference. Slice 1 is write-only and advisory: a pool
+/// or schema problem logs a warning and yields `None`, leaving memory stores
+/// byte-identical to the pre-link behavior (no links are ever written).
+async fn build_link_store(pool: &sqlx::SqlitePool) -> Option<Arc<LinkStore>> {
+    match LinkStore::new(pool.clone()).await {
+        Ok(store) => Some(Arc::new(store)),
+        Err(error) => {
+            tracing::warn!(%error, "memory link store not attached; ADR-69 links disabled");
+            None
+        }
+    }
 }
 
 /// Build a fresh WASM plugin host, capability store, and manager. Returns both
@@ -8885,5 +8917,140 @@ mod runtime_runner_tests {
             GateLabels { review: "QA Reviewer".into(), validate: "QA Verifier".into() },
             "renamed gate tags keep their labels via kind-based resolution"
         );
+    }
+
+    // ===========================================================================
+    // ADR-69 slice 1: production link-store activation (migration 002 + wiring).
+    // ===========================================================================
+
+    /// Serializes tests that redirect `XDG_DATA_HOME` so memory init uses a
+    /// temp data root instead of the real user data dir (mirrors `ENV_LOCK`
+    /// in `concerto-cli`).
+    static MEMORY_INIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII redirect of `XDG_DATA_HOME` to a fresh temp directory; restores
+    /// the previous value on drop (panic-safe). The serialization lock is only
+    /// held around the synchronous set/restore, never across an `.await`
+    /// (clippy::await_holding_lock).
+    struct XdgDataHomeGuard {
+        previous: Option<String>,
+    }
+
+    impl XdgDataHomeGuard {
+        fn redirect(temp: &std::path::Path) -> Self {
+            let xdg_data = temp.join("xdg-data");
+            std::fs::create_dir_all(&xdg_data).expect("create xdg-data");
+            let previous = {
+                let _lock = MEMORY_INIT_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+                let previous = std::env::var("XDG_DATA_HOME").ok();
+                std::env::set_var("XDG_DATA_HOME", &xdg_data);
+                previous
+            };
+            Self { previous }
+        }
+    }
+
+    impl Drop for XdgDataHomeGuard {
+        fn drop(&mut self) {
+            let _lock = MEMORY_INIT_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            match &self.previous {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    /// ADR-69 slice 1 production activation. The real production init path —
+    /// `init_memory_system_with_handles`, the single funnel every frontend
+    /// (desktop pre-init, persistent runner, `run_shared_agent`) routes its
+    /// memory construction through — must attach the link store over the same
+    /// SQLite pool as the vector store and run migration 002 via the normal
+    /// `MemoryDb::connect` chain. We assert on the concrete production
+    /// database under a redirected `XDG_DATA_HOME`:
+    ///   1. the production-built system carries the link store (reported
+    ///      through the `Arc<dyn MemoryStore>` seam by
+    ///      `MemoryStore::link_store_attached`, without downcasting), and
+    ///   2. migration 002 created the `memory_links` table (fresh install), and
+    ///   3. the production link-store helper round-trips a link over the
+    ///      shared project database.
+    #[tokio::test]
+    async fn init_path_attaches_link_store_over_project_pool() {
+        use concerto_core::memory::{MemoryLink, MemoryLinkKind};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _xdg = XdgDataHomeGuard::redirect(temp.path());
+
+        // Empty project dir: the background index is a no-op and never needs
+        // the embedder model download.
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let reindex: Arc<Mutex<Option<Arc<ProjectIndexer>>>> = Arc::new(Mutex::new(None));
+        let reindex_sync: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
+        let memory_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+        let data_dir_lock: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
+
+        let mut config = AppConfig::default();
+        // Keep init hermetic: the provider-backed L1 dedup judge is orthogonal
+        // to the link store and must not be resolved in a test.
+        config.memory.dedup_judge = false;
+
+        let handles = init_memory_system_with_handles(
+            EventBus::default(),
+            &config,
+            &project_dir,
+            &reindex,
+            &reindex_sync,
+            &memory_cancel,
+            &data_dir_lock,
+        )
+        .await
+        .expect("production memory init must succeed under a temp data root");
+
+        // 1. The production-built system carries the link store:
+        //    `MemoryStore::link_store_attached` reports it through the
+        //    `Arc<dyn MemoryStore>` handle, so `true` proves
+        //    `.with_link_store(...)` ran on the init path.
+        assert!(
+            handles.store.link_store_attached(),
+            "production-built memory system must carry the link store"
+        );
+        drop(handles.store);
+
+        // 2. Migration 002 ran through the production connect chain (fresh
+        //    install: the `memory_links` table exists in the project DB).
+        let db_path = temp.path().join("xdg-data/concerto/memory/memory.db");
+        assert!(db_path.is_file(), "production memory db must exist at {db_path:?}");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let pool =
+            sqlx::SqlitePool::connect_with(options).await.expect("open the production memory db");
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'memory_links'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query sqlite_master for memory_links");
+        assert_eq!(table, 1, "production init must run migration 002 (memory_links table)");
+
+        // 3. The production link-store helper is functional over the shared
+        //    project database: a link persisted through the same builder the
+        //    init path calls round-trips from the database the vector store
+        //    indexes into.
+        let link_store =
+            build_link_store(&pool).await.expect("production link-store helper must attach");
+        let link = MemoryLink::new("src-init", "tgt-init", MemoryLinkKind::References);
+        link_store
+            .put(&link, CancellationToken::new())
+            .await
+            .expect("persist a link through the production link-store helper");
+        let read_back = link_store
+            .links_from("src-init", CancellationToken::new())
+            .await
+            .expect("read the link back");
+        assert_eq!(read_back, vec![link], "production memory db must round-trip a persisted link");
     }
 }
