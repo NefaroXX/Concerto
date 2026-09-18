@@ -4,6 +4,7 @@
 //! similarity search using reciprocal-rank fusion (RRF) scoring.
 
 use concerto_core::CancellationToken;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use concerto_core::error::MemoryError;
@@ -63,6 +64,63 @@ impl HybridRetriever {
 
     pub fn supports_chunk_metadata(&self) -> bool {
         self.vector_store.supports_chunk_metadata()
+    }
+
+    /// Recall chunks similar to a not-yet-stored entry WITHOUT rank fusion.
+    ///
+    /// This is the candidate recall for the L1 dedup pass
+    /// ([`crate::system::MemorySystem::store`]): the LLM judge needs the top
+    /// candidate *contents* (and ids) to decide store / update / merge /
+    /// skip, so it compares semantics — fused rank scores would be
+    /// misleading here. Consequently no RRF applies and `RRF_K` is untouched:
+    /// vector hits come first (in store order), FTS-only hits are appended
+    /// (in BM25 order), duplicates across the two sides are dropped keeping
+    /// the vector hit.
+    pub async fn recall_candidates(
+        &self,
+        project_id: &ProjectId,
+        query_text: &str,
+        embedding: &[f32],
+        vector_top_k: usize,
+        fts_top_k: usize,
+        cancel: CancellationToken,
+    ) -> Vec<FusedResult> {
+        let (vector_results, fts_results) = tokio::join!(
+            self.vector_store.search(project_id, embedding, vector_top_k, cancel.clone()),
+            self.fts_store.search(query_text, project_id, fts_top_k, cancel),
+        );
+        let vector_results = vector_results.unwrap_or_default();
+        let fts_results = fts_results.unwrap_or_default();
+
+        let mut results: Vec<FusedResult> =
+            Vec::with_capacity(vector_results.len() + fts_results.len());
+        let mut seen_chunk_ids: HashSet<String> = HashSet::with_capacity(results.capacity());
+        for vector_result in vector_results {
+            seen_chunk_ids.insert(vector_result.chunk_id.clone());
+            results.push(FusedResult {
+                chunk_id: vector_result.chunk_id,
+                score: vector_result.score,
+                vector_score: vector_result.score,
+                fts_score: 0.0,
+                content: vector_result.content,
+                notice: None,
+                stale: vector_result.stale,
+            });
+        }
+        for fts_result in fts_results {
+            if seen_chunk_ids.insert(fts_result.chunk_id.clone()) {
+                results.push(FusedResult {
+                    chunk_id: fts_result.chunk_id,
+                    score: fts_result.score,
+                    vector_score: 0.0,
+                    fts_score: fts_result.score,
+                    content: fts_result.content,
+                    notice: None,
+                    stale: fts_result.stale,
+                });
+            }
+        }
+        results
     }
 
     /// Retrieve context for a memory query using hybrid search.

@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 pub mod categories;
+pub mod persona_mem;
 pub mod runner;
 pub mod scenarios;
 pub use runner::EvalRunner;

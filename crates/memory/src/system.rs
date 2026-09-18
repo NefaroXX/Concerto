@@ -25,12 +25,21 @@ use crate::budget::ContextBudgetAllocator;
 use crate::decision_store::DecisionStore;
 use crate::embedder::EmbeddingGenerator;
 use crate::embedder_health::EmbedderHealth;
+use crate::entities::{L1Candidate, L1DedupJudge, L1DedupVerdict};
 use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
 use crate::rag::HybridRetriever;
 use crate::sync::ChunkSyncService;
 use crate::task_tree::TaskTreeStore;
 use crate::vector_store::VectorStore;
+
+/// How many vector candidates the L1 dedup judge may compare against.
+///
+/// Kept small: the judge only needs the handful of genuinely similar chunks
+/// (see [`HybridRetriever::recall_candidates`]).
+const DEDUP_VECTOR_TOP_K: usize = 5;
+/// How many full-text candidates the L1 dedup judge may compare against.
+const DEDUP_FTS_TOP_K: usize = 5;
 
 /// The integrated Phase 4 memory system.
 ///
@@ -47,6 +56,11 @@ pub struct MemorySystem {
     /// SQLite database. When present, `Global` namespace queries and
     /// writes are routed here instead of the project-scoped stores.
     global_store: Option<Arc<GlobalMemoryStore>>,
+    /// Optional L1 dedup judge (ADR-46 symbolic offload). When set, every
+    /// project-namespace `store` first recalls the top similar chunks and
+    /// asks the judge whether to store / update / merge / skip. Fail-open:
+    /// judge or recall errors store the entry unchanged.
+    dedup_judge: Option<L1DedupJudge>,
 }
 
 impl MemorySystem {
@@ -72,6 +86,7 @@ impl MemorySystem {
             embedder,
             project_id,
             global_store,
+            dedup_judge: None,
         }
     }
     /// Access the decision store.
@@ -107,6 +122,133 @@ impl MemorySystem {
     /// Access the embedder, if configured.
     pub fn embedder(&self) -> Option<&Arc<dyn EmbeddingGenerator>> {
         self.embedder.as_ref()
+    }
+
+    /// Enable the L1 dedup judge for [`MemoryStore::store`] (ADR-46
+    /// symbolic offload).
+    ///
+    /// When configured, every project-namespace `store` first recalls the
+    /// top similar chunks and asks `judge` whether the new entry should be
+    /// stored as-is, skipped (duplicate), stored after superseding an
+    /// existing chunk (`update`), or merged with one (`merge`). The judge is
+    /// extra latency per write and is advisory-only and fail-open: any
+    /// judge / recall error logs a warning and stores the entry unchanged.
+    pub fn with_dedup_judge(mut self, judge: L1DedupJudge) -> Self {
+        self.dedup_judge = Some(judge);
+        self
+    }
+
+    /// Decide how a project-namespace entry relates to already-stored chunks.
+    ///
+    /// Fail-open by construction: without a judge, on cancellation, when
+    /// recall yields no candidates, or when the judge errors, the entry is
+    /// stored unchanged as its own chunk.
+    async fn decide_dedup(
+        &self,
+        entry: &MemoryEntry,
+        vector: &[f32],
+        cancel: CancellationToken,
+    ) -> DedupDecision {
+        let Some(judge) = self.dedup_judge.as_ref() else {
+            return DedupDecision::store(entry, vector);
+        };
+        if cancel.is_cancelled() {
+            return DedupDecision::store(entry, vector);
+        }
+
+        let recalled = self
+            .retriever
+            .recall_candidates(
+                &self.project_id,
+                &entry.content,
+                vector,
+                DEDUP_VECTOR_TOP_K,
+                DEDUP_FTS_TOP_K,
+                cancel.clone(),
+            )
+            .await;
+        if recalled.is_empty() {
+            // Nothing to compare against — no duplication possible.
+            return DedupDecision::store(entry, vector);
+        }
+        let candidates: Vec<L1Candidate> = recalled
+            .into_iter()
+            .map(|candidate| L1Candidate {
+                chunk_id: candidate.chunk_id,
+                content: candidate.content,
+            })
+            .collect();
+
+        let verdict = match judge.judge(&entry.content, &candidates).await {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                tracing::warn!(%error, "l1 dedup judge failed; storing memory unchanged");
+                return DedupDecision::store(entry, vector);
+            }
+        };
+
+        match verdict {
+            L1DedupVerdict::Store => DedupDecision::store(entry, vector),
+            L1DedupVerdict::Skip => DedupDecision::Skip,
+            L1DedupVerdict::Update { target_id } => DedupDecision::Store {
+                content: entry.content.clone(),
+                vector: vector.to_vec(),
+                tombstone_after: Some(target_id),
+            },
+            L1DedupVerdict::Merge { target_id } => {
+                let Some(target) =
+                    candidates.iter().find(|candidate| candidate.chunk_id == target_id)
+                else {
+                    tracing::warn!(
+                        target_id,
+                        "l1 dedup merge target missing from candidates; storing unchanged"
+                    );
+                    return DedupDecision::store(entry, vector);
+                };
+                let merged_content = format!("{}\n{}", entry.content, target.content);
+                let merged_vector = if let Some(embedder) = self.embedder.as_ref() {
+                    match embedder.embed(&merged_content).await {
+                        Ok(embedding) => embedding,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "l1 dedup merge re-embedding failed; keeping original vector"
+                            );
+                            vector.to_vec()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                DedupDecision::Store {
+                    content: merged_content,
+                    vector: merged_vector,
+                    tombstone_after: Some(target_id),
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of the L1 dedup pass for one store call.
+enum DedupDecision {
+    /// The judge ruled the entry is already represented; the store is
+    /// skipped entirely (the existing chunk stays canonical).
+    Skip,
+    /// Write the entry with the given (possibly merged) content/vector, then
+    /// supersede `tombstone_after` — if any — AFTER the write so a failure
+    /// can never leave the only copy of a memory gone.
+    Store { content: String, vector: Vec<f32>, tombstone_after: Option<String> },
+}
+
+impl DedupDecision {
+    /// The default fail-open decision: store the entry unchanged.
+    fn store(entry: &MemoryEntry, vector: &[f32]) -> Self {
+        DedupDecision::Store {
+            content: entry.content.clone(),
+            vector: vector.to_vec(),
+            tombstone_after: None,
+        }
     }
 }
 
@@ -264,13 +406,23 @@ impl MemoryStore for MemorySystem {
             Vec::new()
         };
 
-        let chunk_hash = blake3::hash(entry.content.as_bytes()).to_string();
+        // L1 dedup (ADR-46 symbolic offload): an optional LLM judge decides
+        // store / update / merge / skip against the already-stored chunks.
+        // Fail-open: any judge or recall problem stores the entry unchanged.
+        let decision = self.decide_dedup(&entry, &vector, cancel.clone()).await;
+
+        let DedupDecision::Store { content, vector, tombstone_after } = decision else {
+            // Skip: the judge ruled the entry is already represented.
+            return Ok(entry.id);
+        };
+
+        let chunk_hash = blake3::hash(content.as_bytes()).to_string();
 
         let record = EmbeddingRecord {
             id: entry.id.0.to_string(),
             project_id: self.project_id.clone(),
             chunk_hash,
-            content: entry.content,
+            content,
             file_path: Utf8PathBuf::from("memory"),
             start_line: None,
             end_line: None,
@@ -283,9 +435,17 @@ impl MemoryStore for MemorySystem {
         };
 
         self.sync
-            .store(&record, cancel)
+            .store(&record, cancel.clone())
             .await
             .map_err(|e| CoreMemoryError::Persistence(format!("failed to store memory: {e}")))?;
+
+        // Supersede the replaced/merged chunk ONLY after the write succeeded,
+        // so a tombstone failure is logged-and-kept rather than data loss.
+        if let Some(target_id) = tombstone_after {
+            self.sync.tombstone(&target_id, &self.project_id, cancel).await.map_err(|e| {
+                CoreMemoryError::Persistence(format!("failed to supersede memory {target_id}: {e}"))
+            })?;
+        }
 
         Ok(entry.id)
     }
@@ -409,7 +569,9 @@ fn matches_filters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{InMemoryFullTextStore, InMemoryVectorStore, MockEmbeddingGenerator};
+    use crate::testing::{
+        FakeSummarizer, InMemoryFullTextStore, InMemoryVectorStore, MockEmbeddingGenerator,
+    };
     use concerto_core::error::MemoryError;
     use concerto_core::memory::{ChunkType, MemoryNamespace, VectorResult};
     use std::sync::Mutex;
@@ -652,5 +814,206 @@ mod tests {
         // Without a global store, global queries return empty (not an error)
         let results = system.retrieve(&global, CancellationToken::new()).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // L1 dedup judge (with_dedup_judge)
+    // ---------------------------------------------------------------------
+
+    /// Seed one fact chunk into freshly created in-memory stores, routing the
+    /// write through `ChunkSyncService` so both sides agree on the record.
+    async fn dedup_seed(
+        project_id: &ProjectId,
+        id: &str,
+        content: &str,
+        vector_store: Arc<InMemoryVectorStore>,
+        fts_store: Arc<InMemoryFullTextStore>,
+    ) {
+        let sync = ChunkSyncService::new(vector_store, fts_store);
+        let record = EmbeddingRecord {
+            id: id.into(),
+            project_id: project_id.clone(),
+            chunk_hash: "hash".into(),
+            content: content.into(),
+            file_path: "memory".into(),
+            start_line: None,
+            end_line: None,
+            chunk_type: ChunkType::Fact,
+            vector: vec![0.0; 8],
+            model_id: "test".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        sync.store(&record, CancellationToken::new()).await.unwrap();
+    }
+
+    fn dedup_system(
+        vector_store: Arc<InMemoryVectorStore>,
+        fts_store: Arc<InMemoryFullTextStore>,
+        judge: Option<L1DedupJudge>,
+    ) -> MemorySystem {
+        let system = MemorySystem::new(
+            vector_store,
+            fts_store,
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
+            Some(Arc::new(MockEmbeddingGenerator::new(384))),
+            ProjectId("test".into()),
+            None,
+        );
+        match judge {
+            Some(judge) => system.with_dedup_judge(judge),
+            None => system,
+        }
+    }
+
+    fn dedup_entry(content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: MemoryId(ulid::Ulid::new()),
+            project_id: ProjectId("test".into()),
+            namespace: MemoryNamespace::Project(ProjectId("test".into())),
+            content: content.into(),
+            chunk_type: ChunkType::Fact,
+            model_id: None,
+            model_version: None,
+            metadata: serde_json::json!({}),
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    async fn stored_records(
+        vector_store: &InMemoryVectorStore,
+        project_id: &ProjectId,
+    ) -> Vec<VectorResult> {
+        vector_store.search(project_id, &[0.1; 8], 100, CancellationToken::new()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn store_without_dedup_judge_writes_plainly() {
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        let system = dedup_system(vector_store.clone(), fts_store, None);
+        let entry = dedup_entry("the user prefers rust");
+        let stored = system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(stored, entry.id);
+
+        let records = stored_records(&vector_store, &ProjectId("test".into())).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "the user prefers rust");
+    }
+
+    #[tokio::test]
+    async fn store_skips_near_duplicate_without_writing() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "the user's favorite food is tacos",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "skip", "target_id": null}"#,
+        )));
+        let system = dedup_system(vector_store.clone(), fts_store, Some(judge));
+        let entry = dedup_entry("the user's favorite food is tacos");
+        let stored = system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(stored, entry.id);
+
+        let records = stored_records(&vector_store, &project_id).await;
+        assert_eq!(records.len(), 1, "skip must not write a second chunk");
+        assert_eq!(records[0].chunk_id, "existing-1");
+    }
+
+    #[tokio::test]
+    async fn store_merges_and_tombstones_target() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "the user's preferred color is blue",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "merge", "target_id": "existing-1"}"#,
+        )));
+        let system = dedup_system(vector_store.clone(), fts_store, Some(judge));
+        system
+            .store(dedup_entry("the user's preferred color is teal"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let records = stored_records(&vector_store, &project_id).await;
+        assert_eq!(records.len(), 1, "merge must supersede the target chunk");
+        assert!(records[0].content.contains("teal"));
+        assert!(
+            records[0].content.contains("blue"),
+            "merged content must include the target's content: {}",
+            records[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn store_update_tombstones_target() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "the user's favorite city is london",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "update", "target_id": "existing-1"}"#,
+        )));
+        let system = dedup_system(vector_store.clone(), fts_store, Some(judge));
+        system
+            .store(dedup_entry("the user's favorite city is paris"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let records = stored_records(&vector_store, &project_id).await;
+        assert_eq!(records.len(), 1, "update must supersede the target chunk");
+        assert_eq!(records[0].content, "the user's favorite city is paris");
+        assert!(!records[0].content.contains("london"));
+    }
+
+    #[tokio::test]
+    async fn store_falls_back_to_plain_insert_on_judge_error() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "a pre-existing fact",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new_err("judge down")));
+        let system = dedup_system(vector_store.clone(), fts_store, Some(judge));
+        system.store(dedup_entry("an entirely new fact"), CancellationToken::new()).await.unwrap();
+
+        // Fail-open: the judge's error must not drop the memory.
+        let records = stored_records(&vector_store, &project_id).await;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|r| r.content == "an entirely new fact"));
     }
 }

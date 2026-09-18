@@ -35,3 +35,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 time = { workspace = true }
+# Guard test (tests/persona_mem_recall.rs) provisions its own scratch SQLite
+# database to exercise the real SqliteVectorStore + SqliteFullTextStore, and
+# mints fresh MemoryIds. Both reuse existing workspace pins.
+sqlx = { workspace = true }
+ulid = { workspace = true }
