@@ -43,6 +43,10 @@ type AckSender = tokio::sync::oneshot::Sender<bool>;
 /// A pending acknowledgement request — shown when git undo is unavailable.
 #[derive(Debug)]
 pub struct PendingAck {
+    /// Session the ack belongs to, so resolution can confirm membership
+    /// without consulting the executor (ADR-68, audit H-04). A cross-session
+    /// or stale resolution can never answer a different run's ack.
+    pub session_id: Ulid,
     pub message: String,
     pub sender: AckSender,
 }
@@ -96,11 +100,22 @@ pub fn ack_view(state: &SharedPendingAck) -> Option<Element<'static, AckDialogMe
 }
 
 /// Apply a user decision to the pending ack state.
-pub fn resolve_ack(state: &SharedPendingAck, acknowledged: bool) -> bool {
+///
+/// Resolves the pending ack — but only when it belongs to `session_id`: a
+/// stale or cross-session entry must never answer a different run's prompt
+/// (ADR-68, audit H-04). A non-matching entry is left in place. Returns `true`
+/// when the matching entry was resolved.
+pub fn resolve_ack(state: &SharedPendingAck, session_id: Ulid, acknowledged: bool) -> bool {
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pending) = guard.take() else {
         return false;
     };
+    if pending.session_id != session_id {
+        // A different (stale/cross-session) entry reached the slot — never
+        // answer it; restore it so the owning session still sees its dialog.
+        *guard = Some(pending);
+        return false;
+    }
     let _ = pending.sender.send(acknowledged);
     true
 }
@@ -552,5 +567,42 @@ mod tests {
     fn relative_age_future_timestamp_does_not_underflow() {
         let created = OffsetDateTime::now_utc() + time::Duration::seconds(120);
         assert_eq!(relative_age(created), "made just now");
+    }
+
+    #[test]
+    fn resolve_ack_matching_session_delivers_decision() {
+        let state = shared_pending_ack();
+        let session_id = Ulid::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        *state.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(PendingAck { session_id, message: "warning".into(), sender: tx });
+
+        assert!(resolve_ack(&state, session_id, true), "matching session must resolve");
+        assert_eq!(rx.blocking_recv(), Ok(true));
+        assert!(
+            state.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "resolved ack must leave the slot empty"
+        );
+    }
+
+    #[test]
+    fn resolve_ack_wrong_session_leaves_pending() {
+        let state = shared_pending_ack();
+        let owning_session = Ulid::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        *state.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(PendingAck { session_id: owning_session, message: "warning".into(), sender: tx });
+
+        // A different session's resolution must never answer this ack
+        // (ADR-68, audit H-04).
+        assert!(!resolve_ack(&state, Ulid::new(), false), "cross-session resolve must be rejected");
+        assert!(
+            state.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            "the owning session's ack must stay pending"
+        );
+
+        // The owner can still resolve it.
+        assert!(resolve_ack(&state, owning_session, false), "the owner resolve succeeds");
+        assert_eq!(rx.blocking_recv(), Ok(false));
     }
 }

@@ -152,7 +152,6 @@ async fn main() {
                         10,    // max_iterations
                         false, // fast mode
                         project_dir,
-                        None, // overflow_strategy
                         None, // budget_allocator
                     );
 
@@ -387,7 +386,12 @@ impl concerto_core::traits::approval::ApprovalSink for AllowAllApprovalSink {
     ) {
     }
 
-    async fn request_ack(&self, _message: &str, _cancel: concerto_core::CancellationToken) -> bool {
+    async fn request_ack(
+        &self,
+        _session_id: concerto_core::ids::Ulid,
+        _message: &str,
+        _cancel: concerto_core::CancellationToken,
+    ) -> bool {
         true
     }
 }

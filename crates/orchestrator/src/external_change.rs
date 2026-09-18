@@ -132,6 +132,86 @@ pub fn diff_workspace_entries(previous: &[SnapshotEntry], fresh: &[SnapshotEntry
     changed
 }
 
+/// One planned-artifact drift finding (Phase 6 M3c).
+///
+/// A *plan drift* is an artifact the plan expects to exist but that is absent
+/// from the live workspace, where the run's own recorded writes do not explain
+/// the absence. It is deliberately distinct from an
+/// [`ExternalChangeRecord`]: F3 reports divergences of *observed* paths
+/// (content/size/mtime changed, or an observed file vanished); plan drift
+/// reports the planned-but-absent class — a planned artifact the interrupted
+/// run never materialised, or one externally removed without ever being
+/// recorded as a run write. A path explained by the run's own writes is F3's
+/// domain and is never double-reported here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDrift {
+    /// The plan artifact id (`plan-<plan_id>.json`) this drift is scoped to;
+    /// `None` when the checkpoint carried no plan id. Additive field —
+    /// consumers must not rely on it being present.
+    pub plan_id: Option<String>,
+    /// Project-root-relative forward-slash paths the plan expected but that
+    /// are absent from the live inventory and unexplained by the run's own
+    /// writes. Sorted and deduplicated.
+    pub affected_paths: Vec<String>,
+}
+
+impl PlanDrift {
+    /// Whether any planned artifact drifted.
+    pub fn is_empty(&self) -> bool {
+        self.affected_paths.is_empty()
+    }
+}
+
+/// Compare the plan's expected artifacts against the live workspace inventory
+/// (Phase 6 M3c, gate `plan_drift_detected_on_tampered_worktree`).
+///
+/// `expected` are the plan-declared artifact paths (project-root-relative);
+/// `live` is the current [`SnapshotEntry`] inventory; `own_written` holds the
+/// canonical project-root-relative paths the run recorded writing (the same
+/// write set the F3 reconciliation excludes). An expected path drifts when it
+/// is absent from `live` AND not in `own_written`.
+///
+/// Non-file expectations (empty, directory — trailing `/` — or glob patterns)
+/// cannot be verified against a file inventory and are skipped rather than
+/// reported as false drift.
+pub fn detect_plan_drift(
+    plan_id: Option<&str>,
+    expected: &[camino::Utf8PathBuf],
+    live: &[SnapshotEntry],
+    own_written: &std::collections::HashSet<String>,
+) -> PlanDrift {
+    let live_paths: std::collections::HashSet<&str> =
+        live.iter().map(|entry| entry.path.as_str()).collect();
+
+    let mut affected: Vec<String> = Vec::new();
+    for path in expected {
+        let normalized = normalize_relative_path(path.as_str());
+        if normalized.is_empty()
+            || normalized.ends_with('/')
+            || normalized.contains('*')
+            || normalized.contains('?')
+        {
+            // Not a concrete file path; the inventory cannot speak to it.
+            continue;
+        }
+        if live_paths.contains(normalized.as_str()) || own_written.contains(&normalized) {
+            continue;
+        }
+        affected.push(normalized);
+    }
+    affected.sort();
+    affected.dedup();
+    PlanDrift { plan_id: plan_id.map(str::to_owned), affected_paths: affected }
+}
+
+/// Normalize a workspace-relative path for inventory comparison: forward
+/// slashes only, no leading `./`. The snapshot inventory stores paths in this
+/// canonical form.
+fn normalize_relative_path(path: &str) -> String {
+    let slash_normalized = path.replace('\\', "/");
+    slash_normalized.strip_prefix("./").unwrap_or(&slash_normalized).to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +312,83 @@ mod tests {
         assert_ne!(a.id, b.id, "each record carries a unique id");
         assert_eq!(a.first_path(), Some("src/a.rs"));
         assert!(!a.conflicts_with_coordinator_work());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 6 M3c — plan drift
+    // ------------------------------------------------------------------
+
+    fn expected(paths: &[&str]) -> Vec<camino::Utf8PathBuf> {
+        paths.iter().map(camino::Utf8PathBuf::from).collect()
+    }
+
+    #[test]
+    fn plan_drift_reports_planned_but_absent_artifacts() {
+        let live = vec![entry("src/present.rs", Some(1), Some(1), Some("h"))];
+        let own = std::collections::HashSet::new();
+        let drift = detect_plan_drift(
+            Some("plan-1"),
+            &expected(&["src/present.rs", "src/never_written.rs"]),
+            &live,
+            &own,
+        );
+        assert_eq!(drift.plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(drift.affected_paths, vec!["src/never_written.rs".to_owned()]);
+        assert!(!drift.is_empty());
+    }
+
+    #[test]
+    fn plan_drift_is_never_empty_when_every_artifact_present() {
+        let live = vec![
+            entry("src/a.rs", Some(1), Some(1), Some("h")),
+            entry("src/b.rs", Some(2), Some(2), Some("h2")),
+        ];
+        let own = std::collections::HashSet::new();
+        let drift =
+            detect_plan_drift(Some("plan-1"), &expected(&["src/a.rs", "src/b.rs"]), &live, &own);
+        assert!(drift.is_empty());
+        assert!(drift.affected_paths.is_empty());
+    }
+
+    #[test]
+    fn plan_drift_excludes_paths_explained_by_the_runs_own_writes() {
+        // The run recorded writing `src/mine.rs`; its absence is F3's external
+        // change to report, never a duplicate plan-drift finding.
+        let live: Vec<SnapshotEntry> = vec![];
+        let own: std::collections::HashSet<String> =
+            ["src/mine.rs".to_owned()].into_iter().collect();
+        let drift = detect_plan_drift(
+            Some("plan-1"),
+            &expected(&["src/mine.rs", "src/other.rs"]),
+            &live,
+            &own,
+        );
+        assert_eq!(drift.affected_paths, vec!["src/other.rs".to_owned()]);
+    }
+
+    #[test]
+    fn plan_drift_skips_non_file_expectations() {
+        let live: Vec<SnapshotEntry> = vec![entry("src/a.rs", Some(1), Some(1), Some("h"))];
+        let own = std::collections::HashSet::new();
+        let drift = detect_plan_drift(
+            Some("plan-1"),
+            &expected(&["src/", "src/*.rs", "src/a.rs", ""]),
+            &live,
+            &own,
+        );
+        assert!(drift.is_empty(), "directories, globs, and empty paths are not drift");
+    }
+
+    #[test]
+    fn plan_drift_normalizes_leading_dot_slash_and_backslashes() {
+        let live: Vec<SnapshotEntry> = vec![entry("src/a.rs", Some(1), Some(1), Some("h"))];
+        let own = std::collections::HashSet::new();
+        let drift = detect_plan_drift(
+            Some("plan-1"),
+            &expected(&["./src/a.rs", ".\\src\\b.rs"]),
+            &live,
+            &own,
+        );
+        assert_eq!(drift.affected_paths, vec!["src/b.rs".to_owned()]);
     }
 }

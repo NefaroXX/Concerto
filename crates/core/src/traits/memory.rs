@@ -42,6 +42,18 @@ pub trait MemoryStore: Send + Sync {
         let ulid = Ulid::from_string(id).map_err(|_| MemoryError::NotFound(id.to_string()))?;
         self.invalidate(MemoryId(ulid), cancel).await
     }
+
+    /// Whether this store carries an ADR-69 symbolic link store.
+    ///
+    /// Fail-open by construction: `false` for stores without one, so tests
+    /// that do not opt in keep fanning out plain. Implementations with a
+    /// link store override to `true`, so the production init path can be
+    /// asserted through an `Arc<dyn MemoryStore>` handle without downcasting
+    /// to the concrete system (the memory crate's `MemorySystem` reports the
+    /// presence of the link store its builder attached).
+    fn link_store_attached(&self) -> bool {
+        false
+    }
 }
 
 /// A memory store that does nothing — always returns empty results and

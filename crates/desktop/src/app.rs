@@ -120,6 +120,7 @@ pub enum Message {
     Chat(views::chat::Message),
     Diff(views::diff::Message),
     Memory(views::memory::Message),
+    MemoryGraph(views::memory_graph::Message),
     ToolLog(views::tool_log::Message),
     Settings(views::settings::Message),
     AgentGraph(views::agent_graph::Message),
@@ -195,6 +196,11 @@ pub enum Message {
         id: String,
         result: Result<(), String>,
     },
+    /// ADR-69 slice 3 — the memory graph modal's load task finished.
+    MemoryGraphLoaded(Result<concerto_memory::mermaid::MemoryGraph, String>),
+    /// Open / close the read-only memory graph modal (from the Memory modal).
+    OpenMemoryGraph,
+    CloseMemoryGraph,
     /// A session was picked from the picker; carries the loaded history so the
     /// chat can be seeded with the resumed conversation. `transcript` is the
     /// durable typed transcript (ADR-36) and takes precedence over `history`
@@ -271,6 +277,7 @@ pub struct App {
     pub chat: views::chat::State,
     pub diff: views::diff::State,
     pub memory: views::memory::State,
+    pub memory_graph: views::memory_graph::State,
     pub tool_log: views::tool_log::State,
     pub settings: views::settings::State,
     pub agent_graph: views::agent_graph::State,
@@ -361,6 +368,8 @@ pub struct App {
     pub quick_panel_open: bool,
     /// Whether the Memory explorer modal is open.
     pub memory_view_open: bool,
+    /// Whether the read-only memory graph modal (ADR-69 slice 3) is open.
+    pub memory_graph_open: bool,
     /// Whether the toggleable terminal bottom panel is visible.
     pub terminal_panel_open: bool,
     /// Current height (logical px) of the terminal bottom panel.
@@ -793,6 +802,7 @@ impl App {
             chat: views::chat::State::new(),
             diff: views::diff::State::new(),
             memory: views::memory::State::new(),
+            memory_graph: views::memory_graph::State::new(),
             tool_log: views::tool_log::State::new(),
             settings: {
                 let cfg = global_config.clone();
@@ -836,6 +846,7 @@ impl App {
             save_feedback_generation: 0,
             quick_panel_open: true,
             memory_view_open: false,
+            memory_graph_open: false,
             terminal_panel_open: false,
             terminal_panel_height: 260.0,
             terminal_resizing: false,
@@ -1689,8 +1700,19 @@ impl App {
                 iced::Task::none()
             }
             Message::AckDialog(msg) => {
-                let acknowledged = matches!(msg, capability_dialog::AckDialogMessage::Acknowledge);
-                capability_dialog::resolve_ack(&self.pending_ack, acknowledged);
+                // Resolve only the ack that is actually displayed: capture the
+                // pending ack's session identity so a stale or cross-session
+                // entry can never answer a different run's prompt (ADR-68,
+                // audit H-04).
+                let session_id = {
+                    let guard = self.pending_ack.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.as_ref().map(|ack| ack.session_id)
+                };
+                if let Some(session_id) = session_id {
+                    let acknowledged =
+                        matches!(msg, capability_dialog::AckDialogMessage::Acknowledge);
+                    capability_dialog::resolve_ack(&self.pending_ack, session_id, acknowledged);
+                }
                 iced::Task::none()
             }
             Message::IntentDialog(msg) => {
@@ -1891,6 +1913,28 @@ impl App {
                 self.memory_view_open = false;
                 iced::Task::none()
             }
+            Message::OpenMemoryGraph => {
+                self.memory_graph_open = true;
+                self.memory_graph = views::memory_graph::State::Loading;
+                self.load_memory_graph()
+            }
+            Message::CloseMemoryGraph => {
+                self.memory_graph_open = false;
+                iced::Task::none()
+            }
+            Message::MemoryGraph(msg) => match msg {
+                views::memory_graph::Message::Refresh => {
+                    self.memory_graph = views::memory_graph::State::Loading;
+                    self.load_memory_graph()
+                }
+            },
+            Message::MemoryGraphLoaded(result) => {
+                match result {
+                    Ok(graph) => self.memory_graph = views::memory_graph::State::Loaded(graph),
+                    Err(error) => self.memory_graph = views::memory_graph::State::Error(error),
+                }
+                iced::Task::none()
+            }
             Message::ToggleTerminalPanel => {
                 self.terminal_panel_open = !self.terminal_panel_open;
                 // Kick off the slide animation; `AnimTick` eases the panel
@@ -2077,6 +2121,8 @@ impl App {
                 self.show_help = false;
                 // Esc also dismisses the Memory explorer modal.
                 self.memory_view_open = false;
+                // ...and the read-only memory graph modal (ADR-69 slice 3).
+                self.memory_graph_open = false;
                 // Esc dismisses the Runtime panels modal (memory-modal parity;
                 // the Diff / Tool Log overlays stay close-button-only).
                 if self.page == Page::Chat && self.chat.sub_view == views::chat::SubView::Runtime {
@@ -3237,6 +3283,8 @@ impl App {
                                         reindex_sync: sync.clone(),
                                         cancel: cancel.clone(),
                                         data_dir_lock,
+                                        decision_store: None,
+                                        task_tree: None,
                                     };
                                     *memory.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(active);
@@ -3270,6 +3318,31 @@ impl App {
                 }
             },
             Message::ReindexResult,
+        )
+    }
+
+    /// Load the project's memory graph from `<app data>/memory/memory.db`
+    /// (read-only, ADR-69 slice 3). `MemoryError`s and a missing db both land
+    /// as `MemoryGraphLoaded(Err)` / an empty graph, never a panic.
+    fn load_memory_graph(&self) -> iced::Task<Message> {
+        let project_dir = self.project_dir.clone();
+        iced::Task::perform(
+            async move {
+                let db_path = match concerto_sessions::app_data_dir() {
+                    Ok(dir) => dir.join("memory").join("memory.db"),
+                    Err(e) => return Err(format!("could not resolve app data dir: {e}")),
+                };
+                let project_id = concerto_core::memory::ProjectId(project_id_hash(&project_dir));
+                concerto_memory::mermaid::load_memory_graph(
+                    &db_path,
+                    &project_id,
+                    200,
+                    CancellationToken::new(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            },
+            Message::MemoryGraphLoaded,
         )
     }
 
@@ -3356,6 +3429,8 @@ impl App {
                         reindex_sync,
                         cancel,
                         data_dir_lock,
+                        decision_store: None,
+                        task_tree: None,
                     };
                     *memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
                     store
@@ -4075,6 +4150,46 @@ impl App {
                     ..container::Style::default()
                 });
             stack![after_subview, backdrop].into()
+        } else if self.memory_graph_open {
+            // Read-only memory graph modal (ADR-69 slice 3). Rendered before
+            // the Memory explorer branch so it sits on top when opened from
+            // the Explorer's header button.
+            let graph_content =
+                self.memory_graph.modal_view(&self.current_theme).map(Message::MemoryGraph);
+            let modal = container(
+                column![
+                    row![
+                        text("Memory Graph").size(18).width(Length::Fill),
+                        button(text("↻").size(14))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::MemoryGraph(views::memory_graph::Message::Refresh)),
+                        button(text("✕").size(14))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::CloseMemoryGraph),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    graph_content,
+                ]
+                .spacing(10)
+                .padding(20)
+                .width(Length::Fill),
+            )
+            .width(Length::FillPortion(2))
+            .height(Length::FillPortion(2))
+            .style(crate::ui::container::modal);
+            let backdrop = container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.55,
+                        ..self.current_theme.palette.background
+                    })),
+                    ..container::Style::default()
+                });
+            stack![after_subview, backdrop].into()
         } else if self.memory_view_open {
             // Memory explorer modal (issue #110). Composed via the same
             // system-dialog stack mechanism as the dir picker / capability /
@@ -4085,6 +4200,9 @@ impl App {
                 column![
                     row![
                         text("Memory").size(18).width(Length::Fill),
+                        button(text("⇄ Graph").size(13))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::OpenMemoryGraph),
                         button(text("✕").size(14))
                             .style(crate::ui::button::secondary)
                             .on_press(Message::CloseMemoryModal),
@@ -4414,7 +4532,12 @@ impl ApprovalSink for DesktopApprovalSink {
         self.auto_approve.store(true, Ordering::Relaxed);
     }
 
-    async fn request_ack(&self, message: &str, _cancel: CancellationToken) -> bool {
+    async fn request_ack(
+        &self,
+        session_id: Ulid,
+        message: &str,
+        _cancel: CancellationToken,
+    ) -> bool {
         // Fast path: auto-approve if enabled (mirrors the CLI sink).
         if self.auto_approve.load(Ordering::Relaxed) {
             return true;
@@ -4423,14 +4546,31 @@ impl ApprovalSink for DesktopApprovalSink {
 
         {
             let mut guard = self.pending_ack.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_some() {
+                // ADR-68 H-04 single-slot decision (this phase): the desktop
+                // renders one ack dialog at a time. A second concurrent ack is
+                // rejected as "busy" — the requester sees `false` (abort the
+                // task) and the conflict is logged. ADR-68 §6 records a bounded
+                // per-session queue as the follow-up; reject-busy avoids
+                // redesigning the shared cell here.
+                tracing::warn!(
+                    ?session_id,
+                    "request_ack rejected: another ack dialog is already pending (desktop is \
+                     single-slot; ADR-68 H-04)"
+                );
+                return false;
+            }
             *guard = Some(crate::widgets::capability_dialog::PendingAck {
+                session_id,
                 message: message.to_string(),
                 sender: tx,
             });
         }
 
         // Surface the pending ack to the UI via the event bus so Iced redraws.
-        // Global event: intentionally unscoped (ack carries no session id).
+        // Global event: the ack dialog is a single shared slot, so any window
+        // shows it; the pending entry now carries `session_id` so resolution
+        // is routed by session membership (`resolve_ack`).
         let _ = self.bus.publish_raw(concerto_core::event::EventKind::ApprovalRequested {
             tool_name: "ack".to_string(),
             timeout_secs: 0,
@@ -5675,6 +5815,40 @@ custom_agents = []
         assert!(app.memory_view_open);
     }
 
+    /// OpenMemoryGraph opens the read-only graph modal; CloseMemoryGraph
+    /// closes it (ADR-69 slice 3).
+    #[test]
+    fn memory_graph_modal_opens_and_closes() {
+        let (mut app, _) = App::new();
+        assert!(!app.memory_graph_open);
+        let _ = app.update(Message::OpenMemoryGraph);
+        assert!(app.memory_graph_open);
+        let _ = app.update(Message::CloseMemoryGraph);
+        assert!(!app.memory_graph_open);
+    }
+
+    /// Esc (Shortcut::CancelDialog) dismisses the memory graph modal.
+    #[test]
+    fn escape_closes_the_memory_graph_modal() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::OpenMemoryGraph);
+        assert!(app.memory_graph_open);
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::CancelDialog));
+        assert!(!app.memory_graph_open);
+    }
+
+    /// MemoryGraphLoaded routes a load result into the graph view state.
+    #[test]
+    fn memory_graph_loaded_routes_into_state() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::MemoryGraphLoaded(Ok(
+            concerto_memory::mermaid::MemoryGraph::default(),
+        )));
+        assert!(matches!(app.memory_graph, crate::views::memory_graph::State::Loaded(_)));
+        let _ = app.update(Message::MemoryGraphLoaded(Err("boom".into())));
+        assert!(matches!(app.memory_graph, crate::views::memory_graph::State::Error(_)));
+    }
+
     /// Esc (Shortcut::CancelDialog) dismisses the memory modal.
     #[test]
     fn escape_closes_the_memory_modal() {
@@ -6876,8 +7050,98 @@ custom_agents = []
             bus: EventBus::default(),
         };
         let cancel = CancellationToken::new();
-        let ack = sink.request_ack("some warning", cancel).await;
+        let ack = sink.request_ack(Ulid::new(), "some warning", cancel).await;
         assert!(ack, "request_ack must return true when auto-approve is on");
+    }
+
+    /// Wait until the spawn sink future has installed the pending ack so the
+    /// test resolves it without racing the spawn. Bounded so a broken sink
+    /// fails the test instead of hanging forever.
+    async fn wait_for_pending_ack(shared: &crate::widgets::capability_dialog::SharedPendingAck) {
+        for _ in 0..500 {
+            if shared.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("ack request never queued a dialog");
+    }
+
+    #[tokio::test]
+    async fn approval_sink_request_ack_forwards_session_id() {
+        let cap_pending = crate::widgets::capability_dialog::shared_pending();
+        let pending_ack = crate::widgets::capability_dialog::shared_pending_ack();
+        let sink = DesktopApprovalSink {
+            cap_pending: cap_pending.clone(),
+            pending_ack: pending_ack.clone(),
+            pending_intent: crate::widgets::capability_dialog::shared_pending_intent(),
+            pending_plan: crate::widgets::capability_dialog::shared_pending_plan(),
+            auto_approve: Arc::new(AtomicBool::new(false)),
+            bus: EventBus::default(),
+        };
+        let session_id = Ulid::new();
+        let cancel = CancellationToken::new();
+
+        let sink2 = sink.clone();
+        let handle =
+            tokio::spawn(
+                async move { sink2.request_ack(session_id, "some warning", cancel).await },
+            );
+        wait_for_pending_ack(&pending_ack).await;
+
+        // The pending ack carries the requesting session id so resolution can
+        // confirm membership (ADR-68, audit H-04).
+        let pending_session = {
+            let guard = pending_ack.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().expect("ack must be pending").session_id
+        };
+        assert_eq!(pending_session, session_id, "pending ack must carry the session id");
+
+        assert!(
+            crate::widgets::capability_dialog::resolve_ack(&pending_ack, session_id, true),
+            "matching-session resolve must succeed"
+        );
+        assert!(handle.await.expect("ack task panicked"), "an approved ack continues");
+        assert!(
+            pending_ack.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "after resolve no ack should be pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_sink_request_ack_rejects_when_busy() {
+        let cap_pending = crate::widgets::capability_dialog::shared_pending();
+        let pending_ack = crate::widgets::capability_dialog::shared_pending_ack();
+        let sink = DesktopApprovalSink {
+            cap_pending: cap_pending.clone(),
+            pending_ack: pending_ack.clone(),
+            pending_intent: crate::widgets::capability_dialog::shared_pending_intent(),
+            pending_plan: crate::widgets::capability_dialog::shared_pending_plan(),
+            auto_approve: Arc::new(AtomicBool::new(false)),
+            bus: EventBus::default(),
+        };
+        let cancel = CancellationToken::new();
+
+        // First request occupies the single ack slot.
+        let first_session = Ulid::new();
+        let sink_first = sink.clone();
+        let cancel_first = cancel.clone();
+        let first = tokio::spawn(async move {
+            sink_first.request_ack(first_session, "first warning", cancel_first).await
+        });
+        wait_for_pending_ack(&pending_ack).await;
+
+        // A second concurrent ack (any session) is rejected as busy without
+        // overwriting the pending one; the requester sees `false` (abort).
+        let second = sink.request_ack(Ulid::new(), "second warning", cancel.clone()).await;
+        assert!(!second, "concurrent ack while busy must be rejected");
+
+        // The owner can still resolve its ack.
+        assert!(
+            crate::widgets::capability_dialog::resolve_ack(&pending_ack, first_session, true),
+            "the owner's ack must still resolve"
+        );
+        assert!(first.await.expect("first ack task panicked"), "the first ack continues");
     }
 
     #[tokio::test]

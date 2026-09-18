@@ -254,7 +254,9 @@ pub struct CheckpointSubTask {
     pub dependencies: Vec<TaskId>,
     pub deliverable: Option<String>,
     /// Original creation time of the task.  `None` on v2 records (which did
-    /// not capture timestamps); restore falls back to "now" in that case.
+    /// not capture timestamps); restore marks v2-origin records' creation
+    /// time UNKNOWN (deterministic `UNIX_EPOCH`) instead of fabricating the
+    /// current wall clock.
     #[serde(default)]
     pub created_at: Option<OffsetDateTime>,
     /// Original completion time, if the task completed before the checkpoint.
@@ -268,6 +270,13 @@ pub struct CheckpointSubTask {
 pub struct GraphCheckpoint {
     #[serde(default = "current_schema_version")]
     pub schema_version: u32,
+    /// Transient in-process flag: this checkpoint was loaded from a v2
+    /// record (which captured no per-task timestamps). Never serialized or
+    /// deserialized; set by [`GraphCheckpoint::migrate_schema`] when the
+    /// source record predates v3. Restore consults it to mark v2-origin
+    /// creation times UNKNOWN instead of stamping `now`.
+    #[serde(skip)]
+    pub v2_origin: bool,
     #[serde(default = "concerto_core::ids::Ulid::new")]
     pub run_id: concerto_core::ids::Ulid,
     #[serde(default = "concerto_core::ids::Ulid::new")]
@@ -454,6 +463,11 @@ impl GraphCheckpoint {
                 // v2 -> v4: the same additive-default path (design_doc,
                 // model_assignments, action_ledger, per-task timestamps, and
                 // the §7 fields all default). Bump so a resave is canonical.
+                // Record the v2 origin so restore marks the per-task creation
+                // times UNKNOWN instead of fabricating "now" (§5 — a v2
+                // record genuinely has no creation-time facts, and a made-up
+                // wall clock would misattribute progress history).
+                self.v2_origin = true;
                 self.schema_version = GRAPH_CHECKPOINT_SCHEMA_VERSION;
                 Ok(())
             }
@@ -529,10 +543,12 @@ impl From<&SubTask> for CheckpointSubTask {
 
 impl CheckpointSubTask {
     /// Convert back into a `SubTask`, preserving the original timestamps so a
-    /// resume does not reset progress history.  v2 records (which did not
-    /// capture timestamps) fall back to `now` for `created_at` and keep
-    /// `completed_at` as `None` since we are resuming.
-    pub fn into_subtask(self) -> SubTask {
+    /// resume does not reset progress history. v2 records (which did not
+    /// capture timestamps) have NO creation-time fact — instead of fabricating
+    /// the current wall clock (#5), their `created_at` is marked with the
+    /// deterministic UNKNOWN sentinel `UNIX_EPOCH` when the checkpoint was
+    /// v2-origin. `completed_at` stays `None` since we are resuming.
+    pub fn into_subtask(self, v2_origin: bool) -> SubTask {
         SubTask {
             id: self.id,
             parent_id: self.parent_id,
@@ -542,7 +558,15 @@ impl CheckpointSubTask {
             status: self.status,
             dependencies: self.dependencies,
             deliverable: self.deliverable,
-            created_at: self.created_at.unwrap_or_else(OffsetDateTime::now_utc),
+            created_at: if v2_origin {
+                // A deterministic "unknown" marker that is never confused
+                // with the run's actual start time. Consumers sorting by
+                // created_at see these records as pre-run (epoch), which is
+                // the truthful reading for a record that carries no time.
+                OffsetDateTime::UNIX_EPOCH
+            } else {
+                self.created_at.unwrap_or_else(OffsetDateTime::now_utc)
+            },
             completed_at: self.completed_at,
         }
     }
@@ -576,6 +600,8 @@ pub fn build_checkpoint(
 
     GraphCheckpoint {
         schema_version: GRAPH_CHECKPOINT_SCHEMA_VERSION,
+        // A freshly built checkpoint is canonical v4 — never v2-origin.
+        v2_origin: false,
         run_id: scope.run_id,
         session_id: scope.session_id,
         root_task_id: scope.root_task_id,
@@ -684,7 +710,7 @@ pub fn restore_graph(cp: &GraphCheckpoint) -> Result<TaskGraph, OrchestratorErro
     // lists a dependency on a task absent from the checkpoint is corrupt —
     // reject it rather than resuming with a silently truncated dependency set.
     for cst in &cp.subtasks {
-        let mut st = cst.clone().into_subtask();
+        let mut st = cst.clone().into_subtask(cp.v2_origin);
         if st.status == SubTaskStatus::Running {
             st.status = SubTaskStatus::Pending;
         }
@@ -1331,7 +1357,7 @@ mod tests {
         assert_eq!(cst.id, original.id);
         assert_eq!(cst.description, "implement login");
 
-        let restored = cst.into_subtask();
+        let restored = cst.into_subtask(false);
         assert_eq!(restored.id, original.id);
         assert_eq!(restored.description, original.description);
         assert_eq!(restored.status, original.status);
@@ -1343,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_subtask_without_timestamps_falls_back_to_now() {
+    fn v2_subtask_without_timestamps_marks_creation_unknown() {
         let cst = CheckpointSubTask {
             id: TaskId::new(),
             parent_id: None,
@@ -1357,9 +1383,21 @@ mod tests {
             created_at: None,
             completed_at: None,
         };
-        let restored = cst.into_subtask();
-        assert!(restored.created_at.unix_timestamp() > 0, "v2 created_at falls back to now");
+        // A v2-origin record cannot know when the task was created. It must
+        // NOT be stamped with the current wall clock (that would misattribute
+        // progress history); the deterministic UNKNOWN sentinel is used.
+        let restored = cst.clone().into_subtask(true);
+        assert_eq!(
+            restored.created_at,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "v2 created_at is marked unknown, never fabricated as now"
+        );
         assert!(restored.completed_at.is_none(), "v2 completed_at stays None");
+
+        // Non-v2 records that nevertheless lack a timestamp keep the
+        // defensive now-fallback (should not occur for v3+ writers).
+        let restored = cst.into_subtask(false);
+        assert!(restored.created_at.unix_timestamp() > 0, "non-v2 fallback is now");
     }
 
     // ------------------------------------------------------------------
@@ -1571,13 +1609,15 @@ mod tests {
         // results.
         //
         // Known divergence (documented in docs/audits/AUDIT_FINDINGS_CURRENT.md,
-        // C-05): `model_assignments` captured in a checkpoint lags one batch —
-        // the coordinator inserts each task's assignment only after its
-        // batch's results are processed, so a checkpoint taken mid-run
-        // captures assignments up to the previous batch. That lag is NOT
-        // fixed here; we assert that whatever assignments ARE captured
-        // round-trip exactly. (Resume re-selects models, so the lag is
-        // informational.)
+        // C-05): `model_assignments` are stamped at PERSIST time from the
+        // authoritative run ledger in `CoordinatorAgent::persist_checkpoint`,
+        // so a persisted checkpoint cannot lag the ledger by a batch. A
+        // pre-batch (progress) checkpoint is by construction a consistent cut
+        // that excludes the still-in-flight batch's assignments — those tasks
+        // are re-dispatched on resume — while the post-batch checkpoint
+        // carries the full ledger. Here (unit level) we assert that whatever
+        // assignments ARE captured round-trip exactly. (Resume re-selects
+        // models, so any pre-batch residual is informational.)
         let mut graph = TaskGraph::new();
 
         // Fixed timestamps so the round-trip is exact — never "now".
@@ -1753,10 +1793,11 @@ mod tests {
         assert_eq!(restored.get(&failed_id).unwrap().status, SubTaskStatus::Failed);
         assert_eq!(restored.get(&blocked_id).unwrap().status, SubTaskStatus::Blocked);
 
-        // Completion timestamps exact — v3 round-trips, never fallback-now.
-        // (v2 records carry no timestamps and fall back to `now` on restore;
-        // that documented fallback is covered by
-        // `v2_subtask_without_timestamps_falls_back_to_now` and
+        // Completion timestamps exact — v3+ round-trips, never fallback-now.
+        // (v2 records carry no timestamps; restore marks their creation time
+        // UNKNOWN — the deterministic `UNIX_EPOCH` sentinel — instead of
+        // fabricating the current wall clock. That contract is covered by
+        // `v2_subtask_without_timestamps_marks_creation_unknown` and
         // `v2_record_loads_under_v3_policy_with_defaults`.)
         assert_eq!(restored.get(&done_id).unwrap().created_at, t_created);
         assert_eq!(restored.get(&done_id).unwrap().completed_at, Some(t_completed));
@@ -1942,7 +1983,11 @@ mod tests {
         assert_eq!(restored.len(), 1);
         let task = restored.all_tasks()[0];
         assert_eq!(task.status, SubTaskStatus::Completed);
-        assert!(task.created_at.unix_timestamp() > 0, "restore falls back to now for v2");
+        assert_eq!(
+            task.created_at,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "v2 records carry no timestamps — the restored task marks creation unknown"
+        );
 
         // The migration is also honored by scope validation (defense in depth).
         assert!(loaded.validate_scope(loaded.session_id, "test").is_ok());

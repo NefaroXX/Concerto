@@ -19,6 +19,7 @@ use crate::plan_approval::{
     PlanApprovedPayload, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
+use crate::services::ProviderSummarizer;
 use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
@@ -448,8 +449,12 @@ fn read_only_fallback_message(outcome: RequestedOutcome, route: &RouterRoute) ->
 const DEFAULT_MAX_ITERATIONS: u32 = 25;
 use concerto_eval::EvalEngine;
 use concerto_memory::embedder::{EmbeddingGenerator, ProviderEmbedder};
+use concerto_memory::entities::L1DedupJudge;
 use concerto_memory::fts::SqliteFullTextStore;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
+use concerto_memory::links::LinkStore;
+use concerto_memory::rag::{CascadeTier, LinkCascadeConfig};
+use concerto_memory::scoring::DECAY_FLOOR_DAYS;
 use concerto_memory::storage::MemoryDb;
 use concerto_memory::sync::ChunkSyncService;
 use concerto_memory::vector_store::SqliteVectorStore;
@@ -536,6 +541,22 @@ pub struct ActiveMemoryServices {
     /// when the memory system initialises and kept for the subsystem's
     /// lifetime.
     pub data_dir_lock: Option<Arc<DataDirLock>>,
+    /// Phase 6 M3a/M3b: the SAME decisions/task-tree `Arc`s the memory system
+    /// wraps, handed to the coordinator for outcome write-back and
+    /// run-scoped retrieval. `None` only when the memory system was built by
+    /// a legacy path that did not expose them.
+    pub decision_store: Option<Arc<DecisionStore>>,
+    pub task_tree: Option<Arc<TaskTreeStore>>,
+}
+
+/// Phase 6 M3a/M3b: a freshly initialised memory system plus the shared store
+/// handles a run needs for outcome write-back (M3b) and run-scoped retrieval
+/// (M3a). The handles are the SAME `Arc`s the memory system wraps, so a
+/// coordinator write is immediately visible to the system's own reads.
+pub struct MemorySystemHandles {
+    pub store: Arc<dyn MemoryStore>,
+    pub decision_store: Arc<DecisionStore>,
+    pub task_tree: Arc<TaskTreeStore>,
 }
 
 /// Bundles services that are reused across calls.
@@ -1136,6 +1157,30 @@ pub async fn init_memory_system(
     memory_cancel: &Arc<Mutex<Option<CancellationToken>>>,
     data_dir_lock: &Arc<Mutex<Option<Arc<DataDirLock>>>>,
 ) -> Result<Arc<dyn MemoryStore>, OrchestratorError> {
+    init_memory_system_with_handles(
+        bus,
+        config,
+        project_dir,
+        reindex,
+        reindex_sync,
+        memory_cancel,
+        data_dir_lock,
+    )
+    .await
+    .map(|handles| handles.store)
+}
+
+/// As [`init_memory_system`], additionally returning the shared
+/// decision/task-store handles the coordinator's Phase 6 M3a/M3b wiring needs.
+pub async fn init_memory_system_with_handles(
+    bus: EventBus,
+    config: &AppConfig,
+    project_dir: &std::path::Path,
+    reindex: &Arc<Mutex<Option<Arc<ProjectIndexer>>>>,
+    reindex_sync: &Arc<Mutex<Option<Arc<ChunkSyncService>>>>,
+    memory_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    data_dir_lock: &Arc<Mutex<Option<Arc<DataDirLock>>>>,
+) -> Result<MemorySystemHandles, OrchestratorError> {
     // Re‑use the same implementation as CLI/Desktop apps – copy/paste the
     // `init_memory_system` logic from those modules (project ID hashing, DB
     // path, vector & FTS stores, optional embedder, background indexing).
@@ -1207,12 +1252,12 @@ pub async fn init_memory_system(
     {
         tracing::warn!(%error, "failed to prune derived summaries past retention");
     }
-    let decision_store = DecisionStore::load(db.clone()).await.map_err(|error| {
+    let decision_store = Arc::new(DecisionStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
-    })?;
-    let task_tree = TaskTreeStore::load(db.clone()).await.map_err(|error| {
+    })?);
+    let task_tree = Arc::new(TaskTreeStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("TaskTreeStore load error: {error}"))
-    })?;
+    })?);
 
     // Local fastembed embedder (BAAI/bge-small-en-v1.5). The model binary
     // downloads on first `embed` call; indexing is best‑effort and falls back
@@ -1274,12 +1319,48 @@ pub async fn init_memory_system(
     let system = concerto_memory::system::MemorySystem::new(
         vector_store,
         fts_store,
-        decision_store,
-        task_tree,
+        decision_store.clone(),
+        task_tree.clone(),
         Some(embedder.clone()),
         project_id.clone(),
         None, // global store (stubbed, ADR-54)
     );
+    // L1 dedup judge (ADR-46 symbolic offload): attach it inside this
+    // initializer so EVERY runtime path that builds a project memory system
+    // gets it — desktop pre-init, the persistent runner, and
+    // `run_shared_agent` alike (the store is cached per project and reused).
+    // Fail-open: dedup disabled by config or an unresolvable model provider
+    // leaves the judge off and stores behave exactly as before (plain writes).
+    let system = match build_dedup_judge(config, &lifecycle) {
+        Some(judge) => system.with_dedup_judge(judge),
+        None => system,
+    };
+    // ADR-69 slice 1 link store: attach it inside this initializer so EVERY
+    // runtime path that builds a project memory system gets it — desktop
+    // pre-init, the persistent runner, and `run_shared_agent` alike (the
+    // store is cached per project and reused). It borrows the SAME pool the
+    // vector store was built on (see `build_link_store`), so `memory_links`
+    // rows live in the same database as the chunks they reference. Fail-open:
+    // an unopenable store leaves links off and memory behaves exactly as
+    // before (plain writes).
+    let link_store = build_link_store(&pool, config.memory.max_out_degree).await;
+    let system = match &link_store {
+        Some(store) => system.with_link_store(store.clone()),
+        None => system,
+    };
+    // ADR-69 slice 2 link cascade: when the link store attached, consume
+    // link evidence at retrieval time. `cascade_decay_days` unset → the
+    // 90-day ADR A5 floor; Some(0) disables decay entirely. The cascade is
+    // fail-open (scoring errors/timeouts keep the plain RRF order), so it
+    // can never degrade a query.
+    let system = match &link_store {
+        Some(_) => system.with_link_cascade(LinkCascadeConfig {
+            decay_days: config.memory.cascade_decay_days.or(Some(DECAY_FLOOR_DAYS as u16)),
+            start_tier: CascadeTier::Mild,
+            score_timeout: std::time::Duration::from_millis(250),
+        }),
+        None => system,
+    };
     let system = Arc::new(system);
 
     // Background project indexing — actually persists chunks (FTS + vectors).
@@ -1352,7 +1433,72 @@ pub async fn init_memory_system(
         }
     });
 
-    Ok(system as Arc<dyn MemoryStore>)
+    Ok(MemorySystemHandles { store: system as Arc<dyn MemoryStore>, decision_store, task_tree })
+}
+
+/// Build the L1 dedup judge for project-namespace memory stores, or `None`.
+///
+/// The judge is wired from the *default* resolved model rather than the
+/// model a specific run selects: it is advisory (ADR-46 symbolic offload),
+/// so a cheap, stable judge model is preferable to chasing per-run parity.
+///
+/// Fail-open by construction:
+/// - `[memory] dedup_judge = false` disables the service entirely;
+/// - a provider that cannot be resolved at init time (e.g. plugin-backed
+///   only configs, or a missing model configuration) logs at debug and
+///   yields `None`, leaving `MemorySystem` stores byte-identical to the
+///   pre-judge behavior.
+fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Option<L1DedupJudge> {
+    if !config.memory.dedup_judge {
+        tracing::debug!("l1 dedup judge disabled by [memory] dedup_judge=false");
+        return None;
+    }
+    // No plugin providers are loaded inside memory init; resolution is
+    // best-effort and must never abort the memory subsystem.
+    let no_plugin_providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+    let (provider, model, _provider_config_id) =
+        match resolve_provider_and_model(config, None, None, &no_plugin_providers) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "l1 dedup judge not attached: no resolvable model provider at memory init"
+                );
+                return None;
+            }
+        };
+    Some(L1DedupJudge::new(Arc::new(ProviderSummarizer::new(
+        provider,
+        model,
+        lifecycle.child_token(),
+    ))))
+}
+
+/// Build the ADR-69 slice-1 symbolic link store over the project memory pool,
+/// or `None` (fail-open).
+///
+/// The link store shares the SAME SQLite pool the vector store was built on,
+/// so `memory_links` rows live in the same database — and same write space —
+/// as the chunks they reference. Slice 1 is write-only and advisory: a pool
+/// or schema problem logs a warning and yields `None`, leaving memory stores
+/// byte-identical to the pre-link behavior (no links are ever written).
+///
+/// `max_out_degree` applies the configured ADR-69 A2 per-chunk cap; `None`
+/// keeps the link store's built-in default.
+async fn build_link_store(
+    pool: &sqlx::SqlitePool,
+    max_out_degree: Option<usize>,
+) -> Option<Arc<LinkStore>> {
+    match LinkStore::new(pool.clone()).await {
+        Ok(store) => match max_out_degree {
+            Some(cap) => Some(Arc::new(store.with_max_out_degree(cap))),
+            None => Some(Arc::new(store)),
+        },
+        Err(error) => {
+            tracing::warn!(%error, "memory link store not attached; ADR-69 links disabled");
+            None
+        }
+    }
 }
 
 /// Build a fresh WASM plugin host, capability store, and manager. Returns both
@@ -1861,32 +2007,12 @@ async fn execute_agent_loop(
     // the gates consume it.
     fact_pool: Option<sqlx::SqlitePool>,
 ) -> Result<AgentOutput, OrchestratorError> {
-    // Audit C-03 (immediate fix): the LLM `SummarizeOldest` strategy is no
-    // longer wired into the production runtime. Its failure path could delete
-    // the original messages, and in-run LLM summarization is superseded by the
-    // deterministic durable compaction in `context_compaction` —
-    // `create_session_and_recorder` bounds the active history via the
-    // context engine before the run; `maintain_context_after_run` checkpoints
-    // after it. Overflow is handled there; passing this per-call strategy is
-    // `None` keeps the mid-run message projection intact and is a safe no-op.
-    // The `SummarizeOldest` type remains available for explicit opt-in use and
-    // is exercised by `concerto-memory` tests.
-    //
-    // GATE: in-run overflow strategies must stay disabled. Re-enabling here
-    // (or anywhere in production) without a superseding ADR is a defect, not a
-    // tuning choice — `SummarizeOldest::apply` and the agent-loop apply site
-    // both log loudly if one ever reaches them.
-    let overflow_strategy: Option<Arc<dyn concerto_core::ContextOverflowStrategy>> = {
-        tracing::warn!(
-            "in-run LLM overflow summarization disabled (audit C-03); context is bounded by \
-             deterministic durable compaction"
-        );
-        None
-    };
-    debug_assert!(
-        overflow_strategy.is_none(),
-        "in-run LLM overflow summarization must remain disabled (audit C-03)"
-    );
+    // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
+    // removed from `AgentLoop`. Context overflow is bounded deterministically
+    // by the context engine — `create_session_and_recorder` bounds the active
+    // history before the run and `maintain_context_after_run` checkpoints
+    // after it. Re-introducing an in-run overflow strategy anywhere in
+    // production requires a superseding ADR.
 
     let undo_manager = Arc::new(Mutex::new(UndoManager::new(&req.project_dir)));
     let eval = {
@@ -1945,7 +2071,6 @@ async fn execute_agent_loop(
         DEFAULT_MAX_ITERATIONS,
         false,
         req.project_dir.clone(),
-        overflow_strategy,
         Some(concerto_memory::budget::ContextBudgetAllocator::default()),
     )
     .with_retry_policy(retry_policy)
@@ -2090,6 +2215,20 @@ fn cached_store_for_project(
     })
 }
 
+/// Phase 6 M3a/M3b: the shared decision/task-store handles of the cached
+/// memory services — `(None, None)` when memory is disabled or not yet
+/// initialised. The coordinator's outcome write-back and run-scoped retrieval
+/// are no-ops without them, so an absent handle is never an error.
+fn memory_writeback_handles(
+    memory: &Mutex<Option<ActiveMemoryServices>>,
+) -> (Option<Arc<DecisionStore>>, Option<Arc<TaskTreeStore>>) {
+    let lock = memory.lock().unwrap_or_else(|poison| poison.into_inner());
+    match lock.as_ref() {
+        Some(active) => (active.decision_store.clone(), active.task_tree.clone()),
+        None => (None, None),
+    }
+}
+
 /// Cancel and drop the previous project's memory lifecycle. Called on a
 /// project switch so the new project never inherits the previous one's
 /// background indexer, chunk-sync service, or store.
@@ -2147,7 +2286,7 @@ async fn select_or_init_memory_services(
     let reindex_sync_temp: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
     let lock_temp: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
-    let mem = init_memory_system(
+    let mem = init_memory_system_with_handles(
         services.bus.clone(),
         &services.config,
         project_dir,
@@ -2177,14 +2316,17 @@ async fn select_or_init_memory_services(
 
     let active = ActiveMemoryServices {
         project_id,
-        store: mem.clone(),
+        store: mem.store.clone(),
         reindex,
         reindex_sync,
         cancel,
         data_dir_lock,
+        // Phase 6 M3a/M3b: retain the shared handles for the coordinator.
+        decision_store: Some(mem.decision_store.clone()),
+        task_tree: Some(mem.task_tree.clone()),
     };
     *services.memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
-    Ok(Some(mem))
+    Ok(Some(mem.store))
 }
 
 /// ADR-55 Phase 2d §3: resolve the plan binding a confident Execute
@@ -4016,6 +4158,12 @@ async fn run_multi_agent(
     );
     let selector =
         Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(profiles)), routing));
+    // Phase 6 M3a/M3b: hand the coordinator the SAME decision/task-store
+    // `Arc`s the memory system wraps, so a settled subtask writes back its
+    // outcome and the run's Phase-0 retrieval reads this run's decisions.
+    // Both are no-ops when memory is disabled or was initialised by a legacy
+    // path that exposed no handles.
+    let (memory_decision_store, memory_task_tree) = memory_writeback_handles(&services.memory);
     let mut coordinator = CoordinatorAgent::new(
         registry.clone(),
         runner,
@@ -4025,6 +4173,7 @@ async fn run_multi_agent(
         coordinator_provider,
         memory.clone(),
     )
+    .with_memory_writeback(memory_decision_store, memory_task_tree)
     .with_agent_configs(agent_configs)
     .with_skills_section(skills_section)
     // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
@@ -6437,6 +6586,10 @@ mod runtime_runner_tests {
             )),
             cancel: CancellationToken::new(),
             data_dir_lock: None,
+            // The test slot predates the M3a/M3b wiring; absent handles keep
+            // the coordinator's write-back/retrieval inert.
+            decision_store: None,
+            task_tree: None,
         }
     }
 
@@ -7572,7 +7725,12 @@ mod runtime_runner_tests {
             self.decisions.clone().into_iter().next().unwrap_or(ApprovalDecision::Approve)
         }
         async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
-        async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
             true // auto-acknowledge in tests
         }
     }
@@ -8783,5 +8941,140 @@ mod runtime_runner_tests {
             GateLabels { review: "QA Reviewer".into(), validate: "QA Verifier".into() },
             "renamed gate tags keep their labels via kind-based resolution"
         );
+    }
+
+    // ===========================================================================
+    // ADR-69 slice 1: production link-store activation (migration 002 + wiring).
+    // ===========================================================================
+
+    /// Serializes tests that redirect `XDG_DATA_HOME` so memory init uses a
+    /// temp data root instead of the real user data dir (mirrors `ENV_LOCK`
+    /// in `concerto-cli`).
+    static MEMORY_INIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII redirect of `XDG_DATA_HOME` to a fresh temp directory; restores
+    /// the previous value on drop (panic-safe). The serialization lock is only
+    /// held around the synchronous set/restore, never across an `.await`
+    /// (clippy::await_holding_lock).
+    struct XdgDataHomeGuard {
+        previous: Option<String>,
+    }
+
+    impl XdgDataHomeGuard {
+        fn redirect(temp: &std::path::Path) -> Self {
+            let xdg_data = temp.join("xdg-data");
+            std::fs::create_dir_all(&xdg_data).expect("create xdg-data");
+            let previous = {
+                let _lock = MEMORY_INIT_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+                let previous = std::env::var("XDG_DATA_HOME").ok();
+                std::env::set_var("XDG_DATA_HOME", &xdg_data);
+                previous
+            };
+            Self { previous }
+        }
+    }
+
+    impl Drop for XdgDataHomeGuard {
+        fn drop(&mut self) {
+            let _lock = MEMORY_INIT_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            match &self.previous {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    /// ADR-69 slice 1 production activation. The real production init path —
+    /// `init_memory_system_with_handles`, the single funnel every frontend
+    /// (desktop pre-init, persistent runner, `run_shared_agent`) routes its
+    /// memory construction through — must attach the link store over the same
+    /// SQLite pool as the vector store and run migration 002 via the normal
+    /// `MemoryDb::connect` chain. We assert on the concrete production
+    /// database under a redirected `XDG_DATA_HOME`:
+    ///   1. the production-built system carries the link store (reported
+    ///      through the `Arc<dyn MemoryStore>` seam by
+    ///      `MemoryStore::link_store_attached`, without downcasting), and
+    ///   2. migration 002 created the `memory_links` table (fresh install), and
+    ///   3. the production link-store helper round-trips a link over the
+    ///      shared project database.
+    #[tokio::test]
+    async fn init_path_attaches_link_store_over_project_pool() {
+        use concerto_core::memory::{MemoryLink, MemoryLinkKind};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _xdg = XdgDataHomeGuard::redirect(temp.path());
+
+        // Empty project dir: the background index is a no-op and never needs
+        // the embedder model download.
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let reindex: Arc<Mutex<Option<Arc<ProjectIndexer>>>> = Arc::new(Mutex::new(None));
+        let reindex_sync: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
+        let memory_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+        let data_dir_lock: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
+
+        let mut config = AppConfig::default();
+        // Keep init hermetic: the provider-backed L1 dedup judge is orthogonal
+        // to the link store and must not be resolved in a test.
+        config.memory.dedup_judge = false;
+
+        let handles = init_memory_system_with_handles(
+            EventBus::default(),
+            &config,
+            &project_dir,
+            &reindex,
+            &reindex_sync,
+            &memory_cancel,
+            &data_dir_lock,
+        )
+        .await
+        .expect("production memory init must succeed under a temp data root");
+
+        // 1. The production-built system carries the link store:
+        //    `MemoryStore::link_store_attached` reports it through the
+        //    `Arc<dyn MemoryStore>` handle, so `true` proves
+        //    `.with_link_store(...)` ran on the init path.
+        assert!(
+            handles.store.link_store_attached(),
+            "production-built memory system must carry the link store"
+        );
+        drop(handles.store);
+
+        // 2. Migration 002 ran through the production connect chain (fresh
+        //    install: the `memory_links` table exists in the project DB).
+        let db_path = temp.path().join("xdg-data/concerto/memory/memory.db");
+        assert!(db_path.is_file(), "production memory db must exist at {db_path:?}");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let pool =
+            sqlx::SqlitePool::connect_with(options).await.expect("open the production memory db");
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'memory_links'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query sqlite_master for memory_links");
+        assert_eq!(table, 1, "production init must run migration 002 (memory_links table)");
+
+        // 3. The production link-store helper is functional over the shared
+        //    project database: a link persisted through the same builder the
+        //    init path calls round-trips from the database the vector store
+        //    indexes into.
+        let link_store =
+            build_link_store(&pool, None).await.expect("production link-store helper must attach");
+        let link = MemoryLink::new("src-init", "tgt-init", MemoryLinkKind::References);
+        link_store
+            .put(&link, CancellationToken::new())
+            .await
+            .expect("persist a link through the production link-store helper");
+        let read_back = link_store
+            .links_from("src-init", CancellationToken::new())
+            .await
+            .expect("read the link back");
+        assert_eq!(read_back, vec![link], "production memory db must round-trip a persisted link");
     }
 }

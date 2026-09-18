@@ -397,6 +397,16 @@ impl GenericSpecialistAgent {
             }
         }
 
+        // RAG invariant (ADR-67 M-01): retrieved chunks are count-bounded
+        // (`retrieve_memory_context` caps `top_k` in the coordinator), but
+        // this specialist site has no `TokenBudget` to apply a token-level
+        // cap — the coordinator does not construct one here. The single-agent
+        // path owns its RAG token bound via
+        // `ContextBudgetAllocator::truncate_to_rag_limit` (agent_loop.rs);
+        // this multi-agent path is bounded by the provider-boundary clip of
+        // `ContextGuardProvider`, which drops the optional blocks last.
+        // Token-level stacking for the specialist path without a budget is a
+        // follow-up ADR, not a regression from the removed strategy.
         if !context.retrieved_chunks.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&crate::memory_prompt::format_retrieved_memory(

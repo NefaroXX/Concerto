@@ -2,8 +2,10 @@
 //! LLM provider.
 //!
 //! Wraps an [`Arc<dyn LlmProvider>`] and issues a non-streaming completion
-//! using the provider's default model.  Used by [`SummarizeOldest`] to
-//! compress overflowing conversation history into a compact summary.
+//! using the provider's default model. Used by the memory crate's
+//! [`L1DedupJudge`] to LLM-verify dedup decisions. In-run conversation
+//! overflow summarization (`SummarizeOldest`) was removed under ADR-67 M-01;
+//! this file was kept because of the dedup-judge usage above.
 //!
 //! Stream creation and collection are bounded by the same timeouts the
 //! orchestrator applies to agent requests (60s time-to-first-byte and 120s
@@ -22,7 +24,7 @@ use concerto_core::CancellationToken;
 
 /// A summarizer that delegates to an LLM provider.
 ///
-/// Constructed once per agent run and reused for each overflow event.
+/// Constructed once per agent run and reused for each dedup call.
 /// Uses the provider's built-in completion via `collect_stream_with_timeouts`.
 pub struct ProviderSummarizer {
     provider: Arc<dyn LlmProvider>,

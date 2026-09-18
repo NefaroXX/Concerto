@@ -322,6 +322,42 @@ impl OpenAiStreamState {
                             partial.arguments.push_str(args);
                         }
                     }
+
+                    // ── Proxy fallback: flat format (name / arguments directly
+                    // on the tool-call object, no `function` wrapper) ──
+                    //
+                    // Some proxy gateways translate a model's native tool-call
+                    // shape into `{id, name, arguments}` directly on the tool
+                    // call object. Both fallbacks are gated conservatively on
+                    // the same tool call carrying BOTH a string `name` AND
+                    // `arguments` (string or object) so unrelated payloads
+                    // cannot be misread as tool calls; nothing is extracted
+                    // from `content` or free text.
+                    //
+                    // (a) Flat string arguments: accumulate across deltas the
+                    // same way `function.arguments` fragments do.
+                    if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+                        if let Some(args) = tc.get("arguments").and_then(|v| v.as_str()) {
+                            partial.name = name.to_string();
+                            partial.arguments.push_str(args);
+                        }
+                    }
+                    // (b) Flat object arguments (or an `input` alias): one-shot,
+                    // the complete object serializes directly and needs no chunk
+                    // accumulation. `emit_tool_call` parses it through the same
+                    // `ensure_arguments_object` / loose-schema un-flattening
+                    // pipeline as every other shape.
+                    if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+                        let object_args = match tc.get("arguments") {
+                            Some(v) => v.as_object(),
+                            None => tc.get("input").and_then(|v| v.as_object()),
+                        };
+                        if let Some(object_args) = object_args {
+                            partial.name = name.to_string();
+                            partial.arguments =
+                                serde_json::Value::Object(object_args.clone()).to_string();
+                        }
+                    }
                 }
             }
         }
@@ -738,6 +774,91 @@ mod tests {
         let chunks: Vec<CompletionChunk> =
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object(), "arguments must be a JSON object");
+    }
+
+    /// Proxy flat format (proxy-tool-call-fix doc failure mode #1): the proxy
+    /// emits `{id, name, arguments}` directly on the tool-call object with no
+    /// `function` wrapper, and the string arguments arrive in incremental
+    /// fragments. The flat string fallback accumulates them exactly like the
+    /// `function.arguments` path, and `emit_tool_call` still normalizes to a
+    /// JSON object.
+    #[test]
+    fn stream_flat_tool_call_with_string_arguments() {
+        let mut state = OpenAiStreamState::new();
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        // First flat fragment: id, name and the argument prefix.
+        state.handle_event(event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","name":"shell","arguments":"{\"command\":"}]}}]}"#,
+        ));
+        // Second flat fragment: name re-sent, arguments continue.
+        state.handle_event(event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"name":"shell","arguments":"\"ls\"}"}]}}]}"#,
+        ));
+        state.handle_event(event("[DONE]"));
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object(), "arguments must be a JSON object");
+    }
+
+    /// Proxy flat format with the complete `arguments` delivered as a JSON
+    /// object (one-shot). The object serializes directly and is parsed back to
+    /// the same object by `emit_tool_call` — no chunk accumulation involved.
+    #[test]
+    fn stream_flat_tool_call_with_object_arguments() {
+        let mut state = OpenAiStreamState::new();
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        state.handle_event(event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","name":"shell","arguments":{"command":"ls"}}]}}]}"#,
+        ));
+        state.handle_event(event("[DONE]"));
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object(), "arguments must be a JSON object");
+    }
+
+    /// Proxy flat format using the `input` alias instead of `arguments` for the
+    /// complete JSON object (one-shot). Recognized by the same flat fallback.
+    #[test]
+    fn stream_flat_tool_call_with_input_alias() {
+        let mut state = OpenAiStreamState::new();
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        state.handle_event(event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","name":"shell","input":{"command":"ls"}}]}}]}"#,
+        ));
+        state.handle_event(event("[DONE]"));
+
+        let chunks: Vec<CompletionChunk> =
+            state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
         assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
         assert!(tool.arguments.is_object(), "arguments must be a JSON object");
     }

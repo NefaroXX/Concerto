@@ -55,7 +55,12 @@ impl ApprovalSink for ApprovalTestHarness {
         // No-op in tests
     }
 
-    async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
+    async fn request_ack(
+        &self,
+        _session_id: Ulid,
+        _message: &str,
+        _cancel: CancellationToken,
+    ) -> bool {
         true // auto-acknowledge in tests by default
     }
 }

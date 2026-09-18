@@ -511,4 +511,63 @@ mod tests {
             .any(|e| e.file_name().to_string_lossy().starts_with("valid.db.corrupt"));
         assert!(!touched, "valid-header file must never be quarantined");
     }
+
+    #[tokio::test]
+    /// ADR-69 slice 1: migration 002 creates the `memory_links` table (and its
+    /// target-first index) on a fresh database, so the link store never runs
+    /// against a missing schema.
+    async fn connect_creates_memory_links_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("memory.db")).unwrap();
+        let db = MemoryDb::connect(&db_path).await.unwrap();
+
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'memory_links'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(table, 1, "migration 002 must create memory_links");
+
+        let index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_memory_links_target'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(index, 1, "migration 002 must create the target index");
+    }
+
+    #[tokio::test]
+    /// ADR-69 slice 1: a database created by migration 001 (pre-ADR-69) is
+    /// upgraded in place by the SAME `MemoryDb::connect` path production uses —
+    /// migration 002 runs in order after 001, so an existing install never
+    /// misses the `memory_links` schema the link store needs.
+    async fn connect_upgrades_pre_links_db_with_migration_002() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("memory.db")).unwrap();
+
+        // Simulate a pre-ADR-69 install: apply only migration 001.
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new().filename(db_path.as_std_path()).create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let migrations = sqlx::migrate!("./migrations");
+        migrations.run_to(1, &pool).await.unwrap();
+
+        // The production connect path upgrades in place, applying 002.
+        let db = MemoryDb::connect(&db_path).await.unwrap();
+
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'memory_links'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(table, 1, "migration 002 must upgrade a 001-only database");
+    }
 }

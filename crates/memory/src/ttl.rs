@@ -12,11 +12,13 @@ use std::sync::Arc;
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::ProjectId;
+use sqlx::Row;
 use sqlx::SqlitePool;
-use sqlx::{AssertSqlSafe, Row};
 use time::OffsetDateTime;
 
 use crate::fts::FullTextStore;
+use crate::links::LinkStore;
+use crate::scoring::{chunk_link_score, parse_db_timestamp, ORPHAN_TRIM_SCORE};
 use crate::vector_store::VectorStore;
 
 /// Default TTL for different chunk types (in days).
@@ -30,9 +32,10 @@ pub const TTL_DECISION_DAYS: i64 = 365;
 /// session attribution: they retain project-wide (one shared bucket).
 const DERIVED_SUMMARY_PROJECT_BUCKET: &str = "\u{0}project";
 
-/// Result of one [`TtlManager::prune_derived_summaries`] pass (ADR-65 §8):
-/// the derived chunk ids removed and how many session buckets were examined.
-/// Source chunks are never reported here — they are never touched.
+/// Result of one [`TtlManager::prune_derived_summaries`] pass (ADR-65 §8)
+/// or [`TtlManager::prune_orphaned_derived`] (ADR-69 slice 2): the derived
+/// chunk ids removed and how many session buckets were examined (retention
+/// pass only). Source chunks are never reported here — they are never touched.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PruneReport {
     /// Chunk ids removed (vector row + FTS entry) in removal order.
@@ -40,6 +43,14 @@ pub struct PruneReport {
     /// Distinct session buckets (including the project-wide fallback bucket)
     /// observed during the pass.
     pub sessions_examined: usize,
+}
+
+/// One DERIVED vector row (`Fact` / `SessionSummary`) as selected by
+/// [`TtlManager::load_derived_rows`].
+struct DerivedRow {
+    id: String,
+    created_at: String,
+    metadata: Option<String>,
 }
 
 /// Manages TTL expiry and re-index scheduling.
@@ -81,54 +92,55 @@ impl TtlManager {
         project_id: &ProjectId,
         cancel: CancellationToken,
     ) -> Result<usize, MemoryError> {
-        // Build a SQL CASE expression that maps chunk_type debug strings
-        // to their TTL in days.  Unknown types get the default file TTL.
-        let ttl_case = self.default_ttl_days.map_or_else(
-            || {
-                format!(
-                    "CASE chunk_type \
-                WHEN 'Function' THEN {TTL_FUNCTION_DAYS} \
-                WHEN 'Struct' THEN {TTL_STRUCT_DAYS} \
-                WHEN 'Trait' THEN {TTL_FUNCTION_DAYS} \
-                WHEN 'Impl' THEN {TTL_FUNCTION_DAYS} \
-                WHEN 'SessionSummary' THEN {TTL_DECISION_DAYS} \
-                WHEN 'Fact' THEN {TTL_DECISION_DAYS} \
-                WHEN 'SlidingWindow' THEN {TTL_SLIDING_WINDOW_DAYS} \
-                ELSE {TTL_FILE_DAYS} \
-            END"
-                )
-            },
-            |days| days.to_string(),
-        );
-
-        // Find expired entries: created_at + TTL_days < now.
-        let query = format!(
-            "SELECT id FROM vector_store \
-             WHERE project_id = ? \
-               AND tombstone = 0 \
-               AND datetime(created_at, '+' || {ttl_case} || ' days') < datetime('now')"
-        );
-
-        // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is built from static fragments
-        // and the locally computed `{ttl_case}` CASE expression; no user input is
-        // interpolated — every filter value is bound via `?`.
-        let rows = sqlx::query(AssertSqlSafe(query))
-            .bind(&project_id.0)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
-
-        if rows.is_empty() {
+        if cancel.is_cancelled() {
             return Ok(0);
         }
 
-        let count = rows.len();
+        // Load every live row and decide expiry in Rust instead of comparing
+        // in SQL. The stored `created_at` is `OffsetDateTime::to_string()` — a
+        // suffixed format (e.g. `2023-11-14 22:13:20.0 +00:00:00`) SQLite's
+        // `datetime()` cannot parse, so the old
+        // `datetime(created_at, '+N days') < datetime('now')` predicate was a
+        // silent never-match. `parse_db_timestamp` handles the exact stored
+        // shape and normalizes any stored UTC offset before comparing.
+        let rows = sqlx::query(
+            "SELECT id, chunk_type, created_at FROM vector_store \
+             WHERE project_id = ? AND tombstone = 0",
+        )
+        .bind(&project_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        let mut expired: Vec<String> = Vec::new();
+        for row in rows {
+            let chunk_type: String = row.get("chunk_type");
+            let created_at: String = row.get("created_at");
+            let ttl_days = self
+                .default_ttl_days
+                .map_or_else(|| ttl_days_for_chunk_type(&chunk_type), i64::from);
+            // Fail-open: a row whose timestamp cannot be parsed is never
+            // purged (same contract as `TimedLink::from_db`).
+            let Some(created) = parse_db_timestamp(&created_at) else {
+                continue;
+            };
+            let cutoff_unix = now_unix - time::Duration::days(ttl_days).whole_seconds();
+            if created.unix_timestamp() < cutoff_unix {
+                expired.push(row.get("id"));
+            }
+        }
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let count = expired.len();
 
         // Tombstone each expired entry in the vector store and delete from FTS.
-        for row in &rows {
-            let chunk_id: String = row.get("id");
-            self.vector_store.tombstone(&chunk_id, project_id, cancel.clone()).await?;
-            let _ = self.fts_store.delete(&chunk_id, project_id, cancel.clone()).await;
+        for chunk_id in &expired {
+            self.vector_store.tombstone(chunk_id, project_id, cancel.clone()).await?;
+            let _ = self.fts_store.delete(chunk_id, project_id, cancel.clone()).await;
         }
 
         // Compact: permanently remove tombstoned entries.
@@ -218,16 +230,7 @@ impl TtlManager {
         if cancel.is_cancelled() {
             return Ok(report);
         }
-        let rows = sqlx::query(
-            "SELECT id, created_at, metadata FROM vector_store \
-             WHERE project_id = ? AND tombstone = 0 \
-               AND chunk_type IN ('Fact', 'SessionSummary') \
-             ORDER BY created_at DESC, id ASC",
-        )
-        .bind(&project_id.0)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+        let rows = self.load_derived_rows(project_id, cancel.clone()).await?;
         if rows.is_empty() {
             return Ok(report);
         }
@@ -252,10 +255,7 @@ impl TtlManager {
             if cancel.is_cancelled() {
                 break;
             }
-            let id: String = row.get("id");
-            let created_at: String = row.get("created_at");
-            let metadata: Option<String> = row.get("metadata");
-            let bucket = summary_session_bucket(metadata.as_deref());
+            let bucket = summary_session_bucket(row.metadata.as_deref());
             buckets.insert(bucket.clone());
             let used = kept.entry(bucket).or_insert(0);
             let over_cap = if keep_per_session > 0 && *used >= keep_per_session {
@@ -265,9 +265,9 @@ impl TtlManager {
                 false
             };
             let expired =
-                cutoff.as_ref().is_some_and(|cutoff| created_at.as_str() < cutoff.as_str());
+                cutoff.as_ref().is_some_and(|cutoff| row.created_at.as_str() < cutoff.as_str());
             if over_cap || expired {
-                pruned.push(id);
+                pruned.push(row.id);
             }
         }
         report.sessions_examined = buckets.len();
@@ -282,6 +282,101 @@ impl TtlManager {
             );
         }
         Ok(report)
+    }
+
+    /// ADR-69 slice 2 orphan-evidence prune: delete DERIVED rows (`Fact` /
+    /// `SessionSummary`) that carry INCOMING link evidence but score at or
+    /// below [`ORPHAN_TRIM_SCORE`] after decay (0.5 on the 0–10 scale) —
+    /// "cold but linked" consolidations the decay model says are no longer
+    /// worth retaining.
+    ///
+    /// Unlinked derived rows and SOURCE chunks are never touched. Fail-open
+    /// by contract: a link-store error logs a warning and prunes nothing, so
+    /// this pass can never corrupt retention or drop chunks it cannot judge.
+    pub async fn prune_orphaned_derived(
+        &self,
+        project_id: &ProjectId,
+        link_store: &LinkStore,
+        decay_days: Option<u16>,
+        cancel: CancellationToken,
+    ) -> Result<PruneReport, MemoryError> {
+        let mut report = PruneReport::default();
+        if cancel.is_cancelled() {
+            return Ok(report);
+        }
+        let rows = self.load_derived_rows(project_id, cancel.clone()).await?;
+        if rows.is_empty() {
+            return Ok(report);
+        }
+
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let incoming = match link_store.incoming_links(&ids, cancel.clone()).await {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "orphaned-derived prune skipped: link store unavailable (fail-open)"
+                );
+                return Ok(report);
+            }
+        };
+        if incoming.is_empty() {
+            return Ok(report);
+        }
+
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        for row in rows {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let score = match incoming.get(&row.id) {
+                Some(links) if !links.is_empty() => chunk_link_score(links, decay_days, now_unix),
+                _ => continue, // unlinked rows are never touched
+            };
+            if score <= ORPHAN_TRIM_SCORE {
+                report.pruned_ids.push(row.id);
+            }
+        }
+
+        self.remove_derived_rows(project_id, &report.pruned_ids, cancel).await?;
+        if !report.pruned_ids.is_empty() {
+            tracing::info!(
+                pruned = report.pruned_ids.len(),
+                "pruned low-score derived rows with cold link evidence (ADR-69 slice 2)"
+            );
+        }
+        Ok(report)
+    }
+
+    /// Bare ADR-65 §8 row selector: the project's DERIVED (`Fact` /
+    /// `SessionSummary`) non-tombstoned vector rows, newest first. Shared by
+    /// the retention cap/window prune and the ADR-69 orphan-evidence prune.
+    async fn load_derived_rows(
+        &self,
+        project_id: &ProjectId,
+        cancel: CancellationToken,
+    ) -> Result<Vec<DerivedRow>, MemoryError> {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, created_at, metadata FROM vector_store \
+             WHERE project_id = ? AND tombstone = 0 \
+               AND chunk_type IN ('Fact', 'SessionSummary') \
+             ORDER BY created_at DESC, id ASC",
+        )
+        .bind(&project_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DerivedRow {
+                id: row.get("id"),
+                created_at: row.get("created_at"),
+                metadata: row.get("metadata"),
+            })
+            .collect())
     }
 
     /// Hard-delete pruned vector rows and their FTS entries (best-effort FTS:
@@ -322,6 +417,20 @@ fn summary_session_bucket(metadata: Option<&str>) -> String {
         })
         .filter(|session| !session.is_empty())
         .unwrap_or_else(|| DERIVED_SUMMARY_PROJECT_BUCKET.to_owned())
+}
+
+/// TTL (in days) for a `vector_store.chunk_type` debug string (the
+/// `{chunk_type:?}` the write path binds). Mirrors the SQL CASE
+/// `purge_expired` previously built — unknown types fall back to the file
+/// TTL. The per-type windows are identical to [`suggested_ttl_days`].
+fn ttl_days_for_chunk_type(chunk_type: &str) -> i64 {
+    match chunk_type {
+        "Function" | "Trait" | "Impl" => TTL_FUNCTION_DAYS,
+        "Struct" => TTL_STRUCT_DAYS,
+        "SessionSummary" | "Fact" => TTL_DECISION_DAYS,
+        "SlidingWindow" => TTL_SLIDING_WINDOW_DAYS,
+        _ => TTL_FILE_DAYS,
+    }
 }
 
 /// Suggested TTL for a given chunk type (in days).
@@ -612,5 +721,228 @@ mod tests {
         let gone =
             store.get_chunks(&project, &["old-1".into()], CancellationToken::new()).await.unwrap();
         assert!(gone.is_empty(), "the mismatching row drops out of search: {gone:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // purge_expired — Rust-side timestamp comparison (created_at is stored
+    // as `OffsetDateTime::to_string()`, which SQLite datetime() cannot parse)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn purge_expired_removes_only_rows_past_their_chunk_type_ttl() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+
+        seed_source(&store, "fn-old", offset_days_ago(200)).await;
+        seed_source(&store, "fn-fresh", OffsetDateTime::now_utc()).await;
+        seed(&store, "fact-tween", ChunkType::Fact, "s", "fact 200d", offset_days_ago(200)).await;
+        seed(&store, "sw-old", ChunkType::SlidingWindow, "s", "sw 60d", offset_days_ago(60)).await;
+        seed(&store, "struct-old", ChunkType::Struct, "s", "struct 95d", offset_days_ago(95)).await;
+
+        let purged = manager.purge_expired(&project, token.clone()).await.unwrap();
+        assert_eq!(
+            purged, 3,
+            "fn-old(200d>90), sw-old(60d>30) and struct-old(95d>90) expire; \
+             fn-fresh and the 200-day-old Fact (TTL 365) stay"
+        );
+
+        assert_eq!(count(&pool, "Function").await, 1, "fn-fresh survives");
+        assert_eq!(count(&pool, "Fact").await, 1, "fact-tween is inside its 365-day window");
+        assert_eq!(count(&pool, "SlidingWindow").await, 0, "sw-old hard-deleted");
+        assert_eq!(count(&pool, "Struct").await, 0, "struct-old hard-deleted");
+
+        // Reviewed: only rows past their own per-type TTL are removed — the
+        // freshly stored rows and in-window derived rows are intact.
+        let survivors = store
+            .get_chunks(&project, &["fn-fresh".into(), "fact-tween".into()], token)
+            .await
+            .unwrap();
+        assert_eq!(survivors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn purge_expired_skips_rows_with_unparseable_timestamps() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+
+        seed_source(&store, "fn-corrupt", OffsetDateTime::now_utc()).await;
+        seed_source(&store, "fn-expired", offset_days_ago(200)).await;
+        sqlx::query("UPDATE vector_store SET created_at = 'garbage' WHERE id = 'fn-corrupt'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let purged = manager.purge_expired(&project, token.clone()).await.unwrap();
+        assert_eq!(purged, 1, "the expired row is purged, the corrupt one is skipped");
+
+        assert_eq!(count(&pool, "Function").await, 1, "unparseable row survives (fail-open)");
+        let surviving = store.get_chunks(&project, &["fn-corrupt".into()], token).await.unwrap();
+        assert_eq!(surviving.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_expired_applies_the_default_ttl_to_every_chunk_type() {
+        let (pool, store, _manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+        let fts = Arc::new(SqliteFullTextStore::new(pool.clone()).await.unwrap());
+        let manager = TtlManager::with_default_ttl_days(store.clone(), fts, pool.clone(), 10);
+
+        // A 15-day-old Fact normally has a 365-day TTL, but the configured
+        // default (10 days) overrides every chunk type.
+        seed(&store, "fact-old", ChunkType::Fact, "s", "old", offset_days_ago(15)).await;
+        seed(&store, "fact-fresh", ChunkType::Fact, "s", "fresh", OffsetDateTime::now_utc()).await;
+        seed_source(&store, "fn-old", offset_days_ago(15)).await;
+        seed_source(&store, "fn-fresh", OffsetDateTime::now_utc()).await;
+
+        let purged = manager.purge_expired(&project, token.clone()).await.unwrap();
+        assert_eq!(purged, 2, "default TTL applies to both old rows regardless of type");
+        assert_eq!(count(&pool, "Fact").await, 1, "fact-fresh survives");
+        assert_eq!(count(&pool, "Function").await, 1, "fn-fresh survives");
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-69 slice 2 — orphan-evidence prune (prune_orphaned_derived)
+    // ---------------------------------------------------------------------
+
+    /// Insert a link with an EXPLICIT `created_at`. `LinkStore::put` stamps
+    /// `now_utc` internally, so cold-evidence tests must write the row
+    /// directly (same table, same columns the canonical path uses).
+    async fn seed_link(
+        pool: &sqlx::SqlitePool,
+        from: &str,
+        to: &str,
+        kind: concerto_core::memory::MemoryLinkKind,
+        created_at: OffsetDateTime,
+    ) {
+        sqlx::query(
+            "INSERT INTO memory_links (source_id, target_id, link_type, weight, created_at) \
+             VALUES (?, ?, ?, 1.0, ?)",
+        )
+        .bind(from)
+        .bind(to)
+        .bind(kind.as_str())
+        .bind(created_at.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_orphaned_derived_removes_cold_linked_rows_only() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+        let link_store = LinkStore::new(pool.clone()).await.unwrap();
+
+        // Two derived rows, one with fresh evidence and one with COLD
+        // evidence; one derived row with no links at all; one SOURCE chunk
+        // with an old link (must never prune).
+        seed(&store, "cold-linked", ChunkType::Fact, "s", "old fact", offset_days_ago(30)).await;
+        seed(&store, "fresh-linked", ChunkType::Fact, "s", "new fact", OffsetDateTime::now_utc())
+            .await;
+        seed(&store, "unlinked", ChunkType::Fact, "s", "no links", OffsetDateTime::now_utc()).await;
+        seed_source(&store, "fn-src", offset_days_ago(30)).await;
+        seed_link(
+            &pool,
+            "src-cold",
+            "cold-linked",
+            concerto_core::memory::MemoryLinkKind::Supports,
+            offset_days_ago(120),
+        )
+        .await;
+        seed_link(
+            &pool,
+            "src-fresh",
+            "fresh-linked",
+            concerto_core::memory::MemoryLinkKind::Supports,
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+        seed_link(
+            &pool,
+            "src-old-fn",
+            "fn-src",
+            concerto_core::memory::MemoryLinkKind::Supports,
+            offset_days_ago(120),
+        )
+        .await;
+
+        let report = manager
+            .prune_orphaned_derived(&project, &link_store, Some(90), token.clone())
+            .await
+            .unwrap();
+        assert_eq!(report.pruned_ids, vec!["cold-linked".to_string()]);
+
+        assert_eq!(count(&pool, "Fact").await, 2, "fresh-linked + unlinked remain");
+        assert_eq!(count(&pool, "Function").await, 1, "source chunk with old links never pruned");
+        assert!(
+            store.get_chunks(&project, &["fresh-linked".into()], token).await.unwrap().len() == 1
+        );
+        assert!(
+            store
+                .get_chunks(&project, &["unlinked".into()], CancellationToken::new())
+                .await
+                .unwrap()
+                .len()
+                == 1
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_orphaned_derived_with_decay_disabled_prunes_nothing() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+        let link_store = LinkStore::new(pool.clone()).await.unwrap();
+
+        seed(&store, "cold-linked", ChunkType::Fact, "s", "old fact", offset_days_ago(30)).await;
+        seed_link(
+            &pool,
+            "src-cold",
+            "cold-linked",
+            concerto_core::memory::MemoryLinkKind::Supports,
+            offset_days_ago(120),
+        )
+        .await;
+
+        // Decay disabled: even 120-day-old evidence scores fresh (1.0) →
+        // 4.375 > ORPHAN_TRIM_SCORE, so nothing is pruned.
+        let report = manager
+            .prune_orphaned_derived(&project, &link_store, None, token.clone())
+            .await
+            .unwrap();
+        assert!(report.pruned_ids.is_empty(), "no decay means no cold rows");
+        assert_eq!(count(&pool, "Fact").await, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_orphaned_derived_fails_open_when_link_store_unavailable() {
+        let (_pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        let token = CancellationToken::new();
+
+        seed(&store, "cold-linked", ChunkType::Fact, "s", "old fact", offset_days_ago(30)).await;
+
+        // A link store whose pool is already closed: every in-degree read
+        // fails, and the prune must degrade to "nothing pruned".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.db");
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        let link_store = LinkStore::new(pool).await.unwrap();
+        link_store.close_pool().await;
+
+        let report =
+            manager.prune_orphaned_derived(&project, &link_store, Some(90), token).await.unwrap();
+        assert!(report.pruned_ids.is_empty(), "fail-open must prune nothing");
+        let gone = store
+            .get_chunks(&project, &["cold-linked".into()], CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(gone.len(), 1, "the row survives an unavailable link store");
     }
 }

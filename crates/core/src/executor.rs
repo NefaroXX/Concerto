@@ -1285,7 +1285,12 @@ mod tests {
 
         async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
 
-        async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
             true
         }
     }
@@ -1699,6 +1704,38 @@ mod tests {
         assert_eq!(entries[0].tool_name, "request_ack");
         assert_eq!(entries[0].session_id, session.session_id);
         assert_eq!(entries[0].correlation_id, correlation_id);
+    }
+
+    /// The ack seam is caller-correlated: the recorded row carries the session
+    /// id the caller passed, even when it differs from the fixture session, so
+    /// the audit trail associates the ack with the run it actually came from
+    /// (ADR-68 H-04 "session correlation"; `audit_log.session_id` since
+    /// migration 002).
+    #[tokio::test]
+    async fn ack_decision_records_caller_session_id() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let fixture_session = test_session();
+        let caller_session_id = Ulid::new();
+        assert_ne!(caller_session_id, fixture_session.session_id);
+        let correlation_id = Ulid::new();
+
+        executor
+            .record_ack_decision(
+                caller_session_id,
+                correlation_id,
+                "Session correlation probe",
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, caller_session_id);
+        assert_eq!(entries[0].correlation_id, correlation_id);
+        assert_eq!(entries[0].verdict, "RequestContinue");
     }
 
     /// A deterministic routing decision records a single row under the

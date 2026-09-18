@@ -19,7 +19,6 @@ use concerto_core::types::{
     Message, PolicyAction, ProviderMetrics, Role, SessionContext, TaskExecutionMode, ToolCall,
     ToolExecutionSummary, VerificationSummary,
 };
-use concerto_core::ContextOverflowStrategy;
 use concerto_core::{CancellationToken, OrchestratorError, TaskId};
 use concerto_eval::EvalEngine;
 use concerto_memory::budget::ContextBudgetAllocator;
@@ -68,13 +67,6 @@ pub struct AgentLoop {
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
     project_root: std::path::PathBuf,
-    /// Optional context overflow strategy. When set, after each assistant
-    /// turn the strategy is applied to the active conversation history
-    /// to keep the context within budget. The strategy trims the oldest
-    /// non-System messages when estimated tokens exceed the configured
-    /// trigger ratio of the model's context capacity.
-    overflow_strategy: Option<Arc<dyn ContextOverflowStrategy>>,
-
     /// Optional RAG-only context budget bound (ADR-16/ADR-48).
     /// When set, retrieved memory chunks are filtered through this
     /// allocator's score-ordered `truncate_to_rag_limit` before being
@@ -293,7 +285,6 @@ impl AgentLoop {
         prompt_builder: PromptBuilder,
         max_iterations: u32,
         fast: bool,
-        overflow_strategy: Option<Arc<dyn ContextOverflowStrategy>>,
         budget_allocator: Option<ContextBudgetAllocator>,
     ) -> Self {
         let project_root =
@@ -310,7 +301,6 @@ impl AgentLoop {
             max_iterations,
             fast,
             project_root,
-            overflow_strategy,
             budget_allocator,
         )
     }
@@ -329,7 +319,6 @@ impl AgentLoop {
         max_iterations: u32,
         fast: bool,
         project_root: std::path::PathBuf,
-        overflow_strategy: Option<Arc<dyn ContextOverflowStrategy>>,
         budget_allocator: Option<ContextBudgetAllocator>,
     ) -> Self {
         Self {
@@ -348,7 +337,6 @@ impl AgentLoop {
             fast,
             state: AgentState::Idle,
             project_root,
-            overflow_strategy,
             budget_allocator,
             initial_messages: Vec::new(),
             retry_policy: RetryPolicy::default(),
@@ -875,9 +863,6 @@ impl AgentLoop {
                 &mut messages,
             )
             .await?;
-
-            // Phase 7: Trim conversation history
-            self.trim_conversation_history(&mut messages, task.session_id, cancel.clone()).await;
         }
 
         // Phase 8: Run evaluation
@@ -953,7 +938,7 @@ impl AgentLoop {
             let warning = "This project is not a git repository (or git is unavailable), so \
                             changes made during this task cannot be automatically undone. \
                             Continue anyway?";
-            let ack = self.approval.request_ack(warning, cancel.clone()).await;
+            let ack = self.approval.request_ack(session_id, warning, cancel.clone()).await;
             // Audit seam (ADR-55 §5 / audit H-04): persist the ack outcome
             // through the same channel as approval decisions, sharing the run's
             // correlation_id chain. Pure observability — the ack bool still
@@ -1396,30 +1381,6 @@ impl AgentLoop {
             .await?;
         }
         Ok(())
-    }
-
-    /// Phase 7: Apply conversation-history overflow strategy if configured.
-    ///
-    /// Audit C-03 gate: in-run LLM overflow strategies are disabled in
-    /// production — the runtime forces `None` (see `runtime_runner`) and
-    /// context overflow is bounded deterministically before/after the run by
-    /// `ContextEngine` + `ContextGuardProvider`. Any strategy reaching this
-    /// point is a miswire; log it so it can never run silently, and never
-    /// re-enable without a superseding ADR.
-    async fn trim_conversation_history(
-        &self,
-        messages: &mut Vec<Message>,
-        session_id: Ulid,
-        cancel: CancellationToken,
-    ) {
-        if let Some(ref strategy) = self.overflow_strategy {
-            tracing::warn!(
-                "overflow strategy applied inside agent loop — in-run overflow strategies are \
-                 gated (audit C-03); context should be bounded by deterministic compaction"
-            );
-            let budget = self.provider.context_capacity("");
-            strategy.apply(messages, &budget, session_id, cancel).await;
-        }
     }
 
     /// Phase 8: Run evaluation (test suite) on modified files. The harness
@@ -2763,6 +2724,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::prompts::PromptBuilder;
+    use crate::services::ProviderSummarizer;
     use async_trait::async_trait;
     use concerto_core::error::{MemoryError, ProviderError};
     use concerto_core::event::EventBus;
@@ -2783,6 +2745,7 @@ mod tests {
     use concerto_core::CancellationToken;
     use concerto_eval::EvalEngine;
     use concerto_memory::decision_store::DecisionStore;
+    use concerto_memory::entities::L1DedupJudge;
     use concerto_memory::fts::FullTextStore;
     use concerto_memory::fts::SqliteFullTextStore;
     use concerto_memory::storage::MemoryDb;
@@ -2836,6 +2799,7 @@ mod tests {
         }
         async fn request_ack(
             &self,
+            _session_id: Ulid,
             _message: &str,
             _cancel: concerto_core::CancellationToken,
         ) -> bool {
@@ -3221,6 +3185,141 @@ mod tests {
         }
     }
 
+    /// A memory store whose `retrieve` returns three oversized chunks that
+    /// vastly exceed any reasonable RAG token budget (20k chars each).
+    struct RetrievalMemory;
+    #[async_trait]
+    impl MemoryStore for RetrievalMemory {
+        async fn retrieve(
+            &self,
+            _query: &MemoryQuery,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<MemoryChunk>, MemoryError> {
+            let project_id = ProjectId("proj".into());
+            let oversized = |id: &str, score: f64, fill: char| MemoryChunk {
+                id: id.to_string(),
+                project_id: project_id.clone(),
+                namespace: MemoryNamespace::Project(project_id.clone()),
+                content: std::iter::repeat_n(fill, 20_000).collect(),
+                file_path: None,
+                start_line: None,
+                end_line: None,
+                chunk_type: ChunkType::Function,
+                score,
+                model_id: "test".into(),
+                model_version: "1".into(),
+                stale: false,
+            };
+            Ok(vec![
+                oversized("chunk-1", 1.0, 'a'),
+                oversized("chunk-2", 0.9, 'b'),
+                oversized("chunk-3", 0.8, 'c'),
+            ])
+        }
+        async fn store(
+            &self,
+            _entry: MemoryEntry,
+            _cancel: CancellationToken,
+        ) -> Result<MemoryId, MemoryError> {
+            Ok(MemoryId(Ulid::new()))
+        }
+        async fn invalidate(
+            &self,
+            _id: MemoryId,
+            _cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+
+    /// Provider with a small context window so the RAG bound actually bites:
+    /// 2,000 available tokens → `rag_limit` (25%) = 500 tokens per retrieval.
+    struct TinyBudgetProvider;
+    #[async_trait]
+    impl LlmProvider for TinyBudgetProvider {
+        fn provider_name(&self) -> &'static str {
+            "tiny"
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(2_000, 0)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        async fn stream_completion(
+            &self,
+            _request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, ProviderError> {
+            Ok(Box::pin(stream::iter(Vec::<Result<CompletionChunk, ProviderError>>::new())))
+        }
+    }
+
+    /// Build the loop for the ADR-67 M-01 single-owner test: `RetrievalMemory`
+    /// + `TinyBudgetProvider`, with or without the RAG budget allocator.
+    fn make_rag_loop(with_budget: bool) -> AgentLoop {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy));
+        AgentLoop::with_project_root(
+            EventBus::new(64),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            Arc::new(TinyBudgetProvider),
+            executor,
+            Arc::new(RetrievalMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new("/tmp"))),
+            EvalEngine::new("/tmp"),
+            PromptBuilder::new("test system prompt"),
+            1,
+            false, // fast=false exercises the retrieved-memory (RAG) path
+            std::path::PathBuf::from("/tmp"),
+            with_budget.then(ContextBudgetAllocator::default),
+        )
+    }
+
+    /// ADR-67 M-01 single-owner gate: retrieved working memory is bounded by
+    /// exactly one owner — `ContextBudgetAllocator::truncate_to_rag_limit`
+    /// at the loop site. The in-run overflow strategy was removed, so the
+    /// allocator is the only token bound on the RAG path; a loop without it
+    /// lets retrieved chunks pass through unbounded.
+    #[tokio::test]
+    async fn retrieved_memory_is_bounded_by_the_single_rag_owner() {
+        let session = SessionContext::new(Ulid::new(), std::path::PathBuf::from("/tmp"));
+
+        let bounded = make_rag_loop(true)
+            .retrieve_working_memory("project evidence", &session, CancellationToken::new())
+            .await;
+        let est_tokens = bounded.len().div_ceil(4) as u64;
+
+        // Rag limit is 500 tokens (25% of 2,000 available). The surviving
+        // chunk is clipped to that bound; formatting adds small constant
+        // overhead on top.
+        assert!(
+            est_tokens <= 800,
+            "single RAG owner must keep the injected block within the rag budget; est={est_tokens}"
+        );
+        // Score ordering: the highest-scored chunk is kept; the lower-scored
+        // chunks are dropped once the aggregate budget is consumed.
+        assert!(bounded.contains("\"id\":\"chunk-1\""), "highest-scored chunk retained");
+        assert!(!bounded.contains("\"chunk-2\""), "excess chunks dropped by the RAG bound");
+        // Clipping announces itself — proves truncation actually ran.
+        assert!(bounded.contains("Content clipped to fit the context budget"));
+
+        // Without the allocator nothing else binds the RAG pool: all three
+        // oversized chunks pass through intact (60k chars ⇒ ~15k tokens).
+        let unbounded = make_rag_loop(false)
+            .retrieve_working_memory("project evidence", &session, CancellationToken::new())
+            .await;
+        let unbounded_tokens = unbounded.len().div_ceil(4) as u64;
+        assert!(
+            unbounded_tokens > 3_000,
+            "no second hidden owner: a loop without the allocator stays unbounded \
+             ({unbounded_tokens} tokens)"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -3271,7 +3370,6 @@ mod tests {
             max_iterations,
             true, // fast mode
             std::path::PathBuf::from(project_dir),
-            None, // no overflow strategy
             None, // no budget allocator
         )
         .with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
@@ -3313,7 +3411,6 @@ mod tests {
             max_iterations,
             true,
             std::path::PathBuf::from("/tmp"),
-            None,
             None,
         )
     }
@@ -3367,7 +3464,6 @@ mod tests {
             true,
             dir.to_path_buf(),
             None,
-            None,
         )
     }
 
@@ -3406,7 +3502,6 @@ mod tests {
             true,
             dir.to_path_buf(),
             None,
-            None,
         )
         .with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
             // Transient failures surface immediately so the run ends with the
@@ -3438,6 +3533,7 @@ mod tests {
         }
         async fn request_ack(
             &self,
+            _session_id: Ulid,
             _message: &str,
             _cancel: concerto_core::CancellationToken,
         ) -> bool {
@@ -3464,6 +3560,7 @@ mod tests {
         }
         async fn request_ack(
             &self,
+            _session_id: Ulid,
             _message: &str,
             _cancel: concerto_core::CancellationToken,
         ) -> bool {
@@ -3561,20 +3658,36 @@ mod tests {
             as Arc<dyn VectorStore>;
         let fts_store = Arc::new(SqliteFullTextStore::new(pool.clone()).await.expect("fts"))
             as Arc<dyn FullTextStore>;
-        let decision_store = DecisionStore::new();
-        let task_tree_store = TaskTreeStore::new();
+        let decision_store = Arc::new(DecisionStore::new());
+        let task_tree_store = Arc::new(TaskTreeStore::new());
         // Derive project_id from the same temp dir the agent loop will use,
         // so memory storage/retrieval inside the loop uses matching keys.
         let project_id = ProjectId::resolve(dir.path());
-        let memory: Arc<dyn MemoryStore> = Arc::new(MemorySystem::new(
-            vector_store,
-            fts_store,
-            decision_store,
-            task_tree_store,
-            None,
-            project_id.clone(),
-            None,
-        ));
+        // Wire the L1 dedup judge (ADR-46) onto the project-namespace store —
+        // the same `with_dedup_judge` path production uses in
+        // `init_memory_system_with_handles`. The judge is backed by the loop's
+        // own scripted provider: the scripted replies carry no verdict text,
+        // so any judge pass fails open to a plain store, which is exactly the
+        // production fail-open contract (judge/recall trouble never drops a
+        // memory).
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![], vec![], vec![]]));
+        let judge = L1DedupJudge::new(Arc::new(ProviderSummarizer::new(
+            provider.clone(),
+            "test-model".into(),
+            CancellationToken::new(),
+        )));
+        let memory: Arc<dyn MemoryStore> = Arc::new(
+            MemorySystem::new(
+                vector_store,
+                fts_store,
+                decision_store,
+                task_tree_store,
+                None,
+                project_id.clone(),
+                None,
+            )
+            .with_dedup_judge(judge),
+        );
 
         let entry = MemoryEntry {
             id: MemoryId(Ulid::new()),
@@ -3604,7 +3717,6 @@ mod tests {
             "retrieved content must match stored entry"
         );
 
-        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_dir(
             provider.clone(),
@@ -3886,7 +3998,6 @@ mod tests {
             max_iterations,
             true,
             std::path::PathBuf::from("/tmp"),
-            None,
             None,
         )
         .with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
@@ -4356,7 +4467,6 @@ mod tests {
             10,
             true,
             dir.path().to_path_buf(),
-            None,
             None,
         )
         .with_usage_model("muse-v2".to_string());
@@ -4979,7 +5089,6 @@ mod tests {
             10,
             true,
             std::path::PathBuf::from("/tmp"),
-            None,
             None,
         );
 
@@ -6674,7 +6783,6 @@ mod tests {
             10,
             true,
             dir.path().to_path_buf(),
-            None,
             None,
         );
 

@@ -1,0 +1,26 @@
+{
+  "id": "persona_mem/cold_ask",
+  "description": "Cold recall of stable user facts after a long session: six seed facts and four distractors are stored, then five keyword queries must surface the target fact at rank <= 2 (deterministic FTS5 implicit-AND guarantees the distinctive token of each query matches exactly one seed fact).",
+  "seed_facts": [
+    "The user prefers Rust and works primarily on the Concerto agent workspace.",
+    "The user deploys the agent on a Linux workstation with an AMD Ryzen processor.",
+    "The user's preferred editor is Neovim with the lazy.nvim plugin manager.",
+    "The user meets the design review team on Tuesdays at 14:00 UTC.",
+    "The CI pipeline for Concerto pins the Rust toolchain to 1.96.0.",
+    "The user's default shell is fish with a custom greeting."
+  ],
+  "distractors": [
+    "The team evaluated switching to Go for the web dashboard backend.",
+    "The onboarding doc recommends Visual Studio Code for new contributors.",
+    "Concerto deployments historically used Python build scripts.",
+    "A previous design review was postponed to a Thursday."
+  ],
+  "queries": [
+    { "query": "the user prefers rust", "expected": "prefers Rust", "min_rank": 2 },
+    { "query": "the user's editor is neovim", "expected": "Neovim", "min_rank": 2 },
+    { "query": "the ci pipeline pins the rust toolchain", "expected": "1.96.0", "min_rank": 2 },
+    { "query": "the user meets the design review team", "expected": "Tuesdays", "min_rank": 2 },
+    { "query": "the user's default shell is fish", "expected": "fish", "min_rank": 2 }
+  ],
+  "min_recall_rate": 1.0
+}

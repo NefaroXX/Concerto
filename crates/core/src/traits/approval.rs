@@ -41,7 +41,14 @@ pub trait ApprovalSink: Send + Sync {
     /// Ask the user to acknowledge a non-blocking warning before proceeding.
     /// Returns `true` if the user acknowledged and wants to continue,
     /// `false` if they want to abort the task.
-    async fn request_ack(&self, message: &str, cancel: CancellationToken) -> bool;
+    ///
+    /// `session_id` makes the caller's intent explicit (mirroring
+    /// [`Self::request_plan_approval`]) so multi-session frontends can route
+    /// the prompt back to the window it belongs to and ack resolution can
+    /// confirm session membership without consulting the executor (ADR-68,
+    /// audit H-04).
+    async fn request_ack(&self, session_id: Ulid, message: &str, cancel: CancellationToken)
+        -> bool;
 
     /// Ask the user to confirm a change of run intent (ADR-55 §1/§4).
     ///

@@ -92,6 +92,11 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [62](./ADR-62-tool-executor-and-virtual-fs.md) | Tool Execution Pipeline — `ToolExecutor`, Policy Gates, `VirtualFs` | 2026-08-19 | Accepted | Single auditable, policy-gated mutation boundary with staged, reversible writes. |
 | [63](./ADR-63-memory-subsystem.md) | Memory Subsystem — SQLite Hybrid Vector/FTS Retrieval | 2026-08-19 | Accepted — supersedes [ADR-10](archive/ADR-10.md) | Offline hybrid semantic + lexical retrieval over SQLite with local embeddings. |
 | [64](./ADR-64-timeline-zero-waste-orchestration.md) | Timeline-driven zero-waste orchestration | 2026-09-02 | Proposed | Durable timeline + role-agnostic semantic keys + pre-dispatch resolver; plan reuse, gap-driven research, file capsules, agent-removability. |
+| [65](./ADR-65-evidence-spine.md) | Evidence spine — facts, claims, and decisions on one append-only chain | 2026-09-04 | Accepted | Append-only evidence chain over the whiteboard log; tool facts, workspace snapshot, read cache, resume, resource facts. |
+| [66](./ADR-66-harness-tool-call-guarantee.md) | Harness-level tool-call guarantee — every model drives tools or fails loud | 2026-09-07 | Accepted | Tool use is a loop invariant; fail-loud at selection/request/parse seams; universal text-fallback driver; per-model capability resolution. |
+| [67](./ADR-67-m01-context-pool-consolidation.md) | M-01 — Consolidate context-overflow pools under a single owner per pool | 2026-09-18 | Accepted | One ContextEngine owns all budget pools; removes double-clip, deletes SummarizeOldest (NoOp retained), documents generic.rs:402 invariant. Gate-only S effort. |
+| [68](./ADR-68-h04-session-ack-breaking-param.md) | H-04 — Breaking parameter change for `request_ack` | 2026-09-18 | Accepted | New `request_ack` signature with session_id validation; PendingAck gains session_id; 6 impls + 5 doubles; desktop single-slot queues-or-rejects-busy. |
+| [69](./ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | 2026-09-18 | Accepted | Three slices: link store (M 3-5d), scoring+decay (M 5-8d), Mermaid+UI+eval (S-M 3-5d); fail-open, degree/TTL caps, cost-gated progression. |
 
 ## Archived ADRs ([`archive/`](./archive/))
 

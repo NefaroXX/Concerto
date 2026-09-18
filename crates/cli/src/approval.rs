@@ -9,6 +9,10 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalPrompt {
+    /// Session the prompt belongs to, for routing/logging (ADR-68, audit
+    /// H-04): populates the pending prompt so the TUI can correlate the ack
+    /// or approval back to its originating run.
+    pub session_id: Ulid,
     pub tool_name: String,
     pub detail: String,
     pub acknowledgement: bool,
@@ -246,6 +250,7 @@ impl ApprovalSink for CliApprovalSink {
         }
 
         let prompt = ApprovalPrompt {
+            session_id: action.session_id,
             tool_name: action.tool_name.to_string(),
             detail: summarize_input(action),
             acknowledgement: false,
@@ -267,11 +272,17 @@ impl ApprovalSink for CliApprovalSink {
         self.set_auto_approve(true);
     }
 
-    async fn request_ack(&self, message: &str, _cancel: CancellationToken) -> bool {
+    async fn request_ack(
+        &self,
+        session_id: Ulid,
+        message: &str,
+        _cancel: CancellationToken,
+    ) -> bool {
         if self.auto_approve.load(Ordering::Relaxed) {
             return true;
         }
         let prompt = ApprovalPrompt {
+            session_id,
             tool_name: "warning".to_string(),
             detail: message.to_string(),
             acknowledgement: true,
@@ -484,6 +495,7 @@ mod tests {
     fn approval_state_request_resolve_round_trip() {
         let state = CliApprovalState::default();
         let prompt = ApprovalPrompt {
+            session_id: Ulid::new(),
             tool_name: "shell".into(),
             detail: "command: ls".into(),
             acknowledgement: false,
@@ -494,6 +506,7 @@ mod tests {
 
         // Request while one is pending should return None.
         let second = state.request(ApprovalPrompt {
+            session_id: Ulid::new(),
             tool_name: "git".into(),
             detail: "operation: commit".into(),
             acknowledgement: false,
@@ -573,8 +586,49 @@ mod tests {
     async fn approval_sink_auto_approve_ack_returns_true() {
         let sink = CliApprovalSink::new(true);
         let cancel = concerto_core::CancellationToken::new();
-        let ack = sink.request_ack("some warning", cancel.clone()).await;
+        let ack = sink.request_ack(Ulid::new(), "some warning", cancel.clone()).await;
         assert!(ack);
+    }
+
+    /// Wait until the spawned sink future has installed the pending ack so
+    /// the test resolves it without racing the spawn. Bounded so a broken sink
+    /// fails the test instead of hanging forever.
+    async fn wait_for_pending_ack(state: &CliApprovalState) {
+        for _ in 0..500 {
+            if state.prompt().is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("ack never queued a prompt");
+    }
+
+    #[tokio::test]
+    async fn ack_sink_round_trip_forwards_session_id() {
+        let state = CliApprovalState::default();
+        let sink = CliApprovalSink::with_state(state.clone());
+        let session_id = Ulid::new();
+        let cancel = concerto_core::CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            sink.request_ack(
+                session_id,
+                "This project is not a git repository — continue anyway?",
+                cancel,
+            )
+            .await
+        });
+        wait_for_pending_ack(&state).await;
+
+        // The pending approval prompt carries the requesting session id so the
+        // TUI can route/log the ack back to its originating run (ADR-68).
+        let prompt = state.prompt().expect("ack prompt must be pending");
+        assert_eq!(prompt.session_id, session_id);
+        assert!(prompt.acknowledgement, "ack prompts are acknowledgement prompts");
+
+        state.resolve(ApprovalDecision::Approve);
+        assert!(handle.await.expect("ack task panicked"), "an approved ack continues");
+        assert!(state.prompt().is_none(), "after resolve no prompt should be pending");
     }
 
     #[tokio::test]

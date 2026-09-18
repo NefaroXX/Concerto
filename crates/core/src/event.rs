@@ -266,6 +266,25 @@ pub enum EventKind {
         task_id: TaskId,
         cost_usd: f64,
     },
+    /// Phase 6 M3c: a resumed run's planned expected artifacts no longer match
+    /// the live workspace. Emitted when an artifact the approved plan expects
+    /// (`PlanArtifactTask::expected_artifacts`) is absent from the current
+    /// workspace snapshot AND the run's own recorded writes do not explain it
+    /// — a planned artifact that was never created before interruption, or an
+    /// externally tampered/removed worktree. Distinct from the F3 resume
+    /// reconciliation (which reports divergences of *observed* paths): this
+    /// fires for the planned-but-absent class. `plan_id` is the plan artifact
+    /// id (`plan-<plan_id>.json`), `affected_paths` are project-root-relative
+    /// forward-slash paths.
+    PlanDrift {
+        task_id: TaskId,
+        /// Run-scoped id of the plan the drift is scoped to; `None` when the
+        /// run carried no plan file (heuristic fallback or persistence was
+        /// skipped). Additive field — consumers must not rely on it being
+        /// present.
+        plan_id: Option<String>,
+        affected_paths: Vec<String>,
+    },
     SubTaskCreated {
         task_id: TaskId,
         role: AgentId,
@@ -697,6 +716,14 @@ impl EventKind {
             EventKind::EmbedderDegraded { project_id, reason } => EventKind::EmbedderDegraded {
                 project_id: sanitizer.sanitize(&project_id),
                 reason: sanitizer.sanitize(&reason),
+            },
+            EventKind::PlanDrift { task_id, plan_id, affected_paths } => EventKind::PlanDrift {
+                task_id,
+                plan_id: plan_id.map(|id| sanitizer.sanitize(&id)),
+                affected_paths: affected_paths
+                    .into_iter()
+                    .map(|path| sanitizer.sanitize(&path))
+                    .collect(),
             },
             // All other variants have no string fields or only non-sensitive strings
             other => other,

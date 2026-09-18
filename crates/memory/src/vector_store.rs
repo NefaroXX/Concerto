@@ -103,6 +103,13 @@ impl SqliteVectorStore {
         Ok(Self { pool })
     }
 
+    /// DDL-free constructor for read-only consumers in sibling modules
+    /// (e.g. [`crate::mermaid`] graph loading): assumes the schema already
+    /// exists and never runs migration DDL.
+    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
     /// Store one projection chunk together with its JSON metadata sidecar in a
     /// single transaction (ADR-60 D6).
     ///
