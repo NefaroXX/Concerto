@@ -557,12 +557,14 @@ pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views:
             }
             // Live AgentThought lines render bucketed per agent
             // (runtime.rs route_event); restore the typed fields directly.
-            TranscriptEntry::Thinking { agent, content } => {
+            // The tier flows through so the bucket digest matches live;
+            // pre-tier rows default to Detail via serde.
+            TranscriptEntry::Thinking { agent, content, kind } => {
                 chat_entries.push(ChatEntry::Thinking {
                     id,
-                    agent: agent.clone(),
+                    agent: concerto_core::types::normalize_agent_id(&agent),
                     content: content.clone(),
-                    kind: ThinkingKind::Detail,
+                    kind,
                     collapsed: false,
                     created_at: None,
                     finished_at: None,
@@ -582,7 +584,7 @@ pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views:
             TranscriptEntry::Activity { agent, content } => {
                 chat_entries.push(ChatEntry::Thinking {
                     id,
-                    agent: agent.clone(),
+                    agent: concerto_core::types::normalize_agent_id(&agent),
                     content: content.clone(),
                     kind: ThinkingKind::Detail,
                     collapsed: false,
@@ -597,7 +599,7 @@ pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views:
             TranscriptEntry::Summary { content } => {
                 chat_entries.push(ChatEntry::Thinking {
                     id,
-                    agent: "Context".to_string(),
+                    agent: concerto_core::types::normalize_agent_id("Context"),
                     content: content.clone(),
                     kind: ThinkingKind::Detail,
                     collapsed: true,
@@ -862,6 +864,7 @@ impl App {
         // already-gated cues (scan-line pulse, first-token emphasis, handoff
         // hold, line wipe) follow Settings → Display without a restart.
         app.chat.set_reduced_motion(app.reduced_motion);
+        app.seed_muted_agents();
 
         // Auto-discover models for every credentialed, discoverable provider at
         // startup so the unified picker (and per-provider lists) are populated
@@ -1161,6 +1164,7 @@ impl App {
                     // Persist the current session's agent graph before clearing.
                     self.persist_active_agent_graph();
                     self.chat = views::chat::State::new();
+                    self.seed_muted_agents();
                     self.agent_graph = views::agent_graph::State::new();
                     self.tool_log = views::tool_log::State::new();
                     self.active_session_id = None;
@@ -1227,6 +1231,14 @@ impl App {
                     // config — fast mode is a per-session choice.
                     self.fast = !self.fast;
                     iced::Task::none()
+                } else if matches!(&msg, views::chat::Message::ToggleMuteAgent(_)) {
+                    // Thinking-bucket mute IS persisted (`[display]
+                    // muted_agents`) — unlike fast mode, the filter is a
+                    // durable preference. The WAL and transcript keep every
+                    // thought regardless (hide-not-delete).
+                    let chat_task = self.chat.update(msg).map(Message::Chat);
+                    self.persist_muted_agents();
+                    chat_task
                 } else {
                     self.chat.update(msg).map(Message::Chat)
                 }
@@ -1368,6 +1380,9 @@ impl App {
                 } else {
                     self.tool_log.load_stored_events(&events);
                 }
+                // Restored and replayed entries normalize on read; seed the
+                // mute filter from the merged config on top.
+                self.seed_muted_agents();
                 self.page = Page::Chat;
                 iced::Task::none()
             }
@@ -1920,6 +1935,7 @@ impl App {
         self.reset_spend_state();
         self.agent_graph = views::agent_graph::State::new();
         self.chat = views::chat::State::new();
+        self.seed_muted_agents();
         let terminal = self
             .terminal
             .set_project_dir(self.project_dir.clone(), &self.current_theme)
@@ -2652,6 +2668,44 @@ impl App {
         }
     }
 
+    /// Seed the chat thinking-bucket mute filter from the merged config.
+    /// Called after every `self.chat` replacement (startup, new session,
+    /// session restore, project switch) so blank and restored sessions
+    /// honor `[display] muted_agents`. Hide-not-delete is preserved: the
+    /// WAL and transcript keep every thought regardless of this filter.
+    fn seed_muted_agents(&mut self) {
+        let muted = self
+            .config
+            .as_ref()
+            .map(|config| config.display.muted_agents.clone())
+            .unwrap_or_default();
+        self.chat.set_muted_agents(muted);
+    }
+
+    /// Persist the chat thinking-bucket mute set to `[display]
+    /// muted_agents` in the global config file, mirroring the multi-agent
+    /// toggle: save, then reload + re-derive through the shared helper so a
+    /// project-layer override stays the truth (ADR-57 §6). Falls back to
+    /// in-memory config when no global path exists. Never touches the WAL
+    /// or the durable transcript (hide-not-delete).
+    fn persist_muted_agents(&mut self) {
+        let mut config = self.global_config.clone();
+        config.display.muted_agents = self.chat.muted_agents_snapshot();
+        match concerto_config::default_config_path() {
+            Some(path) => {
+                if let Err(error) = concerto_config::save_config(&config, &path) {
+                    tracing::error!(%error, "failed to persist muted agents");
+                } else {
+                    self.reconcile_config_from_reload();
+                }
+            }
+            None => {
+                self.global_config = config.clone();
+                self.config = Some(config);
+            }
+        }
+    }
+
     /// Re-load config from disk and re-derive every `App` field that depends
     /// on it (ADR-57 §3). Shared by the config-watch subscription and every
     /// config write path, so all reload sites converge on one derivation
@@ -2721,6 +2775,9 @@ impl App {
         self.scanline_overlay_enabled = reloaded.display.scanline_overlay_enabled;
         self.reduced_motion = reloaded.display.reduced_motion;
         self.chat.set_reduced_motion(self.reduced_motion);
+        // Re-derive the thinking-bucket mute filter — the file is truth
+        // (covers the mute toggle's own save and external edits alike).
+        self.chat.set_muted_agents(reloaded.display.muted_agents.clone());
         (self.active_provider_id, self.active_model) = configured_default_route(&reloaded);
         self.sync_chat_model_options();
         self.sync_session_cap_from_config();
@@ -5757,8 +5814,16 @@ description = "keep me"
         let transcript = vec![
             TranscriptEntry::User { content: "build the widget".into() },
             TranscriptEntry::Assistant { content: "on it".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() },
-            TranscriptEntry::Thinking { agent: String::new(), content: "bare thought".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Headline,
+            },
+            TranscriptEntry::Thinking {
+                agent: String::new(),
+                content: "bare thought".into(),
+                kind: ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs".into(),
@@ -5816,7 +5881,7 @@ description = "keep me"
                 id: 3,
                 agent: "coder".into(),
                 content: "step one".into(),
-                kind: ThinkingKind::Detail,
+                kind: ThinkingKind::Headline,
                 collapsed: false,
                 created_at: None,
                 finished_at: None,
@@ -5874,7 +5939,7 @@ description = "keep me"
             },
             ChatEntry::Thinking {
                 id: 11,
-                agent: "Coordinator".into(),
+                agent: "coordinator".into(),
                 content: "Delegated subtask T1 to coder".into(),
                 kind: ThinkingKind::Detail,
                 collapsed: false,
@@ -5884,7 +5949,7 @@ description = "keep me"
             ChatEntry::Error { id: 12, content: "boom".into(), created_at: None },
             ChatEntry::Thinking {
                 id: 13,
-                agent: "Context".into(),
+                agent: "context".into(),
                 content: "context compacted".into(),
                 kind: ThinkingKind::Detail,
                 collapsed: true,
@@ -5920,7 +5985,11 @@ description = "keep me"
 
         let transcript = vec![
             TranscriptEntry::User { content: "build the widget".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs\nWrote 42 bytes".into(),
@@ -6030,7 +6099,7 @@ description = "keep me"
         assert!(matches!(
             &restored[2],
             ChatEntry::Thinking { agent, content, collapsed: false, .. }
-                if agent == "Coordinator"
+                if agent == "coordinator"
                     && content == "Decomposed task T1 into specialist subtask: apply the fix"
         ));
 
@@ -6038,7 +6107,7 @@ description = "keep me"
         assert!(matches!(
             &restored[3],
             ChatEntry::Thinking { agent, content, collapsed: true, .. }
-                if agent == "Context" && content == "context compacted"
+                if agent == "context" && content == "context compacted"
         ));
 
         // Restored completion: structured RunCompletionSummary.

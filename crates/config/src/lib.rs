@@ -387,12 +387,19 @@ fn apply_project_roots_env(config: &mut AppConfig) -> Result<(), ConfigError> {
 
 /// Serialize `config` to TOML and write it to `path`, creating parent
 /// directories as needed. Overwrites any existing file at `path`.
+///
+/// `[display] muted_agents` normalizes on write (trimmed + lowercased,
+/// deduped) so the file and the chat buckets always agree; the write
+/// itself is a byte-identical no-op when the list is already canonical.
 pub fn save_config(config: &AppConfig, path: &Path) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| ConfigError::Load(format!("failed to create config dir: {e}")))?;
     }
-    let toml_str = toml::to_string_pretty(config)
+    let mut normalized = config.clone();
+    normalized.display.muted_agents =
+        crate::schema::normalize_muted_agents(normalized.display.muted_agents);
+    let toml_str = toml::to_string_pretty(&normalized)
         .map_err(|e| ConfigError::Load(format!("failed to serialize config: {e}")))?;
     std::fs::write(path, toml_str)
         .map_err(|e| ConfigError::Load(format!("failed to write config file: {e}")))?;

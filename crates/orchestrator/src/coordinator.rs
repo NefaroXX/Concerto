@@ -1683,7 +1683,9 @@ impl CoordinatorAgent {
                         } else {
                             format!("Subtask failed: {error_string}")
                         },
-                        kind: ThinkingKind::Detail,
+                        // Terminal failure is a bucket digest (Headline);
+                        // cancellation stays Detail with the other internals.
+                        kind: if cancelled { ThinkingKind::Detail } else { ThinkingKind::Headline },
                     },
                 );
                 let lifecycle_event = if cancelled {

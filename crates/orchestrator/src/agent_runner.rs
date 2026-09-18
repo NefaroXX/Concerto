@@ -263,7 +263,9 @@ impl AgentRunner {
                         } else {
                             format!("Subtask failed: {error}")
                         },
-                        kind: ThinkingKind::Detail,
+                        // Terminal failure is a bucket digest (Headline);
+                        // cancellation stays Detail with the other internals.
+                        kind: if cancelled { ThinkingKind::Detail } else { ThinkingKind::Headline },
                     },
                 );
                 let lifecycle_event = if cancelled {
@@ -357,7 +359,8 @@ impl AgentRunner {
                     EventKind::AgentThought {
                         agent_id: role_name.to_string(),
                         content: format!("Subtask failed: {error}"),
-                        kind: ThinkingKind::Detail,
+                        // Terminal failure surfaces as the bucket digest.
+                        kind: ThinkingKind::Headline,
                     },
                 );
                 let _ = self.bus.publish_for_session(
@@ -799,7 +802,6 @@ mod tests {
             "Failed outcome must not publish SubTaskCompleted: {events:?}"
         );
     }
-
     #[tokio::test]
     async fn cancelled_run_publishes_cancelled_not_failed() {
         let (result, events) = run_researcher_and_collect(vec![MockExpertAgent::sequence(
@@ -923,5 +925,84 @@ mod tests {
         assert_eq!(result.model, "mock-model");
         // Cost should be preserved from the agent result (not overwritten).
         assert!((result.cost_usd - 0.015).abs() < f64::EPSILON);
+    }
+
+    // ------------------------------------------------------------------
+    // Score-accordion tiers: terminal completion/failure thoughts are
+    // Headline digests; cancellation and decomposition internals stay Detail.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn failed_outcome_thought_is_headline() {
+        let (_, events) = run_researcher_and_collect(vec![MockExpertAgent::always_fail(
+            AgentId::new("researcher"),
+            "api returned 500",
+        )])
+        .await;
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::AgentThought { content, kind, .. }
+                    if content.contains("Subtask failed") =>
+                {
+                    Some(*kind)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![concerto_core::event::ThinkingKind::Headline],
+            "terminal failure thought must be Headline: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_path_failure_thought_is_headline_but_cancel_stays_detail() {
+        // Non-cancellation error → Headline.
+        let (_, events) = run_researcher_and_collect(vec![MockExpertAgent::sequence(
+            AgentId::new("researcher"),
+            vec![Err(OrchestratorError::AgentLoopError("boom".into()))],
+        )])
+        .await;
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::AgentThought { content, kind, .. }
+                    if content.contains("Subtask failed") =>
+                {
+                    Some(*kind)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![concerto_core::event::ThinkingKind::Headline],
+            "error-path failure thought must be Headline: {events:?}"
+        );
+
+        // Cancellation → Detail.
+        let (_, cancelled_events) = run_researcher_and_collect(vec![MockExpertAgent::sequence(
+            AgentId::new("researcher"),
+            vec![Err(OrchestratorError::Provider(ProviderError::Cancelled))],
+        )])
+        .await;
+        let cancelled_kinds: Vec<_> = cancelled_events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::AgentThought { content, kind, .. }
+                    if content.contains("Subtask cancelled") =>
+                {
+                    Some(*kind)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancelled_kinds,
+            vec![concerto_core::event::ThinkingKind::Detail],
+            "cancellation thought must stay Detail: {cancelled_events:?}"
+        );
     }
 }

@@ -22,6 +22,7 @@ use concerto_core::intent::{PlanDecision, RequestedOutcome, RunStage};
 use concerto_core::traits::approval::ApprovalDecision;
 use concerto_core::transcript::{TranscriptEntry, TranscriptToolStatus};
 
+use concerto_core::types::normalize_agent_id;
 use concerto_core::types::AgentOutput;
 use concerto_core::CancellationToken;
 use concerto_orchestrator::runtime_runner::{
@@ -1092,7 +1093,12 @@ impl App {
     /// The full movement is always logged; rendering follows the collapse
     /// mode — `Headline` thoughts always show, `Detail` only when expanded.
     /// A bold per-agent header is injected on agent change.
+    ///
+    /// The agent id normalizes (trimmed + lowercased) for grouping so
+    /// `" Coder "` and `"coder"` share one bucket; content keeps its
+    /// original text.
     fn ingest_thought(&mut self, agent: String, kind: ThinkingKind, content: String) {
+        let agent = normalize_agent_id(&agent);
         let shown = self.thinking_expanded || kind == ThinkingKind::Headline;
         self.thought_log.push_back(ThoughtRecord {
             agent: agent.clone(),
@@ -2191,7 +2197,7 @@ fn event_line(kind: &EventKind) -> Option<String> {
             if *kind == ThinkingKind::LowLevel {
                 None
             } else {
-                Some(format!("· [{agent_id}] {content}"))
+                Some(format!("· [{}] {content}", normalize_agent_id(agent_id)))
             }
         }
         EventKind::SubTaskCreated { role, description, .. } => {
@@ -2332,7 +2338,8 @@ fn transcript_lines_with_theme(
             TranscriptEntry::Assistant { content } => {
                 chat_line_with_theme(ChatRole::Assistant, content, styling, theme)
             }
-            TranscriptEntry::Thinking { agent, content } => {
+            TranscriptEntry::Thinking { agent, content, .. } => {
+                let agent = normalize_agent_id(agent);
                 let text =
                     if agent.is_empty() { content.clone() } else { format!("[{agent}] {content}") };
                 Line::from(text).style(Style::default().fg(theme.muted))
@@ -2538,6 +2545,35 @@ mod tests {
         assert_eq!(app.thought_log.len(), MAX_THOUGHT_LOG);
         let front = app.thought_log.front().map(|r| r.content.clone()).unwrap_or_default();
         assert_eq!(front, format!("detail {}", 50));
+    }
+
+    #[test]
+    fn thought_ingest_normalizes_agent_for_grouping() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: " Coder ".into(),
+            kind: ThinkingKind::Headline,
+            content: "starting".into(),
+        });
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "CODER".into(),
+            kind: ThinkingKind::Detail,
+            content: "reasoning".into(),
+        });
+        // One header (single bucket), normalized grouping keys, original
+        // content preserved.
+        assert_eq!(app.current_agent.as_deref(), Some("coder"));
+        assert!(app.thought_log.iter().all(|record| record.agent == "coder"));
+        assert_eq!(app.thought_log.len(), 2);
+        // Live lines render the normalized bucket prefix.
+        assert_eq!(
+            event_line(&EventKind::AgentThought {
+                agent_id: " Coder ".into(),
+                content: "hi".into(),
+                kind: ThinkingKind::Headline,
+            }),
+            Some("· [coder] hi".to_string())
+        );
     }
 
     #[test]
@@ -3106,7 +3142,11 @@ mod tests {
 
         let entries = vec![
             TranscriptEntry::User { content: "build the widget".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs".into(),

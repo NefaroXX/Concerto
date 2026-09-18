@@ -14,7 +14,7 @@ use crate::views::spend::{
 use crate::widgets::agent_graph::NodeState;
 use crate::widgets::markdown;
 use concerto_core::event::ThinkingKind;
-use concerto_core::types::AgentId;
+use concerto_core::types::{normalize_agent_id, AgentId};
 use concerto_sessions::spend::SpendRecord;
 
 /// Unique entry identifier within a chat session.
@@ -293,7 +293,8 @@ pub struct State {
     thinking_expand_all: bool,
     /// Per-agent mute set for the thinking filter bar. Muted buckets are
     /// hidden from chat only — the WAL, transcript, and AgentGraph logs
-    /// still record everything.
+    /// still record everything. Persisted to `[display] muted_agents`;
+    /// seeded from config at startup via [`Self::set_muted_agents`].
     muted_agents: HashSet<String>,
     /// Whether the blinking cursor is currently shown on the live streaming
     /// assistant entry. Toggled by `Message::StreamingTick`; only meaningful
@@ -444,6 +445,9 @@ impl State {
     /// Reconstruct a `State` from previously persisted entries (per-project
     /// chat transcript). The next entry id continues after the highest id
     /// already present so new entries don't collide with restored ones.
+    ///
+    /// Stored thinking agents normalize on read so old transcript rows map
+    /// forward into the same buckets as live events.
     pub fn from_entries(mut entries: Vec<ChatEntry>) -> Self {
         // A restored transcript cannot contain a genuinely live tool call.
         // Mark interrupted calls neutrally instead of displaying them forever
@@ -453,6 +457,9 @@ impl State {
                 if matches!(status, ToolCallStatus::Running) {
                     *status = ToolCallStatus::Cancelled;
                 }
+            }
+            if let ChatEntry::Thinking { agent, .. } = entry {
+                *agent = normalize_agent_id(agent);
             }
         }
         if entries.len() > MAX_LIVE_ENTRIES {
@@ -657,7 +664,12 @@ impl State {
     /// entries from the same agent at the same tier merge into one; anything
     /// else appends. Never touches the expand/mute view state, so new input
     /// never auto-expands a bucket.
+    ///
+    /// The stored agent id is normalized (trimmed + lowercased) so
+    /// `" Coder "` and `"coder"` share one bucket; the content text keeps
+    /// its original prefix untouched.
     pub fn add_thinking(&mut self, agent_id: &str, content: String, kind: ThinkingKind) {
+        let agent_id = normalize_agent_id(agent_id);
         if let Some(ChatEntry::Thinking {
             agent,
             kind: existing_kind,
@@ -668,7 +680,7 @@ impl State {
             ..
         }) = self.entries.last_mut()
         {
-            if agent == agent_id && *existing_kind == kind {
+            if *agent == agent_id && *existing_kind == kind {
                 existing.push('\n');
                 existing.push_str(&content);
                 *existing = tail_chars(existing, MAX_THINKING_CHARS);
@@ -689,7 +701,7 @@ impl State {
         let collapsed = content.len() > 500;
         self.entries.push(ChatEntry::Thinking {
             id,
-            agent: agent_id.to_string(),
+            agent: agent_id,
             content,
             kind,
             collapsed,
@@ -698,6 +710,26 @@ impl State {
         });
         self.thinking_reveals.insert(id, 0);
         self.trim_entries();
+    }
+
+    /// Replace the muted-agent filter set, seeding from `[display]
+    /// muted_agents` at startup. Entries normalize exactly like bucket keys
+    /// (trimmed + lowercased, empties dropped) so config and buckets agree.
+    pub fn set_muted_agents(&mut self, agents: Vec<String>) {
+        self.muted_agents = agents
+            .iter()
+            .map(|agent| normalize_agent_id(agent))
+            .filter(|agent| !agent.is_empty())
+            .collect();
+    }
+
+    /// Snapshot the muted-agent filter set for config persistence (sorted
+    /// for stable file output). Hide-not-delete is preserved: the WAL and
+    /// transcript keep every thought regardless of this filter.
+    pub fn muted_agents_snapshot(&self) -> Vec<String> {
+        let mut agents: Vec<String> = self.muted_agents.iter().cloned().collect();
+        agents.sort();
+        agents
     }
 
     /// Surface a blocking error to the user as a distinct chat entry (e.g. a
@@ -1201,6 +1233,7 @@ impl State {
                 }
             }
             Message::ToggleMuteAgent(agent) => {
+                let agent = normalize_agent_id(&agent);
                 if !self.muted_agents.remove(&agent) {
                     self.muted_agents.insert(agent);
                 }
@@ -1906,16 +1939,18 @@ impl State {
     }
 }
 
-/// Bucket key for a thinking entry: the stored agent id, falling back to
-/// the legacy `[agent]` content prefix for pre-V2 entries.
+/// Bucket key for a thinking entry: the normalized stored agent id, falling
+/// back to the normalized legacy `[agent]` content prefix for pre-V2
+/// entries. Content text itself is never modified.
 fn thinking_agent_key(agent: &str, content: &str) -> String {
     if !agent.is_empty() {
-        return agent.to_string();
+        return normalize_agent_id(agent);
     }
-    content
+    let raw = content
         .split_once("] ")
         .map(|(p, _)| p.strip_prefix('[').unwrap_or(p).to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    normalize_agent_id(&raw)
 }
 
 /// Full per-agent bucketing over every `Thinking` entry: returns agents in
@@ -2308,11 +2343,11 @@ fn crosses_paragraph_boundary(content: &str, from: usize, to: usize) -> bool {
     false
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Composer placeholder (V3 quick win): advertises the `/thinking`
 /// accordion toggle with zero behavior change.
 const COMPOSER_PLACEHOLDER: &str = "Type a message... (/thinking toggles thinking)";
 
+#[allow(clippy::too_many_arguments)]
 fn input_bar<'a>(
     input: &'a str,
     palette: &'a crate::theme::Palette,
@@ -3403,5 +3438,52 @@ mod tests {
             provenance_rail(&ToolCallStatus::Failed, "git_commit"),
             "‖ policy ok · fs reversible"
         );
+    }
+
+    #[test]
+    fn thinking_agent_ids_normalize_into_one_bucket() {
+        let mut state = State::new();
+        state.add_thinking(" Coder ", "a".to_string(), ThinkingKind::Detail);
+        // Different case + padding merges into the same open entry.
+        state.add_thinking("coder", "b".to_string(), ThinkingKind::Detail);
+        state.add_thinking("CODER", "c".to_string(), ThinkingKind::Detail);
+        let thinking: Vec<_> = state
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, ChatEntry::Thinking { .. }))
+            .collect();
+        assert_eq!(thinking.len(), 1, "mixed-case ids must share one bucket");
+        assert!(matches!(
+            thinking[0],
+            ChatEntry::Thinking { agent, .. } if agent == "coder"
+        ));
+        // Legacy `[Agent]` content prefixes normalize for grouping while the
+        // content text keeps its original prefix.
+        assert_eq!(thinking_agent_key("", "[Coder] plan"), "coder");
+        assert_eq!(thinking_agent_key(" Reviewer ", "x"), "reviewer");
+        // A mixed-case mute toggle hits the same normalized bucket.
+        let _ = state.update(Message::ToggleMuteAgent("CODER".to_string()));
+        assert!(state.muted_agents.contains("coder"));
+    }
+
+    #[test]
+    fn muted_agents_seed_and_snapshot_round_trip_normalized() {
+        let mut state = State::new();
+        state.set_muted_agents(vec![" Reviewer ".into(), "reviewer".into(), "  ".into()]);
+        assert_eq!(state.muted_agents_snapshot(), vec!["reviewer".to_string()]);
+        // Restore path normalizes stored agents the same way.
+        let restored = State::from_entries(vec![ChatEntry::Thinking {
+            id: 1,
+            agent: " Coder ".into(),
+            content: "x".into(),
+            kind: ThinkingKind::Detail,
+            collapsed: false,
+            created_at: None,
+            finished_at: None,
+        }]);
+        assert!(matches!(
+            restored.entries().first(),
+            Some(ChatEntry::Thinking { agent, .. }) if agent == "coder"
+        ));
     }
 }

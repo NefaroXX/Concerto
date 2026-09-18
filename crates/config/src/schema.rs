@@ -329,6 +329,35 @@ pub struct DisplayConfig {
     /// this key > default — see `concerto_cli::theme::resolve_cli_theme`.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Muted thinking-bucket agents (score accordion). Hide-not-delete: the
+    /// WAL and transcript keep every thought; muted buckets simply don't
+    /// render in chat. Additive serde-default only (empty = nothing muted),
+    /// so old configs load unchanged with no migration. Entries are
+    /// normalized (trimmed + lowercased, empties dropped, deduped) on write
+    /// via [`normalize_muted_agents`]; the desktop toggle writes through
+    /// this key and seeds its filter from it at startup.
+    ///
+    /// Config-only editing for now (no Settings checkbox list — agent ids
+    /// are dynamic per run); e.g. `[display] muted_agents = ["reviewer"]`.
+    #[serde(default)]
+    pub muted_agents: Vec<String>,
+}
+
+/// Normalize a `[display] muted_agents` list the same way chat buckets do:
+/// trim + lowercase each entry, drop empties, dedupe preserving first-seen
+/// order. Applied on every config write ([`crate::save_config`]) and when
+/// the desktop seeds its filter, so the file and the buckets always agree.
+pub fn normalize_muted_agents(raw: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in raw {
+        let normalized = concerto_core::types::normalize_agent_id(&entry);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        out.push(normalized);
+    }
+    out
 }
 
 fn default_animated_terminal_title() -> bool {
@@ -342,6 +371,7 @@ impl Default for DisplayConfig {
             scanline_overlay_enabled: false,
             animated_terminal_title: default_animated_terminal_title(),
             theme: None,
+            muted_agents: Vec::new(),
         }
     }
 }
@@ -2978,6 +3008,36 @@ mod tests {
         assert!(!config.display.reduced_motion);
         assert!(!config.display.scanline_overlay_enabled);
         assert!(config.display.animated_terminal_title);
+        assert!(config.display.muted_agents.is_empty());
+    }
+
+    #[test]
+    fn normalize_muted_agents_trims_lowercases_dedupes() {
+        assert_eq!(
+            normalize_muted_agents(vec![
+                " Reviewer ".into(),
+                "reviewer".into(),
+                "CODER".into(),
+                "  ".into(),
+                String::new(),
+                "coder".into(),
+            ]),
+            vec!["reviewer".to_string(), "coder".to_string()]
+        );
+        assert!(normalize_muted_agents(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn display_muted_agents_survives_toml_round_trip() {
+        let mut config = AppConfig::default();
+        config.display.muted_agents = vec!["reviewer".into()];
+        let toml_str = toml::to_string(&config).expect("config serializes");
+        let back: AppConfig = toml::from_str(&toml_str).expect("config deserializes");
+        assert_eq!(back.display.muted_agents, vec!["reviewer".to_string()]);
+        // Old files without the key load as empty (additive, no migration).
+        let legacy: AppConfig =
+            toml::from_str("schema_version = 7\n").expect("legacy config loads");
+        assert!(legacy.display.muted_agents.is_empty());
     }
 
     #[test]

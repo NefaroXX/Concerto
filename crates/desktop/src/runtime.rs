@@ -13,6 +13,7 @@ use concerto_core::event::{Event as BackendEvent, EventBus, EventKind, ThinkingK
 use concerto_core::ids::Ulid;
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::traits::policy::PolicyEngine;
+use concerto_core::types::normalize_agent_id;
 use concerto_core::CancellationToken;
 use concerto_core::TaskId;
 use concerto_sessions::spend::SpendTracker;
@@ -561,9 +562,11 @@ pub fn route_event(
             // LowLevel thoughts never reach chat: they fold into the
             // AgentGraph logs only. Everything else lands in the agent's
             // chat bucket (Headline = digest, Detail = behind expand).
+            // The id normalizes at ingestion so mixed-case replays share
+            // one bucket; content keeps its original text.
             agent_graph_state.on_agent_thought(agent_id, content);
             if *kind != ThinkingKind::LowLevel {
-                chat_state.add_thinking(agent_id, content.clone(), *kind);
+                chat_state.add_thinking(&normalize_agent_id(agent_id), content.clone(), *kind);
             }
         }
         DesktopEvent::ToolCalled { tool_name, input_hash, detail } => {
@@ -625,7 +628,9 @@ pub fn route_event(
                 outcome: outcome.clone(),
                 role: role.clone(),
             });
-            chat_state.add_thinking(role, format!("Completed: {outcome}"), ThinkingKind::Detail);
+            // Terminal completion is a bucket digest (Headline);
+            // decomposition internals stay Detail.
+            chat_state.add_thinking(role, format!("Completed: {outcome}"), ThinkingKind::Headline);
         }
         DesktopEvent::SubTaskNeedsRevision { task_id, reason, role } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::NeedsRevision {
@@ -661,7 +666,9 @@ pub fn route_event(
                 error: error.clone(),
                 role: role.clone(),
             });
-            chat_state.add_thinking(role, format!("Failed: {error}"), ThinkingKind::Detail);
+            // Terminal failure is a bucket digest (Headline);
+            // cancellation and revision/blocked internals stay Detail.
+            chat_state.add_thinking(role, format!("Failed: {error}"), ThinkingKind::Headline);
         }
         DesktopEvent::IndexingProgress { files_processed, files_total } => {
             memory_state.on_indexing_progress(*files_processed, *files_total);
