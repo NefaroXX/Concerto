@@ -38,8 +38,8 @@ use crate::vector_store::VectorStore;
 pub struct MemorySystem {
     retriever: HybridRetriever,
     sync: ChunkSyncService,
-    decision_store: DecisionStore,
-    task_tree: TaskTreeStore,
+    decision_store: Arc<DecisionStore>,
+    task_tree: Arc<TaskTreeStore>,
     budget: ContextBudgetAllocator,
     embedder: Option<Arc<dyn EmbeddingGenerator>>,
     project_id: ProjectId,
@@ -54,8 +54,8 @@ impl MemorySystem {
     pub fn new(
         vector_store: Arc<dyn VectorStore>,
         fts_store: Arc<dyn FullTextStore>,
-        decision_store: DecisionStore,
-        task_tree: TaskTreeStore,
+        decision_store: Arc<DecisionStore>,
+        task_tree: Arc<TaskTreeStore>,
         embedder: Option<Arc<dyn EmbeddingGenerator>>,
         project_id: ProjectId,
         global_store: Option<Arc<GlobalMemoryStore>>,
@@ -75,11 +75,17 @@ impl MemorySystem {
         }
     }
     /// Access the decision store.
-    pub fn decisions(&self) -> &DecisionStore {
+    ///
+    /// Returns the shared `Arc` so a caller that also holds the same handle
+    /// (e.g. the coordinator's Phase 6 M3 write-back/read-back wiring) reads
+    /// and writes the SAME in-memory store — never a divergent copy.
+    pub fn decisions(&self) -> &Arc<DecisionStore> {
         &self.decision_store
     }
     /// Access the task tree store.
-    pub fn task_tree(&self) -> &TaskTreeStore {
+    ///
+    /// Returns the shared `Arc` (see [`Self::decisions`]).
+    pub fn task_tree(&self) -> &Arc<TaskTreeStore> {
         &self.task_tree
     }
     /// Access the RAG context budget allocator.
@@ -516,8 +522,8 @@ mod tests {
     async fn retrieve_uses_embedder() {
         let vector_store = Arc::new(TestVectorStore::new());
         let fts_store = Arc::new(InMemoryFullTextStore::new());
-        let decision_store = DecisionStore::new();
-        let task_tree = TaskTreeStore::new();
+        let decision_store = Arc::new(DecisionStore::new());
+        let task_tree = Arc::new(TaskTreeStore::new());
         let embedder: Option<Arc<dyn EmbeddingGenerator>> =
             Some(Arc::new(MockEmbeddingGenerator::new(384)));
         let system = MemorySystem::new(
@@ -539,8 +545,8 @@ mod tests {
     async fn retrieve_without_embedder_uses_empty_vector() {
         let vector_store = Arc::new(TestVectorStore::new());
         let fts_store = Arc::new(InMemoryFullTextStore::new());
-        let decision_store = DecisionStore::new();
-        let task_tree = TaskTreeStore::new();
+        let decision_store = Arc::new(DecisionStore::new());
+        let task_tree = Arc::new(TaskTreeStore::new());
         let system = MemorySystem::new(
             vector_store.clone(),
             fts_store,
@@ -584,8 +590,8 @@ mod tests {
         let system = MemorySystem::new(
             vector_store,
             fts_store,
-            DecisionStore::new(),
-            TaskTreeStore::new(),
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
             Some(Arc::new(FailingEmbeddingGenerator)),
             project_id.clone(),
             None,
@@ -613,8 +619,8 @@ mod tests {
         let system = MemorySystem::new(
             vector_store,
             fts_store,
-            DecisionStore::new(),
-            TaskTreeStore::new(),
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
             None,
             ProjectId("test".into()),
             None,
@@ -635,8 +641,8 @@ mod tests {
         let system = MemorySystem::new(
             vector_store,
             fts_store,
-            DecisionStore::new(),
-            TaskTreeStore::new(),
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
             None,
             ProjectId("test".into()),
             None,

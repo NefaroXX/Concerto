@@ -18,8 +18,8 @@ use concerto_core::event::{EventBus, EventKind};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
 use concerto_core::memory::{
-    Decision, DecisionCategory, DecisionId, MemoryNamespace, MemoryQuery, TaskNode, TaskNodeId,
-    TaskStatus,
+    ChunkType, Decision, DecisionCategory, DecisionId, MemoryChunk, MemoryNamespace, MemoryQuery,
+    TaskNode, TaskNodeId, TaskStatus,
 };
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::memory::MemoryStore;
@@ -1180,6 +1180,15 @@ pub struct CoordinatorAgent {
     /// facts, so a run's tool commands are attributable across task
     /// boundaries. `None` only when no run has started yet.
     run_id: Option<String>,
+    /// Phase 6 M3b: the shared decision store — the SAME `Arc` the memory
+    /// system wraps — backing outcome write-back on subtask settlement
+    /// (`Decision` records) and the run-scoped Phase-0 retrieval (M3a).
+    /// `None` when memory is disabled or the wiring is absent; both features
+    /// are then no-ops and the coordinator behaves exactly as before.
+    memory_decision_store: Option<Arc<concerto_memory::decision_store::DecisionStore>>,
+    /// Phase 6 M3b: the shared task-tree store (the memory system's `Arc`),
+    /// backing settled-subtask `TaskNode` records for the same two features.
+    memory_task_tree: Option<Arc<concerto_memory::task_tree::TaskTreeStore>>,
     /// ADR-65 §7: where the DesignDoc claim last stood (verdict + real event
     /// ids), captured into every checkpoint. Restored from the checkpoint on
     /// a resume so the §7 fields keep round-tripping; refreshed by the
@@ -1375,6 +1384,13 @@ fn checkpoint_doc_resolution(
 /// degradation (the checkpoint ledger still carries the per-task outcomes).
 const RESUME_LOG_WINDOW: usize = 2000;
 
+/// Phase 6 M3a: provenance stamps for the synthetic fact chunks rendered from
+/// the run's stored decisions/task nodes. They are not embedding-model
+/// outputs, so they carry a stable synthetic identity rather than a provider
+/// model name.
+const PLAN_MEMORY_MODEL_ID: &str = "concerto://plan-memory";
+const PLAN_MEMORY_MODEL_VERSION: &str = "1";
+
 /// The paths the run's OWN recorded writes explain (ADR-65 §7): the
 /// checkpoint's accumulated `all_files`, the completed results' reported
 /// `files_modified`, and — for the post-cursor tail — applied write paths
@@ -1439,6 +1455,24 @@ fn own_write_paths(
         }
     }
     own
+}
+
+/// Phase 6 M3b: classify a settled subtask outcome into a decision category
+/// by its role name. Token-based so the mapping stays stable as rosters are
+/// configured or renamed; an unrecognized role is recorded as `Other`.
+fn decision_category_for_role(role: &AgentId) -> DecisionCategory {
+    let name = role.as_str().to_ascii_lowercase();
+    if name.contains("plan") || name.contains("design") || name.contains("architect") {
+        DecisionCategory::Architecture
+    } else if name.contains("test") || name.contains("valid") || name.contains("review") {
+        DecisionCategory::Test
+    } else if name.contains("tool") {
+        DecisionCategory::Tooling
+    } else if name.contains("implement") || name.contains("coder") || name.contains("worker") {
+        DecisionCategory::Implementation
+    } else {
+        DecisionCategory::Other
+    }
 }
 
 /// The tag of the first stage carrying the given known kind, resolved from
@@ -1856,6 +1890,8 @@ impl CoordinatorAgent {
             write_gate: None,
             workspace_snapshot: None,
             run_id: None,
+            memory_decision_store: None,
+            memory_task_tree: None,
             last_doc_resolution: None,
             last_dispatch_decision: None,
             resume_cursor_hint_ms: None,
@@ -1902,6 +1938,22 @@ impl CoordinatorAgent {
     /// v4 backfill consumes it; present v4 fields are never overwritten.
     pub fn with_resume_cursor_hint_ms(mut self, hint_ms: Option<i64>) -> Self {
         self.resume_cursor_hint_ms = hint_ms;
+        self
+    }
+
+    /// Phase 6 M3a/M3b: attach the shared decisions/task-store handles so a
+    /// settled subtask outcome persists into memory (`Decision` + `TaskNode`)
+    /// and the run's Phase-0 retrieval is grounded in THIS run's stored
+    /// decisions. Pass the SAME `Arc`s the memory system wraps so writes are
+    /// immediately visible to reads. `None` (default) leaves both features
+    /// disabled.
+    pub fn with_memory_writeback(
+        mut self,
+        decision_store: Option<Arc<concerto_memory::decision_store::DecisionStore>>,
+        task_tree: Option<Arc<concerto_memory::task_tree::TaskTreeStore>>,
+    ) -> Self {
+        self.memory_decision_store = decision_store;
+        self.memory_task_tree = task_tree;
         self
     }
 
@@ -2701,6 +2753,63 @@ impl CoordinatorAgent {
         let Some(gate) = self.write_gate.as_ref() else { return };
         if let Err(error) = gate.release_agent(role.as_str(), reason).await {
             tracing::debug!(role = %role, %error, "settle ownership release failed (fail-soft)");
+        }
+    }
+
+    /// Phase 6 M3b: write a settled subtask outcome into the shared memory
+    /// stores — a `Decision` (what/why/outcome) and a `TaskNode` (`Done`, with
+    /// its dependency edges as blockers). Both are session-scoped, which is
+    /// what the M3a Phase-0 retrieval reads back.
+    ///
+    /// Best-effort by construction: an unwired store is a no-op and an insert
+    /// failure only logs — the settlement itself must never fail because
+    /// memory did.
+    fn write_back_memory_outcome(
+        &self,
+        task_id: &TaskId,
+        role: &AgentId,
+        result: &AgentRunResult,
+        session_id: Ulid,
+        description: &str,
+        dependencies: &[TaskId],
+    ) {
+        let (Some(decision_store), Some(task_tree)) =
+            (self.memory_decision_store.as_ref(), self.memory_task_tree.as_ref())
+        else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let decision = Decision {
+            id: DecisionId(Ulid::new()),
+            session_id,
+            task_id: Some(*task_id),
+            what: format!("{role} completed subtask: {description}"),
+            why: format!(
+                "The plan dispatched this subtask to {role}; it settled {} ({} file(s) modified).",
+                outcome_label(&result.outcome),
+                result.files_modified.len(),
+            ),
+            outcome: Some(result.summary.clone()),
+            category: decision_category_for_role(role),
+            confidence: 1.0,
+            superseded_by: None,
+            created_at: now,
+        };
+        if let Err(error) = decision_store.insert(decision) {
+            warn!(%error, task = %task_id, "Phase 6 M3b: decision write-back failed (fail-soft)");
+        }
+        let node = TaskNode {
+            id: TaskNodeId(task_id.0),
+            session_id,
+            description: description.to_owned(),
+            status: TaskStatus::Done,
+            parent_id: None,
+            children: Vec::new(),
+            blocking: dependencies.iter().map(|dependency| TaskNodeId(dependency.0)).collect(),
+            created_at: now,
+        };
+        if let Err(error) = task_tree.upsert(node) {
+            warn!(%error, task = %task_id, "Phase 6 M3b: task-node write-back failed (fail-soft)");
         }
     }
 
@@ -3812,10 +3921,18 @@ impl CoordinatorAgent {
     }
 
     /// Retrieve project memory context for the specialist agents.
+    ///
+    /// Phase 6 M3a: when a plan/run scope is known (`plan_seed`) and the
+    /// shared decision/task stores are wired, this run's OWN stored decisions
+    /// and settled task nodes are rendered as plan-scoped fact chunks and
+    /// merged AHEAD of the vector results — a resumed specialist is then
+    /// grounded in what this run already decided, not task-text matches
+    /// alone. Chunks carry `score` 1.0 and the `top_k` bound is preserved.
     async fn retrieve_memory_context(
         &self,
         task: &AgentTask,
         context: &mut AgentContext,
+        plan_seed: Option<&str>,
         cancel: CancellationToken,
     ) {
         // Populate retrieved_chunks so every specialist agent (Architect,
@@ -3830,9 +3947,97 @@ impl CoordinatorAgent {
                 top_k: 5,
                 filters: vec![],
             };
-            context.retrieved_chunks =
+            let plan_chunks = self.plan_scoped_memory_chunks(
+                context.session.session_id,
+                &context.session.project_id,
+                plan_seed,
+                query.top_k,
+            );
+            let vector_chunks =
                 self.memory_store.retrieve(&query, cancel).await.unwrap_or_default();
+            // Plan-scoped facts first (they are this run's decisions), then
+            // the vector matches; the budget is the query's `top_k`.
+            let mut merged = plan_chunks;
+            merged.extend(vector_chunks);
+            merged.truncate(query.top_k);
+            context.retrieved_chunks = merged;
         }
+    }
+
+    /// Phase 6 M3a: render this session's stored decisions and settled task
+    /// nodes as plan-scoped fact chunks, newest first, bounded by `top_k`.
+    ///
+    /// Neither `Decision` nor `TaskNode` carries a run/plan id, so the scope
+    /// filter is the session id and the plan seed rides into the chunk id as
+    /// provenance. Superseded decisions are omitted. Best-effort: an unwired
+    /// or unreadable store yields no chunks (the retrieval then falls back to
+    /// vector matches alone).
+    fn plan_scoped_memory_chunks(
+        &self,
+        session_id: Ulid,
+        project_id: &concerto_core::types::ProjectId,
+        plan_seed: Option<&str>,
+        top_k: usize,
+    ) -> Vec<MemoryChunk> {
+        let (Some(decision_store), Some(task_tree)) =
+            (self.memory_decision_store.as_ref(), self.memory_task_tree.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut findings: Vec<(time::OffsetDateTime, String, String)> = Vec::new();
+        if let Ok(decisions) = decision_store.list_all() {
+            for decision in decisions.iter().filter(|item| item.session_id == session_id) {
+                if decision.superseded_by.is_some() {
+                    continue;
+                }
+                let mut text = format!("[decision] {}", decision.what);
+                if !decision.why.trim().is_empty() {
+                    text.push_str(&format!("\nRationale: {}", decision.why));
+                }
+                if let Some(outcome) = decision.outcome.as_deref().filter(|o| !o.trim().is_empty())
+                {
+                    text.push_str(&format!("\nOutcome: {outcome}"));
+                }
+                findings.push((decision.created_at, format!("decision:{}", decision.id.0), text));
+            }
+        }
+        if let Ok(nodes) = task_tree.list_all() {
+            for node in nodes.iter().filter(|item| item.session_id == session_id) {
+                let text = format!("[task {}] {}", node.status.as_str(), node.description);
+                findings.push((node.created_at, format!("task:{}", node.id.0), text));
+            }
+        }
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.0));
+        findings
+            .into_iter()
+            .take(top_k)
+            .map(|(_, key, content)| MemoryChunk {
+                id: match plan_seed {
+                    Some(seed) => format!("plan://{seed}/{key}"),
+                    None => format!("memory://{key}"),
+                },
+                project_id: project_id.clone(),
+                namespace: MemoryNamespace::Project(project_id.clone()),
+                content,
+                file_path: None,
+                start_line: None,
+                end_line: None,
+                chunk_type: ChunkType::Fact,
+                score: 1.0,
+                model_id: PLAN_MEMORY_MODEL_ID.to_owned(),
+                model_version: PLAN_MEMORY_MODEL_VERSION.to_owned(),
+                stale: false,
+            })
+            .collect()
+    }
+
+    /// Phase 6 M3a: read the top-level `run_id` out of a resume checkpoint
+    /// JSON without deserializing the whole record — the cheap seed for a
+    /// resumed run's Phase-0 retrieval. Fail-soft: a malformed/absent
+    /// checkpoint yields `None` (no seed; vector matches only).
+    fn checkpoint_run_id_hint(json: Option<&str>) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(json?).ok()?;
+        value.get("run_id").and_then(serde_json::Value::as_str).map(str::to_owned)
     }
 
     /// Decompose the task into a TaskGraph, or restore from a previous checkpoint.
@@ -4159,6 +4364,23 @@ impl CoordinatorAgent {
         // ADR-55 Phase 2b: retain the id so a planning-only run can bind
         // its rendered plan to the durable artifact.
         self.last_plan_id = plan_id.clone();
+        // ── Phase 6 M3c: plan-drift signal ────────────────────────────────
+        // The resume is Applied: this run continues the restored plan, so
+        // compare the plan's declared artifacts against the live inventory.
+        // Scoped to the subtasks the checkpoint already recorded complete — a
+        // Pending subtask's artifacts legitimately do not exist yet — and
+        // excluding the run's own recorded writes, so a path F3 already
+        // reports as an external change is never double-reported. Fail-soft
+        // and advisory: it never gates the resume.
+        self.emit_plan_drift(
+            plan_id.as_deref(),
+            &cp.expected_artifacts,
+            &all_files,
+            &completed_results,
+            post_cursor,
+            &context.session.project_dir,
+            task,
+        );
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
@@ -4193,6 +4415,67 @@ impl CoordinatorAgent {
             objective,
             objective_hash,
         }))
+    }
+
+    /// Phase 6 M3c: detect planned-but-absent artifacts on a resumed run and
+    /// publish a [`EventKind::PlanDrift`] signal.
+    ///
+    /// Scope is the artifacts of the subtasks the checkpoint recorded COMPLETE
+    /// (a pending subtask's artifacts are not yet expected to exist —
+    /// including them would report drift on every mid-run resume). The run's
+    /// own recorded writes are excluded, so a path F3 already reports as an
+    /// external change is never double-reported here.
+    ///
+    /// Fail-soft and advisory: no captured snapshot means no signal, a publish
+    /// error is logged only, and the signal never gates the resume.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_plan_drift(
+        &self,
+        plan_id: Option<&str>,
+        expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+        checkpoint_all_files: &[camino::Utf8PathBuf],
+        completed_results: &HashMap<TaskId, AgentRunResult>,
+        post_cursor: &[WhiteboardEvent],
+        project_root: &std::path::Path,
+        task: &AgentTask,
+    ) {
+        let Some(snapshot) = self.workspace_snapshot.as_ref() else { return };
+        let mut seen = HashSet::new();
+        let expected: Vec<camino::Utf8PathBuf> = expected_artifacts
+            .iter()
+            .filter(|(task_id, _)| completed_results.contains_key(task_id))
+            .flat_map(|(_, paths)| paths.iter())
+            .filter(|path| seen.insert((*path).clone()))
+            .cloned()
+            .collect();
+        if expected.is_empty() {
+            return;
+        }
+        let own_written =
+            own_write_paths(checkpoint_all_files, completed_results, post_cursor, project_root);
+        let drift = crate::external_change::detect_plan_drift(
+            plan_id,
+            &expected,
+            &snapshot.entries,
+            &own_written,
+        );
+        if drift.is_empty() {
+            return;
+        }
+        warn!(
+            run_id = plan_id.unwrap_or("<none>"),
+            affected = drift.affected_paths.len(),
+            "Phase 6 M3c: plan drift detected — planned artifact(s) absent from the live workspace"
+        );
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::PlanDrift {
+                task_id: task.id,
+                plan_id: plan_id.map(str::to_owned),
+                affected_paths: drift.affected_paths,
+            },
+        );
     }
 
     /// Read this session's log tail window for the resume evaluation
@@ -5317,7 +5600,13 @@ impl CoordinatorAgent {
                                 cancel_clone.clone(),
                             )
                             .await;
-                        return (tid, rl, String::new(), result);
+                        // Issue #5: the coordinator self-executes on the
+                        // resolved `profile`, so record that model — an empty
+                        // string would leave a self-executed task with no
+                        // assignment (the checkpoint's `model_assignments`,
+                        // and therefore a restore's reproducibility, would
+                        // silently lose which model ran it).
+                        return (tid, rl, profile.model_name().to_string(), result);
                     }
                     let result: Result<AgentRunResult, concerto_core::OrchestratorError> = this
                         .runner
@@ -5626,6 +5915,12 @@ impl CoordinatorAgent {
                         // ownerships release (evented via the attached gate).
                         self.settle_release_task_ownership(&role, "subtask settled: completed")
                             .await;
+                        // Phase 6 M3b: persist the settled outcome into the
+                        // shared decision/task stores so the next Phase-0
+                        // retrieval (M3a) is grounded in what this run already
+                        // decided. Best-effort — settlement never fails
+                        // because memory did.
+                        self.write_back_memory_outcome(&task_id, &role, &result, sid, &desc, &deps);
 
                         // ── Replan fallback: design-stage redesign complete ──
                         // When a design-stage replan subtask finishes
@@ -6570,8 +6865,21 @@ impl CoordinatorAgent {
         // loop counts toward it too, so loop + graph dispatches share one
         // ceiling.
         self.model_dispatch_count = 0;
-        // Phase 0: Retrieve project memory context
-        self.retrieve_memory_context(&task, &mut context, cancel.clone()).await;
+        // Phase 0: Retrieve project memory context. Phase 6 M3a: seed the
+        // scope from the run this instance last planned (`last_plan_id`), the
+        // run it is currently executing (`run_id`), or — on a resume, where
+        // both are still unset at this point — the plan id recorded in the
+        // checkpoint's top-level `run_id`. `decompose_or_restore` runs AFTER
+        // this call, so the checkpoint read here is what makes a resumed
+        // specialist grounded in this run's stored decisions. Fail-soft: an
+        // unreadable checkpoint simply carries no seed.
+        let plan_seed = self
+            .last_plan_id
+            .clone()
+            .or_else(|| self.run_id.clone())
+            .or_else(|| Self::checkpoint_run_id_hint(resume_checkpoint_json.as_deref()));
+        self.retrieve_memory_context(&task, &mut context, plan_seed.as_deref(), cancel.clone())
+            .await;
 
         // Phase 1: Decompose or restore
         let DecomposeResult {
@@ -8981,6 +9289,25 @@ impl CoordinatorAgent {
         // match can partially move the result — the recorded observation
         // travels with the outcome record.
         let result_cost_milli = settled_cost_milli(&result);
+        // Phase 6 M3b: persist a genuinely-successful settlement into the
+        // shared decision/task stores so the next Phase-0 retrieval (M3a)
+        // is grounded in what this run already decided. Best-effort —
+        // settlement never fails because memory did. (Mirrors the
+        // `execute_graph` success branch; `NeedsRevision` keeps prior
+        // recorded memory — only new work writes new facts.)
+        if matches!(result.outcome, AgentOutcome::Success)
+            && (self.memory_decision_store.is_some() || self.memory_task_tree.is_some())
+        {
+            let dependencies: Vec<TaskId> = state.last_node.iter().copied().collect();
+            self.write_back_memory_outcome(
+                &subtask_id,
+                &agent_id,
+                &result,
+                task.session_id,
+                &description,
+                &dependencies,
+            );
+        }
         match result.outcome {
             AgentOutcome::Success => {
                 // Issue #60: settled success — recorded with the observed
@@ -24013,5 +24340,506 @@ mod tests {
         assert_eq!(record.acquiring_event_id, "w-1");
         assert_eq!(restored_gate.ownership_owner("src/main.rs").as_deref(), Some("coder"));
         let _ = gate; // silence moved-value lint chafing
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 6 M3 — run-scoped memory grounding (M3a), write-back (M3b),
+    // and plan drift (M3c)
+    // ------------------------------------------------------------------
+
+    /// A coordinator wired to the M3a/M3b memory stores through the same seam
+    /// the runtime uses (`with_memory_writeback`).
+    fn coordinator_with_memory(
+        bus: EventBus,
+        decision_store: Arc<concerto_memory::decision_store::DecisionStore>,
+        task_tree: Arc<concerto_memory::task_tree::TaskTreeStore>,
+    ) -> CoordinatorAgent {
+        coordinator_for_ladder(
+            bus,
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_memory_writeback(Some(decision_store), Some(task_tree))
+    }
+
+    /// A successful `AgentRunResult` for the write-back tests.
+    fn success_result(task_id: TaskId, role: &str, summary: &str) -> AgentRunResult {
+        AgentRunResult {
+            task_id,
+            role: AgentId::new(role),
+            outcome: AgentOutcome::Success,
+            summary: summary.to_owned(),
+            files_modified: vec![camino::Utf8PathBuf::from("src/parser.rs")],
+            tool_call_count: 3,
+            cost_usd: 0.01,
+            latency_ms: 42,
+            provider: "test".into(),
+            model: "test".into(),
+            tokens_in: 10,
+            tokens_out: 10,
+        }
+    }
+
+    /// M3a: this run's stored decisions and settled task nodes are rendered as
+    /// plan-scoped fact chunks and merged ahead of the vector matches, so a
+    /// specialist resuming the plan is grounded in THIS run's memory.
+    #[tokio::test]
+    async fn resume_with_memory_still_grounds() {
+        use concerto_core::memory::{
+            ChunkType, Decision, DecisionCategory, DecisionId, TaskNode, TaskNodeId, TaskStatus,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir for grounding workspace");
+        let session_id = Ulid::new();
+        let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+        let task_tree = Arc::new(concerto_memory::task_tree::TaskTreeStore::new());
+        decision_store
+            .insert(Decision {
+                id: DecisionId(Ulid::new()),
+                session_id,
+                task_id: None,
+                what: "pinned the sqlite vector store".into(),
+                why: "the lancedb gate was removed".into(),
+                outcome: Some("implemented".into()),
+                category: DecisionCategory::Architecture,
+                confidence: 1.0,
+                superseded_by: None,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .expect("decision insert");
+        task_tree
+            .upsert(TaskNode {
+                id: TaskNodeId(Ulid::new()),
+                session_id,
+                description: "wire the resume seed".into(),
+                status: TaskStatus::Done,
+                parent_id: None,
+                children: Vec::new(),
+                blocking: Vec::new(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .expect("task node upsert");
+
+        let coordinator = coordinator_with_memory(EventBus::new(64), decision_store, task_tree);
+
+        let task = AgentTask::new(session_id, "resume the plan");
+        let mut context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            directory.path().to_path_buf(),
+        ));
+
+        coordinator
+            .retrieve_memory_context(&task, &mut context, Some("plan-42"), CancellationToken::new())
+            .await;
+
+        let plan_chunks: Vec<_> = context
+            .retrieved_chunks
+            .iter()
+            .filter(|chunk| chunk.id.starts_with("plan://plan-42/"))
+            .collect();
+        assert_eq!(
+            plan_chunks.len(),
+            2,
+            "both the decision and the settled task node are grounded"
+        );
+        assert!(
+            plan_chunks
+                .iter()
+                .any(|chunk| chunk.content.contains("pinned the sqlite vector store")),
+            "the decision's `what` reaches the prompt"
+        );
+        assert!(
+            plan_chunks.iter().any(|chunk| chunk.content.contains("wire the resume seed")),
+            "the settled task node reaches the prompt"
+        );
+        assert!(
+            plan_chunks
+                .iter()
+                .all(|chunk| chunk.chunk_type == ChunkType::Fact && chunk.score == 1.0),
+            "plan memory is rendered as deterministic fact chunks"
+        );
+        assert!(
+            plan_chunks.iter().all(|chunk| chunk.model_id == "concerto://plan-memory"),
+            "the synthetic chunks carry the plan-memory provenance model"
+        );
+    }
+
+    /// M3a: a plan seed is provenance only — without it the same stored memory
+    /// is still surfaced (project-scoped key) so grounding never regresses to
+    /// nothing just because the seed could not be derived.
+    #[tokio::test]
+    async fn memory_grounding_without_a_plan_seed_still_surfaces_facts() {
+        use concerto_core::memory::{Decision, DecisionCategory, DecisionId};
+
+        let directory = tempfile::tempdir().expect("tempdir for grounding workspace");
+        let session_id = Ulid::new();
+        let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+        decision_store
+            .insert(Decision {
+                id: DecisionId(Ulid::new()),
+                session_id,
+                task_id: None,
+                what: "kept the resume seed optional".into(),
+                why: "a checkpointless continue has no run id".into(),
+                outcome: None,
+                category: DecisionCategory::Architecture,
+                confidence: 1.0,
+                superseded_by: None,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .expect("decision insert");
+
+        let coordinator = coordinator_with_memory(
+            EventBus::new(64),
+            decision_store,
+            Arc::new(concerto_memory::task_tree::TaskTreeStore::new()),
+        );
+        let task = AgentTask::new(session_id, "resume the plan");
+        let mut context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            directory.path().to_path_buf(),
+        ));
+
+        coordinator
+            .retrieve_memory_context(&task, &mut context, None, CancellationToken::new())
+            .await;
+
+        assert_eq!(context.retrieved_chunks.len(), 1);
+        assert!(context.retrieved_chunks[0].id.starts_with("memory://decision:"));
+        assert!(context.retrieved_chunks[0].content.contains("kept the resume seed optional"));
+    }
+
+    /// M3b: a settled subtask writes back a `Decision` and a `Done` `TaskNode`
+    /// into the shared stores, with the subtask's dependency edges recorded as
+    /// the node's blockers.
+    #[test]
+    fn subtask_settlement_writes_back_decision_and_task_node() {
+        use concerto_core::memory::{TaskNodeId, TaskStatus};
+
+        let session_id = Ulid::new();
+        let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+        let task_tree = Arc::new(concerto_memory::task_tree::TaskTreeStore::new());
+        let coordinator =
+            coordinator_with_memory(EventBus::new(64), decision_store.clone(), task_tree.clone());
+
+        let task_id = TaskId::new();
+        let dependency = TaskId::new();
+        let result = success_result(task_id, "coder", "implemented the parser");
+
+        coordinator.write_back_memory_outcome(
+            &task_id,
+            &AgentId::new("coder"),
+            &result,
+            session_id,
+            "implement the parser",
+            &[dependency],
+        );
+
+        let decisions = decision_store.list_all().expect("decisions listed");
+        assert_eq!(decisions.len(), 1, "one decision per settled subtask");
+        let decision = &decisions[0];
+        assert_eq!(decision.session_id, session_id);
+        assert_eq!(decision.task_id, Some(task_id));
+        assert_eq!(decision.outcome.as_deref(), Some("implemented the parser"));
+        assert!(decision.what.contains("coder"), "the role is attributed: {}", decision.what);
+
+        let nodes = task_tree.list_all().expect("task nodes listed");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, TaskNodeId(task_id.0));
+        assert_eq!(nodes[0].session_id, session_id);
+        assert_eq!(nodes[0].status, TaskStatus::Done);
+        assert_eq!(nodes[0].description, "implement the parser");
+        assert_eq!(nodes[0].blocking, vec![TaskNodeId(dependency.0)]);
+    }
+
+    /// M3b: an unwired coordinator writes nothing (memory stays optional for
+    /// correctness — ADR-65 acceptance 9).
+    #[test]
+    fn settlement_write_back_is_a_no_op_without_stores() {
+        let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+        let task_tree = Arc::new(concerto_memory::task_tree::TaskTreeStore::new());
+        let coordinator = coordinator_for_ladder(
+            EventBus::new(64),
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+
+        let task_id = TaskId::new();
+        let result = success_result(task_id, "coder", "implemented the parser");
+        coordinator.write_back_memory_outcome(
+            &task_id,
+            &AgentId::new("coder"),
+            &result,
+            Ulid::new(),
+            "implement the parser",
+            &[],
+        );
+
+        assert!(decision_store.list_all().expect("listed").is_empty());
+        assert!(task_tree.list_all().expect("listed").is_empty());
+    }
+
+    /// M3c: a resumed plan whose COMPLETED subtask declared an artifact the
+    /// live inventory no longer shows (and the run did not itself write)
+    /// publishes exactly one `PlanDrift` naming that path. Artifacts of
+    /// not-yet-complete subtasks are ignored — their absence is expected.
+    #[test]
+    fn plan_drift_detected_on_tampered_worktree() {
+        let bus = EventBus::new(64);
+        let directory = tempfile::tempdir().expect("tempdir for drift workspace");
+        let completed_id = TaskId::new();
+        let pending_id = TaskId::new();
+
+        let snapshot = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "gen-1".into(),
+            entries: vec![concerto_sessions::SnapshotEntry {
+                path: "src/untouched.rs".into(),
+                size_bytes: Some(1),
+                mtime_ms: Some(1),
+                content_hash: Some("h".into()),
+            }],
+            captured_at_ms: 1,
+            project_root: camino::Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+        let coordinator = coordinator_for_ladder(
+            bus.clone(),
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_workspace_snapshot(snapshot);
+
+        let mut expected: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        expected.insert(completed_id, vec![camino::Utf8PathBuf::from("src/gone.rs")]);
+        expected.insert(pending_id, vec![camino::Utf8PathBuf::from("src/not_yet.rs")]);
+        let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
+        completed_results
+            .insert(completed_id, success_result(completed_id, "coder", "wrote the module"));
+
+        let task = AgentTask::new(Ulid::new(), "resume the plan");
+        let mut rx = bus.subscribe();
+        coordinator.emit_plan_drift(
+            Some("plan-7"),
+            &expected,
+            &[],
+            &completed_results,
+            &[],
+            directory.path(),
+            &task,
+        );
+
+        let event = rx.try_recv().expect("PlanDrift published");
+        let EventKind::PlanDrift { task_id, plan_id, affected_paths } = &event.kind else {
+            panic!("expected PlanDrift, got a different event kind");
+        };
+        assert_eq!(*task_id, task.id);
+        assert_eq!(plan_id.as_deref(), Some("plan-7"));
+        assert_eq!(*affected_paths, vec!["src/gone.rs".to_owned()]);
+        assert!(rx.try_recv().is_err(), "exactly one drift event per evaluation");
+    }
+
+    /// M3c: when every completed subtask's declared artifact is present in the
+    /// live inventory, no drift event is published (no false positives).
+    #[test]
+    fn plan_drift_absent_when_expected_artifacts_are_present() {
+        let bus = EventBus::new(64);
+        let directory = tempfile::tempdir().expect("tempdir for drift workspace");
+        let completed_id = TaskId::new();
+
+        let snapshot = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "gen-2".into(),
+            entries: vec![concerto_sessions::SnapshotEntry {
+                path: "src/present.rs".into(),
+                size_bytes: Some(2),
+                mtime_ms: Some(2),
+                content_hash: Some("h2".into()),
+            }],
+            captured_at_ms: 2,
+            project_root: camino::Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+        let coordinator = coordinator_for_ladder(
+            bus.clone(),
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_workspace_snapshot(snapshot);
+
+        let mut expected: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        expected.insert(completed_id, vec![camino::Utf8PathBuf::from("src/present.rs")]);
+        let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
+        completed_results
+            .insert(completed_id, success_result(completed_id, "coder", "wrote the module"));
+
+        let task = AgentTask::new(Ulid::new(), "resume the plan");
+        let mut rx = bus.subscribe();
+        coordinator.emit_plan_drift(
+            Some("plan-8"),
+            &expected,
+            &[],
+            &completed_results,
+            &[],
+            directory.path(),
+            &task,
+        );
+
+        assert!(rx.try_recv().is_err(), "present artifacts must not report drift");
+    }
+
+    /// Phase 6 M3 (#2 + `kill_midrun_resume_produces_grounded_plan`): a run
+    /// interrupted mid-flight persists a resumable checkpoint; a SECOND
+    /// coordinator instance (a fresh process) sharing the same stores resumes
+    /// that checkpoint. The resumed run's Phase-0 retrieval seeds on the
+    /// checkpoint's `run_id`, grounds the plan in the FIRST run's own stored
+    /// decisions and settled task nodes, and never re-dispatches the subtasks
+    /// the checkpoint already records complete — planning (architect) and the
+    /// completed implementer (coder) are both canaries that fail loudly on any
+    /// re-dispatch.
+    #[tokio::test]
+    async fn kill_midrun_resume_produces_grounded_plan() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+        let task_tree = Arc::new(concerto_memory::task_tree::TaskTreeStore::new());
+
+        // ── "process 1": a fresh run that stalls mid-flight ──────────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+        coordinator = coordinator
+            .with_memory_writeback(Some(decision_store.clone()), Some(task_tree.clone()));
+
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let first = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the interrupted run stalls, it does not error");
+        assert_eq!(
+            first.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the interrupted run is Partial: {}",
+            first.final_message
+        );
+        let checkpoint_json =
+            first.checkpoint_json.clone().expect("the interrupted run persisted a checkpoint");
+
+        // M3b: the settled coder subtask wrote back BEFORE the interrupt.
+        let decisions = decision_store.list_all().expect("decisions listed");
+        assert!(
+            decisions.iter().any(|decision| decision.outcome.as_deref() == Some("implemented")),
+            "the settled subtask's outcome is in the decision store: {:?}",
+            decisions
+        );
+        let nodes = task_tree.list_all().expect("task nodes listed");
+        assert!(
+            nodes.iter().any(|node| node.status == concerto_core::memory::TaskStatus::Done),
+            "the settled subtask is a Done task node: {:?}",
+            nodes
+        );
+
+        // ── "process 2": a fresh coordinator resumes the checkpoint ──
+        let bus2 = EventBus::new(256);
+        // Canaries: architect (the resume must never re-derive the plan) and
+        // coder (the completed subtask must never be re-dispatched) fail
+        // loudly if the resume re-walks settled work.
+        let mocks2 = vec![
+            MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+            MockExpertAgent::always_fail(AgentId::new("coder"), "must not be re-dispatched"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+        ];
+        let mut registry2 = AgentRegistry::from_mocks(mocks2);
+        registry2.register(Arc::new(AlwaysRevise));
+        let registry2 = Arc::new(registry2);
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            registry2,
+            vec![CoordinatorTurn::Text(String::new())],
+            store.clone(),
+        )
+        .with_memory_writeback(Some(decision_store.clone()), Some(task_tree.clone()));
+
+        // The resumed run's Phase-0 seed — the same derivation `run()` uses —
+        // grounds the plan in PROCESS 1's own memory.
+        let seed = CoordinatorAgent::checkpoint_run_id_hint(Some(&checkpoint_json));
+        assert!(seed.is_some(), "the checkpoint carries the run id that seeds retrieval");
+        let resume_task = AgentTask::new(session_id, "continue");
+        let mut resume_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        coordinator2
+            .retrieve_memory_context(
+                &resume_task,
+                &mut resume_ctx,
+                seed.as_deref(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            resume_ctx.retrieved_chunks.iter().any(|chunk| chunk.content.contains("implemented")),
+            "the grounded plan carries process 1's outcome: {:?}",
+            resume_ctx.retrieved_chunks
+        );
+
+        let second = coordinator2
+            .run(resume_task, resume_ctx, CancellationToken::new(), Some(checkpoint_json))
+            .await
+            .expect("the resumed run should succeed");
+        // The reviewer still stalls (AlwaysRevise); what matters for #2 is that
+        // no completed subtask was re-dispatched — the canaries never fired.
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the reviewer keeps the resumed run stalled: {}",
+            second.final_message
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stalled resume keeps its checkpoint");
+        let cp: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid resumed checkpoint");
+        let completed: Vec<&str> = cp
+            .subtasks
+            .iter()
+            .filter(|subtask| subtask.status == SubTaskStatus::Completed)
+            .map(|subtask| subtask.role.as_str())
+            .collect();
+        assert!(
+            completed.contains(&"architect") && completed.contains(&"coder"),
+            "the checkpoint still records the settled subtasks as completed: {completed:?}"
+        );
     }
 }

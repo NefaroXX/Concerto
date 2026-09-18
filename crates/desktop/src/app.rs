@@ -3237,6 +3237,8 @@ impl App {
                                         reindex_sync: sync.clone(),
                                         cancel: cancel.clone(),
                                         data_dir_lock,
+                                        decision_store: None,
+                                        task_tree: None,
                                     };
                                     *memory.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(active);
@@ -3356,6 +3358,8 @@ impl App {
                         reindex_sync,
                         cancel,
                         data_dir_lock,
+                        decision_store: None,
+                        task_tree: None,
                     };
                     *memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
                     store

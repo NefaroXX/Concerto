@@ -3561,8 +3561,8 @@ mod tests {
             as Arc<dyn VectorStore>;
         let fts_store = Arc::new(SqliteFullTextStore::new(pool.clone()).await.expect("fts"))
             as Arc<dyn FullTextStore>;
-        let decision_store = DecisionStore::new();
-        let task_tree_store = TaskTreeStore::new();
+        let decision_store = Arc::new(DecisionStore::new());
+        let task_tree_store = Arc::new(TaskTreeStore::new());
         // Derive project_id from the same temp dir the agent loop will use,
         // so memory storage/retrieval inside the loop uses matching keys.
         let project_id = ProjectId::resolve(dir.path());

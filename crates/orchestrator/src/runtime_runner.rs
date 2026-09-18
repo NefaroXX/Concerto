@@ -536,6 +536,22 @@ pub struct ActiveMemoryServices {
     /// when the memory system initialises and kept for the subsystem's
     /// lifetime.
     pub data_dir_lock: Option<Arc<DataDirLock>>,
+    /// Phase 6 M3a/M3b: the SAME decisions/task-tree `Arc`s the memory system
+    /// wraps, handed to the coordinator for outcome write-back and
+    /// run-scoped retrieval. `None` only when the memory system was built by
+    /// a legacy path that did not expose them.
+    pub decision_store: Option<Arc<DecisionStore>>,
+    pub task_tree: Option<Arc<TaskTreeStore>>,
+}
+
+/// Phase 6 M3a/M3b: a freshly initialised memory system plus the shared store
+/// handles a run needs for outcome write-back (M3b) and run-scoped retrieval
+/// (M3a). The handles are the SAME `Arc`s the memory system wraps, so a
+/// coordinator write is immediately visible to the system's own reads.
+pub struct MemorySystemHandles {
+    pub store: Arc<dyn MemoryStore>,
+    pub decision_store: Arc<DecisionStore>,
+    pub task_tree: Arc<TaskTreeStore>,
 }
 
 /// Bundles services that are reused across calls.
@@ -1136,6 +1152,30 @@ pub async fn init_memory_system(
     memory_cancel: &Arc<Mutex<Option<CancellationToken>>>,
     data_dir_lock: &Arc<Mutex<Option<Arc<DataDirLock>>>>,
 ) -> Result<Arc<dyn MemoryStore>, OrchestratorError> {
+    init_memory_system_with_handles(
+        bus,
+        config,
+        project_dir,
+        reindex,
+        reindex_sync,
+        memory_cancel,
+        data_dir_lock,
+    )
+    .await
+    .map(|handles| handles.store)
+}
+
+/// As [`init_memory_system`], additionally returning the shared
+/// decision/task-store handles the coordinator's Phase 6 M3a/M3b wiring needs.
+pub async fn init_memory_system_with_handles(
+    bus: EventBus,
+    config: &AppConfig,
+    project_dir: &std::path::Path,
+    reindex: &Arc<Mutex<Option<Arc<ProjectIndexer>>>>,
+    reindex_sync: &Arc<Mutex<Option<Arc<ChunkSyncService>>>>,
+    memory_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    data_dir_lock: &Arc<Mutex<Option<Arc<DataDirLock>>>>,
+) -> Result<MemorySystemHandles, OrchestratorError> {
     // Re‑use the same implementation as CLI/Desktop apps – copy/paste the
     // `init_memory_system` logic from those modules (project ID hashing, DB
     // path, vector & FTS stores, optional embedder, background indexing).
@@ -1207,12 +1247,12 @@ pub async fn init_memory_system(
     {
         tracing::warn!(%error, "failed to prune derived summaries past retention");
     }
-    let decision_store = DecisionStore::load(db.clone()).await.map_err(|error| {
+    let decision_store = Arc::new(DecisionStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
-    })?;
-    let task_tree = TaskTreeStore::load(db.clone()).await.map_err(|error| {
+    })?);
+    let task_tree = Arc::new(TaskTreeStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("TaskTreeStore load error: {error}"))
-    })?;
+    })?);
 
     // Local fastembed embedder (BAAI/bge-small-en-v1.5). The model binary
     // downloads on first `embed` call; indexing is best‑effort and falls back
@@ -1274,8 +1314,8 @@ pub async fn init_memory_system(
     let system = concerto_memory::system::MemorySystem::new(
         vector_store,
         fts_store,
-        decision_store,
-        task_tree,
+        decision_store.clone(),
+        task_tree.clone(),
         Some(embedder.clone()),
         project_id.clone(),
         None, // global store (stubbed, ADR-54)
@@ -1352,7 +1392,7 @@ pub async fn init_memory_system(
         }
     });
 
-    Ok(system as Arc<dyn MemoryStore>)
+    Ok(MemorySystemHandles { store: system as Arc<dyn MemoryStore>, decision_store, task_tree })
 }
 
 /// Build a fresh WASM plugin host, capability store, and manager. Returns both
@@ -2090,6 +2130,20 @@ fn cached_store_for_project(
     })
 }
 
+/// Phase 6 M3a/M3b: the shared decision/task-store handles of the cached
+/// memory services — `(None, None)` when memory is disabled or not yet
+/// initialised. The coordinator's outcome write-back and run-scoped retrieval
+/// are no-ops without them, so an absent handle is never an error.
+fn memory_writeback_handles(
+    memory: &Mutex<Option<ActiveMemoryServices>>,
+) -> (Option<Arc<DecisionStore>>, Option<Arc<TaskTreeStore>>) {
+    let lock = memory.lock().unwrap_or_else(|poison| poison.into_inner());
+    match lock.as_ref() {
+        Some(active) => (active.decision_store.clone(), active.task_tree.clone()),
+        None => (None, None),
+    }
+}
+
 /// Cancel and drop the previous project's memory lifecycle. Called on a
 /// project switch so the new project never inherits the previous one's
 /// background indexer, chunk-sync service, or store.
@@ -2147,7 +2201,7 @@ async fn select_or_init_memory_services(
     let reindex_sync_temp: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
     let cancel_temp: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
     let lock_temp: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
-    let mem = init_memory_system(
+    let mem = init_memory_system_with_handles(
         services.bus.clone(),
         &services.config,
         project_dir,
@@ -2177,14 +2231,17 @@ async fn select_or_init_memory_services(
 
     let active = ActiveMemoryServices {
         project_id,
-        store: mem.clone(),
+        store: mem.store.clone(),
         reindex,
         reindex_sync,
         cancel,
         data_dir_lock,
+        // Phase 6 M3a/M3b: retain the shared handles for the coordinator.
+        decision_store: Some(mem.decision_store.clone()),
+        task_tree: Some(mem.task_tree.clone()),
     };
     *services.memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
-    Ok(Some(mem))
+    Ok(Some(mem.store))
 }
 
 /// ADR-55 Phase 2d §3: resolve the plan binding a confident Execute
@@ -4016,6 +4073,12 @@ async fn run_multi_agent(
     );
     let selector =
         Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(profiles)), routing));
+    // Phase 6 M3a/M3b: hand the coordinator the SAME decision/task-store
+    // `Arc`s the memory system wraps, so a settled subtask writes back its
+    // outcome and the run's Phase-0 retrieval reads this run's decisions.
+    // Both are no-ops when memory is disabled or was initialised by a legacy
+    // path that exposed no handles.
+    let (memory_decision_store, memory_task_tree) = memory_writeback_handles(&services.memory);
     let mut coordinator = CoordinatorAgent::new(
         registry.clone(),
         runner,
@@ -4025,6 +4088,7 @@ async fn run_multi_agent(
         coordinator_provider,
         memory.clone(),
     )
+    .with_memory_writeback(memory_decision_store, memory_task_tree)
     .with_agent_configs(agent_configs)
     .with_skills_section(skills_section)
     // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
@@ -6437,6 +6501,10 @@ mod runtime_runner_tests {
             )),
             cancel: CancellationToken::new(),
             data_dir_lock: None,
+            // The test slot predates the M3a/M3b wiring; absent handles keep
+            // the coordinator's write-back/retrieval inert.
+            decision_store: None,
+            task_tree: None,
         }
     }
 
