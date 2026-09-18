@@ -386,7 +386,12 @@ impl concerto_core::traits::approval::ApprovalSink for AllowAllApprovalSink {
     ) {
     }
 
-    async fn request_ack(&self, _message: &str, _cancel: concerto_core::CancellationToken) -> bool {
+    async fn request_ack(
+        &self,
+        _session_id: concerto_core::ids::Ulid,
+        _message: &str,
+        _cancel: concerto_core::CancellationToken,
+    ) -> bool {
         true
     }
 }

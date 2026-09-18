@@ -321,7 +321,12 @@ impl ApprovalSink for DenyAllApprovalSink {
         );
     }
 
-    async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
+    async fn request_ack(
+        &self,
+        _session_id: Ulid,
+        _message: &str,
+        _cancel: CancellationToken,
+    ) -> bool {
         Self::deny(
             "user acknowledgment request dropped: ack surfacing is supervisor-side (ADR-60 \
              deferred); aborting the current task",

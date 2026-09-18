@@ -938,7 +938,7 @@ impl AgentLoop {
             let warning = "This project is not a git repository (or git is unavailable), so \
                             changes made during this task cannot be automatically undone. \
                             Continue anyway?";
-            let ack = self.approval.request_ack(warning, cancel.clone()).await;
+            let ack = self.approval.request_ack(session_id, warning, cancel.clone()).await;
             // Audit seam (ADR-55 §5 / audit H-04): persist the ack outcome
             // through the same channel as approval decisions, sharing the run's
             // correlation_id chain. Pure observability — the ack bool still
@@ -2799,6 +2799,7 @@ mod tests {
         }
         async fn request_ack(
             &self,
+            _session_id: Ulid,
             _message: &str,
             _cancel: concerto_core::CancellationToken,
         ) -> bool {
@@ -3532,6 +3533,7 @@ mod tests {
         }
         async fn request_ack(
             &self,
+            _session_id: Ulid,
             _message: &str,
             _cancel: concerto_core::CancellationToken,
         ) -> bool {
@@ -3558,6 +3560,7 @@ mod tests {
         }
         async fn request_ack(
             &self,
+            _session_id: Ulid,
             _message: &str,
             _cancel: concerto_core::CancellationToken,
         ) -> bool {

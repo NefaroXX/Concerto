@@ -7669,7 +7669,12 @@ mod runtime_runner_tests {
             self.decisions.clone().into_iter().next().unwrap_or(ApprovalDecision::Approve)
         }
         async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
-        async fn request_ack(&self, _message: &str, _cancel: CancellationToken) -> bool {
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
             true // auto-acknowledge in tests
         }
     }
