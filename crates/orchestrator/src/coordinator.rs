@@ -3165,7 +3165,11 @@ impl CoordinatorAgent {
         self
     }
 
-    async fn persist_checkpoint(&mut self, checkpoint: &mut checkpoint::GraphCheckpoint) {
+    async fn persist_checkpoint(
+        &mut self,
+        checkpoint: &mut checkpoint::GraphCheckpoint,
+        model_assignments: &HashMap<TaskId, String>,
+    ) {
         // ADR-65 §7: stamp the whiteboard cursor at PERSIST time — the log
         // head is the consistent cut this checkpoint is consistent with, so
         // a resume reads only facts appended after it. Fail-soft: without a
@@ -3184,6 +3188,13 @@ impl CoordinatorAgent {
         if checkpoint.snapshot_generation.is_none() {
             checkpoint.snapshot_generation = self.snapshot_generation();
         }
+        // C-05 (#5): model assignments are stamped at PERSIST time from the
+        // authoritative run ledger — mirroring the cursor/generation stamps
+        // above — never from a build-time snapshot that could lag the ledger
+        // by a batch. The pre-batch (progress) checkpoint remains a consistent
+        // cut that by construction excludes still-in-flight assignments; the
+        // completed-batch checkpoint therefore carries the full ledger.
+        checkpoint.model_assignments = model_assignments.clone();
         let Some(store) = &self.session_store else {
             // Never silent: a coordinator without a session store cannot
             // leave resumable state, so `continue` can never resume it.
@@ -4986,7 +4997,7 @@ impl CoordinatorAgent {
             &retry_feedback,
             &self.checkpoint_context(&model_assignments, &action_ledger),
         );
-        self.persist_checkpoint(&mut initial_execution_checkpoint).await;
+        self.persist_checkpoint(&mut initial_execution_checkpoint, &model_assignments).await;
 
         // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
         // The Coordinator requested human input during its decision loop
@@ -5079,7 +5090,7 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&mut interrupted).await;
+                self.persist_checkpoint(&mut interrupted, &model_assignments).await;
                 return Err(OrchestratorError::Cancelled);
             }
 
@@ -5332,7 +5343,7 @@ impl CoordinatorAgent {
                         &retry_feedback,
                         &self.checkpoint_context(&model_assignments, &action_ledger),
                     );
-                    self.persist_checkpoint(&mut cp).await;
+                    self.persist_checkpoint(&mut cp, &model_assignments).await;
                     let checkpoint_json = serde_json::to_string(&cp).ok();
                     return Ok((
                         AgentOutput {
@@ -5396,7 +5407,7 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&mut cp).await;
+                self.persist_checkpoint(&mut cp, &model_assignments).await;
                 let checkpoint_json = serde_json::to_string(&cp).ok();
                 return Ok((
                     AgentOutput {
@@ -5437,7 +5448,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&mut progress_checkpoint).await;
+            self.persist_checkpoint(&mut progress_checkpoint, &model_assignments).await;
 
             // ── 2a. Check budget once per batch ─────────────────────
             if self.spend_tracker.check(0.001).is_err() {
@@ -6622,7 +6633,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&mut completed_batch_checkpoint).await;
+            self.persist_checkpoint(&mut completed_batch_checkpoint, &model_assignments).await;
 
             if cancelled_during_batch {
                 return Err(OrchestratorError::Cancelled);
@@ -6665,7 +6676,7 @@ impl CoordinatorAgent {
                     &retry_feedback,
                     &self.checkpoint_context(&model_assignments, &action_ledger),
                 );
-                self.persist_checkpoint(&mut cp).await;
+                self.persist_checkpoint(&mut cp, &model_assignments).await;
                 let checkpoint_json = serde_json::to_string(&cp).ok();
                 return Ok((
                     AgentOutput {
@@ -6805,7 +6816,7 @@ impl CoordinatorAgent {
                 &retry_feedback,
                 &self.checkpoint_context(&model_assignments, &action_ledger),
             );
-            self.persist_checkpoint(&mut cp).await;
+            self.persist_checkpoint(&mut cp, &model_assignments).await;
             serde_json::to_string(&cp).ok()
         } else {
             if let Some(store) = &self.session_store {
@@ -11858,7 +11869,9 @@ impl CoordinatorAgent {
             &HashMap::new(),
             &checkpoint_context,
         );
-        self.persist_checkpoint(&mut cp).await;
+        // The resume ledger stays authoritative (C-05 / #5): the assignment
+        // stamp mirrors the ADR-65 §7 cursor stamp taken at persist time.
+        self.persist_checkpoint(&mut cp, &ledger.model_assignments).await;
         let _ = task;
     }
 
@@ -19321,6 +19334,97 @@ mod tests {
             .with_checkpoint_store(Some(store as Arc<dyn concerto_sessions::SessionStore>), None)
     }
 
+    /// C-05 (#5): `persist_checkpoint` snapshots `model_assignments` at PERSIST
+    /// time from the authoritative run ledger — mirroring the ADR-65 §7 cursor
+    /// stamp — so a checkpoint built with no (or stale) assignments is stamped
+    /// with the ledger as of the persist instant. A persisted record therefore
+    /// never lags the ledger by a batch; the pre-batch progress cut is the only
+    /// residual, and it re-dispatches on resume.
+    #[tokio::test]
+    async fn persist_checkpoint_stamps_assignments_from_ledger_at_persist_time() {
+        let dir = tempfile::tempdir().expect("tempdir for persist-stamp test");
+        let store = Arc::new(
+            concerto_sessions::SqliteSessionStore::connect_in_memory()
+                .await
+                .expect("in-memory session store"),
+        );
+        let project = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("test project dir is UTF-8");
+        let session_id = store
+            .create_session(&project, "mock", "test-model", CancellationToken::new())
+            .await
+            .expect("create session row")
+            .id;
+
+        let mut coordinator = coordinator_for_ladder(
+            EventBus::new(64),
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_checkpoint_store(
+            Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+            None,
+        );
+
+        // A checkpoint built with an EMPTY assignment map...
+        let graph = TaskGraph::new();
+        let context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        let mut checkpoint = crate::checkpoint::build_checkpoint(
+            &checkpoint::CheckpointScope {
+                run_id: Ulid::new(),
+                session_id,
+                root_task_id: TaskId::new(),
+                project_id: "test".into(),
+                objective: "test objective".into(),
+                objective_hash: "hash".into(),
+                source_revision: None,
+                sequence_num: 0,
+            },
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &concerto_core::memory::WorkingMemorySnapshot {
+                id: Ulid::new(),
+                session_id,
+                decisions: vec![],
+                task_tree: vec![],
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            &graph,
+            &HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &context,
+        );
+        assert!(
+            checkpoint.model_assignments.is_empty(),
+            "the build-time stamp starts empty for this test"
+        );
+
+        // ...is stamped at PERSIST time from the authoritative run ledger.
+        let mut ledger: HashMap<TaskId, String> = HashMap::new();
+        ledger.insert(TaskId::new(), "claude-3-7-sonnet".to_owned());
+        ledger.insert(TaskId::new(), "gpt-4.1".to_owned());
+        coordinator.persist_checkpoint(&mut checkpoint, &ledger).await;
+
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("persist wrote a record");
+        let stored: crate::checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("checkpoint state json loads");
+        assert_eq!(
+            stored.model_assignments, ledger,
+            "the persisted record carries the persist-time ledger, not the build-time empty stamp"
+        );
+    }
+
     /// A stalled run (review unresolved → Partial) with a DesignDoc KEEPS its
     /// orchestration checkpoint: persisted with completed=false, carrying the
     /// original objective text + hash and the design doc, so a later bare
@@ -24508,6 +24612,75 @@ mod tests {
         assert_eq!(context.retrieved_chunks.len(), 1);
         assert!(context.retrieved_chunks[0].id.starts_with("memory://decision:"));
         assert!(context.retrieved_chunks[0].content.contains("kept the resume seed optional"));
+    }
+
+    /// #5 coverage: the multi-agent retrieval path APPLIES its bound —
+    /// `retrieve_memory_context` caps `retrieved_chunks` at the task-description
+    /// query's `top_k` (5) and plan-scoped findings fill the budget (newest
+    /// first) ahead of any vector matches. Seeding MORE than `top_k` stored
+    /// decisions proves the cap bites on the plan-seeded path.
+    #[tokio::test]
+    async fn retrieve_memory_context_applies_top_k_bound_on_plan_seeded_path() {
+        use concerto_core::memory::{ChunkType, Decision, DecisionCategory, DecisionId};
+
+        let directory = tempfile::tempdir().expect("tempdir for grounding workspace");
+        let session_id = Ulid::new();
+        let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+        // Seed MORE than top_k=5 stored decisions so the bound must trim.
+        for i in 0..7 {
+            decision_store
+                .insert(Decision {
+                    id: DecisionId(Ulid::new()),
+                    session_id,
+                    task_id: None,
+                    what: format!("decision number {i}"),
+                    why: "seeded to overflow the top_k bound".into(),
+                    outcome: Some("settled".into()),
+                    category: DecisionCategory::Architecture,
+                    confidence: 1.0,
+                    superseded_by: None,
+                    created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000 + i)
+                        .expect("fixed timestamp"),
+                })
+                .expect("decision insert");
+        }
+
+        let coordinator = coordinator_with_memory(
+            EventBus::new(64),
+            decision_store,
+            Arc::new(concerto_memory::task_tree::TaskTreeStore::new()),
+        );
+        let task = AgentTask::new(session_id, "resume the plan");
+        let mut context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            directory.path().to_path_buf(),
+        ));
+
+        coordinator
+            .retrieve_memory_context(&task, &mut context, Some("plan-x"), CancellationToken::new())
+            .await;
+
+        // The `top_k` from the task-description query caps the merged set,
+        // plan-scoped findings first (vector store unwired here yields none).
+        assert_eq!(
+            context.retrieved_chunks.len(),
+            5,
+            "top_k = 5 bound must be applied: got {}",
+            context.retrieved_chunks.len()
+        );
+        assert!(
+            context.retrieved_chunks.iter().all(|chunk| chunk.id.starts_with("plan://plan-x/")),
+            "plan findings fill the whole budget on the plan-seeded path"
+        );
+        assert!(
+            context.retrieved_chunks[0].content.contains("decision number 6"),
+            "plan memory is newest-first: {}",
+            context.retrieved_chunks[0].content
+        );
+        for chunk in &context.retrieved_chunks {
+            assert_eq!(chunk.chunk_type, ChunkType::Fact);
+            assert_eq!(chunk.score, 1.0, "plan memory is rendered as deterministic facts");
+        }
     }
 
     /// M3b: a settled subtask writes back a `Decision` and a `Done` `TaskNode`

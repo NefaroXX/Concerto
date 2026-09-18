@@ -1609,13 +1609,15 @@ mod tests {
         // results.
         //
         // Known divergence (documented in docs/audits/AUDIT_FINDINGS_CURRENT.md,
-        // C-05): `model_assignments` captured in a checkpoint lags one batch —
-        // the coordinator inserts each task's assignment only after its
-        // batch's results are processed, so a checkpoint taken mid-run
-        // captures assignments up to the previous batch. That lag is NOT
-        // fixed here; we assert that whatever assignments ARE captured
-        // round-trip exactly. (Resume re-selects models, so the lag is
-        // informational.)
+        // C-05): `model_assignments` are stamped at PERSIST time from the
+        // authoritative run ledger in `CoordinatorAgent::persist_checkpoint`,
+        // so a persisted checkpoint cannot lag the ledger by a batch. A
+        // pre-batch (progress) checkpoint is by construction a consistent cut
+        // that excludes the still-in-flight batch's assignments — those tasks
+        // are re-dispatched on resume — while the post-batch checkpoint
+        // carries the full ledger. Here (unit level) we assert that whatever
+        // assignments ARE captured round-trip exactly. (Resume re-selects
+        // models, so any pre-batch residual is informational.)
         let mut graph = TaskGraph::new();
 
         // Fixed timestamps so the round-trip is exact — never "now".
@@ -1791,10 +1793,11 @@ mod tests {
         assert_eq!(restored.get(&failed_id).unwrap().status, SubTaskStatus::Failed);
         assert_eq!(restored.get(&blocked_id).unwrap().status, SubTaskStatus::Blocked);
 
-        // Completion timestamps exact — v3 round-trips, never fallback-now.
-        // (v2 records carry no timestamps and fall back to `now` on restore;
-        // that documented fallback is covered by
-        // `v2_subtask_without_timestamps_falls_back_to_now` and
+        // Completion timestamps exact — v3+ round-trips, never fallback-now.
+        // (v2 records carry no timestamps; restore marks their creation time
+        // UNKNOWN — the deterministic `UNIX_EPOCH` sentinel — instead of
+        // fabricating the current wall clock. That contract is covered by
+        // `v2_subtask_without_timestamps_marks_creation_unknown` and
         // `v2_record_loads_under_v3_policy_with_defaults`.)
         assert_eq!(restored.get(&done_id).unwrap().created_at, t_created);
         assert_eq!(restored.get(&done_id).unwrap().completed_at, Some(t_completed));

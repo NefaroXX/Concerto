@@ -449,6 +449,54 @@ mod tests {
         );
     }
 
+    /// #5 / coverage: the FTS path is stored-score-NEUTRAL and rank-authoritative.
+    /// `insert` persists only `(chunk_id, project_id, content)` — a chunk's
+    /// `score` field, even a deliberate non-neutral value, is never stored.
+    /// `search` therefore derives every result score at query time from the
+    /// FTS5 BM25 `rank` (negated), never from anything the writer supplied.
+    #[tokio::test]
+    async fn search_scores_are_rank_authoritative_not_stored_scores() {
+        let (store, _pool) = make_store().await;
+        let project_id = ProjectId("score-neutral".into());
+        let cancel = CancellationToken::new();
+
+        // "warm" has six times the query-term occurrences and must rank first —
+        // regardless of the stored (neutral-by-convention, here deliberately
+        // non-neutral) `score` fields the writers supplied.
+        let mut hot = make_chunk("hot", "the quick brown fox", &project_id);
+        hot.score = 99.0; // a stored score must never leak into FTS results
+        store.insert(&hot, &project_id, cancel.clone()).await.unwrap();
+        store
+            .insert(
+                &make_chunk("warm", "fox fox fox fox fox fox", &project_id),
+                &project_id,
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search("fox", &project_id, 5, cancel.clone()).await.unwrap();
+        assert_eq!(results.len(), 2, "both chunks mention the query term");
+        assert_eq!(results[0].chunk_id, "warm", "BM25 rank is the authoritative order");
+        for result in &results {
+            assert_ne!(result.score, 99.0, "a stored score must never surface: {result:?}");
+            assert_ne!(result.score, 0.0, "the neutral stored default must never surface");
+            assert!(result.score > 0.0, "scores are the negated BM25 rank: {result:?}");
+        }
+
+        // Rank-authoritative: the returned score equals -rank from the FTS5
+        // table itself, computed at query time and independent of storage.
+        let row = sqlx::query(
+            "SELECT rank FROM fts_store WHERE fts_store MATCH 'fox' AND project_id = ? ORDER BY rank LIMIT 1",
+        )
+        .bind(&project_id.0)
+        .fetch_one(&store.pool)
+        .await
+        .expect("the top-ranked row's rank reads back");
+        let rank: f64 = row.get("rank");
+        assert_eq!(results[0].score, -rank, "score is the negated FTS5 rank");
+    }
+
     /// FTS search with an empty query returns no results.
     #[tokio::test]
     async fn fts_search_empty_query_returns_empty() {
