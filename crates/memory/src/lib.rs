@@ -339,6 +339,7 @@ pub mod global;
 mod ignore_rules;
 pub mod indexer;
 pub mod links;
+pub mod mermaid;
 pub mod prefs;
 pub mod rag;
 pub mod scoring;

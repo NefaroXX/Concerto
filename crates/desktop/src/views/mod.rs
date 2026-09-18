@@ -4,6 +4,7 @@ pub mod code_editor;
 pub mod context_bar;
 pub mod diff;
 pub mod memory;
+pub mod memory_graph;
 pub mod nav;
 pub mod orchestration_studio;
 pub mod quick_panel;

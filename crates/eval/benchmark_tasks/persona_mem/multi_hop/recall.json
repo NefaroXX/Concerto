@@ -1,0 +1,20 @@
+{
+  "id": "persona_mem/multi_hop",
+  "description": "Two-hop recall: the query's strongest direct match is seed A (the meridian conduit), but the expected detail lives in seed B (the bridge journal), one symbolic hop from A. The runner wires an ADR-69 link (A -Supports-> B, C -Supports-> B) and flips the cascade to the Emergency tier (gamma 0.20), so B's link evidence lifts it from plain fused rank 3 to rank <= 2 even though its raw cosine overlap with the query is weaker than the decoy C. Without the cascade, B stays at rank 3 and the query fails its bound.",
+  "seed_facts": [
+    "The meridian relay conduit carries the weekly payload checksum signal to the audit tower.",
+    "The meridian report is due on Thursday at the station review.",
+    "The bridge journal logs the relay checksum parity factor for the daily audit."
+  ],
+  "distractors": [
+    "The team evaluated switching to Go for the web dashboard backend.",
+    "The onboarding doc recommends Visual Studio Code for new contributors.",
+    "Concerto deployments historically used Python build scripts.",
+    "The probe binaries are released from the local cache."
+  ],
+  "queries": [
+    { "query": "meridian relay conduit", "expected": "parity factor", "min_rank": 2 },
+    { "query": "meridian station thursday report", "expected": "station review", "min_rank": 2 }
+  ],
+  "min_recall_rate": 1.0
+}

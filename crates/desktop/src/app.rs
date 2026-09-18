@@ -120,6 +120,7 @@ pub enum Message {
     Chat(views::chat::Message),
     Diff(views::diff::Message),
     Memory(views::memory::Message),
+    MemoryGraph(views::memory_graph::Message),
     ToolLog(views::tool_log::Message),
     Settings(views::settings::Message),
     AgentGraph(views::agent_graph::Message),
@@ -195,6 +196,11 @@ pub enum Message {
         id: String,
         result: Result<(), String>,
     },
+    /// ADR-69 slice 3 — the memory graph modal's load task finished.
+    MemoryGraphLoaded(Result<concerto_memory::mermaid::MemoryGraph, String>),
+    /// Open / close the read-only memory graph modal (from the Memory modal).
+    OpenMemoryGraph,
+    CloseMemoryGraph,
     /// A session was picked from the picker; carries the loaded history so the
     /// chat can be seeded with the resumed conversation. `transcript` is the
     /// durable typed transcript (ADR-36) and takes precedence over `history`
@@ -271,6 +277,7 @@ pub struct App {
     pub chat: views::chat::State,
     pub diff: views::diff::State,
     pub memory: views::memory::State,
+    pub memory_graph: views::memory_graph::State,
     pub tool_log: views::tool_log::State,
     pub settings: views::settings::State,
     pub agent_graph: views::agent_graph::State,
@@ -361,6 +368,8 @@ pub struct App {
     pub quick_panel_open: bool,
     /// Whether the Memory explorer modal is open.
     pub memory_view_open: bool,
+    /// Whether the read-only memory graph modal (ADR-69 slice 3) is open.
+    pub memory_graph_open: bool,
     /// Whether the toggleable terminal bottom panel is visible.
     pub terminal_panel_open: bool,
     /// Current height (logical px) of the terminal bottom panel.
@@ -793,6 +802,7 @@ impl App {
             chat: views::chat::State::new(),
             diff: views::diff::State::new(),
             memory: views::memory::State::new(),
+            memory_graph: views::memory_graph::State::new(),
             tool_log: views::tool_log::State::new(),
             settings: {
                 let cfg = global_config.clone();
@@ -836,6 +846,7 @@ impl App {
             save_feedback_generation: 0,
             quick_panel_open: true,
             memory_view_open: false,
+            memory_graph_open: false,
             terminal_panel_open: false,
             terminal_panel_height: 260.0,
             terminal_resizing: false,
@@ -1902,6 +1913,28 @@ impl App {
                 self.memory_view_open = false;
                 iced::Task::none()
             }
+            Message::OpenMemoryGraph => {
+                self.memory_graph_open = true;
+                self.memory_graph = views::memory_graph::State::Loading;
+                self.load_memory_graph()
+            }
+            Message::CloseMemoryGraph => {
+                self.memory_graph_open = false;
+                iced::Task::none()
+            }
+            Message::MemoryGraph(msg) => match msg {
+                views::memory_graph::Message::Refresh => {
+                    self.memory_graph = views::memory_graph::State::Loading;
+                    self.load_memory_graph()
+                }
+            },
+            Message::MemoryGraphLoaded(result) => {
+                match result {
+                    Ok(graph) => self.memory_graph = views::memory_graph::State::Loaded(graph),
+                    Err(error) => self.memory_graph = views::memory_graph::State::Error(error),
+                }
+                iced::Task::none()
+            }
             Message::ToggleTerminalPanel => {
                 self.terminal_panel_open = !self.terminal_panel_open;
                 // Kick off the slide animation; `AnimTick` eases the panel
@@ -2088,6 +2121,8 @@ impl App {
                 self.show_help = false;
                 // Esc also dismisses the Memory explorer modal.
                 self.memory_view_open = false;
+                // ...and the read-only memory graph modal (ADR-69 slice 3).
+                self.memory_graph_open = false;
                 // Esc dismisses the Runtime panels modal (memory-modal parity;
                 // the Diff / Tool Log overlays stay close-button-only).
                 if self.page == Page::Chat && self.chat.sub_view == views::chat::SubView::Runtime {
@@ -3286,6 +3321,31 @@ impl App {
         )
     }
 
+    /// Load the project's memory graph from `<app data>/memory/memory.db`
+    /// (read-only, ADR-69 slice 3). `MemoryError`s and a missing db both land
+    /// as `MemoryGraphLoaded(Err)` / an empty graph, never a panic.
+    fn load_memory_graph(&self) -> iced::Task<Message> {
+        let project_dir = self.project_dir.clone();
+        iced::Task::perform(
+            async move {
+                let db_path = match concerto_sessions::app_data_dir() {
+                    Ok(dir) => dir.join("memory").join("memory.db"),
+                    Err(e) => return Err(format!("could not resolve app data dir: {e}")),
+                };
+                let project_id = concerto_core::memory::ProjectId(project_id_hash(&project_dir));
+                concerto_memory::mermaid::load_memory_graph(
+                    &db_path,
+                    &project_id,
+                    200,
+                    CancellationToken::new(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            },
+            Message::MemoryGraphLoaded,
+        )
+    }
+
     fn load_memory_entries(&self) -> iced::Task<Message> {
         use concerto_core::memory::{
             ChunkType, MemoryFilter, MemoryNamespace, MemoryQuery, ProjectId,
@@ -4090,6 +4150,46 @@ impl App {
                     ..container::Style::default()
                 });
             stack![after_subview, backdrop].into()
+        } else if self.memory_graph_open {
+            // Read-only memory graph modal (ADR-69 slice 3). Rendered before
+            // the Memory explorer branch so it sits on top when opened from
+            // the Explorer's header button.
+            let graph_content =
+                self.memory_graph.modal_view(&self.current_theme).map(Message::MemoryGraph);
+            let modal = container(
+                column![
+                    row![
+                        text("Memory Graph").size(18).width(Length::Fill),
+                        button(text("↻").size(14))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::MemoryGraph(views::memory_graph::Message::Refresh)),
+                        button(text("✕").size(14))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::CloseMemoryGraph),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    graph_content,
+                ]
+                .spacing(10)
+                .padding(20)
+                .width(Length::Fill),
+            )
+            .width(Length::FillPortion(2))
+            .height(Length::FillPortion(2))
+            .style(crate::ui::container::modal);
+            let backdrop = container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.55,
+                        ..self.current_theme.palette.background
+                    })),
+                    ..container::Style::default()
+                });
+            stack![after_subview, backdrop].into()
         } else if self.memory_view_open {
             // Memory explorer modal (issue #110). Composed via the same
             // system-dialog stack mechanism as the dir picker / capability /
@@ -4100,6 +4200,9 @@ impl App {
                 column![
                     row![
                         text("Memory").size(18).width(Length::Fill),
+                        button(text("⇄ Graph").size(13))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::OpenMemoryGraph),
                         button(text("✕").size(14))
                             .style(crate::ui::button::secondary)
                             .on_press(Message::CloseMemoryModal),
@@ -5710,6 +5813,40 @@ custom_agents = []
         assert!(!app.memory_view_open);
         let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::Memory));
         assert!(app.memory_view_open);
+    }
+
+    /// OpenMemoryGraph opens the read-only graph modal; CloseMemoryGraph
+    /// closes it (ADR-69 slice 3).
+    #[test]
+    fn memory_graph_modal_opens_and_closes() {
+        let (mut app, _) = App::new();
+        assert!(!app.memory_graph_open);
+        let _ = app.update(Message::OpenMemoryGraph);
+        assert!(app.memory_graph_open);
+        let _ = app.update(Message::CloseMemoryGraph);
+        assert!(!app.memory_graph_open);
+    }
+
+    /// Esc (Shortcut::CancelDialog) dismisses the memory graph modal.
+    #[test]
+    fn escape_closes_the_memory_graph_modal() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::OpenMemoryGraph);
+        assert!(app.memory_graph_open);
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::CancelDialog));
+        assert!(!app.memory_graph_open);
+    }
+
+    /// MemoryGraphLoaded routes a load result into the graph view state.
+    #[test]
+    fn memory_graph_loaded_routes_into_state() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::MemoryGraphLoaded(Ok(
+            concerto_memory::mermaid::MemoryGraph::default(),
+        )));
+        assert!(matches!(app.memory_graph, crate::views::memory_graph::State::Loaded(_)));
+        let _ = app.update(Message::MemoryGraphLoaded(Err("boom".into())));
+        assert!(matches!(app.memory_graph, crate::views::memory_graph::State::Error(_)));
     }
 
     /// Esc (Shortcut::CancelDialog) dismisses the memory modal.

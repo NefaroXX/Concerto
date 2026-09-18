@@ -58,6 +58,13 @@ impl LinkStore {
         Ok(Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE })
     }
 
+    /// DDL-free constructor for read-only consumers in sibling modules
+    /// (e.g. [`crate::mermaid`] graph loading): assumes the `memory_links`
+    /// table already exists and never creates it.
+    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE }
+    }
+
     /// Bound how many distinct NEW links a source may hold (ADR-69 A2).
     ///
     /// Re-writing an already-present `(source, target, type)` triple stays
