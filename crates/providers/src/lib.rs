@@ -24,6 +24,7 @@ pub mod tokenizer;
 pub mod adapters;
 pub mod anthropic;
 pub mod capability;
+pub mod deepseek;
 pub mod google;
 pub mod nim;
 pub mod ollama;
@@ -146,6 +147,15 @@ pub async fn list_models_for_provider_async(
                 String::new(),
                 DEFAULT_TIMEOUT_SECS,
                 api_base.unwrap_or(OPENCODE_ZEN_API_BASE).to_string(),
+            );
+            p.list_models(cancel.clone()).await
+        }
+        "deepseek" => {
+            let p = deepseek::DeepSeekProvider::with_api_base(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+                api_base.unwrap_or(deepseek::DEEPSEEK_API_BASE).to_string(),
             );
             p.list_models(cancel.clone()).await
         }

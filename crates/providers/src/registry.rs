@@ -62,6 +62,7 @@ impl ProviderRegistry {
     /// | openrouter | ~$0.003                  |
     /// | nim        | ~$0.001                  |
     /// | ollama     | ~$0.000                  |
+    /// | deepseek   | ~$0.000                  |
     pub fn routing_profiles(&self) -> Vec<RoutingProfile> {
         self.providers
             .iter()
@@ -74,6 +75,9 @@ impl ProviderRegistry {
                     "openrouter" => (0.003, 1000),
                     "ollama" => (0.000, 200),
                     "nim" => (0.001, 400),
+                    // DeepSeek V4 Flash: $0.14/$0.28 per MTok blended ≈
+                    // $0.0002/1k tokens — the cheapest frontier tier.
+                    "deepseek" => (0.0002, 800),
                     _ => (0.005, 500),
                 };
                 RoutingProfile {

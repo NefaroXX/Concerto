@@ -71,6 +71,7 @@ const ANTHROPIC_KNOWN: &[&str] = &[
     "claude-3-haiku-20240307",
 ];
 const GOOGLE_KNOWN: &[&str] = &["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash-exp"];
+const DEEPSEEK_KNOWN: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
 
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///
@@ -142,6 +143,15 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             model_discovery: ModelDiscoverySupport::Supported,
             allows_custom_model: true,
         },
+        "deepseek" => ProviderDefinition {
+            id: "deepseek",
+            display_name: String::from("DeepSeek"),
+            default_model: Some("deepseek-chat"),
+            known_models: DEEPSEEK_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
         _ => ProviderDefinition {
             id: "<unknown>",
             display_name: provider_type.to_string(),
@@ -156,7 +166,7 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
 
 /// Recognized provider type ids, in UI display order.
 pub const PROVIDER_TYPE_IDS: &[&str] =
-    &["anthropic", "openai", "google", "openrouter", "nim", "ollama", "opencode"];
+    &["anthropic", "openai", "google", "openrouter", "nim", "ollama", "opencode", "deepseek"];
 
 /// Discovered model catalog for a provider.
 ///
@@ -404,6 +414,16 @@ mod tests {
             provider_definition("ollama").credential_requirement,
             CredentialRequirement::None
         );
+    }
+
+    #[test]
+    fn deepseek_definition_is_complete() {
+        let def = provider_definition("deepseek");
+        assert_eq!(def.id, "deepseek");
+        assert_eq!(def.default_model, Some("deepseek-chat"));
+        assert!(def.known_models.contains(&"deepseek-reasoner"));
+        assert_eq!(def.credential_requirement, CredentialRequirement::Required);
+        assert!(def.allows_custom_model);
     }
 
     #[test]

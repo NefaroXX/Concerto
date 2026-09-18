@@ -33,6 +33,12 @@ static MODEL_CAPACITIES: LazyLock<HashMap<&'static str, u64>> = LazyLock::new(||
     m.insert("openai/gpt-4o-mini", 128_000);
     m.insert("meta-llama/llama-3.3-70b-instruct", 128_000);
     m.insert("deepseek/deepseek-chat", 64_000);
+    // DeepSeek — api.deepseek.com native model IDs. The sibling
+    // `deepseek/deepseek-chat` entry above is an OpenRouter-format ID (64K)
+    // and stays untouched; these native IDs are matched exactly and never
+    // collide with it.
+    m.insert("deepseek-chat", 1_000_000);
+    m.insert("deepseek-reasoner", 1_000_000);
     m
 });
 
@@ -78,6 +84,16 @@ mod tests {
     #[test]
     fn test_prefix_match() {
         assert_eq!(capacity_for_model("gpt-4o-2024-08-06"), 128_000);
+    }
+
+    /// DeepSeek direct API IDs carry the full 1M context; the OpenRouter-
+    /// format `deepseek/deepseek-chat` ID keeps its own (smaller) capacity
+    /// even though it shares the `deepseek` stem.
+    #[test]
+    fn test_deepseek_native_capacities() {
+        assert_eq!(capacity_for_model("deepseek-chat"), 1_000_000);
+        assert_eq!(capacity_for_model("deepseek-reasoner"), 1_000_000);
+        assert_eq!(capacity_for_model("deepseek/deepseek-chat"), 64_000);
     }
 
     #[test]

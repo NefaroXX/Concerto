@@ -10,6 +10,7 @@ use concerto_core::types::RoutingProfile;
 
 use crate::anthropic::AnthropicProvider;
 use crate::context_guard::ContextGuardProvider;
+use crate::deepseek::DeepSeekProvider;
 use crate::google::GoogleProvider;
 use crate::nim::NimProvider;
 use crate::ollama::OllamaProvider;
@@ -91,7 +92,14 @@ impl ProviderFactory {
     ) -> Result<Arc<dyn LlmProvider>, ProviderError> {
         if !matches!(
             config.provider.as_str(),
-            "anthropic" | "openai" | "opencode" | "google" | "openrouter" | "nim" | "ollama"
+            "anthropic"
+                | "openai"
+                | "opencode"
+                | "google"
+                | "openrouter"
+                | "nim"
+                | "ollama"
+                | "deepseek"
         ) {
             return Err(ProviderError::UnsupportedProvider { provider: config.provider.clone() });
         }
@@ -196,6 +204,23 @@ impl ProviderFactory {
                 }
                 Arc::new(provider)
             }
+            "deepseek" => {
+                // DeepSeek defaults to `ReasoningEcho::Always` at construction
+                // (ADR-46 reasoning contract), so the config dial is a no-op
+                // here — mirroring the OpenCode Zen arm.
+                let provider = if let Some(base) = &config.api_base {
+                    DeepSeekProvider::with_api_base(
+                        key,
+                        config.model.clone(),
+                        config.timeout_seconds,
+                        base.clone(),
+                    )
+                } else {
+                    DeepSeekProvider::new(key, config.model.clone(), config.timeout_seconds)
+                }
+                .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                Arc::new(provider)
+            }
             other => {
                 return Err(ProviderError::UnsupportedProvider { provider: other.to_string() });
             }
@@ -282,6 +307,9 @@ impl ProviderFactory {
                     "ollama" => (0.000, 200),
                     "nim" => (0.001, 400),
                     "opencode" => (0.005, 600),
+                    // DeepSeek V4 Flash: $0.14/$0.28 per MTok blended ≈
+                    // $0.0002/1k tokens — the cheapest frontier tier.
+                    "deepseek" => (0.0002, 800),
                     _ => (0.005, 500),
                 };
                 let mut profile = RoutingProfile {
@@ -457,6 +485,45 @@ mod tests {
         std::env::remove_var("CONCERTO_ANTHROPIC_API_KEY");
 
         assert_eq!(provider.provider_name(), "anthropic");
+    }
+
+    /// A `deepseek` config builds through the factory: the env-backed test
+    /// keyring resolution maps `keyring_key = "deepseek/api_key"` to
+    /// `CONCERTO_DEEPSEEK_API_KEY`.
+    #[test]
+    fn build_deepseek_provider() {
+        let config = ProviderConfig {
+            id: "deepseek-main".into(),
+            name: "DeepSeek Main".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            keyring_key: "deepseek/api_key".into(),
+            ..ProviderConfig::default()
+        };
+        std::env::set_var("CONCERTO_DEEPSEEK_API_KEY", "sk-test-deepseek");
+        let provider = ProviderFactory::build(&config, &test_creds()).unwrap();
+        std::env::remove_var("CONCERTO_DEEPSEEK_API_KEY");
+
+        assert_eq!(provider.provider_name(), "deepseek");
+    }
+
+    /// The DeepSeek routing profile carries an explicit (cheap) cost rather
+    /// than the built-in `_` fallback, in lockstep with
+    /// `ProviderRegistry::routing_profiles`.
+    #[test]
+    fn build_profiles_deepseek_explicit_cost() {
+        let settings = ModelSettings {
+            providers: vec![ProviderConfig {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                ..ProviderConfig::default()
+            }],
+            ..ModelSettings::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].provider, "deepseek");
+        assert_eq!(profiles[0].cost_per_1k_tokens, 0.0002);
     }
 
     #[test]
