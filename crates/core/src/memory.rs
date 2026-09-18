@@ -190,6 +190,79 @@ pub struct EmbeddingRecord {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryLink — symbolic links between chunks (ADR-69)
+// ---------------------------------------------------------------------------
+
+/// The kind of a symbolic link between two memory chunks (ADR-69 slice 1).
+///
+/// Slice 1 emits `Supersedes` and `Merges` from the L1 dedup judge's
+/// update/merge verdicts, and `References` for the `refs` / `result_ref`
+/// metadata carried on those paths. The ADR's broader vocabulary
+/// (`supports`, `contradicts`, `extends`) arrives with the slice-2 scoring
+/// work; `#[non_exhaustive]` keeps every downstream match explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum MemoryLinkKind {
+    /// The source supersedes the target — the target is now stale.
+    Supersedes,
+    /// The source extends / folds in the target's content.
+    Merges,
+    /// The source references the target for context.
+    References,
+}
+
+impl MemoryLinkKind {
+    /// The stable string form used in the `memory_links.link_type` column
+    /// and in serialized metadata.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Supersedes => "supersedes",
+            Self::Merges => "merges",
+            Self::References => "references",
+        }
+    }
+
+    /// Parse a stored `link_type` string back into a link kind.
+    ///
+    /// Returns `None` for anything unrecognized (for example a future
+    /// slice-2 vocabulary read by an older binary) so callers fail open by
+    /// skipping the link instead of failing the read.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "supersedes" => Some(Self::Supersedes),
+            "merges" => Some(Self::Merges),
+            "references" => Some(Self::References),
+            _ => None,
+        }
+    }
+}
+
+/// A directed, typed edge between two memory chunks (ADR-69 slice 1).
+///
+/// Written as a side effect of the L1 dedup update/merge paths, where the
+/// newly stored chunk points at the chunk it supersedes or merges. The
+/// `weight` default of `1.0` is the neutral strength used once slice-2
+/// scoring reads links back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLink {
+    /// The source chunk id.
+    pub from: String,
+    /// The target chunk id.
+    pub to: String,
+    /// The relationship from `from` to `to`.
+    pub kind: MemoryLinkKind,
+    /// Link strength for later scoring; `1.0` unless overridden.
+    pub weight: f64,
+}
+
+impl MemoryLink {
+    /// A default-weight (`1.0`) link from `from` to `to`.
+    pub fn new(from: impl Into<String>, to: impl Into<String>, kind: MemoryLinkKind) -> Self {
+        Self { from: from.into(), to: to.into(), kind, weight: 1.0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Decision types
 // ---------------------------------------------------------------------------
 
@@ -371,5 +444,29 @@ mod tests {
             let r = FtsResult { chunk_id: "c".into(), score, content: String::new(), stale: false };
             assert!(r.score >= 0.0, "FTS score must be non-negative, got {score}");
         }
+    }
+
+    #[test]
+    fn memory_link_kind_round_trip() {
+        for (kind, expected) in [
+            (MemoryLinkKind::Supersedes, "supersedes"),
+            (MemoryLinkKind::Merges, "merges"),
+            (MemoryLinkKind::References, "references"),
+        ] {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(MemoryLinkKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(MemoryLinkKind::parse("supports"), None, "slice-2 kinds are not known yet");
+        assert_eq!(MemoryLinkKind::parse(""), None);
+        assert_eq!(MemoryLinkKind::parse("SUPERSEDES"), None, "kinds are lowercase");
+    }
+
+    #[test]
+    fn memory_link_new_defaults_weight() {
+        let link = MemoryLink::new("a", "b", MemoryLinkKind::Supersedes);
+        assert_eq!(link.from, "a");
+        assert_eq!(link.to, "b");
+        assert_eq!(link.kind, MemoryLinkKind::Supersedes);
+        assert_eq!(link.weight, 1.0);
     }
 }

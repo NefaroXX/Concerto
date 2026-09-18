@@ -14,8 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use concerto_core::error::MemoryError as CoreMemoryError;
 use concerto_core::memory::{
-    ChunkType, EmbeddingRecord, MemoryChunk, MemoryEntry, MemoryFilter, MemoryId, MemoryNamespace,
-    MemoryQuery, ProjectId,
+    ChunkType, EmbeddingRecord, MemoryChunk, MemoryEntry, MemoryFilter, MemoryId, MemoryLink,
+    MemoryLinkKind, MemoryNamespace, MemoryQuery, ProjectId,
 };
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::CancellationToken;
@@ -29,6 +29,7 @@ use crate::embedder_health::EmbedderHealth;
 use crate::entities::{L1Candidate, L1DedupJudge, L1DedupVerdict};
 use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
+use crate::links::{links_from_metadata, LinkStore};
 use crate::rag::HybridRetriever;
 use crate::sync::ChunkSyncService;
 use crate::task_tree::TaskTreeStore;
@@ -86,6 +87,11 @@ pub struct MemorySystem {
     dedup_judge: Option<L1DedupJudge>,
     /// L1 dedup judge outcome counters (see [`DedupJudgeCounters`]).
     dedup_counters: DedupJudgeCounters,
+    /// Optional symbolic link store (ADR-69 slice 1). When set, `store`
+    /// persists `memory_links` rows on the L1 dedup update/merge paths.
+    /// Fail-open: a link-store error logs a warning and never fails the
+    /// memory store; a missing store simply writes no links.
+    link_store: Option<Arc<LinkStore>>,
 }
 
 impl MemorySystem {
@@ -113,6 +119,7 @@ impl MemorySystem {
             global_store,
             dedup_judge: None,
             dedup_counters: DedupJudgeCounters::default(),
+            link_store: None,
         }
     }
     /// Access the decision store.
@@ -161,6 +168,21 @@ impl MemorySystem {
     /// judge / recall error logs a warning and stores the entry unchanged.
     pub fn with_dedup_judge(mut self, judge: L1DedupJudge) -> Self {
         self.dedup_judge = Some(judge);
+        self
+    }
+
+    /// Enable the symbolic link store for [`MemoryStore::store`] (ADR-69
+    /// slice 1).
+    ///
+    /// When configured, every project-namespace `store` that resolves to an
+    /// L1 dedup update/merge verdict persists `memory_links` rows — the
+    /// verdict's own supersession link plus any `References` links derived
+    /// from `refs` / `result_ref` metadata carried on those paths. The link
+    /// write happens AFTER the chunk is stored and BEFORE the target is
+    /// tombstoned, and is fail-open: any link-store error logs a warning and
+    /// the memory is kept unchanged.
+    pub fn with_link_store(mut self, link_store: Arc<LinkStore>) -> Self {
+        self.link_store = Some(link_store);
         self
     }
 
@@ -254,7 +276,8 @@ impl MemorySystem {
                 DedupDecision::Store {
                     content: entry.content.clone(),
                     vector: vector.to_vec(),
-                    tombstone_after: Some(target_id),
+                    tombstone_after: Some(target_id.clone()),
+                    links: dedup_links(entry, MemoryLinkKind::Supersedes, &target_id),
                 }
             }
             L1DedupVerdict::Merge { target_id } => {
@@ -293,11 +316,24 @@ impl MemorySystem {
                 DedupDecision::Store {
                     content: merged_content,
                     vector: merged_vector,
-                    tombstone_after: Some(target_id),
+                    tombstone_after: Some(target_id.clone()),
+                    links: dedup_links(entry, MemoryLinkKind::Merges, &target_id),
                 }
             }
         }
     }
+}
+
+/// Link rows to persist for an L1 dedup update/merge verdict (ADR-69 slice
+/// 1): the verdict's own supersession link plus any `References` links the
+/// entry metadata carries (`refs` array / `result_ref`).
+///
+/// Only ever called on the update/merge paths — plain stores write no links.
+fn dedup_links(entry: &MemoryEntry, kind: MemoryLinkKind, target_id: &str) -> Vec<MemoryLink> {
+    let from = entry.id.0.to_string();
+    let mut links = vec![MemoryLink::new(&from, target_id, kind)];
+    links.extend(links_from_metadata(&from, &entry.metadata));
+    links
 }
 
 /// Outcome of the L1 dedup pass for one store call.
@@ -308,7 +344,16 @@ enum DedupDecision {
     /// Write the entry with the given (possibly merged) content/vector, then
     /// supersede `tombstone_after` — if any — AFTER the write so a failure
     /// can never leave the only copy of a memory gone.
-    Store { content: String, vector: Vec<f32>, tombstone_after: Option<String> },
+    ///
+    /// `links` (ADR-69 slice 1) are the symbolic links to persist for the
+    /// verdict: empty on plain stores, populated only on the update/merge
+    /// paths.
+    Store {
+        content: String,
+        vector: Vec<f32>,
+        tombstone_after: Option<String>,
+        links: Vec<MemoryLink>,
+    },
 }
 
 impl DedupDecision {
@@ -318,6 +363,7 @@ impl DedupDecision {
             content: entry.content.clone(),
             vector: vector.to_vec(),
             tombstone_after: None,
+            links: Vec::new(),
         }
     }
 }
@@ -481,7 +527,7 @@ impl MemoryStore for MemorySystem {
         // Fail-open: any judge or recall problem stores the entry unchanged.
         let decision = self.decide_dedup(&entry, &vector, cancel.clone()).await;
 
-        let DedupDecision::Store { content, vector, tombstone_after } = decision else {
+        let DedupDecision::Store { content, vector, tombstone_after, links } = decision else {
             // Skip: the judge ruled the entry is already represented.
             return Ok(entry.id);
         };
@@ -508,6 +554,28 @@ impl MemoryStore for MemorySystem {
             .store(&record, cancel.clone())
             .await
             .map_err(|e| CoreMemoryError::Persistence(format!("failed to store memory: {e}")))?;
+
+        // ADR-69 slice 1: persist the verdict's symbolic links BEFORE the
+        // tombstone, so a link failure can never orphan a superseded chunk.
+        // Fail-open by contract: an error (or a missing store) logs and the
+        // memory itself is kept — a link store must never fail a memory
+        // write.
+        if !links.is_empty() {
+            match self.link_store {
+                Some(ref store) => match store.put_many(&links, cancel.clone()).await {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        links = links.len(),
+                        "failed to persist ADR-69 memory links; continuing"
+                    ),
+                },
+                None => tracing::debug!(
+                    links = links.len(),
+                    "no ADR-69 link store configured; skipping link writes"
+                ),
+            }
+        }
 
         // Supersede the replaced/merged chunk ONLY after the write succeeded,
         // so a tombstone failure is logged-and-kept rather than data loss.
@@ -643,7 +711,7 @@ mod tests {
         FakeSummarizer, InMemoryFullTextStore, InMemoryVectorStore, MockEmbeddingGenerator,
     };
     use concerto_core::error::MemoryError;
-    use concerto_core::memory::{ChunkType, MemoryNamespace, VectorResult};
+    use concerto_core::memory::{ChunkType, MemoryLinkKind, MemoryNamespace, VectorResult};
     use std::sync::Mutex;
     use time::OffsetDateTime;
 
@@ -1131,5 +1199,238 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.iter().any(|r| r.content == "an entirely new fact"));
         assert_eq!(counter_snapshot(&system), (0, 0, 0, 0, 1), "judge failure is counted");
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-69 symbolic links (with_link_store)
+    // ---------------------------------------------------------------------
+
+    async fn in_memory_link_store() -> Arc<LinkStore> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        Arc::new(LinkStore::new(pool).await.unwrap())
+    }
+
+    fn dedup_system_with_links(
+        vector_store: Arc<InMemoryVectorStore>,
+        fts_store: Arc<InMemoryFullTextStore>,
+        judge: Option<L1DedupJudge>,
+        link_store: Arc<LinkStore>,
+    ) -> MemorySystem {
+        dedup_system(vector_store, fts_store, judge).with_link_store(link_store)
+    }
+
+    fn dedup_entry_with_metadata(content: &str, metadata: serde_json::Value) -> MemoryEntry {
+        let mut entry = dedup_entry(content);
+        entry.metadata = metadata;
+        entry
+    }
+
+    #[tokio::test]
+    async fn store_update_writes_supersedes_link() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "the user's favorite city is london",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "update", "target_id": "existing-1"}"#,
+        )));
+        let link_store = in_memory_link_store().await;
+        let system = dedup_system_with_links(
+            vector_store.clone(),
+            fts_store,
+            Some(judge),
+            link_store.clone(),
+        );
+        let entry = dedup_entry("the user's favorite city is paris");
+        system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+
+        let from = entry.id.0.to_string();
+        let links = link_store.links_from(&from, CancellationToken::new()).await.unwrap();
+        assert_eq!(links.len(), 1, "update verdict must write one link");
+        assert_eq!(links[0].kind, MemoryLinkKind::Supersedes);
+        assert_eq!(links[0].to, "existing-1");
+        assert_eq!(links[0].weight, 1.0);
+
+        // The target sees the inverse direction (slice-2 in-degree read).
+        let mut into_target =
+            link_store.links_to("existing-1", CancellationToken::new()).await.unwrap();
+        assert_eq!(into_target.len(), 1);
+        assert_eq!(into_target.remove(0).from, from);
+    }
+
+    #[tokio::test]
+    async fn store_merge_writes_merges_link() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "the user's preferred color is blue",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "merge", "target_id": "existing-1"}"#,
+        )));
+        let link_store = in_memory_link_store().await;
+        let system = dedup_system_with_links(
+            vector_store.clone(),
+            fts_store,
+            Some(judge),
+            link_store.clone(),
+        );
+        let entry = dedup_entry("the user's preferred color is teal");
+        system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+
+        let from = entry.id.0.to_string();
+        let links = link_store.links_from(&from, CancellationToken::new()).await.unwrap();
+        assert_eq!(links.len(), 1, "merge verdict must write one link");
+        assert_eq!(links[0].kind, MemoryLinkKind::Merges);
+        assert_eq!(links[0].to, "existing-1");
+    }
+
+    #[tokio::test]
+    async fn store_update_writes_references_from_metadata() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "a pre-existing fact",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "update", "target_id": "existing-1"}"#,
+        )));
+        let link_store = in_memory_link_store().await;
+        let system = dedup_system_with_links(
+            vector_store.clone(),
+            fts_store,
+            Some(judge),
+            link_store.clone(),
+        );
+        let entry = dedup_entry_with_metadata(
+            "an updated fact with context",
+            serde_json::json!({
+                "refs": ["chunk-a", "chunk-b"],
+                "result_ref": "chunk-c",
+            }),
+        );
+        system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+
+        let from = entry.id.0.to_string();
+        let links = link_store.links_from(&from, CancellationToken::new()).await.unwrap();
+        assert_eq!(links.len(), 4, "1 supersedes + 3 references expected");
+        assert_eq!(links[0].kind, MemoryLinkKind::Supersedes);
+        assert_eq!(links[0].to, "existing-1");
+        let reference_targets: Vec<&str> = links[1..]
+            .iter()
+            .map(|link| {
+                assert_eq!(link.kind, MemoryLinkKind::References);
+                link.to.as_str()
+            })
+            .collect();
+        assert_eq!(reference_targets, vec!["chunk-a", "chunk-b", "chunk-c"]);
+    }
+
+    #[tokio::test]
+    async fn store_plain_verdict_writes_no_links() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "a pre-existing fact",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "store", "target_id": null}"#,
+        )));
+        let link_store = in_memory_link_store().await;
+        let system = dedup_system_with_links(
+            vector_store.clone(),
+            fts_store,
+            Some(judge),
+            link_store.clone(),
+        );
+        let entry = dedup_entry_with_metadata(
+            "a plain fact that happens to list refs",
+            serde_json::json!({ "refs": ["chunk-a"] }),
+        );
+        system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+
+        // Plain stores are link-free even when refs metadata is present —
+        // links exist to record supersession/dependence, not to duplicate
+        // arbitrary metadata.
+        let from = entry.id.0.to_string();
+        let links = link_store.links_from(&from, CancellationToken::new()).await.unwrap();
+        assert!(links.is_empty(), "plain store verdict must write no links");
+        assert_eq!(link_store.out_degree(&from, CancellationToken::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn store_fails_open_when_link_store_errors() {
+        let project_id = ProjectId("test".into());
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        dedup_seed(
+            &project_id,
+            "existing-1",
+            "a pre-existing fact",
+            vector_store.clone(),
+            fts_store.clone(),
+        )
+        .await;
+
+        let judge = L1DedupJudge::new(Arc::new(FakeSummarizer::new(
+            r#"{"action": "update", "target_id": "existing-1"}"#,
+        )));
+        // A link store whose pool is already closed: every link write fails.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.db");
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        let link_store = Arc::new(LinkStore::new(pool).await.unwrap());
+        link_store.close_pool().await;
+
+        let system = dedup_system_with_links(
+            vector_store.clone(),
+            fts_store,
+            Some(judge),
+            link_store.clone(),
+        );
+        let entry = dedup_entry("the user's favorite city is paris");
+        system.store(entry.clone(), CancellationToken::new()).await.unwrap();
+
+        // Fail-open by contract: the link-store error must not fail the
+        // memory write nor skip the tombstone.
+        let records = stored_records(&vector_store, &project_id).await;
+        assert_eq!(records.len(), 1, "the chunk must still be written");
+        assert_eq!(records[0].content, "the user's favorite city is paris");
+        assert_eq!(counter_snapshot(&system), (0, 0, 1, 0, 0), "update is still counted");
     }
 }

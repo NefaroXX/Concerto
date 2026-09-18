@@ -511,4 +511,32 @@ mod tests {
             .any(|e| e.file_name().to_string_lossy().starts_with("valid.db.corrupt"));
         assert!(!touched, "valid-header file must never be quarantined");
     }
+
+    #[tokio::test]
+    /// ADR-69 slice 1: migration 002 creates the `memory_links` table (and its
+    /// target-first index) on a fresh database, so the link store never runs
+    /// against a missing schema.
+    async fn connect_creates_memory_links_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("memory.db")).unwrap();
+        let db = MemoryDb::connect(&db_path).await.unwrap();
+
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'memory_links'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(table, 1, "migration 002 must create memory_links");
+
+        let index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_memory_links_target'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(index, 1, "migration 002 must create the target index");
+    }
 }
