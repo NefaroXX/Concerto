@@ -1,8 +1,10 @@
 # Proxy Tool-Call Fix for OpenRouter / NIM / OpenAI-Compatible Providers
 
-> **Status:** Partially implemented (2026-09-19). Fix 1 (flat proxy format)
+> **Status:** Partially implemented (2026-09-20). Fix 1 (flat proxy format)
 > is done — `openai.rs:326` flat fallback + tests at `:781`, `:815`, `:841`.
-> Fix 2 (content-embedded) and Fix 3 (warn/retry) remain open proposals. Do
+> Fix 2 (content-embedded, strict) is done — content buffered to turn end,
+> full-text envelope parse only when `partial_tools` is empty, real deltas
+> always win. Fix 3 (warn/retry) remains open. Do
 > not use this document as evidence that a proxy/model combination is
 > supported.
 
@@ -53,7 +55,7 @@ on the tool call carrying both a string `name` AND `arguments` (string or
 object) so unrelated payloads cannot be misread. The `emit_tool_call` path
 normalizes arguments to a JSON object via `ensure_arguments_object`.
 
-### Fix 2: Extract tool calls from `delta.content` — ⬜ NOT YET IMPLEMENTED
+### Fix 2: Extract tool calls from `delta.content` — ✅ DONE (strict)
 
 Some proxies embed the entire tool call as a JSON string in the `content` field
 rather than using the structured `tool_calls` array. Add this fallback **after**
