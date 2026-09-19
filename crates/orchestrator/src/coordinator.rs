@@ -4422,7 +4422,14 @@ impl CoordinatorAgent {
             action_ledger,
             dispatch_summary: String::new(),
             loop_notes: Vec::new(),
-            requested_user_input: None,
+            // TODO #22 (tracking half): an AwaitingUser pause carries its
+            // pending question on the checkpoint; the resume hands it to
+            // `execute_graph` so the run stops again with the SAME reason —
+            // no re-decide, no re-ask, zero extra model calls. NOTE: this is
+            // the RESULT field only; `self.requested_user_input` stays None
+            // so the live decision loop (the `is_some()` breaks in
+            // `run_dispatch_session`) can never re-await on stale state.
+            requested_user_input: cp.pending_user_input.clone(),
             objective,
             objective_hash,
         }))
@@ -4997,15 +5004,25 @@ impl CoordinatorAgent {
             &retry_feedback,
             &self.checkpoint_context(&model_assignments, &action_ledger),
         );
+        // TODO #22 (tracking half): persist the pending interactive
+        // answer-request ON the checkpoint so an AwaitingUser pause survives
+        // a resume with the SAME question — the short-circuit below is the
+        // only reader on the fresh path, and `restore_and_evaluate` feeds it
+        // back into this parameter on the resume path. `None` except when
+        // the run is waiting on the operator (fresh or restored).
+        initial_execution_checkpoint.pending_user_input = requested_user_input.clone();
         self.persist_checkpoint(&mut initial_execution_checkpoint, &model_assignments).await;
 
         // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
         // The Coordinator requested human input during its decision loop
-        // (`request_user_input`). The run stops HERE — before any further
-        // graph dispatch — with the execution checkpoint preserved so a
-        // resume can continue after the operator answers (the interactive
-        // answer channel is TODO #22/#23). The reason rides the final
-        // message; the status is `AwaitingUser`.
+        // (`request_user_input`), OR a resume restored such a pending
+        // request from the checkpoint (`pending_user_input`, TODO #22
+        // tracking). The run stops HERE — before any further graph dispatch
+        // — with the execution checkpoint preserved (carrying the pending
+        // question) so a resume waits on the same operator question. The
+        // reason rides the final message; the status is `AwaitingUser`.
+        // Injecting the operator's answer is the deferred web-UI channel
+        // (#23).
         if let Some(reason) = requested_user_input {
             let _ = self.bus.publish_for_session(
                 task.session_id,
@@ -22187,6 +22204,110 @@ mod tests {
         assert!(
             output.checkpoint_json.is_some(),
             "an AwaitingUser run must carry a checkpoint so a resume can continue"
+        );
+    }
+
+    /// TODO #22 (tracking half): the pending interactive question is BOTH
+    /// persisted on the AwaitingUser checkpoint (process 1, so the store
+    /// carries it) AND restored on a resume (process 2, so a restarted
+    /// coordinator stops again with the SAME reason). Process 2 runs with an
+    /// EMPTY provider-script: any live decision-loop access would end the run
+    /// Completed immediately — the second AwaitingUser status is therefore
+    /// proof the resume short-circuited on the restored request instead of
+    /// burning a re-ask (answer injection stays the deferred #23 channel).
+    #[tokio::test]
+    async fn awaiting_user_resume_restores_pending_question() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let reason = "confirm the module boundary";
+
+        // ── "process 1": the run asks the operator, then pauses ──
+        let bus = EventBus::new(256);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Calls(vec![ToolCall {
+                id: "call-user-1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL.to_string(),
+                arguments: serde_json::json!({ "reason": reason }),
+                ..Default::default()
+            }])],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "clarify before building");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the awaiting-user run returns Ok");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser
+        );
+        let checkpoint_json =
+            output.checkpoint_json.clone().expect("the pause carried a checkpoint");
+        let cp: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&checkpoint_json).expect("valid AwaitingUser checkpoint");
+        assert_eq!(
+            cp.pending_user_input.as_deref(),
+            Some(reason),
+            "TODO #22: the pending question must be PERSISTED on the pause"
+        );
+
+        // ── "process 2": a fresh coordinator resumes the SAME store ──
+        let bus2 = EventBus::new(256);
+        // Empty provider script: any decision-loop turn returns empty text and
+        // ends the run Completed — an AwaitingUser result can only come from
+        // restoring the pending question.
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            Vec::new(),
+            store.clone(),
+        );
+        let resume_task = AgentTask::new(session_id, "continue");
+        let resume_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let second = coordinator2
+            .run(resume_task, resume_ctx, CancellationToken::new(), Some(checkpoint_json))
+            .await
+            .expect("the resumed run returns Ok");
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "the resume must stop on the SAME pending question: {}",
+            second.final_message
+        );
+        assert!(
+            second.final_message.contains(reason),
+            "the restored reason must surface: {}",
+            second.final_message
+        );
+        let resumed_cp: checkpoint::GraphCheckpoint = serde_json::from_str(
+            &second.checkpoint_json.expect("the resumed pause carries a checkpoint"),
+        )
+        .expect("valid resumed checkpoint");
+        assert_eq!(
+            resumed_cp.pending_user_input.as_deref(),
+            Some(reason),
+            "TODO #22: the resumed pause re-persists the pending question"
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the resumed pause keeps its checkpoint");
+        let stored: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid stored checkpoint");
+        assert_eq!(
+            stored.pending_user_input.as_deref(),
+            Some(reason),
+            "the durable row keeps the pending question across the resume"
         );
     }
 

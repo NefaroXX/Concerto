@@ -421,6 +421,16 @@ pub struct GraphCheckpoint {
     /// ignore the key.
     #[serde(default)]
     pub external_changes: Vec<crate::external_change::ExternalChangeRecord>,
+    /// TODO #22 (answer channel, tracking half): the interactive
+    /// answer-request an `AwaitingUser` run is paused on — the exact reason
+    /// passed to `request_user_input`. Additive only: absent on records
+    /// persisted before the field existed (serde default = `None`); old
+    /// readers ignore the key. A resume that finds it ENDS in `AwaitingUser`
+    /// again with the SAME question instead of burning a decision loop to
+    /// re-ask. The operator's answer injection itself is the deferred web-UI
+    /// channel (#23); this field tracks/persists the pending request only.
+    #[serde(default)]
+    pub pending_user_input: Option<String>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -663,6 +673,10 @@ pub fn build_checkpoint(
         // Issue #65: additive — the explicit external-workspace-change
         // records ride independently; old readers treat this key as opaque.
         external_changes: context.external_changes.clone(),
+        // TODO #22 (tracking half): additive — there is no pending
+        // interactive answer-request unless `execute_graph` stamps one on an
+        // AwaitingUser pause.
+        pending_user_input: None,
     }
 }
 
@@ -2037,6 +2051,7 @@ mod tests {
         cp.doc_resolution = Some(doc_resolution.clone());
         cp.snapshot_generation = Some("gen-7".into());
         cp.pending_decision = Some(pending.clone());
+        cp.pending_user_input = Some("confirm the module boundary".into());
 
         let json = serde_json::to_string(&cp).unwrap();
         let loaded = GraphCheckpoint::from_json(&json).unwrap();
@@ -2044,6 +2059,11 @@ mod tests {
         assert_eq!(loaded.snapshot_generation.as_deref(), Some("gen-7"));
         assert_eq!(loaded.doc_resolution, Some(doc_resolution), "doc resolution preserved");
         assert_eq!(loaded.pending_decision, Some(pending), "pending decision preserved");
+        assert_eq!(
+            loaded.pending_user_input.as_deref(),
+            Some("confirm the module boundary"),
+            "TODO #22: the pending answer-request survives the JSON round-trip"
+        );
         // Keys are stable kebab/JSON names: the pending decision serializes
         // with the ADR-65 §6 payload shape.
         assert!(json.contains("\"selected_agent\""));
@@ -2088,6 +2108,8 @@ mod tests {
         assert!(loaded.doc_resolution.is_none());
         assert!(loaded.snapshot_generation.is_none());
         assert!(loaded.pending_decision.is_none());
+        // TODO #22: a pre-#22 record has no pending answer-request (additive).
+        assert!(loaded.pending_user_input.is_none());
         // Issue #52 (additive, backward-compatible): a checkpoint written
         // before the decision journal loads with an EMPTY journal — the
         // zero-value decision state; the migration chain never required it.

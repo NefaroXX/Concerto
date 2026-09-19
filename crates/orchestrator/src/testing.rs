@@ -427,23 +427,59 @@ impl AgentFlowTestHarness {
         coordinator.run(task, context, cancel, None).await
     }
 
-    /// Run the coordinator with the prepared mocks.
+    /// Run the coordinator with the prepared mocks, then collect every event
+    /// published on the bus during the run into `self.events` so
+    /// [`Self::assert_event_sequence`] can check them afterwards.
+    ///
+    /// The bus is a bounded broadcast; a run that produces more events than
+    /// the bus capacity (256) drops the OLDEST events for late receivers.
+    /// Test scenarios stay well under that — the collector simply reports
+    /// what the bus delivered.
     pub async fn run(&mut self, task: AgentTask) -> Result<AgentOutput, OrchestratorError> {
         let cancel = CancellationToken::new();
-        Self::run_coordinator(
+        let mut receiver = self.bus.subscribe();
+        let result = Self::run_coordinator(
             std::mem::take(&mut self.mocks),
             std::mem::take(&mut self.plan),
             self.bus.clone(),
             task,
             cancel,
         )
-        .await
+        .await;
+        self.events.clear();
+        while let Ok(event) = receiver.try_recv() {
+            self.events.push(event.kind.clone());
+        }
+        result
     }
 
     /// Assert events were emitted in a given order (by variant name).
-    pub fn assert_event_sequence(&self, _expected: &[&str]) {
-        unimplemented!("event sequence assertions are not yet implemented")
+    ///
+    /// Only the enum variant name is compared (e.g. `ToolCalled`,
+    /// `SubTaskCompleted`) — payload fields are ignored. The empty sequence
+    /// always passes, so mocks whose runs publish no events still assert.
+    pub fn assert_event_sequence(&self, expected: &[&str]) {
+        let actual: Vec<String> = self.events.iter().map(event_variant_name).collect();
+        assert!(
+            actual == expected,
+            "event sequence mismatch\nexpected: {expected:?}\n  actual: {actual:?}"
+        );
     }
+}
+
+/// Extract the enum variant name from an [`EventKind`] via its Debug form.
+///
+/// `EventKind` derives `Debug` on every variant, so `format!("{event:?}")`
+/// yields `Variant { field: .. }` (struct variants) or `Variant` (field-less
+/// variants). The name is everything before the first structural mark.
+fn event_variant_name(event: &EventKind) -> String {
+    let debug = format!("{event:?}");
+    let name = match debug.find(['(', '{']) {
+        Some(index) => debug[..index].as_ref(),
+        None => debug.as_str(),
+    };
+    // Debug pads struct variants with a space before `{` (`TaskCompleted { .. }`).
+    name.trim().to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -587,5 +623,50 @@ mod tests {
     fn budget_scenario_tight_builds() {
         let builder = BudgetScenarioBuilder::tight();
         let _built = builder.build();
+    }
+
+    /// Event-variant-name extraction: struct payloads and field-less
+    /// variants both reduce to the bare variant name.
+    #[test]
+    fn event_variant_name_strips_payloads() {
+        let with_payload = EventKind::TaskCompleted {
+            task_id: concerto_core::types::TaskId::new(),
+            success: true,
+        };
+        assert_eq!(event_variant_name(&with_payload), "TaskCompleted");
+        assert_eq!(event_variant_name(&EventKind::SessionSaved), "SessionSaved");
+    }
+
+    /// `assert_event_sequence` matches ordered variant names and panics on
+    /// a mismatch (order matters).
+    #[test]
+    fn assert_event_sequence_checks_variant_order() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let mut harness = AgentFlowTestHarness::new(
+            vec![],
+            crate::graph::TaskGraph::default(),
+            BudgetScenarioBuilder::generous(),
+        );
+        harness.events = vec![
+            EventKind::SessionSaved,
+            EventKind::TaskCompleted {
+                task_id: concerto_core::types::TaskId::new(),
+                success: true,
+            },
+        ];
+
+        // Exact match passes (payload fields are ignored).
+        harness.assert_event_sequence(&["SessionSaved", "TaskCompleted"]);
+
+        let mismatch = catch_unwind(AssertUnwindSafe(|| {
+            harness.assert_event_sequence(&["TaskCompleted", "SessionSaved"]);
+        }));
+        assert!(mismatch.is_err(), "an order mismatch must panic");
+
+        let unknown = catch_unwind(AssertUnwindSafe(|| {
+            harness.assert_event_sequence(&["DoesNotExist"]);
+        }));
+        assert!(unknown.is_err(), "an unknown variant must panic");
     }
 }
