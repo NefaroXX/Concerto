@@ -321,8 +321,8 @@ pub struct State {
     reveal_autofinish: bool,
     /// First-token emphasis ticks for assistant entries: `id -> elapsed
     /// ticks` since the turn started. While present, the first token (up to
-    /// first whitespace) of the revealed text renders bold for ~200 ms
-    /// (12 ticks × 16 ms), then settles. Transient view state — never
+    /// first whitespace) of the revealed text renders bold for ~384 ms
+    /// (24 ticks × 16 ms), then settles. Transient view state — never
     /// serialized.
     first_token_ticks: HashMap<EntryId, u8>,
     /// Paragraph handoff hold (Baton seasoning, prototype #5): `Some((id,
@@ -355,9 +355,19 @@ pub struct State {
     entrance_ticks: HashMap<EntryId, u8>,
     /// Line-wipe progress for new assistant entries (Score seasoning,
     /// prototype #7): `id -> tick count since insertion`, capped at
-    /// `LINE_WIPE_TICKS` (then removed). Transient view state — never
-    /// serialized.
+    /// `LINE_WIPE_TICKS` (then moved to [`line_wipe_settled`](Self::line_wipe_settled)).
+    /// Transient view state — never serialized.
     line_wipe_ticks: HashMap<EntryId, u8>,
+    /// Assistant entries whose line-wipe animation has settled to its muted
+    /// top-rule marker (Score seasoning, prototype #7): while an id is present
+    /// the entry's top rule stays rendered as a full-width, faint hairline —
+    /// the visible "new turn" signature. It survives run finalize and mid-run
+    /// navigation so a just-finished reply keeps its new-text marker instead
+    /// of reverting to the old plain-text look. The marker is *static* (never
+    /// animates), so it must not keep the 16 ms tick alive by itself.
+    /// Reduced-motion never seeds it and clears it on enable. Transient view
+    /// state — never serialized.
+    line_wipe_settled: HashSet<EntryId>,
     /// Free-running 16 ms tick counter driving the subtle shimmer color pulse
     /// on open thinking entries. Transient view state — never serialized.
     shimmer_phase: u32,
@@ -375,22 +385,31 @@ const MAX_THINKING_CHARS: usize = 64_000;
 const MAX_TOOL_DETAIL_CHARS: usize = 256_000;
 /// Characters the typewriter reveal moves per `TypingTick`. The 16 ms
 /// subscription cadence (`circuit_background::TICK_MS`) turns this into
-/// ~500 chars/s — a fast typing feel.
+/// ~500 chars/s — a fast typing feel. Kept in parity with the CLI
+/// (`crates/cli/src/app.rs`, `REVEAL_CHARS_PER_TICK = 8`): the reveal is a
+/// *typing* texture, deliberately faster than typical provider streaming so
+/// text is never visibly lagging behind the token arrival it follows.
 const REVEAL_CHARS_PER_TICK: usize = 8;
 /// Characters the thinking-preview reveal moves per `TypingTick`: with the
 /// same 16 ms cadence this is ~4000 chars/s — a quick open/expand feel.
 const THINKING_REVEAL_CHARS_PER_TICK: usize = 64;
 /// Number of `TypingTick`s an entrance fade runs for (~128 ms at 16 ms/tick).
 const ENTRANCE_TICKS: u8 = 8;
-/// Number of `TypingTick`s the paragraph handoff cue holds (~48 ms at
+/// Number of `TypingTick`s the paragraph handoff cue holds (~128 ms at
 /// 16 ms/tick). The reveal frontier freezes at the blank-line boundary and
 /// the streaming cursor holds visible, then the reveal resumes — the Baton
 /// seasoning (prototype #5). Deterministic: always exactly this many ticks.
-const HANDOFF_HOLD_TICKS: u8 = 3;
-/// Number of `TypingTick`s the first-token emphasis holds (~200 ms at 16 ms/tick).
+/// Set long enough to read as an intentional "continuing" pause (the earlier
+/// 3-tick / ~48 ms hold was sub-perceptual next to a 500 ms blink) without
+/// upsetting the typing cadence.
+const HANDOFF_HOLD_TICKS: u8 = 8;
+/// Number of `TypingTick`s the first-token emphasis holds (~384 ms at 16 ms/tick).
 /// The first word of each assistant turn renders slightly bolder/larger for this
 /// duration, then settles to normal weight — the Score signature text (prototype #6).
-const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 12;
+/// Lengthened from 12 ticks (~200 ms): a 500 chars/s reveal outraces typical
+/// provider streaming, so the freshly rendered post-prompt lines are the ones
+/// a user reads first — a longer emphasis makes the turn start register as new.
+const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 24;
 /// Number of `TypingTick`s a new assistant entry's top rule wipes 0→full
 /// width over (~128 ms at 16 ms/tick) — the Score line-wipe entrance
 /// (prototype #7). Deterministic: always exactly this many ticks.
@@ -442,6 +461,7 @@ impl State {
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
             line_wipe_ticks: HashMap::new(),
+            line_wipe_settled: HashSet::new(),
             handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
@@ -498,6 +518,7 @@ impl State {
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
             line_wipe_ticks: HashMap::new(),
+            line_wipe_settled: HashSet::new(),
             handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
@@ -588,6 +609,7 @@ impl State {
             self.entrance_ticks.clear();
             self.first_token_ticks.clear();
             self.line_wipe_ticks.clear();
+            self.line_wipe_settled.clear();
             self.handoff_hold = None;
         }
     }
@@ -1022,9 +1044,10 @@ impl State {
         !self.reduced_motion && self.first_token_ticks.contains_key(&id)
     }
 
-    /// Advance every in-flight line wipe one tick, dropping entries whose
-    /// wipe completed and any stale ids (entry evicted or no longer an
-    /// assistant entry) so a dead wipe can never hold the tick alive.
+    /// Advance every in-flight line wipe one tick, converging the wipe to its
+    /// settled top-rule marker when it completes, and dropping any stale ids
+    /// (entry evicted or no longer an assistant entry) so a dead wipe can
+    /// never hold the tick alive.
     fn advance_line_wipe_ticks(&mut self) {
         // Ids are snapshotted first: the wipe map is mutated below, so the
         // entries borrow cannot stay live across the updates.
@@ -1036,13 +1059,36 @@ impl State {
                 _ => None,
             })
             .collect();
+        // `settling` collects ids whose animation just finished so the retain
+        // closure stays free of `&mut self.line_wipe_settled` borrows.
+        let mut settling: Vec<EntryId> = Vec::new();
         self.line_wipe_ticks.retain(|id, ticks| {
             if !live.contains(id) {
                 return false;
             }
             *ticks = ticks.saturating_add(1);
-            *ticks < LINE_WIPE_TICKS
+            if *ticks < LINE_WIPE_TICKS {
+                true
+            } else {
+                settling.push(*id);
+                false
+            }
         });
+        for id in settling {
+            self.line_wipe_settled.insert(id);
+        }
+    }
+
+    /// Settle every in-flight line wipe: the animated tick entry drops and
+    /// the id moves to the settled set so the entry keeps its muted top-rule
+    /// marker. Used at run/navigation boundaries where the wipe may never have
+    /// had a tick to play (a fresh reply instantly finalized) — the "new
+    /// turn" signature should still be visible post-run. Reduced-motion never
+    /// seeds wipes, so the settled set stays clean under that override.
+    fn settle_line_wipe(&mut self) {
+        for (id, _) in self.line_wipe_ticks.drain() {
+            self.line_wipe_settled.insert(id);
+        }
     }
 
     /// Current line-wipe step for an assistant entry: `Some(elapsed)` while
@@ -1076,6 +1122,7 @@ impl State {
             self.entrance_ticks.clear();
             self.thinking_reveals.clear();
             self.line_wipe_ticks.clear();
+            self.line_wipe_settled.clear();
         }
     }
 
@@ -1123,7 +1170,7 @@ impl State {
                 self.revealed_chars = Some((id, 0));
                 // Seed first-token emphasis for the new turn (prototype #6):
                 // elapsed-tick counter starts at 0 and expires after
-                // `FIRST_TOKEN_EMPHASIS_TICKS` TypingTicks (~200 ms).
+                // `FIRST_TOKEN_EMPHASIS_TICKS` TypingTicks (~384 ms).
                 self.first_token_ticks.insert(id, 0);
                 // Seed the line-wipe entrance cue for the new turn
                 // (prototype #7): the top rule wipes 0→full over
@@ -1149,10 +1196,13 @@ impl State {
         // The reveal window is transient; once the entry is finalized the
         // full text renders and there is nothing left to drive. The
         // first-token emphasis settles immediately at this boundary too.
+        // In-flight line wipes *converge* to their settled top-rule marker
+        // instead of dropping: a reply that was navigating-away mid-cue still
+        // keeps its visible "new turn" hairline.
         self.revealed_chars = None;
         self.reveal_autofinish = false;
         self.first_token_ticks.clear();
-        self.line_wipe_ticks.clear();
+        self.settle_line_wipe();
         self.handoff_hold = None;
     }
 
@@ -1167,11 +1217,13 @@ impl State {
             *streaming = false;
         }
         // Full text is final after a run boundary — stop any reveal window
-        // and settle first-token emphasis immediately.
+        // and settle first-token emphasis immediately. Line wipes converge
+        // to their settled marker so a finished reply keeps its "new turn"
+        // hairline instead of rendering plain (the post-run signature).
         self.revealed_chars = None;
         self.reveal_autofinish = false;
         self.first_token_ticks.clear();
-        self.line_wipe_ticks.clear();
+        self.settle_line_wipe();
         self.handoff_hold = None;
     }
 
@@ -1224,7 +1276,7 @@ impl State {
                         self.revealed_chars = Some((id, 0));
                         self.reveal_autofinish = true;
                         // Seed first-token emphasis for the new turn (prototype #6):
-                        // elapsed-tick counter starts at 0 (≈200 ms of emphasis).
+                        // elapsed-tick counter starts at 0 (≈384 ms of emphasis).
                         self.first_token_ticks.insert(id, 0);
                         // Seed the line-wipe entrance cue (prototype #7), same
                         // cadence contract as the other entrance ticks.
@@ -1374,7 +1426,7 @@ impl State {
                 // already-parsed event stream instead of re-parsing markdown.
                 // The raw `markdown::render` fallback is purely defensive.
                 // First-token emphasis (Score prototype #6): while the entry's
-                // ~200 ms window is open (and reduced-motion is off), its
+                // ~384 ms window is open (and reduced-motion is off), its
                 // first token renders bold, then settles to normal weight.
                 // The uncached `markdown::render` fallback is purely defensive
                 // (the cache is always populated for assistant entries) and
@@ -1424,10 +1476,14 @@ impl State {
                 let mut block = column![].spacing(4).width(Length::Fill);
                 // Line-wipe entrance cue (Score prototype #7): a 2px rule at
                 // the top of each new assistant entry wipes 0→full width over
-                // `LINE_WIPE_TICKS` TypingTicks (~128 ms). Reduced-motion
+                // `LINE_WIPE_TICKS` TypingTicks (~128 ms), then settles into a
+                // muted full-width hairline (the "new turn" signature) that
+                // persists across run finalize and navigation — reduced-motion
                 // skips the cue entirely (no rule, instant render).
                 if let Some(step) = self.line_wipe_step(*id) {
                     block = block.push(line_wipe_rule(step, palette));
+                } else if self.line_wipe_settled.contains(id) {
+                    block = block.push(settled_line_wipe_rule(palette));
                 }
                 block = block.push(body);
                 if let Some(ts_line) = compact_timestamp_line(created_at, palette) {
@@ -2378,6 +2434,24 @@ fn line_wipe_rule<'a>(step: u8, palette: &'a crate::theme::Palette) -> Element<'
     }
 }
 
+/// Settled top-rule marker for an assistant entry whose line-wipe animation
+/// has finished (Score seasoning, prototype #7): the same 2px rule at full
+/// width, muted to a quiet hairline so the "new turn" signature persists
+/// without drawing attention. Static — never animates, so it must not keep
+/// the 16 ms `TypingTick` alive by itself. Palette colors only; alpha
+/// modulation only, no transform (same contract as `line_wipe_rule`).
+fn settled_line_wipe_rule<'a>(palette: &'a crate::theme::Palette) -> Element<'a, Message> {
+    let color = with_alpha(lerp_color(palette.border, palette.accent, 0.35), 0.45);
+    container(iced::widget::space::horizontal())
+        .width(Length::Fill)
+        .height(Length::Fixed(2.0))
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(color)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// Whether the reveal frontier crossed a paragraph boundary between `from`
 /// (exclusive) and `to` (inclusive), measured in characters. A boundary is a
 /// blank line — an empty or whitespace-only line terminated by `\n` with more
@@ -2629,16 +2703,164 @@ mod tests {
         };
         assert_eq!(state.line_wipe_step(id), Some(0));
 
-        // Deterministic: exactly `LINE_WIPE_TICKS` ticks, then the wipe is
-        // dropped (the rule settles away, like the other entrance cues).
+        // Deterministic: exactly `LINE_WIPE_TICKS` ticks, then the animated
+        // wipe is done and the entry keeps its muted settled marker (the
+        // "new turn" signature) instead of the rule settling away entirely.
         for expected in 1..=LINE_WIPE_TICKS {
             let _ = state.update(Message::TypingTick);
             if expected < LINE_WIPE_TICKS {
                 assert_eq!(state.line_wipe_step(id), Some(expected));
             } else {
-                assert!(!state.line_wipe_ticks.contains_key(&id));
+                assert_eq!(state.line_wipe_step(id), None, "the animated wipe has finished");
+                assert!(
+                    state.line_wipe_settled.contains(&id),
+                    "the completed wipe leaves its settled top-rule marker"
+                );
             }
         }
+    }
+
+    #[test]
+    fn settled_wipe_marker_is_static_and_never_drives_the_tick() {
+        // The settled hairline is a static render, not an animation: once it
+        // exists and every other cue is done, `is_revealing` must be false so
+        // the 16 ms `TypingTick` subscription stops.
+        let mut state = State::new();
+        let _ = state.update(Message::AddAssistant("final reply".into()));
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        // AddAssistant auto-finalizes the reveal once it reaches the end; drive
+        // every window out (emphasis is the longest).
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(state.line_wipe_settled.contains(&id), "the wipe settled into its marker");
+        assert!(state.line_wipe_ticks.is_empty());
+        assert!(state.first_token_ticks.is_empty());
+        assert!(
+            !state.is_revealing(),
+            "a settled marker is static: no typing-tick work may remain"
+        );
+    }
+
+    #[test]
+    fn finalize_converges_in_flight_and_never_played_wipes_into_settled_markers() {
+        // A run finishing mid-wipe (or before any tick played) must still leave
+        // the "new turn" marker on the reply: finalize settles the wipe instead
+        // of erasing all trace of the cue — the post-run signature.
+        let mut via_run = State::new();
+        let _ = via_run.update(Message::AddAssistant("final reply".into()));
+        let id = match via_run.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        assert!(
+            !via_run.line_wipe_ticks.is_empty(),
+            "a final reply seeds its wipe before any tick plays"
+        );
+        via_run.finalize_run();
+        assert!(via_run.line_wipe_ticks.is_empty(), "the animated wipe drops at the run boundary");
+        assert!(
+            via_run.line_wipe_settled.contains(&id),
+            "the reply keeps its settled marker after the run"
+        );
+        assert!(
+            !via_run.is_revealing(),
+            "the settled marker is static and must not drive the tick"
+        );
+
+        // Mid-run navigation boundary (`finalize_streaming`) behaves the same,
+        // including a wipe that had a few ticks to play.
+        let mut via_nav = State::new();
+        via_nav.update_last_assistant("partial stream".to_string());
+        let nav_id = match via_nav.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        let _ = via_nav.update(Message::TypingTick);
+        assert_eq!(via_nav.line_wipe_step(nav_id), Some(1));
+        via_nav.finalize_streaming();
+        assert!(
+            via_nav.line_wipe_settled.contains(&nav_id),
+            "navigating away mid-cue still settles the marker"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_clears_settled_wipe_markers() {
+        // A11y: reduced-motion must remove even the static settled markers, so
+        // no cue — animated or settled — survives the toggle.
+        let mut state = State::new();
+        state.update_last_assistant("streamed text".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        for _ in 0..LINE_WIPE_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(state.line_wipe_settled.contains(&id), "the wipe settled into its marker");
+        state.set_reduced_motion(true);
+        assert!(
+            state.line_wipe_settled.is_empty(),
+            "reduced-motion removes the static settled markers"
+        );
+    }
+
+    #[test]
+    fn live_multi_paragraph_growth_keeps_reveal_and_handoff_alive() {
+        // The live streaming path (runtime `AssistantMessage`) types, it must
+        // not snap the frontier to the new length or drop the handoff cue:
+        // multi-paragraph output keeps the reveal driving behind arriving text.
+        let mut state = State::new();
+        state.update_last_assistant("first paragraph\n\nsecond paragraph content".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        assert_eq!(
+            state.revealed_chars,
+            Some((id, 0)),
+            "a fresh live stream seeds a reveal window"
+        );
+        let _ = state.update(Message::TypingTick);
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        // Third tick crosses the blank-line boundary: the handoff hold opens.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(
+            state.handoff_hold.map(|(_, remaining)| remaining),
+            Some(HANDOFF_HOLD_TICKS),
+            "crossing a paragraph boundary opens the handoff hold"
+        );
+        let frozen = state.revealed_chars;
+
+        // More content arrives mid-hold: the frontier must not jump to the new
+        // length (live growth is typed, not instant) and the in-flight hold is
+        // preserved.
+        state.update_last_assistant(
+            "first paragraph\n\nsecond paragraph content\n\nthird paragraph content here"
+                .to_string(),
+        );
+        assert_eq!(
+            state.revealed_chars, frozen,
+            "arriving content must not snap the frontier to full"
+        );
+        assert!(state.handoff_hold.is_some(), "an open hold is preserved across growth");
+
+        // Drain the hold: the frozen frontier resumes and keeps advancing a tick
+        // at a time behind the arriving content.
+        for _ in 0..HANDOFF_HOLD_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert_eq!(state.handoff_hold, None, "the hold drains in exactly the constant");
+        assert!(state.is_revealing(), "the reveal keeps driving after the hold clears");
+        assert!(
+            state.revealed_chars.is_some_and(|(rid, n)| rid == id && n > 16),
+            "the resumed frontier advances beyond the frozen position"
+        );
     }
 
     #[test]
@@ -2658,12 +2880,25 @@ mod tests {
         state.set_reduced_motion(true);
         let _ = state.update(Message::AddAssistant("hello".into()));
         assert!(state.line_wipe_ticks.is_empty());
-        // Enabling mid-wipe also settles instantly.
+        // Enabling mid-wipe also settles instantly — and removes any settled
+        // marker too, so reduced-motion renders every entry without a cue.
         let mut live = State::new();
         live.update_last_assistant("streaming".to_string());
+        let id = match live.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
         assert!(!live.line_wipe_ticks.is_empty());
+        for _ in 0..LINE_WIPE_TICKS {
+            let _ = live.update(Message::TypingTick);
+        }
+        assert!(live.line_wipe_settled.contains(&id), "the wipe settled first");
         live.set_reduced_motion(true);
         assert!(live.line_wipe_ticks.is_empty());
+        assert!(
+            live.line_wipe_settled.is_empty(),
+            "reduced-motion clears even the static settled markers"
+        );
     }
 
     #[test]
@@ -2940,16 +3175,16 @@ mod tests {
 
         // Clamped at the content length; although the entry is still
         // streaming, nothing is left to reveal. First-token emphasis keeps
-        // the tick alive until its ~200 ms window expires.
+        // the tick alive until its ~384 ms window expires.
         assert_eq!(state.revealed_chars, Some((id, 20)));
         assert!(state.first_token_emphasis(id), "a fresh turn emphasizes its first token");
         assert!(state.is_revealing());
-        // Drive past the 12-tick emphasis window: emphasis settles and, with
-        // the reveal already complete, the tick stops.
+        // Drive the emphasis window out: emphasis settles and, with the reveal
+        // already complete, the tick stops.
         for _ in 3..FIRST_TOKEN_EMPHASIS_TICKS {
             let _ = state.update(Message::TypingTick);
         }
-        assert!(!state.first_token_emphasis(id), "emphasis settles ~200 ms after the turn started");
+        assert!(!state.first_token_emphasis(id), "emphasis settles ~384 ms after the turn started");
         assert!(!state.is_revealing());
     }
 
@@ -2981,15 +3216,15 @@ mod tests {
             let _ = state.update(Message::TypingTick);
         }
         // A streaming continuation on the same entry must not restart the
-        // ~200 ms window: the clock runs from the turn start.
+        // ~384 ms window: the clock runs from the turn start.
         state.update_last_assistant("hello world, more".to_string());
         assert!(state.first_token_emphasis(id));
-        for _ in 0..7 {
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS - 5 {
             let _ = state.update(Message::TypingTick);
         }
         assert!(
             !state.first_token_emphasis(id),
-            "window settles 12 ticks after the turn started, not after the last chunk"
+            "window settles exactly {FIRST_TOKEN_EMPHASIS_TICKS} ticks after the turn started, not after the last chunk"
         );
     }
 
@@ -3393,7 +3628,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_hold_freezes_reveal_for_three_ticks_then_resumes() {
+    fn handoff_hold_freezes_reveal_then_resumes() {
         let mut state = State::new();
         state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
         let id = match state.entries().last() {
@@ -3408,19 +3643,22 @@ mod tests {
         assert_eq!(state.handoff_hold, None);
 
         // Second tick (8→16) crosses the blank-line boundary: the frontier
-        // lands and a 3-tick cursor hold opens.
+        // lands and a `HANDOFF_HOLD_TICKS`-tick cursor hold opens.
         let _ = state.update(Message::TypingTick);
         assert_eq!(state.revealed_chars, Some((id, 16)));
         assert_eq!(state.handoff_hold, Some((id, HANDOFF_HOLD_TICKS)));
         assert!(state.is_revealing(), "an open hold keeps the 16 ms tick alive");
 
         // The frontier stays frozen while the hold counts down, one per tick.
-        let _ = state.update(Message::TypingTick);
-        assert_eq!(state.revealed_chars, Some((id, 16)));
-        assert_eq!(state.handoff_hold, Some((id, 2)));
-        let _ = state.update(Message::TypingTick);
-        assert_eq!(state.revealed_chars, Some((id, 16)));
-        assert_eq!(state.handoff_hold, Some((id, 1)));
+        for remaining in (1..HANDOFF_HOLD_TICKS).rev() {
+            let _ = state.update(Message::TypingTick);
+            assert_eq!(state.revealed_chars, Some((id, 16)), "the frontier stays frozen");
+            assert_eq!(
+                state.handoff_hold,
+                Some((id, remaining)),
+                "the hold counts down exactly one per tick"
+            );
+        }
 
         // Clearing tick: the hold drops but the frontier has not moved yet.
         let _ = state.update(Message::TypingTick);
@@ -3491,6 +3729,7 @@ mod tests {
         assert_eq!(state.revealed_chars, None);
         assert!(state.first_token_ticks.is_empty());
         assert!(state.line_wipe_ticks.is_empty());
+        assert!(state.line_wipe_settled.is_empty(), "no settled markers either");
         assert!(!state.is_revealing(), "no typing-tick work under reduced-motion");
     }
 
@@ -3531,6 +3770,7 @@ mod tests {
         assert!(state.entrance_ticks.is_empty());
         assert!(state.thinking_reveals.is_empty());
         assert!(state.line_wipe_ticks.is_empty());
+        assert!(state.line_wipe_settled.is_empty());
         assert!(state.first_token_ticks.is_empty());
         assert_eq!(state.revealed_chars, None);
         assert!(!state.is_revealing(), "settling must stop the tick immediately");
@@ -3549,12 +3789,23 @@ mod tests {
     fn finalize_run_clears_handoff_hold() {
         let mut state = State::new();
         state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("Expected an assistant entry"),
+        };
         let _ = state.update(Message::TypingTick);
         let _ = state.update(Message::TypingTick);
         assert!(state.handoff_hold.is_some(), "hold must be open before finalizing");
         state.finalize_run();
         assert_eq!(state.handoff_hold, None);
         assert_eq!(state.revealed_chars, None);
+        // The wipe (still animating at the boundary) converges to its settled
+        // top-rule marker so the reply keeps its "new turn" signature.
+        assert!(state.line_wipe_ticks.is_empty(), "the animated wipe drops at the run boundary");
+        assert!(
+            state.line_wipe_settled.contains(&id),
+            "the reply keeps its settled marker after the run"
+        );
     }
 
     #[test]

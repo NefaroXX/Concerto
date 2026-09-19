@@ -54,7 +54,7 @@ impl MarkdownDoc {
     /// When `emphasis_first_token` is `true`, the first word (up to the first
     /// whitespace) of the first `Text` event in each paragraph renders with
     /// bold font weight. This is the Score first-token emphasis (prototype #6):
-    /// it persists for ~200 ms (12 ticks × 16 ms) then settles to normal.
+    /// it persists for ~384 ms (24 ticks × 16 ms) then settles to normal.
     pub fn render_upto<M: Clone + 'static>(
         &self,
         budget: Option<usize>,

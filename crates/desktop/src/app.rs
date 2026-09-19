@@ -4359,10 +4359,18 @@ impl App {
             circuit_background::view(self.circuit_progress, self.current_theme.palette.accent)
         });
         // Faint scan-line overlay behind the chat column, when the default-off
-        // flag is explicitly enabled. Sits above the circuit background (per
-        // the widget's contract) so it stays visible during runs — the only
-        // state in which a streaming entry can double its pulse rate. It
-        // pulses at idle rate otherwise.
+        // flag is explicitly enabled. Default-off is the design intent
+        // (`text-presentation-animation.md`: the Blueprint texture is an
+        // *optional* accent, and the widget visibly pulses while streaming) —
+        // shipping it on by default would add constant background motion to a
+        // productivity tool and contradict the subtle-texture intent. Users
+        // who want it enable the Settings toggle (works end-to-end); it is the
+        // one cue not seeded by the message machinery, so reduced-motion and
+        // the settled "new turn" markers (see `chat.rs::line_wipe_settled`) are
+        // the always-visible presentation changes, not a hidden default.
+        // Sits above the circuit background (per the widget's contract) so it
+        // stays visible during runs — the only state in which a streaming
+        // entry can double its pulse rate. It pulses at idle rate otherwise.
         let scanline_bg = (self.scanline_overlay_enabled && self.page == Page::Chat).then(|| {
             scanline_overlay::view(
                 self.scanline_progress,
