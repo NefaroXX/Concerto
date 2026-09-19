@@ -314,12 +314,11 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
    - **Priority**: High
    - **Effort**: 16 hours
 
-2. **No Secret Sanitization in Events**
-   - **Risk**: EventBus publishes tool inputs/outputs that may contain secrets
-   - **Impact**: Credential leakage to observability systems
-   - **Mitigation**: Add `SecretSanitizer` subscriber to redact patterns
-   - **Priority**: High
-   - **Effort**: 8 hours
+2. **No Secret Sanitization in Events** — ✅ DONE (2026-09-19)
+   - `SecretSanitizer` implemented at `core/sanitizer.rs:250`
+   - Wired into `EventBus` at `event.rs:583` (sanitize method), `:767`
+     (sanitizer field), `:930` (`with_sanitizer` constructor)
+   - Priority: ~~High~~ Resolved
 
 3. **Windows Shell Quoting Weakness**
    - **Risk**: cmd.exe quoting rules weaker than POSIX
@@ -378,7 +377,8 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 
 ### Code Review Checklist
 
-When reviewing code that touches security boundaries:
+When reviewing code that touches security boundaries (this is a review
+checklist, not a gap list):
 
 - [ ] **Input Validation**: All user/model inputs validated before use
 - [ ] **Path Resolution**: File paths resolved under project root
@@ -475,6 +475,7 @@ See [Incident Response](#incident-response) section below.
 | Date | Version | Author | Changes |
 |------|---------|--------|---------|
 | 2026-07-28 | 1.0 | Concerto Team | Initial threat model |
+| 2026-09-19 | 1.1 | Concerto Team | Close gap #2 (SecretSanitizer DONE), label review checklist |
 
 ## Review Schedule
 

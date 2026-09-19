@@ -16,6 +16,21 @@ tests credentials and discovers models where a provider supports discovery.
 | `nim` | NVIDIA NIM |
 | `ollama` | Local or remote Ollama |
 | `opencode` | OpenCode-compatible provider |
+| `deepseek` | DeepSeek |
+| `groq` | Groq |
+| `together` | Together AI |
+| `mistral` | Mistral AI |
+| `xai` | xAI (Grok) |
+| `fireworks` | Fireworks AI |
+| `cerebras` | Cerebras |
+| `cohere` | Cohere |
+| `deepinfra` | DeepInfra |
+| `perplexity` | Perplexity |
+| `sambanova` | SambaNova |
+| `dashscope` | Alibaba (Qwen) via DashScope |
+| `moonshot` | Moonshot AI (Kimi) |
+| `zhipu` | Zhipu AI (GLM) |
+| `novita` | Novita AI |
 
 Provider and model identifiers are case-sensitive API values. Friendly names
 are display labels only.

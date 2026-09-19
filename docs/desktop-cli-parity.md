@@ -51,7 +51,7 @@ feature is fundamentally GUI-only and cannot be usefully rendered in a TUI.
 | `IndexingCompleted` | Shown | Done | `cli/src/app.rs:1190` |
 | `SessionSaved` | Shown | Done | `cli/src/app.rs:1198` |
 
-**File**: `crates/cli/src/app.rs` — function `event_line()` (line 1123)
+**File**: `crates/cli/src/app.rs` — function `event_line()` (line 1530)
 
 ### P2 — Session list / resume screen
 

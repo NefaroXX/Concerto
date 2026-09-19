@@ -1,10 +1,10 @@
 # Proxy Tool-Call Fix for OpenRouter / NIM / OpenAI-Compatible Providers
 
-> **Status:** Open proposal / known compatibility gap. The current
-> `OpenAiStreamState` handles standard
-> `delta.tool_calls[].function.{name,arguments}` only; the flat and
-> content-embedded fallbacks below are not implemented. Do not use this document
-> as evidence that a proxy/model combination is supported.
+> **Status:** Partially implemented (2026-09-19). Fix 1 (flat proxy format)
+> is done — `openai.rs:326` flat fallback + tests at `:781`, `:815`, `:841`.
+> Fix 2 (content-embedded) and Fix 3 (warn/retry) remain open proposals. Do
+> not use this document as evidence that a proxy/model combination is
+> supported.
 
 This document describes a possible issue with non-OpenAI models accessed through
 OpenAI-compatible proxy endpoints (OpenRouter, NVIDIA NIM, Together AI, etc.)
@@ -44,77 +44,16 @@ OpenAI wire format. This translation has three common failure modes:
 
 All changes go in `crates/providers/src/openai.rs`.
 
-### Fix 1: Support flat tool call format (no `function` wrapper)
+### Fix 1: Support flat tool call format (no `function` wrapper) — ✅ DONE
 
-In `OpenAiStreamState::handle_event`, **after** the existing `function`-wrapper
-block (line 120–127), add a fallback that looks for `name` and `arguments`
-directly on the tool call object.
+**Implemented:** `crates/providers/src/openai.rs:326` — flat fallback after the
+standard `function`-wrapper block. Tests at `:781` (string args), `:815`
+(object args), `:841` (`input` alias). The implementation gates conservatively
+on the tool call carrying both a string `name` AND `arguments` (string or
+object) so unrelated payloads cannot be misread. The `emit_tool_call` path
+normalizes arguments to a JSON object via `ensure_arguments_object`.
 
-**Current code (lines 111–129):**
-
-```rust
-if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-    for tc in tc_arr {
-        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let partial = self.partial_tools.entry(index).or_default();
-        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-            partial.id = id.to_string();
-        }
-        if let Some(func) = tc.get("function") {
-            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                partial.name = name.to_string();
-            }
-            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                partial.arguments.push_str(args);
-            }
-        }
-    }
-}
-```
-
-**Replace with:**
-
-```rust
-if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-    for tc in tc_arr {
-        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let partial = self.partial_tools.entry(index).or_default();
-        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-            partial.id = id.to_string();
-        }
-        // Standard OpenAI format: tc.function.name / tc.function.arguments
-        if let Some(func) = tc.get("function") {
-            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                partial.name = name.to_string();
-            }
-            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                partial.arguments.push_str(args);
-            }
-        }
-        // ── Proxy fallback: flat format (name / arguments directly on tc) ──
-        if partial.name.is_empty() {
-            if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-                partial.name = name.to_string();
-            }
-        }
-        if partial.arguments.is_empty() {
-            // string arguments (incremental)
-            if let Some(args) = tc.get("arguments").and_then(|v| v.as_str()) {
-                partial.arguments.push_str(args);
-            // object arguments (one-shot — proxy sent the complete JSON)
-            } else if let Some(args_obj) = tc.get("arguments").and_then(|v| v.as_object())
-                .or_else(|| tc.get("input").and_then(|v| v.as_object()))
-            {
-                if let Ok(json_str) = serde_json::to_string(args_obj) {
-                    partial.arguments = json_str;
-                }
-            }
-        }
-    }
-}
-```
-
-### Fix 2: Extract tool calls from `delta.content`
+### Fix 2: Extract tool calls from `delta.content` — ⬜ NOT YET IMPLEMENTED
 
 Some proxies embed the entire tool call as a JSON string in the `content` field
 rather than using the structured `tool_calls` array. Add this fallback **after**
@@ -184,29 +123,14 @@ wrap the entire block in a helper method `try_extract_tool_call_from_content`.
 The `continue` skips falling through to emit text, so the tool call isn't
 duplicated as both a tool call and assistant text.
 
-### Fix 3: Better error recovery and logging in `emit_tool_call`
+### Fix 3: Better error recovery and logging in `emit_tool_call` — ⬜ NOT YET IMPLEMENTED
 
 In `OpenAiStreamState::emit_tool_call`, the current code silently discards parse
 failures. Replace it with diagnostic logging and a retry.
 
-**Current (lines 51–64):**
-
-```rust
-fn emit_tool_call(&mut self, index: usize) {
-    if let Some(ptc) = self.partial_tools.remove(&index) {
-        let args = if ptc.arguments.trim().is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_str(&ptc.arguments).unwrap_or(serde_json::Value::Null)
-        };
-        self.pending.push_back(Ok(CompletionChunk {
-            delta: String::new(),
-            tool_call: Some(ToolCall { id: ptc.id, name: ptc.name, arguments: args }),
-            is_final: false,
-        }));
-    }
-}
-```
+**Current (line 162):** uses `ensure_arguments_object` to coerce parse failures
+to `{}` rather than diagnostic logging. The proposed replacement adds
+`tracing::warn!` with the raw payload and a single-quote fixup retry.
 
 **Replace with:**
 
@@ -255,7 +179,8 @@ fn emit_tool_call(&mut self, index: usize) {
 
 ## Verification
 
-Run the model that was previously broken:
+Fix 1 is verified by unit tests (`:781`, `:815`, `:841`) covering string
+fragments, object one-shot, and `input` alias. To test live:
 
 ```bash
 CONCERTO_LOG=warn cargo run -p concerto-desktop
@@ -263,8 +188,8 @@ CONCERTO_LOG=warn cargo run -p concerto-desktop
 RUST_LOG=warn cargo run -p concerto-cli
 ```
 
-If tool calls still fail, the `tracing::warn!` in Fix 3 will print the raw
-arguments payload. Open an issue with that output.
+If tool calls still fail, the `tracing::warn!` in Fix 3 (when implemented)
+will print the raw arguments payload. Open an issue with that output.
 
 ## Design Notes
 
