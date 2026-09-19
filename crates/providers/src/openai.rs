@@ -88,6 +88,12 @@ struct PartialToolCall {
     arguments: String,
 }
 
+/// Synthetic tool-call slot used by the content-embedded envelope fallback
+/// (proxy Fix 2 STRICT). Real proxy indexes are small wire integers from the
+/// `tool_calls` array; this sentinel, combined with the empty-`partial_tools`
+/// gate, guarantees the synthesized call can never collide with a real one.
+const ENVELOPE_CALL_INDEX: usize = usize::MAX;
+
 struct OpenAiStreamState {
     parser: BufferedSseParser,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
@@ -111,6 +117,16 @@ struct OpenAiStreamState {
     /// when `stream_options.include_usage` is set). The first observed usage
     /// is attached to the terminal chunk only.
     usage: Option<CompletionUsage>,
+    /// Accumulated `content` deltas for the current turn (proxy Fix 2 STRICT —
+    /// content-embedded tool-call envelope).
+    ///
+    /// Content is buffered instead of streamed eagerly so the fallback can
+    /// judge the COMPLETE turn text with a strict full-text parse (no substring
+    /// extraction). Non-envelope content is drained as plain text at the
+    /// terminal point — identical `delta` output, just aggregated at turn end
+    /// instead of per-delta (mirrors how reasoning and tool args already
+    /// buffer to the terminal point).
+    content_buffer: String,
 }
 
 impl OpenAiStreamState {
@@ -122,6 +138,7 @@ impl OpenAiStreamState {
             tool_adapted: false,
             reasoning_buffer: String::new(),
             usage: None,
+            content_buffer: String::new(),
         }
     }
 
@@ -157,6 +174,96 @@ impl OpenAiStreamState {
                 usage: None,
             }));
         }
+    }
+
+    /// Strict, full-text-only parse of the turn's accumulated `content` as a
+    /// proxy tool-call envelope (Fix 2 STRICT).
+    ///
+    /// Accepted — the ENTIRE content must be exactly one JSON object of one of
+    /// these shapes (full-text parse only, no substring extraction):
+    ///
+    ///   * `{"name": "<string>", "arguments": { … }}`       — object arguments
+    ///   * `{"name": "<string>", "arguments": "<json …>"}`  — string arguments
+    ///   * `{"name": "<string>", "input": { … }}`           — `input` alias
+    ///     (object only, consistent with the Fix 1 flat path)
+    ///
+    /// An optional string `id` member is carried through when present. Anything
+    /// else — trailing prose (the parse must consume the whole payload), JSON
+    /// arrays, missing `name`/arguments, wrong member types, `input` as a
+    /// non-object — returns `None` and the content stays plain text with zero
+    /// behavioral change. No heuristic text mining here: loose recovery from
+    /// free text is the tool guard's / driver's job.
+    fn parse_content_envelope(content: &str) -> Option<PartialToolCall> {
+        let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+        let object = parsed.as_object()?;
+        let name = object.get("name")?.as_str()?.to_string();
+        let arguments = match object.get("arguments") {
+            Some(serde_json::Value::Object(inner)) => {
+                serde_json::Value::Object(inner.clone()).to_string()
+            }
+            Some(serde_json::Value::String(inner)) => inner.clone(),
+            // `arguments` present but not Object|String → reject the envelope.
+            Some(_) => return None,
+            // `arguments` absent → `input` alias (object only, Fix 1-consistent).
+            None => {
+                let input = object.get("input")?.as_object()?;
+                serde_json::Value::Object(input.clone()).to_string()
+            }
+        };
+        let id = object.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        Some(PartialToolCall { id, name, arguments })
+    }
+
+    /// Terminal resolution of the buffered `content` (proxy Fix 2 STRICT).
+    ///
+    /// Invoked from both terminal paths (`[DONE]` and `finish_reason`) before
+    /// tools/reasoning/final are emitted:
+    ///
+    ///   * real tool deltas observed (`partial_tools` non-empty) → the
+    ///     buffered content is drained as plain text; the fallback never
+    ///     competes with real deltas (no double-emit);
+    ///   * otherwise a strict envelope match synthesizes a [`PartialToolCall`]
+    ///     at [`ENVELOPE_CALL_INDEX`], emitted by the EXISTING
+    ///     [`Self::emit_tool_call`] pipeline (`ensure_arguments_object` +
+    ///     loose-schema un-flattening, both unchanged);
+    ///   * otherwise the content is drained as plain text — same `delta`
+    ///     payload as before, aggregated at turn end instead of per-delta.
+    ///
+    /// OpenRouter/NIM inherit this fallback through their `OpenAiProvider`
+    /// inner — no wrapper edits.
+    fn flush_content(&mut self) {
+        if self.content_buffer.is_empty() {
+            return;
+        }
+        if !self.partial_tools.is_empty() {
+            self.emit_buffered_content();
+            return;
+        }
+        let content = std::mem::take(&mut self.content_buffer);
+        if let Some(envelope) = Self::parse_content_envelope(&content) {
+            self.partial_tools.insert(ENVELOPE_CALL_INDEX, envelope);
+        } else {
+            self.pending.push_back(Ok(CompletionChunk {
+                delta: content,
+                reasoning: None,
+                tool_call: None,
+                is_final: false,
+                usage: None,
+            }));
+        }
+    }
+
+    /// Drain the turn's buffered `content` as one plain-text chunk (real tool
+    /// deltas won, or the content is not a strict envelope).
+    fn emit_buffered_content(&mut self) {
+        let content = std::mem::take(&mut self.content_buffer);
+        self.pending.push_back(Ok(CompletionChunk {
+            delta: content,
+            reasoning: None,
+            tool_call: None,
+            is_final: false,
+            usage: None,
+        }));
     }
 
     fn emit_tool_call(&mut self, index: usize) {
@@ -258,6 +365,7 @@ impl OpenAiStreamState {
         };
 
         if data == "[DONE]" {
+            self.flush_content();
             self.emit_remaining_tools();
             self.emit_reasoning_if_any();
             self.pending.push_back(Ok(CompletionChunk {
@@ -296,13 +404,12 @@ impl OpenAiStreamState {
             }
 
             if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                self.pending.push_back(Ok(CompletionChunk {
-                    delta: content.to_string(),
-                    reasoning: None,
-                    tool_call: None,
-                    is_final: false,
-                    usage: None,
-                }));
+                // Buffer the turn's content instead of streaming it eagerly:
+                // the Fix 2 STRICT fallback needs the COMPLETE text to judge
+                // whether it is a tool-call envelope (full-text parse only).
+                // Non-envelope content is drained as plain text at the
+                // terminal point — identical output.
+                self.content_buffer.push_str(content);
             }
 
             if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -364,6 +471,7 @@ impl OpenAiStreamState {
 
         if let Some(finish_reason) = choice["finish_reason"].as_str() {
             if !finish_reason.is_empty() && finish_reason != "null" {
+                self.flush_content();
                 self.emit_remaining_tools();
                 self.emit_reasoning_if_any();
                 self.pending.push_back(Ok(CompletionChunk {
@@ -602,6 +710,37 @@ impl LlmProvider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sse(data: &str) -> crate::sse::SseEvent {
+        crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        }
+    }
+
+    /// Build an SSE `delta.content` event carrying `content` verbatim as a
+    /// JSON *string* (escaping handled by serde), so hand-rolled `\"` /
+    /// `\\` escapes are never needed in fixtures.
+    fn content_event(content: &str) -> crate::sse::SseEvent {
+        sse(&serde_json::json!({"choices": [{"delta": {"content": content}}]}).to_string())
+    }
+
+    fn drain(state: &mut OpenAiStreamState) -> Vec<CompletionChunk> {
+        state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect()
+    }
+
+    /// Assert that an event sequence left the content as verbatim plain text
+    /// with ONE data chunk, no synthesized tool call, and a terminal chunk.
+    fn assert_plain_text(state: &mut OpenAiStreamState, expected: &str) {
+        let chunks = drain(state);
+        assert!(chunks.iter().all(|c| c.tool_call.is_none()), "no tool call synthesized");
+        let text: Vec<&str> =
+            chunks.iter().filter(|c| !c.delta.is_empty()).map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, vec![expected], "content delivered verbatim as plain text");
+        assert!(chunks.last().unwrap().is_final, "terminal chunk present");
+    }
 
     /// ADR-46: a streamed delta carrying `reasoning_content` is captured into a
     /// `CompletionChunk::reasoning`, accumulated across deltas, and emitted
@@ -1114,5 +1253,192 @@ mod tests {
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         assert_eq!(chunks.len(), 1, "only the final chunk");
         assert!(chunks[0].is_final);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Proxy Fix 2 STRICT — content-embedded tool-call envelope
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Accepted shape (a): the proxy embeds a complete tool call as a JSON
+    /// object in the content text. Because the ENTIRE content is exactly the
+    /// envelope, it becomes a real tool call and the raw text is NOT echoed as
+    /// a separate content chunk (no text+call double representation).
+    #[test]
+    fn content_envelope_object_arguments_becomes_tool_call() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","arguments":{"command":"ls"}}"#));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+        assert!(chunks.iter().all(|c| c.delta.is_empty()), "envelope must not be echoed as text");
+        assert!(chunks.last().unwrap().is_final);
+    }
+
+    /// Accepted shape (b): `arguments` delivered as a JSON *string* flows
+    /// through the same parse (`ensure_arguments_object`) as every other
+    /// shape.
+    #[test]
+    fn content_envelope_string_arguments_becomes_tool_call() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","arguments":"{\"command\":\"ls\"}"}"#));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object(), "arguments must land as a JSON object");
+    }
+
+    /// Accepted shape (c): the `input` alias for arguments (object only),
+    /// consistent with the Fix 1 flat path.
+    #[test]
+    fn content_envelope_input_alias_becomes_tool_call() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","input":{"command":"ls"}}"#));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+    }
+
+    /// A synthesized envelope still runs through the EXISTING emit pipeline,
+    /// so loose-schema un-flattening applies on adapted streams exactly as it
+    /// does to real deltas.
+    #[test]
+    fn content_envelope_unflattens_when_adapted() {
+        let mut state = OpenAiStreamState::new();
+        state.tool_adapted = true;
+        state.handle_event(content_event(
+            r#"{"name":"runner","arguments":{"config.mode":"fast","config.retries":2}}"#,
+        ));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "runner");
+        assert_eq!(
+            tool.arguments,
+            serde_json::json!({"config": {"mode": "fast", "retries": 2}}),
+            "dotted arguments must be re-nested on adapted streams"
+        );
+    }
+
+    /// NEG: prose that merely contains a JSON-ish example must stay plain text
+    /// — the full-text parse cannot consume the whole payload (no substring
+    /// mining).
+    #[test]
+    fn content_prose_with_json_example_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        let prose =
+            r#"For example, call {"name": "shell", "arguments": {"command": "ls"}} to list files."#;
+        state.handle_event(content_event(prose));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, prose);
+    }
+
+    /// NEG: an envelope followed by trailing prose — the full-text parse
+    /// fails, so the whole content stays text.
+    #[test]
+    fn content_envelope_with_trailing_prose_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        let content = r#"{"name": "shell", "arguments": {"command": "ls"}} and that's it"#;
+        state.handle_event(content_event(content));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, content);
+    }
+
+    /// NEG: a mixed turn — content text whose entire payload LOOKS like an
+    /// envelope PLUS real structured tool deltas. The real deltas win: the
+    /// content stays plain text and exactly one tool call (the real one) is
+    /// emitted. No envelope synthesis, no double-emit.
+    #[test]
+    fn content_text_with_real_tool_deltas_prefers_real_deltas() {
+        let mut state = OpenAiStreamState::new();
+        let envelope_text = r#"{"name":"shell","arguments":{"command":"ls"}}"#;
+        state.handle_event(sse(&serde_json::json!({
+            "choices": [{"delta": {
+                "content": envelope_text,
+                "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                "function": {"name": "runner", "arguments": ""}}]
+            }}]
+        })
+        .to_string()));
+        state.handle_event(sse(&serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": r#"{"suite":"demo"}"#}}]}}]
+        })
+        .to_string()));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let text: Vec<&str> =
+            chunks.iter().filter(|c| !c.delta.is_empty()).map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, vec![envelope_text], "content stays plain text with real tool deltas");
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one tool call — the real delta, no synthesized envelope"
+        );
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "runner");
+        assert_eq!(calls[0].arguments, serde_json::json!({"suite": "demo"}));
+        assert!(chunks.last().unwrap().is_final);
+    }
+
+    /// NEG: a top-level JSON array is not an envelope.
+    #[test]
+    fn content_array_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        let content =
+            serde_json::json!([{"name": "shell", "arguments": {"command": "ls"}}]).to_string();
+        state.handle_event(content_event(&content));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, &content);
+    }
+
+    /// NEG: an object without a string `name` is not an envelope.
+    #[test]
+    fn content_object_missing_name_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"arguments":{"command":"ls"}}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"arguments":{"command":"ls"}}"#);
+    }
+
+    /// NEG: an object without any arguments/`input` member is not an envelope.
+    #[test]
+    fn content_object_missing_arguments_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell"}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"name":"shell"}"#);
+    }
+
+    /// NEG: `arguments` must be Object|String — a number is rejected.
+    #[test]
+    fn content_wrong_argument_type_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","arguments":42}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"name":"shell","arguments":42}"#);
+    }
+
+    /// NEG: `input` mirrors Fix 1 — object only, so a string `input` is
+    /// rejected.
+    #[test]
+    fn content_input_alias_string_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","input":"{\"command\":\"ls\"}"}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"name":"shell","input":"{\"command\":\"ls\"}"}"#);
     }
 }
