@@ -1,18 +1,36 @@
 # Missing LLM Providers — Implementation Inventory
 
-Analysis date: 2026-07-24
+Analysis date: 2026-07-24 · Updated: 2026-09-19
 
-## Currently implemented (7 providers)
+## Currently implemented (22 providers)
 
-| # | Provider | Module | API Format |
+All 22 named provider types are registered in `provider_defs.rs:346-369`
+(`PROVIDER_TYPE_IDS`). Original 7 + DeepSeek + 7 Tier-1 + 7 Tier-2.
+
+| # | Provider | Type ID | API Format |
 |---|---|---|---|
-| 1 | OpenAI | `openai.rs` | Native |
-| 2 | Anthropic | `anthropic.rs` | Native |
-| 3 | Google Gemini | `google.rs` | Native |
-| 4 | OpenRouter | `openrouter.rs` | Thin wrapper around OpenAI |
-| 5 | NVIDIA NIM | `nim.rs` | Thin wrapper around OpenAI |
-| 6 | Ollama | `ollama.rs` | Native |
-| 7 | OpenCode Zen | `opencode.rs` | Thin wrapper around OpenAI |
+| 1 | OpenAI | `openai` | Native |
+| 2 | Anthropic | `anthropic` | Native |
+| 3 | Google Gemini | `google` | Native |
+| 4 | OpenRouter | `openrouter` | Thin wrapper around OpenAI |
+| 5 | NVIDIA NIM | `nim` | Thin wrapper around OpenAI |
+| 6 | Ollama | `ollama` | Native |
+| 7 | OpenCode Zen | `opencode` | Thin wrapper around OpenAI |
+| 8 | DeepSeek | `deepseek` | Thin wrapper around OpenAI |
+| 9 | Groq | `groq` | Thin wrapper around OpenAI |
+| 10 | Together AI | `together` | Thin wrapper around OpenAI |
+| 11 | Mistral AI | `mistral` | Thin wrapper around OpenAI |
+| 12 | xAI (Grok) | `xai` | Thin wrapper around OpenAI |
+| 13 | Fireworks AI | `fireworks` | Thin wrapper around OpenAI |
+| 14 | Cerebras | `cerebras` | Thin wrapper around OpenAI |
+| 15 | Cohere | `cohere` | Thin wrapper around OpenAI |
+| 16 | DeepInfra | `deepinfra` | Thin wrapper around OpenAI |
+| 17 | Perplexity | `perplexity` | Thin wrapper around OpenAI |
+| 18 | SambaNova | `sambanova` | Thin wrapper around OpenAI |
+| 19 | Alibaba (Qwen) | `dashscope` | Thin wrapper around OpenAI |
+| 20 | Moonshot AI (Kimi) | `moonshot` | Thin wrapper around OpenAI |
+| 21 | Zhipu AI (GLM) | `zhipu` | Thin wrapper around OpenAI |
+| 22 | Novita AI | `novita` | Thin wrapper around OpenAI |
 
 ## Implementation pattern
 
@@ -29,36 +47,16 @@ The files to touch per provider:
 | `docs/models.md` | Update supported provider IDs table |
 
 The desktop Settings UI picks up new providers automatically since it reads
-`PROVIDER_TYPE_IDS` at compile time.
+`PROVIDER_TYPE_IDS` at compile time. Each thin-wrapper also includes the
+flat proxy tool-call Fix 1 fallback from `openai.rs:326`.
 
-## Major providers NOT yet implemented
+## ~~Major providers NOT yet implemented~~ — Tier 1 & 2 DONE
 
-### Tier 1 — High-impact (all OpenAI-compatible)
+All Tier-1 and Tier-2 providers from the original analysis are now implemented
+(see table above). The "Key insight" and "Recommended implementation order"
+sections below are historical and no longer apply to Tier 1/2.
 
-| Provider | API Base URL | Why add it |
-|---|---|---|
-| **DeepSeek** | `https://api.deepseek.com` | Cheapest frontier models (V4 Flash at $0.14/$0.28 per MTok). 1M context. Huge popularity. Already partially referenced in `budget.rs`. |
-| **Groq** | `https://api.groq.com/openai/v1` | Ultra-low latency (LPU hardware, 5-10x faster than GPU). Free tier available. Major OSS inference platform. |
-| **Together AI** | `https://api.together.xyz/v1` | 200+ open-source models (Llama, Qwen, DeepSeek, Mistral). Very competitive pricing. |
-| **Mistral AI** | `https://api.mistral.ai/v1` | European open-weight leader (Mistral Large 3, Codestral). EU data residency. |
-| **xAI (Grok)** | `https://api.x.ai/v1` | Grok 4 models with 2M context. Fast-growing. |
-| **Fireworks AI** | `https://api.fireworks.ai/inference/v1` | Production-grade open-weight inference. Strong enterprise SLAs. |
-| **Cerebras** | `https://api.cerebras.ai/v1` | Wafer-scale inference, 2,100 tok/s on Llama 70B. Free tier. |
-| **Cohere** | `https://api.cohere.ai/compatibility/v1` | Enterprise RAG/embeddings leader. Command A+ models. |
-
-### Tier 2 — Notable but smaller market share
-
-| Provider | API Base URL | Notes |
-|---|---|---|
-| **DeepInfra** | `https://api.deepinfra.com/v1/openai` | Stable inference, dedicated endpoints |
-| **Perplexity** | `https://api.perplexity.ai` | Fast OSS model access, includes web search |
-| **SambaNova** | `https://api.sambanova.ai/v1` | Cloud inference platform |
-| **Alibaba (Qwen)** | `https://dashscope.aliyuncs.com/compatible-mode/v1` | Qwen3 models via DashScope API |
-| **Moonshot AI (Kimi)** | `https://api.moonshot.cn/v1` | Kimi K2/K3 models |
-| **Zhipu AI (GLM)** | `https://open.bigmodel.cn/api/paas/v4` | GLM-5 models |
-| **Novita AI** | Various per-endpoint | Serverless GPUs, low cost |
-
-### Tier 3 — Full SDK / Agent-runtime providers
+### Tier 3 — Full SDK / Agent-runtime providers (still open)
 
 These are not simple API endpoints. They are full agent SDKs with their own
 runtime, tool invocation, session lifecycle, and streaming. Adding them requires
@@ -73,7 +71,7 @@ process — fundamentally more complex than a thin API wrapper.
 | **Google Vertex AI** | GCP SDK + OpenAI-compat | GCP SDK integration |
 | **IBM watsonx** | Custom API | Enterprise LLM platform |
 
-### Tier 4 — Retired / Shutting down
+### Tier 4 — Retired / Shutting down (historical)
 
 | Provider | Notes |
 |---|---|
@@ -90,31 +88,10 @@ GitHub Copilot is an exception: it exposes a full agent SDK (not a raw
 completions API), making it a fundamentally different integration category
 alongside AWS Bedrock, Azure OpenAI, and Vertex AI.
 
-What's missing for first-class support on OpenAI-compatible providers:
+## ~~Recommended implementation order~~ (historical — Tier 1/2 all done)
 
-1. **Named provider types** — proper branding, UI discovery, default model hints
-2. **`provider_defs.rs` entries** — `ProviderDefinition`, display name, known models, `PROVIDER_TYPE_IDS`
-3. **`factory.rs` build arms** — direct construction by name
-4. **`lib.rs` model listing** — `list_models_for_provider_async` entries
-5. **`budget.rs` context windows** — known model capacities + pricing data
-6. **Tool call verification** — each provider's OpenAI-compatible surface needs testing
-
-## Recommended implementation order
-
-**Batch 1 — Market leaders:**
-1. DeepSeek (cheapest frontier, already partially in budget.rs)
-2. Groq (speed leader, free tier)
-3. Together AI (broad OSS coverage)
-
-**Batch 2 — Next tier:**
-4. Mistral AI
-5. xAI (Grok)
-6. Fireworks AI
-
-**Batch 3 — Nice-to-have:**
-7. Cerebras
-8. Cohere
-9. DeepInfra
-
-**Batch 4 — Full SDK integration (higher effort):**
+**Batch 1 — Market leaders:** ✅ DeepSeek, ✅ Groq, ✅ Together AI
+**Batch 2 — Next tier:** ✅ Mistral AI, ✅ xAI (Grok), ✅ Fireworks AI
+**Batch 3 — Nice-to-have:** ✅ Cerebras, ✅ Cohere, ✅ DeepInfra, ✅ Perplexity, ✅ SambaNova, ✅ DashScope, ✅ Moonshot, ✅ Zhipu, ✅ Novita
+**Batch 4 — Full SDK integration (still open):**
 10. GitHub Copilot (agent SDK integration, not a simple API wrapper)

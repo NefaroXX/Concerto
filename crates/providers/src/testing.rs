@@ -162,3 +162,194 @@ impl ScriptedProvider {
         }
     }
 }
+
+/// One-shot HTTP mock server and shared stream assertions for the thin
+/// OpenAI-compatible provider wrappers.
+///
+/// Each wrapper test runs a tiny `std::net::TcpListener` server on a
+/// background thread that records the request body and answers with a canned
+/// SSE stream (no HTTP-mock crate exists in this workspace). Every wait is
+/// bounded (`recv_timeout`, `tokio::time::timeout`). The shared
+/// [`assert_function_shaped_tool_calls`] / [`assert_flat_shaped_tool_calls`]
+/// helpers prove the canonical and Fix-1 flat proxy tool-call shapes through
+/// any wrapper via its `with_api_base` builder, so new connectors only carry
+/// a two-line test each instead of a full HTTP-stub suite.
+#[cfg(test)]
+pub mod mock_server {
+    use concerto_core::error::ProviderError;
+    use concerto_core::traits::{CompletionStream, LlmProvider};
+    use concerto_core::types::{
+        CompletionChunk, CompletionRequest, Message, Role, ToolCall, ToolDefinition,
+    };
+    use concerto_core::CancellationToken;
+    use futures::TryStreamExt;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Serve `sse_body` for the next single request and return
+    /// `(base_url, captured_request_receiver)`.
+    pub fn spawn(sse_body: String) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock server");
+        let port = listener.local_addr().expect("local address").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let (req_tx, req_rx) = mpsc::channel();
+        let _ = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one request");
+            let request = read_request(&mut stream);
+            let _ = req_tx.send(request.clone());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body,
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (base, req_rx)
+    }
+
+    /// Parse the captured request's JSON body out of its raw HTTP bytes.
+    pub fn request_body(raw: Vec<u8>) -> serde_json::Value {
+        let header_end = find_subsequence(&raw, b"\r\n\r\n").expect("captured request has headers");
+        serde_json::from_slice(&raw[header_end + 4..]).expect("captured request body is JSON")
+    }
+
+    /// Read a full HTTP request: headers plus a `Content-Length`-framed body.
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = stream.read(&mut buf).expect("read request bytes");
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(header_end) = find_subsequence(&raw, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&raw[..header_end]);
+                let declared = content_length(&headers);
+                let body_start = header_end + 4;
+                let complete = declared.is_none_or(|len| raw.len() >= body_start + len);
+                if complete {
+                    break;
+                }
+            }
+        }
+        raw
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|window| window == needle)
+    }
+
+    fn content_length(headers: &str) -> Option<usize> {
+        headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn user_message(content: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    /// A chat request asking for a command to run, with the `shell` tool.
+    fn shell_request() -> CompletionRequest {
+        CompletionRequest {
+            stream: true,
+            messages: vec![user_message("list files")],
+            tools: Some(vec![ToolDefinition {
+                name: "shell".to_string(),
+                description: "Run a command.".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// A chat request asking for a manifest read, with the `read_file` tool.
+    fn read_file_request() -> CompletionRequest {
+        CompletionRequest {
+            stream: true,
+            messages: vec![user_message("read the manifest")],
+            tools: Some(vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file.".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Drain a completion stream, bounding the wait.
+    async fn collect(stream: CompletionStream) -> Result<Vec<CompletionChunk>, ProviderError> {
+        tokio::time::timeout(Duration::from_secs(10), stream.try_collect())
+            .await
+            .map_err(|_| ProviderError::Other("mock-server stream timed out".to_string()))?
+    }
+
+    /// Assert the canonical `function {name, arguments}` tool-call shape
+    /// parses through `make`, a provider wrapper built from a mock base URL.
+    pub async fn assert_function_shaped_tool_calls(
+        make: impl FnOnce(String) -> Box<dyn LlmProvider>,
+    ) {
+        let sse = concat!(
+            "data: ",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_fn","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, _req_rx) = spawn(sse.to_string());
+        let provider = make(base);
+        let request = shell_request();
+        let stream =
+            provider.stream_completion(request, CancellationToken::new()).await.expect("stream");
+        let chunks = collect(stream).await.expect("collect");
+
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments, serde_json::json!({"command": "ls"}));
+        assert!(chunks.last().expect("final chunk").is_final, "stream terminates");
+    }
+
+    /// Assert the Fix 1 flat proxy fallback (`name` / `arguments` directly on
+    /// the tool-call object, split across SSE deltas) parses through `make`.
+    pub async fn assert_flat_shaped_tool_calls(make: impl FnOnce(String) -> Box<dyn LlmProvider>) {
+        let sse = concat!(
+            "data: ",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_flat","name":"read_file","arguments":"{\"path\":"}]}}]}"#,
+            "\n\n",
+            "data: ",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"name":"read_file","arguments":"\"Cargo.toml\"}"}]}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, _req_rx) = spawn(sse.to_string());
+        let provider = make(base);
+        let request = read_file_request();
+        let stream =
+            provider.stream_completion(request, CancellationToken::new()).await.expect("stream");
+        let chunks = collect(stream).await.expect("collect");
+
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_flat");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, serde_json::json!({"path": "Cargo.toml"}));
+        assert!(chunks.last().expect("final chunk").is_final, "stream terminates");
+    }
+}

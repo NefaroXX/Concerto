@@ -2,7 +2,7 @@
 
 **Verdict on Feasibility: Highly Feasible — 8–12 weeks of disciplined work**
 
-The codebase is already above average for a Rust project of this size (22 crates, 78k lines). Several pieces — SimplePolicyEngine, EventBus, Plugin SDK, VirtualFs, Error Taxonomy — are already world-class. The gap is concentrated in specific areas: cognitive complexity hotspots, test coverage in peripheral crates, and the desktop/CLI UI layers.
+The codebase is already above average for a Rust project of this size (25 crates, 78k lines). Several pieces — SimplePolicyEngine, EventBus, Plugin SDK, VirtualFs, Error Taxonomy — are already world-class. The gap is concentrated in specific areas: cognitive complexity hotspots, test coverage in peripheral crates, and the desktop/CLI UI layers.
 
 The foundation is solid. You're not lifting a rusty ship — you're polishing a near-complete one.
 
@@ -233,7 +233,8 @@ Target: Unified patterns across all crate boundaries, no conceptual drift.
 
 Target: Security audit completed, threat model documented, harden attack surface.
 
-- **Threat model document** (`docs/security-threat-model.md`):
+- **Threat model document** (`docs/security-threat-model.md`) — ✅ DONE (v1.0,
+  2026-07-28; v1.1 2026-09-19: gap #2 closed):
   - Credential exposure (keyring, env vars)
   - WASM plugin sandboxing
   - SQL injection (sqlx is parameterized, but audit)
@@ -241,9 +242,10 @@ Target: Security audit completed, threat model documented, harden attack surface
   - File path traversal in VirtualFs
   - Provider API key leak in audit/events
   - Effort: 8 hours.
-- **Secret scanning in event data**:
-  - The EventBus publishes tool execution input/output — this could include secrets. Add a `SecretSanitizer` subscriber that redacts matching patterns before persistent subscribers see them.
-  - Effort: 8 hours.
+- **Secret scanning in event data** — ✅ DONE (2026-09-19):
+  - `SecretSanitizer` at `core/sanitizer.rs:250`, wired into `EventBus`
+    (`event.rs:583/767/930`). Threat model gap #2 closed.
+  - Effort: ~~8 hours~~ Resolved.
 - **Dependency audit**:
   - Review `deny.toml` exceptions — are the 6 ignored advisories still acceptable? Pin upgrades for unmaintained transitive deps where possible.
   - Effort: 4 hours.
@@ -256,7 +258,7 @@ Target: Security audit completed, threat model documented, harden attack surface
   - Verify ADRs match current implementation
   - Update `crate-graph.md` if architecture changed
   - Effort: 16 hours.
-- Deliverable: Threat model doc, secrets sanitizer, hardened plugin sandbox, full doc coverage.
+- Deliverable: Threat model doc ✅, secrets sanitizer ✅, hardened plugin sandbox (open), full doc coverage.
 - Risk: **Low-medium**. Security work is methodical; the codebase is already well-audited.
 
 ---

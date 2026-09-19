@@ -5,7 +5,7 @@ code are authoritative when this overview and the implementation differ.
 
 ## System shape
 
-Concerto is a 24-crate Rust workspace with shared execution services and three
+Concerto is a 25-crate Rust workspace with shared execution services and three
 frontends: native desktop, terminal UI, and HTTP API. `concerto-core` owns
 cross-cutting contracts—events, IDs, provider/tool/policy traits, errors,
 cancellation, and the tool executor—without depending on another workspace
@@ -256,7 +256,7 @@ config-driven v1) and via the CLI's `concerto extensions list`.
 configuration such as rust-analyzer. LSP tools (`GetHover`, `FindReferences`,
 `RenameSymbol`, `GetDiagnostics`, `GetSemanticTokens`, `GetCodeActions`,
 `ExecuteCodeAction`, `GetInlayHints`) are registered unconditionally in the
-agent tool registry (`crates/orchestrator/src/runtime_runner.rs:1226-1233`),
+agent tool registry (`crates/orchestrator/src/runtime_runner.rs:1715-1722`),
 and the LSP server starts lazily on first use.
 
 `concerto-eval` detects common project test runners and owns standard,

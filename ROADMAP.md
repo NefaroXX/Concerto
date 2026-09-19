@@ -22,7 +22,7 @@ The design priorities are:
 
 ## Now (dev, implemented)
 
-The 24-crate workspace has completed the audit-remediation programme
+The 25-crate workspace has completed the audit-remediation programme
 (Phases 0–6, PR #77) and the ADR-34 through ADR-40 run of durability and
 lifecycle decisions. What is true on `dev` today:
 

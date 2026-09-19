@@ -9,13 +9,28 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::RoutingProfile;
 
 use crate::anthropic::AnthropicProvider;
+use crate::cerebras::CerebrasProvider;
+use crate::cohere::CohereProvider;
 use crate::context_guard::ContextGuardProvider;
+use crate::dashscope::DashScopeProvider;
+use crate::deepinfra::DeepInfraProvider;
+use crate::deepseek::DeepSeekProvider;
+use crate::fireworks::FireworksProvider;
 use crate::google::GoogleProvider;
+use crate::groq::GroqProvider;
+use crate::mistral::MistralProvider;
+use crate::moonshot::MoonshotProvider;
 use crate::nim::NimProvider;
+use crate::novita::NovitaProvider;
 use crate::ollama::OllamaProvider;
 use crate::openai::{OpenAiProvider, ReasoningEcho};
 use crate::opencode::OpenCodeZenProvider;
 use crate::openrouter::OpenRouterProvider;
+use crate::perplexity::PerplexityProvider;
+use crate::sambanova::SambaNovaProvider;
+use crate::together::TogetherProvider;
+use crate::xai::XaiProvider;
+use crate::zhipu::ZhipuProvider;
 
 /// Resolve the `[providers.*] tool_schema_mode` dial for provider construction.
 ///
@@ -91,7 +106,28 @@ impl ProviderFactory {
     ) -> Result<Arc<dyn LlmProvider>, ProviderError> {
         if !matches!(
             config.provider.as_str(),
-            "anthropic" | "openai" | "opencode" | "google" | "openrouter" | "nim" | "ollama"
+            "anthropic"
+                | "openai"
+                | "opencode"
+                | "google"
+                | "openrouter"
+                | "nim"
+                | "ollama"
+                | "deepseek"
+                | "groq"
+                | "together"
+                | "mistral"
+                | "xai"
+                | "fireworks"
+                | "cerebras"
+                | "cohere"
+                | "deepinfra"
+                | "perplexity"
+                | "sambanova"
+                | "dashscope"
+                | "moonshot"
+                | "zhipu"
+                | "novita"
         ) {
             return Err(ProviderError::UnsupportedProvider { provider: config.provider.clone() });
         }
@@ -196,6 +232,191 @@ impl ProviderFactory {
                 }
                 Arc::new(provider)
             }
+            "deepseek" => {
+                // DeepSeek defaults to `ReasoningEcho::Always` at construction
+                // (ADR-46 reasoning contract), so the config dial is a no-op
+                // here — mirroring the OpenCode Zen arm.
+                let provider = if let Some(base) = &config.api_base {
+                    DeepSeekProvider::with_api_base(
+                        key,
+                        config.model.clone(),
+                        config.timeout_seconds,
+                        base.clone(),
+                    )
+                } else {
+                    DeepSeekProvider::new(key, config.model.clone(), config.timeout_seconds)
+                }
+                .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                Arc::new(provider)
+            }
+            "groq" => {
+                let mut provider =
+                    GroqProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "together" => {
+                let mut provider =
+                    TogetherProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "mistral" => {
+                let mut provider =
+                    MistralProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "xai" => {
+                let mut provider =
+                    XaiProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "fireworks" => {
+                let mut provider =
+                    FireworksProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "cerebras" => {
+                let mut provider =
+                    CerebrasProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "cohere" => {
+                let mut provider =
+                    CohereProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "deepinfra" => {
+                let mut provider =
+                    DeepInfraProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "perplexity" => {
+                let mut provider =
+                    PerplexityProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "sambanova" => {
+                let mut provider =
+                    SambaNovaProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "dashscope" => {
+                let mut provider =
+                    DashScopeProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "moonshot" => {
+                let mut provider =
+                    MoonshotProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "zhipu" => {
+                let mut provider =
+                    ZhipuProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
+            "novita" => {
+                let mut provider =
+                    NovitaProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                if let Some(base) = &config.api_base {
+                    provider = provider.with_api_base(base.clone());
+                }
+                if let Some(echo) = reasoning_echo {
+                    provider = provider.with_reasoning_echo(echo);
+                }
+                Arc::new(provider)
+            }
             other => {
                 return Err(ProviderError::UnsupportedProvider { provider: other.to_string() });
             }
@@ -282,6 +503,29 @@ impl ProviderFactory {
                     "ollama" => (0.000, 200),
                     "nim" => (0.001, 400),
                     "opencode" => (0.005, 600),
+                    // DeepSeek V4 Flash: $0.14/$0.28 per MTok blended ≈
+                    // $0.0002/1k tokens — the cheapest frontier tier.
+                    "deepseek" => (0.0002, 800),
+                    // Tier-1 OpenAI-compatible providers (blended 3:1
+                    // in:out representative flagship pricing, see the docs
+                    // table in `ProviderRegistry::routing_profiles`).
+                    "groq" => (0.0006, 150),
+                    "together" => (0.001, 600),
+                    "mistral" => (0.0008, 700),
+                    "xai" => (0.003, 800),
+                    "fireworks" => (0.0009, 400),
+                    "cerebras" => (0.0009, 250),
+                    "cohere" => (0.004, 900),
+                    // Tier-2 OpenAI-compatible providers (blended 3:1 in:out
+                    // representative flagship pricing, see the docs table in
+                    // `ProviderRegistry::routing_profiles`).
+                    "deepinfra" => (0.0002, 600),
+                    "perplexity" => (0.006, 500),
+                    "sambanova" => (0.0008, 700),
+                    "dashscope" => (0.0006, 700),
+                    "moonshot" => (0.003, 700),
+                    "zhipu" => (0.001, 600),
+                    "novita" => (0.0003, 800),
                     _ => (0.005, 500),
                 };
                 let mut profile = RoutingProfile {
@@ -457,6 +701,210 @@ mod tests {
         std::env::remove_var("CONCERTO_ANTHROPIC_API_KEY");
 
         assert_eq!(provider.provider_name(), "anthropic");
+    }
+
+    /// A `deepseek` config builds through the factory: the env-backed test
+    /// keyring resolution maps `keyring_key = "deepseek/api_key"` to
+    /// `CONCERTO_DEEPSEEK_API_KEY`.
+    #[test]
+    fn build_deepseek_provider() {
+        let config = ProviderConfig {
+            id: "deepseek-main".into(),
+            name: "DeepSeek Main".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            keyring_key: "deepseek/api_key".into(),
+            ..ProviderConfig::default()
+        };
+        std::env::set_var("CONCERTO_DEEPSEEK_API_KEY", "sk-test-deepseek");
+        let provider = ProviderFactory::build(&config, &test_creds()).unwrap();
+        std::env::remove_var("CONCERTO_DEEPSEEK_API_KEY");
+
+        assert_eq!(provider.provider_name(), "deepseek");
+    }
+
+    /// Every Tier-1 OpenAI-compatible provider builds through the factory with
+    /// its env-backed test keyring key (`<PROVIDER>_API_KEY`, provider
+    /// uppercased via `ProviderConfig::effective_api_key`).
+    #[test]
+    fn build_tier1_openai_compatible_providers() {
+        let cases = [
+            ("groq", "groq-main", "llama-3.3-70b-versatile", "CONCERTO_GROQ_API_KEY"),
+            (
+                "together",
+                "together-main",
+                "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                "CONCERTO_TOGETHER_API_KEY",
+            ),
+            ("mistral", "mistral-main", "mistral-large-latest", "CONCERTO_MISTRAL_API_KEY"),
+            ("xai", "xai-main", "grok-4", "CONCERTO_XAI_API_KEY"),
+            (
+                "fireworks",
+                "fireworks-main",
+                "accounts/fireworks/models/llama-v3p3-70b-instruct",
+                "CONCERTO_FIREWORKS_API_KEY",
+            ),
+            ("cerebras", "cerebras-main", "llama-3.3-70b", "CONCERTO_CEREBRAS_API_KEY"),
+            ("cohere", "cohere-main", "command-a-plus-05-2026", "CONCERTO_COHERE_API_KEY"),
+        ];
+        for (provider, id, model, env_key) in cases {
+            let config = ProviderConfig {
+                id: id.into(),
+                name: "Tier-1".into(),
+                provider: provider.into(),
+                model: model.into(),
+                keyring_key: format!("{provider}/api_key"),
+                ..ProviderConfig::default()
+            };
+            std::env::set_var(env_key, format!("sk-test-{provider}"));
+            let built = ProviderFactory::build(&config, &test_creds());
+            std::env::remove_var(env_key);
+
+            assert_eq!(
+                built.expect("factory build succeeds").provider_name(),
+                provider,
+                "built provider_name must match the config provider type"
+            );
+        }
+    }
+
+    /// The Tier-1 routing profiles carry explicit (blended) costs rather than
+    /// the built-in `_` fallback, in lockstep with
+    /// `ProviderRegistry::routing_profiles`.
+    #[test]
+    fn build_profiles_tier1_explicit_costs() {
+        let providers = [
+            ("groq", "llama-3.3-70b-versatile", 0.0006),
+            ("together", "meta-llama/Llama-3.3-70B-Instruct-Turbo", 0.001),
+            ("mistral", "mistral-large-latest", 0.0008),
+            ("xai", "grok-4", 0.003),
+            ("fireworks", "accounts/fireworks/models/llama-v3p3-70b-instruct", 0.0009),
+            ("cerebras", "llama-3.3-70b", 0.0009),
+            ("cohere", "command-a-plus-05-2026", 0.004),
+        ];
+        let settings = ModelSettings {
+            providers: providers
+                .iter()
+                .map(|(provider, model, _)| ProviderConfig {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                    ..ProviderConfig::default()
+                })
+                .collect(),
+            ..ModelSettings::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        assert_eq!(profiles.len(), providers.len());
+        for ((provider, _, expected_cost), profile) in providers.iter().zip(&profiles) {
+            assert_eq!(profile.provider, *provider);
+            assert_eq!(profile.cost_per_1k_tokens, *expected_cost);
+            assert!(
+                profile.supports_tool_calling,
+                "{provider} defaults to native tool calling (ADR-66 §3)"
+            );
+        }
+    }
+
+    /// Every Tier-2 OpenAI-compatible provider builds through the factory with
+    /// its env-backed test keyring key (`<PROVIDER>_API_KEY`, provider
+    /// uppercased via `ProviderConfig::effective_api_key`).
+    #[test]
+    fn build_tier2_openai_compatible_providers() {
+        let cases = [
+            (
+                "deepinfra",
+                "deepinfra-main",
+                "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+                "CONCERTO_DEEPINFRA_API_KEY",
+            ),
+            ("perplexity", "perplexity-main", "sonar-pro", "CONCERTO_PERPLEXITY_API_KEY"),
+            (
+                "sambanova",
+                "sambanova-main",
+                "Meta-Llama-3.3-70B-Instruct",
+                "CONCERTO_SAMBANOVA_API_KEY",
+            ),
+            ("dashscope", "dashscope-main", "qwen-plus", "CONCERTO_DASHSCOPE_API_KEY"),
+            ("moonshot", "moonshot-main", "kimi-k2.6", "CONCERTO_MOONSHOT_API_KEY"),
+            ("zhipu", "zhipu-main", "glm-4.7", "CONCERTO_ZHIPU_API_KEY"),
+            // Novita is discovery-driven, so a custom model id is configured.
+            ("novita", "novita-main", "custom-model", "CONCERTO_NOVITA_API_KEY"),
+        ];
+        for (provider, id, model, env_key) in cases {
+            let config = ProviderConfig {
+                id: id.into(),
+                name: "Tier-2".into(),
+                provider: provider.into(),
+                model: model.into(),
+                keyring_key: format!("{provider}/api_key"),
+                ..ProviderConfig::default()
+            };
+            std::env::set_var(env_key, format!("sk-test-{provider}"));
+            let built = ProviderFactory::build(&config, &test_creds());
+            std::env::remove_var(env_key);
+
+            assert_eq!(
+                built.expect("factory build succeeds").provider_name(),
+                provider,
+                "built provider_name must match the config provider type"
+            );
+        }
+    }
+
+    /// The Tier-2 routing profiles carry explicit (blended) costs rather than
+    /// the built-in `_` fallback, in lockstep with
+    /// `ProviderRegistry::routing_profiles`.
+    #[test]
+    fn build_profiles_tier2_explicit_costs() {
+        let providers = [
+            ("deepinfra", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", 0.0002),
+            ("perplexity", "sonar-pro", 0.006),
+            ("sambanova", "Meta-Llama-3.3-70B-Instruct", 0.0008),
+            ("dashscope", "qwen-plus", 0.0006),
+            ("moonshot", "kimi-k2.6", 0.003),
+            ("zhipu", "glm-4.7", 0.001),
+            ("novita", "custom-model", 0.0003),
+        ];
+        let settings = ModelSettings {
+            providers: providers
+                .iter()
+                .map(|(provider, model, _)| ProviderConfig {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                    ..ProviderConfig::default()
+                })
+                .collect(),
+            ..ModelSettings::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        assert_eq!(profiles.len(), providers.len());
+        for ((provider, _, expected_cost), profile) in providers.iter().zip(&profiles) {
+            assert_eq!(profile.provider, *provider);
+            assert_eq!(profile.cost_per_1k_tokens, *expected_cost);
+            assert!(
+                profile.supports_tool_calling,
+                "{provider} defaults to native tool calling (ADR-66 §3)"
+            );
+        }
+    }
+
+    /// The DeepSeek routing profile carries an explicit (cheap) cost rather
+    /// than the built-in `_` fallback, in lockstep with
+    /// `ProviderRegistry::routing_profiles`.
+    #[test]
+    fn build_profiles_deepseek_explicit_cost() {
+        let settings = ModelSettings {
+            providers: vec![ProviderConfig {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                ..ProviderConfig::default()
+            }],
+            ..ModelSettings::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].provider, "deepseek");
+        assert_eq!(profiles[0].cost_per_1k_tokens, 0.0002);
     }
 
     #[test]

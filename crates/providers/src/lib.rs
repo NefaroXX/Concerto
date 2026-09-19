@@ -24,13 +24,28 @@ pub mod tokenizer;
 pub mod adapters;
 pub mod anthropic;
 pub mod capability;
+pub mod cerebras;
+pub mod cohere;
+pub mod dashscope;
+pub mod deepinfra;
+pub mod deepseek;
+pub mod fireworks;
 pub mod google;
+pub mod groq;
+pub mod mistral;
+pub mod moonshot;
 pub mod nim;
+pub mod novita;
 pub mod ollama;
 pub mod openai;
 pub mod opencode;
 pub mod openrouter;
+pub mod perplexity;
+pub mod sambanova;
 pub mod sse;
+pub mod together;
+pub mod xai;
+pub mod zhipu;
 
 #[cfg(test)]
 pub mod testing;
@@ -147,6 +162,160 @@ pub async fn list_models_for_provider_async(
                 DEFAULT_TIMEOUT_SECS,
                 api_base.unwrap_or(OPENCODE_ZEN_API_BASE).to_string(),
             );
+            p.list_models(cancel.clone()).await
+        }
+        "deepseek" => {
+            let p = deepseek::DeepSeekProvider::with_api_base(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+                api_base.unwrap_or(deepseek::DEEPSEEK_API_BASE).to_string(),
+            );
+            p.list_models(cancel.clone()).await
+        }
+        "groq" => {
+            let mut p =
+                groq::GroqProvider::new(api_key.to_string(), String::new(), DEFAULT_TIMEOUT_SECS);
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "together" => {
+            let mut p = together::TogetherProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "mistral" => {
+            let mut p = mistral::MistralProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "xai" => {
+            let mut p =
+                xai::XaiProvider::new(api_key.to_string(), String::new(), DEFAULT_TIMEOUT_SECS);
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "fireworks" => {
+            let mut p = fireworks::FireworksProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "cerebras" => {
+            let mut p = cerebras::CerebrasProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "cohere" => {
+            let mut p = cohere::CohereProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "dashscope" => {
+            let mut p = dashscope::DashScopeProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "deepinfra" => {
+            let mut p = deepinfra::DeepInfraProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "moonshot" => {
+            let mut p = moonshot::MoonshotProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "novita" => {
+            let mut p = novita::NovitaProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "perplexity" => {
+            let mut p = perplexity::PerplexityProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "sambanova" => {
+            let mut p = sambanova::SambaNovaProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "zhipu" => {
+            let mut p =
+                zhipu::ZhipuProvider::new(api_key.to_string(), String::new(), DEFAULT_TIMEOUT_SECS);
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
             p.list_models(cancel.clone()).await
         }
         _ => return Vec::new(),

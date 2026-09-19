@@ -146,19 +146,71 @@ pub fn should_dispatch(
         return DispatchDecision::Reopen;
     }
 
-    // Step 3: Deliverable completeness — the summary is non-empty when a
-    // valid partial result exists.  If the output contract is specified but
-    // not satisfied by the summary, the work is incomplete and must be
-    // refined, not redone from scratch.
-    // TODO(Phase6): harden completeness from summary-emptiness to actual
-    // evidence (expected_artifacts existence / WroteFile events), so a
-    // non-empty summary that does NOT satisfy the contract can't be Reused.
-    if !candidate.output_contract.is_empty() && record.summary.is_empty() {
-        return DispatchDecision::Refine;
+    // Step 3: Deliverable completeness — the summary must be non-empty AND
+    // every artifact path named in the output contract must have artifact
+    // evidence (listed in the completion's `files_modified` or backed by a
+    // `WroteFile` event at or before the completion). This hardens
+    // summary-emptiness to actual evidence, so a non-empty summary that does
+    // NOT satisfy the contract can never be Reused.
+    if !candidate.output_contract.is_empty() {
+        // Production contracts (resolver_integration) are newline-joined
+        // expected-artifact paths; prose lines are ignored below, so legacy
+        // sentence contracts keep their summary-only semantics.
+        let expected_artifacts = parse_expected_artifacts(&candidate.output_contract);
+        let summary_ok = !record.summary.is_empty();
+        let artifacts_ok = artifact_evidence_satisfied(
+            &expected_artifacts,
+            record.files_modified,
+            projection,
+            record.gate_seq,
+        );
+        if !summary_ok || !artifacts_ok {
+            return DispatchDecision::Refine;
+        }
     }
 
     // Step 4: Inputs unchanged + deliverable satisfies contract → Reuse.
     DispatchDecision::Reuse
+}
+
+/// Parse the expected artifact paths out of a free-form output contract.
+///
+/// A production contract (see [`crate::resolver_integration::build_work_candidate`])
+/// is the sorted, newline-joined list of expected artifact paths. Lines that
+/// do not look like a path — whitespace-bearing prose such as legacy
+/// `"src/out.rs exists"` contracts — are ignored, so the artifact-evidence
+/// guard stays opt-in per named artifact and never fabricates a requirement
+/// from descriptive text.
+fn parse_expected_artifacts(contract: &str) -> Vec<&str> {
+    contract
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.chars().any(char::is_whitespace))
+        .collect()
+}
+
+/// Whether every expected artifact path has artifact evidence.
+///
+/// A path is satisfied when the completing record lists it in
+/// `files_modified`, or a `WroteFile` timeline event recorded it at or
+/// before the record's `gate_seq`. The gate_seq scope matters: a file a
+/// LATER run wrote cannot back an earlier record's completeness claim.
+/// Vacuously true when no artifacts are expected.
+fn artifact_evidence_satisfied(
+    expected: &[&str],
+    record_files: &[camino::Utf8PathBuf],
+    projection: &TimelineProjection,
+    record_gate_seq: u64,
+) -> bool {
+    expected.iter().all(|path| {
+        record_files.iter().any(|file| file.as_str() == *path)
+            || projection.events.iter().any(|event| match event {
+                TimelineEvent::WroteFile { gate_seq, path: written, .. } => {
+                    *gate_seq <= record_gate_seq && written == path
+                }
+                _ => false,
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +234,7 @@ fn find_matching_record<'a>(
                 files_modified,
                 content_hash,
                 recorded_inputs,
+                gate_seq,
                 ..
             } if !semantic_key_hex.is_empty() && semantic_key_hex == target_hex => {
                 Some(CompletedRecord {
@@ -190,6 +243,7 @@ fn find_matching_record<'a>(
                     files_modified,
                     content_hash,
                     recorded_inputs,
+                    gate_seq: *gate_seq,
                 })
             }
             _ => None,
@@ -204,13 +258,18 @@ struct CompletedRecord<'a> {
     #[allow(dead_code)]
     semantic_key_hex: &'a str,
     summary: &'a str,
-    /// Retained for Phase 5 capsules (file-context semantics).
-    #[allow(dead_code)]
+    /// The files the completing run reported writing. Artifact evidence for
+    /// the completeness judgement — a contract naming files must be backed
+    /// by this list or by `WroteFile` events.
     files_modified: &'a [camino::Utf8PathBuf],
     /// Retained for Phase 5 capsules (deliverable hashing).
     #[allow(dead_code)]
     content_hash: &'a str,
     recorded_inputs: &'a [ArtifactFingerprint],
+    /// The `gate_seq` of the completion — scopes `WroteFile` evidence to
+    /// writes that happened AT OR BEFORE this completion (a file written by
+    /// a later run cannot back an earlier record).
+    gate_seq: u64,
 }
 
 /// Compare two fingerprints for identity: same artifact kind and same path.
@@ -404,6 +463,33 @@ mod tests {
             created_at: 1_700_000_000_000 + gate_seq as i64,
             semantic_key_hex: key_hex.to_owned(),
             recorded_inputs: inputs,
+        }
+    }
+
+    /// Like [`completed_event`], but the completion also reports writing the
+    /// given files — artifact evidence IN the record.
+    fn completed_event_with_files(
+        key_hex: &str,
+        summary: &str,
+        inputs: Vec<ArtifactFingerprint>,
+        gate_seq: u64,
+        files: &[&str],
+    ) -> TimelineEvent {
+        let mut event = completed_event(key_hex, summary, inputs, gate_seq);
+        if let TimelineEvent::SubtaskCompleted { files_modified, .. } = &mut event {
+            files_modified.extend(files.iter().map(camino::Utf8PathBuf::from));
+        }
+        event
+    }
+
+    /// A `WroteFile` timeline event — independent artifact evidence on the
+    /// timeline (as opposed to the record's own `files_modified`).
+    fn wrote_file_event(path: &str, gate_seq: u64) -> TimelineEvent {
+        TimelineEvent::WroteFile {
+            gate_seq,
+            path: path.to_owned(),
+            content_hash: blake3::hash(path.as_bytes()).to_hex().to_string(),
+            created_at: 1_700_000_000_000 + gate_seq as i64,
         }
     }
 
@@ -805,6 +891,162 @@ mod tests {
         projection.events.sort_by_key(|e| e.gate_seq());
 
         // Empty contract + non-empty summary → Reuse (vacuous satisfaction).
+        assert_eq!(should_dispatch(&projection, &candidate), DispatchDecision::Reuse);
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-64 Phase 6 hardness: artifact-evidence completeness
+    // ------------------------------------------------------------------
+
+    /// A contract naming a real artifact path, with a non-empty summary but
+    /// NO artifact evidence (neither `files_modified` nor a `WroteFile`) →
+    /// Refine, NOT Reuse. This is the security hole the TODO(Phase6) guard
+    /// closes: summary alone cannot satisfy a path contract.
+    #[test]
+    fn contract_path_without_artifact_evidence_refines() {
+        let key = make_key("hardened-contract work");
+        let inputs = vec![ArtifactFingerprint::Input {
+            path: "src/a.rs".to_owned(),
+            content_hash: "h1".to_owned(),
+        }];
+        // Production contract format: newline-joined artifact paths.
+        let candidate = make_candidate_with_contract(key.clone(), inputs.clone(), "src/out.rs");
+
+        let mut projection = empty_projection();
+        projection.events.push(completed_event(key.hex(), "implemented feature X", inputs, 1));
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        let decision = should_dispatch(&projection, &candidate);
+        assert_eq!(
+            decision,
+            DispatchDecision::Refine,
+            "a satisfied-looking summary with no artifact evidence must not Reuse"
+        );
+    }
+
+    /// Multiple expected artifacts: ALL must be evidenced (here only one is)
+    /// → Refine.
+    #[test]
+    fn multi_path_contract_requires_every_path_evidence() {
+        let key = make_key("multi-artifact work");
+        let inputs = vec![ArtifactFingerprint::Input {
+            path: "Cargo.toml".to_owned(),
+            content_hash: "h1".to_owned(),
+        }];
+        let candidate = make_candidate_with_contract(
+            key.clone(),
+            inputs.clone(),
+            "src/out.rs\nsrc/out_test.rs",
+        );
+
+        let mut projection = empty_projection();
+        // Only ONE of the two contracted paths has evidence.
+        projection.events.push(wrote_file_event("src/out.rs", 1));
+        projection.events.push(completed_event(key.hex(), "implemented", inputs, 2));
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        assert_eq!(
+            should_dispatch(&projection, &candidate),
+            DispatchDecision::Refine,
+            "an uncontracted-but-missing artifact path must force Refine"
+        );
+    }
+
+    /// Contract path backed by the completion record's OWN `files_modified`
+    /// → Reuse.
+    #[test]
+    fn contract_path_satisfied_by_files_modified_reuses() {
+        let key = make_key("record-evidence work");
+        let inputs = vec![ArtifactFingerprint::Input {
+            path: "src/a.rs".to_owned(),
+            content_hash: "h1".to_owned(),
+        }];
+        let candidate = make_candidate_with_contract(key.clone(), inputs.clone(), "src/out.rs");
+
+        let mut projection = empty_projection();
+        projection.events.push(completed_event_with_files(
+            key.hex(),
+            "implemented feature X",
+            inputs,
+            1,
+            &["src/out.rs"],
+        ));
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        assert_eq!(
+            should_dispatch(&projection, &candidate),
+            DispatchDecision::Reuse,
+            "a record that reports writing the contracted artifact is complete"
+        );
+    }
+
+    /// Contract path backed by a timeline `WroteFile` event AT the completion
+    /// order → Reuse.
+    #[test]
+    fn contract_path_satisfied_by_wrotefile_event_reuses() {
+        let key = make_key("wrotefile-evidence work");
+        let inputs = vec![ArtifactFingerprint::Input {
+            path: "src/a.rs".to_owned(),
+            content_hash: "h1".to_owned(),
+        }];
+        let candidate = make_candidate_with_contract(key.clone(), inputs.clone(), "src/out.rs");
+
+        let mut projection = empty_projection();
+        projection.events.push(wrote_file_event("src/out.rs", 1));
+        projection.events.push(completed_event(key.hex(), "implemented", inputs, 2));
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        assert_eq!(
+            should_dispatch(&projection, &candidate),
+            DispatchDecision::Reuse,
+            "a WroteFile event at or before the completion is artifact evidence"
+        );
+    }
+
+    /// A `WroteFile` from a LATER run (gate_seq > the record's) cannot back
+    /// the earlier record — evidence must precede or coincide with the
+    /// completion it justifies.
+    #[test]
+    fn later_wrotefile_event_does_not_back_earlier_record() {
+        let key = make_key("later-write work");
+        let inputs = vec![ArtifactFingerprint::Input {
+            path: "src/a.rs".to_owned(),
+            content_hash: "h1".to_owned(),
+        }];
+        let candidate = make_candidate_with_contract(key.clone(), inputs.clone(), "src/out.rs");
+
+        let mut projection = empty_projection();
+        // The completion at seq 2 claims the work done...
+        projection.events.push(completed_event(key.hex(), "implemented", inputs, 2));
+        // ...but the contracted file was only written at seq 10, by later work.
+        projection.events.push(wrote_file_event("src/out.rs", 10));
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        assert_eq!(
+            should_dispatch(&projection, &candidate),
+            DispatchDecision::Refine,
+            "a later WroteFile cannot evidence an earlier record's completeness"
+        );
+    }
+
+    /// A whitespace-bearing prose contract line is NOT treated as an artifact
+    /// path — legacy sentence contracts keep their summary-only semantics.
+    #[test]
+    fn prose_contract_line_is_not_an_artifact_path() {
+        let key = make_key("prose-contract work");
+        let inputs = vec![ArtifactFingerprint::Input {
+            path: "src/a.rs".to_owned(),
+            content_hash: "h1".to_owned(),
+        }];
+        let candidate =
+            make_candidate_with_contract(key.clone(), inputs.clone(), "src/out.rs exists");
+
+        let mut projection = empty_projection();
+        projection.events.push(completed_event(key.hex(), "implemented", inputs, 1));
+        projection.events.sort_by_key(|e| e.gate_seq());
+
+        // "src/out.rs exists" parses to zero artifact requirements → the
+        // summary alone satisfies the (unparseable) contract → Reuse.
         assert_eq!(should_dispatch(&projection, &candidate), DispatchDecision::Reuse);
     }
 }

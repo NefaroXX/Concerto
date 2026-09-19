@@ -88,6 +88,12 @@ struct PartialToolCall {
     arguments: String,
 }
 
+/// Synthetic tool-call slot used by the content-embedded envelope fallback
+/// (proxy Fix 2 STRICT). Real proxy indexes are small wire integers from the
+/// `tool_calls` array; this sentinel, combined with the empty-`partial_tools`
+/// gate, guarantees the synthesized call can never collide with a real one.
+const ENVELOPE_CALL_INDEX: usize = usize::MAX;
+
 struct OpenAiStreamState {
     parser: BufferedSseParser,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
@@ -111,6 +117,16 @@ struct OpenAiStreamState {
     /// when `stream_options.include_usage` is set). The first observed usage
     /// is attached to the terminal chunk only.
     usage: Option<CompletionUsage>,
+    /// Accumulated `content` deltas for the current turn (proxy Fix 2 STRICT —
+    /// content-embedded tool-call envelope).
+    ///
+    /// Content is buffered instead of streamed eagerly so the fallback can
+    /// judge the COMPLETE turn text with a strict full-text parse (no substring
+    /// extraction). Non-envelope content is drained as plain text at the
+    /// terminal point — identical `delta` output, just aggregated at turn end
+    /// instead of per-delta (mirrors how reasoning and tool args already
+    /// buffer to the terminal point).
+    content_buffer: String,
 }
 
 impl OpenAiStreamState {
@@ -122,6 +138,7 @@ impl OpenAiStreamState {
             tool_adapted: false,
             reasoning_buffer: String::new(),
             usage: None,
+            content_buffer: String::new(),
         }
     }
 
@@ -159,14 +176,141 @@ impl OpenAiStreamState {
         }
     }
 
+    /// Strict, full-text-only parse of the turn's accumulated `content` as a
+    /// proxy tool-call envelope (Fix 2 STRICT).
+    ///
+    /// Accepted — the ENTIRE content must be exactly one JSON object of one of
+    /// these shapes (full-text parse only, no substring extraction):
+    ///
+    ///   * `{"name": "<string>", "arguments": { … }}`       — object arguments
+    ///   * `{"name": "<string>", "arguments": "<json …>"}`  — string arguments
+    ///   * `{"name": "<string>", "input": { … }}`           — `input` alias
+    ///     (object only, consistent with the Fix 1 flat path)
+    ///
+    /// An optional string `id` member is carried through when present. Anything
+    /// else — trailing prose (the parse must consume the whole payload), JSON
+    /// arrays, missing `name`/arguments, wrong member types, `input` as a
+    /// non-object — returns `None` and the content stays plain text with zero
+    /// behavioral change. No heuristic text mining here: loose recovery from
+    /// free text is the tool guard's / driver's job.
+    fn parse_content_envelope(content: &str) -> Option<PartialToolCall> {
+        let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+        let object = parsed.as_object()?;
+        let name = object.get("name")?.as_str()?.to_string();
+        let arguments = match object.get("arguments") {
+            Some(serde_json::Value::Object(inner)) => {
+                serde_json::Value::Object(inner.clone()).to_string()
+            }
+            Some(serde_json::Value::String(inner)) => inner.clone(),
+            // `arguments` present but not Object|String → reject the envelope.
+            Some(_) => return None,
+            // `arguments` absent → `input` alias (object only, Fix 1-consistent).
+            None => {
+                let input = object.get("input")?.as_object()?;
+                serde_json::Value::Object(input.clone()).to_string()
+            }
+        };
+        let id = object.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        Some(PartialToolCall { id, name, arguments })
+    }
+
+    /// Terminal resolution of the buffered `content` (proxy Fix 2 STRICT).
+    ///
+    /// Invoked from both terminal paths (`[DONE]` and `finish_reason`) before
+    /// tools/reasoning/final are emitted:
+    ///
+    ///   * real tool deltas observed (`partial_tools` non-empty) → the
+    ///     buffered content is drained as plain text; the fallback never
+    ///     competes with real deltas (no double-emit);
+    ///   * otherwise a strict envelope match synthesizes a [`PartialToolCall`]
+    ///     at [`ENVELOPE_CALL_INDEX`], emitted by the EXISTING
+    ///     [`Self::emit_tool_call`] pipeline (strict parse with the Fix 3 retry
+    ///     chain + `Null` fallback, plus loose-schema un-flattening);
+    ///   * otherwise the content is drained as plain text — same `delta`
+    ///     payload as before, aggregated at turn end instead of per-delta.
+    ///
+    /// OpenRouter/NIM inherit this fallback through their `OpenAiProvider`
+    /// inner — no wrapper edits.
+    fn flush_content(&mut self) {
+        if self.content_buffer.is_empty() {
+            return;
+        }
+        if !self.partial_tools.is_empty() {
+            self.emit_buffered_content();
+            return;
+        }
+        let content = std::mem::take(&mut self.content_buffer);
+        if let Some(envelope) = Self::parse_content_envelope(&content) {
+            self.partial_tools.insert(ENVELOPE_CALL_INDEX, envelope);
+        } else {
+            self.pending.push_back(Ok(CompletionChunk {
+                delta: content,
+                reasoning: None,
+                tool_call: None,
+                is_final: false,
+                usage: None,
+            }));
+        }
+    }
+
+    /// Drain the turn's buffered `content` as one plain-text chunk (real tool
+    /// deltas won, or the content is not a strict envelope).
+    fn emit_buffered_content(&mut self) {
+        let content = std::mem::take(&mut self.content_buffer);
+        self.pending.push_back(Ok(CompletionChunk {
+            delta: content,
+            reasoning: None,
+            tool_call: None,
+            is_final: false,
+            usage: None,
+        }));
+    }
+
+    /// Emit the accumulated arguments for a finished tool call (proxy Fix 3).
+    ///
+    /// Empty accumulated arguments become `Null` silently. Non-empty arguments
+    /// parse strictly; if that parse fails, a short retry chain rescues the two
+    /// common proxy corruption classes — surrounding whitespace (re-parse after
+    /// trimming, the `double-wrap`/pad case) and single-quoted JSON (re-parse
+    /// after replacing `'` with `"`). The single-quote fixup is safe by
+    /// construction: it only runs after the strict parse already failed and
+    /// its result is still validated by `serde_json`, so legitimate apostrophes
+    /// inside string values that strict JSON accepts are never touched. If
+    /// every parse fails, the tool call still emits with `Null` arguments and a
+    /// `tracing::warn!` carries the tool name, the raw payload length (never
+    /// the payload itself — avoids log injection) and the original parse error.
     fn emit_tool_call(&mut self, index: usize) {
         if let Some(ptc) = self.partial_tools.remove(&index) {
-            // Empty or garbage accumulated arguments must not serialize to
-            // `"null"` / `"\"ls\""` on the wire (`HTTP 400: function.arguments
-            // must be a JSON object`) — coerce to `{}` first.
-            let mut args = crate::protocol::ensure_arguments_object(
-                serde_json::from_str(&ptc.arguments).unwrap_or(serde_json::Value::Null),
-            );
+            let mut args = if ptc.arguments.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                match serde_json::from_str(&ptc.arguments) {
+                    Ok(parsed) => parsed,
+                    Err(parse_err) => {
+                        // Proxy sent malformed JSON arguments. Try a few common
+                        // fixes before giving up.
+                        let cleaned = ptc.arguments.trim();
+                        // Some proxies double-wrap: "{"key": "val"}" → try as-is
+                        let result = serde_json::from_str(cleaned).or_else(|_| {
+                            // Some proxies send single-quoted keys
+                            let fixed = cleaned.replace('\'', "\"");
+                            serde_json::from_str(&fixed)
+                        });
+                        match result {
+                            Ok(parsed) => parsed,
+                            Err(_) => {
+                                tracing::warn!(
+                                    tool_name = %ptc.name,
+                                    raw_len = ptc.arguments.len(),
+                                    parse_error = %parse_err,
+                                    "emit_tool_call: failed to parse arguments, emitting null."
+                                );
+                                serde_json::Value::Null
+                            }
+                        }
+                    }
+                }
+            };
             // Adaptive tool schemas: when the request was rendered with loose
             // (weak-model) schemas, the model answers in the flattened
             // dot-notation shape — re-nest before the executor or the
@@ -258,6 +402,7 @@ impl OpenAiStreamState {
         };
 
         if data == "[DONE]" {
+            self.flush_content();
             self.emit_remaining_tools();
             self.emit_reasoning_if_any();
             self.pending.push_back(Ok(CompletionChunk {
@@ -296,13 +441,12 @@ impl OpenAiStreamState {
             }
 
             if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                self.pending.push_back(Ok(CompletionChunk {
-                    delta: content.to_string(),
-                    reasoning: None,
-                    tool_call: None,
-                    is_final: false,
-                    usage: None,
-                }));
+                // Buffer the turn's content instead of streaming it eagerly:
+                // the Fix 2 STRICT fallback needs the COMPLETE text to judge
+                // whether it is a tool-call envelope (full-text parse only).
+                // Non-envelope content is drained as plain text at the
+                // terminal point — identical output.
+                self.content_buffer.push_str(content);
             }
 
             if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -345,8 +489,8 @@ impl OpenAiStreamState {
                     // (b) Flat object arguments (or an `input` alias): one-shot,
                     // the complete object serializes directly and needs no chunk
                     // accumulation. `emit_tool_call` parses it through the same
-                    // `ensure_arguments_object` / loose-schema un-flattening
-                    // pipeline as every other shape.
+                    // strict-parse / Fix 3 retry chain + loose-schema
+                    // un-flattening pipeline as every other shape.
                     if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
                         let object_args = match tc.get("arguments") {
                             Some(v) => v.as_object(),
@@ -364,6 +508,7 @@ impl OpenAiStreamState {
 
         if let Some(finish_reason) = choice["finish_reason"].as_str() {
             if !finish_reason.is_empty() && finish_reason != "null" {
+                self.flush_content();
                 self.emit_remaining_tools();
                 self.emit_reasoning_if_any();
                 self.pending.push_back(Ok(CompletionChunk {
@@ -603,6 +748,37 @@ impl LlmProvider for OpenAiProvider {
 mod tests {
     use super::*;
 
+    fn sse(data: &str) -> crate::sse::SseEvent {
+        crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        }
+    }
+
+    /// Build an SSE `delta.content` event carrying `content` verbatim as a
+    /// JSON *string* (escaping handled by serde), so hand-rolled `\"` /
+    /// `\\` escapes are never needed in fixtures.
+    fn content_event(content: &str) -> crate::sse::SseEvent {
+        sse(&serde_json::json!({"choices": [{"delta": {"content": content}}]}).to_string())
+    }
+
+    fn drain(state: &mut OpenAiStreamState) -> Vec<CompletionChunk> {
+        state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect()
+    }
+
+    /// Assert that an event sequence left the content as verbatim plain text
+    /// with ONE data chunk, no synthesized tool call, and a terminal chunk.
+    fn assert_plain_text(state: &mut OpenAiStreamState, expected: &str) {
+        let chunks = drain(state);
+        assert!(chunks.iter().all(|c| c.tool_call.is_none()), "no tool call synthesized");
+        let text: Vec<&str> =
+            chunks.iter().filter(|c| !c.delta.is_empty()).map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, vec![expected], "content delivered verbatim as plain text");
+        assert!(chunks.last().unwrap().is_final, "terminal chunk present");
+    }
+
     /// ADR-46: a streamed delta carrying `reasoning_content` is captured into a
     /// `CompletionChunk::reasoning`, accumulated across deltas, and emitted
     /// once on stream end.
@@ -704,13 +880,13 @@ mod tests {
         assert!(chunks[2].tool_call.is_none());
     }
 
-    /// Tool-call arguments must always land on the canonical side as a JSON
-    /// object. Empty accumulated arguments (which previously became
-    /// `Value::Null` and later serialized to the string `"null"`) coerce to
-    /// `{}`.
+    /// Empty accumulated arguments (proxy Fix 3) become `Null` — they never
+    /// take the retry chain and never fire the diagnostic `warn!`.
     #[test]
-    fn stream_empty_arguments_coerce_to_empty_object() {
+    fn stream_empty_arguments_emit_null_without_warn() {
         let mut state = OpenAiStreamState::new();
+        let subscriber = WarnSink::default();
+        let sink = subscriber.clone();
         let event = |data: &str| crate::sse::SseEvent {
             event: None,
             data: Some(data.to_string()),
@@ -718,24 +894,29 @@ mod tests {
             keepalive: false,
         };
 
-        state.handle_event(event(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}"#,
-        ));
-        state.handle_event(event("[DONE]"));
+        tracing::subscriber::with_default(subscriber, || {
+            state.handle_event(event(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}"#,
+            ));
+            state.handle_event(event("[DONE]"));
+        });
 
         let chunks: Vec<CompletionChunk> =
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
-        assert!(tool.arguments.is_object(), "arguments must be a JSON object");
-        assert_eq!(tool.arguments, serde_json::json!({}));
+        assert_eq!(tool.arguments, serde_json::Value::Null, "empty args emit Null");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(sink.warns().len(), 0, "empty args must not emit a parse-failure warning");
     }
 
-    /// A raw string delivered as valid JSON (`"ls"`) is *not* a JSON object,
-    /// which the upstream schema requires — coerce to `{}`, never pass it
-    /// through as the string verbatim.
+    /// A raw string delivered as valid JSON (`"ls"`) parses successfully, so
+    /// Fix 3's success path returns the parsed value directly (no `{ }`
+    /// coercion) and emits no diagnostic.
     #[test]
-    fn stream_non_object_string_arguments_coerce_to_empty_object() {
+    fn stream_non_object_string_arguments_pass_through() {
         let mut state = OpenAiStreamState::new();
+        let subscriber = WarnSink::default();
+        let sink = subscriber.clone();
         let event = |data: &str| crate::sse::SseEvent {
             event: None,
             data: Some(data.to_string()),
@@ -743,19 +924,21 @@ mod tests {
             keepalive: false,
         };
 
-        state.handle_event(event(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"\"ls\""}}]}}]}"#,
-        ));
-        state.handle_event(event("[DONE]"));
+        tracing::subscriber::with_default(subscriber, || {
+            state.handle_event(event(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"\"ls\""}}]}}]}"#,
+            ));
+            state.handle_event(event("[DONE]"));
+        });
 
         let chunks: Vec<CompletionChunk> =
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
-        assert!(tool.arguments.is_object(), "arguments must be a JSON object");
-        assert_eq!(tool.arguments, serde_json::json!({}));
+        assert_eq!(tool.arguments, serde_json::json!("ls"), "valid JSON passes through verbatim");
+        assert_eq!(sink.warns().len(), 0, "no warning on a parseable payload");
     }
 
-    /// A well-formed object argument passes through the normalizer unchanged.
+    /// A well-formed object argument parses directly and passes through unchanged.
     #[test]
     fn stream_object_arguments_are_preserved() {
         let mut state = OpenAiStreamState::new();
@@ -1114,5 +1297,388 @@ mod tests {
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         assert_eq!(chunks.len(), 1, "only the final chunk");
         assert!(chunks[0].is_final);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Proxy Fix 2 STRICT — content-embedded tool-call envelope
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Accepted shape (a): the proxy embeds a complete tool call as a JSON
+    /// object in the content text. Because the ENTIRE content is exactly the
+    /// envelope, it becomes a real tool call and the raw text is NOT echoed as
+    /// a separate content chunk (no text+call double representation).
+    #[test]
+    fn content_envelope_object_arguments_becomes_tool_call() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","arguments":{"command":"ls"}}"#));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+        assert!(chunks.iter().all(|c| c.delta.is_empty()), "envelope must not be echoed as text");
+        assert!(chunks.last().unwrap().is_final);
+    }
+
+    /// Accepted shape (b): `arguments` delivered as a JSON *string* flows
+    /// through the same `emit_tool_call` parse (Fix 3) as every other
+    /// shape.
+    #[test]
+    fn content_envelope_string_arguments_becomes_tool_call() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","arguments":"{\"command\":\"ls\"}"}"#));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object(), "arguments must land as a JSON object");
+    }
+
+    /// Accepted shape (c): the `input` alias for arguments (object only),
+    /// consistent with the Fix 1 flat path.
+    #[test]
+    fn content_envelope_input_alias_becomes_tool_call() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","input":{"command":"ls"}}"#));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+    }
+
+    /// A synthesized envelope still runs through the EXISTING emit pipeline,
+    /// so loose-schema un-flattening applies on adapted streams exactly as it
+    /// does to real deltas.
+    #[test]
+    fn content_envelope_unflattens_when_adapted() {
+        let mut state = OpenAiStreamState::new();
+        state.tool_adapted = true;
+        state.handle_event(content_event(
+            r#"{"name":"runner","arguments":{"config.mode":"fast","config.retries":2}}"#,
+        ));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.name, "runner");
+        assert_eq!(
+            tool.arguments,
+            serde_json::json!({"config": {"mode": "fast", "retries": 2}}),
+            "dotted arguments must be re-nested on adapted streams"
+        );
+    }
+
+    /// NEG: prose that merely contains a JSON-ish example must stay plain text
+    /// — the full-text parse cannot consume the whole payload (no substring
+    /// mining).
+    #[test]
+    fn content_prose_with_json_example_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        let prose =
+            r#"For example, call {"name": "shell", "arguments": {"command": "ls"}} to list files."#;
+        state.handle_event(content_event(prose));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, prose);
+    }
+
+    /// NEG: an envelope followed by trailing prose — the full-text parse
+    /// fails, so the whole content stays text.
+    #[test]
+    fn content_envelope_with_trailing_prose_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        let content = r#"{"name": "shell", "arguments": {"command": "ls"}} and that's it"#;
+        state.handle_event(content_event(content));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, content);
+    }
+
+    /// NEG: a mixed turn — content text whose entire payload LOOKS like an
+    /// envelope PLUS real structured tool deltas. The real deltas win: the
+    /// content stays plain text and exactly one tool call (the real one) is
+    /// emitted. No envelope synthesis, no double-emit.
+    #[test]
+    fn content_text_with_real_tool_deltas_prefers_real_deltas() {
+        let mut state = OpenAiStreamState::new();
+        let envelope_text = r#"{"name":"shell","arguments":{"command":"ls"}}"#;
+        state.handle_event(sse(&serde_json::json!({
+            "choices": [{"delta": {
+                "content": envelope_text,
+                "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                "function": {"name": "runner", "arguments": ""}}]
+            }}]
+        })
+        .to_string()));
+        state.handle_event(sse(&serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": r#"{"suite":"demo"}"#}}]}}]
+        })
+        .to_string()));
+        state.handle_event(sse("[DONE]"));
+
+        let chunks = drain(&mut state);
+        let text: Vec<&str> =
+            chunks.iter().filter(|c| !c.delta.is_empty()).map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, vec![envelope_text], "content stays plain text with real tool deltas");
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one tool call — the real delta, no synthesized envelope"
+        );
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "runner");
+        assert_eq!(calls[0].arguments, serde_json::json!({"suite": "demo"}));
+        assert!(chunks.last().unwrap().is_final);
+    }
+
+    /// NEG: a top-level JSON array is not an envelope.
+    #[test]
+    fn content_array_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        let content =
+            serde_json::json!([{"name": "shell", "arguments": {"command": "ls"}}]).to_string();
+        state.handle_event(content_event(&content));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, &content);
+    }
+
+    /// NEG: an object without a string `name` is not an envelope.
+    #[test]
+    fn content_object_missing_name_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"arguments":{"command":"ls"}}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"arguments":{"command":"ls"}}"#);
+    }
+
+    /// NEG: an object without any arguments/`input` member is not an envelope.
+    #[test]
+    fn content_object_missing_arguments_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell"}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"name":"shell"}"#);
+    }
+
+    /// NEG: `arguments` must be Object|String — a number is rejected.
+    #[test]
+    fn content_wrong_argument_type_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","arguments":42}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"name":"shell","arguments":42}"#);
+    }
+
+    /// NEG: `input` mirrors Fix 1 — object only, so a string `input` is
+    /// rejected.
+    #[test]
+    fn content_input_alias_string_stays_text() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(content_event(r#"{"name":"shell","input":"{\"command\":\"ls\"}"}"#));
+        state.handle_event(sse("[DONE]"));
+        assert_plain_text(&mut state, r#"{"name":"shell","input":"{\"command\":\"ls\"}"}"#);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Proxy Fix 3 — diagnostic logging + retry in `emit_tool_call`
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The Fix 3 diagnostic fields extracted from a captured WARN event:
+    /// `tool_name`, `raw_len` (the payload length, never the raw payload) and
+    /// `parse_error` (the first strict-parse failure).
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarn {
+        tool_name: Option<String>,
+        raw_len: Option<u64>,
+        parse_error: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct FieldCapture {
+        tool_name: Option<String>,
+        raw_len: Option<u64>,
+        parse_error: Option<String>,
+    }
+
+    impl From<FieldCapture> for CapturedWarn {
+        fn from(c: FieldCapture) -> Self {
+            Self { tool_name: c.tool_name, raw_len: c.raw_len, parse_error: c.parse_error }
+        }
+    }
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "tool_name" => self.tool_name = Some(value.to_string()),
+                "parse_error" => self.parse_error = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "raw_len" {
+                self.raw_len = Some(value);
+            }
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            if field.name() == "raw_len" {
+                self.raw_len = Some(value as u64);
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // `%field` (Display) values reach `record_debug` Display-wrapped,
+            // so their `{:?}` representation is the formatted text.
+            let formatted = format!("{value:?}");
+            match field.name() {
+                "tool_name" => self.tool_name = Some(formatted),
+                "parse_error" => self.parse_error = Some(formatted),
+                _ => {}
+            }
+        }
+    }
+
+    /// Minimal `tracing::Subscriber` that collects WARN events while a closure
+    /// runs under `tracing::subscriber::with_default`, so Fix 3's diagnostic
+    /// — and its absence on the empty/valid/recovered paths — can be asserted
+    /// without pulling `tracing-subscriber` into dev-dependencies.
+    #[derive(Clone, Default)]
+    struct WarnSink {
+        warns: std::sync::Arc<std::sync::Mutex<Vec<CapturedWarn>>>,
+    }
+
+    impl WarnSink {
+        fn warns(&self) -> Vec<CapturedWarn> {
+            self.warns.lock().expect("warn capture mutex poisoned").clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnSink {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            tracing::Id::from_u64(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().level() == &tracing::Level::WARN {
+                let mut capture = FieldCapture::default();
+                event.record(&mut capture);
+                self.warns.lock().expect("warn capture mutex poisoned").push(capture.into());
+            }
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    /// Reduce one whole tool-call turn — a single `arguments` fragment for
+    /// `index 0` / `call_1` / `shell`, then `[DONE]` — under a [`WarnSink`]
+    /// subscriber, returning the emitted chunks and the captured warnings.
+    fn tool_call_turn(arguments: &str) -> (Vec<CompletionChunk>, WarnSink) {
+        let mut state = OpenAiStreamState::new();
+        let subscriber = WarnSink::default();
+        let sink = subscriber.clone();
+        let start = serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "shell", "arguments": arguments}}]}}]
+        })
+        .to_string();
+        tracing::subscriber::with_default(subscriber, || {
+            state.handle_event(sse(&start));
+            state.handle_event(sse("[DONE]"));
+        });
+        (drain(&mut state), sink)
+    }
+
+    /// Fix 3 — malformed arguments: every parse in the retry chain fails, so
+    /// the tool call still emits with `Null` arguments (no panic) and the
+    /// `tracing::warn!` fires with `tool_name`, `raw_len` and `parse_error`.
+    #[test]
+    fn stream_malformed_args_emit_null_and_warn() {
+        let payload = "this is not json";
+        let (chunks, sink) = tool_call_turn(payload);
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "shell");
+        assert_eq!(tool.arguments, serde_json::Value::Null, "unrecoverable args emit Null");
+        assert!(chunks.len() >= 2, "tool-call chunk + terminal chunk");
+        assert!(chunks.last().unwrap().is_final, "terminal chunk still emitted");
+
+        let warns = sink.warns();
+        assert_eq!(warns.len(), 1, "exactly one diagnostic warning");
+        assert_eq!(warns[0].tool_name.as_deref(), Some("shell"));
+        assert_eq!(warns[0].raw_len, Some(payload.len() as u64), "raw_len, not raw payload");
+        assert!(warns[0].parse_error.is_some(), "first strict-parse error attached");
+    }
+
+    /// Fix 3 — single-quote fixup recovery: the strict parse fails on
+    /// single-quoted JSON, the `'` → `"` fixup rescues it into a real object,
+    /// and no warning fires.
+    #[test]
+    fn stream_single_quote_args_are_recovered() {
+        let (chunks, sink) = tool_call_turn("{'command': 'ls'}");
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+        assert_eq!(sink.warns().len(), 0, "recovery succeeds silently");
+    }
+
+    /// Fix 3 — double-wrap/trim recovery: the payload carries surrounding
+    /// whitespace (exercising the trim re-parse) AND single quotes (the fixup
+    /// re-parse); the chained retries on the trimmed text recover the object.
+    #[test]
+    fn stream_double_wrapped_trim_args_are_recovered() {
+        let (chunks, sink) = tool_call_turn("  {'command': 'ls'}  ");
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+        assert_eq!(sink.warns().len(), 0, "recovery succeeds silently");
+    }
+
+    /// NEG — a valid JSON payload passes through byte-for-byte with no warning:
+    /// Fix 3 must not perturb the success path.
+    #[test]
+    fn stream_valid_json_arguments_unchanged() {
+        let (chunks, sink) = tool_call_turn(r#"{"command":"ls"}"#);
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
+        assert!(tool.arguments.is_object());
+        assert_eq!(sink.warns().len(), 0, "no warning on a valid payload");
+    }
+
+    /// NEG — legitimate apostrophes inside double-quoted string values are
+    /// valid JSON, so the strict parse succeeds and the single-quote fixup
+    /// never runs (the apostrophe-corruption risk identified in the spec is
+    /// mitigated by construction). The payload is preserved verbatim.
+    #[test]
+    fn stream_string_values_with_apostrophes_are_preserved() {
+        let (chunks, sink) = tool_call_turn(r#"{"message": "it's fine"}"#);
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.arguments, serde_json::json!({"message": "it's fine"}));
+        assert!(tool.arguments.is_object());
+        assert_eq!(sink.warns().len(), 0, "valid JSON with apostrophes is untouched");
     }
 }

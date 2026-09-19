@@ -5,7 +5,7 @@
 > This graph describes dependency edges, not feature completeness. Known
 > incomplete integrations are listed in `docs/STATUS.md`.
 
-## 24-Crate Dependency Graph
+## 25-Crate Dependency Graph
 
 ```mermaid
 graph TD
@@ -33,6 +33,7 @@ graph TD
     testwasm[test-plugin-wasm]
     testadapter[test-adapter-plugin-wasm]
     testprovider[test-provider-plugin-wasm]
+    testdialect[test-dialect-plugin-wasm]
 
     config --> core
     apitypes --> core
@@ -113,6 +114,7 @@ graph TD
     testwasm --> pluginsdk
     testadapter --> pluginsdk
     testprovider --> pluginsdk
+    testdialect --> pluginsdk
 ```
 
 ## Dependency Listing (by crate)
@@ -160,6 +162,7 @@ Each entry lists only internal workspace dependencies (external crates omitted f
 
 ### Examples
 - **test-plugin-wasm** → `plugin-sdk`
+- **test-dialect-plugin-wasm** → `plugin-sdk`
 
 ## Notes
 
@@ -171,6 +174,7 @@ Each entry lists only internal workspace dependencies (external crates omitted f
   `api-types` for the shared manifest types (no `config` dependency), and `mcp`
   depends on `api-types`, `config`, and `core`; both stay below the
   orchestrator, which consumes them at runtime.
-- `test-plugin-wasm` requires the `wasm32-wasip2` Rust target to build.
-- `lsp` is a library dependency island today; its tools are not registered by
-  the default desktop or CLI runtime.
+- `test-plugin-wasm` and `test-dialect-plugin-wasm` require the
+  `wasm32-wasip2` Rust target to build.
+- `lsp` tools are registered unconditionally in the agent tool registry
+  (`runtime_runner.rs:1715-1722`); the LSP server starts lazily on first use.

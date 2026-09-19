@@ -9,7 +9,7 @@ A pure-Rust Cargo workspace (crates/): a local-first, policy-governed AI coding
 agent. `concerto-core` is the foundation; everything depends upward on it. There
 is **no TypeScript/Bun code** despite earlier plans — don't look for it.
 
-## Workspace layout (24 crates)
+## Workspace layout (25 crates)
 All members live under `crates/` and depend upward on `concerto-core`.
 - `core` — traits, `EventBus`, `SimplePolicyEngine`, `ToolExecutor`, error taxonomy
 - `providers` — LLM providers + factory/routing: OpenAI, Anthropic, Google, OpenRouter, Ollama, Nvidia NIM, OpenCode Zen
