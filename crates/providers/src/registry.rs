@@ -70,6 +70,13 @@ impl ProviderRegistry {
     /// | fireworks  | ~$0.001                  |
     /// | cerebras   | ~$0.001                  |
     /// | cohere     | ~$0.004                  |
+    /// | deepinfra  | ~$0.000                  |
+    /// | perplexity | ~$0.006                  |
+    /// | sambanova  | ~$0.001                  |
+    /// | dashscope  | ~$0.001                  |
+    /// | moonshot   | ~$0.003                  |
+    /// | zhipu      | ~$0.001                  |
+    /// | novita     | ~$0.000                  |
     pub fn routing_profiles(&self) -> Vec<RoutingProfile> {
         self.providers
             .iter()
@@ -95,6 +102,16 @@ impl ProviderRegistry {
                     "fireworks" => (0.0009, 400),
                     "cerebras" => (0.0009, 250),
                     "cohere" => (0.004, 900),
+                    // Tier-2 OpenAI-compatible providers (blended 3:1
+                    // in:out representative flagship pricing) — kept in
+                    // lockstep with `ProviderFactory::build_profiles`.
+                    "deepinfra" => (0.0002, 600),
+                    "perplexity" => (0.006, 500),
+                    "sambanova" => (0.0008, 700),
+                    "dashscope" => (0.0006, 700),
+                    "moonshot" => (0.003, 700),
+                    "zhipu" => (0.001, 600),
+                    "novita" => (0.0003, 800),
                     _ => (0.005, 500),
                 };
                 RoutingProfile {
@@ -302,6 +319,32 @@ mod tests {
             ("fireworks", 0.0009),
             ("cerebras", 0.0009),
             ("cohere", 0.004),
+        ];
+        for (name, _) in expected {
+            reg.register(Box::new(MockProvider { name, behavior: MockBehavior::Success }), None);
+        }
+
+        let profiles = reg.routing_profiles();
+        assert_eq!(profiles.len(), expected.len());
+        for (name, cost) in expected {
+            let profile = profiles.iter().find(|p| p.provider == name).unwrap();
+            assert_eq!(profile.cost_per_1k_tokens, cost, "{name} cost mismatch");
+        }
+    }
+
+    /// The Tier-2 OpenAI-compatible routing cost table stays in exact lockstep
+    /// with `ProviderFactory::build_profiles` (same blended 3:1 pricing).
+    #[test]
+    fn routing_profiles_tier2_costs_match_factory() {
+        let mut reg = ProviderRegistry::new();
+        let expected = [
+            ("deepinfra", 0.0002),
+            ("perplexity", 0.006),
+            ("sambanova", 0.0008),
+            ("dashscope", 0.0006),
+            ("moonshot", 0.003),
+            ("zhipu", 0.001),
+            ("novita", 0.0003),
         ];
         for (name, _) in expected {
             reg.register(Box::new(MockProvider { name, behavior: MockBehavior::Success }), None);

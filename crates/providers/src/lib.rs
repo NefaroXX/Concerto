@@ -26,19 +26,26 @@ pub mod anthropic;
 pub mod capability;
 pub mod cerebras;
 pub mod cohere;
+pub mod dashscope;
+pub mod deepinfra;
 pub mod deepseek;
 pub mod fireworks;
 pub mod google;
 pub mod groq;
 pub mod mistral;
+pub mod moonshot;
 pub mod nim;
+pub mod novita;
 pub mod ollama;
 pub mod openai;
 pub mod opencode;
 pub mod openrouter;
+pub mod perplexity;
+pub mod sambanova;
 pub mod sse;
 pub mod together;
 pub mod xai;
+pub mod zhipu;
 
 #[cfg(test)]
 pub mod testing;
@@ -232,6 +239,80 @@ pub async fn list_models_for_provider_async(
                 String::new(),
                 DEFAULT_TIMEOUT_SECS,
             );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "dashscope" => {
+            let mut p = dashscope::DashScopeProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "deepinfra" => {
+            let mut p = deepinfra::DeepInfraProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "moonshot" => {
+            let mut p = moonshot::MoonshotProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "novita" => {
+            let mut p = novita::NovitaProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "perplexity" => {
+            let mut p = perplexity::PerplexityProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "sambanova" => {
+            let mut p = sambanova::SambaNovaProvider::new(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+            );
+            if let Some(base) = api_base {
+                p = p.with_api_base(base.to_string());
+            }
+            p.list_models(cancel.clone()).await
+        }
+        "zhipu" => {
+            let mut p =
+                zhipu::ZhipuProvider::new(api_key.to_string(), String::new(), DEFAULT_TIMEOUT_SECS);
             if let Some(base) = api_base {
                 p = p.with_api_base(base.to_string());
             }

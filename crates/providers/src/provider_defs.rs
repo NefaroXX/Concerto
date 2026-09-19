@@ -90,6 +90,40 @@ const FIREWORKS_KNOWN: &[&str] = &[
 const CEREBRAS_KNOWN: &[&str] = &["llama-3.3-70b", "gpt-oss-120b", "llama3.1-8b", "qwen-3-32b"];
 const COHERE_KNOWN: &[&str] =
     &["command-a-plus-05-2026", "command-a", "command-r-plus-08-2024", "command-r-08-2024"];
+// DeepInfra — api.deepinfra.com model IDs
+const DEEPINFRA_KNOWN: &[&str] = &[
+    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "deepseek-ai/DeepSeek-V3.2",
+];
+// Perplexity — api.perplexity.ai model IDs. `sonar` stays selectable even
+// though its legacy Chat Completions surface is deprecated (2026-09-27).
+const PERPLEXITY_KNOWN: &[&str] = &["sonar", "sonar-pro", "sonar-reasoning-pro"];
+// SambaNova — api.sambanova.ai model IDs
+const SAMBANOVA_KNOWN: &[&str] = &[
+    "Meta-Llama-3.3-70B-Instruct",
+    "DeepSeek-V3.1",
+    "MiniMax-M2.7",
+    "MiniMax-M3",
+    "gemma-4-31B-it",
+    "gpt-oss-120b",
+];
+// Alibaba DashScope — dashscope.aliyuncs.com compatible-mode model IDs (Qwen)
+const DASHSCOPE_KNOWN: &[&str] =
+    &["qwen-plus", "qwen-turbo", "qwen-max", "qwen3-max", "qwen3-235b-a22b-instruct"];
+// Moonshot AI — api.moonshot.cn model IDs. The discontinued `kimi-k2` family
+// is intentionally absent; only live identifiers ship (kimi-k2.5/k2.6/k3 plus
+// the moonshot-v1 legacy line still served by the platform).
+const MOONSHOT_KNOWN: &[&str] =
+    &["kimi-k2.6", "kimi-k2.5", "kimi-k3", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"];
+// Zhipu AI — open.bigmodel.cn model IDs (GLM)
+const ZHIPU_KNOWN: &[&str] = &["glm-4.7", "glm-4.6", "glm-4.5", "glm-4-plus", "glm-4-flash-250414"];
+// Novita AI is shipped discovery-driven: no stable hand-verifiable model ID
+// list exists for its OpenAI-compatible surface, so no static catalog and no
+// default model are hard-coded (custom entry + live discovery cover the long
+// tail).
+const NOVITA_KNOWN: &[&str] = &[];
 
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///
@@ -233,6 +267,69 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             model_discovery: ModelDiscoverySupport::Supported,
             allows_custom_model: true,
         },
+        "deepinfra" => ProviderDefinition {
+            id: "deepinfra",
+            display_name: String::from("DeepInfra"),
+            default_model: Some("meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"),
+            known_models: DEEPINFRA_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "perplexity" => ProviderDefinition {
+            id: "perplexity",
+            display_name: String::from("Perplexity"),
+            default_model: Some("sonar-pro"),
+            known_models: PERPLEXITY_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "sambanova" => ProviderDefinition {
+            id: "sambanova",
+            display_name: String::from("SambaNova"),
+            default_model: Some("Meta-Llama-3.3-70B-Instruct"),
+            known_models: SAMBANOVA_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "dashscope" => ProviderDefinition {
+            id: "dashscope",
+            display_name: String::from("Alibaba (Qwen)"),
+            default_model: Some("qwen-plus"),
+            known_models: DASHSCOPE_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "moonshot" => ProviderDefinition {
+            id: "moonshot",
+            display_name: String::from("Moonshot (Kimi)"),
+            default_model: Some("kimi-k2.6"),
+            known_models: MOONSHOT_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "zhipu" => ProviderDefinition {
+            id: "zhipu",
+            display_name: String::from("Zhipu (GLM)"),
+            default_model: Some("glm-4.7"),
+            known_models: ZHIPU_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        "novita" => ProviderDefinition {
+            id: "novita",
+            display_name: String::from("Novita AI"),
+            default_model: None,
+            known_models: NOVITA_KNOWN,
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
         _ => ProviderDefinition {
             id: "<unknown>",
             display_name: provider_type.to_string(),
@@ -262,6 +359,13 @@ pub const PROVIDER_TYPE_IDS: &[&str] = &[
     "fireworks",
     "cerebras",
     "cohere",
+    "deepinfra",
+    "perplexity",
+    "sambanova",
+    "dashscope",
+    "moonshot",
+    "zhipu",
+    "novita",
 ];
 
 /// Discovered model catalog for a provider.
@@ -540,6 +644,36 @@ mod tests {
                 "{id} default model must be part of its known-model catalog"
             );
         }
+    }
+
+    /// Every Tier-2 OpenAI-compatible provider is fully defined: key-required,
+    /// discovery-supported, custom-model-allowed. All but the
+    /// discovery-driven Novita ship a default model and a hand-maintained
+    /// catalog of real API model IDs.
+    #[test]
+    fn tier2_openai_compatible_definitions_are_complete() {
+        for id in ["deepinfra", "perplexity", "sambanova", "dashscope", "moonshot", "zhipu"] {
+            let def = provider_definition(id);
+            assert_eq!(def.id, id);
+            assert_eq!(def.credential_requirement, CredentialRequirement::Required);
+            assert_eq!(def.model_discovery, ModelDiscoverySupport::Supported);
+            assert!(def.allows_custom_model);
+            assert!(def.default_model.is_some(), "{id} must have a default model");
+            assert!(!def.known_models.is_empty(), "{id} must ship a known-model catalog");
+            assert!(
+                def.default_model.is_some_and(|default| def.known_models.contains(&default)),
+                "{id} default model must be part of its known-model catalog"
+            );
+        }
+        // Novita: discovery-driven — key-required and discovery-supported, but
+        // no static catalog or default model (no speculative IDs shipped).
+        let novita = provider_definition("novita");
+        assert_eq!(novita.id, "novita");
+        assert_eq!(novita.credential_requirement, CredentialRequirement::Required);
+        assert_eq!(novita.model_discovery, ModelDiscoverySupport::Supported);
+        assert!(novita.allows_custom_model);
+        assert!(novita.default_model.is_none());
+        assert!(novita.known_models.is_empty());
     }
 
     #[test]
