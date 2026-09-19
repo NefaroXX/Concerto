@@ -14,7 +14,7 @@ use concerto_config::{
     CustomAgentConfig, FallbackPersonaDef, PromptSections, StageKind,
 };
 use concerto_core::error::ProviderError;
-use concerto_core::event::{EventBus, EventKind};
+use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
 use concerto_core::memory::{
@@ -2490,6 +2490,7 @@ impl CoordinatorAgent {
                     profile.profile.provider,
                     model_name
                 ),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -2518,6 +2519,7 @@ impl CoordinatorAgent {
                     model_name,
                     start.elapsed().as_millis()
                 ),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -2572,6 +2574,9 @@ impl CoordinatorAgent {
                         } else {
                             format!("Subtask failed: {error_string}")
                         },
+                        // Terminal failure is a bucket digest (Headline);
+                        // cancellation stays Detail with the other internals.
+                        kind: if cancelled { ThinkingKind::Detail } else { ThinkingKind::Headline },
                     },
                 );
                 let lifecycle_event = if cancelled {
@@ -3438,7 +3443,11 @@ impl CoordinatorAgent {
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
-            EventKind::AgentThought { agent_id: "coordinator".into(), content: message.into() },
+            EventKind::AgentThought {
+                agent_id: "coordinator".into(),
+                content: message.into(),
+                kind: ThinkingKind::Detail,
+            },
         );
     }
 
@@ -5145,6 +5154,7 @@ impl CoordinatorAgent {
                         EventKind::AgentThought {
                             agent_id: "coordinator".into(),
                             content: format!("Task scheduling ranked the ready batch: {summary}"),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                 }
@@ -5255,6 +5265,7 @@ impl CoordinatorAgent {
                                              (semantic_key={}, reason: {})",
                                             audit.semantic_key_hex, audit.reason,
                                         ),
+                                        kind: ThinkingKind::Detail,
                                     },
                                 );
                                 // 7. Add a working-memory decision so the
@@ -5712,6 +5723,7 @@ impl CoordinatorAgent {
                                     content: format!(
                                         "Retrying {role} subtask {task_id} after recoverable failure (attempt {attempt}/{}): {e}", self.max_subtask_attempts
                                     ),
+                                    kind: ThinkingKind::Detail,
                                 });
                                 continue;
                             }
@@ -5780,6 +5792,7 @@ impl CoordinatorAgent {
                                                 "Escalating {role} subtask {task_id} — escalation retry \
                                              (attempt {attempt}/{} exhausted)", self.max_subtask_attempts
                                             ),
+                                            kind: ThinkingKind::Detail,
                                         },
                                     );
                                     continue;
@@ -6094,6 +6107,7 @@ impl CoordinatorAgent {
                                                 content: format!(
                                                     "Design redesign complete. Spawning new implementation subtask {new_coder_id} for re-implementation."
                                                 ),
+                                                kind: ThinkingKind::Detail,
                                             },
                                         );
                                     }
@@ -6174,6 +6188,7 @@ impl CoordinatorAgent {
                                     content: format!(
                                         "Coder subtask {task_id} completed with no file changes; queuing revision without running the review cycle."
                                     ),
+                                    kind: ThinkingKind::Detail,
                                 },
                             );
                             recoverable_notes.push(format!(
@@ -6269,6 +6284,7 @@ impl CoordinatorAgent {
                                 content: format!(
                                     "Retrying {role} subtask {task_id} with failure feedback (attempt {attempt}/{}): {error}", self.max_subtask_attempts
                                 ),
+                                kind: ThinkingKind::Detail,
                             });
                             continue;
                         }
@@ -6313,6 +6329,7 @@ impl CoordinatorAgent {
                                      (attempt {attempt}/{} exhausted, role-based)",
                                         self.max_subtask_attempts
                                     ),
+                                    kind: ThinkingKind::Detail,
                                 },
                             );
                             continue;
@@ -6400,6 +6417,7 @@ impl CoordinatorAgent {
                                         content: format!(
                                             "Implement subtask {task_id} exhausted attempts producing expected artifacts. Escalating to {design_role} for redesign (replan #1)."
                                         ),
+                                        kind: ThinkingKind::Detail,
                                     },
                                 );
                                 continue;
@@ -8107,6 +8125,9 @@ impl CoordinatorAgent {
     /// - the DesignDoc verifier chain (ADR-65 §5) — an OPTIONAL policy-gated
     ///   check the loop runs when the Coordinator's call produces a
     ///   DesignDoc, never a mandatory stage.
+    /// - score-accordion V2: decision-loop `AgentThought`s carry a
+    ///   `ThinkingKind` tier (dispatch/start `Headline`, tool reasoning and
+    ///   completion/failure notes `Detail`).
     async fn decompose_task(
         &mut self,
         task: &AgentTask,
@@ -8724,6 +8745,7 @@ impl CoordinatorAgent {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("completed")
                         ),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 messages.push(Message {
@@ -8802,6 +8824,7 @@ impl CoordinatorAgent {
                             EventKind::AgentThought {
                                 agent_id: "coordinator".into(),
                                 content: nudge.clone(),
+                                kind: ThinkingKind::Detail,
                             },
                         );
                         messages.push(Message {
@@ -8830,6 +8853,7 @@ impl CoordinatorAgent {
                         EventKind::AgentThought {
                             agent_id: "coordinator".into(),
                             content: nudge.clone(),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     messages.push(Message {
@@ -8854,6 +8878,7 @@ impl CoordinatorAgent {
                         EventKind::AgentThought {
                             agent_id: "coordinator".into(),
                             content: note.clone(),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     ledger.notes.push(note);
@@ -9388,6 +9413,7 @@ impl CoordinatorAgent {
                         EventKind::AgentThought {
                             agent_id: "coordinator".into(),
                             content: note.clone(),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     ledger.notes.push(note);
@@ -12090,7 +12116,11 @@ impl CoordinatorAgent {
         let _ = self.bus.publish_for_session(
             session_id,
             task_id.map(|id| id.0).unwrap_or_default(),
-            EventKind::AgentThought { agent_id: "coordinator".into(), content: brief.clone() },
+            EventKind::AgentThought {
+                agent_id: "coordinator".into(),
+                content: brief.clone(),
+                kind: ThinkingKind::Detail,
+            },
         );
         let Some(pool) = self.review_store.as_ref() else { return };
         let event = NewWhiteboardEvent {

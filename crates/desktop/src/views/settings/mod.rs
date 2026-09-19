@@ -272,6 +272,12 @@ impl State {
                 Message::FontSizeChanged,
                 |v| format!("{:.0}px", v),
             ),
+            checkbox(self.reduced_motion)
+                .label("Reduced motion (skip pulse, emphasis, handoff hold, line wipe)")
+                .on_toggle(Message::ReducedMotionToggled),
+            checkbox(self.scanline_overlay_enabled)
+                .label("Scanline overlay behind chat (default off)")
+                .on_toggle(Message::ScanlineOverlayToggled),
         ]
         .spacing(SPACING_SM);
         let display_section =

@@ -37,7 +37,7 @@ use std::sync::Arc;
 use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
-use concerto_core::event::{EventBus, EventKind};
+use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
@@ -470,6 +470,7 @@ impl GenericSpecialistAgent {
             EventKind::AgentThought {
                 agent_id: agent_id.to_string(),
                 content: format!("Starting {} for task {}", self.name, task.id),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -524,6 +525,7 @@ impl GenericSpecialistAgent {
                         "tool_driver: fallback engaged (provider '{}', model '{model}')",
                         self.provider.provider_name()
                     ),
+                    kind: ThinkingKind::Detail,
                 },
             );
             self.record_tool_driver_event(
@@ -634,6 +636,7 @@ impl GenericSpecialistAgent {
                     EventKind::AgentThought {
                         agent_id: agent_id.to_string(),
                         content: tool_execution_description(&tool_call.name, &tool_call.arguments),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 // Tool-call guard (VALIDATE → COERCE → INFER → EXTRACT →
@@ -658,6 +661,7 @@ impl GenericSpecialistAgent {
                             EventKind::AgentThought {
                                 agent_id: agent_id.to_string(),
                                 content: content.clone(),
+                                kind: ThinkingKind::Detail,
                             },
                         );
                         messages.push(Message {
@@ -867,6 +871,7 @@ impl GenericSpecialistAgent {
                                     iteration + 1,
                                     MAX_TOOL_ITERATIONS
                                 ),
+                                kind: ThinkingKind::Detail,
                             },
                         );
                         messages.push(Message {
@@ -907,6 +912,7 @@ impl GenericSpecialistAgent {
             EventKind::AgentThought {
                 agent_id: agent_id.to_string(),
                 content: format!("{} finished ({tokens_in} in, {tokens_out} out)", self.name),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -1177,6 +1183,7 @@ impl GenericSpecialistAgent {
                                 "tool_driver: fallback turn — {} tool call(s) parsed",
                                 calls.len()
                             ),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     self.record_tool_driver_event(
@@ -1221,6 +1228,7 @@ impl GenericSpecialistAgent {
                             content: format!(
                                 "tool_driver: fallback repair attempt {attempts}: {reason}"
                             ),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     self.record_tool_driver_event(
@@ -1298,6 +1306,7 @@ impl GenericSpecialistAgent {
             EventKind::AgentThought {
                 agent_id: agent_id.to_string(),
                 content: format!("Starting validation for task {}", task.id),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -1312,6 +1321,7 @@ impl GenericSpecialistAgent {
                         "[system_instructions]\n{}",
                         self.prompt_sections.system_instructions
                     ),
+                    kind: ThinkingKind::LowLevel,
                 },
             );
         }
@@ -1352,6 +1362,7 @@ impl GenericSpecialistAgent {
                     EventKind::AgentThought {
                         agent_id: agent_id.to_string(),
                         content: format!("Validation failed: {e}"),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 return Ok(AgentRunResult {
@@ -1386,7 +1397,11 @@ impl GenericSpecialistAgent {
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
-            EventKind::AgentThought { agent_id: agent_id.to_string(), content: summary.clone() },
+            EventKind::AgentThought {
+                agent_id: agent_id.to_string(),
+                content: summary.clone(),
+                kind: ThinkingKind::Detail,
+            },
         );
 
         Ok(AgentRunResult {
@@ -1792,6 +1807,7 @@ impl GenericSpecialistAgent {
                     "Starting {} ({} mode) for task {}",
                     self.name, contract.label, task.id
                 ),
+                kind: ThinkingKind::Headline,
             },
         );
 
@@ -2022,6 +2038,7 @@ impl GenericSpecialistAgent {
                                     &tool_call.name,
                                     &tool_call.arguments,
                                 ),
+                                kind: ThinkingKind::Detail,
                             },
                         );
                         // Tool-call guard (VALIDATE → COERCE → INFER →
@@ -2046,6 +2063,7 @@ impl GenericSpecialistAgent {
                                             EventKind::AgentThought {
                                                 agent_id: agent_id.to_string(),
                                                 content: content.clone(),
+                                                kind: ThinkingKind::Detail,
                                             },
                                         );
                                         messages.push(Message {
@@ -2290,6 +2308,7 @@ impl GenericSpecialistAgent {
                                             "Tool {} failed: {error}. Returning the error to the model.",
                                             tool_call.name
                                         ),
+                                        kind: ThinkingKind::Detail,
                                     },
                                 );
                                 messages.push(Message {
@@ -2369,7 +2388,11 @@ impl GenericSpecialistAgent {
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
-            EventKind::AgentThought { agent_id: agent_id.to_string(), content: completion_message },
+            EventKind::AgentThought {
+                agent_id: agent_id.to_string(),
+                content: completion_message,
+                kind: ThinkingKind::Headline,
+            },
         );
 
         Ok(AgentRunResult {

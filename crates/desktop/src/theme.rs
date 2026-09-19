@@ -58,6 +58,13 @@ fn agent_role_map(
     m
 }
 
+/// Look up a palette agent-role color by agent id string. Returns `None`
+/// when the palette has no mapping for this agent (caller falls back to
+/// `text_muted`).
+pub fn agent_color_from_id(agent_id: &str, palette: &Palette) -> Option<Color> {
+    palette.agent_roles.get(&AgentId::new(agent_id)).copied()
+}
+
 // ---------------------------------------------------------------------------
 // TypeScale — hierarchical text sizes
 // ---------------------------------------------------------------------------

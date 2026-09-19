@@ -219,6 +219,208 @@ impl RetryConfig {
     }
 }
 
+// ---- ADR-55: intent routing and intent-gated authorization ----------------
+
+fn default_classifier_enabled() -> bool {
+    // ADR-56 (model-first): when `[intent] classifier_enabled` is true the LLM
+    // classifier is the PRIMARY intent decider for every non-fast-path
+    // message. The deterministic router (concerto_core::intent::route) remains
+    // the offline / fail-soft fallback and supplies the two fast-path
+    // detections (negation-override, smalltalk). Default is ON — one bounded
+    // model call per non-fast-path message is the intended primary path, not
+    // an opt-in extra (ADR-56 §1/§2).
+    true
+}
+
+fn default_classifier_confidence_threshold() -> f32 {
+    // Bound to the gate's constant (not a literal) so no configured threshold
+    // can create a [threshold, LOW_CONFIDENCE_THRESHOLD) band where a
+    // classifier Execute re-route would miss the gate's arm-1 dialog
+    // (ADR-55 Phase 2c §2).
+    concerto_core::LOW_CONFIDENCE_THRESHOLD
+}
+
+/// LLM intent classifier configuration (ADR-55 Phase 2c §2; ADR-56).
+///
+/// `[intent]` is additive and default-on. When the classifier is enabled it is
+/// the primary intent decider for every non-fast-path request (ADR-56 §1); a
+/// missing `[intent]` section or a disabled classifier leaves the run
+/// deterministic — the offline / fail-soft fallback (ADR-56 §3). The section
+/// carries the three classifier keys only — the `mode`/`enabled` keys dropped
+/// at v6 are NOT resurrected; the intent gate stays always-on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentConfig {
+    /// Whether the LLM classifier is the primary intent decider. Default:
+    /// true (ADR-56 §2) — the classifier runs for every non-fast-path message;
+    /// only the negation-override and smalltalk fast paths bypass it (ADR-56
+    /// §1).
+    #[serde(default = "default_classifier_enabled")]
+    pub classifier_enabled: bool,
+
+    /// Model used for the classifier call. `None` = the run's effective chat
+    /// model (ADR-55 Phase 2c §2, per §9 "same chat model").
+    #[serde(default)]
+    pub classifier_model: Option<String>,
+
+    /// Minimum classifier confidence required to re-route the deterministic
+    /// routing result to the suggested outcome. Default: 0.7 — validated at
+    /// config load to be `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (the
+    /// gate's constant), so a classifier Execute re-route always clears the
+    /// intent gate's arm-1 confirmation dialog (ADR-55 Phase 2c §2; ADR-56 §4
+    /// keeps the invariant).
+    #[serde(default = "default_classifier_confidence_threshold")]
+    pub classifier_confidence_threshold: f32,
+}
+
+impl Default for IntentConfig {
+    fn default() -> Self {
+        Self {
+            classifier_enabled: default_classifier_enabled(),
+            classifier_model: None,
+            classifier_confidence_threshold: default_classifier_confidence_threshold(),
+        }
+    }
+}
+
+impl IntentConfig {
+    /// Validate the classifier settings during config loading, mirroring
+    /// [`RetryConfig::validate`].
+    ///
+    /// The threshold is bound to `concerto_core::LOW_CONFIDENCE_THRESHOLD`
+    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 Phase
+    /// 2d §1) uses that constant, so a configured threshold below it could
+    /// re-route a classifier Execute at a confidence the gate treats as
+    /// ambiguous — landing it in the read-only wildcard instead of the
+    /// auto-grant (ADR-55 Phase 2c §2 invariant retained by the ADR-56
+    /// amendment).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.classifier_confidence_threshold.is_finite()
+            || self.classifier_confidence_threshold < concerto_core::LOW_CONFIDENCE_THRESHOLD
+        {
+            return Err(ConfigError::InvalidValue(format!(
+                "intent.classifier_confidence_threshold must be finite and >= {} \
+                 (concerto_core::LOW_CONFIDENCE_THRESHOLD)",
+                concerto_core::LOW_CONFIDENCE_THRESHOLD
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `[display]` — frontend motion/accessibility controls shared by desktop
+/// and CLI. Additive serde-default only: a missing section (or missing knob)
+/// keeps both motion cues fully enabled, matching pre-section behavior. No
+/// schema migration is required.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayConfig {
+    /// Skip scan-line pulse, first-token emphasis, paragraph handoff hold,
+    /// and line wipe (desktop) / bold, hold, and wipe-analog rule (CLI).
+    /// Default false; the system a11y API hookup lands later.
+    #[serde(default)]
+    pub reduced_motion: bool,
+    /// Faint horizontal scan-line pattern behind the desktop chat column
+    /// (desktop only; the CLI has no scan-line). Default false.
+    #[serde(default)]
+    pub scanline_overlay_enabled: bool,
+    /// Broadcast the run stage to the terminal title via OSC (`ESC ] 0 ; … BEL`).
+    /// Default true; disable with `[display] animated_terminal_title = false`,
+    /// the CLI `--no-terminal-title` flag, or `CONCERTO_NO_TITLE=1`.
+    #[serde(default = "default_animated_terminal_title")]
+    pub animated_terminal_title: bool,
+    /// CLI theme name bridging the desktop palettes (`Midnight` / `Slate` /
+    /// `Chalk` / `Nebula`) to ANSI role colors. Additive serde-default only:
+    /// `None` (missing key) keeps the `Midnight` default; unknown names fall
+    /// back to `Midnight` at resolve time (same contract as the desktop
+    /// `AppTheme::by_name`). Precedence is flag > `CONCERTO_THEME` env >
+    /// this key > default — see `concerto_cli::theme::resolve_cli_theme`.
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Muted thinking-bucket agents (score accordion). Hide-not-delete: the
+    /// WAL and transcript keep every thought; muted buckets simply don't
+    /// render in chat. Additive serde-default only (empty = nothing muted),
+    /// so old configs load unchanged with no migration. Entries are
+    /// normalized (trimmed + lowercased, empties dropped, deduped) on write
+    /// via [`normalize_muted_agents`]; the desktop toggle writes through
+    /// this key and seeds its filter from it at startup.
+    ///
+    /// Config-only editing for now (no Settings checkbox list — agent ids
+    /// are dynamic per run); e.g. `[display] muted_agents = ["reviewer"]`.
+    #[serde(default)]
+    pub muted_agents: Vec<String>,
+}
+
+/// Normalize a `[display] muted_agents` list the same way chat buckets do:
+/// trim + lowercase each entry, drop empties, dedupe preserving first-seen
+/// order. Applied on every config write ([`crate::save_config`]) and when
+/// the desktop seeds its filter, so the file and the buckets always agree.
+pub fn normalize_muted_agents(raw: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in raw {
+        let normalized = concerto_core::types::normalize_agent_id(&entry);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        out.push(normalized);
+    }
+    out
+}
+
+fn default_animated_terminal_title() -> bool {
+    true
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            reduced_motion: false,
+            scanline_overlay_enabled: false,
+            animated_terminal_title: default_animated_terminal_title(),
+            theme: None,
+            muted_agents: Vec::new(),
+        }
+    }
+}
+
+/// Resolve the effective reduced-motion flag.
+///
+/// Precedence: explicit CLI flag > `CONCERTO_REDUCED_MOTION` env > config
+/// file > default (false). The env var is truthy for `1`/`true`/`yes`/`on`
+/// (case-insensitive); unset or any other value means "not set". `NO_COLOR`
+/// is orthogonal: `styling_enabled` stays independent of this flag.
+pub fn resolve_reduced_motion(explicit: Option<bool>, config: &AppConfig) -> bool {
+    if let Some(flag) = explicit {
+        return flag;
+    }
+    if let Ok(raw) = std::env::var("CONCERTO_REDUCED_MOTION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            _ => {}
+        }
+    }
+    config.display.reduced_motion
+}
+
+/// Resolve whether the CLI may broadcast run stages to the terminal title.
+///
+/// Precedence: explicit `--no-terminal-title` flag > `CONCERTO_NO_TITLE` env >
+/// config file (`[display] animated_terminal_title`, default true). The env
+/// var is truthy for `1`/`true`/`yes`/`on` (case-insensitive); unset or any
+/// other value means "not set". `explicit_no_title` is `Some(true)` only when
+/// the flag was passed (there is no `--terminal-title` opt-in); `None`
+/// follows env, then config.
+pub fn resolve_terminal_title_enabled(explicit_no_title: Option<bool>, config: &AppConfig) -> bool {
+    if explicit_no_title.unwrap_or(false) {
+        return false;
+    }
+    if let Ok(raw) = std::env::var("CONCERTO_NO_TITLE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return false,
+            _ => {}
+        }
+    }
+    config.display.animated_terminal_title
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub schema_version: u32,
@@ -284,6 +486,12 @@ pub struct AppConfig {
     /// Shared project-memory behavior for every frontend.
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// Frontend motion/accessibility controls shared by desktop and CLI.
+    /// Absent in older configs defaults to [`DisplayConfig::default`]
+    /// (both cues off-disabled, i.e. full motion).
+    #[serde(default)]
+    pub display: DisplayConfig,
 
     /// Shell profile and toolchain configuration (ADR-28/ADR-30).
     /// `None` = detect installed host shells. Additive since v4.
@@ -379,6 +587,7 @@ impl PartialEq for AppConfig {
             && self.updates == other.updates
             && self.retry == other.retry
             && self.memory == other.memory
+            && self.display == other.display
             && self.shell_settings == other.shell_settings
             && self.project_roots == other.project_roots
             && self.context == other.context
@@ -407,6 +616,7 @@ impl Default for AppConfig {
             updates: None,
             retry: RetryConfig::default(),
             memory: MemoryConfig::default(),
+            display: DisplayConfig::default(),
             shell_settings: None,
             project_roots: Vec::new(),
             context: None,
@@ -2909,6 +3119,84 @@ mod tests {
             None,
             "an explicitly-None multi_agent default must not resolve anything",
         );
+    }
+
+    // ------------------------------------------------------------------
+    // DisplayConfig defaults + resolve_reduced_motion precedence
+    // (flag > CONCERTO_REDUCED_MOTION env > config > default false)
+    // ------------------------------------------------------------------
+
+    /// Serializes the `CONCERTO_REDUCED_MOTION`-mutating tests against each
+    /// other (cargo runs tests in parallel threads and env is process-global).
+    static REDUCED_MOTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn display_defaults_to_full_motion() {
+        let config = AppConfig::default();
+        assert!(!config.display.reduced_motion);
+        assert!(!config.display.scanline_overlay_enabled);
+        assert!(config.display.animated_terminal_title);
+        assert!(config.display.muted_agents.is_empty());
+    }
+
+    #[test]
+    fn normalize_muted_agents_trims_lowercases_dedupes() {
+        assert_eq!(
+            normalize_muted_agents(vec![
+                " Reviewer ".into(),
+                "reviewer".into(),
+                "CODER".into(),
+                "  ".into(),
+                String::new(),
+                "coder".into(),
+            ]),
+            vec!["reviewer".to_string(), "coder".to_string()]
+        );
+        assert!(normalize_muted_agents(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn display_muted_agents_survives_toml_round_trip() {
+        let mut config = AppConfig::default();
+        config.display.muted_agents = vec!["reviewer".into()];
+        let toml_str = toml::to_string(&config).expect("config serializes");
+        let back: AppConfig = toml::from_str(&toml_str).expect("config deserializes");
+        assert_eq!(back.display.muted_agents, vec!["reviewer".to_string()]);
+        // Old files without the key load as empty (additive, no migration).
+        let legacy: AppConfig =
+            toml::from_str("schema_version = 7\n").expect("legacy config loads");
+        assert!(legacy.display.muted_agents.is_empty());
+    }
+
+    #[test]
+    fn resolve_reduced_motion_flag_beats_config() {
+        let _lock = REDUCED_MOTION_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = EnvVarGuard("CONCERTO_REDUCED_MOTION");
+        let mut config = AppConfig::default();
+        config.display.reduced_motion = true;
+        assert!(resolve_reduced_motion(None, &config));
+        assert!(
+            !resolve_reduced_motion(Some(false), &config),
+            "explicit flag off must beat config on"
+        );
+        config.display.reduced_motion = false;
+        assert!(resolve_reduced_motion(Some(true), &config));
+        assert!(!resolve_reduced_motion(None, &config));
+    }
+
+    #[test]
+    fn resolve_reduced_motion_env_beats_config() {
+        let _lock = REDUCED_MOTION_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = EnvVarGuard("CONCERTO_REDUCED_MOTION");
+        let config = AppConfig::default();
+        std::env::set_var("CONCERTO_REDUCED_MOTION", "1");
+        assert!(resolve_reduced_motion(None, &config));
+        assert!(
+            !resolve_reduced_motion(Some(false), &config),
+            "explicit flag off must beat env on"
+        );
+        std::env::set_var("CONCERTO_REDUCED_MOTION", "0");
+        assert!(!resolve_reduced_motion(None, &config), "unrecognized env value means not set");
     }
 
     // ------------------------------------------------------------------

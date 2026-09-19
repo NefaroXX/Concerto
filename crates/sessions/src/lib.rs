@@ -1877,7 +1877,14 @@ impl SessionStore for SqliteSessionStore {
 
             let payload: String =
                 row.try_get("entry").map_err(|e| SessionError::Database(e.to_string()))?;
-            entries.push(serde_json::from_str(&payload)?);
+            // Pre-tier rows carry no `kind` (serde default → Detail, no data
+            // loss); normalize the bucket key on read so old rows map forward
+            // into the same buckets as live events. Stored bytes are untouched.
+            let mut entry: TranscriptEntry = serde_json::from_str(&payload)?;
+            if let TranscriptEntry::Thinking { agent, .. } = &mut entry {
+                *agent = concerto_core::types::normalize_agent_id(agent);
+            }
+            entries.push(entry);
         }
         Ok(entries)
     }
@@ -2644,7 +2651,11 @@ mod tests {
         let entries = vec![
             TranscriptEntry::User { content: "build the widget".into() },
             TranscriptEntry::Assistant { content: "on it".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "hmm".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "hmm".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs".into(),
@@ -2721,7 +2732,11 @@ mod tests {
 
         let batch_one = vec![
             TranscriptEntry::User { content: "first".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "plan".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "plan".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         ];
         let batch_two = vec![
             TranscriptEntry::Assistant { content: "second".into() },
@@ -2761,6 +2776,44 @@ mod tests {
 
         let loaded = store.load_transcript(session.id, CancellationToken::new()).await.unwrap();
         assert!(loaded.is_empty(), "no transcript entry may be written after cancellation");
+    }
+
+    #[tokio::test]
+    /// Pre-tier `Thinking` rows (no `kind` key) load as `Detail` — no data
+    /// loss — and mixed-case agents normalize on read so old rows bucket
+    /// with live events. Stored bytes are untouched (hide-not-delete).
+    async fn transcript_legacy_thinking_row_defaults_kind_and_normalizes_agent() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/test_transcript_legacy");
+        let session =
+            store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
+
+        // Write a pre-tier payload directly, bypassing the typed writer.
+        let legacy = r#"{"Thinking":{"agent":" Coder ","content":"hmm"}}"#;
+        sqlx::query(
+            "INSERT INTO transcript_entries (id, session_id, sequence_num, entry, created_at) \
+             VALUES (?, ?, 1, ?, 0)",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(session.id.to_string())
+        .bind(legacy)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let loaded = store.load_transcript(session.id, CancellationToken::new()).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            matches!(
+                &loaded[0],
+                TranscriptEntry::Thinking { agent, content, kind }
+                if agent == "coder"
+                    && content == "hmm"
+                    && *kind == concerto_core::event::ThinkingKind::Detail
+            ),
+            "legacy row must load as normalized Detail, got {:?}",
+            loaded[0]
+        );
     }
 
     #[tokio::test]

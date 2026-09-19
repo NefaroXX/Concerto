@@ -6,6 +6,7 @@ pub mod app;
 pub mod approval;
 pub mod health;
 pub mod plugin_approval;
+pub mod theme;
 pub mod ui;
 pub mod update;
 
@@ -18,9 +19,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 /// Run the TUI/CLI interface.
-pub fn run_cli(multi_agent: bool, fast: bool, reconfigure: bool) -> anyhow::Result<()> {
+pub fn run_cli(
+    multi_agent: bool,
+    fast: bool,
+    reconfigure: bool,
+    reduced_motion: Option<bool>,
+) -> anyhow::Result<()> {
     let remaining: Vec<String> = std::env::args().skip(1).collect();
-    run_cli_inner(multi_agent, fast, reconfigure, &remaining)
+    run_cli_inner(multi_agent, fast, reconfigure, reduced_motion, &remaining)
 }
 
 /// Inner run function with reconfigure support and subcommand dispatch.
@@ -28,9 +34,35 @@ fn run_cli_inner(
     multi_agent: bool,
     fast: bool,
     reconfigure: bool,
+    reduced_motion: Option<bool>,
     remaining: &[String],
 ) -> anyhow::Result<()> {
-    let (remaining, explicit_project) = invocation_args(remaining)?;
+    // `--no-terminal-title` is a display opt-out handled here (not in
+    // `parse_cli_args`) so `run_cli`'s signature stays stable: strip it from
+    // the raw args before subcommand dispatch. There is no `--terminal-title`
+    // opt-in; absence follows `CONCERTO_NO_TITLE` env, then config. `--theme`
+    // follows the same path (flag > `CONCERTO_THEME` env > `[display] theme`).
+    let mut no_terminal_title: Option<bool> = None;
+    let mut explicit_theme: Option<String> = None;
+    let mut filtered: Vec<String> = Vec::with_capacity(remaining.len());
+    let mut index = 0;
+    while index < remaining.len() {
+        let arg = remaining[index].as_str();
+        if arg == "--no-terminal-title" {
+            no_terminal_title = Some(true);
+        } else if arg == "--theme" {
+            index += 1;
+            if let Some(value) = remaining.get(index) {
+                explicit_theme = Some(value.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix("--theme=") {
+            explicit_theme = Some(value.to_string());
+        } else {
+            filtered.push(remaining[index].clone());
+        }
+        index += 1;
+    }
+    let (remaining, explicit_project) = invocation_args(&filtered)?;
     if remaining.first().map(String::as_str) == Some("logs") {
         return run_logs_subcommand(&remaining[1..]);
     }
@@ -157,9 +189,15 @@ fn run_cli_inner(
 
     let mut terminal_app = app::App::new();
     // Remember explicit CLI flags so the per-run config reload re-applies
-    // them (ADR-57 D5): an explicit -m/-f must survive an external config edit.
-    terminal_app.run_flags =
-        app::RunFlags { multi_agent: multi_agent.then_some(true), fast: fast.then_some(true) };
+    // them (ADR-57 D5): an explicit -m/-f/--reduced-motion must survive an
+    // external config edit.
+    terminal_app.run_flags = app::RunFlags {
+        multi_agent: multi_agent.then_some(true),
+        fast: fast.then_some(true),
+        reduced_motion,
+        no_terminal_title,
+        theme: explicit_theme,
+    };
     let session_manager = std::sync::Arc::new(
         rt.block_on(
             concerto_orchestrator::session_manager::ProjectSessionManager::connect_with_config(
@@ -1208,23 +1246,38 @@ fn resolve_project_dir(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
 }
 
 /// Parse CLI-specific args from an iterator, returning (multi_agent, fast, reconfigure, remaining).
+/// Parsed CLI startup flags: `(multi_agent, fast, reconfigure,
+/// reduced_motion, remaining)`. `reduced_motion` is `Some(true)` only when
+/// `--reduced-motion` was passed (there is no `--no-reduced-motion`); `None`
+/// means "follow `CONCERTO_REDUCED_MOTION` env, then the config file, then
+/// the default (false)" — see `concerto_config::resolve_reduced_motion`.
 pub fn parse_cli_args<'a>(
     args: impl Iterator<Item = &'a String>,
-) -> (bool, bool, bool, Vec<String>) {
+) -> (bool, bool, bool, Option<bool>, Vec<String>) {
     let mut multi_agent = false;
     let mut fast = false;
     let mut reconfigure = false;
+    let mut reduced_motion: Option<bool> = None;
     let mut remaining = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--multi-agent" | "-m" => multi_agent = true,
             "--fast" | "-f" => fast = true,
             "--reconfigure" | "-r" => reconfigure = true,
+            "--reduced-motion" => reduced_motion = Some(true),
             "--help" | "-h" => {
                 eprintln!("Concerto CLI");
                 eprintln!("  --multi-agent, -m   Enable multi-agent orchestration");
                 eprintln!("  --fast, -f          Skip memory retrieval for trivial tasks");
                 eprintln!("  --reconfigure, -r   Re-run the setup wizard");
+                eprintln!("  --reduced-motion    Disable motion cues (first-token bold, handoff hold, wipe rule);");
+                eprintln!("                      flag beats CONCERTO_REDUCED_MOTION env, which beats config file");
+                eprintln!(
+                    "  --no-terminal-title Disable OSC terminal-title broadcasts (run stage);"
+                );
+                eprintln!("                      flag beats CONCERTO_NO_TITLE env, which beats config file");
+                eprintln!("  --theme NAME      CLI palette (Midnight/Slate/Chalk/Nebula);");
+                eprintln!("                      flag beats CONCERTO_THEME env, which beats [display] theme");
                 eprintln!("  --project, -p DIR   Select the project used by chat and commands");
                 eprintln!("  --help, -h          Print this help");
                 eprintln!("  subcommands: config, providers, sessions, projects, plugin, extensions, health, logs");
@@ -1233,7 +1286,7 @@ pub fn parse_cli_args<'a>(
             _ => remaining.push(arg.clone()),
         }
     }
-    (multi_agent, fast, reconfigure, remaining)
+    (multi_agent, fast, reconfigure, reduced_motion, remaining)
 }
 
 #[cfg(test)]
@@ -1246,24 +1299,25 @@ mod tests {
 
     #[test]
     fn parse_cli_args_defaults() {
-        let (multi, fast, reconfigure, remaining) = parse_cli_args([].iter());
+        let (multi, fast, reconfigure, reduced_motion, remaining) = parse_cli_args([].iter());
         assert!(!multi);
         assert!(!fast);
         assert!(!reconfigure);
+        assert_eq!(reduced_motion, None);
         assert!(remaining.is_empty());
     }
 
     #[test]
     fn parse_cli_args_reconfigure() {
         let args = ["--reconfigure".to_string()];
-        let (_, _, reconfigure, _) = parse_cli_args(args.iter());
+        let (_, _, reconfigure, _, _) = parse_cli_args(args.iter());
         assert!(reconfigure);
     }
 
     #[test]
     fn parse_cli_args_fast_and_reconfigure() {
         let args = ["--fast".to_string(), "--reconfigure".to_string()];
-        let (_, fast, reconfigure, _) = parse_cli_args(args.iter());
+        let (_, fast, reconfigure, _, _) = parse_cli_args(args.iter());
         assert!(fast);
         assert!(reconfigure);
     }
@@ -1271,14 +1325,22 @@ mod tests {
     #[test]
     fn parse_cli_args_multi_agent() {
         let args = ["--multi-agent".to_string()];
-        let (multi, _, _, _) = parse_cli_args(args.iter());
+        let (multi, _, _, _, _) = parse_cli_args(args.iter());
         assert!(multi);
+    }
+
+    #[test]
+    fn parse_cli_args_reduced_motion() {
+        let args = ["--reduced-motion".to_string()];
+        let (_, _, _, reduced_motion, remaining) = parse_cli_args(args.iter());
+        assert_eq!(reduced_motion, Some(true));
+        assert!(remaining.is_empty());
     }
 
     #[test]
     fn parse_cli_args_short_flags() {
         let args = ["-m".to_string(), "-f".to_string(), "-r".to_string()];
-        let (multi, fast, reconfigure, _) = parse_cli_args(args.iter());
+        let (multi, fast, reconfigure, _, _) = parse_cli_args(args.iter());
         assert!(multi);
         assert!(fast);
         assert!(reconfigure);
@@ -1288,7 +1350,7 @@ mod tests {
     fn parse_cli_args_unknown_remains() {
         let args = ["--project".to_string(), "/some/path".to_string()];
         // --project is not recognized by parse_cli_args (it's handled by invocation_args)
-        let (_, _, _, remaining) = parse_cli_args(args.iter());
+        let (_, _, _, _, remaining) = parse_cli_args(args.iter());
         assert_eq!(remaining, vec!["--project", "/some/path"]);
     }
 

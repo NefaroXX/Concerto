@@ -19,9 +19,15 @@ pub struct StoredEvent {
 
 impl StoredEvent {
     pub fn to_event(&self) -> Result<Event, SessionError> {
-        let kind: EventKind = serde_json::from_str(&self.payload).map_err(|e| {
+        let mut kind: EventKind = serde_json::from_str(&self.payload).map_err(|e| {
             SessionError::Serialization(format!("failed to deserialize event payload: {e}"))
         })?;
+        // Old WAL rows map forward: pre-tier payloads already default to
+        // `Detail` via serde; normalize the bucket key here so replays land
+        // in the same buckets as live events. Stored bytes are untouched.
+        if let EventKind::AgentThought { agent_id, .. } = &mut kind {
+            *agent_id = concerto_core::types::normalize_agent_id(agent_id);
+        }
         Ok(Event {
             id: self.id,
             correlation_id: self.correlation_id,
@@ -95,6 +101,30 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    /// Pre-tier `AgentThought` payloads (no `kind`) replay as `Detail`, and
+    /// mixed-case agents normalize on read so old WAL rows bucket forward.
+    fn stored_event_legacy_thought_defaults_kind_and_normalizes_agent() {
+        let stored = StoredEvent {
+            id: Ulid::new(),
+            session_id: Ulid::new(),
+            sequence_num: 1,
+            correlation_id: Ulid::new(),
+            event_kind: "AgentThought".into(),
+            payload: r#"{"AgentThought":{"agent_id":" Coder ","content":"hmm"}}"#.into(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let event = stored.to_event().expect("legacy payload replays");
+        match event.kind {
+            EventKind::AgentThought { agent_id, content, kind } => {
+                assert_eq!(agent_id, "coder");
+                assert_eq!(content, "hmm");
+                assert_eq!(kind, concerto_core::event::ThinkingKind::Detail);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     /// Full `StoredEvent` serializes to JSON and deserializes back with all
     /// fields preserved.
     fn stored_event_full_serialization_round_trip() {
@@ -149,7 +179,11 @@ mod tests {
     fn stored_event_different_event_kinds() {
         let kinds: Vec<EventKind> = vec![
             EventKind::SessionSaved,
-            EventKind::AgentThought { agent_id: "a1".into(), content: "thinking".into() },
+            EventKind::AgentThought {
+                agent_id: "a1".into(),
+                content: "thinking".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
             EventKind::ToolExecutionFinished {
                 tool_name: "fs".into(),
                 duration_ms: 100,

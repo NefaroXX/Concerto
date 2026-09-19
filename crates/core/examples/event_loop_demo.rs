@@ -4,7 +4,7 @@
 //!
 //! Run with: `cargo run -p concerto-core --example event_loop_demo`
 
-use concerto_core::event::{Event, EventBus, EventKind};
+use concerto_core::event::{Event, EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::new_id;
 
 #[tokio::main]
@@ -24,6 +24,7 @@ async fn main() {
             EventKind::AgentThought {
                 agent_id: "demo-agent".into(),
                 content: format!("step {i} of the demo loop"),
+                kind: ThinkingKind::Detail,
             },
         );
         bus.publish(event).expect("subscriber is listening");

@@ -9,6 +9,7 @@ use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 
 use crate::app::{App, Screen, SettingsField};
+use crate::theme::CliTheme;
 use concerto_core::intent::RunStage;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -20,11 +21,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::AgentAssignments => draw_agent_assignments_screen(frame, app),
     }
     if let Some(prompt) = app.approval_prompt() {
-        draw_approval_modal(frame, frame.area(), &prompt);
+        draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
     } else if let Some(intent) = app.intent_prompt() {
-        draw_intent_modal(frame, frame.area(), &intent);
+        draw_intent_modal(frame, frame.area(), &intent, &app.cli_theme);
     } else if let Some(plan) = app.plan_prompt() {
-        draw_plan_modal(frame, frame.area(), &plan, app.plan_scroll);
+        draw_plan_modal(frame, frame.area(), &plan, app.plan_scroll, &app.cli_theme);
     }
 }
 
@@ -57,9 +58,9 @@ fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let style = if app.input_mode {
-        Style::default().fg(Color::Green)
+        Style::default().fg(app.cli_theme.success)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(app.cli_theme.muted)
     };
 
     let block = Block::default().borders(Borders::ALL).title("Input").border_style(style);
@@ -114,7 +115,7 @@ fn draw_sessions_screen(frame: &mut Frame, app: &App) {
         .map(|(i, s)| {
             let selected = i == app.sessions_index;
             let style = if selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default().fg(app.cli_theme.warning).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -161,31 +162,50 @@ fn draw_tool_log_screen(frame: &mut Frame, app: &App) {
         return;
     }
 
+    let styling = crate::app::styling_enabled();
+    let theme = &app.cli_theme;
     let items: Vec<ListItem> = app
         .tool_log
         .iter()
         .rev()
-        .map(|entry| {
-            let (icon, style) = match entry.status {
-                crate::app::ToolStatus::Running => (" ▶", Style::default().fg(Color::Cyan)),
-                crate::app::ToolStatus::Success => (" ✓", Style::default().fg(Color::Green)),
-                crate::app::ToolStatus::Failure => (" ✗", Style::default().fg(Color::Red)),
-                crate::app::ToolStatus::Timeout { .. } => {
-                    (" ⏱", Style::default().fg(Color::Yellow))
-                }
-            };
-            let detail = entry.detail.as_deref().unwrap_or("");
-            let duration = match entry.duration_ms {
-                Some(ms) => format!(" {ms}ms"),
-                None => String::new(),
-            };
-            let line = format!("{icon} {}{}{}", entry.tool_name, duration, detail);
-            ListItem::new(Line::from(Span::styled(line, style)))
-        })
+        .map(|entry| ListItem::new(tool_log_line_with_theme(entry, styling, theme)))
         .collect();
 
     let list = List::new(items);
     frame.render_widget(list, inner);
+}
+
+/// One tool-log row: status icon + name + duration + detail + provenance rail.
+///
+/// The rail suffix is read-only from the stored [`crate::app::ToolStatus`]
+/// (never the policy engine). Rail text is always appended — it is state, so
+/// `reduced_motion` never gates it; only the colors follow `styling` (plain
+/// symbols under `NO_COLOR`/off-TTY so nothing leaks into pipes).
+pub(crate) fn tool_log_line_with_theme(
+    entry: &crate::app::ToolLogEntry,
+    styling: bool,
+    theme: &CliTheme,
+) -> Line<'static> {
+    let (icon, style) = match entry.status {
+        crate::app::ToolStatus::Running => (" ▶", Style::default().fg(theme.user)),
+        crate::app::ToolStatus::Success => (" ✓", Style::default().fg(theme.success)),
+        crate::app::ToolStatus::Failure => (" ✗", Style::default().fg(theme.danger)),
+        crate::app::ToolStatus::Timeout { .. } => (" ⏱", Style::default().fg(theme.warning)),
+    };
+    let detail = entry.detail.as_deref().unwrap_or("");
+    let duration = match entry.duration_ms {
+        Some(ms) => format!(" {ms}ms"),
+        None => String::new(),
+    };
+    let base = format!("{icon} {}{}{}", entry.tool_name, duration, detail);
+    let rail = entry.status.rail_text();
+    if !styling {
+        return Line::from(Span::raw(format!("{base}{rail}")));
+    }
+    Line::from(vec![
+        Span::styled(base, style),
+        Span::styled(rail.to_string(), Style::default().fg(entry.status.rail_color(theme))),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +232,7 @@ fn draw_agent_assignments_screen(frame: &mut Frame, app: &App) {
         .map(|(i, assignment)| {
             let selected = i == app.agent_assignment_index;
             let (indicator, style) = if selected {
-                ("> ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                ("> ", Style::default().fg(app.cli_theme.warning).add_modifier(Modifier::BOLD))
             } else {
                 ("  ", Style::default())
             };
@@ -248,7 +268,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App) {
         Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 };
 
     let status = status_line(app);
-    let style = Style::default().fg(Color::DarkGray);
+    let style = Style::default().fg(app.cli_theme.muted);
     let paragraph = Paragraph::new(status).style(style);
     frame.render_widget(paragraph, status_area);
 }
@@ -273,9 +293,18 @@ fn status_line(app: &App) -> String {
         (true, Some(stage)) => format!(" | stage: {}", run_stage_label(stage)),
         _ => String::new(),
     };
+    // Thinking-accordion state (V2): only shown once the movement logged a
+    // thought, so idle status lines stay unchanged.
+    let thinking = if app.thought_log.is_empty() {
+        String::new()
+    } else if app.thinking_expanded {
+        " | thinking: expanded".to_string()
+    } else {
+        " | thinking: collapsed".to_string()
+    };
 
     format!(
-        " {} | {} | mode={}{}{}{}{} | {} ",
+        " {} | {} | mode={}{}{}{}{}{} | {} ",
         provider,
         model,
         mode,
@@ -283,6 +312,7 @@ fn status_line(app: &App) -> String {
         memory,
         run,
         stage,
+        thinking,
         app.project_dir.display()
     )
 }
@@ -334,7 +364,7 @@ fn draw_settings_list(frame: &mut Frame, area: Rect, app: &App) {
         let label = field.label();
 
         let (style, indicator) = if selected {
-            (Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD), "> ")
+            (Style::default().fg(app.cli_theme.warning).add_modifier(Modifier::BOLD), "> ")
         } else {
             (Style::default(), "  ")
         };
@@ -360,7 +390,12 @@ fn draw_settings_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, inner);
 }
 
-fn draw_approval_modal(frame: &mut Frame, area: Rect, prompt: &crate::approval::ApprovalPrompt) {
+fn draw_approval_modal(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &crate::approval::ApprovalPrompt,
+    theme: &CliTheme,
+) {
     let modal_width = (area.width.saturating_div(2)).max(40).min(area.width.saturating_sub(4));
     let modal_height = 5;
     let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
@@ -379,7 +414,7 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, prompt: &crate::approval::
         } else {
             format!(" Approve {}? ", prompt.tool_name)
         })
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border));
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
@@ -396,7 +431,12 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, prompt: &crate::approval::
 /// numbered list of the selectable outcomes. Mirrors `draw_approval_modal`:
 /// a cyan-bordered modal with a wrapped body. The height grows with the option
 /// list so all six choices are visible.
-fn draw_intent_modal(frame: &mut Frame, area: Rect, prompt: &crate::approval::IntentPrompt) {
+fn draw_intent_modal(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &crate::approval::IntentPrompt,
+    theme: &CliTheme,
+) {
     // `Debug` names are the Phase-0 outcome labels (Answer, Diagnose, ...).
     let options_text: Vec<String> = prompt
         .options
@@ -426,7 +466,7 @@ fn draw_intent_modal(frame: &mut Frame, area: Rect, prompt: &crate::approval::In
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Confirm intent ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border));
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
@@ -449,6 +489,7 @@ fn draw_plan_modal(
     area: Rect,
     prompt: &crate::approval::PlanPrompt,
     scroll: u16,
+    theme: &CliTheme,
 ) {
     let modal_width = (area.width.saturating_div(2)).max(48).min(area.width.saturating_sub(4));
     let text_width = modal_width.saturating_sub(4);
@@ -477,7 +518,7 @@ fn draw_plan_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Plan approval ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border));
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
@@ -512,11 +553,11 @@ fn draw_plan_modal(
 
     // Dimmed footer repeats the FULL plan id — the header label is truncated
     // to fit, but the audit identity stays copyable and unambiguous.
-    let footer = Paragraph::new(prompt.plan_id.clone()).style(Style::default().fg(Color::DarkGray));
+    let footer = Paragraph::new(prompt.plan_id.clone()).style(Style::default().fg(theme.muted));
     frame.render_widget(footer, chunks[2]);
 
     let hint = Paragraph::new(plan_hint(clamped, body_lines, viewport_rows, chunks[3].width))
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(theme.muted));
     frame.render_widget(hint, chunks[3]);
 }
 
@@ -579,6 +620,215 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         })
         .sum::<u16>()
         .max(1)
+}
+
+// ---------------------------------------------------------------------------
+// Chat role gutters + markdown-lite (Score signature, CLI slice)
+// ---------------------------------------------------------------------------
+
+/// Chat-line role: one stable gutter symbol + ANSI color each, mirroring the
+/// desktop `agent_roles` palette-map contract (one stable color per bucket).
+/// Under `NO_COLOR`/off-TTY the symbols render plain (no ANSI) so nothing
+/// leaks into pipes — the same contract as `thinking_header`/`reveal_line`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatRole {
+    User,
+    Assistant,
+    Policy,
+}
+
+impl ChatRole {
+    pub(crate) fn gutter(self) -> &'static str {
+        match self {
+            ChatRole::User => "› ",
+            ChatRole::Assistant => "♪ ",
+            ChatRole::Policy => "‖ ",
+        }
+    }
+
+    /// Historical `Midnight` gutter color (pre-theme contract).
+    #[allow(dead_code)]
+    pub(crate) fn color(self) -> Color {
+        self.color_for(&CliTheme::by_name("Midnight"))
+    }
+
+    /// Theme-resolved gutter color from the CLI theme bridge.
+    pub(crate) fn color_for(self, theme: &CliTheme) -> Color {
+        match self {
+            ChatRole::User => theme.user,
+            ChatRole::Assistant => theme.assistant,
+            ChatRole::Policy => theme.policy,
+        }
+    }
+}
+
+/// A chat line: role gutter + markdown-lite body. Plain (symbols only) when
+/// `styling` is false (`NO_COLOR`/off-TTY, caller-gated via
+/// `styling_enabled`); gutter color + markdown spans otherwise.
+#[allow(dead_code)]
+pub(crate) fn chat_line(role: ChatRole, body: &str, styling: bool) -> Line<'static> {
+    chat_line_with_theme(role, body, styling, &CliTheme::by_name("Midnight"))
+}
+
+/// Theme-resolved chat line; `chat_line` keeps the `Midnight` contract.
+pub(crate) fn chat_line_with_theme(
+    role: ChatRole,
+    body: &str,
+    styling: bool,
+    theme: &CliTheme,
+) -> Line<'static> {
+    if !styling {
+        return Line::from(vec![Span::raw(role.gutter().to_string()), Span::raw(body.to_string())]);
+    }
+    let mut spans = vec![Span::styled(
+        role.gutter().to_string(),
+        Style::default().fg(role.color_for(theme)).add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(markdown_spans_with_theme(body, true, theme));
+    Line::from(spans)
+}
+
+/// Markdown-lite spans for assistant/user bodies: `**bold**`, `` `code` ``
+/// (reversed + dim), `#` headings (bold whole line), fenced blocks (indented
+/// `  │ ` gutter in `DarkGray`, dimmed body). Unclosed markers and fences
+/// render literally so a mid-reveal prefix never panics or drops text.
+#[allow(dead_code)]
+pub(crate) fn markdown_spans(text: &str, styling: bool) -> Vec<Span<'static>> {
+    markdown_spans_with_theme(text, styling, &CliTheme::by_name("Midnight"))
+}
+
+/// Theme-resolved markdown-lite spans; `markdown_spans` keeps the `Midnight`
+/// contract. Only the fenced-block gutter color follows the theme (the muted
+/// chrome); bold/code/heading logic is untouched.
+///
+/// Streaming-reveal safety: the reveal renders ever-longer prefixes of one
+/// message through this path, so a prefix can end mid-fence (opener seen,
+/// closer not yet). An odd marker count means the last opener is unmatched:
+/// it renders literally (raw, never inline-parsed) while the fenced body
+/// after it keeps the dim style + `│` gutter — so no fence marker styling
+/// leaks into a partial chunk, and closing the fence settles the block
+/// without dropping text.
+pub(crate) fn markdown_spans_with_theme(
+    text: &str,
+    styling: bool,
+    theme: &CliTheme,
+) -> Vec<Span<'static>> {
+    if !styling {
+        return vec![Span::raw(text.to_string())];
+    }
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let dangling_from =
+        if lines.iter().filter(|line| line.trim_start().starts_with("```")).count() % 2 == 1 {
+            lines.iter().rposition(|line| line.trim_start().starts_with("```"))
+        } else {
+            None
+        };
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push(Span::raw("\n".to_string()));
+        }
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            if dangling_from == Some(index) {
+                // Unmatched opener in a partial prefix: literal raw text (per
+                // the unclosed-marker contract), never dimmed as a boundary —
+                // but the fence still opens so the body below stays guttered.
+                out.push(Span::raw((*line).to_string()));
+            } else {
+                out.push(Span::styled(
+                    (*line).to_string(),
+                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+                ));
+            }
+            continue;
+        }
+        if in_fence {
+            out.push(Span::styled("  │ ".to_string(), Style::default().fg(theme.muted)));
+            out.push(Span::styled(
+                (*line).to_string(),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            ));
+            continue;
+        }
+        out.extend(inline_spans(line, is_heading(line)));
+    }
+    out
+}
+
+/// A `#` heading: 1–6 `#` followed by a space (leading whitespace allowed).
+fn is_heading(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    (1..=6).contains(&hashes) && trimmed.chars().nth(hashes).is_some_and(|c| c == ' ')
+}
+
+/// Inline `**bold**` / `` `code` `` spans for one fence-free line. Looks for
+/// a closing marker before consuming an opener, so unclosed markers stay
+/// literal. `force_bold` (headings) bolds the whole line.
+fn inline_spans(segment: &str, force_bold: bool) -> Vec<Span<'static>> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut index = 0;
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
+        if buf.is_empty() {
+            return;
+        }
+        let text = std::mem::take(buf);
+        if force_bold {
+            spans.push(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)));
+        } else {
+            spans.push(Span::raw(text));
+        }
+    };
+    while index < chars.len() {
+        if chars[index] == '*'
+            && index + 1 < chars.len()
+            && chars[index + 1] == '*'
+            && closes(&chars, index + 2, "**")
+        {
+            flush(&mut buf, &mut spans);
+            let inner: String = chars[index + 2..].iter().collect();
+            let end = inner.find("**").expect("closing marker checked above");
+            let end_chars = inner[..end].chars().count();
+            let content: String = chars[index + 2..index + 2 + end_chars].iter().collect();
+            let mut style = Style::default().add_modifier(Modifier::BOLD);
+            if force_bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(content, style));
+            index += 2 + end_chars + 2;
+        } else if chars[index] == '`' && closes(&chars, index + 1, "`") {
+            flush(&mut buf, &mut spans);
+            let rest: String = chars[index + 1..].iter().collect();
+            let end = rest.find('`').expect("closing backtick checked above");
+            let end_chars = rest[..end].chars().count();
+            let content: String = chars[index + 1..index + 1 + end_chars].iter().collect();
+            let style =
+                Style::default().add_modifier(Modifier::REVERSED).add_modifier(Modifier::DIM);
+            spans.push(Span::styled(content, style));
+            index += 1 + end_chars + 1;
+        } else {
+            buf.push(chars[index]);
+            index += 1;
+        }
+    }
+    flush(&mut buf, &mut spans);
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
+/// Whether `marker` closes later in `chars` from `from` (char index).
+fn closes(chars: &[char], from: usize, marker: &str) -> bool {
+    if from > chars.len() {
+        return false;
+    }
+    let rest: String = chars[from..].iter().collect();
+    rest.contains(marker)
 }
 
 #[cfg(test)]
@@ -765,5 +1015,227 @@ mod tests {
         // separate; the field-level contract is what the status line reads).
         app.run_stage = None;
         assert!(!status_line(&app).contains("stage:"));
+    }
+
+    // ------------------------------------------------------------------
+    // Role gutters + markdown-lite
+    // ------------------------------------------------------------------
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|span| span.content.to_string()).collect()
+    }
+
+    #[test]
+    fn chat_line_plain_is_symbols_only() {
+        assert_eq!(line_text(&chat_line(ChatRole::User, "hi", false)), "› hi");
+        assert_eq!(line_text(&chat_line(ChatRole::Assistant, "hi", false)), "♪ hi");
+        assert_eq!(line_text(&chat_line(ChatRole::Policy, "hi", false)), "‖ hi");
+        for line in
+            [chat_line(ChatRole::User, "hi", false), chat_line(ChatRole::Assistant, "hi", false)]
+        {
+            assert!(line.spans.iter().all(|span| span.style.add_modifier.is_empty()));
+        }
+    }
+
+    #[test]
+    fn chat_line_styled_carries_role_colors() {
+        let user = chat_line(ChatRole::User, "hi", true);
+        assert_eq!(user.spans[0].content.as_ref(), "› ");
+        assert_eq!(user.spans[0].style.fg, Some(Color::Cyan));
+        let assistant = chat_line(ChatRole::Assistant, "hi", true);
+        assert_eq!(assistant.spans[0].style.fg, Some(Color::Green));
+        let policy = chat_line(ChatRole::Policy, "hi", true);
+        assert_eq!(policy.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn markdown_bold_and_code_spans() {
+        let spans = markdown_spans("a **bold** and `code` end", true);
+        let text: String = spans.iter().map(|span| span.content.to_string()).collect();
+        assert_eq!(text, "a bold and code end");
+        assert!(spans.iter().any(|span| span.content.as_ref() == "bold"
+            && span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(spans.iter().any(|span| span.content.as_ref() == "code"
+            && span.style.add_modifier.contains(Modifier::REVERSED)
+            && span.style.add_modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn markdown_unclosed_markers_stay_literal() {
+        assert_eq!(
+            line_text(&Line::from(markdown_spans("a **dangling and `tick", true))),
+            "a **dangling and `tick"
+        );
+    }
+
+    #[test]
+    fn markdown_heading_is_bold_and_fence_gets_gutter() {
+        let head = Line::from(markdown_spans("# Title", true));
+        assert_eq!(line_text(&head), "# Title");
+        assert!(head.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+        let fence = Line::from(markdown_spans("```\nlet x = 1;\n```", true));
+        let text = line_text(&fence);
+        assert!(text.contains("  │ "), "fenced body carries the │ gutter: {text:?}");
+        assert!(text.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn themed_chat_line_plain_carries_no_ansi_and_nebula_differs() {
+        use crate::theme::CliTheme;
+        // NO_COLOR / off-TTY plain: symbols only, no colors or modifiers on
+        // any theme — the theme never leaks ANSI into pipes.
+        for name in ["Midnight", "Slate", "Chalk", "Nebula"] {
+            let theme = CliTheme::by_name(name);
+            let line = chat_line_with_theme(ChatRole::Assistant, "hi", false, &theme);
+            assert_eq!(line_text(&line), "♪ hi", "{name} plain text stays symbols-only");
+            assert!(
+                line.spans.iter().all(|span| span.style.fg.is_none()),
+                "{name} plain carries no fg"
+            );
+            assert!(
+                line.spans.iter().all(|span| span.style.add_modifier.is_empty()),
+                "{name} plain carries no modifiers"
+            );
+        }
+        // The bridge actually varies by theme: Nebula's neon gutters differ
+        // from Midnight's historical hues.
+        let midnight = CliTheme::by_name("Midnight");
+        let nebula = CliTheme::by_name("Nebula");
+        assert_ne!(midnight.user, nebula.user);
+        let styled = chat_line_with_theme(ChatRole::User, "hi", true, &nebula);
+        assert_eq!(styled.spans[0].style.fg, Some(nebula.user));
+    }
+
+    // ------------------------------------------------------------------
+    // Tool-log provenance rail (`‖ policy ok` / `‖ approval needed` /
+    // `‖ denied`): text always, color only when styled.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tool_log_rail_themed_carries_policy_colors() {
+        use crate::app::{ToolLogEntry, ToolStatus};
+        let theme = CliTheme::by_name("Midnight");
+        let entry = |status| ToolLogEntry {
+            tool_name: "shell".into(),
+            status,
+            detail: None,
+            duration_ms: Some(12),
+        };
+        let running = tool_log_line_with_theme(&entry(ToolStatus::Running), true, &theme);
+        assert_eq!(line_text(&running), " ▶ shell 12ms ‖ approval needed");
+        assert_eq!(running.spans[1].style.fg, Some(Color::Yellow));
+        let ok = tool_log_line_with_theme(&entry(ToolStatus::Success), true, &theme);
+        assert!(line_text(&ok).ends_with(" ‖ policy ok"), "{}", line_text(&ok));
+        assert_eq!(ok.spans[1].style.fg, Some(Color::Green));
+        let failed = tool_log_line_with_theme(&entry(ToolStatus::Failure), true, &theme);
+        assert!(line_text(&failed).ends_with(" ‖ policy ok"), "{}", line_text(&failed));
+        assert_eq!(failed.spans[1].style.fg, Some(Color::Green));
+        let denied = tool_log_line_with_theme(
+            &entry(ToolStatus::Timeout { timeout_secs: 30 }),
+            true,
+            &theme,
+        );
+        assert!(line_text(&denied).ends_with(" ‖ denied"), "{}", line_text(&denied));
+        assert_eq!(denied.spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn tool_log_rail_plain_is_symbols_only() {
+        use crate::app::{ToolLogEntry, ToolStatus};
+        // Plain on every theme: the rail text stays, no ANSI anywhere.
+        for name in ["Midnight", "Slate", "Chalk", "Nebula"] {
+            let theme = CliTheme::by_name(name);
+            for status in [
+                ToolStatus::Running,
+                ToolStatus::Success,
+                ToolStatus::Failure,
+                ToolStatus::Timeout { timeout_secs: 5 },
+            ] {
+                let line = tool_log_line_with_theme(
+                    &ToolLogEntry {
+                        tool_name: "fs_write".into(),
+                        status,
+                        detail: None,
+                        duration_ms: None,
+                    },
+                    false,
+                    &theme,
+                );
+                assert!(line_text(&line).contains(" ‖ "), "{name}: rail text present");
+                assert!(
+                    line.spans.iter().all(|span| span.style.fg.is_none()),
+                    "{name}: plain carries no fg"
+                );
+                assert!(
+                    line.spans.iter().all(|span| span.style.add_modifier.is_empty()),
+                    "{name}: plain carries no modifiers"
+                );
+            }
+        }
+        let theme = CliTheme::by_name("Midnight");
+        let line = tool_log_line_with_theme(
+            &crate::app::ToolLogEntry {
+                tool_name: "shell".into(),
+                status: crate::app::ToolStatus::Running,
+                detail: None,
+                duration_ms: None,
+            },
+            false,
+            &theme,
+        );
+        assert_eq!(line_text(&line), " ▶ shell ‖ approval needed");
+    }
+
+    // ------------------------------------------------------------------
+    // Fence hardening: partial streaming prefixes must not leak fence
+    // marker styling; the unmatched opener stays literal while the body
+    // keeps the dim style + `│` gutter.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn markdown_partial_fence_keeps_gutter_with_literal_opener() {
+        let theme = CliTheme::by_name("Midnight");
+        let spans = markdown_spans_with_theme("```\nlet x = 1;", true, &theme);
+        let text: String = spans.iter().map(|span| span.content.to_string()).collect();
+        assert_eq!(text, "```\n  │ let x = 1;");
+        // The unmatched opener is literal raw text — never a dimmed boundary.
+        assert_eq!(spans[0].content.as_ref(), "```");
+        assert!(spans[0].style.add_modifier.is_empty());
+        assert!(spans[0].style.fg.is_none());
+        // The fenced body keeps the │ gutter and the dimmed body style.
+        assert!(spans.iter().any(|span| span.content.as_ref() == "  │ "));
+        let body = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "let x = 1;")
+            .expect("fenced body present");
+        assert!(body.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn markdown_fence_across_reveal_chunks_settles_without_marker_leak() {
+        let theme = CliTheme::by_name("Midnight");
+        // Chunk 1: opener seen, closer not yet — the opener stays literal
+        // while the partial body already carries the gutter.
+        let partial = markdown_spans_with_theme("intro\n```\nlet x", true, &theme);
+        assert!(
+            partial
+                .iter()
+                .filter(|span| span.content.as_ref() == "```")
+                .all(|span| span.style.add_modifier.is_empty()),
+            "partial opener must not render as a fence boundary"
+        );
+        assert!(partial.iter().any(|span| span.content.as_ref() == "  │ "));
+        // Chunk 2 (full text): the closed fence renders both boundaries
+        // dimmed and the body guttered — the settled contract is unchanged.
+        let full = markdown_spans_with_theme("intro\n```\nlet x = 1;\n```\ndone", true, &theme);
+        let markers: Vec<_> = full.iter().filter(|span| span.content.as_ref() == "```").collect();
+        assert_eq!(markers.len(), 2);
+        assert!(
+            markers.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)),
+            "closed boundaries stay dimmed"
+        );
+        let text: String = full.iter().map(|span| span.content.to_string()).collect();
+        assert!(text.contains("  │ let x = 1;"));
+        assert!(text.contains("done"));
     }
 }

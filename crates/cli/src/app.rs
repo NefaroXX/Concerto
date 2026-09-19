@@ -5,22 +5,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use crate::approval::{
     ApprovalPrompt, CliApprovalSink, CliApprovalState, IntentPrompt, PlanPrompt,
 };
-use crate::ui;
+use crate::theme::CliTheme;
+use crate::ui::{self, chat_line_with_theme, ChatRole};
 use concerto_config::{
     AgentModelAssignment, AppConfig, ConditionDef, ModelSettings, MultiAgentConfig, PolicyConfig,
     PolicyRuleDef,
 };
-use concerto_core::event::{EventBus, EventKind};
+use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{PlanDecision, RequestedOutcome, RunStage};
 use concerto_core::traits::approval::ApprovalDecision;
 use concerto_core::transcript::{TranscriptEntry, TranscriptToolStatus};
 
+use concerto_core::types::normalize_agent_id;
 use concerto_core::types::AgentOutput;
 use concerto_core::CancellationToken;
 use concerto_orchestrator::runtime_runner::{
@@ -35,7 +37,7 @@ use concerto_sessions::SessionSummary;
 /// CLI flags supplied at startup and remembered for the life of the TUI
 /// (ADR-57 D5). `Some` marks an explicit flag that must survive a config
 /// reload; `None` means "follow the (reloaded) config default".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunFlags {
     /// Explicit `--multi-agent`/`-m`. Always `Some(true)` when the flag was
     /// passed (there is no `--no-multi-agent`); `None` when it was not.
@@ -43,6 +45,21 @@ pub struct RunFlags {
     /// Explicit `--fast`/`-f`, likewise. There is no config key for fast, so
     /// absent means `false`.
     pub fast: Option<bool>,
+    /// Explicit `--reduced-motion`. `Some(true)` when the flag was passed
+    /// (there is no `--no-reduced-motion`); `None` follows
+    /// `CONCERTO_REDUCED_MOTION` env, then the config file — see
+    /// `concerto_config::resolve_reduced_motion`.
+    pub reduced_motion: Option<bool>,
+    /// Explicit `--no-terminal-title`. `Some(true)` when the flag was passed
+    /// (there is no `--terminal-title` opt-in); `None` follows
+    /// `CONCERTO_NO_TITLE` env, then the config file — see
+    /// `concerto_config::resolve_terminal_title_enabled`.
+    pub no_terminal_title: Option<bool>,
+    /// Explicit `--theme <name>`. `Some` carries the raw flag value
+    /// (`Midnight` / `Slate` / `Chalk` / `Nebula`); `None` follows
+    /// `CONCERTO_THEME` env, then `[display] theme` — see
+    /// `crate::theme::resolve_cli_theme`.
+    pub theme: Option<String>,
 }
 
 /// Per-run preferences resolved from the effective config plus the remembered
@@ -51,6 +68,9 @@ pub struct RunFlags {
 struct ResolvedRunPrefs {
     multi_agent: bool,
     fast: bool,
+    reduced_motion: bool,
+    terminal_title_enabled: bool,
+    cli_theme: CliTheme,
     selected_model: String,
     model_choices: Vec<String>,
     agent_assignments: Vec<AgentModelAssignment>,
@@ -80,6 +100,33 @@ pub enum ToolStatus {
     Success,
     Failure,
     Timeout { timeout_secs: u64 },
+}
+
+impl ToolStatus {
+    /// Provenance rail suffix for tool-log lines (Blueprint texture `‖ ok`).
+    /// Read-only derivation from the stored status — it never consults the
+    /// policy engine. The text is always appended (rail is state, not motion:
+    /// `reduced_motion` never gates it); only the color is gated by `styling`.
+    /// Mapping mirrors the desktop/transcript rails: executed tools passed
+    /// the gate (`policy ok`), running tools await it (`approval needed`), and
+    /// a timed-out tool surfaces as `denied` (the run refused to wait further).
+    pub(crate) fn rail_text(&self) -> &'static str {
+        match self {
+            ToolStatus::Running => " ‖ approval needed",
+            ToolStatus::Success | ToolStatus::Failure => " ‖ policy ok",
+            ToolStatus::Timeout { .. } => " ‖ denied",
+        }
+    }
+
+    /// Themed rail color: ok green, approval-needed yellow, denied red.
+    /// Uses the CLI theme bridge so light/neon themes stay legible.
+    pub(crate) fn rail_color(&self, theme: &CliTheme) -> ratatui::style::Color {
+        match self {
+            ToolStatus::Running => theme.warning,
+            ToolStatus::Success | ToolStatus::Failure => theme.success,
+            ToolStatus::Timeout { .. } => theme.danger,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,14 +201,31 @@ pub(crate) enum UiLine {
     Text(String),
     /// The assistant's final message, animated into view by the reveal.
     Assistant(String),
+    /// An agent thought, tiered for the score accordion (V2). `LowLevel`
+    /// thoughts never become `UiLine`s (dropped at the bus adapter).
+    Thought { agent: String, kind: ThinkingKind, content: String },
 }
 
 /// In-progress typewriter reveal of the assistant's final message. The last
 /// `messages` line holds the revealed prefix; `shown` is how many characters
-/// are visible so far.
+/// are visible so far. `ticks` counts elapsed reveal ticks (16 ms cadence)
+/// for the first-token emphasis window; `hold` counts down the paragraph
+/// handoff hold while the frontier stays frozen at a blank-line boundary.
 struct RevealState {
     full: String,
     shown: usize,
+    ticks: u8,
+    hold: u8,
+}
+
+/// One tiered thought in the current movement's log (V2 score accordion).
+/// `shown` records whether the line rendered at ingest time so `/thinking`
+/// expand-all replays exactly the suppressed lines — never duplicates.
+pub(crate) struct ThoughtRecord {
+    agent: String,
+    kind: ThinkingKind,
+    content: String,
+    shown: bool,
 }
 
 /// Characters the typewriter reveal adds per tick. Together with
@@ -171,6 +235,21 @@ struct RevealState {
 const REVEAL_CHARS_PER_TICK: usize = 8;
 /// Milliseconds between reveal advances while a reveal is active.
 const REVEAL_TICK_MS: u64 = 16;
+/// First-token emphasis window (Score signature, prototype #6): 12 ticks at
+/// the 16 ms cadence ≈ 200 ms, matching the desktop
+/// `FIRST_TOKEN_EMPHASIS_TICKS`. The first word of each assistant turn
+/// renders bold for this long, then settles to normal weight.
+const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 12;
+/// Paragraph handoff hold (Baton cue, prototype #5): 3 ticks at the 16 ms
+/// cadence ≈ 50 ms, matching the desktop `HANDOFF_HOLD_TICKS`. The reveal
+/// frontier freezes at the blank-line boundary and the line dims while the
+/// hold counts down, then the 8ch@16ms cadence resumes exactly where it
+/// paused.
+const HANDOFF_HOLD_TICKS: u8 = 3;
+/// Wipe-analog rule drawn above each new assistant turn. The desktop canvas
+/// line-wipe has no TUI equivalent, so a static horizontal rule marks the
+/// same turn boundary. Skipped under reduced-motion (caller gate).
+const WIPE_RULE: &str = "───";
 /// ADR-60 D7 (interrupt-safe resume): how long a quit with a run still in
 /// flight waits for the cancelled run to unwind and persist its interrupted
 /// checkpoint before the process tears down. Bounded so the exit is never a
@@ -179,6 +258,10 @@ const REVEAL_TICK_MS: u64 = 16;
 /// provider streams to observe the cancellation and the coordinator's cancel
 /// path to run its bounded SQLite write.
 const GRACEFUL_SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// Bound on the per-movement thought log (V3 quick win): the log is
+/// session-scoped (cleared on new session) and drops oldest-first past this
+/// cap so long movements cannot grow memory without bound.
+const MAX_THOUGHT_LOG: usize = 500;
 
 pub struct App {
     bus: EventBus,
@@ -237,6 +320,33 @@ pub struct App {
     tool_event_rx: Option<std::sync::mpsc::Receiver<EventKind>>,
     stage_rx: Option<std::sync::mpsc::Receiver<RunStage>>,
     pub memory_chunks: usize,
+    /// Tracks the most recently seen agent id for the thinking accordion
+    /// header insertion. When the agent changes, a bold header line is
+    /// injected before the first thought from the new agent.
+    current_agent: Option<String>,
+    /// Full thought log for the current movement (V2 score accordion).
+    /// Every `Headline`/`Detail` thought is recorded with its visibility so
+    /// `/thinking` expand-all can replay suppressed lines and collapse-all
+    /// can print a per-agent digest. `LowLevel` thoughts never enter here.
+    /// Bounded to `MAX_THOUGHT_LOG` entries (session-scoped; cleared on new
+    /// session) so a long movement cannot grow memory without bound.
+    pub(crate) thought_log: VecDeque<ThoughtRecord>,
+    /// Whether `Detail` thoughts render inline (V2). `true` preserves the
+    /// historical show-everything behavior; `/thinking` toggles it per
+    /// movement. `Headline` thoughts always render.
+    pub(crate) thinking_expanded: bool,
+    /// Reduced-motion override (same gate as desktop): skips first-token
+    /// bold, the handoff hold/dim, and the wipe-analog rule — reveals render
+    /// plain and instant. Off by default; set via `set_reduced_motion`.
+    pub(crate) reduced_motion: bool,
+    /// Whether run stages are broadcast to the terminal title via OSC.
+    /// Resolved per run (flag > env > config); the emit itself is gated to
+    /// stage transitions only (never per-frame) — see `sync_terminal_title`.
+    pub(crate) terminal_title_enabled: bool,
+    /// Effective CLI theme (flag > `CONCERTO_THEME` env > `[display] theme` >
+    /// `Midnight`). The single color source for gutters and status chrome;
+    /// `NO_COLOR`/off-TTY still renders plain via the `styling` gate.
+    pub cli_theme: CliTheme,
 }
 
 impl Default for App {
@@ -252,10 +362,14 @@ impl App {
         let approval_sink = Arc::new(CliApprovalSink::with_state(approval_state.clone()));
         Self {
             bus: EventBus::default(),
-            messages: vec![
-                Line::from("Concerto CLI — type a message and press Enter"),
-                Line::from("Esc: commands/settings  [l] sessions  [t] log  [n] new  [p] project  Ctrl+C: cancel or quit"),
-            ],
+            messages: {
+                let mut initial = startup_signature_lines(styling_enabled());
+                initial.push(Line::from("Concerto CLI — type a message and press Enter"));
+                initial.push(Line::from(
+                    "Esc: commands/settings  [l] sessions  [t] log  [n] new  [p] project  Ctrl+C: cancel or quit",
+                ));
+                initial
+            },
             reveal: None,
             input: String::new(),
             scroll: 0,
@@ -291,6 +405,12 @@ impl App {
             tool_event_rx: None,
             stage_rx: None,
             memory_chunks: 0,
+            current_agent: None,
+            thought_log: VecDeque::new(),
+            thinking_expanded: true,
+            reduced_motion: false,
+            terminal_title_enabled: true,
+            cli_theme: CliTheme::by_name("Midnight"),
         }
     }
 
@@ -354,6 +474,9 @@ impl App {
     fn apply_run_prefs(&mut self, prefs: ResolvedRunPrefs) {
         self.multi_agent = prefs.multi_agent;
         self.fast = prefs.fast;
+        self.set_reduced_motion(prefs.reduced_motion);
+        self.terminal_title_enabled = prefs.terminal_title_enabled;
+        self.cli_theme = prefs.cli_theme;
         self.selected_model = prefs.selected_model;
         self.model_choices = prefs.model_choices;
         self.agent_assignments = prefs.agent_assignments;
@@ -398,6 +521,8 @@ impl App {
         self.project_dir = canonical.clone();
         self.selected_model = default_model(&effective_config);
         self.model_choices = available_models(&effective_config);
+        self.cli_theme =
+            crate::theme::resolve_cli_theme(self.run_flags.theme.as_deref(), &effective_config);
         self.agent_assignments = effective_config
             .model_settings
             .as_ref()
@@ -452,7 +577,9 @@ impl App {
         if !transcript.is_empty() {
             self.session_id = Some(session.session_id);
             self.messages.push(Line::from(format!("Resumed session {}", session.session_id)));
-            self.messages.extend(transcript_lines(&transcript));
+            let theme = self.cli_theme;
+            let styling = styling_enabled();
+            self.messages.extend(transcript_lines_with_theme(&transcript, styling, &theme));
             return;
         }
         let history = match rt
@@ -467,13 +594,25 @@ impl App {
         self.session_id = Some(session.session_id);
         if !history.is_empty() {
             self.messages.push(Line::from(format!("Resumed session {}", session.session_id)));
+            let styling = styling_enabled();
+            let theme = self.cli_theme;
             for message in history {
                 match message.role {
                     concerto_core::types::Role::User => {
-                        self.messages.push(Line::from(format!("> {}", message.content)));
+                        self.messages.push(chat_line_with_theme(
+                            ChatRole::User,
+                            &message.content,
+                            styling,
+                            &theme,
+                        ));
                     }
                     concerto_core::types::Role::Assistant if !message.content.trim().is_empty() => {
-                        self.messages.push(Line::from(message.content));
+                        self.messages.push(chat_line_with_theme(
+                            ChatRole::Assistant,
+                            &message.content,
+                            styling,
+                            &theme,
+                        ));
                     }
                     _ => {}
                 }
@@ -491,6 +630,36 @@ impl App {
 
     pub fn plan_prompt(&self) -> Option<PlanPrompt> {
         self.approval_state.plan_prompt()
+    }
+
+    /// Reduced-motion override (same gate as desktop): when true the reveal
+    /// renders plain — no first-token bold, no handoff hold/dim, no
+    /// wipe-analog rule. Mirrors the desktop `set_reduced_motion` contract.
+    pub fn set_reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
+    }
+
+    /// Whether an approval (tool, intent, or plan) is currently awaiting the
+    /// user. Overrides any run stage in the terminal title.
+    fn is_awaiting_approval(&self) -> bool {
+        self.approval_state.prompt().is_some()
+            || self.approval_state.intent_prompt().is_some()
+            || self.approval_state.plan_prompt().is_some()
+    }
+
+    /// Broadcast the current run stage to the terminal title (OSC `ESC ] 0`).
+    ///
+    /// Gated TTY-only via `should_emit_terminal_title` and called only on
+    /// stage transitions (never per-frame), so the escape is written at most
+    /// once per transition — no flicker, no pipe pollution, silent under CI.
+    fn sync_terminal_title(&self) {
+        use std::io::IsTerminal as _;
+        let is_tty = std::io::stdout().is_terminal();
+        let is_ci = std::env::var("CI").is_ok();
+        if !should_emit_terminal_title(self.terminal_title_enabled, is_tty, is_ci) {
+            return;
+        }
+        emit_terminal_title(&title_for_stage(self.run_stage, self.is_awaiting_approval()));
     }
 
     pub fn model_label(&self) -> &str {
@@ -571,9 +740,19 @@ impl App {
                         | EventKind::ToolTimeout { .. }
                         | EventKind::IndexingCompleted { .. }
                 );
+                // Tiered thoughts (score accordion V2): LowLevel never
+                // reaches a chat surface; the App applies collapse filtering
+                // and header injection at ingest time.
+                if let EventKind::AgentThought { agent_id, content, kind } = &event.kind {
+                    if *kind != ThinkingKind::LowLevel {
+                        let _ = event_tx.send(UiLine::Thought {
+                            agent: agent_id.clone(),
+                            kind: *kind,
+                            content: content.clone(),
+                        });
+                    }
+                }
                 if let Some(line) = event_line(&event.kind) {
-                    // Assistant final messages reveal typewriter-style; every
-                    // other line renders instantly (Issue #147 Part 2).
                     let tagged = if matches!(&event.kind, EventKind::AssistantMessage { .. }) {
                         UiLine::Assistant(line)
                     } else {
@@ -668,6 +847,7 @@ impl App {
                     Ok(output) => self.session_id = Some(output.session_id),
                     Err(error) => self.push_line(Line::from(format!("Error: {error}"))),
                 }
+                self.sync_terminal_title();
             }
 
             // Drain raw events (tool + status) (collect first to avoid borrow conflict).
@@ -694,14 +874,22 @@ impl App {
             }
 
             // Run-stage transitions from the backend (ADR-55 Phase 2a); the
-            // status bar shows only the latest stage.
+            // status bar shows only the latest stage. The terminal title
+            // follows the same transition (once per change, never per-frame).
+            let mut stage_changed = false;
             while let Ok(stage) = self
                 .stage_rx
                 .as_ref()
                 .map(|rx| rx.try_recv())
                 .unwrap_or(Err(std::sync::mpsc::TryRecvError::Empty))
             {
-                self.run_stage = Some(stage);
+                if self.run_stage != Some(stage) {
+                    self.run_stage = Some(stage);
+                    stage_changed = true;
+                }
+            }
+            if stage_changed {
+                self.sync_terminal_title();
             }
 
             terminal.draw(|frame| ui::draw(frame, self))?;
@@ -730,6 +918,12 @@ impl App {
 
     fn dispatch_message(&mut self, input: String, rt: &tokio::runtime::Runtime) {
         if self.running || input.trim().is_empty() {
+            return;
+        }
+        // `/thinking` is a local accordion toggle for the current movement
+        // (collapse-all / expand-all) — never dispatched as a run.
+        if input.trim() == "/thinking" {
+            self.toggle_thinking();
             return;
         }
         // External config edits take effect on this dispatch (ADR-57 D5).
@@ -779,11 +973,21 @@ impl App {
             }
         };
 
-        self.push_line(Line::from(format!("> {input}")));
+        self.push_line(chat_line_with_theme(
+            ChatRole::User,
+            &input,
+            styling_enabled(),
+            &self.cli_theme,
+        ));
         self.running = true;
         // Fresh run boundary: no stale stage from a previous run may show in
         // the status bar (the chip re-appears once a stage event lands).
         self.run_stage = None;
+        self.current_agent = None;
+        // Fresh movement boundary: the thought log belongs to the previous
+        // movement, and collapse mode resets to show-everything.
+        self.thought_log.clear();
+        self.thinking_expanded = true;
         self.cancel_token = CancellationToken::new();
 
         let request =
@@ -852,29 +1056,202 @@ impl App {
     fn ingest_ui_line(&mut self, line: UiLine) {
         match line {
             UiLine::Text(text) => self.push_line(Line::from(text)),
+            UiLine::Thought { agent, kind, content } => {
+                self.ingest_thought(agent, kind, content);
+            }
             UiLine::Assistant(full) => {
                 // Cancel any active reveal first (same semantics as
                 // `push_line`) so its slot is materialized before we push the
                 // replacement slot below.
                 self.cancel_reveal();
-                self.messages.push(Line::from(prefix(&full, 0)));
-                self.reveal = Some(RevealState { full, shown: 0 });
+                let styling = styling_enabled();
+                let theme = self.cli_theme;
+                // Reduced-motion: instant — the full markdown-lite + gutter
+                // line lands at once, no reveal state, no bold/hold extension.
+                if self.reduced_motion {
+                    self.messages.push(chat_line_with_theme(
+                        ChatRole::Assistant,
+                        &full,
+                        styling,
+                        &theme,
+                    ));
+                    self.reveal = None;
+                    return;
+                }
+                // Wipe analog (Score prototype #7): a horizontal rule above
+                // each new assistant turn — the desktop canvas line-wipe has
+                // no TUI equivalent. Skipped under reduced-motion (same gate
+                // as desktop); dimmed only on a color TTY.
+                self.messages.push(wipe_rule_line(styling));
+                self.messages.push(chat_line_with_theme(ChatRole::Assistant, "", styling, &theme));
+                self.reveal = Some(RevealState { full, shown: 0, ticks: 0, hold: 0 });
             }
         }
     }
 
-    /// Advance the typewriter reveal one tick: grow `shown` by
-    /// `REVEAL_CHARS_PER_TICK` (clamped to the message length), rewrite the
-    /// last message line with the revealed prefix, and clear the state once
-    /// the full text is shown. No-op when no reveal is active.
+    /// Route one tiered thought into the chat view (V2 score accordion).
+    /// The full movement is always logged; rendering follows the collapse
+    /// mode — `Headline` thoughts always show, `Detail` only when expanded.
+    /// A bold per-agent header is injected on agent change.
+    ///
+    /// The agent id normalizes (trimmed + lowercased) for grouping so
+    /// `" Coder "` and `"coder"` share one bucket; content keeps its
+    /// original text.
+    fn ingest_thought(&mut self, agent: String, kind: ThinkingKind, content: String) {
+        let agent = normalize_agent_id(&agent);
+        let shown = self.thinking_expanded || kind == ThinkingKind::Headline;
+        self.thought_log.push_back(ThoughtRecord {
+            agent: agent.clone(),
+            kind,
+            content: content.clone(),
+            shown,
+        });
+        // Bounded log: drop oldest first so a long movement stays session-
+        // scoped without unbounded growth.
+        while self.thought_log.len() > MAX_THOUGHT_LOG {
+            self.thought_log.pop_front();
+        }
+        if self.current_agent.as_deref() != Some(agent.as_str()) {
+            let theme = self.cli_theme;
+            self.push_line(thinking_header_with_theme(&agent, &theme));
+            self.current_agent = Some(agent.clone());
+        }
+        if shown {
+            self.push_line(Line::from(format!("· [{agent}] {content}")));
+        }
+    }
+
+    /// `/thinking` toggle for the current movement: collapse-all prints a
+    /// per-agent digest (latest headline each) and suppresses future
+    /// `Detail` lines; expand-all replays exactly the suppressed lines.
+    fn toggle_thinking(&mut self) {
+        // Policy-gutter (`‖`, yellow on a color TTY) for the digest lines;
+        // the text stays byte-identical to the V2 accordion contract — only
+        // the gutter color is new, and plain (symbols only) off-TTY.
+        let styling = styling_enabled();
+        let theme = self.cli_theme;
+        self.thinking_expanded = !self.thinking_expanded;
+        if self.thinking_expanded {
+            let replay: Vec<(String, String)> = self
+                .thought_log
+                .iter_mut()
+                .filter(|record| !record.shown && record.kind == ThinkingKind::Detail)
+                .map(|record| {
+                    record.shown = true;
+                    (record.agent.clone(), record.content.clone())
+                })
+                .collect();
+            for (agent, content) in replay {
+                self.push_line(Line::from(format!("· [{agent}] {content}")));
+            }
+            self.push_line(chat_line_with_theme(
+                ChatRole::Policy,
+                "thinking expanded",
+                styling,
+                &theme,
+            ));
+        } else {
+            let mut order: Vec<String> = Vec::new();
+            let mut latest: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for record in &self.thought_log {
+                if record.kind == ThinkingKind::Headline {
+                    if !latest.contains_key(&record.agent) {
+                        order.push(record.agent.clone());
+                    }
+                    latest.insert(record.agent.clone(), record.content.clone());
+                }
+            }
+            // Detail fallback (V3 quick win): agents with no `Headline`
+            // (Detail-only movements; `LowLevel` never enters the log) fall
+            // back to their latest `Detail` line instead of going invisible.
+            // Headline digests are never overwritten by Detail lines. The
+            // forward iteration leaves the latest Detail in the map.
+            let headline_agents: std::collections::HashSet<&str> = self
+                .thought_log
+                .iter()
+                .filter(|r| r.kind == ThinkingKind::Headline)
+                .map(|r| r.agent.as_str())
+                .collect();
+            for record in &self.thought_log {
+                if record.kind == ThinkingKind::Detail
+                    && !headline_agents.contains(record.agent.as_str())
+                {
+                    if !latest.contains_key(&record.agent) {
+                        order.push(record.agent.clone());
+                    }
+                    latest.insert(record.agent.clone(), record.content.clone());
+                }
+            }
+            for agent in &order {
+                if let Some(headline) = latest.get(agent) {
+                    let first = headline.lines().next().unwrap_or("").trim();
+                    self.push_line(chat_line_with_theme(
+                        ChatRole::Policy,
+                        &format!("[{agent}] {first}"),
+                        styling,
+                        &theme,
+                    ));
+                }
+            }
+            self.push_line(chat_line_with_theme(
+                ChatRole::Policy,
+                "thinking collapsed — /thinking to expand",
+                styling,
+                &theme,
+            ));
+        }
+    }
+
+    /// Advance the typewriter reveal one tick at the 8ch@16ms parity cadence.
+    /// Each tick the emphasis clock advances; while a paragraph handoff hold
+    /// is open the frontier stays frozen and the line renders dim instead of
+    /// growing. Crossing a blank-line boundary opens a fresh
+    /// `HANDOFF_HOLD_TICKS` hold (skipped under reduced-motion). The finished
+    /// line always settles to normal weight, and the state clears once the
+    /// full text is shown. No-op when no reveal is active.
     fn advance_reveal(&mut self) {
+        let reduced = self.reduced_motion;
+        let styling = styling_enabled();
+        let theme = self.cli_theme;
         let Some(state) = self.reveal.as_mut() else { return };
+        // The emphasis clock runs on every tick — including hold ticks, like
+        // the desktop `advance_first_token_ticks` — so a handoff never
+        // stretches the bold window.
+        state.ticks = state.ticks.saturating_add(1);
+        if state.hold > 0 {
+            state.hold -= 1;
+            let line =
+                reveal_line_with_theme(&state.full, state.shown, false, true, styling, &theme);
+            if let Some(last) = self.messages.last_mut() {
+                *last = line;
+            }
+            return;
+        }
         let total = state.full.chars().count();
-        state.shown = state.shown.saturating_add(REVEAL_CHARS_PER_TICK).min(total);
-        let done = state.shown >= total;
-        let prefix_text = prefix(&state.full, state.shown);
+        let from = state.shown;
+        let next = from.saturating_add(REVEAL_CHARS_PER_TICK).min(total);
+        // Paragraph handoff cue (Baton prototype #5): when the frontier
+        // crosses a blank-line boundary mid-reveal, freeze it and hold the
+        // dimmed line for `HANDOFF_HOLD_TICKS` before resuming. A finishing
+        // tick never opens a hold; single-paragraph content never triggers.
+        if next != total && !reduced && crosses_paragraph_boundary(&state.full, from, next) {
+            state.shown = next;
+            state.hold = HANDOFF_HOLD_TICKS;
+            let line = reveal_line_with_theme(&state.full, next, false, true, styling, &theme);
+            if let Some(last) = self.messages.last_mut() {
+                *last = line;
+            }
+            return;
+        }
+        state.shown = next;
+        let done = next >= total;
+        // The completed line settles to normal weight even inside the
+        // emphasis window — a one-tick reveal must not linger bold.
+        let emphasis = !done && !reduced && state.ticks < FIRST_TOKEN_EMPHASIS_TICKS;
+        let line = reveal_line_with_theme(&state.full, next, emphasis, false, styling, &theme);
         if let Some(last) = self.messages.last_mut() {
-            *last = Line::from(prefix_text);
+            *last = line;
         }
         if done {
             self.reveal = None;
@@ -895,7 +1272,15 @@ impl App {
     fn cancel_reveal(&mut self) {
         if let Some(reveal) = self.reveal.take() {
             if let Some(last) = self.messages.last_mut() {
-                *last = Line::from(reveal.full);
+                // Settle to the final markdown-lite + gutter rendering, not
+                // plain text, so the abandoned slot matches a completed line.
+                let theme = self.cli_theme;
+                *last = chat_line_with_theme(
+                    ChatRole::Assistant,
+                    &reveal.full,
+                    styling_enabled(),
+                    &theme,
+                );
             }
         }
     }
@@ -1257,13 +1642,25 @@ impl App {
             };
         self.messages.clear();
         self.push_line(Line::from(format!("Resumed session {session_id}")));
+        let styling = styling_enabled();
+        let theme = self.cli_theme;
         for message in &history {
             match message.role {
                 concerto_core::types::Role::User => {
-                    self.push_line(Line::from(format!("> {}", message.content)));
+                    self.push_line(chat_line_with_theme(
+                        ChatRole::User,
+                        &message.content,
+                        styling,
+                        &theme,
+                    ));
                 }
                 concerto_core::types::Role::Assistant if !message.content.trim().is_empty() => {
-                    self.push_line(Line::from(message.content.clone()));
+                    self.push_line(chat_line_with_theme(
+                        ChatRole::Assistant,
+                        &message.content,
+                        styling,
+                        &theme,
+                    ));
                 }
                 _ => {}
             }
@@ -1468,6 +1865,20 @@ fn resolve_run_prefs(effective: &AppConfig, flags: &RunFlags) -> ResolvedRunPref
     // `fast` has no config key: absent flag means off (matches the pre-reload
     // startup derivation).
     let fast = flags.fast.unwrap_or(false);
+    // Reduced-motion precedence: explicit flag > CONCERTO_REDUCED_MOTION env
+    // > config file > default (false). The CLI has no scan-line; this flag
+    // gates the bold/hold/rule cues (all already respect it). NO_COLOR stays
+    // independent (`styling_enabled` is untouched).
+    let reduced_motion = concerto_config::resolve_reduced_motion(flags.reduced_motion, effective);
+    // Terminal-title precedence: explicit flag > CONCERTO_NO_TITLE env >
+    // config file > default (true). Resolved here so reloads re-apply the
+    // remembered flag like the other run prefs.
+    let terminal_title_enabled =
+        concerto_config::resolve_terminal_title_enabled(flags.no_terminal_title, effective);
+    // Theme precedence: explicit flag > CONCERTO_THEME env > config file >
+    // default (Midnight). Resolved here so reloads re-apply the remembered
+    // flag like the other run prefs.
+    let cli_theme = crate::theme::resolve_cli_theme(flags.theme.as_deref(), effective);
     let selected_model = default_model(effective);
     let model_choices = available_models(effective);
     let agent_assignments = effective
@@ -1475,7 +1886,16 @@ fn resolve_run_prefs(effective: &AppConfig, flags: &RunFlags) -> ResolvedRunPref
         .as_ref()
         .map(|settings| settings.agent_assignments.clone())
         .unwrap_or_default();
-    ResolvedRunPrefs { multi_agent, fast, selected_model, model_choices, agent_assignments }
+    ResolvedRunPrefs {
+        multi_agent,
+        fast,
+        reduced_motion,
+        terminal_title_enabled,
+        cli_theme,
+        selected_model,
+        model_choices,
+        agent_assignments,
+    }
 }
 
 /// Decide the outcome of a per-run reload (ADR-57 D5). The equality
@@ -1527,23 +1947,259 @@ fn prefix(full: &str, shown: usize) -> String {
     full.chars().take(shown).collect()
 }
 
+/// Startup signature staff: 2 static lines (≤3) printed as the first chat
+/// lines in `App::new` — an ASCII staff plus the version/tagline. Static
+/// text (reduced-motion irrelevant). Styled on a color TTY; plain ASCII
+/// (no symbol beyond `-`) under `NO_COLOR`/off-TTY so nothing non-ASCII
+/// leaks into pipes. `styling` is a parameter (like `reveal_line`) so the
+/// plain side stays unit-testable off-TTY.
+fn startup_signature_lines(styling: bool) -> Vec<Line<'static>> {
+    use ratatui::style::{Modifier, Style};
+    let version = env!("CARGO_PKG_VERSION");
+    if styling {
+        vec![
+            Line::from(Span::styled(
+                "♪ ─── ♪ ─── ♪",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("CONCERTO v{version} — local-first • policy-governed")),
+        ]
+    } else {
+        vec![
+            Line::from("- - - CONCERTO - - -"),
+            Line::from(format!("CONCERTO v{version} - local-first - policy-governed")),
+        ]
+    }
+}
+/// Terminal title for a run stage (OSC broadcaster, pure — no I/O).
+///
+/// Four titles cover the run lifecycle: early stages (Understand/Inspect/
+/// Plan) are `Tuning`, doing stages (Execute/Verify) are `Performing`, an
+/// idle run (no stage, or Complete) is `Done`, and a pending approval
+/// overrides any stage with `Awaiting approval`.
+pub fn title_for_stage(stage: Option<RunStage>, awaiting_approval: bool) -> String {
+    if awaiting_approval {
+        return "Concerto: Awaiting approval".to_string();
+    }
+    match stage {
+        None | Some(RunStage::Complete) => "Concerto: Done".to_string(),
+        Some(RunStage::Execute) | Some(RunStage::Verify) => "Concerto: Performing".to_string(),
+        // `RunStage` is non-exhaustive: unknown future stages read Tuning
+        // (grounding) rather than failing to compile at the next addition.
+        Some(RunStage::Understand) | Some(RunStage::Inspect) | Some(RunStage::Plan) | Some(_) => {
+            "Concerto: Tuning".to_string()
+        }
+    }
+}
+
+/// Pure emit gate for the OSC terminal-title broadcaster (unit-testable; no I/O).
+///
+/// Titles emit only when the resolved pref is enabled AND stdout is a TTY
+/// AND the run is not under CI (`CI` env present). The anti-flicker half of
+/// the contract is call-site discipline: `sync_terminal_title` runs only on
+/// stage transitions (never per-frame), so the escape is written at most
+/// once per transition.
+pub(crate) fn should_emit_terminal_title(enabled: bool, is_tty: bool, is_ci: bool) -> bool {
+    enabled && is_tty && !is_ci
+}
+
+/// Write one OSC `ESC ] 0 ; title BEL` sequence to stdout (no newline).
+/// Caller-owned gating: only call after `should_emit_terminal_title`.
+fn emit_terminal_title(title: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]0;{title}\x07");
+    let _ = out.flush();
+}
+/// Styling gate for the CLI motion cues (bold first token, dim handoff,
+/// dimmed wipe rule): cues render only on a color TTY. Under `NO_COLOR` or
+/// off-TTY every line stays plain so no ANSI escapes leak into pipes — the
+/// same contract as `thinking_header`. A parameter at the call boundary (not
+/// read inside `reveal_line`) so the cues stay unit-testable off-TTY.
+/// `pub(crate)` so the tool-log screen (`ui`) shares the identical gate for
+/// its provenance rail colors (rail text itself is state and always present).
+pub(crate) fn styling_enabled() -> bool {
+    use std::io::IsTerminal as _;
+    std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal()
+}
+
+/// Styled reveal line for the assistant typewriter: the `full[..shown]`
+/// prefix rendered as markdown-lite (`ui::markdown_spans`) behind the role
+/// gutter (`♪`, green on a color TTY), with the Score motion cues layered on
+/// top — a bold first word while `emphasis` (first-token emphasis, prototype
+/// #6), a dim whole line while `holding` (paragraph handoff, prototype #5).
+/// Plain (symbols only) when `styling` is false (`NO_COLOR`/off-TTY, see
+/// `styling_enabled`).
+#[allow(dead_code)]
+fn reveal_line(
+    full: &str,
+    shown: usize,
+    emphasis: bool,
+    holding: bool,
+    styling: bool,
+) -> Line<'static> {
+    reveal_line_with_theme(full, shown, emphasis, holding, styling, &CliTheme::by_name("Midnight"))
+}
+
+/// Theme-resolved reveal line; `reveal_line` keeps the `Midnight` contract.
+fn reveal_line_with_theme(
+    full: &str,
+    shown: usize,
+    emphasis: bool,
+    holding: bool,
+    styling: bool,
+    theme: &CliTheme,
+) -> Line<'static> {
+    use ratatui::style::Modifier;
+    let text = prefix(full, shown);
+    let mut line = chat_line_with_theme(ChatRole::Assistant, &text, styling, theme);
+    if !styling {
+        return line;
+    }
+    if holding {
+        for span in line.spans.iter_mut() {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+        return line;
+    }
+    if emphasis {
+        bold_first_token(&mut line);
+    }
+    line
+}
+
+/// Bold the first whitespace-delimited token of the body (every span past
+/// the gutter at index 0), splitting the span that holds the boundary.
+/// A prefix with no whitespace yet is one token — bold it all (mirrors the
+/// desktop truncated-reveal path). Markdown-lite spans underneath keep
+/// their own styles; this only adds `BOLD`.
+fn bold_first_token(line: &mut Line<'static>) {
+    use ratatui::style::Modifier;
+    for index in 1..line.spans.len() {
+        let content = line.spans[index].content.to_string();
+        if let Some(pos) = content.find(char::is_whitespace) {
+            let (head, tail) = content.split_at(pos);
+            let base = line.spans[index].style;
+            line.spans[index] =
+                ratatui::text::Span::styled(head.to_string(), base.add_modifier(Modifier::BOLD));
+            line.spans.insert(index + 1, ratatui::text::Span::styled(tail.to_string(), base));
+            for span in line.spans.iter_mut().skip(1).take(index - 1) {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+            }
+            return;
+        }
+    }
+    for span in line.spans.iter_mut().skip(1) {
+        span.style = span.style.add_modifier(Modifier::BOLD);
+    }
+}
+
+/// Wipe-analog rule above each new assistant turn (Score prototype #7).
+/// Dimmed on a color TTY, plain under `NO_COLOR`/off-TTY. The reduced-motion
+/// gate lives with the caller (`ingest_ui_line`), which skips the rule.
+fn wipe_rule_line(styling: bool) -> Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    if styling {
+        Line::from(Span::styled(WIPE_RULE, Style::default().add_modifier(Modifier::DIM)))
+    } else {
+        Line::from(WIPE_RULE)
+    }
+}
+
+/// Whether the reveal frontier crossed a paragraph boundary between `from`
+/// (exclusive) and `to` (inclusive), measured in characters. Same contract
+/// as the desktop Baton cue: a boundary is a blank line — an empty or
+/// whitespace-only line terminated by `\n` with more content following it —
+/// covering `\n\n`, `\r\n\r\n`, and whitespace-only separator lines.
+/// Single-paragraph text (and a trailing newline run with no content after
+/// it) yields `false`, so the handoff cue falls back to no cue.
+fn crosses_paragraph_boundary(content: &str, from: usize, to: usize) -> bool {
+    if to <= from {
+        return false;
+    }
+    let mut offset: usize = 0;
+    let mut lines = content.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line_len = line.chars().count();
+        let line_end = offset.saturating_add(line_len);
+        // Only a newline-terminated blank line with content after it marks a
+        // "continuing" handoff; a final newline run is just the message end.
+        let is_separator = line.contains('\n') && line.trim().is_empty() && lines.peek().is_some();
+        if is_separator && line_end > from && line_end <= to {
+            return true;
+        }
+        offset = line_end;
+    }
+    false
+}
+
+/// ANSI counterpart of the desktop `agent_roles` palette map: one stable
+/// color per specialist role so CLI headers match desktop buckets.
+///
+/// Kept as the `Midnight` contract; use [`agent_ansi_color_themed`] (or
+/// [`CliTheme::agent_color`]) for the active theme.
+#[allow(dead_code)]
+fn agent_ansi_color(role: &str) -> ratatui::style::Color {
+    agent_ansi_color_themed(&CliTheme::by_name("Midnight"), role)
+}
+
+/// Theme-resolved agent color (V2 score-accordion extension).
+fn agent_ansi_color_themed(theme: &CliTheme, role: &str) -> ratatui::style::Color {
+    theme.agent_color(role)
+}
+
+/// Per-agent thinking header (V2 score accordion). Colorized `[‖ agent]`
+/// on a color TTY; plain `[+ agent]` under `NO_COLOR` or off-TTY so no ANSI
+/// escapes leak into pipes.
+#[allow(dead_code)]
+pub(crate) fn thinking_header(agent: &str) -> Line<'static> {
+    thinking_header_with_theme(agent, &CliTheme::by_name("Midnight"))
+}
+
+/// Theme-resolved thinking header; `thinking_header` keeps the `Midnight`
+/// contract.
+pub(crate) fn thinking_header_with_theme(agent: &str, theme: &CliTheme) -> Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    use std::io::IsTerminal as _;
+    let use_color = std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
+    if use_color {
+        Line::from(Span::styled(
+            format!("[‖ {agent}]"),
+            Style::default().fg(agent_ansi_color_themed(theme, agent)).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(format!("[+ {agent}]"))
+    }
+}
+
 fn event_line(kind: &EventKind) -> Option<String> {
     match kind {
         EventKind::AssistantMessage { content, .. } => Some(content.clone()),
         // -- tool lifecycle --
-        EventKind::ToolExecutionStarted { tool_name, detail, .. } => {
-            Some(format!("· {tool_name}: {}", detail.as_deref().unwrap_or("running")))
-        }
+        // Live tool blocks carry the plain provenance rail suffix (no theme
+        // available here; `UiLine::Text` renders unstyled, so pipes stay
+        // clean). The restore path adds themed colors via
+        // `transcript_lines_with_theme`.
+        EventKind::ToolExecutionStarted { tool_name, detail, .. } => Some(format!(
+            "· {tool_name}: {} ‖ approval needed",
+            detail.as_deref().unwrap_or("running")
+        )),
         EventKind::ToolExecutionFinished { tool_name, duration_ms, success, .. } => Some(format!(
-            "· {tool_name} {} ({} ms)",
+            "· {tool_name} {} ({} ms) ‖ policy ok",
             if *success { "completed" } else { "failed" },
             duration_ms
         )),
         EventKind::ToolTimeout { tool_name, timeout_secs } => {
-            Some(format!("· {tool_name} timed out after {timeout_secs}s"))
+            Some(format!("· {tool_name} timed out after {timeout_secs}s ‖ denied"))
         }
-        // -- agent activity --
-        EventKind::AgentThought { agent_id, content } => Some(format!("· [{agent_id}] {content}")),
+        // -- agent activity (LowLevel thoughts never reach chat surfaces) --
+        EventKind::AgentThought { agent_id, content, kind } => {
+            if *kind == ThinkingKind::LowLevel {
+                None
+            } else {
+                Some(format!("· [{}] {content}", normalize_agent_id(agent_id)))
+            }
+        }
         EventKind::SubTaskCreated { role, description, .. } => {
             Some(format!("· [{role:?}] starting: {description}"))
         }
@@ -1633,8 +2289,45 @@ fn event_line(kind: &EventKind) -> Option<String> {
 /// Tool-call statuses are color-coded (completed green, failed red, approvals
 /// and cancellations dim). Pure so it can be unit-tested; the caller decides
 /// whether the transcript is present (legacy sessions fall back to messages).
+#[allow(dead_code)]
 fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
-    use ratatui::style::{Color, Style};
+    transcript_lines_with_theme(entries, styling_enabled(), &CliTheme::by_name("Midnight"))
+}
+
+/// Provenance rail suffix for tool lines (Blueprint texture `‖ ok`).
+/// Read-only mapping from the stored policy/tool status — it never consults
+/// the policy engine. The text is always appended; only the color is gated
+/// by `styling` (plain symbols under `NO_COLOR`/off-TTY).
+fn provenance_rail_text(status: &TranscriptToolStatus) -> &'static str {
+    match status {
+        TranscriptToolStatus::Denied => " ‖ denied",
+        TranscriptToolStatus::Running | TranscriptToolStatus::Cancelled => " ‖ approval needed",
+        TranscriptToolStatus::Completed
+        | TranscriptToolStatus::Allowed
+        | TranscriptToolStatus::Failed => " ‖ policy ok",
+    }
+}
+
+/// Themed rail color: ok green, approval-needed yellow, denied red.
+/// Uses the CLI theme bridge so light/neon themes stay legible.
+fn provenance_rail_color(status: &TranscriptToolStatus, theme: &CliTheme) -> ratatui::style::Color {
+    match status {
+        TranscriptToolStatus::Denied => theme.danger,
+        TranscriptToolStatus::Running | TranscriptToolStatus::Cancelled => theme.warning,
+        TranscriptToolStatus::Completed
+        | TranscriptToolStatus::Allowed
+        | TranscriptToolStatus::Failed => theme.success,
+    }
+}
+
+/// Theme-resolved transcript rendering; `transcript_lines` keeps the
+/// `Midnight` contract.
+fn transcript_lines_with_theme(
+    entries: &[TranscriptEntry],
+    styling: bool,
+    theme: &CliTheme,
+) -> Vec<Line<'static>> {
+    use ratatui::style::Style;
     let status_label = |status: &TranscriptToolStatus| match status {
         TranscriptToolStatus::Running => "running",
         TranscriptToolStatus::Completed => "completed",
@@ -1644,21 +2337,28 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
         TranscriptToolStatus::Cancelled => "cancelled",
     };
     let mut lines = Vec::with_capacity(entries.len());
+    // Restored lines carry the same role gutters + markdown-lite as live
+    // chat (plain symbols off-TTY so tests and pipes stay stable).
     for entry in entries {
         let line = match entry {
-            TranscriptEntry::User { content } => Line::from(format!("> {content}")),
-            TranscriptEntry::Assistant { content } => Line::from(content.clone()),
-            TranscriptEntry::Thinking { agent, content } => {
+            TranscriptEntry::User { content } => {
+                chat_line_with_theme(ChatRole::User, content, styling, theme)
+            }
+            TranscriptEntry::Assistant { content } => {
+                chat_line_with_theme(ChatRole::Assistant, content, styling, theme)
+            }
+            TranscriptEntry::Thinking { agent, content, .. } => {
+                let agent = normalize_agent_id(agent);
                 let text =
                     if agent.is_empty() { content.clone() } else { format!("[{agent}] {content}") };
-                Line::from(text).style(Style::default().fg(Color::DarkGray))
+                Line::from(text).style(Style::default().fg(theme.muted))
             }
             TranscriptEntry::Activity { agent, content } => {
-                Line::from(format!("[{agent}] {content}"))
-                    .style(Style::default().fg(Color::DarkGray))
+                Line::from(format!("[{agent}] {content}")).style(Style::default().fg(theme.muted))
             }
-            TranscriptEntry::Summary { content } => Line::from(format!("[context] {content}"))
-                .style(Style::default().fg(Color::DarkGray)),
+            TranscriptEntry::Summary { content } => {
+                Line::from(format!("[context] {content}")).style(Style::default().fg(theme.muted))
+            }
             TranscriptEntry::ToolCall { tool_name, detail, status } => {
                 let label = if detail.is_empty() {
                     format!("· {tool_name}: {}", status_label(status))
@@ -1666,15 +2366,32 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
                     format!("· {tool_name}: {detail} ({})", status_label(status))
                 };
                 let style = match status {
-                    TranscriptToolStatus::Completed => Style::default().fg(Color::Green),
-                    TranscriptToolStatus::Failed => Style::default().fg(Color::Red),
+                    TranscriptToolStatus::Completed => Style::default().fg(theme.success),
+                    TranscriptToolStatus::Failed => Style::default().fg(theme.danger),
                     // Running / Allowed / Denied / Cancelled settle to dim.
-                    _ => Style::default().fg(Color::DarkGray),
+                    _ => Style::default().fg(theme.muted),
                 };
-                Line::from(label).style(style)
+                // Provenance rail: themed suffix on a color TTY, plain
+                // symbols under NO_COLOR/off-TTY. The base line style is
+                // untouched so status colors keep their contract — and under
+                // plain the line stays fully unstyled (no Line-level fg leak).
+                let mut line = Line::from(label);
+                if styling {
+                    line = line.style(style);
+                }
+                let rail = provenance_rail_text(status);
+                if styling {
+                    line.spans.push(Span::styled(
+                        rail.to_string(),
+                        Style::default().fg(provenance_rail_color(status, theme)),
+                    ));
+                } else {
+                    line.spans.push(Span::raw(rail.to_string()));
+                }
+                line
             }
             TranscriptEntry::Error { content } => {
-                Line::from(format!("error: {content}")).style(Style::default().fg(Color::Red))
+                Line::from(format!("error: {content}")).style(Style::default().fg(theme.danger))
             }
             TranscriptEntry::Completion { multi_agent, completed, files, .. } => {
                 let mode = if *multi_agent { "multi-agent" } else { "single-agent" };
@@ -1748,6 +2465,149 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         })
+    }
+
+    #[test]
+    fn thought_ingest_logs_headline_and_detail_while_expanded() {
+        let mut app = App::new();
+        let base = app.messages.len();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Headline,
+            content: "starting".into(),
+        });
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Detail,
+            content: "tool reasoning".into(),
+        });
+        assert_eq!(app.thought_log.len(), 2);
+        // Header + 2 thought lines.
+        assert_eq!(app.messages.len(), base + 3);
+        assert_eq!(app.current_agent.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn thinking_toggle_suppresses_detail_and_replays_on_expand() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Headline,
+            content: "starting".into(),
+        });
+        // Collapse: digest only, future Detail suppressed.
+        app.toggle_thinking();
+        assert!(!app.thinking_expanded);
+        let collapsed_len = app.messages.len();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Detail,
+            content: "hidden detail".into(),
+        });
+        assert_eq!(app.messages.len(), collapsed_len, "collapsed Detail stays hidden");
+        // Expand: exactly the suppressed line replays, no duplicates.
+        app.toggle_thinking();
+        assert!(app.thinking_expanded);
+        assert!(
+            app.messages
+                .iter()
+                .filter(|line| format!("{line:?}").contains("hidden detail"))
+                .count()
+                == 1
+        );
+    }
+
+    #[test]
+    fn collapse_digest_falls_back_to_detail_for_detail_only_agent() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Detail,
+            content: "older detail".into(),
+        });
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "coder".into(),
+            kind: ThinkingKind::Detail,
+            content: "latest detail".into(),
+        });
+        // Collapse: Detail-only agent still gets a digest line (was invisible).
+        // Only the post-toggle lines are digest lines (the inline Detail
+        // lines rendered at ingest time while expanded).
+        let before = app.messages.len();
+        app.toggle_thinking();
+        assert!(!app.thinking_expanded);
+        assert!(app.messages[before..]
+            .iter()
+            .any(|line| format!("{line:?}").contains("latest detail")));
+    }
+
+    #[test]
+    fn thought_log_is_bounded_oldest_first() {
+        let mut app = App::new();
+        for i in 0..(MAX_THOUGHT_LOG + 50) {
+            app.ingest_ui_line(UiLine::Thought {
+                agent: "coder".into(),
+                kind: ThinkingKind::Detail,
+                content: format!("detail {i}"),
+            });
+        }
+        assert_eq!(app.thought_log.len(), MAX_THOUGHT_LOG);
+        let front = app.thought_log.front().map(|r| r.content.clone()).unwrap_or_default();
+        assert_eq!(front, format!("detail {}", 50));
+    }
+
+    #[test]
+    fn thought_ingest_normalizes_agent_for_grouping() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Thought {
+            agent: " Coder ".into(),
+            kind: ThinkingKind::Headline,
+            content: "starting".into(),
+        });
+        app.ingest_ui_line(UiLine::Thought {
+            agent: "CODER".into(),
+            kind: ThinkingKind::Detail,
+            content: "reasoning".into(),
+        });
+        // One header (single bucket), normalized grouping keys, original
+        // content preserved.
+        assert_eq!(app.current_agent.as_deref(), Some("coder"));
+        assert!(app.thought_log.iter().all(|record| record.agent == "coder"));
+        assert_eq!(app.thought_log.len(), 2);
+        // Live lines render the normalized bucket prefix.
+        assert_eq!(
+            event_line(&EventKind::AgentThought {
+                agent_id: " Coder ".into(),
+                content: "hi".into(),
+                kind: ThinkingKind::Headline,
+            }),
+            Some("· [coder] hi".to_string())
+        );
+    }
+
+    #[test]
+    fn low_level_thoughts_have_no_chat_line() {
+        let kind = EventKind::AgentThought {
+            agent_id: "coder".into(),
+            content: "[system_instructions]".into(),
+            kind: ThinkingKind::LowLevel,
+        };
+        assert_eq!(event_line(&kind), None);
+        let detail = EventKind::AgentThought {
+            agent_id: "coder".into(),
+            content: "reasoning".into(),
+            kind: ThinkingKind::Detail,
+        };
+        assert!(event_line(&detail).is_some());
+    }
+
+    #[test]
+    fn thinking_header_is_plain_off_tty() {
+        // Test harnesses run off-TTY, so headers must be the plain `[+]`
+        // form with no ANSI styling.
+        let header = thinking_header("coder");
+        let rendered: String = header.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(rendered, "[+ coder]");
     }
 
     #[test]
@@ -1996,10 +2856,66 @@ mod tests {
     fn resolve_run_prefs_flags_override_config() {
         // The file says multi-agent off, but an explicit -m -f must win.
         let config = config_with_multi_agent(false);
-        let flags = RunFlags { multi_agent: Some(true), fast: Some(true) };
+        let flags = RunFlags {
+            multi_agent: Some(true),
+            fast: Some(true),
+            reduced_motion: Some(true),
+            no_terminal_title: None,
+            theme: None,
+        };
         let prefs = resolve_run_prefs(&config, &flags);
         assert!(prefs.multi_agent, "an explicit -m must clobber a config default_enabled=false");
         assert!(prefs.fast, "an explicit -f must set fast");
+        assert!(prefs.reduced_motion, "an explicit --reduced-motion must set reduced_motion");
+    }
+
+    #[test]
+    fn resolve_run_prefs_reduced_motion_follows_config() {
+        let mut config = config_with_multi_agent(false);
+        assert!(
+            !resolve_run_prefs(&config, &RunFlags::default()).reduced_motion,
+            "default config must leave reduced_motion off"
+        );
+        config.display.reduced_motion = true;
+        assert!(
+            resolve_run_prefs(&config, &RunFlags::default()).reduced_motion,
+            "config display.reduced_motion must flow into run prefs with no flag"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // OSC terminal-title broadcaster: pure string + gating (no real writes).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn terminal_title_for_stage_covers_the_run_lifecycle() {
+        // Idle (no stage yet, or finished) reads Done.
+        assert_eq!(title_for_stage(None, false), "Concerto: Done");
+        assert_eq!(title_for_stage(Some(RunStage::Complete), false), "Concerto: Done");
+        // Grounding stages read Tuning; doing stages read Performing.
+        for stage in [RunStage::Understand, RunStage::Inspect, RunStage::Plan] {
+            assert_eq!(title_for_stage(Some(stage), false), "Concerto: Tuning", "{stage:?}");
+        }
+        for stage in [RunStage::Execute, RunStage::Verify] {
+            assert_eq!(title_for_stage(Some(stage), false), "Concerto: Performing", "{stage:?}");
+        }
+        // A pending approval overrides any stage.
+        assert_eq!(title_for_stage(Some(RunStage::Execute), true), "Concerto: Awaiting approval");
+        assert_eq!(title_for_stage(None, true), "Concerto: Awaiting approval");
+    }
+
+    #[test]
+    fn terminal_title_emit_gate_needs_tty_without_ci() {
+        assert!(should_emit_terminal_title(true, true, false));
+        assert!(
+            !should_emit_terminal_title(false, true, false),
+            "resolved pref off must stay silent"
+        );
+        assert!(
+            !should_emit_terminal_title(true, false, false),
+            "pipes must never see the OSC escape"
+        );
+        assert!(!should_emit_terminal_title(true, true, true), "CI logs must stay clean");
     }
 
     #[test]
@@ -2185,6 +3101,42 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Startup signature staff (static, ≤3 lines, NO_COLOR/off-TTY plain).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn startup_signature_plain_is_ascii_and_versioned() {
+        let lines = startup_signature_lines(false);
+        assert!(lines.len() <= 3, "signature must stay within 3 lines");
+        assert!(!lines.is_empty());
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("CONCERTO"), "wordmark present: {joined}");
+        assert!(joined.contains(env!("CARGO_PKG_VERSION")), "version present: {joined}");
+        for line in &lines {
+            let text = line_text(line);
+            assert!(text.is_ascii(), "plain signature must be ASCII-only: {text:?}");
+            assert!(
+                text.chars().all(|c| c.is_alphanumeric() || c == '-' || c == ' ' || c == '.'),
+                "plain signature uses no symbol beyond '-': {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_signature_styled_carries_staff_and_new_app_leads_with_it() {
+        let styled = startup_signature_lines(true);
+        let joined = styled.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("CONCERTO"), "wordmark present: {joined}");
+        assert!(joined.contains(env!("CARGO_PKG_VERSION")), "version present: {joined}");
+        // Off-TTY tests get the plain side; the app must still lead with it.
+        let app = App::new();
+        let plain = startup_signature_lines(false);
+        for (index, expected) in plain.iter().enumerate() {
+            assert_eq!(line_text(&app.messages[index]), line_text(expected));
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Transcript restore (ADR-36, stage 3)
     // ------------------------------------------------------------------
 
@@ -2199,7 +3151,11 @@ mod tests {
 
         let entries = vec![
             TranscriptEntry::User { content: "build the widget".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs".into(),
@@ -2229,16 +3185,17 @@ mod tests {
                 project_root: Some("/proj".into()),
             },
         ];
-        let lines = transcript_lines(&entries);
+        let lines = transcript_lines_with_theme(&entries, true, &CliTheme::by_name("Midnight"));
 
-        // Line text — mirrors the restore loop / live event_line formatting.
-        assert_eq!(line_text(&lines[0]), "> build the widget");
+        // Line text — mirrors the restore loop / live event_line formatting,
+        // now behind the role gutters (`›` user, `♪` assistant).
+        assert_eq!(line_text(&lines[0]), "› build the widget");
         assert_eq!(line_text(&lines[1]), "[coder] step one");
-        assert_eq!(line_text(&lines[2]), "· fs_write: write main.rs (completed)");
-        assert_eq!(line_text(&lines[3]), "· shell: allowed");
-        assert_eq!(line_text(&lines[4]), "· net: failed");
+        assert_eq!(line_text(&lines[2]), "· fs_write: write main.rs (completed) ‖ policy ok");
+        assert_eq!(line_text(&lines[3]), "· shell: allowed ‖ policy ok");
+        assert_eq!(line_text(&lines[4]), "· net: failed ‖ policy ok");
         assert_eq!(line_text(&lines[5]), "[Coordinator] Delegated subtask T1 to coder");
-        assert_eq!(line_text(&lines[6]), "the fix is in");
+        assert_eq!(line_text(&lines[6]), "♪ the fix is in");
         assert_eq!(line_text(&lines[7]), "error: boom");
         assert_eq!(line_text(&lines[8]), "[context] context compacted");
         assert_eq!(line_text(&lines[9]), "Run multi-agent (complete) — files: main.rs, lib.rs");
@@ -2264,37 +3221,78 @@ mod tests {
         use concerto_core::transcript::{TranscriptEntry, TranscriptToolStatus};
         use ratatui::style::Color;
 
-        let lines = transcript_lines(&[
-            TranscriptEntry::ToolCall {
-                tool_name: "git".into(),
-                detail: String::new(),
-                status: TranscriptToolStatus::Denied,
-            },
-            TranscriptEntry::ToolCall {
-                tool_name: "live".into(),
-                detail: String::new(),
-                status: TranscriptToolStatus::Cancelled,
-            },
-            TranscriptEntry::ToolCall {
-                tool_name: "probe".into(),
-                detail: String::new(),
-                status: TranscriptToolStatus::Running,
-            },
-            TranscriptEntry::Completion {
-                multi_agent: false,
-                completed: false,
-                files: Vec::new(),
-                project_root: None,
-            },
-        ]);
-        assert_eq!(line_text(&lines[0]), "· git: denied");
-        assert_eq!(line_text(&lines[1]), "· live: cancelled");
-        assert_eq!(line_text(&lines[2]), "· probe: running");
+        let lines = transcript_lines_with_theme(
+            &[
+                TranscriptEntry::ToolCall {
+                    tool_name: "git".into(),
+                    detail: String::new(),
+                    status: TranscriptToolStatus::Denied,
+                },
+                TranscriptEntry::ToolCall {
+                    tool_name: "live".into(),
+                    detail: String::new(),
+                    status: TranscriptToolStatus::Cancelled,
+                },
+                TranscriptEntry::ToolCall {
+                    tool_name: "probe".into(),
+                    detail: String::new(),
+                    status: TranscriptToolStatus::Running,
+                },
+                TranscriptEntry::Completion {
+                    multi_agent: false,
+                    completed: false,
+                    files: Vec::new(),
+                    project_root: None,
+                },
+            ],
+            true,
+            &CliTheme::by_name("Midnight"),
+        );
+        assert_eq!(line_text(&lines[0]), "· git: denied ‖ denied");
+        assert_eq!(line_text(&lines[1]), "· live: cancelled ‖ approval needed");
+        assert_eq!(line_text(&lines[2]), "· probe: running ‖ approval needed");
         assert_eq!(line_text(&lines[3]), "Run single-agent (incomplete) — files: no files changed");
         // Denied / cancelled / running settle to the dim style.
         for line in &lines[..3] {
             assert_eq!(line.style.fg, Some(Color::DarkGray));
         }
+    }
+
+    #[test]
+    fn provenance_rail_text_themed_and_plain() {
+        use concerto_core::transcript::{TranscriptEntry, TranscriptToolStatus};
+        use ratatui::style::{Color, Style};
+
+        let tool = |status| TranscriptEntry::ToolCall {
+            tool_name: "shell".into(),
+            detail: String::new(),
+            status,
+        };
+        let theme = CliTheme::by_name("Midnight");
+
+        // Styled: rail text appended with themed colors (ok green,
+        // approval yellow, denied red); base line style untouched.
+        let lines = transcript_lines_with_theme(
+            &[tool(TranscriptToolStatus::Completed), tool(TranscriptToolStatus::Denied)],
+            true,
+            &theme,
+        );
+        assert_eq!(line_text(&lines[0]), "· shell: completed ‖ policy ok");
+        assert_eq!(line_text(&lines[1]), "· shell: denied ‖ denied");
+        assert_eq!(lines[0].style.fg, Some(Color::Green));
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
+        assert_eq!(lines[1].spans[1].style.fg, Some(Color::Red));
+
+        // Plain (NO_COLOR/off-TTY): rail symbols present, no ANSI styling.
+        let plain =
+            transcript_lines_with_theme(&[tool(TranscriptToolStatus::Running)], false, &theme);
+        assert_eq!(line_text(&plain[0]), "· shell: running ‖ approval needed");
+        assert!(plain[0].spans.iter().all(|span| span.style == Style::default()));
+        assert_eq!(plain[0].style, Style::default());
+
+        // Live event lines carry the plain rail too (unstyled by construction).
+        assert_eq!(provenance_rail_text(&TranscriptToolStatus::Allowed), " ‖ policy ok");
+        assert_eq!(provenance_rail_text(&TranscriptToolStatus::Cancelled), " ‖ approval needed");
     }
 
     // ------------------------------------------------------------------
@@ -2574,8 +3572,10 @@ mod tests {
         let mut app = App::new();
         let before = app.messages.len();
         app.ingest_ui_line(UiLine::Assistant("hello world".to_string()));
-        assert_eq!(app.messages.len(), before + 1);
-        assert_eq!(line_text(app.messages.last().unwrap()), "");
+        // Wipe-analog rule + the empty reveal slot (assistant gutter only).
+        assert_eq!(app.messages.len(), before + 2);
+        assert_eq!(line_text(&app.messages[app.messages.len() - 2]), WIPE_RULE);
+        assert_eq!(line_text(app.messages.last().unwrap()), "♪ ");
         let reveal = app.reveal.as_ref().unwrap();
         assert_eq!(reveal.full, "hello world");
         assert_eq!(reveal.shown, 0);
@@ -2593,10 +3593,13 @@ mod tests {
             ticks += 1;
             let shown = app.reveal.as_ref().map(|r| r.shown).unwrap_or(32);
             assert_eq!(shown, ticks * REVEAL_CHARS_PER_TICK, "each tick adds exactly 8 chars");
-            assert_eq!(line_text(app.messages.last().unwrap()), prefix(&full, shown));
+            assert_eq!(
+                line_text(app.messages.last().unwrap()),
+                format!("♪ {}", prefix(&full, shown))
+            );
         }
         assert_eq!(ticks, 4);
-        assert_eq!(line_text(app.messages.last().unwrap()), full);
+        assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
         assert!(app.reveal.is_none(), "reveal is cleared once the full text is shown");
     }
 
@@ -2607,7 +3610,7 @@ mod tests {
         assert!(app.reveal.is_some());
         // 5 chars on an 8-char tick reveals everything at once.
         app.advance_reveal();
-        assert_eq!(line_text(app.messages.last().unwrap()), "short");
+        assert_eq!(line_text(app.messages.last().unwrap()), "♪ short");
         assert!(app.reveal.is_none(), "reveal completes as soon as the full text is shown");
     }
 
@@ -2619,11 +3622,11 @@ mod tests {
         while app.reveal.is_some() {
             app.advance_reveal();
             let shown = app.reveal.as_ref().map(|r| r.shown).unwrap_or(full.chars().count());
-            let expected = prefix(full, shown);
+            let expected = format!("♪ {}", prefix(full, shown));
             assert_eq!(line_text(app.messages.last().unwrap()), expected);
-            assert!(expected.is_char_boundary(expected.len()));
+            assert!(prefix(full, shown).is_char_boundary(prefix(full, shown).len()));
         }
-        assert_eq!(line_text(app.messages.last().unwrap()), full);
+        assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
     }
 
     #[test]
@@ -2638,11 +3641,11 @@ mod tests {
         app.ingest_ui_line(UiLine::Text("· tool finished".to_string()));
         assert_eq!(app.messages.len(), before + 1);
         assert!(app.reveal.is_none(), "a plain line must cancel any active reveal");
-        // The abandoned reveal slot materializes its full text before the new
-        // line is appended.
+        // The abandoned reveal slot materializes its full guttered text
+        // before the new line is appended.
         assert_eq!(
             line_text(&app.messages[app.messages.len() - 2]),
-            "long enough to still be revealing"
+            "♪ long enough to still be revealing"
         );
         assert_eq!(line_text(app.messages.last().unwrap()), "· tool finished");
     }
@@ -2654,8 +3657,8 @@ mod tests {
         assert!(app.reveal.is_some());
         app.push_line(Line::from("> new question"));
         assert!(app.reveal.is_none(), "any direct push must cancel the reveal");
-        // The reveal slot renders its full text (it was cancelled, not lost).
-        assert_eq!(line_text(&app.messages[app.messages.len() - 2]), "abcdefgh");
+        // The reveal slot renders its full guttered text (it was cancelled, not lost).
+        assert_eq!(line_text(&app.messages[app.messages.len() - 2]), "♪ abcdefgh");
         assert_eq!(line_text(app.messages.last().unwrap()), "> new question");
     }
 
@@ -2667,9 +3670,131 @@ mod tests {
         assert!(app.reveal.is_some());
 
         app.ingest_ui_line(UiLine::Assistant("second".to_string()));
-        assert_eq!(line_text(app.messages.last().unwrap()), "");
+        assert_eq!(line_text(app.messages.last().unwrap()), "♪ ");
         let reveal = app.reveal.as_ref().unwrap();
         assert_eq!(reveal.full, "second");
         assert_eq!(reveal.shown, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Signature text motion parity (Score first-token + Baton handoff +
+    // wipe analog). `styling` is passed explicitly so the cues are
+    // assertable off-TTY, where `styling_enabled()` is false.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reveal_line_bolds_first_token_only_while_emphasis_holds() {
+        use ratatui::style::Modifier;
+        let line = reveal_line("hello world here", 16, true, false, true);
+        // Gutter + bold first token + plain remainder.
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content.as_ref(), "♪ ");
+        assert_eq!(line.spans[1].content.as_ref(), "hello");
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[2].content.as_ref(), " world here");
+        assert!(!line.spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn reveal_line_bolds_whole_prefix_before_first_space() {
+        use ratatui::style::Modifier;
+        let line = reveal_line("hello", 5, true, false, true);
+        assert_eq!(line.spans.len(), 2);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn reveal_line_dims_while_holding_and_settles_plain() {
+        use ratatui::style::Modifier;
+        let held = reveal_line("hello world", 11, false, true, true);
+        assert!(held.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)));
+        let settled = reveal_line("hello world", 11, false, false, true);
+        // Body settles plain (no emphasis BOLD); span 0 is the role gutter,
+        // which keeps its `chat_line` role color + BOLD by contract.
+        assert!(settled
+            .spans
+            .iter()
+            .skip(1)
+            .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)));
+        // NO_COLOR/off-TTY: gutter symbols only, no modifiers.
+        let plain = reveal_line("hello world", 11, true, false, false);
+        assert_eq!(line_text(&plain), "♪ hello world");
+        assert_eq!(plain.spans.len(), 2);
+    }
+
+    #[test]
+    fn handoff_hold_freezes_reveal_three_ticks_then_resumes() {
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Assistant(
+            "01234567\n\nrest of second paragraph here".to_string(),
+        ));
+        // First tick reveals 8 chars; the boundary end (char 10) is still
+        // out of reach, so no cue yet.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 8);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+
+        // Second tick (8→16) crosses the blank-line boundary: the frontier
+        // lands and a 3-tick hold opens.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, HANDOFF_HOLD_TICKS);
+
+        // The frontier stays frozen while the hold counts down, one per tick.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 2);
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 1);
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 16);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+
+        // Next tick resumes the 8ch@16ms cadence exactly where it paused.
+        app.advance_reveal();
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 24);
+        assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+    }
+
+    #[test]
+    fn single_paragraph_reveal_never_holds() {
+        // 32 chars → 3 ticks of 8 stay mid-reveal, so `hold` is readable.
+        let mut app = App::new();
+        app.ingest_ui_line(UiLine::Assistant("0123456789abcdefghij0123456789AB".to_string()));
+        for _ in 0..3 {
+            app.advance_reveal();
+            assert_eq!(app.reveal.as_ref().unwrap().hold, 0);
+        }
+        assert_eq!(app.reveal.as_ref().unwrap().shown, 24);
+    }
+
+    #[test]
+    fn paragraph_boundary_detection_covers_separator_shapes() {
+        assert!(!crosses_paragraph_boundary("just one paragraph", 0, 18));
+        let two = "01234567\n\nrest";
+        assert!(crosses_paragraph_boundary(two, 8, 16));
+        assert!(!crosses_paragraph_boundary(two, 0, 8));
+        assert!(!crosses_paragraph_boundary(two, 10, 16));
+        assert!(crosses_paragraph_boundary("01234567\n   \nrest", 8, 16));
+        assert!(crosses_paragraph_boundary("01234567\r\n\r\nrest", 8, 16));
+        assert!(!crosses_paragraph_boundary("0123456789\n\n", 0, 12));
+        assert!(!crosses_paragraph_boundary("0123456789\n", 0, 11));
+        assert!(!crosses_paragraph_boundary("", 0, 0));
+        assert!(!crosses_paragraph_boundary("a\n\nb", 4, 4));
+    }
+
+    #[test]
+    fn reduced_motion_renders_assistant_instant_with_no_hold_or_rule() {
+        let mut app = App::new();
+        app.set_reduced_motion(true);
+        let before = app.messages.len();
+        let full = "01234567\n\nrest of second paragraph here".to_string();
+        app.ingest_ui_line(UiLine::Assistant(full.clone()));
+        // No wipe-analog rule and no reveal state: the full guttered line
+        // lands at once.
+        assert_eq!(app.messages.len(), before + 1);
+        assert!(app.reveal.is_none(), "reduced-motion never opens a reveal");
+        assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
     }
 }

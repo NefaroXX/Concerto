@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use concerto_core::error::{ProviderError, ToolError};
-use concerto_core::event::{Event, EventBus, EventKind};
+use concerto_core::event::{Event, EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::memory::{ChunkType, MemoryEntry, MemoryId, MemoryNamespace, MemoryQuery};
 use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
@@ -613,7 +613,11 @@ impl AgentLoop {
         let _ = self.bus.publish_for_session(
             session_id,
             Ulid::new(),
-            EventKind::AgentThought { agent_id: "single-agent".to_owned(), content },
+            EventKind::AgentThought {
+                agent_id: "single-agent".to_owned(),
+                content,
+                kind: ThinkingKind::Detail,
+            },
         );
     }
 
@@ -698,6 +702,7 @@ impl AgentLoop {
                                 self.provider.provider_name(),
                                 self.usage_model
                             ),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     self.tool_executor
@@ -722,6 +727,7 @@ impl AgentLoop {
                 EventKind::AgentThought {
                     agent_id: "single-agent".to_string(),
                     content: format!("Iteration {}: provider request started", iteration),
+                    kind: ThinkingKind::LowLevel,
                 },
             );
 
@@ -805,6 +811,7 @@ impl AgentLoop {
                 EventKind::AgentThought {
                     agent_id: "single-agent".to_string(),
                     content: format!("Iteration {}: provider response started", iteration),
+                    kind: ThinkingKind::LowLevel,
                 },
             );
 
@@ -1094,6 +1101,7 @@ impl AgentLoop {
                                 "tool_driver: fallback turn — {} tool call(s) parsed",
                                 calls.len()
                             ),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     self.tool_executor
@@ -1143,6 +1151,7 @@ impl AgentLoop {
                             content: format!(
                                 "tool_driver: fallback repair attempt {attempts}: {reason}"
                             ),
+                            kind: ThinkingKind::Detail,
                         },
                     );
                     self.tool_executor
@@ -1325,6 +1334,7 @@ impl AgentLoop {
                                 "Iteration {}: no file action returned, retrying",
                                 iteration,
                             ),
+                            kind: ThinkingKind::Detail,
                         },
                     );
 
@@ -1922,6 +1932,7 @@ impl AgentLoop {
                     EventKind::AgentThought {
                         agent_id: "single-agent".to_string(),
                         content: content.clone(),
+                        kind: ThinkingKind::Detail,
                     },
                 );
                 messages.push(Message {
@@ -2425,6 +2436,7 @@ impl AgentLoop {
                     shell_repair::MAX_SHELL_REPAIR_ATTEMPTS,
                     shell_repair::diagnostic_code(&failure)
                 ),
+                kind: ThinkingKind::Detail,
             },
         );
         let content = shell_repair::corrective_message_text(

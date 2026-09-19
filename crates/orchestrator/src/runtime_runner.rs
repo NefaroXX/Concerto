@@ -6250,7 +6250,11 @@ mod runtime_runner_tests {
         publish(
             &bus,
             session_id,
-            EventKind::AgentThought { agent_id: "coder".into(), content: "plan".into() },
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "plan".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         );
         publish(
             &bus,
@@ -6267,6 +6271,7 @@ mod runtime_runner_tests {
             EventKind::AgentThought {
                 agent_id: "coder".into(),
                 content: "observing result".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
             },
         );
         publish(
@@ -6286,7 +6291,11 @@ mod runtime_runner_tests {
         assert_eq!(
             transcript,
             vec![
-                TranscriptEntry::Thinking { agent: "coder".into(), content: "plan".into() },
+                TranscriptEntry::Thinking {
+                    agent: "coder".into(),
+                    content: "plan".into(),
+                    kind: concerto_core::event::ThinkingKind::Detail,
+                },
                 TranscriptEntry::ToolCall {
                     tool_name: "fs_write".into(),
                     detail: "write main.rs\nwrote 42 bytes".into(),
@@ -6295,6 +6304,7 @@ mod runtime_runner_tests {
                 TranscriptEntry::Thinking {
                     agent: "coder".into(),
                     content: "observing result".into(),
+                    kind: concerto_core::event::ThinkingKind::Detail,
                 },
             ],
             "terminal event merges in place; interleaved lines keep their position"
@@ -6381,7 +6391,11 @@ mod runtime_runner_tests {
             publish(
                 &bus,
                 session_id,
-                EventKind::AgentThought { agent_id: "coder".into(), content: format!("step {i}") },
+                EventKind::AgentThought {
+                    agent_id: "coder".into(),
+                    content: format!("step {i}"),
+                    kind: concerto_core::event::ThinkingKind::Detail,
+                },
             );
         }
         recorder.stop().await;
@@ -6391,7 +6405,11 @@ mod runtime_runner_tests {
         for (i, entry) in transcript.iter().enumerate() {
             assert_eq!(
                 *entry,
-                TranscriptEntry::Thinking { agent: "coder".into(), content: format!("step {i}") }
+                TranscriptEntry::Thinking {
+                    agent: "coder".into(),
+                    content: format!("step {i}"),
+                    kind: concerto_core::event::ThinkingKind::Detail,
+                }
             );
         }
     }
@@ -6407,12 +6425,20 @@ mod runtime_runner_tests {
         publish(
             &bus,
             session_a,
-            EventKind::AgentThought { agent_id: "coder".into(), content: "step one".into() },
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "step one".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         );
         publish(
             &bus,
             session_b,
-            EventKind::AgentThought { agent_id: "coder".into(), content: "other session".into() },
+            EventKind::AgentThought {
+                agent_id: "coder".into(),
+                content: "other session".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            },
         );
 
         recorder.stop().await;
@@ -6421,7 +6447,11 @@ mod runtime_runner_tests {
         assert_eq!(transcript.len(), 1, "only this session's events should be recorded");
         assert_eq!(
             transcript[0],
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() }
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: concerto_core::event::ThinkingKind::Detail,
+            }
         );
     }
 

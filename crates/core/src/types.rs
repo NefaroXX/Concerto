@@ -769,15 +769,26 @@ impl std::fmt::Debug for AgentId {
 }
 
 impl AgentId {
-    /// Create a new AgentId, normalizing to lowercase.
+    /// Create a new AgentId, normalizing to trimmed lowercase so
+    /// `" Coder "` and `"coder"` bucket identically in chat surfaces.
     pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into().to_ascii_lowercase())
+        Self(normalize_agent_id(&id.into()))
     }
 
     /// View the id as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Canonical bucket key for an agent id: trimmed + ASCII-lowercased.
+///
+/// Used at every chat-bucketing ingestion point (desktop `route_event` /
+/// `add_thinking` / grouping, CLI `ingest_thought`) and on WAL/transcript
+/// reads so old rows map forward. Display text keeps the original content
+/// prefix; only the bucket key is normalized.
+pub fn normalize_agent_id(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
 }
 
 impl std::fmt::Display for AgentId {
@@ -795,10 +806,10 @@ impl serde::Serialize for AgentId {
 impl<'de> serde::Deserialize<'de> for AgentId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        // Normalise to lowercase.  Known IDs accept both PascalCase (old
+        // Normalise to trimmed lowercase.  Known IDs accept both PascalCase (old
         // checkpoint format) and lowercase (canonical form).  Custom IDs are
         // lowercased for consistent comparison.
-        Ok(Self(s.to_ascii_lowercase()))
+        Ok(Self(normalize_agent_id(&s)))
     }
 }
 

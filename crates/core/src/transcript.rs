@@ -12,7 +12,7 @@
 //! results remain hash + detail summaries (full payloads stay in the audit
 //! log).
 
-use crate::event::EventKind;
+use crate::event::{EventKind, ThinkingKind};
 use serde::{Deserialize, Serialize};
 
 /// Outcome of a tool call shown in the transcript.
@@ -43,7 +43,17 @@ pub enum TranscriptEntry {
     /// Assistant text response.
     Assistant { content: String },
     /// Agent thinking / internal reasoning surfaced to the UI.
-    Thinking { agent: String, content: String },
+    ///
+    /// `kind` carries the score-accordion verbosity tier through the durable
+    /// transcript so restored UIs bucket identically to live ones. `#[serde(default)]`
+    /// keeps pre-tier rows (no `kind` key) deserializing as `Detail` — no
+    /// data loss, no payload version bump (rows are unversioned JSON).
+    Thinking {
+        agent: String,
+        content: String,
+        #[serde(default)]
+        kind: ThinkingKind,
+    },
     /// A tool call. The recorder pushes one entry per invocation and merges
     /// terminal/approval events into it (Stage 2); the pure mapping below
     /// produces one entry per event.
@@ -156,9 +166,11 @@ pub fn transcript_entry_from_event_with_labels(
         }),
 
         // ---- Agent output ----
-        EventKind::AgentThought { agent_id, content } => {
-            Some(TranscriptEntry::Thinking { agent: agent_id.clone(), content: content.clone() })
-        }
+        EventKind::AgentThought { agent_id, content, kind } => Some(TranscriptEntry::Thinking {
+            agent: agent_id.clone(),
+            content: content.clone(),
+            kind: *kind,
+        }),
         EventKind::AssistantMessage { content, .. } => {
             Some(TranscriptEntry::Assistant { content: content.clone() })
         }
@@ -582,10 +594,31 @@ mod tests {
         let thinking = transcript_entry_from_event(&EventKind::AgentThought {
             agent_id: "coder".into(),
             content: "step one".into(),
+            kind: crate::event::ThinkingKind::Detail,
         });
         assert_eq!(
             thinking,
-            Some(TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() })
+            Some(TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: crate::event::ThinkingKind::Detail,
+            })
+        );
+
+        // The tier flows through: a Headline thought restores as Headline so
+        // the bucket digest matches the live UI.
+        let headline = transcript_entry_from_event(&EventKind::AgentThought {
+            agent_id: "coder".into(),
+            content: "done".into(),
+            kind: crate::event::ThinkingKind::Headline,
+        });
+        assert_eq!(
+            headline,
+            Some(TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "done".into(),
+                kind: crate::event::ThinkingKind::Headline,
+            })
         );
 
         let assistant = transcript_entry_from_event(&EventKind::AssistantMessage {
@@ -842,7 +875,11 @@ mod tests {
         let entries = vec![
             TranscriptEntry::User { content: "build the widget".into() },
             TranscriptEntry::Assistant { content: "on it".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "hmm".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "hmm".into(),
+                kind: crate::event::ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs".into(),
@@ -871,5 +908,21 @@ mod tests {
             let back: TranscriptEntry = serde_json::from_str(&json).expect("entry deserializes");
             assert_eq!(entry, &back, "round-trip mismatch for {json}");
         }
+    }
+
+    /// Pre-tier `Thinking` rows (no `kind` key) deserialize as `Detail` —
+    /// no data loss for transcripts written before the tier existed.
+    #[test]
+    fn legacy_thinking_row_without_kind_defaults_to_detail() {
+        let json = r#"{"Thinking":{"agent":"coder","content":"hmm"}}"#;
+        let back: TranscriptEntry = serde_json::from_str(json).expect("legacy row deserializes");
+        assert_eq!(
+            back,
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "hmm".into(),
+                kind: crate::event::ThinkingKind::Detail,
+            }
+        );
     }
 }

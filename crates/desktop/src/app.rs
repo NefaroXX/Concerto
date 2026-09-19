@@ -9,6 +9,7 @@ use crate::views;
 use crate::widgets::agent_graph::NodeState;
 use crate::widgets::capability_dialog;
 use crate::widgets::circuit_background;
+use crate::widgets::scanline_overlay;
 
 use crate::services::session_handler::DesktopSessionHandler;
 use crate::views::memory::MemoryStatus;
@@ -19,7 +20,7 @@ use crate::views::studio_runtime::{
 use camino::Utf8PathBuf;
 use concerto_config::AppConfig;
 use concerto_config::CredentialStore;
-use concerto_core::event::EventBus;
+use concerto_core::event::{EventBus, ThinkingKind};
 use concerto_core::failures::{ClassifiedFailure, FailureAudience};
 use concerto_core::helpers::project_id_hash;
 use concerto_core::ids::Ulid;
@@ -112,6 +113,9 @@ pub enum Message {
     /// dispatched while `run_status == RunStatus::Running` — see
     /// `subscription`.
     CircuitTick,
+    /// Advances the scanline overlay animation phase. Only dispatched while
+    /// `scanline_overlay_enabled` is true and `page == Page::Chat`.
+    ScanlineTick,
     /// One step (16 ms) of the shared overlay/terminal animation tick. Moves
     /// `overlay_fade` toward `overlay_fade_target` and `terminal_panel_anim`
     /// toward its open/closed target; the subscription stays active only
@@ -325,6 +329,21 @@ pub struct App {
     /// circuit-trace background pulse. Only advanced while
     /// `run_status == RunStatus::Running` — see `subscription`/`update`.
     pub circuit_progress: f32,
+    /// Scanline overlay: default-off feature flag. When true a faint
+    /// horizontal scan-line pattern renders behind the chat column.
+    /// Derived from `display.scanline_overlay_enabled` (see
+    /// `reconcile_config_from_reload`); toggled in Settings → Display.
+    pub scanline_overlay_enabled: bool,
+    /// Reduced-motion override (`display.reduced_motion`, default false).
+    /// Mirrored into the chat view (skips scan-line pulse, first-token
+    /// emphasis, handoff hold, line wipe) and the scan-line overlay
+    /// (static when true). Toggled in Settings → Display; the system
+    /// a11y API hookup lands later.
+    pub reduced_motion: bool,
+    /// Phase accumulator (wraps in `[0.0, 1.0)`) driving the scanline
+    /// overlay breathing animation. Advanced by `ScanlineTick` while the
+    /// overlay is enabled and the Chat page is active.
+    pub scanline_progress: f32,
     /// Serialised orchestration checkpoint from the last partial run.
     /// Passed to `AgentRunRequest` on the next submit so the coordinator can
     /// resume the graph without re-architecting.
@@ -550,8 +569,8 @@ fn messages_to_entries(history: Vec<concerto_core::types::Message>) -> Vec<views
 /// Map the durable typed transcript (ADR-36) onto chat entries for restore.
 ///
 /// This mirrors the live rendering in `crates/desktop/src/runtime.rs`:
-/// `Thinking`/`Activity`/`Summary` become dimmed `Thinking` lines (activity
-/// with the `[agent]` prefix, summaries as collapsed `[Context]` lines), tool
+/// `Thinking`/`Activity`/`Summary` become dimmed `Thinking` lines (typed
+/// per-agent buckets, summaries as collapsed `Context` lines), tool
 /// calls carry their final status 1:1, and the completion marker becomes a
 /// `RunCompletionSummary` card. Entry ids are assigned sequentially (the
 /// existing convention); `State::from_entries` derives the next id.
@@ -585,13 +604,16 @@ pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views:
                     created_at: None,
                 });
             }
-            // Live AgentThought lines render as `[{agent_id}] {content}`
-            // (runtime.rs route_event); mirror that exactly.
-            TranscriptEntry::Thinking { agent, content } => {
-                let label = if agent.is_empty() { content } else { format!("[{agent}] {content}") };
+            // Live AgentThought lines render bucketed per agent
+            // (runtime.rs route_event); restore the typed fields directly.
+            // The tier flows through so the bucket digest matches live;
+            // pre-tier rows default to Detail via serde.
+            TranscriptEntry::Thinking { agent, content, kind } => {
                 chat_entries.push(ChatEntry::Thinking {
                     id,
-                    content: label,
+                    agent: concerto_core::types::normalize_agent_id(&agent),
+                    content: content.clone(),
+                    kind,
                     collapsed: false,
                     created_at: None,
                     finished_at: None,
@@ -606,12 +628,14 @@ pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views:
                     created_at: None,
                 });
             }
-            // Activity lines restore as thinking lines (ADR-36); the
-            // `[agent]` prefix mirrors the live subtask/activity rendering.
+            // Activity lines restore as thinking lines (ADR-36); the agent
+            // field mirrors the live subtask/activity attribution.
             TranscriptEntry::Activity { agent, content } => {
                 chat_entries.push(ChatEntry::Thinking {
                     id,
-                    content: format!("[{agent}] {content}"),
+                    agent: concerto_core::types::normalize_agent_id(&agent),
+                    content: content.clone(),
+                    kind: ThinkingKind::Detail,
                     collapsed: false,
                     created_at: None,
                     finished_at: None,
@@ -624,7 +648,9 @@ pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views:
             TranscriptEntry::Summary { content } => {
                 chat_entries.push(ChatEntry::Thinking {
                     id,
-                    content: format!("[Context] {content}"),
+                    agent: concerto_core::types::normalize_agent_id("Context"),
+                    content: content.clone(),
+                    kind: ThinkingKind::Detail,
                     collapsed: true,
                     created_at: None,
                     finished_at: None,
@@ -795,6 +821,8 @@ impl App {
         // state (revoke) and passed to every run's ServicesBuilder (liveness).
         // The inner manager is materialised on the first agent run.
         let plugin_manager = concerto_plugins::manager::new_shared_plugin_manager();
+        let initial_scanline_overlay = initial_config.display.scanline_overlay_enabled;
+        let initial_reduced_motion = initial_config.display.reduced_motion;
         let mut app = Self {
             page: Page::Chat,
             current_theme: theme,
@@ -835,6 +863,9 @@ impl App {
             run_status: RunStatus::Idle,
             run_stage: None,
             circuit_progress: 0.0,
+            scanline_overlay_enabled: initial_scanline_overlay,
+            reduced_motion: initial_reduced_motion,
+            scanline_progress: 0.0,
             vfs: Arc::new(Mutex::new(VirtualFs::new())),
             session_manager: Arc::new(Mutex::new(None)),
             text_focused: false,
@@ -906,6 +937,11 @@ impl App {
         }
         app.sync_chat_model_options();
         app.sync_memory_configuration();
+        // Mirror the configured motion override into the chat view so the
+        // already-gated cues (scan-line pulse, first-token emphasis, handoff
+        // hold, line wipe) follow Settings → Display without a restart.
+        app.chat.set_reduced_motion(app.reduced_motion);
+        app.seed_muted_agents();
 
         // Auto-discover models for every credentialed, discoverable provider at
         // startup so the unified picker (and per-provider lists) are populated
@@ -1132,6 +1168,11 @@ impl App {
                     (self.circuit_progress + circuit_background::PROGRESS_STEP) % 1.0;
                 iced::Task::none()
             }
+            Message::ScanlineTick => {
+                self.scanline_progress =
+                    (self.scanline_progress + scanline_overlay::PROGRESS_STEP) % 1.0;
+                iced::Task::none()
+            }
             Message::AnimTick => {
                 // Overlay backdrop fade: advance toward the target in fixed
                 // 0.08 steps, snapping on the final step (~15 ticks ≈ 240 ms
@@ -1201,6 +1242,7 @@ impl App {
                     // Persist the current session's agent graph before clearing.
                     self.persist_active_agent_graph();
                     self.chat = views::chat::State::new();
+                    self.seed_muted_agents();
                     self.agent_graph = views::agent_graph::State::new();
                     self.tool_log = views::tool_log::State::new();
                     self.active_session_id = None;
@@ -1226,6 +1268,15 @@ impl App {
                         return iced::Task::none();
                     }
                     let user_input = self.chat.input().to_string();
+                    // `/thinking` is a local accordion toggle for the current
+                    // movement (collapse-all / expand-all) — never dispatched.
+                    if user_input.trim() == "/thinking" {
+                        self.chat.toggle_thinking_all();
+                        return self
+                            .chat
+                            .update(views::chat::Message::InputChanged(String::new()))
+                            .map(Message::Chat);
+                    }
                     let chat_task =
                         self.chat.update(views::chat::Message::SubmitInput).map(Message::Chat);
                     let agent_task = self.submit_to_agent(user_input);
@@ -1258,6 +1309,14 @@ impl App {
                     // config — fast mode is a per-session choice.
                     self.fast = !self.fast;
                     iced::Task::none()
+                } else if matches!(&msg, views::chat::Message::ToggleMuteAgent(_)) {
+                    // Thinking-bucket mute IS persisted (`[display]
+                    // muted_agents`) — unlike fast mode, the filter is a
+                    // durable preference. The WAL and transcript keep every
+                    // thought regardless (hide-not-delete).
+                    let chat_task = self.chat.update(msg).map(Message::Chat);
+                    self.persist_muted_agents();
+                    chat_task
                 } else {
                     self.chat.update(msg).map(Message::Chat)
                 }
@@ -1405,6 +1464,9 @@ impl App {
                 } else {
                     self.tool_log.load_stored_events(&events);
                 }
+                // Restored and replayed entries normalize on read; seed the
+                // mute filter from the merged config on top.
+                self.seed_muted_agents();
                 self.page = Page::Chat;
                 iced::Task::none()
             }
@@ -2018,6 +2080,7 @@ impl App {
         self.reset_spend_state();
         self.agent_graph = views::agent_graph::State::new();
         self.chat = views::chat::State::new();
+        self.seed_muted_agents();
         let terminal = self
             .terminal
             .set_project_dir(self.project_dir.clone(), &self.current_theme)
@@ -3048,6 +3111,44 @@ impl App {
         }
     }
 
+    /// Seed the chat thinking-bucket mute filter from the merged config.
+    /// Called after every `self.chat` replacement (startup, new session,
+    /// session restore, project switch) so blank and restored sessions
+    /// honor `[display] muted_agents`. Hide-not-delete is preserved: the
+    /// WAL and transcript keep every thought regardless of this filter.
+    fn seed_muted_agents(&mut self) {
+        let muted = self
+            .config
+            .as_ref()
+            .map(|config| config.display.muted_agents.clone())
+            .unwrap_or_default();
+        self.chat.set_muted_agents(muted);
+    }
+
+    /// Persist the chat thinking-bucket mute set to `[display]
+    /// muted_agents` in the global config file, mirroring the multi-agent
+    /// toggle: save, then reload + re-derive through the shared helper so a
+    /// project-layer override stays the truth (ADR-57 §6). Falls back to
+    /// in-memory config when no global path exists. Never touches the WAL
+    /// or the durable transcript (hide-not-delete).
+    fn persist_muted_agents(&mut self) {
+        let mut config = self.global_config.clone();
+        config.display.muted_agents = self.chat.muted_agents_snapshot();
+        match concerto_config::default_config_path() {
+            Some(path) => {
+                if let Err(error) = concerto_config::save_config(&config, &path) {
+                    tracing::error!(%error, "failed to persist muted agents");
+                } else {
+                    self.reconcile_config_from_reload();
+                }
+            }
+            None => {
+                self.global_config = config.clone();
+                self.config = Some(config);
+            }
+        }
+    }
+
     /// Re-load config from disk and re-derive every `App` field that depends
     /// on it (ADR-57 §3). Shared by the config-watch subscription and every
     /// config write path, so all reload sites converge on one derivation
@@ -3127,6 +3228,15 @@ impl App {
         // Re-derive run-mode flags — the file is truth (ADR-57 §6).
         self.multi_agent =
             reloaded.multi_agent.as_ref().map(|settings| settings.default_enabled).unwrap_or(false);
+        // Re-derive the Display motion toggles — the file is truth. The chat
+        // setter settles any in-flight wipe instantly when reduced-motion
+        // turns on mid-animation.
+        self.scanline_overlay_enabled = reloaded.display.scanline_overlay_enabled;
+        self.reduced_motion = reloaded.display.reduced_motion;
+        self.chat.set_reduced_motion(self.reduced_motion);
+        // Re-derive the thinking-bucket mute filter — the file is truth
+        // (covers the mute toggle's own save and external edits alike).
+        self.chat.set_muted_agents(reloaded.display.muted_agents.clone());
         (self.active_provider_id, self.active_model) = configured_default_route(&reloaded);
         self.sync_chat_model_options();
         self.sync_session_cap_from_config();
@@ -3155,6 +3265,7 @@ impl App {
         // are ever rebuilt against in-flight edits.
         self.settings.sync_providers_from_config(&reloaded);
         self.settings.refresh_provider_cache_from_config(&reloaded);
+        self.settings.sync_display_from_config(&reloaded);
         self.orchestration_studio.sync_models(self.settings.cached_models_by_provider());
         self.refresh_effective_roots_from_config();
     }
@@ -4241,6 +4352,20 @@ impl App {
             let circuit_bg =
                 circuit_background::view(self.circuit_progress, self.current_theme.palette.accent);
             stack![circuit_bg, composed].into()
+        } else if self.scanline_overlay_enabled && self.page == Page::Chat {
+            // Faint scan-line overlay behind the chat column. Visible only
+            // when the default-off flag is explicitly enabled. The overlay
+            // pulses at idle rate; the subscription doubles the effective
+            // progress when a streaming entry is active.
+            let scanline_bg = scanline_overlay::view(
+                self.scanline_progress,
+                self.chat.is_streaming(),
+                self.reduced_motion,
+                false, // show_grid — off for chat
+                self.current_theme.palette.surface,
+                self.current_theme.palette.border,
+            );
+            stack![scanline_bg, composed].into()
         } else {
             composed
         }
@@ -4342,6 +4467,16 @@ impl App {
         } else {
             Subscription::none()
         };
+        // Scanline overlay tick: active when the default-off flag is enabled
+        // and the Chat page is showing. Advances the breathing phase so
+        // the overlay pulses; streaming doubles the effective rate inside
+        // the widget. Costs nothing when disabled.
+        let scanline_sub = if self.scanline_overlay_enabled && self.page == Page::Chat {
+            iced::time::every(std::time::Duration::from_millis(scanline_overlay::TICK_MS))
+                .map(|_| Message::ScanlineTick)
+        } else {
+            Subscription::none()
+        };
         // One shared tick drives both the overlay backdrop fade and the
         // terminal panel slide. Active only while at least one animation is
         // in flight, so it costs nothing the rest of the time.
@@ -4397,6 +4532,7 @@ impl App {
             terminal_sub,
             drag_sub,
             circuit_sub,
+            scanline_sub,
             anim_sub,
             blink_sub,
             typing_sub,
@@ -4690,7 +4826,7 @@ pub(crate) fn format_run_summary(output: &AgentOutput) -> String {
 mod tests {
     use super::{
         configured_default_route, orchestration_hides_relationships, AgentOutput, App,
-        DesktopApprovalSink, EventBus, Message, Page, PolicyAction, RunStatus, Ulid,
+        DesktopApprovalSink, EventBus, Message, Page, PolicyAction, RunStatus, ThinkingKind, Ulid,
     };
     use crate::views::settings::Message as SettingsMessage;
     use concerto_config::{AppConfig, ProviderConfig};
@@ -6661,8 +6797,16 @@ custom_agents = []
         let transcript = vec![
             TranscriptEntry::User { content: "build the widget".into() },
             TranscriptEntry::Assistant { content: "on it".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() },
-            TranscriptEntry::Thinking { agent: String::new(), content: "bare thought".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Headline,
+            },
+            TranscriptEntry::Thinking {
+                agent: String::new(),
+                content: "bare thought".into(),
+                kind: ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs".into(),
@@ -6718,14 +6862,18 @@ custom_agents = []
             },
             ChatEntry::Thinking {
                 id: 3,
-                content: "[coder] step one".into(),
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Headline,
                 collapsed: false,
                 created_at: None,
                 finished_at: None,
             },
             ChatEntry::Thinking {
                 id: 4,
+                agent: String::new(),
                 content: "bare thought".into(),
+                kind: ThinkingKind::Detail,
                 collapsed: false,
                 created_at: None,
                 finished_at: None,
@@ -6774,7 +6922,9 @@ custom_agents = []
             },
             ChatEntry::Thinking {
                 id: 11,
-                content: "[Coordinator] Delegated subtask T1 to coder".into(),
+                agent: "coordinator".into(),
+                content: "Delegated subtask T1 to coder".into(),
+                kind: ThinkingKind::Detail,
                 collapsed: false,
                 created_at: None,
                 finished_at: None,
@@ -6782,7 +6932,9 @@ custom_agents = []
             ChatEntry::Error { id: 12, content: "boom".into(), created_at: None },
             ChatEntry::Thinking {
                 id: 13,
-                content: "[Context] context compacted".into(),
+                agent: "context".into(),
+                content: "context compacted".into(),
+                kind: ThinkingKind::Detail,
                 collapsed: true,
                 created_at: None,
                 finished_at: None,
@@ -6816,7 +6968,11 @@ custom_agents = []
 
         let transcript = vec![
             TranscriptEntry::User { content: "build the widget".into() },
-            TranscriptEntry::Thinking { agent: "coder".into(), content: "step one".into() },
+            TranscriptEntry::Thinking {
+                agent: "coder".into(),
+                content: "step one".into(),
+                kind: ThinkingKind::Detail,
+            },
             TranscriptEntry::ToolCall {
                 tool_name: "fs_write".into(),
                 detail: "write main.rs\nWrote 42 bytes".into(),
@@ -6831,7 +6987,7 @@ custom_agents = []
         // route_event + the run-end finalize_run).
         let mut live = State::new();
         let _ = live.update(crate::views::chat::Message::AddUser("build the widget".into()));
-        live.add_thinking("[coder] step one".into());
+        live.add_thinking("coder", "step one".into(), ThinkingKind::Detail);
         live.add_tool_call("fs_write".into(), "write main.rs".into());
         live.update_tool_call("fs_write", "Wrote 42 bytes".into(), true);
         live.update_last_assistant("the fix is in".into());
@@ -6919,21 +7075,22 @@ custom_agents = []
                 if tool_name == "shell (allowed)"
         ));
 
-        // Restored activity: `[agent] content` thinking line. The live
-        // SubTaskCreated line uses different wording ("[Coordinator → coder]
-        // apply the fix") — a documented string divergence; both render as
+        // Restored activity: typed thinking line in the agent's bucket. The
+        // live SubTaskCreated line uses different wording ("→ coder: apply
+        // the fix") — a documented string divergence; both render as
         // thinking lines.
         assert!(matches!(
             &restored[2],
-            ChatEntry::Thinking { content, collapsed: false, .. }
-                if content == "[Coordinator] Decomposed task T1 into specialist subtask: apply the fix"
+            ChatEntry::Thinking { agent, content, collapsed: false, .. }
+                if agent == "coordinator"
+                    && content == "Decomposed task T1 into specialist subtask: apply the fix"
         ));
 
-        // Restored summary: collapsed thinking line with the [Context] prefix.
+        // Restored summary: collapsed thinking line in the Context bucket.
         assert!(matches!(
             &restored[3],
-            ChatEntry::Thinking { content, collapsed: true, .. }
-                if content == "[Context] context compacted"
+            ChatEntry::Thinking { agent, content, collapsed: true, .. }
+                if agent == "context" && content == "context compacted"
         ));
 
         // Restored completion: structured RunCompletionSummary.

@@ -27,6 +27,10 @@ pub struct State {
     pub theme_names: Vec<&'static str>,
     pub selected_theme: &'static str,
     pub font_size: f32,
+    /// Reduced-motion override (`display.reduced_motion`).
+    pub reduced_motion: bool,
+    /// Scan-line overlay flag (`display.scanline_overlay_enabled`).
+    pub scanline_overlay_enabled: bool,
 
     // Multi-provider state
     pub providers: Vec<ProviderConfig>,
@@ -232,6 +236,8 @@ impl State {
             theme_names,
             selected_theme: "Midnight",
             font_size: 14.0,
+            reduced_motion: config.display.reduced_motion,
+            scanline_overlay_enabled: config.display.scanline_overlay_enabled,
             providers,
             global_default_model,
             relationship_rules: config
@@ -402,6 +408,19 @@ impl State {
         self.provider_refresh_errors.retain(|id, _| self.providers.iter().any(|p| p.id == *id));
     }
 
+    /// Refresh the Display motion toggles from the live merged config.
+    ///
+    /// Same ownership rule as [`Self::sync_providers_from_config`] (ADR-57
+    /// §3d): once the user edits anything (`settings_dirty`), the form owns
+    /// the toggles until the next explicit save.
+    pub fn sync_display_from_config(&mut self, config: &AppConfig) {
+        if self.settings_dirty {
+            return;
+        }
+        self.reduced_motion = config.display.reduced_motion;
+        self.scanline_overlay_enabled = config.display.scanline_overlay_enabled;
+    }
+
     /// Build the `AppConfig` fragments this page owns, merging onto `base`.
     pub fn to_config(&self, base: &AppConfig) -> AppConfig {
         let mut cfg = base.clone();
@@ -436,6 +455,8 @@ impl State {
             self.retry_max_elapsed_seconds.trim().parse::<u64>().ok().filter(|value| *value > 0);
         cfg.memory.enabled = self.memory_enabled;
         cfg.memory.ttl_days = self.memory_ttl_days.round().clamp(1.0, 365.0) as u16;
+        cfg.display.reduced_motion = self.reduced_motion;
+        cfg.display.scanline_overlay_enabled = self.scanline_overlay_enabled;
 
         // Persist the canonical shell profile. The managed environment
         // config is mirrored from the live runtime manager (source of truth) so
@@ -794,6 +815,14 @@ impl State {
         match message {
             Message::ThemeSelected(name) => self.selected_theme = name,
             Message::FontSizeChanged(size) => self.font_size = size.clamp(12.0, 20.0),
+            Message::ReducedMotionToggled(reduced) => {
+                self.settings_dirty = true;
+                self.reduced_motion = reduced;
+            }
+            Message::ScanlineOverlayToggled(enabled) => {
+                self.settings_dirty = true;
+                self.scanline_overlay_enabled = enabled;
+            }
 
             // Legacy single-provider messages (no-op when using multi-provider)
             Message::ProviderSelected(_) => {}
