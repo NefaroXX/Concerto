@@ -84,6 +84,14 @@ Combine the best of all three:
   settles, the rule persists as a muted full-width hairline on the finished
   reply (`chat.rs::line_wipe_settled`) — the durable "new turn" marker that
   survives the run instead of the text reverting to the old plain look.
+- **Completion-path reveal**: The desktop emits no mid-run `AssistantMessage`,
+  so the final reply enters through `Message::AddAssistant` and is immediately
+  followed by the run's `Completion` chip (`set_run_completion`). The
+  typewriter window is therefore keyed by entry id, not tail position
+  (`chat.rs::revealed_chars`): the reveal keeps animating while the chip sits
+  below it, then auto-finalizes the reply (streaming → false) so no blinking
+  cursor or subscription outlives the turn. Reduced-motion never seeds the
+  window in this path either.
 
 ---
 

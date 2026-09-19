@@ -305,11 +305,15 @@ pub struct State {
     /// assistant entry. Toggled by `Message::StreamingTick`; only meaningful
     /// (and only ever read) while at least one entry is still streaming.
     streaming_cursor_visible: bool,
-    /// Typewriter-reveal frontier for the live streaming assistant entry:
+    /// Typewriter-reveal frontier for a streaming assistant entry:
     /// `Some((id, n))` means the entry with id `id` has revealed its first
-    /// `n` *characters* so far. Transient view state only — deliberately NOT
-    /// a `ChatEntry` field, never serialized, and dropped once the entry is
-    /// finalized. `None` means nothing is animating (all content shown).
+    /// `n` *characters* so far. Keyed by entry id rather than tail position:
+    /// the run-boundary path (`AddAssistant` + `set_run_completion`) appends
+    /// a `Completion` chip after the final reply, so the revealed entry is
+    /// never the last one while its reveal plays. Transient view state only —
+    /// deliberately NOT a `ChatEntry` field, never serialized, and dropped
+    /// once the entry is finalized. `None` means nothing is animating (all
+    /// content shown).
     revealed_chars: Option<(EntryId, usize)>,
     /// True while a reveal is being driven toward the end of a *final*
     /// assistant message (seeded by `Message::AddAssistant`). When the reveal
@@ -893,13 +897,19 @@ impl State {
         if self.reduced_motion {
             return false;
         }
-        // Assistant typewriter-reveal window still animating.
+        // Assistant typewriter-reveal window still animating. The window is
+        // keyed by entry id, not by tail position: the run-boundary path
+        // (`AddAssistant` + `set_run_completion`) appends a `Completion` chip
+        // after the final reply, so the revealed entry is no longer the last
+        // one — searching by id keeps the reveal alive until it finishes.
         let assistant_revealing = self.revealed_chars.is_some_and(|(id, revealed)| {
-            matches!(
-                self.entries.last(),
-                Some(ChatEntry::Assistant { id: entry_id, content, streaming: true, .. })
-                    if *entry_id == id && revealed < content.chars().count()
-            )
+            self.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { id: entry_id, content, streaming: true, .. }
+                        if *entry_id == id && revealed < content.chars().count()
+                )
+            })
         });
         if assistant_revealing {
             return true;
@@ -921,22 +931,28 @@ impl State {
             .any(|entry| matches!(entry, ChatEntry::Thinking { finished_at: None, .. }))
     }
 
-    /// Advance the typewriter reveal one tick on the live streaming assistant
-    /// entry (the tracked entry id must still be the streaming tail). While a
+    /// Advance the typewriter reveal one tick on the streaming assistant
+    /// entry tracked by `revealed_chars`. The tracked entry is located by id
+    /// anywhere in the transcript (not just the tail), so a `Completion` chip
+    /// appended after the final reply cannot orphan the window. While a
     /// paragraph handoff hold is open the frontier freezes and the hold counts
     /// down instead of advancing. No-op when no reveal is in progress; resets
-    /// the window to `None` when the tracked id no longer matches the live
-    /// streaming entry, so a stale window can never drive a completed entry.
+    /// the window to `None` when the tracked id is gone or no longer
+    /// streaming, so a stale window can never drive a completed entry.
     fn advance_reveal(&mut self) {
         // Handoff hold (Baton prototype #5): freeze the frontier at the
         // paragraph boundary while the cue counts down, one tick at a time.
-        // A stale hold (entry gone or no longer the streaming tail) clears.
+        // A stale hold (tracked entry gone or no longer streaming) clears.
+        // The hold is keyed by id too, so a trailing `Completion` chip cannot
+        // orphan it either.
         if let Some((hold_id, remaining)) = self.handoff_hold {
-            let live = matches!(
-                self.entries.last(),
-                Some(ChatEntry::Assistant { id: entry_id, streaming: true, .. })
-                    if *entry_id == hold_id
-            );
+            let live = self.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { id: entry_id, streaming: true, .. }
+                        if *entry_id == hold_id
+                )
+            });
             if live {
                 if remaining <= 1 {
                     self.handoff_hold = None;
@@ -950,42 +966,81 @@ impl State {
         let Some((id, revealed)) = self.revealed_chars else {
             return;
         };
-        match self.entries.last() {
-            Some(ChatEntry::Assistant { id: entry_id, content, streaming: true, .. })
+        // The reveal window is keyed by entry id, not tail position: the
+        // final reply seeded by `Message::AddAssistant` is immediately
+        // followed by the run's `Completion` chip (`set_run_completion`), so
+        // it is never the last entry while its reveal plays. Locate the
+        // tracked entry anywhere in the transcript — still requiring it to be
+        // `streaming: true`, so a stale window can never drive a finalized
+        // entry. The length is snapshotted first because the entry borrow
+        // cannot stay live across the writes below.
+        let Some(len) = self.entries.iter().find_map(|entry| match entry {
+            ChatEntry::Assistant { id: entry_id, content, streaming: true, .. }
                 if *entry_id == id =>
             {
-                let len = content.chars().count();
-                let next = revealed.saturating_add(REVEAL_CHARS_PER_TICK).min(len);
-                if next == len && self.reveal_autofinish {
-                    // A *final* message has fully revealed: the text is
-                    // complete, so mark the entry non-streaming (dropping the
-                    // blinking cursor and both subscriptions) and clear the
-                    // window — the reveal is done, not paused mid-content.
-                    if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
-                        *streaming = false;
-                    }
-                    self.revealed_chars = None;
-                    self.reveal_autofinish = false;
-                    self.handoff_hold = None;
-                } else {
-                    // Paragraph handoff cue (Baton prototype #5): when the
-                    // frontier crosses a blank-line boundary mid-reveal, hold
-                    // the cursor for `HANDOFF_HOLD_TICKS` before resuming.
-                    // Single-paragraph content never triggers (fallback: no
-                    // cue); reduced-motion skips the cue entirely.
-                    if next != len
-                        && !self.reduced_motion
-                        && crosses_paragraph_boundary(content, revealed, next)
-                    {
-                        self.handoff_hold = Some((id, HANDOFF_HOLD_TICKS));
-                    }
-                    self.revealed_chars = Some((id, next));
-                }
+                Some(content.chars().count())
             }
-            _ => {
-                self.revealed_chars = None;
-                self.handoff_hold = None;
+            _ => None,
+        }) else {
+            self.revealed_chars = None;
+            self.reveal_autofinish = false;
+            self.handoff_hold = None;
+            return;
+        };
+        let next = revealed.saturating_add(REVEAL_CHARS_PER_TICK).min(len);
+        if next == len && self.reveal_autofinish {
+            // A *final* message has fully revealed: the text is complete, so
+            // mark the entry non-streaming (dropping the blinking cursor and
+            // both subscriptions) and clear the window — the reveal is done,
+            // not paused mid-content.
+            self.finalize_tracked_reveal(id);
+            self.revealed_chars = None;
+            self.reveal_autofinish = false;
+            self.handoff_hold = None;
+        } else {
+            // Paragraph handoff cue (Baton prototype #5): when the frontier
+            // crosses a blank-line boundary mid-reveal, hold the cursor for
+            // `HANDOFF_HOLD_TICKS` before resuming. Single-paragraph content
+            // never triggers (fallback: no cue); reduced-motion skips the cue
+            // entirely. This is a read-only pass over the entry (it borrows
+            // `self.entries`) before the window write below.
+            let open_hold =
+                next != len && !self.reduced_motion && self.entries.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        ChatEntry::Assistant {
+                            id: entry_id,
+                            content,
+                            streaming: true,
+                            ..
+                        } if *entry_id == id && crosses_paragraph_boundary(content, revealed, next)
+                    )
+                });
+            if open_hold {
+                self.handoff_hold = Some((id, HANDOFF_HOLD_TICKS));
             }
+            self.revealed_chars = Some((id, next));
+        }
+    }
+
+    /// Mark the assistant entry tracked by the autofinish reveal (seeded by
+    /// `Message::AddAssistant`) non-streaming, if it still exists and is
+    /// streaming. The tracked id — not the tail position — decides, so the
+    /// entry finalizes even when the run's `Completion` chip (or any other
+    /// entry) has been appended after it. This is the single place that
+    /// settles a final reply mid-reveal, shared by the tick completer, run
+    /// boundaries, and the reduced-motion toggle.
+    fn finalize_tracked_reveal(&mut self, id: EntryId) {
+        if let Some(ChatEntry::Assistant { streaming, .. }) =
+            self.entries.iter_mut().find(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { id: entry_id, streaming: true, .. }
+                        if *entry_id == id
+                )
+            })
+        {
+            *streaming = false;
         }
     }
 
@@ -1110,9 +1165,12 @@ impl State {
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         if reduced {
+            // A *final* message mid-reveal finalizes even when the run's
+            // `Completion` chip has already been appended after it: the
+            // tracked id decides, not the tail position.
             if self.reveal_autofinish {
-                if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
-                    *streaming = false;
+                if let Some((id, _)) = self.revealed_chars {
+                    self.finalize_tracked_reveal(id);
                 }
             }
             self.revealed_chars = None;
@@ -1190,7 +1248,15 @@ impl State {
     /// the whole run; use [`finalize_run`](Self::finalize_run) at the true
     /// run boundary instead.
     pub fn finalize_streaming(&mut self) {
-        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+        // A final reply mid-autofinish-reveal is finalized by its tracked id —
+        // the run's `Completion` chip may already trail it — so navigating
+        // away mid-reveal cannot leave a `streaming` entry behind. Live
+        // streaming entries (no autofinish) sit at the tail, as before.
+        if self.reveal_autofinish {
+            if let Some((id, _)) = self.revealed_chars {
+                self.finalize_tracked_reveal(id);
+            }
+        } else if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
             *streaming = false;
         }
         // The reveal window is transient; once the entry is finalized the
@@ -1213,7 +1279,14 @@ impl State {
     /// content can arrive afterwards.
     pub fn finalize_run(&mut self) {
         self.finish_all_open_thinking();
-        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+        // Same id-keyed finalization as `finalize_streaming`: a final reply
+        // mid-autofinish-reveal is settled even when the run's `Completion`
+        // chip trails it.
+        if self.reveal_autofinish {
+            if let Some((id, _)) = self.revealed_chars {
+                self.finalize_tracked_reveal(id);
+            }
+        } else if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
             *streaming = false;
         }
         // Full text is final after a run boundary — stop any reveal window
@@ -3202,6 +3275,96 @@ mod tests {
         // A new streaming entry restarts its own typewriter reveal from zero.
         assert_eq!(state.revealed_chars, Some((id, 0)));
         assert!(state.is_revealing());
+    }
+
+    #[test]
+    fn final_reply_reveal_survives_a_trailing_completion_entry() {
+        // Normal desktop runs emit no mid-run `AssistantMessage`, so the final
+        // reply enters through `AddAssistant` and is immediately followed by
+        // the run's `Completion` chip (`set_run_completion`). The reveal must
+        // track its entry by id — not by tail position — or the appended
+        // Completion would orphan the window on the first tick and the reply
+        // would render as an instant dump.
+        let mut state = State::new();
+        let _ = state.update(Message::AddAssistant("0123456789abcdefghij".to_string()));
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        state.set_run_completion(true, true, vec!["src/main.rs".into()], Some("project".into()));
+        assert!(
+            matches!(state.entries().last(), Some(ChatEntry::Completion { .. })),
+            "the completion chip trails the final reply"
+        );
+        assert_eq!(state.revealed_chars, Some((id, 0)), "the final reply seeds a reveal");
+        assert!(state.is_revealing(), "the reveal survives a trailing Completion entry");
+
+        // The reveal must advance 8 chars/tick instead of snapping to full:
+        // the trailing Completion must not drop the window on the first tick.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 8)));
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        assert!(state.is_revealing(), "mid-reveal keeps the typing tick alive");
+
+        // Once the frontier reaches the content end the autofinish fires: the
+        // entry stops streaming and the window clears, exactly as it would
+        // without the trailing chip.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, None, "the reveal finishes at the content end");
+        assert!(
+            matches!(
+                state
+                    .entries()
+                    .iter()
+                    .find(|e| { matches!(e, ChatEntry::Assistant { id: eid, .. } if *eid == id) }),
+                Some(ChatEntry::Assistant { streaming: false, .. })
+            ),
+            "the final reply auto-finalizes once fully revealed"
+        );
+        assert!(
+            matches!(
+                state.entries().iter().find(|e| {
+                    matches!(e, ChatEntry::Assistant { id: eid, .. } if *eid == id)
+                }),
+                Some(ChatEntry::Assistant { content, .. }) if content == "0123456789abcdefghij"
+            ),
+            "the full content stays intact after the reveal"
+        );
+
+        // The line wipe still plays and settles to its static marker (the
+        // "new turn" signature), and every window drains so the 16 ms tick
+        // subscription stops.
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(
+            state.line_wipe_settled.contains(&id),
+            "the wipe settles to its muted marker despite the trailing chip"
+        );
+        assert!(!state.is_revealing(), "no animation work remains after all windows settle");
+    }
+
+    #[test]
+    fn final_reply_and_completion_render_instantly_under_reduced_motion() {
+        // A11y: reduced-motion must never seed the reveal or its cues even
+        // when the run's Completion chip trails the final reply.
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        let _ = state.update(Message::AddAssistant("0123456789abcdefghij".to_string()));
+        state.set_run_completion(true, true, vec![], None);
+
+        assert_eq!(state.revealed_chars, None, "reduced-motion never seeds a reveal");
+        assert!(state.line_wipe_ticks.is_empty(), "no wipe under reduced-motion");
+        assert!(state.first_token_ticks.is_empty(), "no first-token emphasis");
+        assert!(
+            matches!(
+                state.entries().iter().find(|e| matches!(e, ChatEntry::Assistant { .. })),
+                Some(ChatEntry::Assistant { streaming: false, .. })
+            ),
+            "the final reply is never streaming under reduced-motion"
+        );
+        assert!(!state.is_revealing(), "the transcript renders instantly");
     }
 
     #[test]
