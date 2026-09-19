@@ -562,7 +562,11 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
                     children.push(t.into());
                 }
                 Span::Code(t) => {
-                    let bg = Color::from_rgb(0.12, 0.14, 0.19);
+                    // Theme-aware inline-code chip: `surface_variant` matches
+                    // the fenced code-block surfaces, so the chip reads on
+                    // both the Chalk light and dark palettes (no hard-coded
+                    // RGB that breaks light themes).
+                    let bg = self.surface_variant;
                     let code = container(text(t).size(size).font(Font::MONOSPACE))
                         .padding(iced::Padding::new(2.0).right(6.0).left(6.0))
                         .style(move |_theme: &iced::Theme| container::Style {
@@ -582,7 +586,7 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
     /// finalization, where the partially-built current row is deliberately
     /// dropped rather than emitted half-rendered.
     fn table_elements(&mut self) -> Vec<Element<'a, M>> {
-        let border_color = Color::from_rgb(0.3, 0.3, 0.35);
+        let border_color = self.text_muted;
         let mut row_elements = Vec::with_capacity(self.table_rows.len());
         for r in self.table_rows.drain(..) {
             let mut cell_elements = Vec::with_capacity(r.len());
