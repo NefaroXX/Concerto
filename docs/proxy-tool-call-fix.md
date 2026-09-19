@@ -4,7 +4,9 @@
 > is done — `openai.rs:326` flat fallback + tests at `:781`, `:815`, `:841`.
 > Fix 2 (content-embedded, strict) is done — content buffered to turn end,
 > full-text envelope parse only when `partial_tools` is empty, real deltas
-> always win. Fix 3 (warn/retry) remains open. Do
+> always win. Fix 3 (warn/retry) is done — malformed args retry
+> trim + single-quote fixup, then warn (name/len/error, never payload) +
+> Null. Do
 > not use this document as evidence that a proxy/model combination is
 > supported.
 
@@ -125,7 +127,7 @@ wrap the entire block in a helper method `try_extract_tool_call_from_content`.
 The `continue` skips falling through to emit text, so the tool call isn't
 duplicated as both a tool call and assistant text.
 
-### Fix 3: Better error recovery and logging in `emit_tool_call` — ⬜ NOT YET IMPLEMENTED
+### Fix 3: Better error recovery and logging in `emit_tool_call` — ✅ DONE
 
 In `OpenAiStreamState::emit_tool_call`, the current code silently discards parse
 failures. Replace it with diagnostic logging and a retry.
