@@ -3939,11 +3939,13 @@ impl App {
 
         let content: Element<'_, Message> = match self.page {
             Page::Chat => {
-                // Cap the chat column's reading width and center it: on wide
-                // panels an unbounded Fill left the transcript hugging the
-                // sidebar while the input bar stretched edge-to-edge — the
-                // layout never felt columnar. ~900px is long enough for the
-                // two-pane chart + diff feel without sprawling.
+                // Constrain the chat reading column: `Fill` width capped at
+                // `CHAT_MAX_WIDTH` and centered — same pattern as the ~900px
+                // modal card below (`container(..).width(Fill).max_width(900)`
+                // inside a `.center_x(Fill)` backdrop). A raw `Fixed` width
+                // here would overflow behind the fixed side rails on narrow
+                // windows; `Fill` + `max_width` shrinks with the main area
+                // instead.
                 let chat = self
                     .chat
                     .view(
@@ -3957,11 +3959,16 @@ impl App {
                         !self.runtime_assignments().is_empty() || agents_configured,
                     )
                     .map(Message::Chat);
-                container(chat)
-                    .width(Length::Fixed(CHAT_MAX_WIDTH))
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .into()
+                container(
+                    container(chat)
+                        .width(Length::Fill)
+                        .max_width(CHAT_MAX_WIDTH)
+                        .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .into()
             }
             Page::ToolLog => self.tool_log.view(&self.current_theme).map(Message::ToolLog),
             Page::DiffViewer => self.diff.view(&self.current_theme).map(Message::Diff),
@@ -4036,9 +4043,14 @@ impl App {
                 container(self.terminal.view(&self.current_theme).map(Message::Terminal))
                     .width(Length::Fill)
                     .height(Length::Fixed(panel_height));
-            column![content_column, resize_handle, terminal_area, status_bar]
+            // The main area must be an explicit `Fill` child of the shell row
+            // so it takes exactly the leftover space between the fixed side
+            // rails. Without it the row-sized column reports its natural
+            // width and overflows behind the sidebar/quick panel on narrow
+            // windows.
+            column![content_column, resize_handle, terminal_area, status_bar].width(Length::Fill)
         } else {
-            column![content_column, status_bar]
+            column![content_column, status_bar].width(Length::Fill)
         };
 
         let sep2 = rule::vertical(1);
