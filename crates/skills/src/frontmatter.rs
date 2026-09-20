@@ -31,8 +31,8 @@ pub(crate) struct FrontMatter {
 /// and CRLF line endings are tolerated (every line is normalized by
 /// `str::lines()`, so the body below the closing delimiter is re-joined with
 /// `\n`). An empty `id` value (`id:` alone) leaves the field unset; missing
-/// and explicit-empty ids are both surfaced as `SkillsError::InvalidId` by the
-/// loader, with the pack directory attached.
+/// and explicit-empty ids are both handled by the loader, which falls back to
+/// the pack directory's name as the id (see `manager::validate_skill_id`).
 ///
 /// Errors carry a human-readable reason only; the caller attaches the file
 /// path (`SkillsError::FrontMatter`).
@@ -320,8 +320,9 @@ Body line two.
 
     #[test]
     fn empty_id_forms_leave_field_unset_or_explicitly_empty() {
-        // `id:` (empty value) leaves the field unset; the loader turns both
-        // unset and explicit-empty into `SkillsError::InvalidId`.
+        // `id:` (empty value) leaves the field unset; both unset and
+        // explicit-empty ids are handled by the loader (which falls back to
+        // the pack directory's name as the id).
         let fm = parse_front_matter("---\nid:\n---\n").expect("empty id value should parse");
         assert_eq!(fm.id, None);
         let fm = parse_front_matter("---\nid: \"\"\n---\n").expect("quoted empty id should parse");

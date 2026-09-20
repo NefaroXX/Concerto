@@ -27,6 +27,7 @@ pub mod state;
 pub use message::ExtensionTab;
 pub use message::Message;
 pub use state::InstalledPluginInfo;
+pub use state::McpAddDraft;
 pub use state::McpEditDraft;
 pub use state::SkillEditDraft;
 pub use state::State;
@@ -179,6 +180,11 @@ const AGENT_ROLES: &[&str] =
     &["coordinator", "architect", "researcher", "coder", "reviewer", "validator"];
 const RELATIONSHIP_TYPES: &[&str] =
     &["supervises", "provides_context_to", "reports_to", "owns_design"];
+
+/// Cap for one discovery-diagnostic line in the Skills tab. A formatted
+/// search path can be very long (e.g. `C:\Users\…\AppData\Roaming\concerto\…`)
+/// and one pathological line must not balloon the settings pane.
+const SKILL_DIAGNOSTIC_MAX_CHARS: usize = 140;
 
 /// Truncate a display string to `max` chars, appending an ellipsis when cut.
 /// Used to keep skill descriptions and snippets compact in the Extensions UI.
@@ -1267,8 +1273,28 @@ impl State {
         // Per-path/per-pack diagnostics from the last discovery run (missing
         // search paths, packs skipped for malformed manifests) explain a
         // sparse result without hiding it behind a bare "no skills found" line.
+        // Each line is truncated so one long absolute path cannot balloon the
+        // pane.
         for warning in &self.skills_warnings {
-            master.push(text(format!("• {warning}")).size(11).color(palette.warning).into());
+            master.push(
+                text(format!("• {}", truncate(warning, SKILL_DIAGNOSTIC_MAX_CHARS)))
+                    .size(11)
+                    .color(palette.warning)
+                    .into(),
+            );
+        }
+
+        // Informational notes from the same run — e.g. a pack with an empty
+        // manifest id loaded under its directory name (its manifest id was
+        // missing, which is common for local packs) — are not failures, so
+        // they render as quiet, muted one-liners under the warnings.
+        for note in &self.skills_notes {
+            master.push(
+                text(truncate(note, SKILL_DIAGNOSTIC_MAX_CHARS))
+                    .size(11)
+                    .color(palette.text_muted)
+                    .into(),
+            );
         }
 
         ext_master_detail(
@@ -1714,25 +1740,23 @@ impl State {
                 .size(12)
                 .color(palette.text_muted)
                 .into(),
+            row![
+                text("Configured servers").size(13).color(palette.text),
+                self.ext_new_mcp_server_button(),
+            ]
+            .spacing(SPACING_SM)
+            .align_y(Alignment::Center)
+            .into(),
         ];
 
         if self.mcp_servers.is_empty() {
             master.push(
-                column![
-                    text(
-                        "No MCP servers configured. Add `[mcp.servers]` entries to your \
-                         config file."
-                    )
-                    .size(12)
-                    .color(palette.text_muted),
-                    text(
-                        "Existing servers can be edited or removed from the detail pane. \
-                         Adding a brand-new server still happens in the config file."
-                    )
-                    .size(11)
-                    .color(palette.text_muted),
-                ]
-                .spacing(SPACING_XS)
+                text(
+                    "No MCP servers configured yet. Press \"Add server\" to create one; it \
+                     starts with the next run.",
+                )
+                .size(12)
+                .color(palette.text_muted)
                 .into(),
             );
         } else {
@@ -1746,8 +1770,25 @@ impl State {
         ext_master_detail(
             theme,
             column(master).spacing(SPACING_SM).into(),
-            self.ext_mcp_detail(theme),
+            if let Some(draft) = &self.mcp_add_draft {
+                self.ext_mcp_add_form(theme, draft)
+            } else {
+                self.ext_mcp_detail(theme)
+            },
         )
+    }
+
+    /// Master "Add server" action (ADR-43 add): opens the add form in the
+    /// detail pane. Inert while the form is already open so the draft is never
+    /// reset under the user.
+    fn ext_new_mcp_server_button<'a>(&'a self) -> Element<'a, Message> {
+        let mut button = button(text("Add server").size(13))
+            .style(crate::ui::button::secondary)
+            .padding([6, 14]);
+        if self.mcp_add_draft.is_none() {
+            button = button.on_press(Message::McpAddPressed);
+        }
+        button.into()
     }
 
     fn ext_mcp_row<'a>(
@@ -2012,6 +2053,129 @@ impl State {
                     .style(crate::ui::button::secondary)
                     .padding([6, 14])
                     .on_press(Message::McpEditCancelled),
+            ]
+            .spacing(SPACING_SM),
+        ]
+        .spacing(SPACING_SM)
+        .into()
+    }
+
+    /// New-server form for the MCP tab (ADR-43 add), rendered in the detail
+    /// pane in place of the read-only metadata. Mirrors the edit form with an
+    /// editable `id` field; command, arguments, environment rows, and timeout
+    /// are drafted and applied by [`Message::McpAddSaved`] with inline
+    /// validation on the way out. Cancelling discards the draft.
+    fn ext_mcp_add_form<'a>(
+        &'a self,
+        theme: &'a AppTheme,
+        draft: &'a McpAddDraft,
+    ) -> Element<'a, Message> {
+        let palette = &theme.palette;
+
+        let mut env_rows: Vec<Element<'a, Message>> = Vec::new();
+        let keys: Vec<String> = draft.env.keys().cloned().collect();
+        for (i, key) in keys.iter().enumerate() {
+            let value = draft.env.get(key).cloned().unwrap_or_default();
+            env_rows.push(
+                row![
+                    text_input("VAR", key)
+                        .on_input(move |s| Message::McpAddEnvKeyChanged(i, s))
+                        .width(160),
+                    text_input("value", &value)
+                        .on_input(move |s| Message::McpAddEnvValueChanged(i, s))
+                        .width(Length::Fill),
+                    button(text("Remove").size(13))
+                        .style(crate::ui::button::danger_outline)
+                        .padding([6, 10])
+                        .on_press(Message::McpAddEnvRemove(i)),
+                ]
+                .spacing(SPACING_XS)
+                .align_y(Alignment::Center)
+                .into(),
+            );
+        }
+
+        let mut env_field: Vec<Element<'a, Message>> = vec![
+            text("Environment").size(13).color(palette.text).into(),
+            text("Optional variable overrides for the server process; leave empty for none.")
+                .size(11)
+                .color(palette.text_muted)
+                .into(),
+        ];
+        if env_rows.is_empty() {
+            env_field.push(text("No variables set.").size(12).color(palette.text_muted).into());
+        } else {
+            env_field.extend(env_rows);
+        }
+        if let Some(error) = &draft.env_error {
+            env_field.push(text(error.clone()).size(11).color(palette.danger).into());
+        }
+        env_field.push(
+            button(text("+ Add variable").size(13))
+                .style(crate::ui::button::secondary)
+                .padding([6, 12])
+                .on_press(Message::McpAddEnvAdd)
+                .into(),
+        );
+
+        column![
+            text("New MCP server").size(16).color(palette.text),
+            text(
+                "The server is added to the pending config and starts with the next run; \
+                 edit and delete stay available from the detail pane."
+            )
+            .size(12)
+            .color(palette.text_muted),
+            form_field(
+                theme,
+                "Id",
+                true,
+                Some("Tool namespace key: mcp:<id>:<tool>; must be unique and free of ':'"),
+                draft.id_error.as_deref(),
+                text_input("server id", &draft.id)
+                    .on_input(Message::McpAddIdChanged)
+                    .width(Length::Fill),
+            ),
+            form_field(
+                theme,
+                "Command",
+                true,
+                None::<&str>,
+                draft.command_error.as_deref(),
+                text_input("command", &draft.command)
+                    .on_input(Message::McpAddCommandChanged)
+                    .width(Length::Fill),
+            ),
+            form_field(
+                theme,
+                "Arguments",
+                false,
+                Some("Space-separated arguments, e.g. \"-y @example/server\""),
+                None::<&str>,
+                text_input("arguments", &draft.args)
+                    .on_input(Message::McpAddArgsChanged)
+                    .width(Length::Fill),
+            ),
+            column(env_field).spacing(SPACING_XS),
+            form_field(
+                theme,
+                "Per-call timeout (seconds)",
+                false,
+                Some("Blank = crate default (60s); hard cap 300s"),
+                draft.timeout_error.as_deref(),
+                text_input("blank = 60", &draft.timeout)
+                    .on_input(Message::McpAddTimeoutChanged)
+                    .width(Length::Fill),
+            ),
+            row![
+                button(text("Add server").size(13))
+                    .style(crate::ui::button::primary)
+                    .padding([6, 14])
+                    .on_press(Message::McpAddSaved),
+                button(text("Cancel").size(13))
+                    .style(crate::ui::button::secondary)
+                    .padding([6, 14])
+                    .on_press(Message::McpAddCancelled),
             ]
             .spacing(SPACING_SM),
         ]
@@ -2504,6 +2668,42 @@ mod tests {
         // Create wizard (replaces the detail).
         let _ = state.update(Message::SkillDeleteCancelled("rust-testing".into()));
         let _ = state.update(Message::SkillCreatePressed);
+        let _ = state.view(&theme, false);
+    }
+
+    /// Smoke test: the MCP tab renders the add form in the detail pane over
+    /// both the empty list and the populated list, with inline errors visible,
+    /// and returns to the read-only detail after cancel, without panicking
+    /// (ADR-43 add).
+    #[test]
+    fn mcp_tab_renders_add_form_and_empty_state() {
+        let theme = AppTheme::by_name("Midnight");
+        let mut state = State::from_config(&concerto_config::AppConfig::default());
+        let _ = state.update(Message::ExtensionTabSelected(ExtensionTab::Mcp));
+
+        // Empty list with the add form open.
+        let _ = state.update(Message::McpAddPressed);
+        let _ = state.view(&theme, false);
+
+        // Add form open on top of existing servers.
+        state.mcp_servers.push(McpServerConfig {
+            id: "files".into(),
+            command: "npx".into(),
+            args: vec!["-y".into()],
+            env: None,
+            enabled: true,
+            timeout_secs: None,
+        });
+        let _ = state.update(Message::McpAddPressed);
+        let _ = state.view(&theme, false);
+
+        // Add form with an inline validation error visible.
+        let _ = state.update(Message::McpAddIdChanged("files".into()));
+        let _ = state.update(Message::McpAddSaved);
+        let _ = state.view(&theme, false);
+
+        // Cancel returns to the read-only detail.
+        let _ = state.update(Message::McpAddCancelled);
         let _ = state.view(&theme, false);
     }
 }

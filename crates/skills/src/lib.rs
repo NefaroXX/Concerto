@@ -26,18 +26,24 @@
 //! never aborts discovery of the rest. Results are sorted by id, and duplicate
 //! ids keep the first occurrence (deterministically: lowest `(id, path)` wins).
 //!
+//! A manifest whose `id` trims to empty is not a failure: discovery falls back
+//! to the pack directory's name as the id (e.g. a pack in `…/deepwork` without
+//! an id loads as `deepwork`) and records an informational note.
+//!
 //! [`SkillManager::discover_with_report`] performs the same discovery but
 //! returns the diagnostics as a [`DiscoveryReport`] (resolved search paths,
-//! descriptors, and per-path/per-pack warnings) so UI callers can surface why
-//! a "no skills found" result happened; [`expanded_search_path`] expands a
-//! single configured path for display without scanning.
+//! descriptors, per-path/per-pack warnings, and informational notes) so UI
+//! callers can surface why a "no skills found" result happened;
+//! [`expanded_search_path`] expands a single configured path for display
+//! without scanning.
 //!
 //! # Manifest formats
 //!
 //! ## `skill.toml`
 //!
 //! TOML with the same field names as the shared data model. Only `id` is
-//! required and must be non-empty after trimming. Optional fields default to
+//! required and must be non-empty after trimming (an empty id loads under the
+//! pack directory's name; see Discovery above). Optional fields default to
 //! `""` (`name`, `version`, `description`), `None` (`instructions`,
 //! `instructions_path`), or an empty list (`tools`, `resources`). Unknown
 //! fields are ignored. `instructions` is inline text; `instructions_path` is a

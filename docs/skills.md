@@ -25,9 +25,13 @@ lookup used for the application's other data:
 
 The legacy literal `~/.local/share/concerto/skills` remains in the default
 search list only when it resolves to a *different* directory than the primary
-platform root — on a default Linux install the two are the same tree, so the
-legacy entry is dropped to avoid scanning it twice. Packs placed under the old
-location keep loading on Windows/macOS/custom `XDG_DATA_HOME` setups.
+platform root **and that directory currently exists** — on a default Linux
+install the two are the same tree, so the legacy entry is dropped to avoid
+scanning it twice, and on Windows the `~/.local/share/...` tree usually does not
+exist, so the existence gate prunes it (no wasted scan, no spurious "missing
+search path" warning). Packs placed under the old location keep loading on
+setups where the directory genuinely exists (e.g. macOS or a custom
+`XDG_DATA_HOME` that still has packs under `~/.local/share`).
 
 ## Pack layout
 
@@ -45,22 +49,27 @@ is found, depth 5 is not). Search paths may contain a leading `~` (expanded to
 the user's home directory) and Windows-style `%VAR%` references such as
 `%USERPROFILE%`/`%APPDATA%`. Directories without a manifest are silently
 not skills; missing search paths are warned about and skipped. A malformed
-manifest fails loudly with the offending path. Results are sorted by id;
+manifest fails loudly with the offending path. A manifest whose `id` trims to
+empty is *not* a failure: the pack loads under its directory name (e.g. a pack
+in `…/deepwork` without a usable id loads as `deepwork`) and discovery records
+an informational note. Results are sorted by id;
 duplicate ids keep the first occurrence deterministically (lowest `(id, path)`
 wins) and are warned about.
 
 `SkillManager::discover_with_report` returns the same pass as a
-`DiscoveryReport` (resolved search paths, descriptors, and per-path/per-pack
-warnings) for callers that need the diagnostics as data; the desktop Settings
-→ Skills tab shows resolved, absolute search paths with existence badges and
-renders those warnings so a sparse result is explainable.
+`DiscoveryReport` (resolved search paths, descriptors, per-path/per-pack
+warnings, and informational notes) for callers that need the diagnostics as
+data; the desktop Settings → Skills tab shows resolved, absolute search paths
+with existence badges and renders those diagnostics so a sparse result is
+explainable.
 
 ## Manifest formats
 
 ### `skill.toml`
 
-Only `id` is required (non-empty after trimming). Optional fields default to
-`""` (`name`, `version`, `description`), `None` (`instructions`,
+Only `id` is required. A non-empty id must not contain `/`, `\`, `:`, or NUL;
+one that trims to empty loads under the pack directory's name. Optional fields
+default to `""` (`name`, `version`, `description`), `None` (`instructions`,
 `instructions_path`), or an empty list (`tools`, `resources`). Unknown fields
 are ignored. `instructions` is inline text; `instructions_path` is a path
 relative to the pack directory and wins over inline `instructions` when both

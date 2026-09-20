@@ -284,6 +284,32 @@ pub enum Message {
     /// Confirm deletion of the armed MCP server (removes it from the pending
     /// config; persisted on Save Settings).
     McpDeleteConfirmed(String),
+    /// Open the add-server form in the detail pane, seeding a fresh blank
+    /// draft. Transient view state: nothing here arms the dirty flag.
+    McpAddPressed,
+    /// Discard the in-progress MCP server add draft and leave the add form.
+    McpAddCancelled,
+    /// Change the id field of the in-progress MCP server add draft.
+    McpAddIdChanged(String),
+    /// Change the command field of the in-progress MCP server add draft.
+    McpAddCommandChanged(String),
+    /// Change the (space-joined) arguments field of the add draft.
+    McpAddArgsChanged(String),
+    /// Change one environment-variable key row of the add draft.
+    McpAddEnvKeyChanged(usize, String),
+    /// Change one environment-variable value row of the add draft.
+    McpAddEnvValueChanged(usize, String),
+    /// Add an empty environment-variable row to the add draft.
+    McpAddEnvAdd,
+    /// Remove an environment-variable row from the add draft.
+    McpAddEnvRemove(usize),
+    /// Change the per-call timeout field of the add draft.
+    McpAddTimeoutChanged(String),
+    /// Validate and append the add draft as a new `mcp.servers[]` entry.
+    /// Arms the dirty flag (persisted on Save Settings, next-run semantics)
+    /// and selects the new server; stays in the add form with inline field
+    /// errors when the draft is invalid.
+    McpAddSaved,
 
     // Unified Extensions manager (ADR-37/43/70)
     /// Switch the active sub-tab of the Extensions section.

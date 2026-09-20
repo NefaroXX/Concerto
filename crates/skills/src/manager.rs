@@ -18,10 +18,11 @@
 //!
 //! Search paths may contain `~` or Windows-style `%VAR%` references (e.g.
 //! `%APPDATA%`); they are expanded before scanning. [`SkillManager::discover`]
-//! logs diagnostics at `warn` level; [`SkillManager::discover_with_report`]
-//! returns the same diagnostics as data so callers (e.g. a settings UI) can
-//! surface them, and [`expanded_search_path`] expands a single configured path
-//! for display without scanning.
+//! logs warnings at `warn` level and informational notes at `info` level;
+//! [`SkillManager::discover_with_report`] returns all of them as data so
+//! callers (e.g. a settings UI) can surface them, and
+//! [`expanded_search_path`] expands a single configured path for display
+//! without scanning.
 
 use crate::error::SkillsError;
 use crate::frontmatter::parse_front_matter;
@@ -30,7 +31,7 @@ use concerto_api_types::extension::{SkillDescriptor, SkillManifest};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum nesting depth of a skill pack relative to a search path root.
 /// The root itself is depth 0; packs deeper than this are not discovered.
@@ -51,6 +52,11 @@ pub struct DiscoveryReport {
     pub descriptors: Vec<SkillDescriptor>,
     /// Human-readable per-path and per-pack diagnostics.
     pub warnings: Vec<String>,
+    /// Informational diagnostics (not failures) from the same pass: e.g. a
+    /// pack whose manifest id is empty was loaded under its pack directory's
+    /// name. [`SkillManager::discover`] logs these at `info` level; a settings
+    /// UI can surface them as quiet notes.
+    pub notes: Vec<String>,
 }
 
 /// Discovers and loads local skill packs (ADR-43, decision 1).
@@ -80,13 +86,17 @@ impl SkillManager {
     ///   (deterministic: lowest `(id, path)` wins) and are warned about.
     ///
     /// This is a convenience over [`SkillManager::discover_with_report`] that
-    /// logs every diagnostic at `warn` level and discards them. Callers that
-    /// need the diagnostics as data (e.g. a settings UI) should call
-    /// [`SkillManager::discover_with_report`] directly.
+    /// logs every warning at `warn` level and informational notes at `info`
+    /// level and discards them. Callers that need the diagnostics as data
+    /// (e.g. a settings UI) should call [`SkillManager::discover_with_report`]
+    /// directly.
     pub fn discover(&self) -> Result<Vec<SkillDescriptor>, SkillsError> {
         let report = self.discover_with_report()?;
         for warning in &report.warnings {
             warn!(warning = %warning, "skill discovery warning");
+        }
+        for note in &report.notes {
+            info!(note = %note, "using directory name as id");
         }
         Ok(report.descriptors)
     }
@@ -95,14 +105,16 @@ impl SkillManager {
     ///
     /// Equivalent to [`SkillManager::discover`], but the diagnostics are
     /// returned as [`DiscoveryReport`] data (resolved search paths, discovered
-    /// descriptors, and per-path/per-pack warnings) so a caller can surface
-    /// them instead of relying on `tracing`. Discovery semantics are
-    /// otherwise identical. This function never fails on a broken pack or a
-    /// missing path; `Err` is reserved for genuinely unexpected conditions.
+    /// descriptors, and per-path/per-pack warnings plus informational notes)
+    /// so a caller can surface them instead of relying on `tracing`. Discovery
+    /// semantics are otherwise identical. This function never fails on a
+    /// broken pack or a missing path; `Err` is reserved for genuinely
+    /// unexpected conditions.
     pub fn discover_with_report(&self) -> Result<DiscoveryReport, SkillsError> {
         let mut found: Vec<(PathBuf, SkillDescriptor)> = Vec::new();
         let mut failures: Vec<SkillsError> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         let mut resolved_paths: Vec<PathBuf> = Vec::new();
         for raw in &self.search_paths {
             let Some(root) = expand_home(raw) else {
@@ -120,7 +132,7 @@ impl SkillManager {
                 ));
                 continue;
             }
-            self.walk(&root, 0, &mut found, &mut failures);
+            self.walk(&root, 0, &mut found, &mut failures, &mut notes);
         }
         for failure in &failures {
             warnings.push(format!("skill pack failed to load; skipping it: {failure}"));
@@ -142,7 +154,7 @@ impl SkillManager {
             }
             discovered.push(descriptor);
         }
-        Ok(DiscoveryReport { resolved_paths, descriptors: discovered, warnings })
+        Ok(DiscoveryReport { resolved_paths, descriptors: discovered, warnings, notes })
     }
 
     /// Filter discovered skills to those explicitly enabled.
@@ -181,9 +193,9 @@ impl SkillManager {
     /// Create a new `skill.toml` skill pack at `parent/<manifest.id>`.
     ///
     /// * The id is validated: non-empty single path component after trimming
-    ///   (no `/`, `\`, NUL; not `.`/`..`). The manifest's `id` is normalized
-    ///   to the trimmed value so the written manifest stays consistent with
-    ///   its directory name.
+    ///   (no `/`, `\`, `:`, NUL; not `.`/`..`). The manifest's `id` is
+    ///   normalized to the trimmed value so the written manifest stays
+    ///   consistent with its directory name.
     /// * `parent` is created when missing.
     /// * Any existing directory at the target path fails with
     ///   [`SkillsError::AlreadyExists`].
@@ -323,11 +335,12 @@ impl SkillManager {
         depth: usize,
         out: &mut Vec<(PathBuf, SkillDescriptor)>,
         failures: &mut Vec<SkillsError>,
+        notes: &mut Vec<String>,
     ) {
         if depth > MAX_SKILL_DEPTH {
             return;
         }
-        match self.load_pack(dir) {
+        match self.load_pack(dir, notes) {
             Ok(Some(pack)) => {
                 out.push((dir.to_path_buf(), pack));
                 return;
@@ -368,7 +381,7 @@ impl SkillManager {
             }
             children.sort();
             for child in children {
-                self.walk(&child, depth + 1, out, failures);
+                self.walk(&child, depth + 1, out, failures, notes);
             }
         }
     }
@@ -376,7 +389,11 @@ impl SkillManager {
     /// Load the pack at `dir`, if it has a manifest. `None` means the
     /// directory is not a skill pack. `skill.toml` wins over `SKILL.md` when
     /// both are present.
-    fn load_pack(&self, dir: &Path) -> Result<Option<SkillDescriptor>, SkillsError> {
+    fn load_pack(
+        &self,
+        dir: &Path,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<SkillDescriptor>, SkillsError> {
         let toml_path = dir.join("skill.toml");
         let md_path = dir.join("SKILL.md");
         if toml_path.exists() {
@@ -386,10 +403,10 @@ impl SkillManager {
                     "both skill.toml and SKILL.md present; skill.toml wins"
                 );
             }
-            return self.load_toml_pack(dir, &toml_path).map(Some);
+            return self.load_toml_pack(dir, &toml_path, notes).map(Some);
         }
         if md_path.exists() {
-            return self.load_md_pack(dir, &md_path).map(Some);
+            return self.load_md_pack(dir, &md_path, notes).map(Some);
         }
         Ok(None)
     }
@@ -400,11 +417,15 @@ impl SkillManager {
         &self,
         dir: &Path,
         manifest_path: &Path,
+        notes: &mut Vec<String>,
     ) -> Result<SkillDescriptor, SkillsError> {
         let text = fs::read_to_string(manifest_path)
             .map_err(|e| SkillsError::Io { path: manifest_path.to_path_buf(), source: e })?;
         let mut manifest = parse_skill_toml(&text, manifest_path)?;
-        let id = validate_skill_id(&manifest.id, dir)?;
+        let (id, used_directory_name) = validate_skill_id(&manifest.id, dir)?;
+        if used_directory_name {
+            notes.push(format!("Skill '{id}' loaded via directory name"));
+        }
         manifest.id = id.clone();
 
         // `instructions_path` takes precedence over inline `instructions`
@@ -439,6 +460,7 @@ impl SkillManager {
         &self,
         dir: &Path,
         manifest_path: &Path,
+        notes: &mut Vec<String>,
     ) -> Result<SkillDescriptor, SkillsError> {
         let text = fs::read_to_string(manifest_path)
             .map_err(|e| SkillsError::Io { path: manifest_path.to_path_buf(), source: e })?;
@@ -448,7 +470,10 @@ impl SkillManager {
         })?;
 
         let raw_id = fm.id.as_deref().unwrap_or_default();
-        let id = validate_skill_id(raw_id, dir)?;
+        let (id, used_directory_name) = validate_skill_id(raw_id, dir)?;
+        if used_directory_name {
+            notes.push(format!("Skill '{id}' loaded via directory name"));
+        }
 
         let instructions = if fm.body.trim().is_empty() {
             fm.instructions.clone().unwrap_or_default()
@@ -478,22 +503,37 @@ impl SkillManager {
     }
 }
 
-/// Normalize a skill id and reject empty results, attaching the pack
-/// directory to `SkillsError::InvalidId` for diagnostics.
-fn validate_skill_id(raw_id: &str, dir: &Path) -> Result<String, SkillsError> {
-    let id = raw_id.trim().to_string();
-    if id.is_empty() {
+/// Resolve a skill id from a manifest, attaching the pack directory to
+/// [`SkillsError::InvalidId`] for diagnostics.
+///
+/// An id that trims to empty is *not* an error: it falls back to the pack
+/// directory's file name (e.g. a `SKILL.md` in `…/deepwork` without an `id`
+/// loads as `deepwork`). Returns the resolved id and whether the directory
+/// name was used. Non-empty ids that still contain a path separator, `:`, or
+/// NUL after trimming stay strict errors.
+fn validate_skill_id(raw_id: &str, dir: &Path) -> Result<(String, bool), SkillsError> {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() {
+        if let Some(name) = dir.file_name().filter(|name| !name.is_empty()) {
+            return Ok((name.to_string_lossy().into_owned(), true));
+        }
         return Err(SkillsError::InvalidId { id: raw_id.to_string(), path: dir.to_path_buf() });
     }
-    Ok(id)
+    if trimmed.contains(['/', '\\', '\0', ':']) {
+        return Err(SkillsError::InvalidId { id: raw_id.to_string(), path: dir.to_path_buf() });
+    }
+    Ok((trimmed.to_string(), false))
 }
 
 /// Validate a *new* skill id for create/rename operations: non-empty after
-/// trimming, a single path component (no `/`, `\`, or NUL), and not `.`/`..`.
-/// The trimmed value is returned.
+/// trimming, a single path component (no `/`, `\`, `:`, or NUL), and not
+/// `.`/`..`. The checks mirror [`validate_skill_id`]'s strict rules so a pack
+/// created here can never be rejected by discovery later (the loader is
+/// lenient about empty ids, but create with an empty id is meaningless). The
+/// trimmed value is returned.
 fn validate_new_skill_id(raw_id: &str, parent: &Path) -> Result<String, SkillsError> {
     let id = raw_id.trim();
-    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']) {
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', ':', '\0']) {
         return Err(SkillsError::InvalidId { id: raw_id.to_string(), path: parent.to_path_buf() });
     }
     Ok(id.to_string())
@@ -887,7 +927,7 @@ Always use conventional commits:
         write_file(&dir.join("SKILL.md"), "---\nid: broken\n")?;
 
         let manager = SkillManager::new(vec![]);
-        let err = match manager.load_pack(&dir) {
+        let err = match manager.load_pack(&dir, &mut Vec::new()) {
             Err(e) => e,
             Ok(_) => panic!("expected a front-matter error"),
         };
@@ -924,7 +964,7 @@ Always use conventional commits:
         write_file(&dir.join("skill.toml"), "id = [unclosed\n")?;
 
         let manager = SkillManager::new(vec![]);
-        let err = match manager.load_pack(&dir) {
+        let err = match manager.load_pack(&dir, &mut Vec::new()) {
             Err(e) => e,
             Ok(_) => panic!("expected a manifest error"),
         };
@@ -953,7 +993,7 @@ Always use conventional commits:
     fn discover_skips_bad_packs_and_keeps_good_ones() -> Result<(), SkillsError> {
         let temp = TempDir::new("mixed")?;
         write_toml_pack(&temp.path().join("good"), "good", "ok")?;
-        // Whitespace id in `skill.toml`.
+        // Whitespace id in `skill.toml` → loads under the directory name.
         write_file(&temp.path().join("bad-id/skill.toml"), "id = \"   \"\n")?;
         // Malformed front matter in `SKILL.md`.
         write_file(&temp.path().join("bad-md/SKILL.md"), "---\nid: broken\n")?;
@@ -961,7 +1001,7 @@ Always use conventional commits:
         write_file(&temp.path().join("bad-toml/skill.toml"), "id = [unclosed\n")?;
 
         let found = discover_in(temp.path())?;
-        assert_eq!(ids(&found), vec!["good"]);
+        assert_eq!(ids(&found), vec!["bad-id", "good"]);
         Ok(())
     }
 
@@ -1007,10 +1047,12 @@ Always use conventional commits:
     fn discover_with_report_surfaces_paths_and_warnings() -> Result<(), SkillsError> {
         let temp = TempDir::new("report")?;
         write_toml_pack(&temp.path().join("pack-a"), "a", "alpha")?;
-        // A broken pack, a duplicate id, and a missing search path.
+        // A broken pack, a duplicate id, a missing search path, and a pack
+        // whose manifest id is empty (loaded under its directory name).
         write_file(&temp.path().join("broken/skill.toml"), "id = [unclosed\n")?;
         write_toml_pack(&temp.path().join("dup-1"), "dup", "from 1")?;
         write_toml_pack(&temp.path().join("dup-2"), "dup", "from 2")?;
+        write_file(&temp.path().join("nameless/skill.toml"), "id = \"   \"\n")?;
 
         let manager =
             SkillManager::new(vec![temp.path().join("does-not-exist"), temp.path().to_path_buf()]);
@@ -1021,7 +1063,7 @@ Always use conventional commits:
             report.resolved_paths,
             vec![temp.path().join("does-not-exist"), temp.path().to_path_buf()]
         );
-        assert_eq!(ids(&report.descriptors), vec!["a", "dup"]);
+        assert_eq!(ids(&report.descriptors), vec!["a", "dup", "nameless"]);
         assert!(
             report.warnings.iter().any(|w| w.contains("does-not-exist") && w.contains("missing")),
             "missing search path must be reported: {:?}",
@@ -1036,6 +1078,11 @@ Always use conventional commits:
             report.warnings.iter().any(|w| w.contains("duplicate skill id")),
             "duplicate ids must be reported: {:?}",
             report.warnings
+        );
+        assert!(
+            report.notes.iter().any(|n| n == "Skill 'nameless' loaded via directory name"),
+            "directory-name fallback must be reported as a note: {:?}",
+            report.notes
         );
         Ok(())
     }
@@ -1116,6 +1163,35 @@ Always use conventional commits:
     #[test]
     fn invalid_id_error_includes_pack_directory() -> Result<(), SkillsError> {
         let temp = TempDir::new("bad-id")?;
+        // Path separator / colon / backslash ids in `skill.toml` (strict).
+        let slash_dir = temp.path().join("toml-slash");
+        write_file(&slash_dir.join("skill.toml"), "id = \"a/b\"\n")?;
+        let colon_dir = temp.path().join("toml-colon");
+        write_file(&colon_dir.join("skill.toml"), "id = \"a:b\"\n")?;
+        let backslash_dir = temp.path().join("toml-backslash");
+        write_file(&backslash_dir.join("skill.toml"), "id = \"a\\\\b\"\n")?;
+        // A separator id through `SKILL.md` front matter.
+        let md_dir = temp.path().join("md-slash");
+        write_file(&md_dir.join("SKILL.md"), "---\nid: a/b\n---\nbody\n")?;
+
+        let manager = SkillManager::new(vec![]);
+        for pack_dir in [slash_dir, colon_dir, backslash_dir, md_dir] {
+            let err = match manager.load_pack(&pack_dir, &mut Vec::new()) {
+                Err(e) => e,
+                Ok(_) => panic!("expected an InvalidId error for `{}`", pack_dir.display()),
+            };
+            assert!(
+                matches!(&err, SkillsError::InvalidId { path, .. } if path == &pack_dir),
+                "unexpected error for `{}`: {err}",
+                pack_dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_or_whitespace_ids_fall_back_to_directory_name() -> Result<(), SkillsError> {
+        let temp = TempDir::new("fallback-id")?;
         // Whitespace id in `skill.toml`.
         let toml_dir = temp.path().join("toml-pack");
         write_file(&toml_dir.join("skill.toml"), "id = \"   \"\n")?;
@@ -1130,33 +1206,37 @@ Always use conventional commits:
         write_file(&md_empty.join("SKILL.md"), "---\nid: \"\"\n---\nbody\n")?;
 
         let manager = SkillManager::new(vec![]);
-        for pack_dir in [toml_dir, md_dir, md_missing, md_empty] {
-            let err = match manager.load_pack(&pack_dir) {
-                Err(e) => e,
-                Ok(_) => panic!("expected an InvalidId error for `{}`", pack_dir.display()),
+        for pack_dir in [&toml_dir, &md_dir, &md_missing, &md_empty] {
+            let mut notes = Vec::new();
+            let Some(descriptor) = manager.load_pack(pack_dir, &mut notes)? else {
+                panic!("pack at `{}` must load via directory-name fallback", pack_dir.display());
             };
-            assert!(
-                matches!(
-                    &err,
-                    SkillsError::InvalidId { id, path }
-                        if id.trim().is_empty() && path == &pack_dir
-                ),
-                "unexpected error for `{}`: {err}",
-                pack_dir.display()
-            );
+            let name = pack_dir.file_name().expect("pack dir has a name").to_string_lossy();
+            assert_eq!(descriptor.id, name, "id must fall back to the directory name");
+            assert_eq!(notes, vec![format!("Skill '{name}' loaded via directory name")]);
         }
         Ok(())
     }
 
     #[test]
-    fn empty_id_packs_are_skipped_not_fatal() -> Result<(), SkillsError> {
-        let temp = TempDir::new("bad-id-continue")?;
+    fn empty_id_packs_load_via_directory_name_not_skipped() -> Result<(), SkillsError> {
+        let temp = TempDir::new("empty-id-continue")?;
         write_file(&temp.path().join("toml-pack/skill.toml"), "id = \"   \"\n")?;
         write_file(&temp.path().join("md-pack/SKILL.md"), "---\nid:\n---\nbody\n")?;
         write_toml_pack(&temp.path().join("good"), "good", "ok")?;
 
-        let found = discover_in(temp.path())?;
-        assert_eq!(ids(&found), vec!["good"]);
+        let manager = SkillManager::new(vec![temp.path().to_path_buf()]);
+        let report = manager.discover_with_report()?;
+        // Empty/whitespace manifest ids load under their pack directory names;
+        // discovery never skips a pack for an empty id (it only notes it).
+        assert_eq!(ids(&report.descriptors), vec!["good", "md-pack", "toml-pack"]);
+        assert_eq!(
+            report.notes,
+            vec![
+                "Skill 'md-pack' loaded via directory name".to_string(),
+                "Skill 'toml-pack' loaded via directory name".to_string(),
+            ]
+        );
         Ok(())
     }
 
@@ -1306,7 +1386,7 @@ Always use conventional commits:
         let temp = TempDir::new("crud-id")?;
         let parent = temp.path().join("skills");
         let manager = SkillManager::new(vec![]);
-        let unsafe_ids = ["..", ".", "a/b", "a\\b", "a\0b", "  "];
+        let unsafe_ids = ["..", ".", "a/b", "a\\b", "a\0b", "a:b", "  "];
         for bad in unsafe_ids {
             let err = manager
                 .create_pack(&parent, &skill_manifest(bad, Some("body")))

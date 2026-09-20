@@ -225,6 +225,11 @@ pub struct State {
     /// missing, or a pack skipped for a malformed manifest. Rendered under the
     /// search-paths row so a "no skills found" result is explainable.
     pub skills_warnings: Vec<String>,
+    /// Informational notes from the last successful discovery run (e.g. a pack
+    /// whose manifest id was empty loaded under its directory name). These are
+    /// not failures — the settings view renders them as muted info lines under
+    /// the search-paths row. Deduplicated like [`Self::skills_warnings`].
+    pub skills_notes: Vec<String>,
     /// True = all discovered skills are candidates (`enabled_ids: None`);
     /// false = `skills_enabled_ids` is the explicit allow-list.
     pub skills_allow_all: bool,
@@ -269,7 +274,7 @@ pub struct State {
     /// Master MCP toggle (`mcp.enabled`).
     pub mcp_enabled: bool,
     /// Configured MCP servers (editable in v1: per-server enabled flag,
-    /// edit, and delete; additions still happen in the config file).
+    /// add, edit, and delete; all persisted on Save Settings).
     pub mcp_servers: Vec<McpServerConfig>,
     /// Probe results keyed by server id. `Ok` = tool list, `Err` = error text.
     pub mcp_probe_results: HashMap<String, Result<Vec<McpToolDescriptor>, String>>,
@@ -285,6 +290,12 @@ pub struct State {
     /// Transient view state; the actual removal only happens on
     /// [`Message::McpDeleteConfirmed`].
     pub mcp_delete_confirm: Option<String>,
+    /// Draft fields for the in-progress MCP server add form. `Some` = the add
+    /// form is open in the detail pane. Transient view state: entering the
+    /// form never arms the dirty flag, and the new server only lands in
+    /// [`Self::mcp_servers`] (and eventually the config) on
+    /// [`Message::McpAddSaved`].
+    pub mcp_add_draft: Option<McpAddDraft>,
 
     // Unified Extensions manager (ADR-37/43/70) — master-detail view state.
     /// Active sub-tab of the Extensions section. Transient; never persisted.
@@ -336,6 +347,40 @@ pub struct McpEditDraft {
     pub env: BTreeMap<String, String>,
     /// Per-call timeout in seconds; blank = crate default (60s).
     pub timeout: String,
+    /// Inline error for the command field.
+    pub command_error: Option<String>,
+    /// Inline error for the environment rows (e.g. an empty key).
+    pub env_error: Option<String>,
+    /// Inline error for the timeout field.
+    pub timeout_error: Option<String>,
+}
+
+/// Draft fields for an in-progress MCP server add (ADR-43 add).
+///
+/// Mirrors [`McpEditDraft`] with the `id` editable — a brand-new server needs
+/// a key for its tool namespace `mcp:<server_id>:<tool_name>` — so validation
+/// mirrors `McpConfig::validate` (non-empty, no `:`, unique) plus the edit
+/// draft's command/env/timeout rules. Seeded blank on
+/// [`Message::McpAddPressed`]; on [`Message::McpAddSaved`] a valid draft is
+/// pushed into `mcp_servers` as a new [`McpServerConfig`], while an invalid
+/// draft keeps the form open with inline errors. Per-field `*_error` hold
+/// inline validation messages; `None` = valid.
+#[derive(Debug, Clone)]
+pub struct McpAddDraft {
+    /// Unique id, used to namespace tools as `mcp:<server_id>:<tool_name>`.
+    pub id: String,
+    /// Executable to spawn.
+    pub command: String,
+    /// Arguments joined with spaces (split back on save).
+    pub args: String,
+    /// Environment variables as key → value rows, rendered from the map's key
+    /// order (same editor pattern as the shell profiles). An empty map saves
+    /// as `env = none`.
+    pub env: BTreeMap<String, String>,
+    /// Per-call timeout in seconds; blank = crate default (60s).
+    pub timeout: String,
+    /// Inline error for the id field.
+    pub id_error: Option<String>,
     /// Inline error for the command field.
     pub command_error: Option<String>,
     /// Inline error for the environment rows (e.g. an empty key).
@@ -504,6 +549,7 @@ impl State {
             skills_loading: false,
             skills_error: None,
             skills_warnings: Vec::new(),
+            skills_notes: Vec::new(),
             skills_allow_all: skills.enabled_ids.is_none(),
             skills_enabled_ids: skills.enabled_ids.clone().unwrap_or_default(),
             skills_expanded: HashSet::new(),
@@ -531,6 +577,7 @@ impl State {
             mcp_editing_id: None,
             mcp_edit_draft: None,
             mcp_delete_confirm: None,
+            mcp_add_draft: None,
             active_extension_tab: ExtensionTab::Skills,
             ext_selected_skill: None,
             ext_selected_mcp: mcp.servers.first().map(|server| server.id.clone()),
@@ -779,6 +826,23 @@ impl State {
             Ok(_) => None,
             Err(_) => Some("Must be a whole number".into()),
         }
+    }
+
+    /// Validate the id of an MCP add draft against the configured servers.
+    /// Mirrors `McpConfig::validate` (ADR-43 §4): non-empty, no `:` — tools
+    /// are namespaced `mcp:<server_id>:<tool_name>` — and unique.
+    fn mcp_add_id_error(mcp_servers: &[McpServerConfig], id: &str) -> Option<String> {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Some("Id is required".into());
+        }
+        if trimmed.contains(':') {
+            return Some("Id must not contain ':'".into());
+        }
+        if mcp_servers.iter().any(|server| server.id == trimmed) {
+            return Some("An MCP server with this id already exists".into());
+        }
+        None
     }
 
     pub(super) fn rule_display(rule: &PolicyRuleDef) -> String {
@@ -1129,8 +1193,10 @@ impl State {
 
     /// Validates a prospective new skill id against the same rules the skills
     /// crate enforces when a pack is created: a non-empty single path
-    /// component after trimming (no `/`, `\`, or NUL; not `.`/`..`). Returns a
-    /// human-readable inline error, or `None` when the id is acceptable.
+    /// component after trimming (no `/`, `\`, `:`, or NUL; not `.`/`..`).
+    /// Returns a human-readable inline error, or `None` when the id is
+    /// acceptable. Mirrors `concerto-skills`' create/load id rules so a pack
+    /// the wizard can create is never rejected by discovery later.
     fn skill_id_error(id: &str) -> Option<String> {
         let trimmed = id.trim();
         let invalid = trimmed.is_empty()
@@ -1138,9 +1204,13 @@ impl State {
             || trimmed == ".."
             || trimmed.contains('/')
             || trimmed.contains('\\')
+            || trimmed.contains(':')
             || trimmed.contains('\0');
         if invalid {
-            Some("Id must be a single path component (no slashes, no NUL).".to_string())
+            Some(
+                "Id must be a single path component (no slashes, backslashes, colons, or NUL)."
+                    .to_string(),
+            )
         } else {
             None
         }
@@ -1824,7 +1894,8 @@ impl State {
                 match result {
                     Ok(report) => {
                         self.skills_discovered = report.descriptors;
-                        self.skills_warnings = report.warnings;
+                        self.skills_warnings = dedupe_lines(report.warnings);
+                        self.skills_notes = dedupe_lines(report.notes);
                         self.skills_error = None;
                         // Keep the master-detail selection valid: default to the
                         // first pack when nothing is selected or the selected
@@ -1858,6 +1929,7 @@ impl State {
                     Err(error) => {
                         self.skills_error = Some(error);
                         self.skills_warnings = Vec::new();
+                        self.skills_notes = Vec::new();
                     }
                 }
             }
@@ -2300,6 +2372,139 @@ impl State {
                 self.settings_dirty = true;
             }
 
+            // ADR-43 — MCP server add. The add draft is transient view state:
+            // field edits mutate only the draft and never arm the dirty flag.
+            // A committed add pushes a new server into `mcp_servers` and arms
+            // the dirty flag, so it persists through the regular Save Settings
+            // flow (next-run semantics).
+            Message::McpAddPressed => {
+                // Opening the add form leaves any in-progress edit/delete
+                // state: the detail pane is given over to the new-server form.
+                self.mcp_editing_id = None;
+                self.mcp_edit_draft = None;
+                self.mcp_delete_confirm = None;
+                self.mcp_add_draft = Some(McpAddDraft {
+                    id: String::new(),
+                    command: String::new(),
+                    args: String::new(),
+                    env: BTreeMap::new(),
+                    timeout: String::new(),
+                    id_error: None,
+                    command_error: None,
+                    env_error: None,
+                    timeout_error: None,
+                });
+            }
+            Message::McpAddCancelled => {
+                self.mcp_add_draft = None;
+            }
+            Message::McpAddIdChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.id = value;
+                    draft.id_error = Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim());
+                }
+            }
+            Message::McpAddCommandChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.command = value;
+                    draft.command_error = None;
+                }
+            }
+            Message::McpAddArgsChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.args = value;
+                }
+            }
+            Message::McpAddEnvKeyChanged(index, value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(old) = keys.get(index) {
+                        if let Some(env_value) = draft.env.remove(old) {
+                            draft.env.insert(value, env_value);
+                        }
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddEnvValueChanged(index, value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(key) = keys.get(index) {
+                        draft.env.insert(key.clone(), value);
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddEnvAdd => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    // Pick the first unused VAR{n} name so empty/duplicate
+                    // keys cannot be introduced by the Add button.
+                    let mut n = 1;
+                    while draft.env.contains_key(&format!("VAR{n}")) {
+                        n += 1;
+                    }
+                    draft.env.insert(format!("VAR{n}"), String::new());
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddEnvRemove(index) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(key) = keys.get(index) {
+                        draft.env.remove(key);
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddTimeoutChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.timeout = value;
+                    draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
+                }
+            }
+            Message::McpAddSaved => {
+                let Some(mut draft) = self.mcp_add_draft.take() else {
+                    return iced::Task::none();
+                };
+                // Inline validation mirrors `McpConfig::validate` plus the
+                // edit draft's command/env/timeout rules. Keep the form open
+                // with the errors visible; only a valid draft is applied.
+                draft.id_error = Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim());
+                draft.command_error = if draft.command.trim().is_empty() {
+                    Some("Command is required".into())
+                } else {
+                    None
+                };
+                draft.env_error = if draft.env.keys().any(|key| key.trim().is_empty()) {
+                    Some("Environment keys must not be empty".into())
+                } else {
+                    None
+                };
+                draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
+                if draft.id_error.is_some()
+                    || draft.command_error.is_some()
+                    || draft.env_error.is_some()
+                    || draft.timeout_error.is_some()
+                {
+                    self.mcp_add_draft = Some(draft);
+                    return iced::Task::none();
+                }
+                let id = draft.id.trim().to_string();
+                self.mcp_servers.push(McpServerConfig {
+                    id: id.clone(),
+                    command: draft.command.trim().to_string(),
+                    args: draft.args.split_whitespace().map(String::from).collect(),
+                    env: Some(draft.env).filter(|vars| !vars.is_empty()),
+                    enabled: true,
+                    timeout_secs: draft.timeout.trim().parse::<u64>().ok(),
+                });
+                // Select the new server so its read-only detail renders
+                // instead of the empty "No server selected" pane.
+                self.ext_selected_mcp = Some(id);
+                self.mcp_add_draft = None;
+                self.settings_dirty = true;
+            }
+
             // Unified Extensions manager (ADR-37/43/70). Tab switching and
             // master-list selection are transient view state: they never arm
             // the dirty flag and are never persisted.
@@ -2366,6 +2571,16 @@ impl State {
         }
         iced::Task::none()
     }
+}
+
+/// Collapse duplicates while preserving first-occurrence order.
+///
+/// Discovery diagnostics can repeat — e.g. two configured search paths that
+/// resolve to the same tree, or one pack discovered through an overlapping
+/// path scan. The settings list renders each line once.
+fn dedupe_lines(lines: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    lines.into_iter().filter(|line| seen.insert(line.clone())).collect()
 }
 
 #[cfg(test)]
@@ -2507,7 +2722,16 @@ mod tests {
         let report = concerto_skills::DiscoveryReport {
             resolved_paths: vec![PathBuf::from("/nonexistent/skills")],
             descriptors: vec![skill("rust-testing")],
-            warnings: vec!["`/nonexistent/skills` is missing or not a directory; skipping".into()],
+            warnings: vec![
+                "`/nonexistent/skills` is missing or not a directory; skipping".into(),
+                // Duplicate diagnostics (e.g. two search paths resolving to the
+                // same tree) must be collapsed by the state layer.
+                "`/nonexistent/skills` is missing or not a directory; skipping".into(),
+            ],
+            notes: vec![
+                "Skill 'rust-testing' loaded via directory name".into(),
+                "Skill 'rust-testing' loaded via directory name".into(),
+            ],
         };
 
         let _ = state.update(Message::SkillsDiscoveryResult(Ok(report)));
@@ -2518,15 +2742,22 @@ mod tests {
         assert_eq!(state.skills_discovered, vec![skill("rust-testing")]);
         assert_eq!(
             state.skills_warnings,
-            vec!["`/nonexistent/skills` is missing or not a directory; skipping".to_string()]
+            vec!["`/nonexistent/skills` is missing or not a directory; skipping".to_string()],
+            "duplicate warnings must be collapsed"
+        );
+        assert_eq!(
+            state.skills_notes,
+            vec!["Skill 'rust-testing' loaded via directory name".to_string()],
+            "discovery notes must be surfaced and duplicates collapsed"
         );
 
-        // An error records the message without touching discovered skills or
-        // the previous run's warnings.
+        // An error records the message without touching discovered skills;
+        // warnings and notes from the previous run are cleared.
         let _ = state.update(Message::SkillsDiscoveryResult(Err("boom".into())));
         assert!(state.skills_loaded);
         assert_eq!(state.skills_error.as_deref(), Some("boom"));
         assert!(state.skills_warnings.is_empty());
+        assert!(state.skills_notes.is_empty(), "notes must not leak across a failed run");
         assert!(
             !state.settings_dirty,
             "discovery results are transient and must not arm the dirty flag"
@@ -2567,7 +2798,7 @@ mod tests {
             State::skill_id_error("  rust-testing  ").is_none(),
             "leading/trailing whitespace is tolerated (trimmed before validation)"
         );
-        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "a:b"] {
             assert!(State::skill_id_error(bad).is_some(), "{bad:?} must be rejected");
         }
     }
@@ -2687,6 +2918,7 @@ mod tests {
             resolved_paths: vec![PathBuf::from("/nonexistent/skills")],
             descriptors: vec![skill("kept")],
             warnings: Vec::new(),
+            notes: Vec::new(),
         };
         let _ = state.update(Message::SkillsDiscoveryResult(Ok(report)));
 
@@ -2982,6 +3214,139 @@ mod tests {
         assert!(state.mcp_edit_draft.is_none());
         assert!(!state.mcp_probing.contains("files"));
         assert!(!state.mcp_probe_results.contains_key("files"));
+    }
+
+    // ── ADR-43 — MCP server add ───────────────────────────────────────────
+    //
+    // The add draft is transient view state: entering/cancelling the add form
+    // never arms the dirty flag, and the new server only lands in
+    // `mcp_servers` on a successful `McpAddSaved` — which persists through the
+    // regular Save Settings flow (next-run semantics).
+
+    #[test]
+    fn mcp_add_pressed_seeds_blank_draft_and_cancel_discards() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        // Enter the add form; it must displace any in-progress edit state.
+        let _ = state.update(Message::McpEditPressed("files".into()));
+        assert!(state.mcp_editing_id.is_some(), "precondition: edit mode is open");
+        let _ = state.update(Message::McpAddPressed);
+
+        let draft = state.mcp_add_draft.as_ref().expect("Add pressed must open the form");
+        assert!(state.mcp_editing_id.is_none(), "opening the add form must leave edit mode");
+        assert!(state.mcp_edit_draft.is_none());
+        assert!(draft.id.is_empty());
+        assert!(draft.command.is_empty());
+        assert!(draft.env.is_empty());
+        assert!(draft.timeout.is_empty());
+        assert!(draft.id_error.is_none());
+        assert!(!state.settings_dirty, "opening the add form must not arm the dirty flag");
+
+        let _ = state.update(Message::McpAddCancelled);
+        assert!(state.mcp_add_draft.is_none(), "cancelling must discard the draft");
+        assert!(!state.settings_dirty, "cancelling must not arm the dirty flag");
+    }
+
+    #[test]
+    fn mcp_add_saved_appends_valid_server_and_round_trips() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpAddPressed);
+        let _ = state.update(Message::McpAddIdChanged("github".into()));
+        let _ = state.update(Message::McpAddCommandChanged("npx".into()));
+        let _ = state.update(Message::McpAddArgsChanged("-y @example/github-server".into()));
+        let _ = state.update(Message::McpAddEnvAdd);
+        let _ = state.update(Message::McpAddEnvKeyChanged(0, "TOKEN".into()));
+        let _ = state.update(Message::McpAddEnvValueChanged(0, "s3cret".into()));
+        let _ = state.update(Message::McpAddTimeoutChanged("45".into()));
+
+        let _ = state.update(Message::McpAddSaved);
+
+        assert!(state.mcp_add_draft.is_none(), "a successful add must leave the form");
+        assert!(state.settings_dirty, "a committed add must arm the dirty flag");
+        assert_eq!(state.mcp_servers.len(), 2);
+        let added = &state.mcp_servers[1];
+        assert_eq!(added.id, "github");
+        assert_eq!(added.command, "npx");
+        assert_eq!(added.args, vec!["-y", "@example/github-server"]);
+        assert_eq!(added.env.as_ref().and_then(|e| e.get("TOKEN")), Some(&"s3cret".to_string()));
+        assert_eq!(added.timeout_secs, Some(45));
+        assert!(added.enabled, "new servers are enabled by default");
+        assert_eq!(
+            state.ext_selected_mcp.as_deref(),
+            Some("github"),
+            "a committed add must select the new server"
+        );
+
+        // The added server survives to_config, so Save Settings persists it.
+        let saved = state.to_config(&base);
+        let mcp = saved.mcp.expect("the mcp section must be published");
+        assert_eq!(mcp.servers.len(), 2);
+        assert_eq!(mcp.servers[1].id, "github");
+        assert_eq!(mcp.servers[1].command, "npx");
+    }
+
+    #[test]
+    fn mcp_add_invalid_draft_stays_open_with_inline_errors() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpAddPressed);
+        // Blank id + blank command + duplicate id + over-cap timeout are all
+        // rejected on save and keep the form open with inline errors.
+        let _ = state.update(Message::McpAddIdChanged("files".into()));
+        let _ = state.update(Message::McpAddTimeoutChanged("400".into()));
+
+        let _ = state.update(Message::McpAddSaved);
+
+        let draft = state.mcp_add_draft.as_ref().expect("an invalid draft must keep the form open");
+        assert_eq!(draft.id_error.as_deref(), Some("An MCP server with this id already exists"));
+        assert_eq!(draft.command_error.as_deref(), Some("Command is required"));
+        assert_eq!(draft.timeout_error.as_deref(), Some("Hard cap is 300 seconds"));
+        assert_eq!(state.mcp_servers.len(), 1, "no server may be appended while invalid");
+        assert!(!state.settings_dirty, "a rejected draft must not arm the dirty flag");
+
+        // A colon in the id is rejected too.
+        let _ = state.update(Message::McpAddIdChanged("a:b".into()));
+        let _ = state.update(Message::McpAddSaved);
+        let draft = state.mcp_add_draft.as_ref().expect("draft still open");
+        assert_eq!(draft.id_error.as_deref(), Some("Id must not contain ':'"));
+
+        // Fixing everything lets the add land.
+        let _ = state.update(Message::McpAddIdChanged("github".into()));
+        let _ = state.update(Message::McpAddCommandChanged("npx".into()));
+        let _ = state.update(Message::McpAddTimeoutChanged("300".into()));
+        let _ = state.update(Message::McpAddSaved);
+        assert!(state.mcp_add_draft.is_none());
+        assert_eq!(state.mcp_servers.len(), 2);
+        assert_eq!(state.mcp_servers[1].timeout_secs, Some(300));
+        assert!(state.settings_dirty);
+    }
+
+    #[test]
+    fn mcp_add_blank_timeout_and_empty_env_save_as_defaults() {
+        let mut state = State::from_config(&AppConfig::default());
+        let _ = state.update(Message::McpAddPressed);
+        let _ = state.update(Message::McpAddIdChanged("local".into()));
+        let _ = state.update(Message::McpAddCommandChanged("uvx".into()));
+        // Blank timeout (valid: uses the crate's 60s default) and no env rows.
+
+        let _ = state.update(Message::McpAddSaved);
+
+        assert!(state.mcp_add_draft.is_none());
+        assert_eq!(state.mcp_servers.len(), 1);
+        let added = &state.mcp_servers[0];
+        assert_eq!(added.id, "local");
+        assert_eq!(added.timeout_secs, None, "blank timeout saves as the crate default");
+        assert_eq!(added.env, None, "an empty env map saves as None");
     }
 
     // ── ADR-57 — cache-only refresh ──────────────────────────────────────────

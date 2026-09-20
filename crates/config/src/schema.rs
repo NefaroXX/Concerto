@@ -949,12 +949,18 @@ fn default_skills_search_paths() -> Vec<String> {
 ///    on macOS).
 /// 2. **Project-local** — `./.concerto/skills`.
 /// 3. **Legacy literal** — `~/.local/share/concerto/skills`, kept only when it
-///    resolves to a *different* directory than the primary. Historically the
-///    default was written as this literal path; keeping it as a fallback lets
-///    pre-existing packs under the XDG data dir keep loading even when the
-///    platform root moved (e.g. Windows). On a default Linux install the
-///    legacy literal expands to the same tree as the primary, so it is dropped
-///    to avoid scanning the same directory twice.
+///    resolves to a *different* directory than the primary *and that directory
+///    currently exists*. Historically the default was written as this literal
+///    path; keeping it as a fallback lets pre-existing packs under the XDG
+///    data dir keep loading even when the platform root moved (e.g. Windows)
+///    or the data dir is customized. The existence gate prunes the entry for
+///    users who never had packs there — on a typical Windows install the
+///    `~/.local/share/concerto/skills` tree does not exist, so no scan is
+///    wasted on it and no spurious "missing search path" warning is emitted.
+///    On a default Linux install the legacy literal expands to the same tree
+///    as the primary, so it is dropped regardless. The `is_dir` probe runs at
+///    config-default time using `home_dir`; when no home directory is known
+///    (and so the literal could not be resolved anyway), the entry is omitted.
 #[doc(hidden)]
 pub(crate) fn skills_search_paths_for(
     data_dir: Option<&Path>,
@@ -966,7 +972,9 @@ pub(crate) fn skills_search_paths_for(
         paths.insert(0, primary.to_string_lossy().into_owned());
         let legacy_resolved =
             home_dir.map(|home| home.join(".local/share").join("concerto").join("skills"));
-        if legacy_resolved.as_deref() != Some(primary.as_path()) {
+        let legacy_is_redundant = legacy_resolved.as_deref() == Some(primary.as_path());
+        let legacy_exists = legacy_resolved.as_deref().is_some_and(|legacy| legacy.is_dir());
+        if !legacy_is_redundant && legacy_exists {
             paths.push("~/.local/share/concerto/skills".to_string());
         }
     }
@@ -3174,9 +3182,11 @@ mod tests {
         );
 
         // Windows: `%APPDATA%` is outside the legacy `~/.local/share` tree, so
-        // the legacy fallback is retained for pre-existing packs. Backslashes
-        // are treated as ordinary characters by `Path::join` on non-Windows
-        // test runners, so the primary is derived from the passed data dir.
+        // the legacy fallback *would* be eligible — but on this host that
+        // directory does not exist, so the existence gate prunes it (no wasted
+        // scan, no spurious "missing search path" warning). Backslashes are
+        // treated as ordinary characters by `Path::join` on non-Windows test
+        // runners, so the primary is derived from the passed data dir.
         let windows_data = std::path::Path::new("C:\\Users\\alice\\AppData\\Roaming");
         let windows = skills_search_paths_for(
             Some(windows_data),
@@ -3187,14 +3197,41 @@ mod tests {
             vec![
                 windows_data.join("concerto").join("skills").to_string_lossy().into_owned(),
                 "./.concerto/skills".to_string(),
-                "~/.local/share/concerto/skills".to_string(),
             ]
         );
 
-        // A custom XDG_DATA_HOME also keeps the legacy fallback (different tree).
+        // A custom XDG_DATA_HOME would also normally keep the legacy fallback
+        // (different tree), but the directory does not exist here either, so
+        // the existence gate drops it.
         let custom_data = std::path::Path::new("/srv/data");
         let custom =
             skills_search_paths_for(Some(custom_data), Some(std::path::Path::new("/home/alice")));
+        assert_eq!(
+            custom,
+            vec![
+                custom_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+            ]
+        );
+
+        // No resolvable data dir degrades to the project-local location only.
+        assert_eq!(
+            skills_search_paths_for(None, Some(std::path::Path::new("/home/alice"))),
+            vec!["./.concerto/skills".to_string()]
+        );
+    }
+
+    #[test]
+    fn skills_search_paths_keep_legacy_only_when_directory_exists() {
+        let temp = tempfile::tempdir().expect("tempdir must succeed");
+        let home = temp.path();
+        let legacy = home.join(".local/share/concerto/skills");
+        std::fs::create_dir_all(&legacy).expect("create legacy pack dir");
+
+        // Custom-but-existing XDG data dir: legacy differs from the primary
+        // *and* the directory exists, so the literal is retained.
+        let custom_data = std::path::Path::new("/srv/data");
+        let custom = skills_search_paths_for(Some(custom_data), Some(home));
         assert_eq!(
             custom,
             vec![
@@ -3204,10 +3241,17 @@ mod tests {
             ]
         );
 
-        // No resolvable data dir degrades to the project-local location only.
+        // Default Unix XDG layout (data dir == home/.local/share): the legacy
+        // literal is the *same* directory as the primary, so it is dropped even
+        // when the directory exists, keeping a single scan of the tree.
+        let unix_data = home.join(".local/share");
+        let unix = skills_search_paths_for(Some(&unix_data), Some(home));
         assert_eq!(
-            skills_search_paths_for(None, Some(std::path::Path::new("/home/alice"))),
-            vec!["./.concerto/skills".to_string()]
+            unix,
+            vec![
+                unix_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+            ]
         );
     }
 

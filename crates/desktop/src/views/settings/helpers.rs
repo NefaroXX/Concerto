@@ -1272,6 +1272,33 @@ mod tests {
     }
 
     #[test]
+    fn discover_skills_loads_empty_id_pack_via_directory_name() {
+        // Windows regression: a pack whose manifest has no usable id (e.g. a
+        // `deepwork` dir with `id = ""` or missing `id`) used to surface a
+        // verbose `invalid skill id ''` warning and get skipped. It now loads
+        // under its directory name and reports an informational note instead.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pack = temp.path().join("deepwork");
+        std::fs::create_dir_all(&pack).expect("create pack dir");
+        std::fs::write(pack.join("skill.toml"), "id = \"\"\n").expect("write manifest");
+
+        let result = super::discover_skills(vec![temp.path().to_string_lossy().into_owned()]);
+        let report = result.expect("discovery should succeed");
+        assert_eq!(report.descriptors.len(), 1);
+        assert_eq!(report.descriptors[0].id, "deepwork", "id must fall back to the dir name");
+        assert!(
+            report.warnings.is_empty(),
+            "an empty-id pack must not warn: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            report.notes,
+            vec!["Skill 'deepwork' loaded via directory name".to_string()],
+            "the fallback must be surfaced as an informational note"
+        );
+    }
+
+    #[test]
     fn skill_pack_crud_round_trip_via_helpers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let parent = temp.path().to_string_lossy().into_owned();
