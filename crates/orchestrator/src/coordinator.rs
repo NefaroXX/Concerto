@@ -5071,7 +5071,10 @@ impl CoordinatorAgent {
         // reason rides the final message; the status is `AwaitingUser`.
         // Injecting the operator's answer is the deferred web-UI channel
         // (#23).
-        if let Some(reason) = requested_user_input {
+        // The short-circuit below matches by reference so `requested_user_input`
+        // stays alive for the tail's vacuous-completion guard (which must read
+        // its None-ness); the run exits the same way either way.
+        if let Some(reason) = requested_user_input.as_ref() {
             let _ = self.bus.publish_for_session(
                 task.session_id,
                 task.id.0,
@@ -5086,7 +5089,7 @@ impl CoordinatorAgent {
                 AgentOutput {
                     task_id: task.id,
                     session_id: task.session_id,
-                    final_message: reason,
+                    final_message: reason.clone(),
                     files_modified: crate::tool_facts::sanitize_files_modified(
                         &context.session.project_dir,
                         &all_files,
@@ -6799,6 +6802,40 @@ impl CoordinatorAgent {
             task.id.0,
             EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
         );
+
+        // ── Vacuous-completion guard (2026-09-20) ────────────────────────
+        // An ACTION-REQUIRED run that reaches the success tail with an EMPTY
+        // graph and ZERO produced files would otherwise exit `Completed` on
+        // a vacuous truth: the dispatch loop above breaks immediately on an
+        // empty graph (empty ready queue + `all_completed()` vacuously true),
+        // and every success-tail acceptance check is itself vacuous (the
+        // zero-work guard needs a dispatched ledger, C-06 needs a
+        // build-stage subtask, the expected-artifact and stall gates need a
+        // non-empty declared set). This is the push site for the "empty
+        // dispatch session on an action-required run" note the `loop_notes`
+        // / `DispatchLedger` docs describe but no decision-loop site ever
+        // pushed. The note downgrades the exit to Partial and the stall gate
+        // below KEEPS the run's checkpoint (persisted with `completed=false`)
+        // so a later bare "continue" can resume the run.
+        // Exempt by construction: AnswerOnly root tasks (prose completion is
+        // correct — the mode gate below only arms ActionRequired runs),
+        // PlanningOnly depth (returned before `execute_graph`), runs waiting
+        // on user input (short-circuited to AwaitingUser above), fully
+        // resolver-reused runs (their graphs hold planned, timeline-resolved
+        // tasks — never empty here), and any run that actually wrote files.
+        let vacuous_execute_dispatch = graph.is_empty()
+            && matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && requested_user_input.is_none()
+            && self.orchestration_depth == OrchestrationDepth::Full
+            && all_files.is_empty();
+        if vacuous_execute_dispatch {
+            recoverable_notes.push(
+                "Vacuous-completion guard: this action-required run dispatched zero tasks and \
+                 produced zero files — an empty dispatch session cannot claim completion; the \
+                 run is reported Partial and its checkpoint is preserved for resume."
+                    .to_owned(),
+            );
+        }
 
         // ── ADR-60 D7 (interrupt-safe resume, 2026-09-05): zero-work guard ─
         // An action-required (build-classified) run that reaches the success
@@ -22218,6 +22255,126 @@ mod tests {
             !flagged,
             "the research-stage call is NOT flagged per-call (the per-call guard is \
              implement-scoped); the run-level guard is the net here"
+        );
+    }
+
+    /// Vacuous-completion guard (2026-09-20): an ACTION-REQUIRED run whose
+    /// planning session answers prose-only — zero `call_specialist`
+    /// dispatches, an EMPTY graph, zero files written — must exit `Partial`
+    /// with its checkpoint preserved for resume, never a vacuous `Completed`
+    /// (empty graph vacuously satisfies `all_completed`; every success-tail
+    /// acceptance gate is itself vacuous on zero tasks/artifacts).
+    #[tokio::test]
+    async fn prose_only_action_required_run_is_partial_and_resumable() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            // The planning provider answers with prose only: nothing to do,
+            // so the Coordinator stops in prose without ever dispatching a
+            // subtask (the 22429 harness shape).
+            vec![CoordinatorTurn::Text("no dispatch needed".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                // The ROOT task is action-required: this arms the vacuous-
+                // completion guard (zero dispatches, zero artifacts).
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a prose-only planning session dispatches nothing: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an empty-dispatch-session action-required run must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "the vacuous run keeps its checkpoint for resume"
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "the guard names the omission: {}",
+            output.final_message
+        );
+        assert!(
+            output.files_modified.is_empty(),
+            "a zero-dispatch, zero-artifact run modifies nothing, got: {:?}",
+            output.files_modified
+        );
+    }
+
+    /// Vacuous-completion guard twin: the SAME prose-only empty-dispatch
+    /// session on an AnswerOnly root task keeps the pre-existing `Completed`
+    /// outcome — prose completion is correct for answer-only runs.
+    #[tokio::test]
+    async fn prose_only_answer_only_run_still_completes() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("no dispatch needed".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new(session_id, "answer a question"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a prose-only planning session dispatches nothing: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "an answer-only prose turn stays Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
         );
     }
 
