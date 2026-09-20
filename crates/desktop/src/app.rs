@@ -61,15 +61,12 @@ static TEXT_FOCUSED: AtomicBool = AtomicBool::new(false);
 /// this costs nothing at idle.
 const STREAMING_CURSOR_PERIOD_MS: u64 = 500;
 
+/// Max reading width (logical px) for the centered chat column (`Page::Chat`).
+const CHAT_MAX_WIDTH: f32 = 900.0;
+
 /// How long a toast stays visible before it auto-dismisses. The expiry
 /// subscription ticks once per second while any toast is showing.
 pub const TOAST_LIFETIME_SECS: u64 = 5;
-
-/// Max reading width (logical px) for the chat column on [`Page::Chat`].
-/// The column is `Fill`-width constrained by this cap and centered, so it
-/// shrinks on narrow windows instead of overflowing behind the fixed side
-/// rails (sidebar 224 + quick panel 280).
-const CHAT_MAX_WIDTH: f32 = 900.0;
 
 // ---------------------------------------------------------------------------
 // Page enum — all navigable views
@@ -4550,9 +4547,9 @@ impl App {
             Subscription::none()
         };
         // One shared 16 ms tick drives every chat animation — the assistant
-        // typewriter reveal, thinking-preview reveals, entrance fades and the
-        // open-thinking shimmer — active only while at least one is in
-        // flight, so it costs nothing at idle.
+        // typewriter reveal, entrance fades and the open-thinking shimmer —
+        // active only while at least one is in flight, so it costs nothing
+        // at idle.
         let typing_sub = if self.chat.is_revealing() {
             iced::time::every(std::time::Duration::from_millis(circuit_background::TICK_MS))
                 .map(|_| Message::Chat(views::chat::Message::TypingTick))

@@ -44,6 +44,26 @@ pub struct RetryDecision {
     pub reason: String,
 }
 
+/// Upper bound (in chars, not bytes) on the verbatim transport-error text
+/// embedded in a [`RetryClass::Network`] reason. A single pathological
+/// DNS/TLS/reset chain (assembled by `describe_error_chain`) must not blow up
+/// logs, events, the transcript, or audit storage.
+///
+/// Why this is safe to embed at all: transport error text comes from
+/// reqwest's wire-phase diagnostics (DNS, TLS, connect, reset, body read) and
+/// by construction never includes request headers or bodies, so no API key or
+/// other credential material can appear. Endpoint hosts/IPs in URLs are not
+/// secrets. Truncation only bounds size, not sensitivity.
+const MAX_NETWORK_REASON_CHARS: usize = 200;
+
+/// Truncate `text` to at most `max_chars` characters. An exact char bound
+/// (via `chars().take`) keeps multi-byte UTF-8 intact; text shorter than the
+/// bound passes through unchanged (no ellipsis marker — callers prefix the
+/// text with their own context).
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 /// Decide whether a provider error warrants a retry and (if so) what delay the
 /// provider itself asked for.
 ///
@@ -88,11 +108,19 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             }
         }
 
-        ProviderError::Network(_) => RetryDecision {
+        ProviderError::Network(message) => RetryDecision {
             retryable: true,
             class: Some(RetryClass::Network),
             provider_delay: None,
-            reason: "temporary network failure".into(),
+            // Embed the verbatim transport text (DNS/TLS/reset/connect,
+            // assembled via `describe_error_chain`) so retry telemetry, the
+            // transcript, and audit show the actual cause — the bare static
+            // prefix previously made repeated failures undiagnosable. The
+            // inner text is bounded to `MAX_NETWORK_REASON_CHARS` chars.
+            reason: format!(
+                "temporary network failure: {}",
+                truncate_chars(message, MAX_NETWORK_REASON_CHARS)
+            ),
         },
 
         // ADR-55 Phase 2e stream-retry: the collector wraps a dropped
@@ -726,6 +754,38 @@ mod tests {
         let d = classify_provider_error(&ProviderError::Network("conn reset".into()));
         assert!(d.retryable);
         assert_eq!(d.class, Some(RetryClass::Network));
+        assert_eq!(d.provider_delay, None);
+        // The reason must carry the transport detail (not just the static
+        // prefix) so retry telemetry and audit show the actual cause.
+        assert!(d.reason.starts_with("temporary network failure: "));
+        assert!(d.reason.contains("conn reset"));
+    }
+
+    /// The Network reason embeds the inner transport text verbatim for short
+    /// messages and hard-caps it at `MAX_NETWORK_REASON_CHARS` *chars* (not
+    /// bytes) for pathological ones, without splitting UTF-8 sequences.
+    #[test]
+    fn classify_network_reason_embeds_inner_and_is_char_bounded() {
+        // Short text flows through verbatim…
+        let short = "dns lookup failed";
+        let d = classify_provider_error(&ProviderError::Network(short.into()));
+        assert_eq!(d.reason, format!("temporary network failure: {short}"));
+
+        // …while a chatty multi-byte chain is capped at the char bound.
+        let long = "é".repeat(1_000);
+        let d = classify_provider_error(&ProviderError::Network(long.clone()));
+        let prefix = "temporary network failure: ";
+        assert!(d.reason.starts_with(prefix));
+        let inner = &d.reason[prefix.len()..];
+        assert_eq!(
+            inner.chars().count(),
+            MAX_NETWORK_REASON_CHARS,
+            "inner text must be capped at MAX_NETWORK_REASON_CHARS chars"
+        );
+        assert!(
+            inner.chars().all(|c| c == 'é'),
+            "truncation must not split a multi-byte UTF-8 sequence"
+        );
     }
 
     /// ADR-55 Phase 2e stream-retry: a transport fault while a completion
