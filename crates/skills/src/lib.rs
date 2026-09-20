@@ -17,13 +17,20 @@
 //!
 //! # Discovery
 //!
-//! [`SkillManager::discover`] expands a leading `~` in each search path to the
-//! user's home directory (`dirs::home_dir`), then walks the tree to a bounded
-//! depth (4 levels below the search path root) looking for directories that
-//! contain a manifest. Directories without a manifest are silently not skills;
-//! missing search paths are warned about and skipped; malformed manifests fail
-//! loudly with the offending path. Results are sorted by id, and duplicate ids
-//! keep the first occurrence (deterministically: lowest `(id, path)` wins).
+//! [`SkillManager::discover`] expands a leading `~` (and Windows-style `%VAR%`
+//! references such as `%USERPROFILE%`/`%APPDATA%`) in each search path, then
+//! walks the tree to a bounded depth (4 levels below the search path root)
+//! looking for directories that contain a manifest. Directories without a
+//! manifest are silently not skills; missing search paths are warned about and
+//! skipped; a malformed pack is warned about and skipped, so one broken pack
+//! never aborts discovery of the rest. Results are sorted by id, and duplicate
+//! ids keep the first occurrence (deterministically: lowest `(id, path)` wins).
+//!
+//! [`SkillManager::discover_with_report`] performs the same discovery but
+//! returns the diagnostics as a [`DiscoveryReport`] (resolved search paths,
+//! descriptors, and per-path/per-pack warnings) so UI callers can surface why
+//! a "no skills found" result happened; [`expanded_search_path`] expands a
+//! single configured path for display without scanning.
 //!
 //! # Manifest formats
 //!
@@ -94,11 +101,24 @@
 //! instruction text; a front-matter `instructions` key is used only when the
 //! body is empty.
 //!
+//! # Management (CRUD)
+//!
+//! [`SkillManager::create_pack`] writes a new `skill.toml` pack at
+//! `parent/<id>` (id validated, parent created when missing, atomic write),
+//! [`SkillManager::update_pack`] rewrites an existing pack's `skill.toml` in
+//! place (id is not editable — it follows the directory name), and
+//! [`SkillManager::delete_pack`] renames the manifest file(s) to hidden
+//! `.deleted-<stamp>-*` backups so the pack leaves discovery but stays
+//! recoverable. SKILL.md-only packs can be deleted but not updated by this
+//! API ([`SkillsError::UnsupportedFormat`]).
+//!
 //! # Errors
 //!
 //! All fallible operations return [`SkillsError`] (thiserror): `Io`,
-//! `ManifestParse`, `InvalidId`, and `FrontMatter`. The library (non-test) code
-//! contains no `unwrap()`/`expect()`.
+//! `ManifestParse`, `InvalidId`, `FrontMatter`, `AlreadyExists`, `NotAPack`,
+//! and `UnsupportedFormat`. `InvalidId` carries the offending id and the
+//! skill pack directory. The library (non-test) code contains no
+//! `unwrap()`/`expect()`.
 
 mod error;
 mod frontmatter;
@@ -107,4 +127,4 @@ mod manifest;
 
 pub use concerto_api_types::extension::{SkillDescriptor, SkillManifest};
 pub use error::SkillsError;
-pub use manager::SkillManager;
+pub use manager::{expanded_search_path, DiscoveryReport, SkillManager};

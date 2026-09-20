@@ -52,6 +52,7 @@ pub use relationship::{
 };
 pub mod planner;
 pub mod progress;
+pub mod project_context;
 pub mod prompts;
 mod read_cache;
 pub mod registry;

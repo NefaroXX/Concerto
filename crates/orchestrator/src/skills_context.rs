@@ -8,12 +8,14 @@
 //! cloned out per call, so no filesystem or parsing work happens in the
 //! prompt hot path.
 //!
-//! The context is **fail-soft** by design: discovery errors are logged at
-//! error level and the previous state is kept, so an unreadable skill pack
-//! can never crash the agent loop. (The `concerto-skills` crate itself fails
-//! loudly per malformed pack; this layer deliberately downgrades that to a
-//! log so the loop keeps running.) `refresh` still returns the error so the
-//! caller can decide whether to surface it.
+//! The context is **fail-soft** by design: discovery is warn-and-continue —
+//! a broken skill pack is logged and skipped, never aborting the scan — so
+//! an unreadable pack can never crash the agent loop. (This mirrors the
+//! `concerto-skills` manager contract, where discovery itself warns and skips
+//! malformed packs; this layer therefore normally sees discovery succeed.)
+//! `refresh` still surfaces a *genuinely fatal* scan error (returning `Err`
+//! and keeping the previous section) so the caller can decide how to surface
+//! it, but a single broken pack is not one of those.
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -372,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_failure_keeps_previous_state() {
+    fn refresh_warns_and_skips_broken_pack_keeping_previous_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_toml_pack(temp.path(), "alpha", "Do alpha.");
         let context = SkillsContext::new(manager(temp.path()), None, true, 4000);
@@ -380,13 +382,16 @@ mod tests {
         let before = context.section();
         assert!(before.contains("Do alpha."));
 
-        // Introduce a malformed pack so the next discovery fails loudly.
+        // Introduce a malformed pack. Discovery is warn-and-continue: the
+        // broken pack is logged at warning level and skipped (ADR-43 — the
+        // skills manager contract), never aborting the rest of the scan, so
+        // refresh succeeds and the previous section is kept.
         let bad_dir = temp.path().join("zz-broken");
         fs::create_dir_all(&bad_dir).expect("create bad pack dir");
         fs::write(bad_dir.join("skill.toml"), "id = [unclosed\n").expect("write bad manifest");
 
-        assert!(context.refresh().is_err(), "refresh must surface the discovery error");
-        assert_eq!(context.section(), before, "failed refresh must keep the previous section");
+        assert!(context.refresh().is_ok(), "refresh must warn-and-continue past a broken pack");
+        assert_eq!(context.section(), before, "skipped pack must not change the section");
         assert_eq!(context.descriptors().len(), 1);
     }
 

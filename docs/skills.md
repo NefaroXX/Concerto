@@ -11,10 +11,28 @@ Discovery, parsing, and loading live in `concerto-skills`
 (`crates/skills/`). Injection and budgeting live in the orchestrator
 (`crates/orchestrator/src/skills_context.rs`, `SkillsContext`).
 
+## Where skills live
+
+Packs are discovered under the `[skills] search_paths` (see Configuration).
+When the section is omitted, the default per-user root
+`<data-dir>/concerto/skills` is resolved from `dirs::data_dir()` — the same
+lookup used for the application's other data:
+
+- **Linux**: `~/.local/share/concerto/skills`
+- **Windows**: `%APPDATA%\concerto\skills` (the roaming profile; also where
+  `dirs::config_dir()` points on Windows)
+- **macOS**: `~/Library/Application Support/concerto/skills`
+
+The legacy literal `~/.local/share/concerto/skills` remains in the default
+search list only when it resolves to a *different* directory than the primary
+platform root — on a default Linux install the two are the same tree, so the
+legacy entry is dropped to avoid scanning it twice. Packs placed under the old
+location keep loading on Windows/macOS/custom `XDG_DATA_HOME` setups.
+
 ## Pack layout
 
 ```
-~/.local/share/concerto/skills/
+<data-dir>/concerto/skills/          # per-user platform root (see above)
 └── rust-testing/              # one directory per skill pack
     ├── skill.toml             # manifest (or SKILL.md — skill.toml wins)
     ├── instructions.md        # optional; referenced by instructions_path
@@ -23,12 +41,19 @@ Discovery, parsing, and loading live in `concerto-skills`
 
 Discovery (`SkillManager::discover`) walks each search path to a bounded depth
 of 4 levels below the search-path root (the root is depth 0; a pack at depth 4
-is found, depth 5 is not). A leading `~` in a search path expands to the user's
-home directory (`dirs::home_dir`). Directories without a manifest are silently
+is found, depth 5 is not). Search paths may contain a leading `~` (expanded to
+the user's home directory) and Windows-style `%VAR%` references such as
+`%USERPROFILE%`/`%APPDATA%`. Directories without a manifest are silently
 not skills; missing search paths are warned about and skipped. A malformed
 manifest fails loudly with the offending path. Results are sorted by id;
 duplicate ids keep the first occurrence deterministically (lowest `(id, path)`
 wins) and are warned about.
+
+`SkillManager::discover_with_report` returns the same pass as a
+`DiscoveryReport` (resolved search paths, descriptors, and per-path/per-pack
+warnings) for callers that need the diagnostics as data; the desktop Settings
+→ Skills tab shows resolved, absolute search paths with existence badges and
+renders those warnings so a sparse result is explainable.
 
 ## Manifest formats
 
@@ -88,7 +113,7 @@ omitted.
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Master switch (ADR-43 decision 5: explicit opt-in) |
-| `search_paths` | `["~/.local/share/concerto/skills", "./.concerto/skills"]` | Directories to walk for packs |
+| `search_paths` | [`<data-dir>/concerto/skills`, `./.concerto/skills`, legacy] | Directories to walk for packs; the data-dir root is resolved per platform (`%APPDATA%` on Windows), `~`/`%VAR%` expand at discovery |
 | `auto_load` | `true` | When `enabled_ids` is unset, load every discovered skill |
 | `enabled_ids` | `None` | Explicit allow-list of skill ids; `None` = allow-all |
 | `max_chars` | `None` → 4000 | Hard character budget for the injected section |
@@ -96,7 +121,7 @@ omitted.
 ```toml
 [skills]
 enabled = true
-search_paths = ["~/.local/share/concerto/skills", "./.concerto/skills"]
+search_paths = ["%APPDATA%\\concerto\\skills", "./.concerto/skills"]   # Windows example
 auto_load = true
 # enabled_ids = ["rust-testing", "commit-style"]   # omitted = allow-all
 # max_chars = 4000

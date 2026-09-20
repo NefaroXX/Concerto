@@ -1,4 +1,4 @@
-use concerto_api_types::extension::{McpToolDescriptor, SkillDescriptor};
+use concerto_api_types::extension::{McpToolDescriptor, SkillManifest};
 use concerto_config::managed::{IntegrityStatus, ManagedRuntimeManager};
 use concerto_config::shell::{ProfileAvailability, ShellProfileConfig};
 use concerto_config::McpServerConfig;
@@ -129,10 +129,84 @@ pub(crate) fn managed_import(path: String) -> String {
 
 /// ADR-43 — Discover skill packs under the configured search paths. Runs
 /// inside `Task::perform` (wrapped in an async block) so the UI thread is
-/// never blocked. Returns the found packs, or a human-readable error.
-pub(crate) fn discover_skills(search_paths: Vec<String>) -> Result<Vec<SkillDescriptor>, String> {
+/// never blocked. Returns a discovery report — the found packs plus per-path
+/// diagnostics (missing/invalid search paths, skipped packs) — or a
+/// human-readable error.
+pub(crate) fn discover_skills(
+    search_paths: Vec<String>,
+) -> Result<concerto_skills::DiscoveryReport, String> {
     let paths = search_paths.iter().map(std::path::PathBuf::from).collect();
-    concerto_skills::SkillManager::new(paths).discover().map_err(|e| e.to_string())
+    concerto_skills::SkillManager::new(paths).discover_with_report().map_err(|e| e.to_string())
+}
+
+/// Expand a raw configured parent path (`~` / `%VAR%`) to its absolute form,
+/// falling back to the literal when expansion fails. Mirrors the display
+/// helper in the settings view and the skills crate's own discovery expansion.
+fn expanded_parent(raw: &str) -> std::path::PathBuf {
+    concerto_skills::expanded_search_path(std::path::Path::new(raw))
+        .unwrap_or_else(|| std::path::PathBuf::from(raw))
+}
+
+/// ADR-43 — Create a new `skill.toml` skill pack from the Settings wizard at
+/// `parent/<id>`. The parent directory is created when missing; an existing
+/// pack with the same id fails with an "already exists" error. Runs inside
+/// `Task::perform` so the UI thread is never blocked. Returns a human-readable
+/// outcome line, or an error message that keeps the wizard open.
+pub(crate) fn create_skill_pack(
+    raw_parent: String,
+    id: String,
+    name: String,
+    version: String,
+    description: String,
+    instructions: String,
+) -> Result<String, String> {
+    let parent = expanded_parent(&raw_parent);
+    let manager = concerto_skills::SkillManager::new(vec![parent.clone()]);
+    let manifest = SkillManifest {
+        id,
+        name,
+        version,
+        description,
+        instructions_path: None,
+        instructions: Some(instructions),
+        tools: Vec::new(),
+        resources: Vec::new(),
+    };
+    match manager.create_pack(&parent, &manifest) {
+        Ok(pack_dir) => Ok(format!("Created '{}' at {}", manifest.id, pack_dir.display())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// ADR-43 — Rewrite a skill pack's `skill.toml` in place from the edit form.
+/// The manifest `id` is forced to the pack directory name by the skills crate
+/// (identity and path stay in sync); inline `instructions` always win over an
+/// `instructions_path`. Returns a human-readable outcome line.
+pub(crate) fn update_skill_pack(
+    pack_dir: String,
+    manifest: SkillManifest,
+) -> Result<String, String> {
+    let dir = std::path::PathBuf::from(pack_dir);
+    concerto_skills::SkillManager::new(Vec::new())
+        .update_pack(&dir, &manifest)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Saved '{}'", dir.display()))
+}
+
+/// ADR-43 — Delete a skill pack from the Settings UI. The manifest file(s)
+/// are renamed to hidden `.deleted-<stamp>-skill.toml` / `-SKILL.md` backups
+/// in place (reversible delete), so the pack disappears from discovery but the
+/// committed files remain recoverable. Returns a human-readable outcome line.
+pub(crate) fn delete_skill_pack(pack_dir: String) -> Result<String, String> {
+    let dir = std::path::PathBuf::from(pack_dir);
+    let backups = concerto_skills::SkillManager::new(Vec::new())
+        .delete_pack(&dir)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Deleted '{}' — {} manifest file(s) moved to hidden backups",
+        dir.display(),
+        backups.len()
+    ))
 }
 
 /// ADR-43 — Probe one MCP server end-to-end: spawn the stdio child, run the
@@ -225,11 +299,298 @@ pub(crate) async fn revoke_plugin_grants(
     Ok(format!("Revoked grants for '{plugin_id}'"))
 }
 
+/// ADR-37 — Open the native file dialog for a `.wasm` plugin. Returns `None`
+/// when the user cancels; the picked path is the source for the install card.
+pub(crate) async fn pick_plugin_file() -> Option<String> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Select a WebAssembly plugin")
+        .add_filter("WebAssembly plugin", &["wasm"])
+        .pick_file()
+        .await
+        .map(|handle| handle.path().display().to_string())
+}
+
+/// ADR-37 — Re-scan the canonical plugins directory and fold each plugin's
+/// persisted capability-grant summary into [`InstalledPluginInfo`].
+///
+/// Plugins that fail to load (e.g. a hand-dropped malformed module) surface as
+/// unreadable entries carrying the error instead of failing the whole scan, so
+/// they stay visible and deletable. The directory is always scanned, never the
+/// configured `.wasm` list, so the tab reflects what will be discovered next
+/// run.
+pub(crate) async fn list_installed_plugins() -> Result<Vec<super::InstalledPluginInfo>, String> {
+    let plugins_dir = concerto_plugins::discovery::plugins_dir();
+    let config = concerto_plugins::discovery::DiscoveryConfig {
+        search_paths: vec![plugins_dir.clone()],
+        bundled_path: None,
+    };
+    let candidates = concerto_plugins::discovery::PluginDiscovery::new(config)
+        .discover()
+        .map_err(|e| e.to_string())?;
+    let cap_mgr = concerto_plugins::capability::CapabilityManager::open(&plugins_dir)
+        .map_err(|e| format!("could not open capability store: {e}"))?;
+
+    let host = concerto_plugins::host::PluginHost::new()
+        .map_err(|e| format!("could not construct plugin host: {e}"))?;
+    let loader = concerto_plugins::loader::PluginLoader::new(std::sync::Arc::new(host));
+
+    let mut installed: Vec<super::InstalledPluginInfo> = Vec::new();
+    for candidate in candidates {
+        let wasm_path = candidate.wasm_path.clone();
+        let stem =
+            wasm_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let (manifest, load_error) = match loader.load(&wasm_path).await {
+            Ok(loaded) => (Some(loaded.manifest), None),
+            Err(error) => {
+                tracing::warn!(
+                    path = %wasm_path.display(),
+                    error = %error,
+                    "plugin list: unreadable module stays visible"
+                );
+                (None, Some(error.to_string()))
+            }
+        };
+        let id = manifest.as_ref().map(|m| m.id.clone()).unwrap_or_else(|| stem.clone());
+        let grants = cap_mgr.load_grants(&id, None);
+        let capability_summary =
+            grants.iter().map(|(d, _, _)| format!("{d:?}")).collect::<Vec<_>>().join(", ");
+        installed.push(super::InstalledPluginInfo {
+            id,
+            name: manifest.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| stem.clone()),
+            version: manifest.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
+            description: manifest
+                .as_ref()
+                .map(|m| m.description.clone())
+                .unwrap_or_else(|| format!("Unreadable plugin at {}", wasm_path.display())),
+            provides: manifest.as_ref().map(|m| provides_label(&m.provides)).unwrap_or_default(),
+            capability_summary,
+            wasm_path,
+            load_error,
+        });
+    }
+    installed.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(installed)
+}
+
+/// ADR-37 — Install (or replace) the plugin at `source`.
+///
+/// Pipeline: strict validation via [`PluginInstaller::validate`] (compiles the
+/// module, extracts and checks the manifest, sidecar and ABI, and enforces the
+/// size/memory caps) → capability approval through the desktop dialog
+/// **before** any file is written → atomic write under the plugin id.
+///
+/// Replace semantics: when `<store_dir>/<id>.wasm` already exists, the stale
+/// hash-pinned grants (ADR-37) are revoked and the previous live instance
+/// unloaded before the new binary is prompted for and written. The retained
+/// manager is then re-discovered with empty (fail-closed) grants so host
+/// functions deny until a run initialises the plugin with its stored grants.
+pub(crate) async fn install_plugin(
+    source: std::path::PathBuf,
+    store_dir: std::path::PathBuf,
+    plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>,
+    approval: Option<crate::services::plugin_approval::PluginApprovalService>,
+) -> Result<String, String> {
+    let host = concerto_plugins::host::PluginHost::new()
+        .map_err(|e| format!("could not construct plugin host: {e}"))?;
+    let installer = concerto_plugins::installer::PluginInstaller::new(std::sync::Arc::new(host));
+    // Strict validation: refuses to install anything that would not load at
+    // run time, oversized modules, or modules whose linear memory could exceed
+    // the host cap.
+    let validated =
+        installer.validate(&source).await.map_err(|e| format!("Plugin rejected: {e}"))?;
+
+    let id = validated.manifest.id.clone();
+    let wasm_dest = store_dir.join(format!("{id}.wasm"));
+    let replacing = wasm_dest.exists();
+    let mut notes = Vec::new();
+
+    if replacing {
+        // The on-disk binary is about to change: hash-pinned grants (ADR-37)
+        // can never match the new bytes, so clear persisted + live grants
+        // before prompting for the replacement.
+        match concerto_plugins::capability::CapabilityManager::open(&store_dir) {
+            Ok(cap_mgr) => {
+                if let Err(error) = cap_mgr.revoke_plugin(&id) {
+                    notes.push(format!("stale grants not fully removed: {error}"));
+                }
+            }
+            Err(error) => notes.push(format!("capability store unavailable: {error}")),
+        }
+        if let Some(handle) = &plugin_manager {
+            let mut guard = handle.lock().await;
+            if let Some(manager) = guard.as_mut().map(|(_, manager)| manager) {
+                manager.revoke_grants_best_effort(&id).await;
+            }
+        }
+    }
+
+    // Capability approval — required capabilities are granted (or denied)
+    // through the same dialog the runtime uses, before anything is written.
+    if !validated.manifest.capabilities_required.is_empty() {
+        let Some(approval) = approval else {
+            return Err(
+                "plugin requests capabilities but the approval bridge is unavailable".to_string()
+            );
+        };
+        let cap_mgr = concerto_plugins::capability::CapabilityManager::open(&store_dir)
+            .map_err(|e| format!("could not open capability store: {e}"))?;
+        let decisions = cap_mgr
+            .request_approval(
+                &validated.manifest,
+                &validated.manifest.capabilities_required,
+                &approval,
+                Some(validated.sha256.clone()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if decisions
+            .iter()
+            .any(|decision| matches!(decision, concerto_plugins::capability::GrantDecision::Denied))
+        {
+            return Err(format!("capability approval declined for '{id}'; plugin not installed"));
+        }
+        let granted = decisions
+            .iter()
+            .filter(|decision| {
+                matches!(decision, concerto_plugins::capability::GrantDecision::GrantedPersistent)
+            })
+            .count();
+        notes.push(format!("{granted} capability grant(s) stored"));
+    }
+
+    let installed =
+        installer.write(&validated, &store_dir).map_err(|e| format!("Install failed: {e}"))?;
+
+    // Live-manager re-discovery: surface the new module so it is usable
+    // without a run. Replace unloads the previous instance first (there is no
+    // per-run registry to unregister from; the next run registers tools).
+    sync_live_manager(&plugin_manager, replacing, &id, &store_dir).await;
+
+    let verb = if installed.replaced { "Replaced" } else { "Installed" };
+    let detail =
+        if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) };
+    Ok(format!("{verb} '{id}' v{}{detail}", installed.manifest.version))
+}
+
+/// ADR-37 — Delete an installed plugin: persisted grants, live grants and
+/// active instance, then the `.wasm` and sidecar files. Idempotent when the
+/// file is already gone (stale selection); grant-store failures are reported
+/// as notes on the success line rather than aborting the file removal.
+pub(crate) async fn delete_plugin(
+    plugin_id: String,
+    wasm_path: Option<std::path::PathBuf>,
+    plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>,
+) -> Result<String, String> {
+    let store_dir = concerto_plugins::capability::CapabilityManager::data_dir();
+    let mut notes = Vec::new();
+
+    // 1. Persisted grants first, so the store and filesystem stay in sync.
+    match concerto_plugins::capability::CapabilityManager::open(&store_dir) {
+        Ok(cap_mgr) => {
+            if let Err(error) = cap_mgr.revoke_plugin(&plugin_id) {
+                notes.push(format!("grants not fully removed: {error}"));
+            }
+        }
+        Err(error) => notes.push(format!("capability store unavailable: {error}")),
+    }
+
+    // 2. Best-effort live revocation + unload so host functions fail closed
+    // for any alias still holding the instance; the next run rediscovers the
+    // (now missing) plugin fresh.
+    if let Some(handle) = &plugin_manager {
+        let mut guard = handle.lock().await;
+        if let Some(manager) = guard.as_mut().map(|(_, manager)| manager) {
+            manager.revoke_grants_best_effort(&plugin_id).await;
+            if let Err(error) = manager.unload_without_registry(&plugin_id).await {
+                tracing::warn!(
+                    plugin_id,
+                    error = %error,
+                    "plugin delete: unload failed (next run rediscovers)"
+                );
+            }
+        }
+    }
+
+    // 3. Files (idempotent); a stale selection simply has nothing to remove.
+    if let Some(path) = wasm_path {
+        concerto_plugins::installer::delete_plugin_file(&path)
+            .map_err(|e| format!("Delete failed: {e}"))?;
+    } else {
+        tracing::debug!(plugin_id, "plugin delete: no known wasm path — file already absent");
+    }
+
+    if notes.is_empty() {
+        Ok(format!("Deleted '{plugin_id}'"))
+    } else {
+        Ok(format!("Deleted '{plugin_id}' (with notes: {})", notes.join("; ")))
+    }
+}
+
+/// Best-effort live-manager reconciliation after an install/replace, so a
+/// freshly written module is discoverable without an agent run. New plugins
+/// are initialised with empty (fail-closed) grants; a full run initialises
+/// them with their run-scoped, store-backed grant set.
+async fn sync_live_manager(
+    plugin_manager: &Option<concerto_plugins::manager::SharedPluginManager>,
+    replacing: bool,
+    plugin_id: &str,
+    store_dir: &std::path::Path,
+) {
+    let Some(handle) = plugin_manager else { return };
+    let mut guard = handle.lock().await;
+    let Some(manager) = guard.as_mut().map(|(_, manager)| manager) else { return };
+    if replacing {
+        // The previous instance holds the old binary; drop it so the refresh
+        // below initialises the replacement rather than skipping an "active"
+        // plugin.
+        if let Err(error) = manager.unload_without_registry(plugin_id).await {
+            tracing::warn!(
+                plugin_id,
+                error = %error,
+                "plugin install: failed to unload previous instance"
+            );
+        }
+    }
+    let config = concerto_plugins::discovery::DiscoveryConfig {
+        search_paths: vec![store_dir.to_owned()],
+        bundled_path: None,
+    };
+    match manager
+        .refresh_new_plugins(config, |_| concerto_plugins::capability::GrantedCapabilities::new())
+        .await
+    {
+        Ok(loaded) => tracing::info!(plugin_id, loaded, "plugin install: live manager refreshed"),
+        Err(error) => tracing::warn!(
+            plugin_id,
+            error = %error,
+            "plugin install: live manager refresh failed (next run loads it)"
+        ),
+    }
+}
+
+/// Human-readable summary of what a plugin provides, for the Settings list
+/// (e.g. `tool:edit_file, provider:anthropic`).
+fn provides_label(provides: &[concerto_api_types::plugin::PluginProvides]) -> String {
+    use concerto_api_types::plugin::PluginProvides;
+    provides
+        .iter()
+        .map(|p| match p {
+            PluginProvides::Tool(tool) => format!("tool:{}", tool.name),
+            PluginProvides::Provider(provider) => format!("provider:{}", provider.name),
+            PluginProvides::MemoryAdapter(adapter) => format!("memory:{}", adapter.name),
+            PluginProvides::Dialect(dialect) => format!("dialect:{}", dialect.name),
+            _ => "unknown".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::message::SectionId;
     use super::super::*;
     use super::super::{readable_provider_label, PolicyActionChoice, PolicyConditionChoice};
+    use concerto_api_types::extension::SkillManifest;
     use concerto_config::{
         AgentRelationshipConfig, AppConfig, ConditionDef, ModelSettings, PolicyRuleDef,
         ProviderConfig,
@@ -517,17 +878,17 @@ mod tests {
     fn jump_to_section_expands_but_never_folds() {
         let mut state = State::from_config(&AppConfig::default());
         // The sidebar jump expands its target...
-        let _ = state.update(Message::JumpToSection(SectionId::Mcp));
+        let _ = state.update(Message::JumpToSection(SectionId::Extensions));
         assert!(
-            !state.collapsed_sections.contains(&SectionId::Mcp),
+            !state.collapsed_sections.contains(&SectionId::Extensions),
             "a sidebar jump must expand its target"
         );
         // ...and is idempotent: jumping again never folds it.
-        let _ = state.update(Message::JumpToSection(SectionId::Mcp));
-        assert!(!state.collapsed_sections.contains(&SectionId::Mcp));
+        let _ = state.update(Message::JumpToSection(SectionId::Extensions));
+        assert!(!state.collapsed_sections.contains(&SectionId::Extensions));
         // The section header keeps the toggle semantics.
-        let _ = state.update(Message::ToggleSection(SectionId::Mcp));
-        assert!(state.collapsed_sections.contains(&SectionId::Mcp));
+        let _ = state.update(Message::ToggleSection(SectionId::Extensions));
+        assert!(state.collapsed_sections.contains(&SectionId::Extensions));
     }
 
     #[test]
@@ -853,16 +1214,21 @@ mod tests {
     // ── ADR-43 — skill discovery helper ────────────────────────────────────
     //
     // `SkillManager::discover` skips (with a warning) search paths that are
-    // missing or not directories — a nonexistent path is *not* an error. The
-    // only discovery failures are malformed manifests, which surface as `Err`.
+    // missing or not directories, and also skips packs that fail to load
+    // (malformed manifest, invalid id, unreadable directory). A broken pack
+    // is *not* fatal — remaining packs still surface, mirroring the skills
+    // crate's own `malformed_skill_toml_is_skipped_not_fatal` semantics.
 
     #[test]
     fn discover_skills_skips_missing_path_without_error() {
         let result = super::discover_skills(vec!["/definitely/does/not/exist/xyzzy-99999".into()]);
-        assert_eq!(
-            result.as_deref().map(|skills| skills.len()),
-            Ok(0),
-            "a missing search path is skipped, not an error: {result:?}"
+        let report = result.expect("a missing search path is skipped, not an error");
+        assert_eq!(report.descriptors.len(), 0);
+        assert_eq!(report.resolved_paths.len(), 1, "the missing path is still reported");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("xyzzy-99999") && w.contains("missing")),
+            "the missing path must be surfaced in warnings: {:?}",
+            report.warnings
         );
     }
 
@@ -878,21 +1244,94 @@ mod tests {
         .expect("write manifest");
 
         let result = super::discover_skills(vec![temp.path().to_string_lossy().into_owned()]);
-        let skills = result.expect("discovery should succeed");
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].id, "rust-testing");
-        assert_eq!(skills[0].manifest.tools, vec!["cargo nextest run"]);
-        assert_eq!(skills[0].instructions, "Prefer cargo nextest.");
+        let report = result.expect("discovery should succeed");
+        assert_eq!(report.descriptors.len(), 1);
+        let skill = &report.descriptors[0];
+        assert_eq!(skill.id, "rust-testing");
+        assert_eq!(skill.manifest.tools, vec!["cargo nextest run"]);
+        assert_eq!(skill.instructions, "Prefer cargo nextest.");
+        assert_eq!(report.resolved_paths, vec![temp.path()], "resolved path is the scanned dir");
+        assert!(report.warnings.is_empty(), "a healthy pack must not warn: {:?}", report.warnings);
     }
 
     #[test]
-    fn discover_skills_surfaces_malformed_manifest_error() {
+    fn discover_skills_skips_malformed_manifest_without_error() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pack = temp.path().join("pack");
         std::fs::create_dir_all(&pack).expect("create pack dir");
         std::fs::write(pack.join("skill.toml"), "id = [unclosed\n").expect("write manifest");
 
         let result = super::discover_skills(vec![temp.path().to_string_lossy().into_owned()]);
-        assert!(result.is_err(), "a malformed manifest must fail discovery loudly: {result:?}");
+        let report = result.expect("a malformed manifest is skipped with a warning, not fatal");
+        assert_eq!(report.descriptors.len(), 0);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("failed to load")),
+            "the malformed pack must be surfaced in warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn skill_pack_crud_round_trip_via_helpers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().to_string_lossy().into_owned();
+
+        let created = super::create_skill_pack(
+            parent.clone(),
+            "reviewer".into(),
+            "Code Reviewer".into(),
+            "0.1.0".into(),
+            "second pair of eyes".into(),
+            "Look for bugs.".into(),
+        )
+        .expect("create should succeed");
+        assert!(created.contains("reviewer"), "outcome names the pack: {created}");
+
+        let report = super::discover_skills(vec![parent.clone()]).expect("discovery");
+        assert_eq!(report.descriptors.len(), 1);
+        assert_eq!(report.descriptors[0].id, "reviewer");
+        assert_eq!(report.descriptors[0].manifest.name, "Code Reviewer");
+        assert_eq!(report.descriptors[0].instructions, "Look for bugs.");
+
+        // Update preserves the id/version/tools and replaces instructions.
+        let updated = super::update_skill_pack(
+            report.descriptors[0].pack_dir.to_string_lossy().into_owned(),
+            SkillManifest {
+                id: "reviewer".into(),
+                name: "Senior Reviewer".into(),
+                version: "0.1.0".into(),
+                description: "second pair of eyes".into(),
+                instructions_path: None,
+                instructions: Some("Review harder.".into()),
+                tools: vec!["cargo review".into()],
+                resources: Vec::new(),
+            },
+        )
+        .expect("update should succeed");
+        assert!(updated.contains("Saved"), "outcome names the action: {updated}");
+
+        let report = super::discover_skills(vec![parent.clone()]).expect("rediscovery");
+        assert_eq!(report.descriptors[0].manifest.name, "Senior Reviewer");
+        assert_eq!(report.descriptors[0].manifest.tools, vec!["cargo review"]);
+        assert_eq!(report.descriptors[0].instructions, "Review harder.");
+
+        // Delete backs the manifest up (reversible), so discovery is empty
+        // again while the hidden backup still exists in the pack directory.
+        let deleted =
+            super::delete_skill_pack(report.descriptors[0].pack_dir.to_string_lossy().into_owned())
+                .expect("delete should succeed");
+        assert!(deleted.contains("Deleted"), "outcome names the action: {deleted}");
+        assert!(deleted.contains("1 manifest file(s)"), "one backup reported: {deleted}");
+
+        let report = super::discover_skills(vec![parent.clone()]).expect("post-delete discovery");
+        assert!(report.descriptors.is_empty(), "the pack disappears from discovery");
+
+        let backups = std::fs::read_dir(temp.path().join("reviewer"))
+            .expect("pack dir survives as the backup container")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".deleted-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "one hidden backup remains: {backups:?}");
     }
 }

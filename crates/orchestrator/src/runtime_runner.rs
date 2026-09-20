@@ -2006,6 +2006,11 @@ async fn execute_agent_loop(
     // no-op). Cloned from the write-gate pool in `run_shared_agent` before
     // the gates consume it.
     fact_pool: Option<sqlx::SqlitePool>,
+    // The run-scoped project AGENTS.md context (ADR-70), injected into the
+    // single-agent system prompt between the skills section and the
+    // environment card via `PromptBuilder::with_project_context`. Refreshed
+    // once at run start by `run_shared_agent` (fail-soft).
+    project_context: Arc<crate::project_context::ProjectContext>,
 ) -> Result<AgentOutput, OrchestratorError> {
     // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
     // removed from `AgentLoop`. Context overflow is bounded deterministically
@@ -2055,7 +2060,10 @@ async fn execute_agent_loop(
         // OS/shell identity card (custom-ai-shell plan, Phase C): the resolved
         // selected profile grounds every built prompt in the host OS and the
         // selected agent shell's dialect; `None` falls back to OS facts only.
-        .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned());
+        .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
+        // Run-scoped project AGENTS.md context (ADR-70): injected between the
+        // skills section and the environment card.
+        .with_project_context(Some(project_context));
 
     let retry_policy = RetryPolicy::new(services.config.retry.clone());
     let metrics_store = session_store.clone();
@@ -3539,6 +3547,25 @@ pub async fn run_shared_agent(
         Arc::new(Mutex::new(StageTracker::new(services.bus.clone(), session_id, task.id)));
     stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Understand);
 
+    // 6c. Project AGENTS.md context (ADR-70). Run-scoped like the session: it
+    // needs THIS run's project dir, so one instance is built per run and
+    // refreshed once at startup. The same handle then feeds both prompt
+    // paths — the single-agent PromptBuilder and the coordinator dispatch
+    // assembly. Fail-soft: a refresh error logs at warn and the run proceeds
+    // without the section — an unreadable AGENTS.md can never fail an agent
+    // loop (ADR-70).
+    let project_context = Arc::new(crate::project_context::ProjectContext::from_config(
+        services.config.project_context.as_ref(),
+        &req.project_dir,
+    ));
+    if let Err(error) = project_context.refresh() {
+        tracing::warn!(
+            %error,
+            "project AGENTS.md context refresh failed at run start; prompts proceed \
+             without the project-context section (ADR-70)"
+        );
+    }
+
     // 7. Multi-agent dispatch. ADR-55 Phase 2e §1: the text-only fork is
     // deleted — every non-empty run enters the unified agent loop, and Chat
     // is what the loop does when the model uses no tools (≈ one text-only
@@ -3568,6 +3595,7 @@ pub async fn run_shared_agent(
             gate_log_pool.clone(),
             resume_updated_at_ms,
             headless_resume,
+            project_context.clone(),
         )
         .await;
     }
@@ -3629,6 +3657,7 @@ pub async fn run_shared_agent(
         &routing.route,
         &stage_tracker,
         d7_event_pool.clone(),
+        project_context,
     )
     .await?;
 
@@ -3748,6 +3777,11 @@ async fn run_multi_agent(
     // dispatch seed for a checkpointless `continue` run — `None` for every
     // other run shape (fresh, checkpoint-resumed, approved-plan Execute).
     headless_resume: Option<HeadlessResumeSeed>,
+    // The run-scoped project AGENTS.md context (ADR-70), injected into the
+    // coordinator dispatch assembly between the skills section and the
+    // environment card; its refresh cadence also gates the coordinator's
+    // maintenance nudge. Refreshed once at run start by `run_shared_agent`.
+    project_context: Arc<crate::project_context::ProjectContext>,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -4176,6 +4210,10 @@ async fn run_multi_agent(
     .with_memory_writeback(memory_decision_store, memory_task_tree)
     .with_agent_configs(agent_configs)
     .with_skills_section(skills_section)
+    // Run-scoped project AGENTS.md context (ADR-70): injected into the
+    // dispatch system prompt between the skills section and the environment
+    // card; its refresh cadence also gates the coordinator maintenance nudge.
+    .with_project_context(Some(project_context))
     // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
     // above from the resolved shell settings; see the registry wiring.
     .with_environment_card(environment_card)
@@ -8455,6 +8493,7 @@ mod runtime_runner_tests {
             &concerto_core::intent::RouterRoute::RuleHit { rule: "execute_keyword" },
             &stage_tracker,
             None, // no fact-writer pool in this test
+            Arc::new(crate::project_context::ProjectContext::disabled()),
         )
         .await
         .expect("action-required run should complete");
@@ -8517,6 +8556,7 @@ mod runtime_runner_tests {
             &concerto_core::intent::RouterRoute::RuleHit { rule: "plan_keyword" },
             &stage_tracker,
             None, // no fact-writer pool in this test
+            Arc::new(crate::project_context::ProjectContext::disabled()),
         )
         .await
         .expect("plan run should complete");
@@ -8579,6 +8619,7 @@ mod runtime_runner_tests {
             &concerto_core::intent::RouterRoute::RuleHit { rule: "execute_keyword" },
             &stage_tracker,
             None, // no fact-writer pool in this test
+            Arc::new(crate::project_context::ProjectContext::disabled()),
         )
         .await;
 

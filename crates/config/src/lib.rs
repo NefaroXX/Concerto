@@ -53,13 +53,14 @@ pub use saving::{
     GLOBAL_ONLY_ORCHESTRATION_KEYS,
 };
 pub use schema::{
-    builtin_agent_seeds, parse_tool_schema_mode, resolve_reduced_motion,
-    resolve_terminal_title_enabled, AgentCapabilities, AgentModelAssignment,
-    AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig, CustomAgentConfig,
-    DisplayConfig, FewShotExample, IntentConfig, McpConfig, McpServerConfig, MemoryConfig,
-    ModelPinConfig, ModelProfileOverride, ModelSettings, MultiAgentConfig, ObservabilityConfig,
-    PipelinePreset, PlanBindingSource, PolicyConfig, PolicyRuleDef, PromptSections, ProviderConfig,
-    RetryConfig, SkillsConfig, ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
+    builtin_agent_seeds, default_global_agents_path, parse_tool_schema_mode,
+    resolve_reduced_motion, resolve_terminal_title_enabled, AgentCapabilities,
+    AgentModelAssignment, AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig,
+    CustomAgentConfig, DisplayConfig, FewShotExample, IntentConfig, McpConfig, McpServerConfig,
+    MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings, MultiAgentConfig,
+    ObservabilityConfig, PipelinePreset, PlanBindingSource, PolicyConfig, PolicyRuleDef,
+    ProjectContextConfig, PromptSections, ProviderConfig, RetryConfig, SkillsConfig,
+    ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};
 pub use shell::{
@@ -237,6 +238,13 @@ fn load_config_layers(
     // Validate MCP server entries (ADR-43 §4: non-empty id, no ':').
     if let Some(mcp) = &config.mcp {
         mcp.validate()?;
+    }
+
+    // Validate project-context settings (ADR-70): `update_frequency` must be
+    // non-zero (0 would silently disable the nudge cadence) and `max_bytes`
+    // non-zero when set (0 would collapse every injected source).
+    if let Some(project_context) = &config.project_context {
+        project_context.validate()?;
     }
 
     // ADR-58: resolve the blueprint on EVERY load path — the `[orchestration]`
@@ -745,12 +753,17 @@ mod tests {
         // documented Default impls.
         assert!(cfg.skills.is_none(), "skills section absent -> None");
         assert!(cfg.mcp.is_none(), "mcp section absent -> None");
+        assert!(cfg.project_context.is_none(), "project_context section absent -> None");
 
         let skills = SkillsConfig::default();
         assert!(!skills.enabled, "skills default off per ADR-43 decision 5");
         assert_eq!(
             skills.search_paths,
-            vec!["~/.local/share/concerto/skills".to_string(), "./.concerto/skills".to_string()]
+            crate::schema::skills_search_paths_for(
+                dirs::data_dir().as_deref(),
+                dirs::home_dir().as_deref(),
+            ),
+            "search paths must resolve the platform data dir + project-local + legacy fallback"
         );
         assert!(skills.auto_load);
         assert_eq!(skills.enabled_ids, None);
@@ -758,6 +771,17 @@ mod tests {
         let mcp = McpConfig::default();
         assert!(!mcp.enabled, "mcp defaults to disabled until the user opts in (ADR-43 §6)");
         assert!(mcp.servers.is_empty());
+
+        let project_context = ProjectContextConfig::default();
+        assert!(
+            !project_context.enabled,
+            "project_context defaults off until the user opts in (ADR-70)"
+        );
+        assert_eq!(project_context.global_path, None);
+        assert_eq!(project_context.max_bytes, None);
+        assert!(!project_context.auto_update_agents_md);
+        assert_eq!(project_context.update_frequency, 1);
+        assert_eq!(project_context.nudge_frequency(), None);
     }
 
     #[test]

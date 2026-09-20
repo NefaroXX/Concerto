@@ -27,6 +27,21 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// The canonical user-plugins directory (`<data_dir>/concerto/plugins`).
+///
+/// The installer writes here and the capability store lives here too
+/// ([`crate::capability::CapabilityManager::data_dir`]), so one canonical
+/// path keeps install, discovery, and the grant store in sync. The XDG
+/// `dirs_data_dir` legacy fallback is intentionally NOT applied: installs
+/// always target the current name; migration-time discovery of the old
+/// `opencode-rs` directory is handled by [`DiscoveryConfig::default`].
+pub fn plugins_dir() -> std::path::PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("concerto")
+        .join("plugins")
+}
+
 /// Plugin discovery — scans filesystem directories for `.wasm` files.
 pub struct PluginDiscovery {
     config: DiscoveryConfig,

@@ -97,6 +97,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [67](./ADR-67-m01-context-pool-consolidation.md) | M-01 — Consolidate context-overflow pools under a single owner per pool | 2026-09-18 | Accepted | One ContextEngine owns all budget pools; removes double-clip, deletes SummarizeOldest (NoOp retained), documents generic.rs:402 invariant. Gate-only S effort. |
 | [68](./ADR-68-h04-session-ack-breaking-param.md) | H-04 — Breaking parameter change for `request_ack` | 2026-09-18 | Accepted | New `request_ack` signature with session_id validation; PendingAck gains session_id; 6 impls + 5 doubles; desktop single-slot queues-or-rejects-busy. |
 | [69](./ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | 2026-09-18 | Accepted | Three slices: link store (M 3-5d), scoring+decay (M 5-8d), Mermaid+UI+eval (S-M 3-5d); fail-open, degree/TTL caps, cost-gated progression. |
+| [70](./ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | 2026-09-20 | Accepted | Global + per-project AGENTS.md injected into every prompt path (skills → AGENTS → environment card); project-over-global, bounded/truncated, fail-soft, opt-in, coordinator maintenance nudge (text only). |
 
 ## Archived ADRs ([`archive/`](./archive/))
 

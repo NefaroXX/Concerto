@@ -49,6 +49,11 @@ pub struct SkillDescriptor {
     pub manifest: SkillManifest,
     /// Resolved instruction text (loaded from `instructions_path` or inline).
     pub instructions: String,
+    /// Directory containing the pack manifest (`skill.toml` or `SKILL.md`),
+    /// used by CRUD operations and file-based UI. Absolute when the discovery
+    /// search path was absolute.
+    #[serde(default)]
+    pub pack_dir: PathBuf,
     /// Absolute paths to the skill's resource files.
     #[serde(default)]
     pub resource_paths: Vec<PathBuf>,
@@ -145,6 +150,7 @@ mod tests {
                 resources: vec![PathBuf::from("fixtures/sample.rs")],
             },
             instructions: "Prefer cargo nextest.".into(),
+            pack_dir: PathBuf::from("/abs/skills/rust-testing"),
             resource_paths: vec![PathBuf::from("/abs/fixtures/sample.rs")],
         };
         let json = serde_json::to_string(&descriptor).expect("serialization should succeed");

@@ -22,6 +22,9 @@
 //! - Migrations only insert `Option` fields with `None` or sensible defaults.
 //! - If a migration cannot be applied, it returns `ConfigError::Load`.
 //! - Loading a config at the current schema version is a no-op.
+//! - Purely additive serde-default sections need no bump: `[project_context]`
+//!   (ADR-70) arrived after v8 without a migration step, mirroring the
+//!   `[skills]`/`[mcp]`/`[context]` trajectory at v5.
 
 use crate::schema::AppConfig;
 use concerto_core::error::ConfigError;
@@ -101,6 +104,8 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         context: None,
         // [tools] is additive and default-on; old configs keep it None.
         tool_settings: None,
+        // ADR-70 adds [project_context]; additive Option defaults to None.
+        project_context: None,
         orchestration: None,
         // ADR-58 P2+P3: derived state, filled by the load seam; never in files.
         resolved_blueprint: None,
@@ -144,6 +149,8 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         context: config.context,
         // [tools] is additive and default-on; old configs keep it None.
         tool_settings: None,
+        // ADR-70 adds [project_context]; additive Option defaults to None.
+        project_context: None,
         orchestration: None,
         // ADR-58 P2+P3: derived state, filled by the load seam; never in files.
         resolved_blueprint: None,
@@ -238,6 +245,8 @@ mod tests {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            // ADR-70 adds [project_context]; additive Option defaults to None.
+            project_context: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
@@ -268,6 +277,8 @@ mod tests {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            // ADR-70 adds [project_context]; additive Option defaults to None.
+            project_context: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
@@ -280,6 +291,7 @@ mod tests {
         let v2 = migrate_config(v1).expect("v1→v2 migration should succeed");
         assert_eq!(v2.schema_version, 8);
         assert_eq!(v2.observability, None);
+        assert_eq!(v2.project_context, None, "ADR-70 field defaults to None in migrations");
         assert_eq!(v2.primary_provider.as_deref(), Some("anthropic"));
         assert_eq!(v2.session_spend_cap_usd, Some(5.0));
     }
@@ -290,6 +302,7 @@ mod tests {
         let v3 = migrate_config(v2).expect("v2→v3 migration should succeed");
         assert_eq!(v3.schema_version, 8);
         assert_eq!(v3.model_settings, None);
+        assert_eq!(v3.project_context, None, "ADR-70 field defaults to None in migrations");
         assert_eq!(v3.primary_provider.as_deref(), Some("openai"));
     }
 
@@ -318,6 +331,8 @@ mod tests {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            // ADR-70 adds [project_context]; additive Option defaults to None.
+            project_context: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
