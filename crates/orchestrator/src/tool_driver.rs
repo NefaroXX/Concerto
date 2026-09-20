@@ -185,7 +185,7 @@ impl TextToolDriver {
 
         let mut tool_calls = Vec::with_capacity(calls.len());
         for call in calls {
-            let ParsedCall { name, arguments } = call;
+            let ParsedCall { name, arguments, thought_signature } = call;
             if !self.tools.iter().any(|tool| tool.name == name) {
                 return DriverTurn::Malformed { reason: format!("unknown tool name '{name}'") };
             }
@@ -197,7 +197,19 @@ impl TextToolDriver {
             }
             let id = format!("td_{}", self.next_id);
             self.next_id += 1;
-            tool_calls.push(ToolCall { id, name, arguments, ..Default::default() });
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+                // The text fallback driver has no native `functionCall` part
+                // and its requests deliberately carry no wire tool
+                // declarations, so no signature is fabricated here: it is
+                // threaded through only when the model itself emitted one
+                // inside the text block, and `None` otherwise preserves the
+                // canonical signature-less shape (the driver's replay target
+                // dialects ignore the field anyway).
+                thought_signature,
+            });
         }
         DriverTurn::ToolCalls(tool_calls)
     }
@@ -233,6 +245,16 @@ struct ParsedCall {
     name: String,
     #[serde(default)]
     arguments: Option<serde_json::Value>,
+    /// Optional opaque provider signature (e.g. Gemini 3.x
+    /// `thought_signature`) echoed by the model inside the text block.
+    /// Threaded verbatim onto the synthesized [`ToolCall`]; the driver never
+    /// invents one. The text fallback path normally has no signature — the
+    /// block protocol declares no such field and these calls are replayed by
+    /// tool-less provider dialects that ignore it — so `None` is the correct
+    /// default here and the field exists only to avoid silently dropping one
+    /// the model happened to emit.
+    #[serde(default)]
+    thought_signature: Option<String>,
 }
 
 /// Decide whether the ADR-66 §4 text-fallback driver engages for a run.
@@ -357,6 +379,38 @@ mod tests {
                 assert_eq!(calls.len(), 2);
                 assert_eq!(calls[0].name, "filesystem");
                 assert_eq!(calls[1].name, "echo");
+            }
+            other => panic!("expected ToolCalls, got: {other:?}"),
+        }
+    }
+
+    /// The text fallback driver threads an optional `thought_signature`
+    /// through from a block that carries one — and never fabricates one when
+    /// absent. The block protocol declares no signature field (these calls are
+    /// replayed by tool-less provider dialects that ignore it), so `None` is
+    /// the correct default; only a model that explicitly echoed one keeps it.
+    #[test]
+    fn block_thought_signature_is_threaded_not_fabricated() {
+        let mut driver = driver();
+        let text = "<tool_calls>\n\
+                    [{\"name\": \"filesystem\", \"arguments\": {}, \
+                    \"thought_signature\": \"sig-txt\"}]\n\
+                    </tool_calls>";
+        match driver.parse_turn(text) {
+            DriverTurn::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "td_0");
+                assert_eq!(calls[0].thought_signature.as_deref(), Some("sig-txt"));
+            }
+            other => panic!("expected ToolCalls, got: {other:?}"),
+        }
+
+        // Without a signature the synthesized call stays `None` (canonical
+        // signature-less shape — no fabrication).
+        match driver.parse_turn("<tool_calls>\n[{\"name\": \"echo\"}]\n</tool_calls>") {
+            DriverTurn::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].thought_signature, None);
             }
             other => panic!("expected ToolCalls, got: {other:?}"),
         }
