@@ -5,7 +5,10 @@ use concerto_plugins::error::PluginError;
 
 /// Desktop implementation of CapabilityApprovalUI.
 ///
-/// Bridges the Iced capability dialog with the plugin approval flow.
+/// Bridges the Iced capability dialog with the plugin approval flow. `Clone`
+/// lets the Settings installer hand the service into a `Task::perform` while
+/// the dialog keeps being driven from the App's shared pending queue.
+#[derive(Clone)]
 pub struct PluginApprovalService {
     pending: SharedPending,
 }

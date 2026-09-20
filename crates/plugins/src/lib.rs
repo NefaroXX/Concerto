@@ -15,6 +15,7 @@ pub mod error;
 pub mod guest_abi;
 pub mod host;
 pub mod host_fns;
+pub mod installer;
 pub mod loader;
 pub mod manager;
 pub mod memory_adapter_host;

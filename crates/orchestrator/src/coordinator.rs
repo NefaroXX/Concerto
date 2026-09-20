@@ -1103,6 +1103,15 @@ pub struct CoordinatorAgent {
     /// every dispatch prompt and into the self-implement persona's prompts.
     /// Empty when unset (manual/test constructions).
     environment_card: String,
+    /// Run-scoped project AGENTS.md context (ADR-70). Constructed once per
+    /// run by the runtime (`ProjectContext::refresh` at run start) and
+    /// injected into the dispatch system prompt between the skills section
+    /// and the environment card. `None` in manual/test constructions.
+    project_context: Option<Arc<crate::project_context::ProjectContext>>,
+    /// ADR-70 §6: monotonic per-run count of decision-loop dispatches used to
+    /// pace the project-context maintenance nudge. Reset at construction; the
+    /// cadence is [`crate::project_context::ProjectContext::nudge_frequency`].
+    project_context_nudge_count: u64,
     /// ADR-55 Phase 2b: how far this run may go — full lifecycle (default)
     /// or planning-only (produce + render + persist the plan, nothing else).
     orchestration_depth: OrchestrationDepth,
@@ -1873,6 +1882,8 @@ impl CoordinatorAgent {
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
             skills_section: String::new(),
             environment_card: String::new(),
+            project_context: None,
+            project_context_nudge_count: 0,
             max_total_iterations: None,
             model_dispatch_count: 0,
             plans: None,
@@ -3153,6 +3164,19 @@ impl CoordinatorAgent {
         self
     }
 
+    /// Attach the run-scoped project AGENTS.md context (ADR-70), injected
+    /// into the dispatch system prompt between the skills section and the
+    /// environment card; its refresh cadence also gates the coordinator's
+    /// maintenance nudge (§6). Pass `None` to omit it (manual/test
+    /// constructions without a runtime-built context).
+    pub fn with_project_context(
+        mut self,
+        project_context: Option<Arc<crate::project_context::ProjectContext>>,
+    ) -> Self {
+        self.project_context = project_context;
+        self
+    }
+
     /// Apply the same request-level retry policy to planner calls as the
     /// specialist agents use.
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
@@ -3291,6 +3315,21 @@ impl CoordinatorAgent {
     /// `Some(0)` disables the guard entirely).
     fn iteration_cap_reached(&self) -> bool {
         self.max_total_iterations.is_some_and(|cap| self.model_dispatch_count >= cap)
+    }
+
+    /// ADR-70 §6: the project-context maintenance nudge for the decision
+    /// loop, when the cadence is due. `None` whenever the feature is off, the
+    /// nudge is not opted in, or the project AGENTS.md is absent — all folded
+    /// into `ProjectContext::nudge_frequency`. Each call advances the per-run
+    /// cadence counter by one decision-loop dispatch. Advisory text only; the
+    /// coordinator never edits AGENTS.md itself.
+    fn project_context_nudge(&mut self) -> Option<&'static str> {
+        let frequency =
+            self.project_context.as_ref().and_then(|context| context.nudge_frequency())?;
+        self.project_context_nudge_count = self.project_context_nudge_count.saturating_add(1);
+        self.project_context_nudge_count
+            .is_multiple_of(frequency)
+            .then_some(crate::project_context::PROJECT_CONTEXT_NUDGE)
     }
 
     /// ADR-52: persist a plan artifact to the configured plans dir
@@ -8491,6 +8530,35 @@ impl CoordinatorAgent {
                 return Err(OrchestratorError::NoBudgetForDelegation);
             }
 
+            // ── ADR-70 §6: project-context maintenance nudge ───────────
+            // Advisory text only, gated on dispatching (the nudge points at
+            // the policy-gated filesystem tool, which planning-only sessions
+            // lack) and on the opt-in cadence. Mirrors the consultation /
+            // progress-guard nudge pattern: a bounded user message into the
+            // existing conversation, never a forced tool call.
+            if dispatching {
+                if let Some(nudge) = self.project_context_nudge() {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: nudge.to_string(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: nudge.to_string(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                }
+            }
+
             let request = CompletionRequest {
                 model: model.clone(),
                 messages: messages.clone(),
@@ -12306,6 +12374,17 @@ impl CoordinatorAgent {
         if !self.skills_section.is_empty() {
             prompt.push_str(&self.skills_section);
             prompt.push_str("\n\n");
+        }
+        // Project AGENTS.md context (ADR-70): injected between the skills
+        // section and the environment card. Run-scoped and refreshed once at
+        // run start by the runtime; `section()` is a cheap clone, so no
+        // filesystem work happens in the prompt hot path.
+        if let Some(project_context) = &self.project_context {
+            let section = project_context.section();
+            if !section.is_empty() {
+                prompt.push_str(&section);
+                prompt.push_str("\n\n");
+            }
         }
         // OS/shell identity card (custom-ai-shell plan, Phase C): the
         // coordinator dispatches shell-capable specialists, so its decision

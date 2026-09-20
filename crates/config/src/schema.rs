@@ -2,6 +2,7 @@ use camino::Utf8PathBuf;
 use concerto_core::types::{AgentId, AgentStage, OutputMode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::blueprint::{OrchestrationConfig, ResolvedBlueprint};
@@ -40,6 +41,9 @@ use crate::ConfigError;
 /// ADR-56 supersedes the Phase 2c `classifier_enabled` default pin (off → on):
 /// the LLM classifier is the primary intent decider, so the omitted-key
 /// default now enables it. Nothing else changes.
+///
+/// ADR-70 (`[project_context]`, AGENTS.md injection) is additive serde-default
+/// only — no version bump, mirroring the `[skills]`/`[mcp]` trajectory at v5.
 pub const SCHEMA_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
@@ -468,6 +472,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub mcp: Option<McpConfig>,
 
+    /// Project AGENTS.md injection into prompts (ADR-70).
+    ///
+    /// `None` (no `[project_context]` section) keeps the feature off entirely.
+    /// Additive serde-default only — every pre-existing and migrated config
+    /// loads unchanged, mirroring the `[skills]`/`[mcp]` trajectory.
+    #[serde(default)]
+    pub project_context: Option<ProjectContextConfig>,
+
     /// Multi-provider model management settings.
     /// `None` = single-provider mode (backward compatible).
     #[serde(default)]
@@ -583,6 +595,7 @@ impl PartialEq for AppConfig {
             && self.plugins == other.plugins
             && self.skills == other.skills
             && self.mcp == other.mcp
+            && self.project_context == other.project_context
             && self.model_settings == other.model_settings
             && self.updates == other.updates
             && self.retry == other.retry
@@ -612,6 +625,7 @@ impl Default for AppConfig {
             plugins: None,
             skills: None,
             mcp: None,
+            project_context: None,
             model_settings: None,
             updates: None,
             retry: RetryConfig::default(),
@@ -921,7 +935,50 @@ fn default_skills_enabled() -> bool {
 }
 
 fn default_skills_search_paths() -> Vec<String> {
-    vec!["~/.local/share/concerto/skills".into(), "./.concerto/skills".into()]
+    skills_search_paths_for(dirs::data_dir().as_deref(), dirs::home_dir().as_deref())
+}
+
+/// Build the default skill search paths for the platform.
+///
+/// Order and contents depend on [`dirs`], which resolves `%APPDATA%` on
+/// Windows and `$XDG_DATA_HOME`/`~/.local/share` on Unix:
+///
+/// 1. **Primary per-user root** — `<data_dir>/concerto/skills`
+///    (`%APPDATA%\concerto\skills` on Windows, `~/.local/share/concerto/skills`
+///    on a default Linux desktop, `~/Library/Application Support/concerto/skills`
+///    on macOS).
+/// 2. **Project-local** — `./.concerto/skills`.
+/// 3. **Legacy literal** — `~/.local/share/concerto/skills`, kept only when it
+///    resolves to a *different* directory than the primary *and that directory
+///    currently exists*. Historically the default was written as this literal
+///    path; keeping it as a fallback lets pre-existing packs under the XDG
+///    data dir keep loading even when the platform root moved (e.g. Windows)
+///    or the data dir is customized. The existence gate prunes the entry for
+///    users who never had packs there — on a typical Windows install the
+///    `~/.local/share/concerto/skills` tree does not exist, so no scan is
+///    wasted on it and no spurious "missing search path" warning is emitted.
+///    On a default Linux install the legacy literal expands to the same tree
+///    as the primary, so it is dropped regardless. The `is_dir` probe runs at
+///    config-default time using `home_dir`; when no home directory is known
+///    (and so the literal could not be resolved anyway), the entry is omitted.
+#[doc(hidden)]
+pub(crate) fn skills_search_paths_for(
+    data_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut paths = vec!["./.concerto/skills".to_string()];
+    if let Some(data_dir) = data_dir {
+        let primary = data_dir.join("concerto").join("skills");
+        paths.insert(0, primary.to_string_lossy().into_owned());
+        let legacy_resolved =
+            home_dir.map(|home| home.join(".local/share").join("concerto").join("skills"));
+        let legacy_is_redundant = legacy_resolved.as_deref() == Some(primary.as_path());
+        let legacy_exists = legacy_resolved.as_deref().is_some_and(|legacy| legacy.is_dir());
+        if !legacy_is_redundant && legacy_exists {
+            paths.push("~/.local/share/concerto/skills".to_string());
+        }
+    }
+    paths
 }
 
 fn default_skills_auto_load() -> bool {
@@ -938,8 +995,10 @@ pub struct SkillsConfig {
     #[serde(default = "default_skills_enabled")]
     pub enabled: bool,
 
-    /// Directories to search for skill packs. Defaults to the per-user and
-    /// per-project locations.
+    /// Directories to search for skill packs. Defaults to the per-user data
+    /// directory (`%APPDATA%\concerto\skills` on Windows,
+    /// `~/.local/share/concerto/skills` on Linux) plus the per-project
+    /// `./.concerto/skills`; `~` and `%VAR%` are expanded at discovery time.
     #[serde(default = "default_skills_search_paths")]
     pub search_paths: Vec<String>,
 
@@ -1056,6 +1115,125 @@ pub struct McpServerConfig {
     /// enforced in the bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// ADR-70 — project context (AGENTS.md) injection configuration
+// ---------------------------------------------------------------------------
+
+fn default_project_context_enabled() -> bool {
+    // ADR-70 decision: AGENTS.md content is injected into every prompt, so
+    // activation is explicit and default-off for safety. Users opt in per
+    // project via the [project_context] section.
+    false
+}
+
+fn default_project_context_update_frequency() -> u64 {
+    1
+}
+
+/// Resolve the default global AGENTS.md path.
+///
+/// `dirs::config_dir()` yields `~/.config` on POSIX and `%APPDATA%` on
+/// Windows — the same roots Concerto's own global `config.toml` uses — so an
+/// unset `global_path` reads `~/.config/concerto/AGENTS.md` (POSIX) or
+/// `%APPDATA%\concerto\AGENTS.md` (Windows). Returns `None` when no config
+/// directory resolves (headless containers); the global source is then
+/// skipped silently by the runtime.
+pub fn default_global_agents_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("concerto").join("AGENTS.md"))
+}
+
+/// Project AGENTS.md injection into prompts (ADR-70).
+///
+/// Opt-in (`enabled` defaults to `false` — AGENTS.md content is injected into
+/// every prompt, so activation is explicit). A missing `[project_context]`
+/// section keeps the feature off; the section is additive serde-default only,
+/// so no schema migration is required.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectContextConfig {
+    /// Whether the global + project AGENTS.md files are read and injected
+    /// into prompts. Default: `false` (ADR-70 — explicit opt-in).
+    #[serde(default = "default_project_context_enabled")]
+    pub enabled: bool,
+
+    /// Path to the user-global AGENTS.md file. `None` (default) resolves the
+    /// platform default via [`default_global_agents_path`]:
+    /// `~/.config/concerto/AGENTS.md` (POSIX) or
+    /// `%APPDATA%\concerto\AGENTS.md` (Windows).
+    #[serde(default)]
+    pub global_path: Option<String>,
+
+    /// Hard character budget for EACH injected AGENTS.md source (the global
+    /// file and the project file are truncated independently). `None` = the
+    /// orchestrator's default (32 KiB); a truncation marker is appended when
+    /// content is cut.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+
+    /// Coordinator nudge opt-in (ADR-70 §6): when `true`, the multi-agent
+    /// coordinator's dispatch prompt periodically notes that the project
+    /// AGENTS.md exists and may be refreshed via the policy-gated filesystem
+    /// tool. The nudge is advisory text only — the coordinator never edits
+    /// AGENTS.md itself (`false` for all settings-facing toggles here).
+    #[serde(default)]
+    pub auto_update_agents_md: bool,
+
+    /// Nudge cadence in model dispatches when `auto_update_agents_md` is on.
+    /// `1` (the default) nudges before every dispatch; `5` nudges before
+    /// every 5th dispatch.
+    #[serde(default = "default_project_context_update_frequency")]
+    pub update_frequency: u64,
+}
+
+impl Default for ProjectContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_project_context_enabled(),
+            global_path: None,
+            max_bytes: None,
+            auto_update_agents_md: false,
+            update_frequency: default_project_context_update_frequency(),
+        }
+    }
+}
+
+impl ProjectContextConfig {
+    /// The effective coordinator nudge cadence: `Some(f)` with `f >= 1` only
+    /// when the whole feature is enabled AND the nudge is opted in, otherwise
+    /// `None`. Keeps the coordinator free of decoder logic.
+    pub fn nudge_frequency(&self) -> Option<u64> {
+        if self.enabled && self.auto_update_agents_md && self.update_frequency > 0 {
+            Some(self.update_frequency)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the global AGENTS.md path: the configured `global_path`, or
+    /// the platform default (via [`default_global_agents_path`]) when unset.
+    pub fn resolved_global_path(&self) -> Option<PathBuf> {
+        self.global_path.as_ref().map(PathBuf::from).or_else(default_global_agents_path)
+    }
+
+    /// Validate the project-context settings at config load time (mirrors
+    /// `RetryConfig::validate` / `MemoryConfig::validate`): `update_frequency`
+    /// must be non-zero (0 would silently disable the nudge cadence) and
+    /// `max_bytes`, when set, must be non-zero (0 would collapse every
+    /// injected source to an empty block).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.update_frequency == 0 {
+            return Err(ConfigError::InvalidValue(
+                "project_context.update_frequency must be greater than zero".into(),
+            ));
+        }
+        if self.max_bytes == Some(0) {
+            return Err(ConfigError::InvalidValue(
+                "project_context.max_bytes must be greater than zero when set".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2853,6 +3031,110 @@ mod tests {
         assert!(cfg.validate().is_err(), "decay window above 365 days is invalid");
     }
 
+    // ADR-70 — [project_context] defaults and resolution helpers.
+    #[test]
+    fn project_context_defaults_are_opt_in() {
+        let cfg = ProjectContextConfig::default();
+        assert!(!cfg.enabled, "ADR-70: injected into every prompt, so opt-in only");
+        assert_eq!(cfg.global_path, None);
+        assert_eq!(cfg.max_bytes, None);
+        assert!(!cfg.auto_update_agents_md);
+        assert_eq!(cfg.update_frequency, 1);
+        assert_eq!(cfg.nudge_frequency(), None, "disabled feature never nudges");
+    }
+
+    #[test]
+    fn project_context_nudge_frequency_gates_on_enabled_and_opt_in() {
+        let base = ProjectContextConfig { enabled: true, ..Default::default() };
+        assert_eq!(base.nudge_frequency(), None, "enabled alone does not nudge");
+
+        let on = ProjectContextConfig {
+            enabled: true,
+            auto_update_agents_md: true,
+            update_frequency: 5,
+            ..Default::default()
+        };
+        assert_eq!(on.nudge_frequency(), Some(5));
+
+        let zero = ProjectContextConfig {
+            enabled: true,
+            auto_update_agents_md: true,
+            update_frequency: 0,
+            ..Default::default()
+        };
+        assert_eq!(zero.nudge_frequency(), None, "zero cadence disables the nudge");
+    }
+
+    #[test]
+    fn project_context_resolves_global_path_fallback() {
+        // Explicit path wins.
+        let cfg = ProjectContextConfig {
+            global_path: Some("/tmp/orbits/custom-AGENTS.md".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_global_path().map(|p| p.to_string_lossy().into_owned()),
+            Some("/tmp/orbits/custom-AGENTS.md".to_string())
+        );
+
+        // Unset resolves through the OS config directory, exactly like the
+        // schema's own helper (so the assertion is platform-neutral).
+        let defaulted = ProjectContextConfig::default();
+        assert_eq!(
+            defaulted.resolved_global_path(),
+            default_global_agents_path(),
+            "resolved_global_path must fall back to the platform default"
+        );
+    }
+
+    #[test]
+    fn project_context_parses_from_toml() {
+        let parsed: ProjectContextConfig = toml::from_str(
+            "enabled = true\n\
+             global_path = \"/x/AGENTS.md\"\n\
+             max_bytes = 1000\n\
+             auto_update_agents_md = true\n\
+             update_frequency = 3",
+        )
+        .expect("must parse");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.max_bytes, Some(1000));
+        assert!(parsed.auto_update_agents_md);
+        assert_eq!(parsed.update_frequency, 3);
+
+        // Absent keys default (ADR-70: additive serde-default section).
+        let parsed: ProjectContextConfig = toml::from_str("").expect("must parse");
+        assert_eq!(parsed, ProjectContextConfig::default());
+    }
+
+    #[test]
+    fn project_context_validate_rejects_zero_cadence_and_zero_budget() {
+        let zero_cadence = ProjectContextConfig {
+            enabled: true,
+            auto_update_agents_md: true,
+            update_frequency: 0,
+            ..Default::default()
+        };
+        assert!(
+            zero_cadence.validate().is_err(),
+            "update_frequency=0 must be rejected at load time"
+        );
+
+        let zero_budget =
+            ProjectContextConfig { enabled: true, max_bytes: Some(0), ..Default::default() };
+        assert!(zero_budget.validate().is_err(), "max_bytes=0 must be rejected at load time");
+
+        // Defaults (and the opt-in defaults) validate clean.
+        assert!(ProjectContextConfig::default().validate().is_ok());
+        let on = ProjectContextConfig {
+            enabled: true,
+            auto_update_agents_md: true,
+            update_frequency: 1,
+            ..Default::default()
+        };
+        assert!(on.validate().is_ok());
+    }
+
     #[test]
     fn memory_config_parses_slice2_fields_from_toml() {
         let parsed: MemoryConfig =
@@ -2876,11 +3158,101 @@ mod tests {
         assert!(!skills.enabled, "skills default off per ADR-43 decision 5");
         assert_eq!(
             skills.search_paths,
-            vec!["~/.local/share/concerto/skills".to_string(), "./.concerto/skills".to_string()]
+            skills_search_paths_for(dirs::data_dir().as_deref(), dirs::home_dir().as_deref()),
+            "search paths must resolve the platform data dir + project-local + legacy fallback"
         );
         assert!(skills.auto_load);
         assert_eq!(skills.enabled_ids, None);
         assert_eq!(skills.max_chars, None, "max_chars defaults to None (orchestrator budget)");
+    }
+
+    #[test]
+    fn skills_search_paths_for_resolves_platform_shapes() {
+        // Default Unix XDG layout: data dir == home/.local/share, so the
+        // legacy literal collapses and is not scanned twice.
+        let unix_data = std::path::Path::new("/home/alice/.local/share");
+        let unix =
+            skills_search_paths_for(Some(unix_data), Some(std::path::Path::new("/home/alice")));
+        assert_eq!(
+            unix,
+            vec![
+                unix_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+            ]
+        );
+
+        // Windows: `%APPDATA%` is outside the legacy `~/.local/share` tree, so
+        // the legacy fallback *would* be eligible — but on this host that
+        // directory does not exist, so the existence gate prunes it (no wasted
+        // scan, no spurious "missing search path" warning). Backslashes are
+        // treated as ordinary characters by `Path::join` on non-Windows test
+        // runners, so the primary is derived from the passed data dir.
+        let windows_data = std::path::Path::new("C:\\Users\\alice\\AppData\\Roaming");
+        let windows = skills_search_paths_for(
+            Some(windows_data),
+            Some(std::path::Path::new("C:\\Users\\alice")),
+        );
+        assert_eq!(
+            windows,
+            vec![
+                windows_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+            ]
+        );
+
+        // A custom XDG_DATA_HOME would also normally keep the legacy fallback
+        // (different tree), but the directory does not exist here either, so
+        // the existence gate drops it.
+        let custom_data = std::path::Path::new("/srv/data");
+        let custom =
+            skills_search_paths_for(Some(custom_data), Some(std::path::Path::new("/home/alice")));
+        assert_eq!(
+            custom,
+            vec![
+                custom_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+            ]
+        );
+
+        // No resolvable data dir degrades to the project-local location only.
+        assert_eq!(
+            skills_search_paths_for(None, Some(std::path::Path::new("/home/alice"))),
+            vec!["./.concerto/skills".to_string()]
+        );
+    }
+
+    #[test]
+    fn skills_search_paths_keep_legacy_only_when_directory_exists() {
+        let temp = tempfile::tempdir().expect("tempdir must succeed");
+        let home = temp.path();
+        let legacy = home.join(".local/share/concerto/skills");
+        std::fs::create_dir_all(&legacy).expect("create legacy pack dir");
+
+        // Custom-but-existing XDG data dir: legacy differs from the primary
+        // *and* the directory exists, so the literal is retained.
+        let custom_data = std::path::Path::new("/srv/data");
+        let custom = skills_search_paths_for(Some(custom_data), Some(home));
+        assert_eq!(
+            custom,
+            vec![
+                custom_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+                "~/.local/share/concerto/skills".to_string(),
+            ]
+        );
+
+        // Default Unix XDG layout (data dir == home/.local/share): the legacy
+        // literal is the *same* directory as the primary, so it is dropped even
+        // when the directory exists, keeping a single scan of the tree.
+        let unix_data = home.join(".local/share");
+        let unix = skills_search_paths_for(Some(&unix_data), Some(home));
+        assert_eq!(
+            unix,
+            vec![
+                unix_data.join("concerto").join("skills").to_string_lossy().into_owned(),
+                "./.concerto/skills".to_string(),
+            ]
+        );
     }
 
     #[test]

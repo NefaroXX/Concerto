@@ -296,6 +296,25 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Remove a plugin from this manager without touching any tool registry.
+    ///
+    /// Used by the Settings plugin installer when a plugin's file was deleted:
+    /// there is no live per-run `ToolRegistry` available to unregister tools
+    /// from, and the pooled registry is gone with its run. The plugin's
+    /// in-memory grants are best-effort cleared first so host functions fail
+    /// closed for any alias still holding the instance; the next agent run
+    /// rediscovers the (now missing) plugin fresh.
+    pub async fn unload_without_registry(&mut self, plugin_id: &str) -> Result<(), PluginError> {
+        self.revoke_grants_best_effort(plugin_id).await;
+        self.plugin_tools.remove(plugin_id);
+        self.active.remove(plugin_id);
+        self.status.remove(plugin_id);
+        self.violations.remove(plugin_id);
+        self.resolved_grants.remove(plugin_id);
+        tracing::info!(plugin_id, "plugin unloaded without a tool registry");
+        Ok(())
+    }
+
     /// Clear a LIVE plugin's in-memory capability grants so subsequent
     /// host-function capability checks fail closed (fail-closed revocation).
     ///

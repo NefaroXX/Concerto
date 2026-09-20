@@ -25,16 +25,13 @@ pub(crate) struct RawSkillToml {
 }
 
 impl RawSkillToml {
-    /// Convert into the shared `SkillManifest`, applying defaults and
-    /// validating the id.
-    fn into_manifest(self) -> Result<SkillManifest, SkillsError> {
-        let raw_id = self.id;
-        let id = raw_id.trim().to_string();
-        if id.is_empty() {
-            return Err(SkillsError::InvalidId { id: raw_id });
-        }
-        Ok(SkillManifest {
-            id,
+    /// Convert into the shared `SkillManifest`, applying defaults. The id is
+    /// trimmed but deliberately NOT validated here: id validation happens at
+    /// the loader (`manager::load_toml_pack`), where the pack directory is
+    /// known, so `SkillsError::InvalidId` can carry the pack path.
+    fn into_manifest(self) -> SkillManifest {
+        SkillManifest {
+            id: self.id.trim().to_string(),
             name: self.name.unwrap_or_default(),
             version: self.version.unwrap_or_default(),
             description: self.description.unwrap_or_default(),
@@ -42,17 +39,21 @@ impl RawSkillToml {
             instructions: self.instructions,
             tools: self.tools.unwrap_or_default(),
             resources: self.resources.unwrap_or_default().into_iter().map(PathBuf::from).collect(),
-        })
+        }
     }
 }
 
 /// Parse the text of a `skill.toml` file into a `SkillManifest`.
+///
+/// Only TOML syntax errors are reported here; id validation (empty or
+/// whitespace-only) is the loader's responsibility because `InvalidId` needs
+/// the pack directory for diagnostics.
 pub(crate) fn parse_skill_toml(text: &str, path: &Path) -> Result<SkillManifest, SkillsError> {
     let raw: RawSkillToml = toml::from_str(text).map_err(|e| SkillsError::ManifestParse {
         path: path.to_path_buf(),
         detail: e.to_string(),
     })?;
-    raw.into_manifest()
+    Ok(raw.into_manifest())
 }
 
 #[cfg(test)]
@@ -116,13 +117,12 @@ unknown_field = "ignored"
     }
 
     #[test]
-    fn whitespace_id_is_invalid() {
-        let err =
-            parse_skill_toml("id = \"   \"\n", Path::new("skill.toml")).expect_err("should error");
-        assert!(matches!(
-            err,
-            SkillsError::InvalidId { id } if id == "   "
-        ));
+    fn whitespace_id_is_trimmed_at_parse_level() {
+        // Id validation (which needs the pack directory for `InvalidId`) lives
+        // in the loader; the parser only normalizes the id.
+        let manifest = parse_skill_toml("id = \"   \"\n", Path::new("skill.toml"))
+            .expect("parse should succeed");
+        assert_eq!(manifest.id, "");
     }
 
     #[test]

@@ -18,6 +18,7 @@ use concerto_core::types::{CompletionRequest, CompletionUsage, Message, Role, To
 use concerto_core::{CancellationToken, OrchestratorError, TaskId};
 use concerto_providers::retry::{with_provider_retry, RetryPolicy};
 
+use crate::project_context::ProjectContext;
 use crate::skills_context::SkillsContext;
 
 /// Builds the full `CompletionRequest` for each agent cycle.
@@ -30,6 +31,9 @@ pub struct PromptBuilder {
     /// the current skills section is appended to the system prompt on every
     /// build, so a live refresh takes effect without rebuilding the builder.
     skills: Option<Arc<SkillsContext>>,
+    /// Run-scoped project AGENTS.md context (ADR-70). When set and non-empty,
+    /// the AGENTS section is appended after the skills section on every build.
+    project_context: Option<Arc<ProjectContext>>,
     /// The session's selected shell profile (ADR-28). Rendered into the
     /// OS/shell identity card appended to every built system prompt.
     /// `None` renders the card from OS facts plus the detected OS default
@@ -41,7 +45,12 @@ impl PromptBuilder {
     /// Create a new builder with the given system prompt template and no
     /// skills context.
     pub fn new(system_template: impl Into<String>) -> Self {
-        Self { system_template: system_template.into(), skills: None, shell_profile: None }
+        Self {
+            system_template: system_template.into(),
+            skills: None,
+            project_context: None,
+            shell_profile: None,
+        }
     }
 
     /// Create a builder that appends the enabled skills section to the system
@@ -50,7 +59,20 @@ impl PromptBuilder {
         system_template: impl Into<String>,
         skills: Option<Arc<SkillsContext>>,
     ) -> Self {
-        Self { system_template: system_template.into(), skills, shell_profile: None }
+        Self {
+            system_template: system_template.into(),
+            skills,
+            project_context: None,
+            shell_profile: None,
+        }
+    }
+
+    /// Attach the run-scoped project AGENTS.md context (ADR-70). When present
+    /// its section is appended after the skills section on every build. Pass
+    /// `None` to keep the current behavior.
+    pub fn with_project_context(mut self, project_context: Option<Arc<ProjectContext>>) -> Self {
+        self.project_context = project_context;
+        self
     }
 
     /// Attach the session's selected shell profile for the identity card.
@@ -89,6 +111,18 @@ impl PromptBuilder {
         // section is already formatted and budgeted by `SkillsContext`.
         if let Some(skills) = &self.skills {
             let section = skills.section();
+            if !section.is_empty() {
+                system.push_str("\n\n");
+                system.push_str(&section);
+            }
+        }
+
+        // Project AGENTS.md context (ADR-70): injected between the skills
+        // section and the identity card, matching the coordinator's assembly
+        // order (skills -> AGENTS -> environment card). Already formatted and
+        // per-file budgeted by `ProjectContext`.
+        if let Some(project_context) = &self.project_context {
+            let section = project_context.section();
             if !section.is_empty() {
                 system.push_str("\n\n");
                 system.push_str(&section);

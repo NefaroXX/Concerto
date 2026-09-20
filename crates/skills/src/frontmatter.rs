@@ -26,9 +26,18 @@ pub(crate) struct FrontMatter {
 
 /// Parse the front matter (and body) of a `SKILL.md` file.
 ///
+/// A single leading UTF-8 byte order mark (`\u{FEFF}`, written by some Windows
+/// editors and preserved by `fs::read_to_string`) is stripped before parsing,
+/// and CRLF line endings are tolerated (every line is normalized by
+/// `str::lines()`, so the body below the closing delimiter is re-joined with
+/// `\n`). An empty `id` value (`id:` alone) leaves the field unset; missing
+/// and explicit-empty ids are both handled by the loader, which falls back to
+/// the pack directory's name as the id (see `manager::validate_skill_id`).
+///
 /// Errors carry a human-readable reason only; the caller attaches the file
 /// path (`SkillsError::FrontMatter`).
 pub(crate) fn parse_front_matter(text: &str) -> Result<FrontMatter, String> {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     let Some(first) = lines.first() else {
         return Err("file is empty; expected `---` opening delimiter".into());
@@ -275,5 +284,50 @@ Body line two.
         let fm = parse_front_matter("---\ndescription: Use colons: here\n---\n")
             .expect("parse should succeed");
         assert_eq!(fm.description.as_deref(), Some("Use colons: here"));
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped_before_parsing() {
+        // Windows editors commonly save `SKILL.md` with a UTF-8 BOM; the BOM
+        // must not break the opening `---` delimiter check.
+        let fm = parse_front_matter("\u{FEFF}---\nid: bom-pack\n---\nbody\n")
+            .expect("BOM should be stripped");
+        assert_eq!(fm.id.as_deref(), Some("bom-pack"));
+        assert_eq!(fm.body, "body");
+    }
+
+    #[test]
+    fn crlf_line_endings_are_tolerated() {
+        let fm = parse_front_matter(
+            "---\r\nid: crlf-pack\r\nname: CRLF Pack\r\ntools:\r\n  - cargo test\r\nresources:\r\n  - fixtures/a.rs\r\n---\r\nLine one.\r\nLine two.\r\n",
+        )
+        .expect("CRLF should be tolerated");
+        assert_eq!(fm.id.as_deref(), Some("crlf-pack"));
+        assert_eq!(fm.name.as_deref(), Some("CRLF Pack"));
+        assert_eq!(fm.tools, vec!["cargo test"]);
+        assert_eq!(fm.resources, vec![PathBuf::from("fixtures/a.rs")]);
+        // The body is normalized to `\n` line endings by `str::lines()`.
+        assert_eq!(fm.body, "Line one.\nLine two.");
+    }
+
+    #[test]
+    fn bom_and_crlf_together() {
+        let fm = parse_front_matter("\u{FEFF}---\r\nid: both\r\n---\r\nbody\r\n")
+            .expect("BOM + CRLF should be tolerated");
+        assert_eq!(fm.id.as_deref(), Some("both"));
+        assert_eq!(fm.body, "body");
+    }
+
+    #[test]
+    fn empty_id_forms_leave_field_unset_or_explicitly_empty() {
+        // `id:` (empty value) leaves the field unset; both unset and
+        // explicit-empty ids are handled by the loader (which falls back to
+        // the pack directory's name as the id).
+        let fm = parse_front_matter("---\nid:\n---\n").expect("empty id value should parse");
+        assert_eq!(fm.id, None);
+        let fm = parse_front_matter("---\nid: \"\"\n---\n").expect("quoted empty id should parse");
+        assert_eq!(fm.id, Some(String::new()));
+        let fm = parse_front_matter("---\nid: \"  \"\n---\n").expect("whitespace id should parse");
+        assert_eq!(fm.id, Some("  ".to_string()));
     }
 }

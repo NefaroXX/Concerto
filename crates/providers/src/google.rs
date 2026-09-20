@@ -80,6 +80,41 @@ fn function_call_args(fc: &serde_json::Value) -> serde_json::Value {
     )
 }
 
+/// Read the opaque `thought_signature` from inside a Gemini `functionCall`
+/// object.
+///
+/// The wire spelling has varied: the API's own error text and early field
+/// dumps use snake_case `thought_signature`, while the canonical IR names the
+/// same field `thoughtSignature` (ARCHITECTURE-V2 §2.1). Both spellings are
+/// accepted so a capture never silently drops a signature.
+fn fc_thought_signature(fc: &serde_json::Value) -> Option<String> {
+    ["thought_signature", "thoughtSignature"]
+        .into_iter()
+        .filter_map(|key| fc.get(key))
+        .find_map(|value| value.as_str().map(str::to_owned))
+}
+
+/// Resolve the opaque `thought_signature` for one `functionCall` part, in
+/// every shape Gemini has emitted it.
+///
+/// The `functionCall` object itself is checked first (both spellings), then
+/// the part-level sibling keys (both spellings) — streaming responses have
+/// also placed the signature next to `functionCall` rather than inside it.
+fn function_call_thought_signature(
+    fc: &serde_json::Value,
+    part: &serde_json::Value,
+) -> Option<String> {
+    [
+        fc.get("thought_signature"),
+        fc.get("thoughtSignature"),
+        part.get("thought_signature"),
+        part.get("thoughtSignature"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| value.as_str().map(str::to_owned))
+}
+
 /// Parse one Gemini `functionCall` part into a canonical [`ToolCall`].
 ///
 /// Gemini provides no unique call IDs, so `counter` mints sequential `gc_<n>`
@@ -88,9 +123,12 @@ fn function_call_args(fc: &serde_json::Value) -> serde_json::Value {
 /// original nested shape (see [`crate::adapters::schema_loose`]).
 ///
 /// The opaque `thought_signature` the model attached to the part is preserved
-/// verbatim: Google's API requires it to be replayed on the next request that
-/// re-sends this function call, or the request 400s (see
-/// [`crate::adapters::google`]).
+/// verbatim (in either wire spelling, see [`fc_thought_signature`]): Google's
+/// API requires it to be replayed on the next request that re-sends this
+/// function call, or the request 400s (see [`crate::adapters::google`]). A
+/// signature carried as a *sibling* key of `functionCall` (rather than inside
+/// it) and the within-turn propagation to `None` siblings are handled by the
+/// stream state in [`GoogleStreamState::handle_event`].
 fn parse_function_call_part(
     fc: &serde_json::Value,
     counter: &mut u64,
@@ -107,7 +145,7 @@ fn parse_function_call_part(
     }
     *counter += 1;
     let id = format!("gc_{counter}");
-    let thought_signature = fc.get("thought_signature").and_then(|v| v.as_str()).map(str::to_owned);
+    let thought_signature = fc_thought_signature(fc);
     ToolCall { id, name, arguments: args, thought_signature }
 }
 
@@ -121,11 +159,59 @@ struct GoogleStreamState {
     /// Provider-reported usage captured from the final chunk's
     /// `usageMetadata` (ADR-48 §4); attached to the terminal chunk only.
     usage: Option<CompletionUsage>,
+    /// Tool calls parsed from the current assistant turn, held out of the
+    /// stream until the turn completes.
+    ///
+    /// Gemini attaches the opaque `thought_signature` to some `functionCall`
+    /// parts of a multi-call turn (usually only the first) while Google
+    /// requires every replayed sibling part to carry it too — `None` on any
+    /// part 400s the next request (`INVALID_ARGUMENT` at position 2+). Holding
+    /// the parsed calls until `finishReason` / `[DONE]` lets
+    /// [`Self::flush_pending_tool_calls`] backfill the turn-wide signature
+    /// onto `None` siblings before any chunk is emitted.
+    ///
+    /// The state lives per-stream and one stream is exactly one assistant
+    /// turn, so a signature captured here can never leak across turns.
+    pending_tool_calls: Vec<CompletionChunk>,
+    /// The opaque `thought_signature` observed anywhere in the current
+    /// assistant turn, used to backfill sibling `functionCall` parts that
+    /// omitted it. `None` when no part has carried one: the turn then emits
+    /// signature-less calls unchanged (fail-open, the legacy single-call wire
+    /// shape).
+    turn_thought_signature: Option<String>,
 }
 
 impl GoogleStreamState {
     fn new() -> Self {
-        Self { parser: BufferedSseParser::new(), usage: None }
+        Self {
+            parser: BufferedSseParser::new(),
+            usage: None,
+            pending_tool_calls: Vec::new(),
+            turn_thought_signature: None,
+        }
+    }
+
+    /// Drain the turn's parsed tool calls, backfilling any sibling that
+    /// arrives without a signature from the signature known elsewhere in the
+    /// same assistant turn.
+    ///
+    /// `None` siblings keep their `None` when the whole turn carried no
+    /// signature at all (fail-open), so this never fabricates a signature —
+    /// it only widens one the model already emitted somewhere in the same
+    /// turn.
+    fn flush_pending_tool_calls(&mut self) -> Vec<Result<CompletionChunk, ProviderError>> {
+        let known = self.turn_thought_signature.clone();
+        self.pending_tool_calls
+            .drain(..)
+            .map(|mut chunk| {
+                if let (Some(signature), Some(tool_call)) = (&known, chunk.tool_call.as_mut()) {
+                    if tool_call.thought_signature.is_none() {
+                        tool_call.thought_signature = Some(signature.clone());
+                    }
+                }
+                Ok(chunk)
+            })
+            .collect()
     }
 
     /// Capture Gemini's `usageMetadata` (ADR-48 §4).
@@ -169,6 +255,11 @@ impl GoogleStreamState {
         }
         let Some(data) = event.data else { return items };
         if data == "[DONE]" {
+            // End of the turn: drain any parsed tool calls (see
+            // [`Self::pending_tool_calls`]) before the terminal chunk so a
+            // stream that ended without an explicit finishReason still emits
+            // them.
+            items.extend(self.flush_pending_tool_calls());
             items.push(Ok(CompletionChunk {
                 reasoning: None,
                 delta: String::new(),
@@ -207,20 +298,42 @@ impl GoogleStreamState {
                                 // parts. Parse the name, args, and the opaque
                                 // `thought_signature` (replayed verbatim by
                                 // the dialect) into a ToolCall chunk.
-                                let tc = parse_function_call_part(fc, fc_counter, tool_adapted);
-                                items.push(Ok(CompletionChunk {
+                                let mut tc = parse_function_call_part(fc, fc_counter, tool_adapted);
+                                if tc.thought_signature.is_none() {
+                                    // Sibling / part-level fallback: the wire
+                                    // may attach the signature next to
+                                    // `functionCall` rather than inside it.
+                                    tc.thought_signature =
+                                        function_call_thought_signature(fc, part);
+                                }
+                                // Multi-call turns usually carry the signature
+                                // on the first part only; Google rejects the
+                                // replayed message unless every sibling part
+                                // carries it too. Hold the chunk until the
+                                // turn ends so
+                                // [`Self::flush_pending_tool_calls`] can
+                                // backfill the known signature onto `None`
+                                // siblings before any chunk is emitted.
+                                if let Some(signature) = &tc.thought_signature {
+                                    self.turn_thought_signature = Some(signature.clone());
+                                }
+                                self.pending_tool_calls.push(CompletionChunk {
                                     reasoning: None,
                                     delta: String::new(),
                                     tool_call: Some(tc),
                                     is_final: false,
                                     usage: None,
-                                }));
+                                });
                             }
                         }
                     }
                 }
                 if let Some(finish) = candidate["finishReason"].as_str() {
                     if !finish.is_empty() && finish != "STOP" {
+                        // A non-STOP terminal (MAX_TOKENS, SAFETY, ...) closes
+                        // the turn and the stream: flush sibling calls, then
+                        // the terminal chunk with usage.
+                        items.extend(self.flush_pending_tool_calls());
                         items.push(Ok(CompletionChunk {
                             reasoning: None,
                             delta: String::new(),
@@ -228,6 +341,12 @@ impl GoogleStreamState {
                             is_final: true,
                             usage: self.usage.take(),
                         }));
+                    } else if !finish.is_empty() {
+                        // Plain STOP closes the assistant turn; the [DONE]
+                        // sentinel still delivers the terminal usage chunk.
+                        // Flush the parsed calls now so a clean STOP (or a
+                        // truncated stream before [DONE]) never drops them.
+                        items.extend(self.flush_pending_tool_calls());
                     }
                 }
             }
@@ -368,6 +487,12 @@ impl LlmProvider for GoogleProvider {
             while let Some(chunk) = byte_stream.next().await {
                 // Check for cancellation before processing the chunk
                 if cancel.is_cancelled() {
+                    // A mid-turn cancel must not drop already-parsed sibling
+                    // calls: flush the pending turn with whatever signature is
+                    // known so far (possibly `None` — fail-open).
+                    for item in state.flush_pending_tool_calls() {
+                        yield item;
+                    }
                     break;
                 }
                 let items = match chunk {
@@ -392,6 +517,12 @@ impl LlmProvider for GoogleProvider {
                 for item in items {
                     yield item;
                 }
+            }
+            // The byte stream ended without an explicit terminal/[DONE]:
+            // flush any pending tool calls so a truncated stream never drops
+            // a parsed turn (already flushed by a finishReason — a no-op).
+            for item in state.flush_pending_tool_calls() {
+                yield item;
             }
         }
         .boxed();
@@ -549,6 +680,237 @@ mod tests {
         let tc = parse_function_call_part(&plain, &mut counter, false);
         assert_eq!(tc.thought_signature, None);
         assert_eq!(tc.id, "gc_2", "counter advances across parts");
+    }
+
+    /// The capture must not depend on the field's wire spelling. The API
+    /// error text and early dumps use snake_case `thought_signature`, while
+    /// the canonical IR names it `thoughtSignature` (ARCHITECTURE-V2 §2.1);
+    /// either may also sit as a *sibling* key of `functionCall` in a streamed
+    /// part. Every spelling and location is read.
+    #[test]
+    fn thought_signature_is_read_in_either_spelling_and_location() {
+        let mut counter = 0u64;
+
+        // camelCase on the functionCall object itself.
+        let fc_camel = serde_json::json!({"name": "shell", "args": {"command": "ls"}, "thoughtSignature": "sig-camel"});
+        let tc = parse_function_call_part(&fc_camel, &mut counter, false);
+        assert_eq!(tc.thought_signature.as_deref(), Some("sig-camel"));
+
+        // snake_case as a part-level sibling of `functionCall`.
+        let part = serde_json::json!({
+            "functionCall": {"name": "shell", "args": {"command": "ls"}},
+            "thought_signature": "sib-snake"
+        });
+        assert_eq!(
+            function_call_thought_signature(&part["functionCall"], &part).as_deref(),
+            Some("sib-snake")
+        );
+
+        // camelCase as a part-level sibling.
+        let part = serde_json::json!({
+            "functionCall": {"name": "shell", "args": {"command": "ls"}},
+            "thoughtSignature": "sib-camel"
+        });
+        assert_eq!(
+            function_call_thought_signature(&part["functionCall"], &part).as_deref(),
+            Some("sib-camel")
+        );
+
+        // The fc-level value wins over a conflicting sibling.
+        let part = serde_json::json!({
+            "functionCall": {"name": "shell", "args": {}, "thought_signature": "fc-snake"},
+            "thoughtSignature": "sib-camel"
+        });
+        assert_eq!(
+            function_call_thought_signature(&part["functionCall"], &part).as_deref(),
+            Some("fc-snake")
+        );
+
+        // Absent everywhere -> `None` (fail-open, the legacy single-call shape).
+        let part = serde_json::json!({"functionCall": {"name": "shell", "args": {}}});
+        assert_eq!(function_call_thought_signature(&part["functionCall"], &part), None);
+    }
+
+    /// A multi-call turn usually carries the opaque `thought_signature` on the
+    /// first `functionCall` part only; Google rejects the *replayed* message
+    /// unless every sibling part carries it too (`400 INVALID_ARGUMENT` at
+    /// position 2+). The stream must propagate the turn's known signature to
+    /// `None` siblings before emitting any chunk.
+    #[test]
+    fn stream_propagates_thought_signature_to_sibling_parts() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-9f2a"}},
+                        {"functionCall": {"name": "read_file", "args": {"path": "Cargo.toml"}}},
+                        {"functionCall": {"name": "grep", "args": {"pattern": "fn"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let chunks: Vec<CompletionChunk> = state
+            .handle_event(event(&payload.to_string()), &mut fc_counter, false)
+            .into_iter()
+            .map(|r| r.expect("chunk emitted"))
+            .collect();
+
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(calls.len(), 3, "all three parts parse to tool calls");
+        assert_eq!(calls[0].id, "gc_1", "sequential per-part ids minted in order");
+        assert_eq!(calls[2].id, "gc_3");
+        for call in &calls {
+            assert_eq!(
+                call.thought_signature.as_deref(),
+                Some("sig-9f2a"),
+                "every sibling functionCall part in the turn must replay the turn's signature: {call:?}"
+            );
+        }
+    }
+
+    /// Within one assistant turn the known signature carries forward across
+    /// streamed events: a sibling part arriving in a later chunk without a
+    /// signature still replays the signature captured earlier in the turn.
+    /// (Delayed emission until the turn closes is what makes this sound.)
+    #[test]
+    fn stream_propagates_signature_forward_across_events_within_turn() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let first = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-9f2a"}}
+                    ]
+                }
+            }]
+        });
+        let mut chunks: Vec<CompletionChunk> = state
+            .handle_event(event(&first.to_string()), &mut fc_counter, false)
+            .into_iter()
+            .map(|r| r.expect("chunk emitted"))
+            .collect();
+
+        let second = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "grep", "args": {"pattern": "fn"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        chunks.extend(
+            state
+                .handle_event(event(&second.to_string()), &mut fc_counter, false)
+                .into_iter()
+                .map(|r| r.expect("chunk emitted")),
+        );
+
+        assert_eq!(chunks.len(), 2, "one chunk per part, emitted at turn close");
+        for chunk in &chunks {
+            let call = chunk.tool_call.as_ref().expect("tool-call chunk");
+            assert_eq!(
+                call.thought_signature.as_deref(),
+                Some("sig-9f2a"),
+                "sibling emitted in a later event of the same turn must replay the signature: {call:?}"
+            );
+        }
+    }
+
+    /// A turn whose parts carry no signature anywhere emits its calls with
+    /// `None` unchanged (fail-open, the legacy single-call wire shape) — no
+    /// signature is ever fabricated just because a turn happened to carry
+    /// multiple calls.
+    #[test]
+    fn stream_without_signature_emits_none_sibling_calls() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "shell", "args": {"command": "ls"}}},
+                        {"functionCall": {"name": "grep", "args": {"pattern": "fn"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let chunks: Vec<CompletionChunk> = state
+            .handle_event(event(&payload.to_string()), &mut fc_counter, false)
+            .into_iter()
+            .map(|r| r.expect("chunk emitted"))
+            .collect();
+
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(
+                call.thought_signature, None,
+                "a turn with no signature anywhere must stay None, never fabricated: {call:?}"
+            );
+        }
+    }
+
+    /// A signature carried as a part-level sibling key (next to
+    /// `functionCall`, not inside it) is captured off the stream and carried
+    /// on the emitted tool call.
+    #[test]
+    fn stream_captures_part_level_sibling_signature() {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0u64;
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        };
+
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "shell", "args": {}}, "thought_signature": "sib-sig"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let chunks: Vec<CompletionChunk> = state
+            .handle_event(event(&payload.to_string()), &mut fc_counter, false)
+            .into_iter()
+            .map(|r| r.expect("chunk emitted"))
+            .collect();
+
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].thought_signature.as_deref(), Some("sib-sig"));
     }
 
     /// ADR-66 §4 family: the loose tier flattens nested properties for the

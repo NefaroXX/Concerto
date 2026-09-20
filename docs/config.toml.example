@@ -190,16 +190,20 @@ always = true
 # Tool plugins only are currently executable through the plugin bridge.
 # [plugins]
 # enabled = false
-# search_paths = ["~/.local/share/concerto/plugins"]
+# search_paths = ["~/.local/share/concerto/plugins"]  # when empty: <data-dir>/plugins
 # bundled_plugins_enabled = true
 # auto_load = true
 
 # Skills are local instruction packs injected into prompts (ADR-43). They
 # never execute code. Defaults shown here apply when the section is omitted.
 # NOTE: enabled defaults to false (ADR-43 decision 5 — explicit opt-in).
+# The default search paths are <data-dir>/concerto/skills (Linux
+# ~/.local/share, Windows %APPDATA%), then ./.concerto/skills; the legacy
+# literal ~/.local/share/concerto/skills is kept only when it differs from the
+# platform root. `~` and %VAR% references are expanded at discovery time.
 # [skills]
 # enabled = true
-# search_paths = ["~/.local/share/concerto/skills", "./.concerto/skills"]
+# search_paths = ["%APPDATA%\\concerto\\skills", "./.concerto/skills"]  # Windows example
 # auto_load = true
 # enabled_ids = ["rust-testing", "commit-style"]  # empty/unset = all discovered
 # max_chars = 4000  # cap on the injected skills section
@@ -216,6 +220,19 @@ always = true
 # env = {}
 # enabled = true
 # timeout_secs = 60  # per-call default, hard cap enforced in the bridge
+
+# Project AGENTS.md injection (ADR-70). Reads the global AGENTS.md at
+# <config_dir>/concerto/AGENTS.md plus the project's <root>/AGENTS.md and
+# appends both to the system prompt, truncated independently to max_bytes.
+# Default off until you opt in (injected into every prompt). Conflicts are
+# resolved project-over-global, with both sources named in the prompt.
+# <config_dir> is ~/.config on Linux and %APPDATA% on Windows.
+# [project_context]
+# enabled = true
+# global_path = "~/.config/concerto/AGENTS.md"  # default when unset (per-platform)
+# max_bytes = 32768  # 32 KiB per file; per-file truncation with a marker
+# auto_update_agents_md = false  # coordinator nudge only; never edits files
+# update_frequency = 1  # nudge every N dispatches when auto_update is on
 
 # The default crates.io update endpoint is not useful for an unpublished
 # source build. Disable it unless you provide an endpoint for your deployment.

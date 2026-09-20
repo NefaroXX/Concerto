@@ -29,6 +29,7 @@ orchestrator/
 ├── cycle.rs            # cycle detection
 ├── cycle_manager.rs    # cycle handling
 ├── planner.rs          # task planning
+├── project_context.rs  # run-scoped AGENTS.md context injection (ADR-70)
 ├── memory_serial.rs    # memory serialization
 ├── testing.rs          # test harness
 ├── registry.rs         # agent registry
@@ -60,6 +61,7 @@ orchestrator/
 | Relationships | `relationship.rs` |
 | Task planning | `planner.rs` |
 | Memory serialization | `memory_serial.rs` |
+| Project AGENTS.md context (ADR-70) | `project_context.rs` (`ProjectContext` — run-scoped, wired via `PromptBuilder::with_project_context` and `CoordinatorAgent::with_project_context`) |
 
 ## CONVENTIONS
 - **Agent trait** - specialists implement `ExpertAgent` and are resolved by

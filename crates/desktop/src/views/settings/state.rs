@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use concerto_api_types::extension::{McpToolDescriptor, SkillDescriptor};
@@ -6,7 +6,7 @@ use concerto_config::managed::ManagedRuntimeManager;
 use concerto_config::shell::ShellProfileConfig;
 use concerto_config::{
     AgentRelationshipConfig, AppConfig, ConditionDef, ManagedEnvConfig, McpConfig, McpServerConfig,
-    PolicyConfig, PolicyRuleDef, ProviderConfig, ShellSettings, SkillsConfig,
+    PolicyConfig, PolicyRuleDef, ProjectContextConfig, ProviderConfig, ShellSettings, SkillsConfig,
 };
 use concerto_providers::provider_defs::{
     picker_model_options, provider_definition, PROVIDER_TYPE_IDS,
@@ -17,10 +17,29 @@ use crate::theme::AppTheme;
 use super::helpers::default_managed_source;
 use super::message::SectionId;
 use super::{
-    readable_provider_label, Message, PolicyActionChoice, PolicyConditionChoice,
-    CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID, POLICY_ACTIONS,
-    POLICY_CONDITION_KINDS, POLICY_OPERATION_TOOLS, POLICY_TOOLS,
+    readable_provider_label, CreateParentOption, ExtensionTab, Message, PolicyActionChoice,
+    PolicyConditionChoice, CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID,
+    POLICY_ACTIONS, POLICY_CONDITION_KINDS, POLICY_OPERATION_TOOLS, POLICY_TOOLS,
 };
+
+/// A plugin installed in the canonical plugins directory, as listed by the
+/// Settings → Plugins tab. Transient view state: never persisted and never
+/// arms the dirty flag.
+///
+/// `load_error` carries a warning when the file could not be loaded (e.g. a
+/// hand-dropped malformed module) so even unreadable plugins stay visible in
+/// the list and deletable; `id` then falls back to the file stem.
+#[derive(Debug, Clone)]
+pub struct InstalledPluginInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub provides: String,
+    pub capability_summary: String,
+    pub wasm_path: PathBuf,
+    pub load_error: Option<String>,
+}
 
 pub struct State {
     // Theme / display
@@ -156,6 +175,33 @@ pub struct State {
     /// fresh best-effort manager, tolerating `NotActive`.
     pub plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>,
 
+    // ADR-37 — Plugin install / remove (Settings → Plugins)
+    /// Installer approval bridge attached by the App at startup
+    /// ([`Self::with_plugin_approval`]); drives the same capability dialog the
+    /// runtime uses, so install-time prompts are answered before any file is
+    /// written. `None` headless/tests.
+    pub plugin_approval: Option<crate::services::plugin_approval::PluginApprovalService>,
+    /// Plugins currently installed in the canonical plugins directory, folded
+    /// with their capability-grant summaries. Transient view state.
+    pub installed_plugins: Vec<InstalledPluginInfo>,
+    /// True once `installed_plugins` has been seeded (success or failure);
+    /// triggers the one lazy re-scan when the Plugins tab is first opened.
+    pub plugins_loaded: bool,
+    /// True while the directory re-scan is in flight (single-flight).
+    pub plugins_loading: bool,
+    /// Typed source path for the install card (also set by the file picker).
+    pub plugin_install_path: String,
+    /// Transient outcome line of the last install/replace/delete action.
+    pub plugin_install_result: Option<String>,
+    /// Single-flight gate for install/replace/delete tasks: the buttons render
+    /// inert while a task is in flight so the user cannot queue competing
+    /// plugin writes.
+    pub plugin_action_busy: bool,
+    /// True while the native file picker is open (install or replace).
+    pub plugin_picker_busy: bool,
+    /// Id whose delete-confirm prompt is armed, if any.
+    pub plugin_delete_confirm: Option<String>,
+
     // ADR-43 — Skills configuration
     /// Master skills toggle (`skills.enabled`).
     pub skills_enabled: bool,
@@ -163,6 +209,9 @@ pub struct State {
     pub skills_search_paths: Vec<String>,
     /// Whether auto-load of discovered skills is enabled (display only in v1).
     pub skills_auto_load: bool,
+    /// Per-skill prompt budget (`skills.max_chars`); display-only in v1 and
+    /// preserved verbatim on save.
+    pub skills_max_chars: Option<usize>,
     /// Discovered skill packs, populated lazily when the page opens.
     pub skills_discovered: Vec<SkillDescriptor>,
     /// True once a discovery run has completed (success or failure).
@@ -171,6 +220,16 @@ pub struct State {
     pub skills_loading: bool,
     /// Human-readable discovery failure, when the last run failed.
     pub skills_error: Option<String>,
+    /// Per-path/per-pack diagnostics from the last successful discovery run
+    /// (`resolved_paths`/`warnings`) — e.g. a configured search path that is
+    /// missing, or a pack skipped for a malformed manifest. Rendered under the
+    /// search-paths row so a "no skills found" result is explainable.
+    pub skills_warnings: Vec<String>,
+    /// Informational notes from the last successful discovery run (e.g. a pack
+    /// whose manifest id was empty loaded under its directory name). These are
+    /// not failures — the settings view renders them as muted info lines under
+    /// the search-paths row. Deduplicated like [`Self::skills_warnings`].
+    pub skills_notes: Vec<String>,
     /// True = all discovered skills are candidates (`enabled_ids: None`);
     /// false = `skills_enabled_ids` is the explicit allow-list.
     pub skills_allow_all: bool,
@@ -180,15 +239,173 @@ pub struct State {
     /// Transient view state; never persisted and never arms the dirty flag.
     pub skills_expanded: HashSet<String>,
 
+    // ADR-43 — skill pack CRUD (transient wizard / confirm state)
+    /// True while the skill-create wizard is open in the detail pane.
+    pub skill_create_open: bool,
+    /// New-pack id draft (`Id` field).
+    pub skill_create_id: String,
+    /// New-pack display-name draft.
+    pub skill_create_name: String,
+    /// New-pack version draft.
+    pub skill_create_version: String,
+    /// New-pack description draft.
+    pub skill_create_description: String,
+    /// New-pack inline instructions body.
+    pub skill_create_instructions: iced::widget::text_editor::Content,
+    /// New-pack parent directory (one of the configured search paths).
+    pub skill_create_parent: Option<CreateParentOption>,
+    /// Inline validation error for the id field.
+    pub skill_create_id_error: Option<String>,
+    /// Inline validation error for the parent field.
+    pub skill_create_parent_error: Option<String>,
+    /// True while a create/edit/delete task is in flight; gates the buttons so
+    /// the user cannot queue competing pack writes.
+    pub skill_crud_busy: bool,
+    /// Outcome line of the last create/edit/delete ("Saved…" / "Error: …").
+    pub skill_crud_result: Option<String>,
+    /// Id of the skill currently in edit mode (`None` = read-only detail).
+    pub skill_editing_id: Option<String>,
+    /// In-progress edit draft for `skill_editing_id`.
+    pub skill_edit_draft: Option<SkillEditDraft>,
+    /// Id of the skill whose delete-confirm prompt is open.
+    pub skill_delete_confirm: Option<String>,
+
     // ADR-43 — MCP configuration
     /// Master MCP toggle (`mcp.enabled`).
     pub mcp_enabled: bool,
-    /// Configured MCP servers (editable in v1: per-server enabled flag).
+    /// Configured MCP servers (editable in v1: per-server enabled flag,
+    /// add, edit, and delete; all persisted on Save Settings).
     pub mcp_servers: Vec<McpServerConfig>,
     /// Probe results keyed by server id. `Ok` = tool list, `Err` = error text.
     pub mcp_probe_results: HashMap<String, Result<Vec<McpToolDescriptor>, String>>,
     /// Server ids currently being probed.
     pub mcp_probing: HashSet<String>,
+    /// Id of the MCP server currently in edit mode; `None` = read-only
+    /// detail pane. Transient: entering edit mode never arms the dirty flag.
+    pub mcp_editing_id: Option<String>,
+    /// Draft fields for the in-progress MCP server edit. Present iff
+    /// [`Self::mcp_editing_id`] is set.
+    pub mcp_edit_draft: Option<McpEditDraft>,
+    /// Id of the MCP server whose deletion is awaiting confirmation.
+    /// Transient view state; the actual removal only happens on
+    /// [`Message::McpDeleteConfirmed`].
+    pub mcp_delete_confirm: Option<String>,
+    /// Draft fields for the in-progress MCP server add form. `Some` = the add
+    /// form is open in the detail pane. Transient view state: entering the
+    /// form never arms the dirty flag, and the new server only lands in
+    /// [`Self::mcp_servers`] (and eventually the config) on
+    /// [`Message::McpAddSaved`].
+    pub mcp_add_draft: Option<McpAddDraft>,
+
+    // Unified Extensions manager (ADR-37/43/70) — master-detail view state.
+    /// Active sub-tab of the Extensions section. Transient; never persisted.
+    pub active_extension_tab: ExtensionTab,
+    /// Selected skill id in the Skills tab (transient view state).
+    pub ext_selected_skill: Option<String>,
+    /// Selected MCP server id in the MCP tab (transient view state).
+    pub ext_selected_mcp: Option<String>,
+    /// Selected plugin id in the Plugins tab (transient view state).
+    pub ext_selected_plugin: Option<String>,
+
+    // ADR-70 — project AGENTS.md context injection
+    /// Master toggle (`project_context.enabled`); opt-in, defaults off.
+    pub project_context_enabled: bool,
+    /// Coordinator advisory nudge (`project_context.auto_update_agents_md`).
+    pub project_context_auto_update_agents_md: bool,
+    /// Nudge cadence in dispatches (`project_context.update_frequency`).
+    /// Display-only in this release.
+    pub project_context_update_frequency: u64,
+    /// Per-source character budget (`project_context.max_bytes`).
+    /// Display-only in this release.
+    pub project_context_max_bytes: Option<usize>,
+    /// Path to the user-global AGENTS.md (`project_context.global_path`).
+    /// Display-only in this release.
+    pub project_context_global_path: Option<String>,
+    /// True once the user edits the project-context block. A plain Settings
+    /// save/reload must neither publish the section from this snapshot nor
+    /// clobber a newer externally-written section (mirrors `relationship_dirty`).
+    pub project_context_dirty: bool,
+}
+
+/// Draft fields for an in-progress MCP server edit (ADR-43 edit/delete).
+///
+/// Seeded from the server's config on [`Message::McpEditPressed`] and applied
+/// back on [`Message::McpEditSaved`]. The `id` is intentionally not
+/// editable: it is the stable key namespacing tools as
+/// `mcp:<server_id>:<tool_name>`, so the config loader's id validation
+/// (non-empty, no `:`, unique — `McpConfig::validate`) is reused unchanged.
+/// Per-field `*_error` hold inline validation messages; `None` = valid.
+#[derive(Debug, Clone)]
+pub struct McpEditDraft {
+    /// Executable to spawn.
+    pub command: String,
+    /// Arguments joined with spaces (split back on save).
+    pub args: String,
+    /// Environment variables as key → value rows, rendered from the map's key
+    /// order (same editor pattern as the shell profiles). An empty map saves
+    /// as `env = none`.
+    pub env: BTreeMap<String, String>,
+    /// Per-call timeout in seconds; blank = crate default (60s).
+    pub timeout: String,
+    /// Inline error for the command field.
+    pub command_error: Option<String>,
+    /// Inline error for the environment rows (e.g. an empty key).
+    pub env_error: Option<String>,
+    /// Inline error for the timeout field.
+    pub timeout_error: Option<String>,
+}
+
+/// Draft fields for an in-progress MCP server add (ADR-43 add).
+///
+/// Mirrors [`McpEditDraft`] with the `id` editable — a brand-new server needs
+/// a key for its tool namespace `mcp:<server_id>:<tool_name>` — so validation
+/// mirrors `McpConfig::validate` (non-empty, no `:`, unique) plus the edit
+/// draft's command/env/timeout rules. Seeded blank on
+/// [`Message::McpAddPressed`]; on [`Message::McpAddSaved`] a valid draft is
+/// pushed into `mcp_servers` as a new [`McpServerConfig`], while an invalid
+/// draft keeps the form open with inline errors. Per-field `*_error` hold
+/// inline validation messages; `None` = valid.
+#[derive(Debug, Clone)]
+pub struct McpAddDraft {
+    /// Unique id, used to namespace tools as `mcp:<server_id>:<tool_name>`.
+    pub id: String,
+    /// Executable to spawn.
+    pub command: String,
+    /// Arguments joined with spaces (split back on save).
+    pub args: String,
+    /// Environment variables as key → value rows, rendered from the map's key
+    /// order (same editor pattern as the shell profiles). An empty map saves
+    /// as `env = none`.
+    pub env: BTreeMap<String, String>,
+    /// Per-call timeout in seconds; blank = crate default (60s).
+    pub timeout: String,
+    /// Inline error for the id field.
+    pub id_error: Option<String>,
+    /// Inline error for the command field.
+    pub command_error: Option<String>,
+    /// Inline error for the environment rows (e.g. an empty key).
+    pub env_error: Option<String>,
+    /// Inline error for the timeout field.
+    pub timeout_error: Option<String>,
+}
+
+/// In-progress edit of a discovered skill pack's `skill.toml` (ADR-43).
+/// Seeded by [`Message::SkillEditPressed`] from the discovered descriptor and
+/// written back by [`Message::SkillEditSaved`]. The pack `id` is not
+/// editable — it is the pack directory name (dotfile registration adds
+/// `skills.<id>` to `enabled_ids`) — so only `name`, `description`, and the
+/// inline `instructions` body are drafted; `version`, `tools`, and `resources`
+/// are preserved unchanged because nothing in the v1 editor manages them.
+///
+/// The instructions body is an iced `text_editor::Content`, which is not
+/// `Clone`; the draft is owned by the state and never derived.
+pub struct SkillEditDraft {
+    /// Display name; blank renders as the id.
+    pub name: String,
+    /// Short description shown in the detail pane.
+    pub description: String,
+    /// Inline instruction body (replaces `instructions_path` on save).
+    pub instructions: iced::widget::text_editor::Content,
 }
 
 impl State {
@@ -231,6 +448,7 @@ impl State {
         // MCP off with no servers).
         let skills = config.skills.clone().unwrap_or_default();
         let mcp = config.mcp.clone().unwrap_or_default();
+        let project_context = config.project_context.clone().unwrap_or_default();
 
         let mut state = Self {
             theme_names,
@@ -313,20 +531,63 @@ impl State {
             plugin_grants_summary: Vec::new(),
             plugin_revoke_result: None,
             plugin_manager: None,
+            plugin_approval: None,
+            installed_plugins: Vec::new(),
+            plugins_loaded: false,
+            plugins_loading: false,
+            plugin_install_path: String::new(),
+            plugin_install_result: None,
+            plugin_action_busy: false,
+            plugin_picker_busy: false,
+            plugin_delete_confirm: None,
             skills_enabled: skills.enabled,
             skills_search_paths: skills.search_paths.clone(),
             skills_auto_load: skills.auto_load,
+            skills_max_chars: skills.max_chars,
             skills_discovered: Vec::new(),
             skills_loaded: false,
             skills_loading: false,
             skills_error: None,
+            skills_warnings: Vec::new(),
+            skills_notes: Vec::new(),
             skills_allow_all: skills.enabled_ids.is_none(),
             skills_enabled_ids: skills.enabled_ids.clone().unwrap_or_default(),
             skills_expanded: HashSet::new(),
+            // Transient skill-pack CRUD state (ADR-43). All of it is
+            // wizard/confirm view state: nothing here persists directly and
+            // nothing here arms `settings_dirty`.
+            skill_create_open: false,
+            skill_create_id: String::new(),
+            skill_create_name: String::new(),
+            skill_create_version: "0.1.0".to_string(),
+            skill_create_description: String::new(),
+            skill_create_instructions: iced::widget::text_editor::Content::new(),
+            skill_create_parent: None,
+            skill_create_id_error: None,
+            skill_create_parent_error: None,
+            skill_crud_busy: false,
+            skill_crud_result: None,
+            skill_editing_id: None,
+            skill_edit_draft: None,
+            skill_delete_confirm: None,
             mcp_enabled: mcp.enabled,
             mcp_servers: mcp.servers.clone(),
             mcp_probe_results: HashMap::new(),
             mcp_probing: HashSet::new(),
+            mcp_editing_id: None,
+            mcp_edit_draft: None,
+            mcp_delete_confirm: None,
+            mcp_add_draft: None,
+            active_extension_tab: ExtensionTab::Skills,
+            ext_selected_skill: None,
+            ext_selected_mcp: mcp.servers.first().map(|server| server.id.clone()),
+            ext_selected_plugin: None,
+            project_context_enabled: project_context.enabled,
+            project_context_auto_update_agents_md: project_context.auto_update_agents_md,
+            project_context_update_frequency: project_context.update_frequency,
+            project_context_max_bytes: project_context.max_bytes,
+            project_context_global_path: project_context.global_path.clone(),
+            project_context_dirty: false,
         };
         let shell = config.resolved_shell_settings();
         state.shell_active_profile = shell.selected_profile_id().to_owned();
@@ -335,6 +596,13 @@ impl State {
         state.shell_new_env_key = String::new();
         state.shell_new_env_value = String::new();
         state.load_plugin_grants();
+        // Default the Plugins detail pane to the first granted plugin so the
+        // pane never opens empty when grants exist.
+        state.ext_selected_plugin = state.plugin_granted_ids.first().cloned();
+        // Default the skill-create wizard's parent picker to the first
+        // configured search path so a newly opened wizard is fully populated
+        // (mirrors the plugin leading-selection seeding above).
+        state.skill_create_parent = state.create_parent_options().into_iter().next();
         state.normalize_model_settings();
         state
     }
@@ -421,6 +689,24 @@ impl State {
         self.scanline_overlay_enabled = config.display.scanline_overlay_enabled;
     }
 
+    /// Refresh the project-context block from the live merged config.
+    ///
+    /// Same ownership rule as [`Self::sync_providers_from_config`] (ADR-57
+    /// §3d), scoped to the block the user actually edits: once the user toggles
+    /// anything on this tab (`project_context_dirty`), the form owns the block
+    /// until the next explicit save.
+    pub fn sync_project_context_from_config(&mut self, config: &AppConfig) {
+        if self.project_context_dirty {
+            return;
+        }
+        let project_context = config.project_context.clone().unwrap_or_default();
+        self.project_context_enabled = project_context.enabled;
+        self.project_context_auto_update_agents_md = project_context.auto_update_agents_md;
+        self.project_context_update_frequency = project_context.update_frequency;
+        self.project_context_max_bytes = project_context.max_bytes;
+        self.project_context_global_path = project_context.global_path.clone();
+    }
+
     /// Build the `AppConfig` fragments this page owns, merging onto `base`.
     pub fn to_config(&self, base: &AppConfig) -> AppConfig {
         let mut cfg = base.clone();
@@ -491,9 +777,23 @@ impl State {
             } else {
                 Some(self.skills_enabled_ids.clone())
             },
-            max_chars: base.skills.as_ref().and_then(|skills| skills.max_chars),
+            max_chars: self.skills_max_chars,
         });
         cfg.mcp = Some(McpConfig { enabled: self.mcp_enabled, servers: self.mcp_servers.clone() });
+
+        // ADR-70 — project context. Published only after an explicit edit here
+        // (`project_context_dirty`); otherwise the section is left untouched so
+        // an absent section stays absent and any external project-scoped edit
+        // survives the save.
+        if self.project_context_dirty {
+            cfg.project_context = Some(ProjectContextConfig {
+                enabled: self.project_context_enabled,
+                global_path: self.project_context_global_path.clone(),
+                max_bytes: self.project_context_max_bytes,
+                auto_update_agents_md: self.project_context_auto_update_agents_md,
+                update_frequency: self.project_context_update_frequency,
+            });
+        }
         cfg
     }
 
@@ -510,6 +810,39 @@ impl State {
             Ok(_) => Some("Must be a positive number".into()),
             Err(_) => Some("Must be a whole number".into()),
         }
+    }
+
+    /// Validate the timeout field of the MCP edit draft. Blank is valid (the
+    /// crate default is 60s); otherwise the value must be a whole number in
+    /// `1..=300` — the hard cap the MCP bridge enforces.
+    fn validate_mcp_timeout(s: &str) -> Option<String> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None; // blank is valid (means "use the 60s default")
+        }
+        match trimmed.parse::<u64>() {
+            Ok(0) => Some("Must be a positive number".into()),
+            Ok(v) if v > 300 => Some("Hard cap is 300 seconds".into()),
+            Ok(_) => None,
+            Err(_) => Some("Must be a whole number".into()),
+        }
+    }
+
+    /// Validate the id of an MCP add draft against the configured servers.
+    /// Mirrors `McpConfig::validate` (ADR-43 §4): non-empty, no `:` — tools
+    /// are namespaced `mcp:<server_id>:<tool_name>` — and unique.
+    fn mcp_add_id_error(mcp_servers: &[McpServerConfig], id: &str) -> Option<String> {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Some("Id is required".into());
+        }
+        if trimmed.contains(':') {
+            return Some("Id must not contain ':'".into());
+        }
+        if mcp_servers.iter().any(|server| server.id == trimmed) {
+            return Some("An MCP server with this id already exists".into());
+        }
+        None
     }
 
     pub(super) fn rule_display(rule: &PolicyRuleDef) -> String {
@@ -703,6 +1036,66 @@ impl State {
         self.plugin_manager = Some(plugin_manager);
     }
 
+    /// Attach the capability-approval bridge so the plugin installer can
+    /// prompt for capability grants before any file is written. The App passes
+    /// the same shared queue its runtime capability dialog consumes, so the
+    /// user answers install-time prompts in the familiar modal and
+    /// `GrantedPersistent` decisions land in the same persisted store.
+    pub fn with_plugin_approval(
+        &mut self,
+        pending: crate::widgets::capability_dialog::SharedPending,
+    ) {
+        self.plugin_approval =
+            Some(crate::services::plugin_approval::PluginApprovalService::new(pending));
+    }
+
+    /// Whether an install/replace/delete task is in flight (gates the plugins
+    /// tab's buttons).
+    pub fn plugin_action_in_flight(&self) -> bool {
+        self.plugin_action_busy
+    }
+
+    /// Re-scan the canonical plugins directory and fold capability-grant
+    /// summaries into the installed list. Sets the loading flag and returns
+    /// the task whose completion routes back as `PluginListRefreshResult`.
+    /// Idempotent: a second call while a run is in flight is a no-op.
+    pub fn start_plugin_list_refresh(&mut self) -> iced::Task<Message> {
+        if self.plugins_loading {
+            return iced::Task::none();
+        }
+        self.plugins_loading = true;
+        iced::Task::perform(
+            async move { super::helpers::list_installed_plugins().await },
+            Message::PluginListRefreshResult,
+        )
+    }
+
+    /// Start a plugin install/replace for `source` (typed path or picker
+    /// result). Enforces the single-flight gate; returns the task to run, or
+    /// `None` when already busy or the source is blank.
+    fn start_plugin_install(&mut self, source: String) -> Option<iced::Task<Message>> {
+        let trimmed = source.trim().to_string();
+        if trimmed.is_empty() || self.plugin_action_busy {
+            return None;
+        }
+        let approval = self.plugin_approval.clone();
+        let manager = self.plugin_manager.clone();
+        let store_dir = concerto_plugins::capability::CapabilityManager::data_dir();
+        self.plugin_action_busy = true;
+        Some(iced::Task::perform(
+            async move {
+                super::helpers::install_plugin(
+                    std::path::PathBuf::from(trimmed),
+                    store_dir,
+                    manager,
+                    approval,
+                )
+                .await
+            },
+            Message::PluginInstallResult,
+        ))
+    }
+
     /// Load plugin grants from the capability store and populate UI state.
     pub fn load_plugin_grants(&mut self) {
         let data_dir = dirs::data_dir()
@@ -729,6 +1122,14 @@ impl State {
                 tracing::error!(error = %e, "failed to open capability store for plugin grants UI");
                 self.plugin_granted_ids.clear();
                 self.plugin_grants_summary.clear();
+            }
+        }
+        // Keep the Plugins-tab selection valid: if the selected plugin was
+        // revoked (or the store changed underneath us), fall back to the
+        // first granted id.
+        if let Some(selected) = self.ext_selected_plugin.as_deref() {
+            if !self.plugin_granted_ids.iter().any(|id| id == selected) {
+                self.ext_selected_plugin = self.plugin_granted_ids.first().cloned();
             }
         }
     }
@@ -774,6 +1175,45 @@ impl State {
             async move { super::helpers::discover_skills(search_paths) },
             Message::SkillsDiscoveryResult,
         )
+    }
+
+    /// Parent-directory options for the skill-create wizard, derived from the
+    /// configured search paths. Each option shows the resolved absolute path
+    /// with an existence badge (the same rendering used in the Search paths
+    /// meta row), so the user picks an actual file path to write into.
+    pub fn create_parent_options(&self) -> Vec<CreateParentOption> {
+        self.skills_search_paths
+            .iter()
+            .map(|raw| CreateParentOption {
+                raw: raw.clone(),
+                label: super::resolved_path_label(raw, true),
+            })
+            .collect()
+    }
+
+    /// Validates a prospective new skill id against the same rules the skills
+    /// crate enforces when a pack is created: a non-empty single path
+    /// component after trimming (no `/`, `\`, `:`, or NUL; not `.`/`..`).
+    /// Returns a human-readable inline error, or `None` when the id is
+    /// acceptable. Mirrors `concerto-skills`' create/load id rules so a pack
+    /// the wizard can create is never rejected by discovery later.
+    fn skill_id_error(id: &str) -> Option<String> {
+        let trimmed = id.trim();
+        let invalid = trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.contains(':')
+            || trimmed.contains('\0');
+        if invalid {
+            Some(
+                "Id must be a single path component (no slashes, backslashes, colons, or NUL)."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
     }
 
     /// Switch the skills allow-list from "all discovered" (`enabled_ids:
@@ -1270,6 +1710,147 @@ impl State {
                 }
             }
 
+            // ADR-37 — Plugin install / remove. Transient view state and
+            // capability-store writes only: nothing here arms `settings_dirty`.
+            // The install/delete tasks run off the UI thread inside
+            // `Task::perform`; the callbacks re-read grants and re-scan the
+            // plugins directory.
+            Message::PluginInstallPathChanged(value) => {
+                self.plugin_install_path = value;
+            }
+            Message::PluginInstallBrowsePressed => {
+                if self.plugin_picker_busy {
+                    return iced::Task::none();
+                }
+                self.plugin_picker_busy = true;
+                return iced::Task::perform(
+                    super::helpers::pick_plugin_file(),
+                    Message::PluginBrowsePicked,
+                );
+            }
+            Message::PluginBrowsePicked(picked) => {
+                self.plugin_picker_busy = false;
+                if let Some(path) = picked {
+                    self.plugin_install_path = path;
+                }
+                return iced::Task::none();
+            }
+            Message::PluginInstallPressed => {
+                if let Some(task) = self.start_plugin_install(self.plugin_install_path.clone()) {
+                    return task;
+                }
+                if self.plugin_install_path.trim().is_empty() {
+                    self.plugin_install_result =
+                        Some("Enter a .wasm path or use Browse….".to_string());
+                }
+                return iced::Task::none();
+            }
+            Message::PluginReplacePressed => {
+                if self.plugin_picker_busy {
+                    return iced::Task::none();
+                }
+                self.plugin_picker_busy = true;
+                return iced::Task::perform(
+                    super::helpers::pick_plugin_file(),
+                    Message::PluginReplacePicked,
+                );
+            }
+            Message::PluginReplacePicked(picked) => {
+                self.plugin_picker_busy = false;
+                return match picked {
+                    // A picked replace source immediately starts the install
+                    // pipeline (which detects the existing file and changes
+                    // the grant flow to replace semantics).
+                    Some(path) => {
+                        self.plugin_install_path = path.clone();
+                        self.start_plugin_install(path).unwrap_or_else(iced::Task::none)
+                    }
+                    None => iced::Task::none(),
+                };
+            }
+            Message::PluginInstallResult(result) => {
+                self.plugin_action_busy = false;
+                self.plugin_install_result = Some(match &result {
+                    Ok(message) => message.clone(),
+                    Err(error) => format!("Error: {error}"),
+                });
+                if result.is_ok() {
+                    // A successful install wrote a new file: re-read grants
+                    // (hash pinning may have invalidated others) and re-scan
+                    // so the list reflects reality.
+                    self.load_plugin_grants();
+                    self.plugin_install_path = String::new();
+                    return self.start_plugin_list_refresh();
+                }
+                return iced::Task::none();
+            }
+            Message::PluginDeletePressed(id) => {
+                self.plugin_delete_confirm = Some(id);
+                return iced::Task::none();
+            }
+            Message::PluginDeleteCancelled(id) => {
+                if self.plugin_delete_confirm.as_deref() == Some(id.as_str()) {
+                    self.plugin_delete_confirm = None;
+                }
+                return iced::Task::none();
+            }
+            Message::PluginDeleteConfirmed(id) => {
+                if self.plugin_action_busy {
+                    return iced::Task::none();
+                }
+                self.plugin_delete_confirm = None;
+                let wasm_path = self
+                    .installed_plugins
+                    .iter()
+                    .find(|plugin| plugin.id == id)
+                    .map(|plugin| plugin.wasm_path.clone());
+                let manager = self.plugin_manager.clone();
+                self.plugin_action_busy = true;
+                return iced::Task::perform(
+                    async move { super::helpers::delete_plugin(id, wasm_path, manager).await },
+                    Message::PluginDeleteResult,
+                );
+            }
+            Message::PluginDeleteResult(result) => {
+                self.plugin_action_busy = false;
+                self.plugin_install_result = Some(match &result {
+                    Ok(message) => message.clone(),
+                    Err(error) => format!("Error: {error}"),
+                });
+                if result.is_ok() {
+                    self.load_plugin_grants();
+                    return self.start_plugin_list_refresh();
+                }
+                return iced::Task::none();
+            }
+            Message::PluginListRefreshRequested => return self.start_plugin_list_refresh(),
+            Message::PluginListRefreshResult(result) => {
+                self.plugins_loaded = true;
+                self.plugins_loading = false;
+                match result {
+                    Ok(infos) => {
+                        // Keep the selection valid against the refreshed list:
+                        // preserve it when still present, otherwise fall back
+                        // to the first installed plugin.
+                        let selected = self.ext_selected_plugin.clone();
+                        self.installed_plugins = infos;
+                        self.ext_selected_plugin = match selected {
+                            Some(id)
+                                if self.installed_plugins.iter().any(|plugin| plugin.id == id) =>
+                            {
+                                Some(id)
+                            }
+                            _ => self.installed_plugins.first().map(|plugin| plugin.id.clone()),
+                        };
+                    }
+                    Err(error) => {
+                        self.plugin_install_result =
+                            Some(format!("Error: plugin directory scan failed: {error}"));
+                    }
+                }
+                return iced::Task::none();
+            }
+
             // ADR-43 — Skills & MCP. Master toggles and allow-list edits arm
             // the dirty flag (they persist on Save Settings). Discovery and
             // probe results are transient view state and never arm it.
@@ -1311,11 +1892,293 @@ impl State {
                 self.skills_loading = false;
                 self.skills_loaded = true;
                 match result {
-                    Ok(skills) => {
-                        self.skills_discovered = skills;
+                    Ok(report) => {
+                        self.skills_discovered = report.descriptors;
+                        self.skills_warnings = dedupe_lines(report.warnings);
+                        self.skills_notes = dedupe_lines(report.notes);
                         self.skills_error = None;
+                        // Keep the master-detail selection valid: default to the
+                        // first pack when nothing is selected or the selected
+                        // id is no longer present in the discovered set.
+                        if self.ext_selected_skill.is_none()
+                            || !self
+                                .skills_discovered
+                                .iter()
+                                .any(|skill| self.ext_selected_skill.as_deref() == Some(&skill.id))
+                        {
+                            self.ext_selected_skill =
+                                self.skills_discovered.first().map(|skill| skill.id.clone());
+                        }
+                        // Discovery is the ground truth for what exists on disk:
+                        // drop dangling edit/delete state whose pack is gone
+                        // (removed on disk, or just deleted via the UI).
+                        let discovered_ids: HashSet<&str> =
+                            self.skills_discovered.iter().map(|skill| skill.id.as_str()).collect();
+                        if let Some(editing) = &self.skill_editing_id {
+                            if !discovered_ids.contains(editing.as_str()) {
+                                self.skill_editing_id = None;
+                                self.skill_edit_draft = None;
+                            }
+                        }
+                        if let Some(confirming) = &self.skill_delete_confirm {
+                            if !discovered_ids.contains(confirming.as_str()) {
+                                self.skill_delete_confirm = None;
+                            }
+                        }
                     }
-                    Err(error) => self.skills_error = Some(error),
+                    Err(error) => {
+                        self.skills_error = Some(error);
+                        self.skills_warnings = Vec::new();
+                        self.skills_notes = Vec::new();
+                    }
+                }
+            }
+
+            // ADR-43 — skill pack CRUD (create wizard / edit / delete).
+            // All of these are transient wizard/confirm/result messages: they
+            // never arm `settings_dirty`, and pack files only land on disk via
+            // the skills crate's create/update/delete operations inside the
+            // spawned task.
+            Message::SkillCreatePressed => {
+                // Opening the wizard resets the draft and drops the previous
+                // CRUD result (it described a different skill's operation).
+                self.skill_crud_result = None;
+                self.skill_create_id_error = None;
+                self.skill_create_parent_error = None;
+                self.skill_create_id = String::new();
+                self.skill_create_name = String::new();
+                self.skill_create_version = "0.1.0".to_string();
+                self.skill_create_description = String::new();
+                self.skill_create_instructions = iced::widget::text_editor::Content::new();
+                self.skill_create_parent = self.create_parent_options().into_iter().next();
+                self.skill_create_open = true;
+            }
+            Message::SkillCreateIdChanged(id) => {
+                self.skill_create_id = id.clone();
+                self.skill_create_id_error = Self::skill_id_error(&id);
+                self.skill_crud_result = None;
+            }
+            Message::SkillCreateNameChanged(name) => self.skill_create_name = name,
+            Message::SkillCreateVersionChanged(version) => self.skill_create_version = version,
+            Message::SkillCreateDescriptionChanged(description) => {
+                self.skill_create_description = description
+            }
+            Message::SkillCreateInstructionsChanged(action) => {
+                self.skill_create_instructions.perform(action);
+            }
+            Message::SkillCreateParentChanged(parent) => {
+                self.skill_create_parent = Some(parent);
+                self.skill_create_parent_error = None;
+                self.skill_crud_result = None;
+            }
+            Message::SkillCreateConfirmed => {
+                // Validate id and parent before touching the filesystem.
+                if let Some(error) = Self::skill_id_error(&self.skill_create_id) {
+                    self.skill_create_id_error = Some(error);
+                    return iced::Task::none();
+                }
+                let Some(parent_option) = self.skill_create_parent.clone() else {
+                    self.skill_create_parent_error = Some("Pick a parent directory.".to_string());
+                    return iced::Task::none();
+                };
+                self.skill_create_id_error = None;
+                self.skill_create_parent_error = None;
+                self.skill_crud_busy = true;
+                let parent = parent_option.raw;
+                let id = self.skill_create_id.trim().to_string();
+                let name = {
+                    let trimmed = self.skill_create_name.trim();
+                    if trimmed.is_empty() {
+                        id.clone()
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
+                let version = {
+                    let trimmed = self.skill_create_version.trim();
+                    if trimmed.is_empty() {
+                        "0.1.0".to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
+                let description = self.skill_create_description.trim().to_string();
+                let instructions = self.skill_create_instructions.text();
+                return iced::Task::perform(
+                    async move {
+                        super::helpers::create_skill_pack(
+                            parent,
+                            id,
+                            name,
+                            version,
+                            description,
+                            instructions,
+                        )
+                    },
+                    Message::SkillCreateResult,
+                );
+            }
+            Message::SkillCreateCancelled => {
+                self.skill_create_open = false;
+                self.skill_crud_result = None;
+                self.skill_create_id_error = None;
+                self.skill_create_parent_error = None;
+            }
+            Message::SkillCreateResult(result) => {
+                self.skill_crud_busy = false;
+                match result {
+                    Ok(outcome) => {
+                        self.skill_crud_result = Some(outcome);
+                        self.skill_create_open = false;
+                        self.skill_create_id_error = None;
+                        self.skill_create_parent_error = None;
+                        // The pack landed on disk; refresh so it shows up in the
+                        // discovered list (and becomes selectable).
+                        return self.start_skill_discovery();
+                    }
+                    Err(error) => {
+                        // Stay in the wizard so the user can correct the draft
+                        // (e.g. an id that already exists on disk).
+                        self.skill_crud_result = Some(format!("Error: {error}"));
+                    }
+                }
+            }
+            Message::SkillEditPressed(id) => {
+                let Some(skill) = self.skills_discovered.iter().find(|skill| skill.id == id) else {
+                    return iced::Task::none();
+                };
+                self.skill_crud_result = None;
+                self.skill_editing_id = Some(id);
+                self.skill_edit_draft = Some(SkillEditDraft {
+                    name: skill.manifest.name.clone(),
+                    description: skill.manifest.description.clone(),
+                    instructions: iced::widget::text_editor::Content::with_text(
+                        &skill.instructions,
+                    ),
+                });
+            }
+            Message::SkillEditNameChanged(name) => {
+                if let Some(draft) = &mut self.skill_edit_draft {
+                    draft.name = name;
+                }
+                self.skill_crud_result = None;
+            }
+            Message::SkillEditDescriptionChanged(description) => {
+                if let Some(draft) = &mut self.skill_edit_draft {
+                    draft.description = description;
+                }
+                self.skill_crud_result = None;
+            }
+            Message::SkillEditInstructionsChanged(action) => {
+                if let Some(draft) = &mut self.skill_edit_draft {
+                    draft.instructions.perform(action);
+                }
+                self.skill_crud_result = None;
+            }
+            Message::SkillEditSaved => {
+                let Some(id) = self.skill_editing_id.clone() else {
+                    return iced::Task::none();
+                };
+                let Some(skill) =
+                    self.skills_discovered.iter().find(|skill| skill.id == id).cloned()
+                else {
+                    // The pack vanished between discovery and now; leave edit
+                    // mode instead of writing to a gone directory.
+                    self.skill_editing_id = None;
+                    self.skill_edit_draft = None;
+                    return iced::Task::none();
+                };
+                let Some(draft) = &self.skill_edit_draft else {
+                    return iced::Task::none();
+                };
+                self.skill_crud_busy = true;
+                let pack_dir = skill.pack_dir.to_string_lossy().into_owned();
+                let name = {
+                    let trimmed = draft.name.trim();
+                    if trimmed.is_empty() {
+                        skill.id.clone()
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
+                let manifest = concerto_api_types::extension::SkillManifest {
+                    id: skill.id.clone(),
+                    name,
+                    version: skill.manifest.version.clone(),
+                    description: draft.description.trim().to_string(),
+                    instructions_path: None,
+                    instructions: Some(draft.instructions.text()),
+                    tools: skill.manifest.tools.clone(),
+                    resources: skill.manifest.resources.clone(),
+                };
+                return iced::Task::perform(
+                    async move { super::helpers::update_skill_pack(pack_dir, manifest) },
+                    Message::SkillEditResult,
+                );
+            }
+            Message::SkillEditCancelled => {
+                self.skill_editing_id = None;
+                self.skill_edit_draft = None;
+                self.skill_crud_result = None;
+            }
+            Message::SkillEditResult(result) => {
+                self.skill_crud_busy = false;
+                match result {
+                    Ok(outcome) => {
+                        self.skill_crud_result = Some(outcome);
+                        self.skill_editing_id = None;
+                        self.skill_edit_draft = None;
+                        return self.start_skill_discovery();
+                    }
+                    Err(error) => {
+                        // Stay in edit mode so the user can fix the draft (e.g.
+                        // a read-only pack directory).
+                        self.skill_crud_result = Some(format!("Error: {error}"));
+                    }
+                }
+            }
+            Message::SkillDeletePressed(id) => {
+                // First press only arms the confirm prompt (destructive action;
+                // same explicit-confirm rule as providers and MCP servers).
+                self.skill_delete_confirm = Some(id);
+                self.skill_crud_result = None;
+            }
+            Message::SkillDeleteCancelled(id) => {
+                if self.skill_delete_confirm.as_deref() == Some(id.as_str()) {
+                    self.skill_delete_confirm = None;
+                }
+            }
+            Message::SkillDeleteConfirmed(id) => {
+                // Clear the prompt immediately: the task below is the one
+                // destructive step, and the confirm row must not linger.
+                self.skill_delete_confirm = None;
+                let Some(pack_dir) = self
+                    .skills_discovered
+                    .iter()
+                    .find(|skill| skill.id == id)
+                    .map(|skill| skill.pack_dir.to_string_lossy().into_owned())
+                else {
+                    return iced::Task::none();
+                };
+                self.skill_crud_busy = true;
+                return iced::Task::perform(
+                    async move { super::helpers::delete_skill_pack(pack_dir) },
+                    Message::SkillDeleteResult,
+                );
+            }
+            Message::SkillDeleteResult(result) => {
+                self.skill_crud_busy = false;
+                match result {
+                    Ok(outcome) => {
+                        self.skill_crud_result = Some(outcome);
+                        // The pack is gone from disk; refresh so the list no
+                        // longer shows it. If it was selected, discovery
+                        // re-defaults the selection to the first remaining pack.
+                        return self.start_skill_discovery();
+                    }
+                    Err(error) => {
+                        self.skill_crud_result = Some(format!("Error: {error}"));
+                    }
                 }
             }
             Message::McpEnabledToggled(enabled) => {
@@ -1344,6 +2207,361 @@ impl State {
                 self.mcp_probe_results.insert(id, result);
             }
 
+            // ADR-43 — MCP server edit/delete. The draft is transient view
+            // state: field edits mutate only the draft and never arm the
+            // dirty flag. The pending config changes only when a draft is
+            // committed (`McpEditSaved`) or a server is confirmed for
+            // deletion (`McpDeleteConfirmed`), and is persisted by the
+            // regular Save Settings flow.
+            Message::McpEditPressed(id) => {
+                let Some(server) = self.mcp_servers.iter().find(|server| server.id == id).cloned()
+                else {
+                    return iced::Task::none();
+                };
+                self.mcp_editing_id = Some(server.id.clone());
+                self.mcp_edit_draft = Some(McpEditDraft {
+                    command: server.command,
+                    args: server.args.join(" "),
+                    env: server.env.unwrap_or_default(),
+                    timeout: server.timeout_secs.map(|secs| secs.to_string()).unwrap_or_default(),
+                    command_error: None,
+                    env_error: None,
+                    timeout_error: None,
+                });
+            }
+            Message::McpEditCancelled => {
+                self.mcp_editing_id = None;
+                self.mcp_edit_draft = None;
+            }
+            Message::McpEditCommandChanged(value) => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    draft.command = value;
+                    draft.command_error = None;
+                }
+            }
+            Message::McpEditArgsChanged(value) => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    draft.args = value;
+                }
+            }
+            Message::McpEditEnvKeyChanged(index, value) => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(old) = keys.get(index) {
+                        if let Some(env_value) = draft.env.remove(old) {
+                            draft.env.insert(value, env_value);
+                        }
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpEditEnvValueChanged(index, value) => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(key) = keys.get(index) {
+                        draft.env.insert(key.clone(), value);
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpEditEnvAdd => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    // Pick the first unused VAR{n} name so empty/duplicate
+                    // keys cannot be introduced by the Add button.
+                    let mut n = 1;
+                    while draft.env.contains_key(&format!("VAR{n}")) {
+                        n += 1;
+                    }
+                    draft.env.insert(format!("VAR{n}"), String::new());
+                    draft.env_error = None;
+                }
+            }
+            Message::McpEditEnvRemove(index) => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(key) = keys.get(index) {
+                        draft.env.remove(key);
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpEditTimeoutChanged(value) => {
+                if let Some(draft) = &mut self.mcp_edit_draft {
+                    draft.timeout = value;
+                    draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
+                }
+            }
+            Message::McpEditSaved => {
+                let Some(id) = self.mcp_editing_id.clone() else {
+                    return iced::Task::none();
+                };
+                let Some(mut draft) = self.mcp_edit_draft.take() else {
+                    return iced::Task::none();
+                };
+                // Inline validation: keep the user in edit mode with the
+                // errors visible; only a valid draft is applied.
+                draft.command_error = if draft.command.trim().is_empty() {
+                    Some("Command is required".into())
+                } else {
+                    None
+                };
+                draft.env_error = if draft.env.keys().any(|key| key.trim().is_empty()) {
+                    Some("Environment keys must not be empty".into())
+                } else {
+                    None
+                };
+                draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
+                if draft.command_error.is_some()
+                    || draft.env_error.is_some()
+                    || draft.timeout_error.is_some()
+                {
+                    self.mcp_edit_draft = Some(draft);
+                    return iced::Task::none();
+                }
+                if let Some(server) = self.mcp_servers.iter_mut().find(|server| server.id == id) {
+                    server.command = draft.command.trim().to_string();
+                    server.args = draft.args.split_whitespace().map(String::from).collect();
+                    server.env = Some(draft.env).filter(|vars| !vars.is_empty());
+                    server.timeout_secs = draft.timeout.trim().parse::<u64>().ok();
+                    self.settings_dirty = true;
+                }
+                self.mcp_editing_id = None;
+                self.mcp_edit_draft = None;
+                // A committed edit invalidates the last probe result for the
+                // server (it described the previous command line).
+                self.mcp_probe_results.remove(&id);
+            }
+            Message::McpDeletePressed(id) => {
+                // Toggle the confirm prompt; the destructive removal only
+                // happens on McpDeleteConfirmed (same explicit-confirm rule
+                // as provider deletion, plan §5.3). Arming is transient and
+                // never arms the dirty flag.
+                if self.mcp_delete_confirm.as_deref() == Some(id.as_str()) {
+                    self.mcp_delete_confirm = None;
+                } else {
+                    self.mcp_delete_confirm = Some(id);
+                }
+            }
+            Message::McpDeleteCancelled(id) => {
+                if self.mcp_delete_confirm.as_deref() == Some(id.as_str()) {
+                    self.mcp_delete_confirm = None;
+                }
+            }
+            Message::McpDeleteConfirmed(id) => {
+                if self.mcp_delete_confirm.as_deref() != Some(id.as_str()) {
+                    return iced::Task::none();
+                }
+                let Some(index) = self.mcp_servers.iter().position(|server| server.id == id) else {
+                    self.mcp_delete_confirm = None;
+                    return iced::Task::none();
+                };
+                self.mcp_servers.remove(index);
+                self.mcp_delete_confirm = None;
+                // Drop transient state that referenced the deleted server:
+                // an open edit draft, probe results, and the selection.
+                if self.mcp_editing_id.as_deref() == Some(id.as_str()) {
+                    self.mcp_editing_id = None;
+                    self.mcp_edit_draft = None;
+                }
+                if self.ext_selected_mcp.as_deref() == Some(id.as_str()) {
+                    self.ext_selected_mcp =
+                        self.mcp_servers.first().map(|server| server.id.clone());
+                }
+                self.mcp_probe_results.remove(&id);
+                self.mcp_probing.remove(&id);
+                self.settings_dirty = true;
+            }
+
+            // ADR-43 — MCP server add. The add draft is transient view state:
+            // field edits mutate only the draft and never arm the dirty flag.
+            // A committed add pushes a new server into `mcp_servers` and arms
+            // the dirty flag, so it persists through the regular Save Settings
+            // flow (next-run semantics).
+            Message::McpAddPressed => {
+                // Opening the add form leaves any in-progress edit/delete
+                // state: the detail pane is given over to the new-server form.
+                self.mcp_editing_id = None;
+                self.mcp_edit_draft = None;
+                self.mcp_delete_confirm = None;
+                self.mcp_add_draft = Some(McpAddDraft {
+                    id: String::new(),
+                    command: String::new(),
+                    args: String::new(),
+                    env: BTreeMap::new(),
+                    timeout: String::new(),
+                    id_error: None,
+                    command_error: None,
+                    env_error: None,
+                    timeout_error: None,
+                });
+            }
+            Message::McpAddCancelled => {
+                self.mcp_add_draft = None;
+            }
+            Message::McpAddIdChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.id = value;
+                    draft.id_error = Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim());
+                }
+            }
+            Message::McpAddCommandChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.command = value;
+                    draft.command_error = None;
+                }
+            }
+            Message::McpAddArgsChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.args = value;
+                }
+            }
+            Message::McpAddEnvKeyChanged(index, value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(old) = keys.get(index) {
+                        if let Some(env_value) = draft.env.remove(old) {
+                            draft.env.insert(value, env_value);
+                        }
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddEnvValueChanged(index, value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(key) = keys.get(index) {
+                        draft.env.insert(key.clone(), value);
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddEnvAdd => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    // Pick the first unused VAR{n} name so empty/duplicate
+                    // keys cannot be introduced by the Add button.
+                    let mut n = 1;
+                    while draft.env.contains_key(&format!("VAR{n}")) {
+                        n += 1;
+                    }
+                    draft.env.insert(format!("VAR{n}"), String::new());
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddEnvRemove(index) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    let keys: Vec<String> = draft.env.keys().cloned().collect();
+                    if let Some(key) = keys.get(index) {
+                        draft.env.remove(key);
+                    }
+                    draft.env_error = None;
+                }
+            }
+            Message::McpAddTimeoutChanged(value) => {
+                if let Some(draft) = &mut self.mcp_add_draft {
+                    draft.timeout = value;
+                    draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
+                }
+            }
+            Message::McpAddSaved => {
+                let Some(mut draft) = self.mcp_add_draft.take() else {
+                    return iced::Task::none();
+                };
+                // Inline validation mirrors `McpConfig::validate` plus the
+                // edit draft's command/env/timeout rules. Keep the form open
+                // with the errors visible; only a valid draft is applied.
+                draft.id_error = Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim());
+                draft.command_error = if draft.command.trim().is_empty() {
+                    Some("Command is required".into())
+                } else {
+                    None
+                };
+                draft.env_error = if draft.env.keys().any(|key| key.trim().is_empty()) {
+                    Some("Environment keys must not be empty".into())
+                } else {
+                    None
+                };
+                draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
+                if draft.id_error.is_some()
+                    || draft.command_error.is_some()
+                    || draft.env_error.is_some()
+                    || draft.timeout_error.is_some()
+                {
+                    self.mcp_add_draft = Some(draft);
+                    return iced::Task::none();
+                }
+                let id = draft.id.trim().to_string();
+                self.mcp_servers.push(McpServerConfig {
+                    id: id.clone(),
+                    command: draft.command.trim().to_string(),
+                    args: draft.args.split_whitespace().map(String::from).collect(),
+                    env: Some(draft.env).filter(|vars| !vars.is_empty()),
+                    enabled: true,
+                    timeout_secs: draft.timeout.trim().parse::<u64>().ok(),
+                });
+                // Select the new server so its read-only detail renders
+                // instead of the empty "No server selected" pane.
+                self.ext_selected_mcp = Some(id);
+                self.mcp_add_draft = None;
+                self.settings_dirty = true;
+            }
+
+            // Unified Extensions manager (ADR-37/43/70). Tab switching and
+            // master-list selection are transient view state: they never arm
+            // the dirty flag and are never persisted.
+            Message::ExtensionTabSelected(tab) => {
+                self.active_extension_tab = tab;
+                if tab == ExtensionTab::Plugins {
+                    // The installed-plugin list is scanned once, lazily, the
+                    // first time the tab is opened (mirrors skill discovery).
+                    if !self.plugins_loaded && !self.plugins_loading {
+                        return self.start_plugin_list_refresh();
+                    }
+                }
+            }
+            Message::ExtensionItemSelected(tab, id) => {
+                match tab {
+                    ExtensionTab::Skills => {
+                        // A CRUD outcome belongs to the previously selected
+                        // skill; drop it so the next selection never shows a
+                        // stale result line.
+                        self.skill_crud_result = None;
+                        self.ext_selected_skill = Some(id);
+                    }
+                    ExtensionTab::Mcp => self.ext_selected_mcp = Some(id),
+                    ExtensionTab::Plugins => {
+                        // A revoke or delete outcome belongs to the previously
+                        // selected plugin; drop it so the next selection never
+                        // shows a stale result line.
+                        self.plugin_revoke_result = None;
+                        self.plugin_install_result = None;
+                        self.plugin_delete_confirm = None;
+                        self.ext_selected_plugin = Some(id);
+                    }
+                    // The project-context tab has no item list.
+                    ExtensionTab::ProjectContext => {}
+                }
+            }
+
+            // ADR-70 — project AGENTS.md context injection. Persisted on Save
+            // Settings; each edit explicitly arms `project_context_dirty` so a
+            // plain save never publishes the startup snapshot.
+            Message::ProjectContextEnabledToggled(enabled) => {
+                self.settings_dirty = true;
+                self.project_context_dirty = true;
+                self.project_context_enabled = enabled;
+                // Disabling the feature also quiets the nudge: ADR-70 gates the
+                // advisory on the whole feature being active, so leaving the
+                // nudge on after a disable would be dead config.
+                if !enabled {
+                    self.project_context_auto_update_agents_md = false;
+                }
+            }
+            Message::ProjectContextNudgeToggled(enabled) => {
+                self.settings_dirty = true;
+                self.project_context_dirty = true;
+                self.project_context_auto_update_agents_md = enabled;
+            }
+
             // Shell messages are delegated to handle_shell_message in shell.rs.
             // They modify settings state and only persist on Save Settings.
             other => {
@@ -1353,6 +2571,16 @@ impl State {
         }
         iced::Task::none()
     }
+}
+
+/// Collapse duplicates while preserving first-occurrence order.
+///
+/// Discovery diagnostics can repeat — e.g. two configured search paths that
+/// resolve to the same tree, or one pack discovered through an overlapping
+/// path scan. The settings list renders each line once.
+fn dedupe_lines(lines: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    lines.into_iter().filter(|line| seen.insert(line.clone())).collect()
 }
 
 #[cfg(test)]
@@ -1374,6 +2602,7 @@ mod tests {
                 resources: Vec::new(),
             },
             instructions: "do the thing".to_string(),
+            pack_dir: PathBuf::new(),
             resource_paths: Vec::new(),
         }
     }
@@ -1490,19 +2719,45 @@ mod tests {
     fn skills_discovery_result_updates_state() {
         let mut state = State::from_config(&AppConfig::default());
         state.skills_loading = true;
-        let discovered = vec![skill("rust-testing")];
+        let report = concerto_skills::DiscoveryReport {
+            resolved_paths: vec![PathBuf::from("/nonexistent/skills")],
+            descriptors: vec![skill("rust-testing")],
+            warnings: vec![
+                "`/nonexistent/skills` is missing or not a directory; skipping".into(),
+                // Duplicate diagnostics (e.g. two search paths resolving to the
+                // same tree) must be collapsed by the state layer.
+                "`/nonexistent/skills` is missing or not a directory; skipping".into(),
+            ],
+            notes: vec![
+                "Skill 'rust-testing' loaded via directory name".into(),
+                "Skill 'rust-testing' loaded via directory name".into(),
+            ],
+        };
 
-        let _ = state.update(Message::SkillsDiscoveryResult(Ok(discovered.clone())));
+        let _ = state.update(Message::SkillsDiscoveryResult(Ok(report)));
 
         assert!(!state.skills_loading, "loading flag must clear after a result");
         assert!(state.skills_loaded);
         assert!(state.skills_error.is_none());
-        assert_eq!(state.skills_discovered, discovered);
+        assert_eq!(state.skills_discovered, vec![skill("rust-testing")]);
+        assert_eq!(
+            state.skills_warnings,
+            vec!["`/nonexistent/skills` is missing or not a directory; skipping".to_string()],
+            "duplicate warnings must be collapsed"
+        );
+        assert_eq!(
+            state.skills_notes,
+            vec!["Skill 'rust-testing' loaded via directory name".to_string()],
+            "discovery notes must be surfaced and duplicates collapsed"
+        );
 
-        // An error records the message without touching discovered skills.
+        // An error records the message without touching discovered skills;
+        // warnings and notes from the previous run are cleared.
         let _ = state.update(Message::SkillsDiscoveryResult(Err("boom".into())));
         assert!(state.skills_loaded);
         assert_eq!(state.skills_error.as_deref(), Some("boom"));
+        assert!(state.skills_warnings.is_empty());
+        assert!(state.skills_notes.is_empty(), "notes must not leak across a failed run");
         assert!(
             !state.settings_dirty,
             "discovery results are transient and must not arm the dirty flag"
@@ -1534,6 +2789,163 @@ mod tests {
 
         let _ = state.update(Message::SkillExpandToggled("rust-testing".into()));
         assert!(!state.skills_expanded.contains("rust-testing"));
+    }
+
+    #[test]
+    fn skill_id_error_rejects_bad_ids_and_accepts_good_ones() {
+        assert!(State::skill_id_error("rust-testing").is_none());
+        assert!(
+            State::skill_id_error("  rust-testing  ").is_none(),
+            "leading/trailing whitespace is tolerated (trimmed before validation)"
+        );
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "a:b"] {
+            assert!(State::skill_id_error(bad).is_some(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn skill_create_wizard_validates_id_and_parent_before_writing() {
+        let mut state = State::from_config(&AppConfig::default());
+        let _ = state.update(Message::SkillCreatePressed);
+        assert!(state.skill_create_open);
+        assert!(
+            state.skill_create_parent.is_some(),
+            "opening the wizard seeds the parent picker from the configured search paths"
+        );
+        assert!(!state.settings_dirty, "opening the wizard must not arm the dirty flag");
+
+        // Invalid id → nothing is spawned and the inline error surfaces.
+        let _ = state.update(Message::SkillCreateIdChanged("a/b".into()));
+        let task = state.update(Message::SkillCreateConfirmed);
+        assert_eq!(task.units(), 0, "an invalid wizard must not spawn a write task");
+        assert!(state.skill_create_open, "the wizard stays open for correction");
+        assert!(state.skill_create_id_error.is_some());
+        assert!(!state.settings_dirty);
+        assert!(!state.skill_crud_busy, "a rejected confirm must not arm busy");
+
+        // A missing parent (e.g. no search paths configured) is also rejected.
+        state.skill_create_parent = None;
+        let _ = state.update(Message::SkillCreateIdChanged("rust-testing".into()));
+        let task = state.update(Message::SkillCreateConfirmed);
+        assert_eq!(task.units(), 0);
+        assert!(state.skill_create_parent_error.is_some());
+
+        // A valid id + parent schedules a create task and clears both errors.
+        let _ = state.update(Message::SkillCreateParentChanged(CreateParentOption {
+            raw: "/nonexistent/parent/skills".into(),
+            label: "/nonexistent/parent/skills (missing)".into(),
+        }));
+        let task = state.update(Message::SkillCreateConfirmed);
+        assert_eq!(task.units(), 1, "a valid wizard must spawn a create task");
+        assert!(state.skill_crud_busy);
+        assert!(state.skill_create_id_error.is_none());
+        assert!(state.skill_create_parent_error.is_none());
+    }
+
+    #[test]
+    fn skill_crud_transients_never_arm_dirty_flag() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.skills_discovered = vec![skill("rust-testing")];
+        state.ext_selected_skill = Some("rust-testing".into());
+
+        let _ = state.update(Message::SkillCreatePressed);
+        let _ = state.update(Message::SkillCreateIdChanged("new-skill".into()));
+        let _ = state.update(Message::SkillCreateNameChanged("New Skill".into()));
+        let _ = state.update(Message::SkillCreateInstructionsChanged(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Enter),
+        ));
+        let _ = state.update(Message::SkillCreateCancelled);
+
+        let _ = state.update(Message::SkillEditPressed("rust-testing".into()));
+        let _ = state.update(Message::SkillEditNameChanged("Renamed".into()));
+        assert!(state.skill_edit_draft.is_some());
+        let _ = state.update(Message::SkillEditCancelled);
+        assert!(state.skill_edit_draft.is_none());
+
+        let _ = state.update(Message::SkillDeletePressed("rust-testing".into()));
+        assert_eq!(state.skill_delete_confirm.as_deref(), Some("rust-testing"));
+        let _ = state.update(Message::SkillDeleteCancelled("rust-testing".into()));
+        assert!(state.skill_delete_confirm.is_none());
+
+        assert!(
+            !state.settings_dirty,
+            "wizard/edit/delete transients must never arm the dirty flag"
+        );
+    }
+
+    #[test]
+    fn skill_delete_confirmed_spawns_delete_task() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.skills_discovered = vec![skill("rust-testing")];
+
+        let task = state.update(Message::SkillDeleteConfirmed("rust-testing".into()));
+        assert_eq!(task.units(), 1, "a confirmed delete spawns the delete task");
+        assert!(state.skill_crud_busy);
+        assert!(
+            state.skill_delete_confirm.is_none(),
+            "the confirm prompt clears immediately when the task is spawned"
+        );
+    }
+
+    #[test]
+    fn skill_edit_pressed_seeds_draft_from_descriptor() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.skills_discovered = vec![skill("rust-testing")];
+
+        let _ = state.update(Message::SkillEditPressed("rust-testing".into()));
+        let draft = state.skill_edit_draft.as_ref().expect("draft must be seeded");
+        assert_eq!(draft.name, "rust-testing", "name seeds from the manifest name");
+        assert_eq!(draft.description, "test skill");
+        assert_eq!(draft.instructions.text(), "do the thing");
+
+        let _ = state.update(Message::SkillEditSaved);
+        assert!(state.skill_crud_busy, "saving the draft schedules the update task");
+    }
+
+    #[test]
+    fn skill_discovery_result_drops_dangling_edit_and_delete_state() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.skills_discovered = vec![skill("kept")];
+        state.skill_editing_id = Some("gone".into());
+        state.skill_edit_draft = Some(SkillEditDraft {
+            name: "gone".into(),
+            description: String::new(),
+            instructions: iced::widget::text_editor::Content::new(),
+        });
+        state.skill_delete_confirm = Some("gone".into());
+
+        let report = concerto_skills::DiscoveryReport {
+            resolved_paths: vec![PathBuf::from("/nonexistent/skills")],
+            descriptors: vec![skill("kept")],
+            warnings: Vec::new(),
+            notes: Vec::new(),
+        };
+        let _ = state.update(Message::SkillsDiscoveryResult(Ok(report)));
+
+        assert!(state.skill_editing_id.is_none(), "edit state for a vanished pack must be dropped");
+        assert!(state.skill_edit_draft.is_none());
+        assert!(
+            state.skill_delete_confirm.is_none(),
+            "confirm state for a vanished pack must be dropped"
+        );
+        assert_eq!(state.skills_discovered, vec![skill("kept")]);
+    }
+
+    #[test]
+    fn ext_selection_change_clears_stale_skill_crud_result() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.skills_discovered = vec![skill("rust-testing"), skill("code-review")];
+        state.ext_selected_skill = Some("rust-testing".into());
+        state.skill_crud_result = Some("Saved '/tmp/pack'".into());
+
+        let _ = state
+            .update(Message::ExtensionItemSelected(ExtensionTab::Skills, "code-review".into()));
+
+        assert_eq!(state.ext_selected_skill.as_deref(), Some("code-review"));
+        assert!(
+            state.skill_crud_result.is_none(),
+            "a CRUD outcome belongs to the previously selected skill and must not leak"
+        );
     }
 
     // ── ADR-43 — MCP config and probe state ───────────────────────────────
@@ -1622,6 +3034,321 @@ mod tests {
         assert!(state.mcp_probing.is_empty());
     }
 
+    // ── ADR-43 — MCP server edit/delete ───────────────────────────────────
+
+    #[test]
+    fn mcp_edit_pressed_seeds_draft_and_save_applies_changes() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        // Seed an env and timeout so the draft seed + apply path covers them.
+        state.mcp_servers[0].env = Some([("API_KEY".to_string(), "s3cret".to_string())].into());
+        state.mcp_servers[0].timeout_secs = Some(120);
+
+        let _ = state.update(Message::McpEditPressed("files".into()));
+        let draft = state.mcp_edit_draft.as_ref().expect("edit pressed must seed a draft");
+        assert_eq!(state.mcp_editing_id.as_deref(), Some("files"));
+        assert_eq!(draft.command, "npx");
+        assert_eq!(draft.args, "-y @example/files");
+        assert_eq!(draft.env.get("API_KEY"), Some(&"s3cret".to_string()));
+        assert_eq!(draft.timeout, "120");
+        assert!(!state.settings_dirty, "entering edit mode must not arm the dirty flag by itself");
+
+        // Mutate the draft and save.
+        let _ = state.update(Message::McpEditCommandChanged("node".into()));
+        let _ = state.update(Message::McpEditArgsChanged("server.js --port 3000".into()));
+        let _ = state.update(Message::McpEditEnvValueChanged(0, "new-secret".into()));
+        let _ = state.update(Message::McpEditTimeoutChanged("45".into()));
+        let _ = state.update(Message::McpEditSaved);
+
+        assert!(state.mcp_editing_id.is_none(), "a successful save must leave edit mode");
+        assert!(state.mcp_edit_draft.is_none());
+        assert!(state.settings_dirty, "a committed edit must arm the dirty flag");
+        let server = &state.mcp_servers[0];
+        assert_eq!(server.id, "files", "the id is the stable tool-namespace key");
+        assert!(server.enabled, "the enabled flag must be preserved");
+        assert_eq!(server.command, "node");
+        assert_eq!(server.args, vec!["server.js", "--port", "3000"]);
+        assert_eq!(
+            server.env.as_ref().and_then(|env| env.get("API_KEY")),
+            Some(&"new-secret".to_string())
+        );
+        assert_eq!(server.timeout_secs, Some(45));
+
+        // The committed edit round-trips through to_config.
+        let saved = state.to_config(&base);
+        let mcp = saved.mcp.expect("mcp section must be published");
+        assert_eq!(mcp.servers[0].command, "node");
+        assert_eq!(
+            mcp.servers[0].env.as_ref().and_then(|e| e.get("API_KEY")),
+            Some(&"new-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn mcp_edit_invalid_draft_stays_in_edit_mode_with_inline_errors() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpEditPressed("files".into()));
+        // Blank command and an over-cap timeout are both invalid.
+        let _ = state.update(Message::McpEditCommandChanged("   ".into()));
+        let _ = state.update(Message::McpEditTimeoutChanged("400".into()));
+
+        let _ = state.update(Message::McpEditSaved);
+
+        assert!(state.mcp_editing_id.is_some(), "invalid input must keep edit mode open");
+        let draft = state.mcp_edit_draft.as_ref().expect("the draft must be retained");
+        assert_eq!(draft.command_error.as_deref(), Some("Command is required"));
+        assert_eq!(draft.timeout_error.as_deref(), Some("Hard cap is 300 seconds"));
+        assert_eq!(state.mcp_servers[0].command, "npx", "the server must be untouched");
+        assert!(!state.settings_dirty, "a rejected draft must not arm the dirty flag");
+
+        // Fixing the errors lets the edit land.
+        let _ = state.update(Message::McpEditCommandChanged("npx".into()));
+        let _ = state.update(Message::McpEditTimeoutChanged("300".into()));
+        let _ = state.update(Message::McpEditSaved);
+        assert!(state.mcp_editing_id.is_none());
+        assert_eq!(state.mcp_servers[0].timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn mcp_edit_env_add_and_remove_manage_rows() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpEditPressed("files".into()));
+
+        let _ = state.update(Message::McpEditEnvAdd);
+        assert!(
+            state.mcp_edit_draft.as_ref().unwrap().env.contains_key("VAR1"),
+            "Add must create the first unused VAR1 row"
+        );
+
+        let _ = state.update(Message::McpEditEnvRemove(0));
+        assert!(state.mcp_edit_draft.as_ref().unwrap().env.is_empty());
+    }
+
+    #[test]
+    fn mcp_edit_cancel_discards_the_draft() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpEditPressed("files".into()));
+        let _ = state.update(Message::McpEditCommandChanged("node".into()));
+
+        let _ = state.update(Message::McpEditCancelled);
+
+        assert!(state.mcp_editing_id.is_none());
+        assert!(state.mcp_edit_draft.is_none());
+        assert_eq!(state.mcp_servers[0].command, "npx", "cancelling must not change the server");
+        assert!(!state.settings_dirty);
+    }
+
+    #[test]
+    fn mcp_delete_requires_confirmation_and_removes_server() {
+        let base = AppConfig {
+            mcp: Some(McpConfig {
+                enabled: true,
+                servers: vec![server("files"), server("github")],
+            }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        state.ext_selected_mcp = Some("files".into());
+
+        // First press only arms the confirm prompt.
+        let _ = state.update(Message::McpDeletePressed("files".into()));
+        assert_eq!(state.mcp_delete_confirm.as_deref(), Some("files"));
+        assert_eq!(state.mcp_servers.len(), 2, "arming must not remove anything");
+        assert!(!state.settings_dirty, "arming a prompt must not arm the dirty flag");
+
+        // Cancelling keeps the server.
+        let _ = state.update(Message::McpDeleteCancelled("files".into()));
+        assert!(state.mcp_delete_confirm.is_none());
+        assert_eq!(state.mcp_servers.len(), 2);
+
+        // Confirming removes the server and repoints the selection.
+        let _ = state.update(Message::McpDeletePressed("files".into()));
+        let _ = state.update(Message::McpDeleteConfirmed("files".into()));
+        assert!(state.mcp_delete_confirm.is_none());
+        assert_eq!(
+            state.mcp_servers.iter().map(|server| server.id.as_str()).collect::<Vec<_>>(),
+            vec!["github"]
+        );
+        assert_eq!(state.ext_selected_mcp.as_deref(), Some("github"));
+        assert!(state.settings_dirty, "a confirmed delete must arm the dirty flag");
+
+        // A confirm against a server that is not armed is a no-op.
+        let _ = state.update(Message::McpDeleteConfirmed("github".into()));
+        assert_eq!(state.mcp_servers.len(), 1);
+    }
+
+    #[test]
+    fn mcp_delete_drops_edit_mode_and_probe_state_for_removed_server() {
+        let base = AppConfig {
+            mcp: Some(McpConfig {
+                enabled: true,
+                servers: vec![server("files"), server("github")],
+            }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        // Edit the server that will be deleted, and keep a probe result for it.
+        let _ = state.update(Message::McpEditPressed("files".into()));
+        state.mcp_probing.insert("files".into());
+        state.mcp_probe_results.insert("files".into(), Ok(Vec::new()));
+
+        let _ = state.update(Message::McpDeletePressed("files".into()));
+        let _ = state.update(Message::McpDeleteConfirmed("files".into()));
+
+        assert!(state.mcp_editing_id.is_none(), "deleting a server must close its edit draft");
+        assert!(state.mcp_edit_draft.is_none());
+        assert!(!state.mcp_probing.contains("files"));
+        assert!(!state.mcp_probe_results.contains_key("files"));
+    }
+
+    // ── ADR-43 — MCP server add ───────────────────────────────────────────
+    //
+    // The add draft is transient view state: entering/cancelling the add form
+    // never arms the dirty flag, and the new server only lands in
+    // `mcp_servers` on a successful `McpAddSaved` — which persists through the
+    // regular Save Settings flow (next-run semantics).
+
+    #[test]
+    fn mcp_add_pressed_seeds_blank_draft_and_cancel_discards() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        // Enter the add form; it must displace any in-progress edit state.
+        let _ = state.update(Message::McpEditPressed("files".into()));
+        assert!(state.mcp_editing_id.is_some(), "precondition: edit mode is open");
+        let _ = state.update(Message::McpAddPressed);
+
+        let draft = state.mcp_add_draft.as_ref().expect("Add pressed must open the form");
+        assert!(state.mcp_editing_id.is_none(), "opening the add form must leave edit mode");
+        assert!(state.mcp_edit_draft.is_none());
+        assert!(draft.id.is_empty());
+        assert!(draft.command.is_empty());
+        assert!(draft.env.is_empty());
+        assert!(draft.timeout.is_empty());
+        assert!(draft.id_error.is_none());
+        assert!(!state.settings_dirty, "opening the add form must not arm the dirty flag");
+
+        let _ = state.update(Message::McpAddCancelled);
+        assert!(state.mcp_add_draft.is_none(), "cancelling must discard the draft");
+        assert!(!state.settings_dirty, "cancelling must not arm the dirty flag");
+    }
+
+    #[test]
+    fn mcp_add_saved_appends_valid_server_and_round_trips() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpAddPressed);
+        let _ = state.update(Message::McpAddIdChanged("github".into()));
+        let _ = state.update(Message::McpAddCommandChanged("npx".into()));
+        let _ = state.update(Message::McpAddArgsChanged("-y @example/github-server".into()));
+        let _ = state.update(Message::McpAddEnvAdd);
+        let _ = state.update(Message::McpAddEnvKeyChanged(0, "TOKEN".into()));
+        let _ = state.update(Message::McpAddEnvValueChanged(0, "s3cret".into()));
+        let _ = state.update(Message::McpAddTimeoutChanged("45".into()));
+
+        let _ = state.update(Message::McpAddSaved);
+
+        assert!(state.mcp_add_draft.is_none(), "a successful add must leave the form");
+        assert!(state.settings_dirty, "a committed add must arm the dirty flag");
+        assert_eq!(state.mcp_servers.len(), 2);
+        let added = &state.mcp_servers[1];
+        assert_eq!(added.id, "github");
+        assert_eq!(added.command, "npx");
+        assert_eq!(added.args, vec!["-y", "@example/github-server"]);
+        assert_eq!(added.env.as_ref().and_then(|e| e.get("TOKEN")), Some(&"s3cret".to_string()));
+        assert_eq!(added.timeout_secs, Some(45));
+        assert!(added.enabled, "new servers are enabled by default");
+        assert_eq!(
+            state.ext_selected_mcp.as_deref(),
+            Some("github"),
+            "a committed add must select the new server"
+        );
+
+        // The added server survives to_config, so Save Settings persists it.
+        let saved = state.to_config(&base);
+        let mcp = saved.mcp.expect("the mcp section must be published");
+        assert_eq!(mcp.servers.len(), 2);
+        assert_eq!(mcp.servers[1].id, "github");
+        assert_eq!(mcp.servers[1].command, "npx");
+    }
+
+    #[test]
+    fn mcp_add_invalid_draft_stays_open_with_inline_errors() {
+        let base = AppConfig {
+            mcp: Some(McpConfig { enabled: true, servers: vec![server("files")] }),
+            ..AppConfig::default()
+        };
+        let mut state = State::from_config(&base);
+        let _ = state.update(Message::McpAddPressed);
+        // Blank id + blank command + duplicate id + over-cap timeout are all
+        // rejected on save and keep the form open with inline errors.
+        let _ = state.update(Message::McpAddIdChanged("files".into()));
+        let _ = state.update(Message::McpAddTimeoutChanged("400".into()));
+
+        let _ = state.update(Message::McpAddSaved);
+
+        let draft = state.mcp_add_draft.as_ref().expect("an invalid draft must keep the form open");
+        assert_eq!(draft.id_error.as_deref(), Some("An MCP server with this id already exists"));
+        assert_eq!(draft.command_error.as_deref(), Some("Command is required"));
+        assert_eq!(draft.timeout_error.as_deref(), Some("Hard cap is 300 seconds"));
+        assert_eq!(state.mcp_servers.len(), 1, "no server may be appended while invalid");
+        assert!(!state.settings_dirty, "a rejected draft must not arm the dirty flag");
+
+        // A colon in the id is rejected too.
+        let _ = state.update(Message::McpAddIdChanged("a:b".into()));
+        let _ = state.update(Message::McpAddSaved);
+        let draft = state.mcp_add_draft.as_ref().expect("draft still open");
+        assert_eq!(draft.id_error.as_deref(), Some("Id must not contain ':'"));
+
+        // Fixing everything lets the add land.
+        let _ = state.update(Message::McpAddIdChanged("github".into()));
+        let _ = state.update(Message::McpAddCommandChanged("npx".into()));
+        let _ = state.update(Message::McpAddTimeoutChanged("300".into()));
+        let _ = state.update(Message::McpAddSaved);
+        assert!(state.mcp_add_draft.is_none());
+        assert_eq!(state.mcp_servers.len(), 2);
+        assert_eq!(state.mcp_servers[1].timeout_secs, Some(300));
+        assert!(state.settings_dirty);
+    }
+
+    #[test]
+    fn mcp_add_blank_timeout_and_empty_env_save_as_defaults() {
+        let mut state = State::from_config(&AppConfig::default());
+        let _ = state.update(Message::McpAddPressed);
+        let _ = state.update(Message::McpAddIdChanged("local".into()));
+        let _ = state.update(Message::McpAddCommandChanged("uvx".into()));
+        // Blank timeout (valid: uses the crate's 60s default) and no env rows.
+
+        let _ = state.update(Message::McpAddSaved);
+
+        assert!(state.mcp_add_draft.is_none());
+        assert_eq!(state.mcp_servers.len(), 1);
+        let added = &state.mcp_servers[0];
+        assert_eq!(added.id, "local");
+        assert_eq!(added.timeout_secs, None, "blank timeout saves as the crate default");
+        assert_eq!(added.env, None, "an empty env map saves as None");
+    }
+
     // ── ADR-57 — cache-only refresh ──────────────────────────────────────────
     //
     // `refresh_provider_cache_from_config` is called on every config reload so
@@ -1684,5 +3411,91 @@ mod tests {
             "form provider rows must never be rebuilt by a cache refresh"
         );
         assert!(!state.settings_dirty, "a cache refresh must not arm the dirty flag");
+    }
+
+    // ---------------------------------------------------------------------
+    // Plugins tab (ADR-37) — transient view state, never persisted.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn plugin_install_typed_path_updates_state() {
+        let mut state = State::from_config(&AppConfig::default());
+        let _ = state.update(Message::PluginInstallPathChanged("/opt/x.wasm".into()));
+        assert_eq!(state.plugin_install_path, "/opt/x.wasm");
+    }
+
+    #[test]
+    fn plugin_install_blank_path_reports_inline_error() {
+        let mut state = State::from_config(&AppConfig::default());
+        let _ = state.update(Message::PluginInstallPressed);
+        assert_eq!(
+            state.plugin_install_result.as_deref(),
+            Some("Enter a .wasm path or use Browse….")
+        );
+    }
+
+    #[test]
+    fn plugin_install_pressed_is_gated_by_action_busy() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.plugin_install_path = "/opt/x.wasm".into();
+        state.plugin_action_busy = true;
+        let _ = state.update(Message::PluginInstallPressed);
+        assert!(state.plugin_action_busy, "the single-flight gate must hold");
+        assert!(
+            state.plugin_install_result.is_none(),
+            "no second install may start while one is in flight"
+        );
+    }
+
+    #[test]
+    fn plugin_browse_cancel_clears_picker_busy() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.plugin_picker_busy = true;
+        let _ = state.update(Message::PluginBrowsePicked(None));
+        assert!(!state.plugin_picker_busy);
+        assert!(state.plugin_install_path.is_empty());
+    }
+
+    #[test]
+    fn plugin_delete_confirm_arms_and_cancels() {
+        let mut state = State::from_config(&AppConfig::default());
+        let _ = state.update(Message::PluginDeletePressed("alpha".into()));
+        assert_eq!(state.plugin_delete_confirm.as_deref(), Some("alpha"));
+
+        // A cancel for a different plugin id leaves the pending confirm alone.
+        let _ = state.update(Message::PluginDeleteCancelled("other".into()));
+        assert_eq!(state.plugin_delete_confirm.as_deref(), Some("alpha"));
+
+        let _ = state.update(Message::PluginDeleteCancelled("alpha".into()));
+        assert_eq!(state.plugin_delete_confirm, None);
+    }
+
+    #[test]
+    fn plugins_tab_select_launches_lazy_list_refresh_once() {
+        let mut state = State::from_config(&AppConfig::default());
+        assert!(!state.plugins_loaded, "the plugin list starts unread");
+        assert!(!state.plugins_loading);
+
+        let _ = state.update(Message::ExtensionTabSelected(ExtensionTab::Plugins));
+        assert!(state.plugins_loading, "the first open must start a directory scan");
+        assert_eq!(state.active_extension_tab, ExtensionTab::Plugins);
+
+        // Re-selecting the tab while a scan is in flight is single-flighted.
+        let _ = state.update(Message::ExtensionTabSelected(ExtensionTab::Plugins));
+        assert!(state.plugins_loading);
+    }
+
+    #[test]
+    fn plugin_selection_clears_stale_results() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.plugin_install_result = Some("stale install note".into());
+        state.plugin_delete_confirm = Some("stale id".into());
+        let _ = state.update(Message::ExtensionItemSelected(ExtensionTab::Plugins, "beta".into()));
+        assert_eq!(state.ext_selected_plugin.as_deref(), Some("beta"));
+        assert!(
+            state.plugin_install_result.is_none(),
+            "a revoke/delete outcome belongs to the previously selected plugin"
+        );
+        assert!(state.plugin_delete_confirm.is_none());
     }
 }

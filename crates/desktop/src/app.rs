@@ -912,6 +912,11 @@ impl App {
             orchestration_banner_dismissed: false,
             toasts: ToastManager::new(),
         };
+        // Plugin installer approval bridge (Settings → Plugins): install-time
+        // capability prompts are answered through the SAME shared queue the
+        // runtime capability dialog consumes, so a freshly installed plugin's
+        // persistent grants land in the store that runs later honour.
+        app.settings.with_plugin_approval(app.cap_pending.clone());
         // Spec §6 (startup-fallback toast): when config loading fell back to
         // defaults at startup, surface it as a high-severity toast.
         // `config_broken` already drives the persistent status-bar config
@@ -3273,6 +3278,7 @@ impl App {
         self.settings.sync_providers_from_config(&reloaded);
         self.settings.refresh_provider_cache_from_config(&reloaded);
         self.settings.sync_display_from_config(&reloaded);
+        self.settings.sync_project_context_from_config(&reloaded);
         self.orchestration_studio.sync_models(self.settings.cached_models_by_provider());
         self.refresh_effective_roots_from_config();
     }

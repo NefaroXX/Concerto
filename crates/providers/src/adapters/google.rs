@@ -778,6 +778,57 @@ mod tests {
         );
     }
 
+    /// A multi-call turn replays the opaque `thought_signature` on *every*
+    /// `functionCall` part: Google rejects the replayed message with
+    /// `400 INVALID_ARGUMENT` at position 2+ unless the sibling parts carry it
+    /// too. This is the replay half of the stream-side within-turn propagation
+    /// (the request body is built only after capture has backfilled every
+    /// sibling), so a turn of N calls yields exactly N signed parts.
+    #[test]
+    fn multi_call_turn_replays_signature_on_every_part() {
+        let request = CompletionRequest {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "gc_1".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        thought_signature: Some("sig-9f2a".into()),
+                    },
+                    ToolCall {
+                        id: "gc_2".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                        thought_signature: Some("sig-9f2a".into()),
+                    },
+                    ToolCall {
+                        id: "gc_3".into(),
+                        name: "grep".into(),
+                        arguments: serde_json::json!({"pattern": "fn"}),
+                        thought_signature: Some("sig-9f2a".into()),
+                    },
+                ]),
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..Default::default()
+        };
+        let body = render(&request);
+        let parts = body["contents"][0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 3);
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(
+                part["functionCall"]["thought_signature"],
+                "sig-9f2a",
+                "every replayed functionCall part must carry the turn's signature (index {index}): {part}"
+            );
+        }
+    }
+
     /// ADR-46 parity: Gemini never echoes `reasoning_content` onto assistant
     /// parts; a reasoning-only assistant renders as a bare text part.
     #[test]
