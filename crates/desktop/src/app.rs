@@ -65,6 +65,12 @@ const STREAMING_CURSOR_PERIOD_MS: u64 = 500;
 /// subscription ticks once per second while any toast is showing.
 pub const TOAST_LIFETIME_SECS: u64 = 5;
 
+/// Max reading width (logical px) for the chat column on [`Page::Chat`].
+/// The column is `Fill`-width constrained by this cap and centered, so it
+/// shrinks on narrow windows instead of overflowing behind the fixed side
+/// rails (sidebar 224 + quick panel 280).
+const CHAT_MAX_WIDTH: f32 = 900.0;
+
 // ---------------------------------------------------------------------------
 // Page enum — all navigable views
 // ---------------------------------------------------------------------------
@@ -3935,19 +3941,38 @@ impl App {
             .unwrap_or(false);
 
         let content: Element<'_, Message> = match self.page {
-            Page::Chat => self
-                .chat
-                .view(
-                    &self.current_theme,
-                    self.multi_agent,
-                    self.fast,
-                    &self.active_model,
-                    &self.chat_model_options,
-                    self.model_source_label(),
-                    &self.agent_graph,
-                    !self.runtime_assignments().is_empty() || agents_configured,
+            Page::Chat => {
+                // Constrain the chat reading column: `Fill` width capped at
+                // `CHAT_MAX_WIDTH` and centered — same pattern as the ~900px
+                // modal card below (`container(..).width(Fill).max_width(900)`
+                // inside a `.center_x(Fill)` backdrop). A raw `Fixed` width
+                // here would overflow behind the fixed side rails on narrow
+                // windows; `Fill` + `max_width` shrinks with the main area
+                // instead.
+                let chat = self
+                    .chat
+                    .view(
+                        &self.current_theme,
+                        self.multi_agent,
+                        self.fast,
+                        &self.active_model,
+                        &self.chat_model_options,
+                        self.model_source_label(),
+                        &self.agent_graph,
+                        !self.runtime_assignments().is_empty() || agents_configured,
+                    )
+                    .map(Message::Chat);
+                container(
+                    container(chat)
+                        .width(Length::Fill)
+                        .max_width(CHAT_MAX_WIDTH)
+                        .height(Length::Fill),
                 )
-                .map(Message::Chat),
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .into()
+            }
             Page::ToolLog => self.tool_log.view(&self.current_theme).map(Message::ToolLog),
             Page::DiffViewer => self.diff.view(&self.current_theme).map(Message::Diff),
             Page::Settings => {
@@ -4021,9 +4046,14 @@ impl App {
                 container(self.terminal.view(&self.current_theme).map(Message::Terminal))
                     .width(Length::Fill)
                     .height(Length::Fixed(panel_height));
-            column![content_column, resize_handle, terminal_area, status_bar]
+            // The main area must be an explicit `Fill` child of the shell row
+            // so it takes exactly the leftover space between the fixed side
+            // rails. Without it the row-sized column reports its natural
+            // width and overflows behind the sidebar/quick panel on narrow
+            // windows.
+            column![content_column, resize_handle, terminal_area, status_bar].width(Length::Fill)
         } else {
-            column![content_column, status_bar]
+            column![content_column, status_bar].width(Length::Fill)
         };
 
         let sep2 = rule::vertical(1);

@@ -1,6 +1,6 @@
 use crate::widgets::highlight;
 use iced::widget::{button, column, container, row, text};
-use iced::{Background, Color, Element};
+use iced::{Background, Color, Element, Length};
 
 /// A simple code‑block widget with a language header and a copy button.
 ///
@@ -30,7 +30,9 @@ pub fn view<M: Clone + 'static>(
         })
         .collect();
 
-    let code_column = column(code_lines).spacing(0).padding(4);
+    // `Width(Fill)` makes the per-line `text` elements wrap at the message
+    // column's available width instead of pushing the block past the rails.
+    let code_column = column(code_lines).spacing(0).padding(4).width(Length::Fill);
 
     container(column![header, code_column])
         .padding(4)

@@ -577,7 +577,7 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
                 }
             }
         }
-        let r = row(children).spacing(4);
+        let r = row(children).spacing(4).width(Length::Fill).wrap();
         container(r).padding(2).into()
     }
 
@@ -593,6 +593,11 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
             for cell in r {
                 cell_elements.push(
                     container(cell)
+                        // `FillPortion(1)` per cell makes every column share
+                        // the row's constrained width evenly so long cell
+                        // content wraps instead of widening the table past the
+                        // message column.
+                        .width(Length::FillPortion(1))
                         .padding(4)
                         .style(move |_theme: &iced::Theme| iced::widget::container::Style {
                             border: iced::Border {
@@ -605,7 +610,7 @@ impl<'a, M: Clone + 'static> MarkdownRenderer<'a, M> {
                         .into(),
                 );
             }
-            row_elements.push(row(cell_elements).spacing(0).into());
+            row_elements.push(row(cell_elements).spacing(0).width(Length::Fill).into());
         }
         row_elements
     }
@@ -795,6 +800,53 @@ mod tests {
         let doc = MarkdownDoc::parse(md);
         let elem =
             doc.render_upto(Some(7), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
+        let _ = elem;
+    }
+
+    #[test]
+    fn long_unbroken_paragraph_renders_through_wrapping_row() {
+        // A paragraph whose inline spans (with a very long unbroken token)
+        // previously went into a non-wrapping `Row`: on a narrow column that
+        // pushed the chat width past the side rails. Now the row is
+        // `width(Fill).wrap()`, so building this must not panic and must keep
+        // every span text.
+        let md = "Some **bold** and `mono` then a very long unbroken token: \
+                  abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz.";
+        let doc = MarkdownDoc::parse(md);
+        assert!(doc.total_units > 0, "total_units must count visible text");
+        let elem =
+            doc.render_upto(None, dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
+        let _ = elem;
+        let truncated =
+            doc.render_upto(Some(8), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
+        let _ = truncated;
+    }
+
+    #[test]
+    fn code_block_long_line_renders_with_fill_column() {
+        // A single unbroken code line exercises the `width(Fill)` per-line
+        // column that allows text lines to wrap instead of overflowing.
+        let md = "```rust\nlet very_long_identifier = \
+                  abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz;\n```";
+        let doc = MarkdownDoc::parse(md);
+        let elem =
+            doc.render_upto(None, dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
+        let _ = elem;
+        let truncated =
+            doc.render_upto(Some(5), dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
+        let _ = truncated;
+    }
+
+    #[test]
+    fn table_with_long_cells_renders_constrained_rows() {
+        // Cells are now `FillPortion(1)` inside `width(Fill)` table rows so a
+        // long cell wraps within its column instead of widening the table past
+        // the message column.
+        let md =
+            "| A | B |\n|---|---|\n| abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz | 2 |";
+        let doc = MarkdownDoc::parse(md);
+        let elem =
+            doc.render_upto(None, dummy_copy, Color::BLACK, Color::WHITE, Color::WHITE, false);
         let _ = elem;
     }
 }
