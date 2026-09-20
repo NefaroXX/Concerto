@@ -95,13 +95,15 @@ impl Dialect for GeminiChatDialect {
                                     "args": tc.arguments
                                 });
                                 // Gemini 3.x echoes an opaque
-                                // `thought_signature` on functionCall parts;
+                                // `thoughtSignature` on functionCall parts;
                                 // Google requires it be replayed verbatim when
                                 // the call is re-sent. Emit it only when the
                                 // call carries one so signature-less calls keep
-                                // the exact legacy wire shape.
+                                // the exact legacy wire shape. The canonical IR
+                                // field is snake_case; the wire must use the
+                                // camel spelling Google accepts on replay.
                                 if let Some(signature) = &tc.thought_signature {
-                                    function_call["thought_signature"] =
+                                    function_call["thoughtSignature"] =
                                         serde_json::json!(signature);
                                 }
                                 serde_json::json!({ "functionCall": function_call })
@@ -705,7 +707,7 @@ mod tests {
     }
 
     /// Gemini 3.x replay: a tool call carrying the model's opaque
-    /// `thought_signature` must echo it back verbatim inside the
+    /// `thoughtSignature` must echo it back verbatim inside the
     /// `functionCall` part — omitting it makes Google reject the request
     /// (`400 INVALID_ARGUMENT: Function call is missing a thought_signature`).
     #[test]
@@ -728,20 +730,31 @@ mod tests {
             ..Default::default()
         };
         let body = render(&request);
+        // The camel key sits *inside* the `functionCall` object, a sibling of
+        // `name`/`args` (never at part level), carrying the signature verbatim.
         assert_eq!(
             body["contents"][0]["parts"],
             serde_json::json!([{
                 "functionCall": {
                     "name": "shell",
                     "args": {"command": "ls"},
-                    "thought_signature": "sig-9f2a"
+                    "thoughtSignature": "sig-9f2a"
                 }
             }])
+        );
+        let serialized = serde_json::to_string(&body).expect("body serializes");
+        assert!(
+            serialized.contains("thoughtSignature"),
+            "emitted functionCall must carry camelCase thoughtSignature: {serialized}"
+        );
+        assert!(
+            !serialized.contains("thought_signature"),
+            "snake_case thought_signature must not reach the Gemini wire: {serialized}"
         );
     }
 
     /// Replay of a tool call without a signature emits exactly the wire shape
-    /// produced before the field existed: not even a `thought_signature` key.
+    /// produced before the field existed: not even a `thoughtSignature` key.
     #[test]
     fn assistant_tool_call_without_signature_omits_thought_signature_key() {
         let request = CompletionRequest {
@@ -774,11 +787,15 @@ mod tests {
         let serialized = serde_json::to_string(&body).expect("body serializes");
         assert!(
             !serialized.contains("thought_signature"),
-            "None must emit no signature key on the wire: {serialized}"
+            "None must emit no snake signature key on the wire: {serialized}"
+        );
+        assert!(
+            !serialized.contains("thoughtSignature"),
+            "None must emit no camel signature key on the wire: {serialized}"
         );
     }
 
-    /// A multi-call turn replays the opaque `thought_signature` on *every*
+    /// A multi-call turn replays the opaque `thoughtSignature` on *every*
     /// `functionCall` part: Google rejects the replayed message with
     /// `400 INVALID_ARGUMENT` at position 2+ unless the sibling parts carry it
     /// too. This is the replay half of the stream-side within-turn propagation
@@ -822,11 +839,20 @@ mod tests {
         assert_eq!(parts.len(), 3);
         for (index, part) in parts.iter().enumerate() {
             assert_eq!(
-                part["functionCall"]["thought_signature"],
+                part["functionCall"]["thoughtSignature"],
                 "sig-9f2a",
-                "every replayed functionCall part must carry the turn's signature (index {index}): {part}"
+                "every replayed functionCall part must carry the turn's camel thoughtSignature (index {index}): {part}"
+            );
+            assert!(
+                part["functionCall"].get("thought_signature").is_none(),
+                "no replayed part may carry the snake_case key (index {index}): {part}"
             );
         }
+        let serialized = serde_json::to_string(&body).expect("body serializes");
+        assert!(
+            !serialized.contains("thought_signature"),
+            "snake_case thought_signature must not reach the Gemini wire: {serialized}"
+        );
     }
 
     /// ADR-46 parity: Gemini never echoes `reasoning_content` onto assistant

@@ -662,24 +662,34 @@ mod tests {
         assert_eq!(function_call_args(&fc), serde_json::json!({"command": "ls"}));
     }
 
-    /// Gemini 3.x `functionCall` parts carry an opaque `thought_signature`
-    /// that must be preserved for replay on the next request; the parsed
-    /// canonical tool call keeps it (and leaves it `None` when absent).
+    /// Gemini 3.x `functionCall` parts carry an opaque `thoughtSignature` —
+    /// the confirmed camel wire spelling; the snake `thought_signature`
+    /// variant from early dumps must keep parsing too — that must be
+    /// preserved for replay on the next request; the parsed canonical tool
+    /// call keeps it (and leaves it `None` when absent).
     #[test]
     fn function_call_part_preserves_thought_signature() {
         let mut counter = 0u64;
-        let fc = serde_json::json!({"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-9f2a"});
+        // Camel fc-level spelling — the confirmed wire shape.
+        let fc = serde_json::json!({"name": "shell", "args": {"command": "ls"}, "thoughtSignature": "sig-9f2a"});
         let tc = parse_function_call_part(&fc, &mut counter, false);
         assert_eq!(tc.name, "shell");
         assert_eq!(tc.arguments, serde_json::json!({"command": "ls"}));
         assert_eq!(tc.thought_signature.as_deref(), Some("sig-9f2a"));
         assert_eq!(tc.id, "gc_1", "sequential stream id minted once");
 
+        // The legacy snake spelling must still parse verbatim (the API error
+        // text and early field dumps use it) — a capture never silently
+        // drops a signature just because its key spelling differed.
+        let legacy = serde_json::json!({"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-legacy"});
+        let tc = parse_function_call_part(&legacy, &mut counter, false);
+        assert_eq!(tc.thought_signature.as_deref(), Some("sig-legacy"));
+
         // A part without a signature parses to `None` — no replay key emitted.
         let plain = serde_json::json!({"name": "shell", "args": {"command": "ls"}});
         let tc = parse_function_call_part(&plain, &mut counter, false);
         assert_eq!(tc.thought_signature, None);
-        assert_eq!(tc.id, "gc_2", "counter advances across parts");
+        assert_eq!(tc.id, "gc_3", "counter advances across parts");
     }
 
     /// The capture must not depend on the field's wire spelling. The API
@@ -731,11 +741,12 @@ mod tests {
         assert_eq!(function_call_thought_signature(&part["functionCall"], &part), None);
     }
 
-    /// A multi-call turn usually carries the opaque `thought_signature` on the
-    /// first `functionCall` part only; Google rejects the *replayed* message
-    /// unless every sibling part carries it too (`400 INVALID_ARGUMENT` at
-    /// position 2+). The stream must propagate the turn's known signature to
-    /// `None` siblings before emitting any chunk.
+    /// A multi-call turn usually carries the opaque `thoughtSignature` (the
+    /// confirmed camel wire spelling) on the first `functionCall` part only;
+    /// Google rejects the *replayed* message unless every sibling part carries
+    /// it too (`400 INVALID_ARGUMENT` at position 2+). The stream must
+    /// propagate the turn's known signature to `None` siblings before emitting
+    /// any chunk.
     #[test]
     fn stream_propagates_thought_signature_to_sibling_parts() {
         let mut state = GoogleStreamState::new();
@@ -751,7 +762,7 @@ mod tests {
             "candidates": [{
                 "content": {
                     "parts": [
-                        {"functionCall": {"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-9f2a"}},
+                        {"functionCall": {"name": "shell", "args": {"command": "ls"}, "thoughtSignature": "sig-9f2a"}},
                         {"functionCall": {"name": "read_file", "args": {"path": "Cargo.toml"}}},
                         {"functionCall": {"name": "grep", "args": {"pattern": "fn"}}}
                     ]
@@ -797,7 +808,7 @@ mod tests {
             "candidates": [{
                 "content": {
                     "parts": [
-                        {"functionCall": {"name": "shell", "args": {"command": "ls"}, "thought_signature": "sig-9f2a"}}
+                        {"functionCall": {"name": "shell", "args": {"command": "ls"}, "thoughtSignature": "sig-9f2a"}}
                     ]
                 }
             }]
@@ -880,7 +891,8 @@ mod tests {
 
     /// A signature carried as a part-level sibling key (next to
     /// `functionCall`, not inside it) is captured off the stream and carried
-    /// on the emitted tool call.
+    /// on the emitted tool call. Both wire spellings are accepted — snake_case
+    /// (early dumps) and the confirmed camel `thoughtSignature`.
     #[test]
     fn stream_captures_part_level_sibling_signature() {
         let mut state = GoogleStreamState::new();
@@ -892,11 +904,12 @@ mod tests {
             keepalive: false,
         };
 
+        // snake_case sibling.
         let payload = serde_json::json!({
             "candidates": [{
                 "content": {
                     "parts": [
-                        {"functionCall": {"name": "shell", "args": {}}, "thought_signature": "sib-sig"}
+                        {"functionCall": {"name": "shell", "args": {}}, "thought_signature": "sib-snake"}
                     ]
                 },
                 "finishReason": "STOP"
@@ -907,10 +920,29 @@ mod tests {
             .into_iter()
             .map(|r| r.expect("chunk emitted"))
             .collect();
-
         let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].thought_signature.as_deref(), Some("sib-sig"));
+        assert_eq!(calls[0].thought_signature.as_deref(), Some("sib-snake"));
+
+        // camelCase sibling — the confirmed wire spelling.
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "read_file", "args": {}}, "thoughtSignature": "sib-camel"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let chunks: Vec<CompletionChunk> = state
+            .handle_event(event(&payload.to_string()), &mut fc_counter, false)
+            .into_iter()
+            .map(|r| r.expect("chunk emitted"))
+            .collect();
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].thought_signature.as_deref(), Some("sib-camel"));
     }
 
     /// ADR-66 §4 family: the loose tier flattens nested properties for the
