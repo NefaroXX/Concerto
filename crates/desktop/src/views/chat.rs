@@ -305,11 +305,15 @@ pub struct State {
     /// assistant entry. Toggled by `Message::StreamingTick`; only meaningful
     /// (and only ever read) while at least one entry is still streaming.
     streaming_cursor_visible: bool,
-    /// Typewriter-reveal frontier for the live streaming assistant entry:
+    /// Typewriter-reveal frontier for a streaming assistant entry:
     /// `Some((id, n))` means the entry with id `id` has revealed its first
-    /// `n` *characters* so far. Transient view state only — deliberately NOT
-    /// a `ChatEntry` field, never serialized, and dropped once the entry is
-    /// finalized. `None` means nothing is animating (all content shown).
+    /// `n` *characters* so far. Keyed by entry id rather than tail position:
+    /// the run-boundary path (`AddAssistant` + `set_run_completion`) appends
+    /// a `Completion` chip after the final reply, so the revealed entry is
+    /// never the last one while its reveal plays. Transient view state only —
+    /// deliberately NOT a `ChatEntry` field, never serialized, and dropped
+    /// once the entry is finalized. `None` means nothing is animating (all
+    /// content shown).
     revealed_chars: Option<(EntryId, usize)>,
     /// True while a reveal is being driven toward the end of a *final*
     /// assistant message (seeded by `Message::AddAssistant`). When the reveal
@@ -321,8 +325,8 @@ pub struct State {
     reveal_autofinish: bool,
     /// First-token emphasis ticks for assistant entries: `id -> elapsed
     /// ticks` since the turn started. While present, the first token (up to
-    /// first whitespace) of the revealed text renders bold for ~200 ms
-    /// (12 ticks × 16 ms), then settles. Transient view state — never
+    /// first whitespace) of the revealed text renders bold for ~384 ms
+    /// (24 ticks × 16 ms), then settles. Transient view state — never
     /// serialized.
     first_token_ticks: HashMap<EntryId, u8>,
     /// Paragraph handoff hold (Baton seasoning, prototype #5): `Some((id,
@@ -332,10 +336,12 @@ pub struct State {
     /// cursor holds visible until it clears. Transient view state — never
     /// serialized.
     handoff_hold: Option<(EntryId, u8)>,
-    /// Reduced-motion override: when true, first-token emphasis is skipped
-    /// (entries render at normal weight immediately). Iced exposes no system
-    /// a11y API (see the scanline_overlay call site in `app.rs`), so this
-    /// defaults to false until wired to a user setting.
+    /// Reduced-motion override: when true every tick-driven animation is
+    /// skipped — typewriter reveal, first-token emphasis, line wipe, entrance
+    /// fades, thinking reveals and the paragraph handoff all render instantly
+    /// (the design-doc fallbacks). Iced exposes no system a11y API (see the
+    /// scanline_overlay call site in `app.rs`), so this defaults to false until
+    /// wired to a user setting.
     reduced_motion: bool,
     /// Per-entry cached parses of assistant markdown, so the 16 ms reveal tick
     /// re-renders an already-parsed event stream (`render_upto`) instead of
@@ -353,9 +359,19 @@ pub struct State {
     entrance_ticks: HashMap<EntryId, u8>,
     /// Line-wipe progress for new assistant entries (Score seasoning,
     /// prototype #7): `id -> tick count since insertion`, capped at
-    /// `LINE_WIPE_TICKS` (then removed). Transient view state — never
-    /// serialized.
+    /// `LINE_WIPE_TICKS` (then moved to [`line_wipe_settled`](Self::line_wipe_settled)).
+    /// Transient view state — never serialized.
     line_wipe_ticks: HashMap<EntryId, u8>,
+    /// Assistant entries whose line-wipe animation has settled to its muted
+    /// top-rule marker (Score seasoning, prototype #7): while an id is present
+    /// the entry's top rule stays rendered as a full-width, faint hairline —
+    /// the visible "new turn" signature. It survives run finalize and mid-run
+    /// navigation so a just-finished reply keeps its new-text marker instead
+    /// of reverting to the old plain-text look. The marker is *static* (never
+    /// animates), so it must not keep the 16 ms tick alive by itself.
+    /// Reduced-motion never seeds it and clears it on enable. Transient view
+    /// state — never serialized.
+    line_wipe_settled: HashSet<EntryId>,
     /// Free-running 16 ms tick counter driving the subtle shimmer color pulse
     /// on open thinking entries. Transient view state — never serialized.
     shimmer_phase: u32,
@@ -373,22 +389,31 @@ const MAX_THINKING_CHARS: usize = 64_000;
 const MAX_TOOL_DETAIL_CHARS: usize = 256_000;
 /// Characters the typewriter reveal moves per `TypingTick`. The 16 ms
 /// subscription cadence (`circuit_background::TICK_MS`) turns this into
-/// ~500 chars/s — a fast typing feel.
+/// ~500 chars/s — a fast typing feel. Kept in parity with the CLI
+/// (`crates/cli/src/app.rs`, `REVEAL_CHARS_PER_TICK = 8`): the reveal is a
+/// *typing* texture, deliberately faster than typical provider streaming so
+/// text is never visibly lagging behind the token arrival it follows.
 const REVEAL_CHARS_PER_TICK: usize = 8;
 /// Characters the thinking-preview reveal moves per `TypingTick`: with the
 /// same 16 ms cadence this is ~4000 chars/s — a quick open/expand feel.
 const THINKING_REVEAL_CHARS_PER_TICK: usize = 64;
 /// Number of `TypingTick`s an entrance fade runs for (~128 ms at 16 ms/tick).
 const ENTRANCE_TICKS: u8 = 8;
-/// Number of `TypingTick`s the paragraph handoff cue holds (~48 ms at
+/// Number of `TypingTick`s the paragraph handoff cue holds (~128 ms at
 /// 16 ms/tick). The reveal frontier freezes at the blank-line boundary and
 /// the streaming cursor holds visible, then the reveal resumes — the Baton
 /// seasoning (prototype #5). Deterministic: always exactly this many ticks.
-const HANDOFF_HOLD_TICKS: u8 = 3;
-/// Number of `TypingTick`s the first-token emphasis holds (~200 ms at 16 ms/tick).
+/// Set long enough to read as an intentional "continuing" pause (the earlier
+/// 3-tick / ~48 ms hold was sub-perceptual next to a 500 ms blink) without
+/// upsetting the typing cadence.
+const HANDOFF_HOLD_TICKS: u8 = 8;
+/// Number of `TypingTick`s the first-token emphasis holds (~384 ms at 16 ms/tick).
 /// The first word of each assistant turn renders slightly bolder/larger for this
 /// duration, then settles to normal weight — the Score signature text (prototype #6).
-const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 12;
+/// Lengthened from 12 ticks (~200 ms): a 500 chars/s reveal outraces typical
+/// provider streaming, so the freshly rendered post-prompt lines are the ones
+/// a user reads first — a longer emphasis makes the turn start register as new.
+const FIRST_TOKEN_EMPHASIS_TICKS: u8 = 24;
 /// Number of `TypingTick`s a new assistant entry's top rule wipes 0→full
 /// width over (~128 ms at 16 ms/tick) — the Score line-wipe entrance
 /// (prototype #7). Deterministic: always exactly this many ticks.
@@ -440,6 +465,7 @@ impl State {
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
             line_wipe_ticks: HashMap::new(),
+            line_wipe_settled: HashSet::new(),
             handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
@@ -496,6 +522,7 @@ impl State {
             thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
             line_wipe_ticks: HashMap::new(),
+            line_wipe_settled: HashSet::new(),
             handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
@@ -586,6 +613,7 @@ impl State {
             self.entrance_ticks.clear();
             self.first_token_ticks.clear();
             self.line_wipe_ticks.clear();
+            self.line_wipe_settled.clear();
             self.handoff_hold = None;
         }
     }
@@ -651,7 +679,9 @@ impl State {
         self.finish_open_thinking();
         let id = self.next_id;
         self.next_id += 1;
-        self.entrance_ticks.insert(id, 0);
+        if !self.reduced_motion {
+            self.entrance_ticks.insert(id, 0);
+        }
         self.entries.push(ChatEntry::Completion {
             id,
             summary: RunCompletionSummary {
@@ -713,7 +743,10 @@ impl State {
             created_at: Some(now_rfc3339()),
             finished_at: None,
         });
-        self.thinking_reveals.insert(id, 0);
+        // Reduced-motion shows the thinking preview as full text instantly.
+        if !self.reduced_motion {
+            self.thinking_reveals.insert(id, 0);
+        }
         self.trim_entries();
     }
 
@@ -743,7 +776,9 @@ impl State {
         self.finish_open_thinking();
         let id = self.next_id;
         self.next_id += 1;
-        self.entrance_ticks.insert(id, 0);
+        if !self.reduced_motion {
+            self.entrance_ticks.insert(id, 0);
+        }
         self.entries.push(ChatEntry::Error { id, content, created_at: Some(now_rfc3339()) });
         self.trim_entries();
     }
@@ -767,7 +802,9 @@ impl State {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.entrance_ticks.insert(id, 0);
+        if !self.reduced_motion {
+            self.entrance_ticks.insert(id, 0);
+        }
         self.entries.push(ChatEntry::ToolCall {
             id,
             tool_name,
@@ -799,7 +836,9 @@ impl State {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.entrance_ticks.insert(id, 0);
+        if !self.reduced_motion {
+            self.entrance_ticks.insert(id, 0);
+        }
         self.entries.push(ChatEntry::ToolCall {
             id,
             tool_name: tool_name.to_string(),
@@ -851,13 +890,26 @@ impl State {
     /// Used by `app.rs` to keep the 16 ms `TypingTick` subscription alive only
     /// while a reveal is animating.
     pub fn is_revealing(&self) -> bool {
-        // Assistant typewriter-reveal window still animating.
+        // Reduced-motion renders every entry instantly (design-doc fallbacks):
+        // no tick-driven animation state is seeded, and any in-flight
+        // animation settles in `set_reduced_motion`. Return false so the
+        // 16 ms `TypingTick` subscription is never started.
+        if self.reduced_motion {
+            return false;
+        }
+        // Assistant typewriter-reveal window still animating. The window is
+        // keyed by entry id, not by tail position: the run-boundary path
+        // (`AddAssistant` + `set_run_completion`) appends a `Completion` chip
+        // after the final reply, so the revealed entry is no longer the last
+        // one — searching by id keeps the reveal alive until it finishes.
         let assistant_revealing = self.revealed_chars.is_some_and(|(id, revealed)| {
-            matches!(
-                self.entries.last(),
-                Some(ChatEntry::Assistant { id: entry_id, content, streaming: true, .. })
-                    if *entry_id == id && revealed < content.chars().count()
-            )
+            self.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { id: entry_id, content, streaming: true, .. }
+                        if *entry_id == id && revealed < content.chars().count()
+                )
+            })
         });
         if assistant_revealing {
             return true;
@@ -879,22 +931,28 @@ impl State {
             .any(|entry| matches!(entry, ChatEntry::Thinking { finished_at: None, .. }))
     }
 
-    /// Advance the typewriter reveal one tick on the live streaming assistant
-    /// entry (the tracked entry id must still be the streaming tail). While a
+    /// Advance the typewriter reveal one tick on the streaming assistant
+    /// entry tracked by `revealed_chars`. The tracked entry is located by id
+    /// anywhere in the transcript (not just the tail), so a `Completion` chip
+    /// appended after the final reply cannot orphan the window. While a
     /// paragraph handoff hold is open the frontier freezes and the hold counts
     /// down instead of advancing. No-op when no reveal is in progress; resets
-    /// the window to `None` when the tracked id no longer matches the live
-    /// streaming entry, so a stale window can never drive a completed entry.
+    /// the window to `None` when the tracked id is gone or no longer
+    /// streaming, so a stale window can never drive a completed entry.
     fn advance_reveal(&mut self) {
         // Handoff hold (Baton prototype #5): freeze the frontier at the
         // paragraph boundary while the cue counts down, one tick at a time.
-        // A stale hold (entry gone or no longer the streaming tail) clears.
+        // A stale hold (tracked entry gone or no longer streaming) clears.
+        // The hold is keyed by id too, so a trailing `Completion` chip cannot
+        // orphan it either.
         if let Some((hold_id, remaining)) = self.handoff_hold {
-            let live = matches!(
-                self.entries.last(),
-                Some(ChatEntry::Assistant { id: entry_id, streaming: true, .. })
-                    if *entry_id == hold_id
-            );
+            let live = self.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { id: entry_id, streaming: true, .. }
+                        if *entry_id == hold_id
+                )
+            });
             if live {
                 if remaining <= 1 {
                     self.handoff_hold = None;
@@ -908,42 +966,81 @@ impl State {
         let Some((id, revealed)) = self.revealed_chars else {
             return;
         };
-        match self.entries.last() {
-            Some(ChatEntry::Assistant { id: entry_id, content, streaming: true, .. })
+        // The reveal window is keyed by entry id, not tail position: the
+        // final reply seeded by `Message::AddAssistant` is immediately
+        // followed by the run's `Completion` chip (`set_run_completion`), so
+        // it is never the last entry while its reveal plays. Locate the
+        // tracked entry anywhere in the transcript — still requiring it to be
+        // `streaming: true`, so a stale window can never drive a finalized
+        // entry. The length is snapshotted first because the entry borrow
+        // cannot stay live across the writes below.
+        let Some(len) = self.entries.iter().find_map(|entry| match entry {
+            ChatEntry::Assistant { id: entry_id, content, streaming: true, .. }
                 if *entry_id == id =>
             {
-                let len = content.chars().count();
-                let next = revealed.saturating_add(REVEAL_CHARS_PER_TICK).min(len);
-                if next == len && self.reveal_autofinish {
-                    // A *final* message has fully revealed: the text is
-                    // complete, so mark the entry non-streaming (dropping the
-                    // blinking cursor and both subscriptions) and clear the
-                    // window — the reveal is done, not paused mid-content.
-                    if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
-                        *streaming = false;
-                    }
-                    self.revealed_chars = None;
-                    self.reveal_autofinish = false;
-                    self.handoff_hold = None;
-                } else {
-                    // Paragraph handoff cue (Baton prototype #5): when the
-                    // frontier crosses a blank-line boundary mid-reveal, hold
-                    // the cursor for `HANDOFF_HOLD_TICKS` before resuming.
-                    // Single-paragraph content never triggers (fallback: no
-                    // cue); reduced-motion skips the cue entirely.
-                    if next != len
-                        && !self.reduced_motion
-                        && crosses_paragraph_boundary(content, revealed, next)
-                    {
-                        self.handoff_hold = Some((id, HANDOFF_HOLD_TICKS));
-                    }
-                    self.revealed_chars = Some((id, next));
-                }
+                Some(content.chars().count())
             }
-            _ => {
-                self.revealed_chars = None;
-                self.handoff_hold = None;
+            _ => None,
+        }) else {
+            self.revealed_chars = None;
+            self.reveal_autofinish = false;
+            self.handoff_hold = None;
+            return;
+        };
+        let next = revealed.saturating_add(REVEAL_CHARS_PER_TICK).min(len);
+        if next == len && self.reveal_autofinish {
+            // A *final* message has fully revealed: the text is complete, so
+            // mark the entry non-streaming (dropping the blinking cursor and
+            // both subscriptions) and clear the window — the reveal is done,
+            // not paused mid-content.
+            self.finalize_tracked_reveal(id);
+            self.revealed_chars = None;
+            self.reveal_autofinish = false;
+            self.handoff_hold = None;
+        } else {
+            // Paragraph handoff cue (Baton prototype #5): when the frontier
+            // crosses a blank-line boundary mid-reveal, hold the cursor for
+            // `HANDOFF_HOLD_TICKS` before resuming. Single-paragraph content
+            // never triggers (fallback: no cue); reduced-motion skips the cue
+            // entirely. This is a read-only pass over the entry (it borrows
+            // `self.entries`) before the window write below.
+            let open_hold =
+                next != len && !self.reduced_motion && self.entries.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        ChatEntry::Assistant {
+                            id: entry_id,
+                            content,
+                            streaming: true,
+                            ..
+                        } if *entry_id == id && crosses_paragraph_boundary(content, revealed, next)
+                    )
+                });
+            if open_hold {
+                self.handoff_hold = Some((id, HANDOFF_HOLD_TICKS));
             }
+            self.revealed_chars = Some((id, next));
+        }
+    }
+
+    /// Mark the assistant entry tracked by the autofinish reveal (seeded by
+    /// `Message::AddAssistant`) non-streaming, if it still exists and is
+    /// streaming. The tracked id — not the tail position — decides, so the
+    /// entry finalizes even when the run's `Completion` chip (or any other
+    /// entry) has been appended after it. This is the single place that
+    /// settles a final reply mid-reveal, shared by the tick completer, run
+    /// boundaries, and the reduced-motion toggle.
+    fn finalize_tracked_reveal(&mut self, id: EntryId) {
+        if let Some(ChatEntry::Assistant { streaming, .. }) =
+            self.entries.iter_mut().find(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Assistant { id: entry_id, streaming: true, .. }
+                        if *entry_id == id
+                )
+            })
+        {
+            *streaming = false;
         }
     }
 
@@ -1002,9 +1099,10 @@ impl State {
         !self.reduced_motion && self.first_token_ticks.contains_key(&id)
     }
 
-    /// Advance every in-flight line wipe one tick, dropping entries whose
-    /// wipe completed and any stale ids (entry evicted or no longer an
-    /// assistant entry) so a dead wipe can never hold the tick alive.
+    /// Advance every in-flight line wipe one tick, converging the wipe to its
+    /// settled top-rule marker when it completes, and dropping any stale ids
+    /// (entry evicted or no longer an assistant entry) so a dead wipe can
+    /// never hold the tick alive.
     fn advance_line_wipe_ticks(&mut self) {
         // Ids are snapshotted first: the wipe map is mutated below, so the
         // entries borrow cannot stay live across the updates.
@@ -1016,13 +1114,36 @@ impl State {
                 _ => None,
             })
             .collect();
+        // `settling` collects ids whose animation just finished so the retain
+        // closure stays free of `&mut self.line_wipe_settled` borrows.
+        let mut settling: Vec<EntryId> = Vec::new();
         self.line_wipe_ticks.retain(|id, ticks| {
             if !live.contains(id) {
                 return false;
             }
             *ticks = ticks.saturating_add(1);
-            *ticks < LINE_WIPE_TICKS
+            if *ticks < LINE_WIPE_TICKS {
+                true
+            } else {
+                settling.push(*id);
+                false
+            }
         });
+        for id in settling {
+            self.line_wipe_settled.insert(id);
+        }
+    }
+
+    /// Settle every in-flight line wipe: the animated tick entry drops and
+    /// the id moves to the settled set so the entry keeps its muted top-rule
+    /// marker. Used at run/navigation boundaries where the wipe may never have
+    /// had a tick to play (a fresh reply instantly finalized) — the "new
+    /// turn" signature should still be visible post-run. Reduced-motion never
+    /// seeds wipes, so the settled set stays clean under that override.
+    fn settle_line_wipe(&mut self) {
+        for (id, _) in self.line_wipe_ticks.drain() {
+            self.line_wipe_settled.insert(id);
+        }
     }
 
     /// Current line-wipe step for an assistant entry: `Some(elapsed)` while
@@ -1035,13 +1156,37 @@ impl State {
         self.line_wipe_ticks.get(&id).copied()
     }
 
-    /// Set the reduced-motion override (skips first-token emphasis and the
-    /// line-wipe cue; any in-flight wipe settles instantly).
+    /// Set the reduced-motion override. When enabled, every in-flight
+    /// tick-driven animation settles instantly — first-token emphasis, line
+    /// wipe, entrance fades, thinking reveals, the paragraph handoff and the
+    /// typewriter-reveal window all drop — so entries render at full content
+    /// immediately. A *final* assistant message mid-reveal finalizes too, so
+    /// no streaming cursor or blink subscription outlives the toggle.
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         if reduced {
+            // A *final* message mid-reveal finalizes even when the run's
+            // `Completion` chip has already been appended after it: the
+            // tracked id decides, not the tail position.
+            if self.reveal_autofinish {
+                if let Some((id, _)) = self.revealed_chars {
+                    self.finalize_tracked_reveal(id);
+                }
+            }
+            self.revealed_chars = None;
+            self.reveal_autofinish = false;
+            self.handoff_hold = None;
+            self.first_token_ticks.clear();
+            self.entrance_ticks.clear();
+            self.thinking_reveals.clear();
             self.line_wipe_ticks.clear();
+            self.line_wipe_settled.clear();
         }
+    }
+
+    /// Whether the reduced-motion override is active.
+    pub fn reduced_motion(&self) -> bool {
+        self.reduced_motion
     }
 
     /// Update the latest assistant entry with streaming content.
@@ -1076,19 +1221,21 @@ impl State {
             // A brand-new streaming entry starts its reveal from scratch. Live
             // entries hold their window at the content length when done rather
             // than auto-finalizing (`reveal_autofinish` stays false).
-            self.revealed_chars = Some((id, 0));
-            self.reveal_autofinish = false;
+            // Reduced-motion renders every arrival instantly: no reveal
+            // window, no emphasis, no wipe (design-doc fallbacks).
             self.handoff_hold = None;
-            // Seed first-token emphasis for the new turn (prototype #6):
-            // elapsed-tick counter starts at 0 and expires after
-            // `FIRST_TOKEN_EMPHASIS_TICKS` TypingTicks (~200 ms).
-            self.first_token_ticks.insert(id, 0);
-            // Seed the line-wipe entrance cue for the new turn (prototype #7):
-            // the top rule wipes 0→full over `LINE_WIPE_TICKS` TypingTicks.
-            // Reduced-motion skips the cue (no seed → instant render).
             if !self.reduced_motion {
+                self.revealed_chars = Some((id, 0));
+                // Seed first-token emphasis for the new turn (prototype #6):
+                // elapsed-tick counter starts at 0 and expires after
+                // `FIRST_TOKEN_EMPHASIS_TICKS` TypingTicks (~384 ms).
+                self.first_token_ticks.insert(id, 0);
+                // Seed the line-wipe entrance cue for the new turn
+                // (prototype #7): the top rule wipes 0→full over
+                // `LINE_WIPE_TICKS` TypingTicks.
                 self.line_wipe_ticks.insert(id, 0);
             }
+            self.reveal_autofinish = false;
             self.md_docs.insert(id, doc);
             self.trim_entries();
         }
@@ -1101,16 +1248,27 @@ impl State {
     /// the whole run; use [`finalize_run`](Self::finalize_run) at the true
     /// run boundary instead.
     pub fn finalize_streaming(&mut self) {
-        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+        // A final reply mid-autofinish-reveal is finalized by its tracked id —
+        // the run's `Completion` chip may already trail it — so navigating
+        // away mid-reveal cannot leave a `streaming` entry behind. Live
+        // streaming entries (no autofinish) sit at the tail, as before.
+        if self.reveal_autofinish {
+            if let Some((id, _)) = self.revealed_chars {
+                self.finalize_tracked_reveal(id);
+            }
+        } else if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
             *streaming = false;
         }
         // The reveal window is transient; once the entry is finalized the
         // full text renders and there is nothing left to drive. The
         // first-token emphasis settles immediately at this boundary too.
+        // In-flight line wipes *converge* to their settled top-rule marker
+        // instead of dropping: a reply that was navigating-away mid-cue still
+        // keeps its visible "new turn" hairline.
         self.revealed_chars = None;
         self.reveal_autofinish = false;
         self.first_token_ticks.clear();
-        self.line_wipe_ticks.clear();
+        self.settle_line_wipe();
         self.handoff_hold = None;
     }
 
@@ -1121,15 +1279,24 @@ impl State {
     /// content can arrive afterwards.
     pub fn finalize_run(&mut self) {
         self.finish_all_open_thinking();
-        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+        // Same id-keyed finalization as `finalize_streaming`: a final reply
+        // mid-autofinish-reveal is settled even when the run's `Completion`
+        // chip trails it.
+        if self.reveal_autofinish {
+            if let Some((id, _)) = self.revealed_chars {
+                self.finalize_tracked_reveal(id);
+            }
+        } else if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
             *streaming = false;
         }
         // Full text is final after a run boundary — stop any reveal window
-        // and settle first-token emphasis immediately.
+        // and settle first-token emphasis immediately. Line wipes converge
+        // to their settled marker so a finished reply keeps its "new turn"
+        // hairline instead of rendering plain (the post-run signature).
         self.revealed_chars = None;
         self.reveal_autofinish = false;
         self.first_token_ticks.clear();
-        self.line_wipe_ticks.clear();
+        self.settle_line_wipe();
         self.handoff_hold = None;
     }
 
@@ -1170,26 +1337,31 @@ impl State {
                 // every tick instead of re-running the markdown parser.
                 let doc = markdown::MarkdownDoc::parse(&s);
                 if !s.is_empty() {
-                    // The final message enters with a typewriter reveal; once
-                    // it reaches the end (`reveal_autofinish` + full window)
-                    // the entry auto-finalizes itself.
-                    self.revealed_chars = Some((id, 0));
-                    self.reveal_autofinish = true;
                     self.handoff_hold = None;
-                    // Seed first-token emphasis for the new turn (prototype #6):
-                    // elapsed-tick counter starts at 0 (≈200 ms of emphasis).
-                    self.first_token_ticks.insert(id, 0);
-                    // Seed the line-wipe entrance cue (prototype #7), same
-                    // cadence contract as the other entrance ticks. Reduced
-                    // motion skips it (no seed → instant render).
-                    if !self.reduced_motion {
+                    if self.reduced_motion {
+                        // Reduced-motion renders the final message instantly:
+                        // no reveal window, no emphasis, no wipe.
+                        self.reveal_autofinish = false;
+                    } else {
+                        // The final message enters with a typewriter reveal;
+                        // once it reaches the end (`reveal_autofinish` + full
+                        // window) the entry auto-finalizes itself.
+                        self.revealed_chars = Some((id, 0));
+                        self.reveal_autofinish = true;
+                        // Seed first-token emphasis for the new turn (prototype #6):
+                        // elapsed-tick counter starts at 0 (≈384 ms of emphasis).
+                        self.first_token_ticks.insert(id, 0);
+                        // Seed the line-wipe entrance cue (prototype #7), same
+                        // cadence contract as the other entrance ticks.
                         self.line_wipe_ticks.insert(id, 0);
                     }
                 }
                 // An empty final message must never linger as a `streaming`
                 // entry: without a reveal window it would blink a cursor and
-                // keep the blink subscription alive at idle forever.
-                let streaming = !s.is_empty();
+                // keep the blink subscription alive at idle forever. Reduced
+                // motion also renders instantly — a non-streaming entry shows
+                // the full text with no cursor and no subscriptions.
+                let streaming = !s.is_empty() && !self.reduced_motion;
                 self.entries.push(ChatEntry::Assistant {
                     id,
                     content: s,
@@ -1311,8 +1483,14 @@ impl State {
                 // streaming entry owns a reveal window, render the cached
                 // markdown up to that budget so the message grows live. Any
                 // other state renders the full content exactly as before.
+                // Reduced-motion has no reveal window: live arrivals render at
+                // their full current content instantly.
                 let reveal_window = match self.revealed_chars {
-                    Some((rid, n)) if rid == *id && *streaming && n < char_count => Some(n),
+                    Some((rid, n))
+                        if !self.reduced_motion && rid == *id && *streaming && n < char_count =>
+                    {
+                        Some(n)
+                    }
                     _ => None,
                 };
                 // Render from the cached parse (always populated for assistant
@@ -1321,7 +1499,7 @@ impl State {
                 // already-parsed event stream instead of re-parsing markdown.
                 // The raw `markdown::render` fallback is purely defensive.
                 // First-token emphasis (Score prototype #6): while the entry's
-                // ~200 ms window is open (and reduced-motion is off), its
+                // ~384 ms window is open (and reduced-motion is off), its
                 // first token renders bold, then settles to normal weight.
                 // The uncached `markdown::render` fallback is purely defensive
                 // (the cache is always populated for assistant entries) and
@@ -1357,6 +1535,7 @@ impl State {
                     self.revealed_chars.is_some_and(|(rid, n)| rid == *id && n >= char_count);
                 let in_handoff = self.handoff_hold.is_some_and(|(hold_id, _)| hold_id == *id);
                 let body: Element<'a, Message> = if *streaming
+                    && !self.reduced_motion
                     && (self.streaming_cursor_visible || in_handoff)
                     && !reveal_complete
                 {
@@ -1370,10 +1549,14 @@ impl State {
                 let mut block = column![].spacing(4).width(Length::Fill);
                 // Line-wipe entrance cue (Score prototype #7): a 2px rule at
                 // the top of each new assistant entry wipes 0→full width over
-                // `LINE_WIPE_TICKS` TypingTicks (~128 ms). Reduced-motion
+                // `LINE_WIPE_TICKS` TypingTicks (~128 ms), then settles into a
+                // muted full-width hairline (the "new turn" signature) that
+                // persists across run finalize and navigation — reduced-motion
                 // skips the cue entirely (no rule, instant render).
                 if let Some(step) = self.line_wipe_step(*id) {
                     block = block.push(line_wipe_rule(step, palette));
+                } else if self.line_wipe_settled.contains(id) {
+                    block = block.push(settled_line_wipe_rule(palette));
                 }
                 block = block.push(body);
                 if let Some(ts_line) = compact_timestamp_line(created_at, palette) {
@@ -1395,7 +1578,9 @@ impl State {
                 // Subtle shimmer while the thinking phase is still open: the
                 // preview color pulses between palette tokens (never
                 // hard-coded RGB). Driven by the `TypingTick` shimmer phase.
-                let preview_color = if finished_at.is_none() {
+                // Reduced-motion freezes the cue — the preview renders at
+                // the static muted weight.
+                let preview_color = if finished_at.is_none() && !self.reduced_motion {
                     let phase = self.shimmer_phase % (2 * SHIMMER_PERIOD);
                     let wave = if phase < SHIMMER_PERIOD {
                         phase as f32 / SHIMMER_PERIOD as f32
@@ -2322,6 +2507,24 @@ fn line_wipe_rule<'a>(step: u8, palette: &'a crate::theme::Palette) -> Element<'
     }
 }
 
+/// Settled top-rule marker for an assistant entry whose line-wipe animation
+/// has finished (Score seasoning, prototype #7): the same 2px rule at full
+/// width, muted to a quiet hairline so the "new turn" signature persists
+/// without drawing attention. Static — never animates, so it must not keep
+/// the 16 ms `TypingTick` alive by itself. Palette colors only; alpha
+/// modulation only, no transform (same contract as `line_wipe_rule`).
+fn settled_line_wipe_rule<'a>(palette: &'a crate::theme::Palette) -> Element<'a, Message> {
+    let color = with_alpha(lerp_color(palette.border, palette.accent, 0.35), 0.45);
+    container(iced::widget::space::horizontal())
+        .width(Length::Fill)
+        .height(Length::Fixed(2.0))
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(color)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// Whether the reveal frontier crossed a paragraph boundary between `from`
 /// (exclusive) and `to` (inclusive), measured in characters. A boundary is a
 /// blank line — an empty or whitespace-only line terminated by `\n` with more
@@ -2573,16 +2776,164 @@ mod tests {
         };
         assert_eq!(state.line_wipe_step(id), Some(0));
 
-        // Deterministic: exactly `LINE_WIPE_TICKS` ticks, then the wipe is
-        // dropped (the rule settles away, like the other entrance cues).
+        // Deterministic: exactly `LINE_WIPE_TICKS` ticks, then the animated
+        // wipe is done and the entry keeps its muted settled marker (the
+        // "new turn" signature) instead of the rule settling away entirely.
         for expected in 1..=LINE_WIPE_TICKS {
             let _ = state.update(Message::TypingTick);
             if expected < LINE_WIPE_TICKS {
                 assert_eq!(state.line_wipe_step(id), Some(expected));
             } else {
-                assert!(!state.line_wipe_ticks.contains_key(&id));
+                assert_eq!(state.line_wipe_step(id), None, "the animated wipe has finished");
+                assert!(
+                    state.line_wipe_settled.contains(&id),
+                    "the completed wipe leaves its settled top-rule marker"
+                );
             }
         }
+    }
+
+    #[test]
+    fn settled_wipe_marker_is_static_and_never_drives_the_tick() {
+        // The settled hairline is a static render, not an animation: once it
+        // exists and every other cue is done, `is_revealing` must be false so
+        // the 16 ms `TypingTick` subscription stops.
+        let mut state = State::new();
+        let _ = state.update(Message::AddAssistant("final reply".into()));
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        // AddAssistant auto-finalizes the reveal once it reaches the end; drive
+        // every window out (emphasis is the longest).
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(state.line_wipe_settled.contains(&id), "the wipe settled into its marker");
+        assert!(state.line_wipe_ticks.is_empty());
+        assert!(state.first_token_ticks.is_empty());
+        assert!(
+            !state.is_revealing(),
+            "a settled marker is static: no typing-tick work may remain"
+        );
+    }
+
+    #[test]
+    fn finalize_converges_in_flight_and_never_played_wipes_into_settled_markers() {
+        // A run finishing mid-wipe (or before any tick played) must still leave
+        // the "new turn" marker on the reply: finalize settles the wipe instead
+        // of erasing all trace of the cue — the post-run signature.
+        let mut via_run = State::new();
+        let _ = via_run.update(Message::AddAssistant("final reply".into()));
+        let id = match via_run.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        assert!(
+            !via_run.line_wipe_ticks.is_empty(),
+            "a final reply seeds its wipe before any tick plays"
+        );
+        via_run.finalize_run();
+        assert!(via_run.line_wipe_ticks.is_empty(), "the animated wipe drops at the run boundary");
+        assert!(
+            via_run.line_wipe_settled.contains(&id),
+            "the reply keeps its settled marker after the run"
+        );
+        assert!(
+            !via_run.is_revealing(),
+            "the settled marker is static and must not drive the tick"
+        );
+
+        // Mid-run navigation boundary (`finalize_streaming`) behaves the same,
+        // including a wipe that had a few ticks to play.
+        let mut via_nav = State::new();
+        via_nav.update_last_assistant("partial stream".to_string());
+        let nav_id = match via_nav.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        let _ = via_nav.update(Message::TypingTick);
+        assert_eq!(via_nav.line_wipe_step(nav_id), Some(1));
+        via_nav.finalize_streaming();
+        assert!(
+            via_nav.line_wipe_settled.contains(&nav_id),
+            "navigating away mid-cue still settles the marker"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_clears_settled_wipe_markers() {
+        // A11y: reduced-motion must remove even the static settled markers, so
+        // no cue — animated or settled — survives the toggle.
+        let mut state = State::new();
+        state.update_last_assistant("streamed text".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        for _ in 0..LINE_WIPE_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(state.line_wipe_settled.contains(&id), "the wipe settled into its marker");
+        state.set_reduced_motion(true);
+        assert!(
+            state.line_wipe_settled.is_empty(),
+            "reduced-motion removes the static settled markers"
+        );
+    }
+
+    #[test]
+    fn live_multi_paragraph_growth_keeps_reveal_and_handoff_alive() {
+        // The live streaming path (runtime `AssistantMessage`) types, it must
+        // not snap the frontier to the new length or drop the handoff cue:
+        // multi-paragraph output keeps the reveal driving behind arriving text.
+        let mut state = State::new();
+        state.update_last_assistant("first paragraph\n\nsecond paragraph content".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        assert_eq!(
+            state.revealed_chars,
+            Some((id, 0)),
+            "a fresh live stream seeds a reveal window"
+        );
+        let _ = state.update(Message::TypingTick);
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        // Third tick crosses the blank-line boundary: the handoff hold opens.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(
+            state.handoff_hold.map(|(_, remaining)| remaining),
+            Some(HANDOFF_HOLD_TICKS),
+            "crossing a paragraph boundary opens the handoff hold"
+        );
+        let frozen = state.revealed_chars;
+
+        // More content arrives mid-hold: the frontier must not jump to the new
+        // length (live growth is typed, not instant) and the in-flight hold is
+        // preserved.
+        state.update_last_assistant(
+            "first paragraph\n\nsecond paragraph content\n\nthird paragraph content here"
+                .to_string(),
+        );
+        assert_eq!(
+            state.revealed_chars, frozen,
+            "arriving content must not snap the frontier to full"
+        );
+        assert!(state.handoff_hold.is_some(), "an open hold is preserved across growth");
+
+        // Drain the hold: the frozen frontier resumes and keeps advancing a tick
+        // at a time behind the arriving content.
+        for _ in 0..HANDOFF_HOLD_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert_eq!(state.handoff_hold, None, "the hold drains in exactly the constant");
+        assert!(state.is_revealing(), "the reveal keeps driving after the hold clears");
+        assert!(
+            state.revealed_chars.is_some_and(|(rid, n)| rid == id && n > 16),
+            "the resumed frontier advances beyond the frozen position"
+        );
     }
 
     #[test]
@@ -2602,12 +2953,25 @@ mod tests {
         state.set_reduced_motion(true);
         let _ = state.update(Message::AddAssistant("hello".into()));
         assert!(state.line_wipe_ticks.is_empty());
-        // Enabling mid-wipe also settles instantly.
+        // Enabling mid-wipe also settles instantly — and removes any settled
+        // marker too, so reduced-motion renders every entry without a cue.
         let mut live = State::new();
         live.update_last_assistant("streaming".to_string());
+        let id = match live.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
         assert!(!live.line_wipe_ticks.is_empty());
+        for _ in 0..LINE_WIPE_TICKS {
+            let _ = live.update(Message::TypingTick);
+        }
+        assert!(live.line_wipe_settled.contains(&id), "the wipe settled first");
         live.set_reduced_motion(true);
         assert!(live.line_wipe_ticks.is_empty());
+        assert!(
+            live.line_wipe_settled.is_empty(),
+            "reduced-motion clears even the static settled markers"
+        );
     }
 
     #[test]
@@ -2884,16 +3248,16 @@ mod tests {
 
         // Clamped at the content length; although the entry is still
         // streaming, nothing is left to reveal. First-token emphasis keeps
-        // the tick alive until its ~200 ms window expires.
+        // the tick alive until its ~384 ms window expires.
         assert_eq!(state.revealed_chars, Some((id, 20)));
         assert!(state.first_token_emphasis(id), "a fresh turn emphasizes its first token");
         assert!(state.is_revealing());
-        // Drive past the 12-tick emphasis window: emphasis settles and, with
-        // the reveal already complete, the tick stops.
+        // Drive the emphasis window out: emphasis settles and, with the reveal
+        // already complete, the tick stops.
         for _ in 3..FIRST_TOKEN_EMPHASIS_TICKS {
             let _ = state.update(Message::TypingTick);
         }
-        assert!(!state.first_token_emphasis(id), "emphasis settles ~200 ms after the turn started");
+        assert!(!state.first_token_emphasis(id), "emphasis settles ~384 ms after the turn started");
         assert!(!state.is_revealing());
     }
 
@@ -2914,6 +3278,96 @@ mod tests {
     }
 
     #[test]
+    fn final_reply_reveal_survives_a_trailing_completion_entry() {
+        // Normal desktop runs emit no mid-run `AssistantMessage`, so the final
+        // reply enters through `AddAssistant` and is immediately followed by
+        // the run's `Completion` chip (`set_run_completion`). The reveal must
+        // track its entry by id — not by tail position — or the appended
+        // Completion would orphan the window on the first tick and the reply
+        // would render as an instant dump.
+        let mut state = State::new();
+        let _ = state.update(Message::AddAssistant("0123456789abcdefghij".to_string()));
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("expected an assistant entry"),
+        };
+        state.set_run_completion(true, true, vec!["src/main.rs".into()], Some("project".into()));
+        assert!(
+            matches!(state.entries().last(), Some(ChatEntry::Completion { .. })),
+            "the completion chip trails the final reply"
+        );
+        assert_eq!(state.revealed_chars, Some((id, 0)), "the final reply seeds a reveal");
+        assert!(state.is_revealing(), "the reveal survives a trailing Completion entry");
+
+        // The reveal must advance 8 chars/tick instead of snapping to full:
+        // the trailing Completion must not drop the window on the first tick.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 8)));
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, Some((id, 16)));
+        assert!(state.is_revealing(), "mid-reveal keeps the typing tick alive");
+
+        // Once the frontier reaches the content end the autofinish fires: the
+        // entry stops streaming and the window clears, exactly as it would
+        // without the trailing chip.
+        let _ = state.update(Message::TypingTick);
+        assert_eq!(state.revealed_chars, None, "the reveal finishes at the content end");
+        assert!(
+            matches!(
+                state
+                    .entries()
+                    .iter()
+                    .find(|e| { matches!(e, ChatEntry::Assistant { id: eid, .. } if *eid == id) }),
+                Some(ChatEntry::Assistant { streaming: false, .. })
+            ),
+            "the final reply auto-finalizes once fully revealed"
+        );
+        assert!(
+            matches!(
+                state.entries().iter().find(|e| {
+                    matches!(e, ChatEntry::Assistant { id: eid, .. } if *eid == id)
+                }),
+                Some(ChatEntry::Assistant { content, .. }) if content == "0123456789abcdefghij"
+            ),
+            "the full content stays intact after the reveal"
+        );
+
+        // The line wipe still plays and settles to its static marker (the
+        // "new turn" signature), and every window drains so the 16 ms tick
+        // subscription stops.
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(
+            state.line_wipe_settled.contains(&id),
+            "the wipe settles to its muted marker despite the trailing chip"
+        );
+        assert!(!state.is_revealing(), "no animation work remains after all windows settle");
+    }
+
+    #[test]
+    fn final_reply_and_completion_render_instantly_under_reduced_motion() {
+        // A11y: reduced-motion must never seed the reveal or its cues even
+        // when the run's Completion chip trails the final reply.
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        let _ = state.update(Message::AddAssistant("0123456789abcdefghij".to_string()));
+        state.set_run_completion(true, true, vec![], None);
+
+        assert_eq!(state.revealed_chars, None, "reduced-motion never seeds a reveal");
+        assert!(state.line_wipe_ticks.is_empty(), "no wipe under reduced-motion");
+        assert!(state.first_token_ticks.is_empty(), "no first-token emphasis");
+        assert!(
+            matches!(
+                state.entries().iter().find(|e| matches!(e, ChatEntry::Assistant { .. })),
+                Some(ChatEntry::Assistant { streaming: false, .. })
+            ),
+            "the final reply is never streaming under reduced-motion"
+        );
+        assert!(!state.is_revealing(), "the transcript renders instantly");
+    }
+
+    #[test]
     fn first_token_emphasis_survives_same_turn_chunks_without_reseed() {
         let mut state = State::new();
         state.update_last_assistant("hello world".to_string());
@@ -2925,15 +3379,15 @@ mod tests {
             let _ = state.update(Message::TypingTick);
         }
         // A streaming continuation on the same entry must not restart the
-        // ~200 ms window: the clock runs from the turn start.
+        // ~384 ms window: the clock runs from the turn start.
         state.update_last_assistant("hello world, more".to_string());
         assert!(state.first_token_emphasis(id));
-        for _ in 0..7 {
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS - 5 {
             let _ = state.update(Message::TypingTick);
         }
         assert!(
             !state.first_token_emphasis(id),
-            "window settles 12 ticks after the turn started, not after the last chunk"
+            "window settles exactly {FIRST_TOKEN_EMPHASIS_TICKS} ticks after the turn started, not after the last chunk"
         );
     }
 
@@ -3337,7 +3791,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_hold_freezes_reveal_for_three_ticks_then_resumes() {
+    fn handoff_hold_freezes_reveal_then_resumes() {
         let mut state = State::new();
         state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
         let id = match state.entries().last() {
@@ -3352,19 +3806,22 @@ mod tests {
         assert_eq!(state.handoff_hold, None);
 
         // Second tick (8→16) crosses the blank-line boundary: the frontier
-        // lands and a 3-tick cursor hold opens.
+        // lands and a `HANDOFF_HOLD_TICKS`-tick cursor hold opens.
         let _ = state.update(Message::TypingTick);
         assert_eq!(state.revealed_chars, Some((id, 16)));
         assert_eq!(state.handoff_hold, Some((id, HANDOFF_HOLD_TICKS)));
         assert!(state.is_revealing(), "an open hold keeps the 16 ms tick alive");
 
         // The frontier stays frozen while the hold counts down, one per tick.
-        let _ = state.update(Message::TypingTick);
-        assert_eq!(state.revealed_chars, Some((id, 16)));
-        assert_eq!(state.handoff_hold, Some((id, 2)));
-        let _ = state.update(Message::TypingTick);
-        assert_eq!(state.revealed_chars, Some((id, 16)));
-        assert_eq!(state.handoff_hold, Some((id, 1)));
+        for remaining in (1..HANDOFF_HOLD_TICKS).rev() {
+            let _ = state.update(Message::TypingTick);
+            assert_eq!(state.revealed_chars, Some((id, 16)), "the frontier stays frozen");
+            assert_eq!(
+                state.handoff_hold,
+                Some((id, remaining)),
+                "the hold counts down exactly one per tick"
+            );
+        }
 
         // Clearing tick: the hold drops but the frontier has not moved yet.
         let _ = state.update(Message::TypingTick);
@@ -3407,15 +3864,111 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_final_message_renders_instantly() {
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        let _ = state.update(Message::AddAssistant("final reply".into()));
+        match state.entries().last() {
+            Some(ChatEntry::Assistant { streaming, content, .. }) => {
+                assert!(!*streaming, "reduced-motion final messages render instantly");
+                assert_eq!(content, "final reply");
+            }
+            _ => panic!("Expected an assistant entry"),
+        }
+        assert_eq!(state.revealed_chars, None, "no reveal window under reduced-motion");
+        assert!(!state.is_revealing(), "reduced-motion never starts the 16 ms tick");
+        assert!(!state.is_streaming(), "no blink subscription may linger at idle");
+    }
+
+    #[test]
+    fn reduced_motion_live_stream_seeds_no_animation_state() {
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        // The live-streaming path (runtime `AssistantMessage`) still marks the
+        // entry streaming (the run IS streaming), but seeds no reveal window,
+        // no emphasis and no line wipe — every arrival renders in full.
+        state.update_last_assistant("streamed text".to_string());
+        assert!(state.is_streaming());
+        assert_eq!(state.revealed_chars, None);
+        assert!(state.first_token_ticks.is_empty());
+        assert!(state.line_wipe_ticks.is_empty());
+        assert!(state.line_wipe_settled.is_empty(), "no settled markers either");
+        assert!(!state.is_revealing(), "no typing-tick work under reduced-motion");
+    }
+
+    #[test]
+    fn reduced_motion_seeds_no_entrance_or_thinking_animation() {
+        let mut state = State::new();
+        state.set_reduced_motion(true);
+        state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
+        state.add_error("blocking".to_string());
+        state.add_tool_call("read_file".into(), "src/main.rs".into());
+        assert!(
+            state.entrance_ticks.is_empty(),
+            "reduced-motion chips render fully opaque instantly"
+        );
+        assert!(
+            state.thinking_reveals.is_empty(),
+            "reduced-motion thinking previews show full text instantly"
+        );
+    }
+
+    #[test]
+    fn set_reduced_motion_true_settles_in_flight_animations() {
+        let mut state = State::new();
+        // Seed every tick-driven animation under normal motion. The assistant
+        // final message goes last so it is the tracked reveal entry.
+        state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
+        state.add_error("blocking".to_string());
+        let _ = state.update(Message::AddAssistant("hello world".into()));
+        assert!(!state.entrance_ticks.is_empty());
+        assert!(!state.thinking_reveals.is_empty());
+        assert!(!state.line_wipe_ticks.is_empty());
+        assert!(!state.first_token_ticks.is_empty());
+        assert!(state.revealed_chars.is_some());
+        assert!(state.is_revealing());
+
+        state.set_reduced_motion(true);
+
+        assert!(state.entrance_ticks.is_empty());
+        assert!(state.thinking_reveals.is_empty());
+        assert!(state.line_wipe_ticks.is_empty());
+        assert!(state.line_wipe_settled.is_empty());
+        assert!(state.first_token_ticks.is_empty());
+        assert_eq!(state.revealed_chars, None);
+        assert!(!state.is_revealing(), "settling must stop the tick immediately");
+        // Entry content is untouched by the settle; the final message
+        // mid-reveal finalizes itself so no cursor or blink lingers.
+        match state.entries().iter().find(|e| matches!(e, ChatEntry::Assistant { .. })) {
+            Some(ChatEntry::Assistant { content, streaming, .. }) => {
+                assert_eq!(content, "hello world");
+                assert!(!*streaming, "a final message mid-reveal finalizes on settle");
+            }
+            _ => panic!("Expected the assistant entry"),
+        }
+    }
+
+    #[test]
     fn finalize_run_clears_handoff_hold() {
         let mut state = State::new();
         state.update_last_assistant("01234567\n\nrest of second paragraph here".to_string());
+        let id = match state.entries().last() {
+            Some(ChatEntry::Assistant { id, .. }) => *id,
+            _ => panic!("Expected an assistant entry"),
+        };
         let _ = state.update(Message::TypingTick);
         let _ = state.update(Message::TypingTick);
         assert!(state.handoff_hold.is_some(), "hold must be open before finalizing");
         state.finalize_run();
         assert_eq!(state.handoff_hold, None);
         assert_eq!(state.revealed_chars, None);
+        // The wipe (still animating at the boundary) converges to its settled
+        // top-rule marker so the reply keeps its "new turn" signature.
+        assert!(state.line_wipe_ticks.is_empty(), "the animated wipe drops at the run boundary");
+        assert!(
+            state.line_wipe_settled.contains(&id),
+            "the reply keeps its settled marker after the run"
+        );
     }
 
     #[test]

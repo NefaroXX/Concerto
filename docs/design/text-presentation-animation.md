@@ -73,11 +73,25 @@ Combine the best of all three:
 ### Signature Details
 
 - **Signature text**: First token of each assistant turn renders slightly
-  larger or bolder for ~200 ms, then settles. Signals "new turn" without
-  a full animation.
+  larger or bolder for ~384 ms (24 ticks × 16 ms), then settles. Signals
+  "new turn" without a full animation. Lengthened from the initial ~200 ms
+  design: the 8 ch/16 ms reveal (~500 chars/s) outraces typical provider
+  streaming, so the first freshly rendered lines are the ones a user reads
+  first — a longer emphasis makes the turn start register as new.
 - **Signature animation**: A brief horizontal line wipe (left-to-right,
-  ~120 ms) at the top of each new assistant turn. Subtle enough to miss
-  if you're not looking; present enough to create rhythm.
+  ~128 ms) at the top of each new assistant turn. Subtle enough to miss if
+  you're not looking; present enough to create rhythm. After the animation
+  settles, the rule persists as a muted full-width hairline on the finished
+  reply (`chat.rs::line_wipe_settled`) — the durable "new turn" marker that
+  survives the run instead of the text reverting to the old plain look.
+- **Completion-path reveal**: The desktop emits no mid-run `AssistantMessage`,
+  so the final reply enters through `Message::AddAssistant` and is immediately
+  followed by the run's `Completion` chip (`set_run_completion`). The
+  typewriter window is therefore keyed by entry id, not tail position
+  (`chat.rs::revealed_chars`): the reveal keeps animating while the chip sits
+  below it, then auto-finalizes the reply (streaming → false) so no blinking
+  cursor or subscription outlives the turn. Reduced-motion never seeds the
+  window in this path either.
 
 ---
 

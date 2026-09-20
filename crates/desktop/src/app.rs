@@ -1242,6 +1242,10 @@ impl App {
                     // Persist the current session's agent graph before clearing.
                     self.persist_active_agent_graph();
                     self.chat = views::chat::State::new();
+                    // A fresh chat starts from the factory defaults; re-apply
+                    // the display prefs (reduced-motion + muted agents) so the
+                    // new session honors the current settings.
+                    self.chat.set_reduced_motion(self.reduced_motion);
                     self.seed_muted_agents();
                     self.agent_graph = views::agent_graph::State::new();
                     self.tool_log = views::tool_log::State::new();
@@ -1464,9 +1468,12 @@ impl App {
                 } else {
                     self.tool_log.load_stored_events(&events);
                 }
-                // Restored and replayed entries normalize on read; seed the
-                // mute filter from the merged config on top.
+                // Restored and replayed entries normalize on read; re-apply the
+                // display prefs on top — the mute filter from config plus the
+                // reduced-motion override (a replaced chat otherwise reverts
+                // to the factory default and silently re-enables animations).
                 self.seed_muted_agents();
+                self.chat.set_reduced_motion(self.reduced_motion);
                 self.page = Page::Chat;
                 iced::Task::none()
             }
@@ -4348,26 +4355,37 @@ impl App {
         // Ambient circuit-trace pulse, active only while an agent run is in
         // progress. Bottom-most layer, so it reads through any gaps in
         // `composed` rather than covering it.
-        if self.run_status == RunStatus::Running {
-            let circuit_bg =
-                circuit_background::view(self.circuit_progress, self.current_theme.palette.accent);
-            stack![circuit_bg, composed].into()
-        } else if self.scanline_overlay_enabled && self.page == Page::Chat {
-            // Faint scan-line overlay behind the chat column. Visible only
-            // when the default-off flag is explicitly enabled. The overlay
-            // pulses at idle rate; the subscription doubles the effective
-            // progress when a streaming entry is active.
-            let scanline_bg = scanline_overlay::view(
+        let circuit_bg = (self.run_status == RunStatus::Running).then(|| {
+            circuit_background::view(self.circuit_progress, self.current_theme.palette.accent)
+        });
+        // Faint scan-line overlay behind the chat column, when the default-off
+        // flag is explicitly enabled. Default-off is the design intent
+        // (`text-presentation-animation.md`: the Blueprint texture is an
+        // *optional* accent, and the widget visibly pulses while streaming) —
+        // shipping it on by default would add constant background motion to a
+        // productivity tool and contradict the subtle-texture intent. Users
+        // who want it enable the Settings toggle (works end-to-end); it is the
+        // one cue not seeded by the message machinery, so reduced-motion and
+        // the settled "new turn" markers (see `chat.rs::line_wipe_settled`) are
+        // the always-visible presentation changes, not a hidden default.
+        // Sits above the circuit background (per the widget's contract) so it
+        // stays visible during runs — the only state in which a streaming
+        // entry can double its pulse rate. It pulses at idle rate otherwise.
+        let scanline_bg = (self.scanline_overlay_enabled && self.page == Page::Chat).then(|| {
+            scanline_overlay::view(
                 self.scanline_progress,
                 self.chat.is_streaming(),
                 self.reduced_motion,
                 false, // show_grid — off for chat
                 self.current_theme.palette.surface,
                 self.current_theme.palette.border,
-            );
-            stack![scanline_bg, composed].into()
-        } else {
-            composed
+            )
+        });
+        match (circuit_bg, scanline_bg) {
+            (Some(circuit), Some(scanline)) => stack![circuit, scanline, composed].into(),
+            (Some(circuit), None) => stack![circuit, composed].into(),
+            (None, Some(scanline)) => stack![scanline, composed].into(),
+            (None, None) => composed,
         }
     }
 
@@ -4487,8 +4505,9 @@ impl App {
             Subscription::none()
         };
         // Blinking cursor on the streaming assistant entry — active only while
-        // the run is actually streaming text, so it costs nothing at idle.
-        let blink_sub = if self.chat.is_streaming() {
+        // the run is actually streaming text and reduced-motion is off, so it
+        // costs nothing at idle (and reduced-motion renders no blink).
+        let blink_sub = if self.chat.is_streaming() && !self.reduced_motion {
             iced::time::every(std::time::Duration::from_millis(STREAMING_CURSOR_PERIOD_MS))
                 .map(|_| Message::Chat(views::chat::Message::StreamingTick))
         } else {
@@ -4828,6 +4847,7 @@ mod tests {
         configured_default_route, orchestration_hides_relationships, AgentOutput, App,
         DesktopApprovalSink, EventBus, Message, Page, PolicyAction, RunStatus, ThinkingKind, Ulid,
     };
+    use crate::views::chat::Message as ChatMessage;
     use crate::views::settings::Message as SettingsMessage;
     use concerto_config::{AppConfig, ProviderConfig};
     use concerto_core::event::EventKind;
@@ -4915,6 +4935,18 @@ mod tests {
         assert!(app.show_help);
         let _ = app.update(Message::HelpToggled);
         assert!(!app.show_help);
+    }
+
+    #[test]
+    fn new_session_reapplies_reduced_motion_to_the_fresh_chat() {
+        let (mut app, _) = App::new();
+        // Simulate a user who enabled reduced-motion (the default config
+        // disables it): an interrupted NewSession reset must not revert the
+        // fresh chat to the factory default and silently re-enable the
+        // animations the setting turned off.
+        app.reduced_motion = true;
+        let _ = app.update(Message::Chat(ChatMessage::NewSession));
+        assert!(app.chat.reduced_motion(), "a fresh chat must honor the reduced-motion override");
     }
 
     #[test]
