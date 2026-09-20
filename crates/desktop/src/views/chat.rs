@@ -14,7 +14,7 @@ use crate::views::spend::{
 use crate::widgets::agent_graph::NodeState;
 use crate::widgets::markdown;
 use concerto_core::event::ThinkingKind;
-use concerto_core::types::{normalize_agent_id, AgentId};
+use concerto_core::types::normalize_agent_id;
 use concerto_sessions::spend::SpendRecord;
 
 /// Unique entry identifier within a chat session.
@@ -70,6 +70,11 @@ pub enum Message {
     CollapseAllThinking,
     /// Expand every thinking bucket (`/thinking` toggle → expanded side).
     ExpandAllThinking,
+    /// `/thinking` accordion toggle for the current movement: expand all when
+    /// nothing is open, collapse all otherwise. Drives `toggle_thinking_all`
+    /// from the composer's real button — the `/thinking` text command still
+    /// works too (handled in `app.rs`).
+    ToggleThinkingAll,
     CopyCode(String),
     ToggleMultiAgent,
     ToggleFastMode,
@@ -349,13 +354,10 @@ pub struct State {
     /// state — never serialized; populated eagerly wherever assistant content
     /// is set and dropped by `trim_entries` when entries are evicted.
     md_docs: HashMap<EntryId, markdown::MarkdownDoc>,
-    /// Typewriter-reveal frontier for thinking previews:
-    /// `id -> chars revealed`. Removed once the reveal reaches the content
-    /// length. Transient view state — never serialized.
-    thinking_reveals: HashMap<EntryId, usize>,
-    /// Entrance-fade progress for ToolCall / Error / Completion chips:
-    /// `id -> tick count since insertion`, capped at `ENTRANCE_TICKS` (then
-    /// removed). Transient view state — never serialized.
+    /// Entrance-fade progress for ToolCall / Error / Completion chips
+    /// (and thinking previews): `id -> tick count since insertion`, capped
+    /// at `ENTRANCE_TICKS` (then removed). Transient view state — never
+    /// serialized.
     entrance_ticks: HashMap<EntryId, u8>,
     /// Line-wipe progress for new assistant entries (Score seasoning,
     /// prototype #7): `id -> tick count since insertion`, capped at
@@ -394,9 +396,6 @@ const MAX_TOOL_DETAIL_CHARS: usize = 256_000;
 /// *typing* texture, deliberately faster than typical provider streaming so
 /// text is never visibly lagging behind the token arrival it follows.
 const REVEAL_CHARS_PER_TICK: usize = 8;
-/// Characters the thinking-preview reveal moves per `TypingTick`: with the
-/// same 16 ms cadence this is ~4000 chars/s — a quick open/expand feel.
-const THINKING_REVEAL_CHARS_PER_TICK: usize = 64;
 /// Number of `TypingTick`s an entrance fade runs for (~128 ms at 16 ms/tick).
 const ENTRANCE_TICKS: u8 = 8;
 /// Number of `TypingTick`s the paragraph handoff cue holds (~128 ms at
@@ -462,7 +461,6 @@ impl State {
             first_token_ticks: HashMap::new(),
             reduced_motion: false,
             md_docs: HashMap::new(),
-            thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
             line_wipe_ticks: HashMap::new(),
             line_wipe_settled: HashSet::new(),
@@ -519,7 +517,6 @@ impl State {
             first_token_ticks: HashMap::new(),
             reduced_motion: false,
             md_docs,
-            thinking_reveals: HashMap::new(),
             entrance_ticks: HashMap::new(),
             line_wipe_ticks: HashMap::new(),
             line_wipe_settled: HashSet::new(),
@@ -609,7 +606,6 @@ impl State {
             // per-entry caches (markdown docs, reveal/animation maps) can never
             // grow stale or leak ids that no longer exist.
             self.md_docs.clear();
-            self.thinking_reveals.clear();
             self.entrance_ticks.clear();
             self.first_token_ticks.clear();
             self.line_wipe_ticks.clear();
@@ -711,7 +707,6 @@ impl State {
             content: ref mut existing,
             collapsed: false,
             finished_at: None,
-            id,
             ..
         }) = self.entries.last_mut()
         {
@@ -719,21 +714,17 @@ impl State {
                 existing.push('\n');
                 existing.push_str(&content);
                 *existing = tail_chars(existing, MAX_THINKING_CHARS);
-                // Content grew: keep any in-flight reveal, clamping it to the new
-                // length (and finishing it if the tail was truncated into range).
-                if let Some(revealed) = self.thinking_reveals.get_mut(id) {
-                    let len = existing.chars().count();
-                    *revealed = (*revealed).min(len);
-                    if *revealed >= len {
-                        self.thinking_reveals.remove(id);
-                    }
-                }
+                // Merged content shares the entry's entrance fade — never
+                // restarts it (a settled preview must not re-fade).
                 return;
             }
         }
         let id = self.next_id;
         self.next_id += 1;
-        let collapsed = content.len() > 500;
+        // Collapse heuristic counts *characters*: a bytes() cutoff mis-counts
+        // multi-byte content (CJK, emoji), so the same text could sometimes
+        // collide into an open bucket and sometimes spawn a ragged one.
+        let collapsed = content.chars().count() > 500;
         self.entries.push(ChatEntry::Thinking {
             id,
             agent: agent_id,
@@ -743,9 +734,12 @@ impl State {
             created_at: Some(now_rfc3339()),
             finished_at: None,
         });
-        // Reduced-motion shows the thinking preview as full text instantly.
+        // Thinking previews render their full content as it arrives with a
+        // short entrance fade only — no typewriter reveal, so a cold start
+        // never reads as a blank colored block that fills over seconds.
+        // Reduced-motion shows the preview as full text instantly.
         if !self.reduced_motion {
-            self.thinking_reveals.insert(id, 0);
+            self.entrance_ticks.insert(id, 0);
         }
         self.trim_entries();
     }
@@ -914,21 +908,21 @@ impl State {
         if assistant_revealing {
             return true;
         }
-        // Thinking-preview reveal, entrance fade, first-token emphasis,
+        // Thinking-preview fade, entrance fade, first-token emphasis,
         // line wipe, or paragraph handoff hold still animating.
-        if !self.thinking_reveals.is_empty()
-            || !self.entrance_ticks.is_empty()
+        if !self.entrance_ticks.is_empty()
             || !self.first_token_ticks.is_empty()
             || !self.line_wipe_ticks.is_empty()
             || self.handoff_hold.is_some()
         {
             return true;
         }
-        // An open thinking entry keeps the shimmer driver (and its 16 ms tick)
-        // alive until the run boundary stamps it finished.
-        self.entries
-            .iter()
-            .any(|entry| matches!(entry, ChatEntry::Thinking { finished_at: None, .. }))
+        // An open-but-settled thinking entry is static: its shimmer freezes
+        // at the last rendered color, so it must NOT keep the 16 ms tick
+        // alive indefinitely (the "thinking entry pulses forever" defect —
+        // the fade above provides the transient motion). Nothing left to
+        // animate.
+        false
     }
 
     /// Advance the typewriter reveal one tick on the streaming assistant
@@ -1044,36 +1038,6 @@ impl State {
         }
     }
 
-    /// Advance every in-flight thinking reveal one tick (clamped to each
-    /// entry's content length), removing entries whose reveal finished.
-    fn advance_thinking_reveals(&mut self) {
-        // Lengths are snapshotted first: the reveal map is mutated below, so
-        // the entries borrow cannot stay live across the updates.
-        let lengths: HashMap<EntryId, usize> = self
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                ChatEntry::Thinking { id, content, .. } => Some((*id, content.chars().count())),
-                _ => None,
-            })
-            .collect();
-        let mut done: Vec<EntryId> = Vec::new();
-        for (id, revealed) in self.thinking_reveals.iter_mut() {
-            match lengths.get(id).copied() {
-                Some(len) => {
-                    *revealed = revealed.saturating_add(THINKING_REVEAL_CHARS_PER_TICK).min(len);
-                    if *revealed >= len {
-                        done.push(*id);
-                    }
-                }
-                None => done.push(*id),
-            }
-        }
-        for id in done {
-            self.thinking_reveals.remove(&id);
-        }
-    }
-
     /// Advance every pending entrance fade one tick, dropping entries whose
     /// fade has completed.
     fn advance_entrance_ticks(&mut self) {
@@ -1178,7 +1142,6 @@ impl State {
             self.handoff_hold = None;
             self.first_token_ticks.clear();
             self.entrance_ticks.clear();
-            self.thinking_reveals.clear();
             self.line_wipe_ticks.clear();
             self.line_wipe_settled.clear();
         }
@@ -1277,27 +1240,45 @@ impl State {
     /// timestamp on every thinking entry still open. Safe only at the true
     /// run boundary (run completed or cancelled) because no further thinking
     /// content can arrive afterwards.
+    ///
+    /// A *final reply* that is still typewriter-revealing when the run ends is
+    /// NOT snapped to full text: the app appends the `Completion` chip after
+    /// this call, and the reveal keeps driving past that chip until it reaches
+    /// the end (the tracked entry auto-finalizes itself, then the window
+    /// drops). Killing the window here was the "instant dump" defect — the
+    /// final reply jumped from its mid-reveal frontier to full text the moment
+    /// the run landed.
     pub fn finalize_run(&mut self) {
         self.finish_all_open_thinking();
-        // Same id-keyed finalization as `finalize_streaming`: a final reply
-        // mid-autofinish-reveal is settled even when the run's `Completion`
-        // chip trails it.
-        if self.reveal_autofinish {
-            if let Some((id, _)) = self.revealed_chars {
-                self.finalize_tracked_reveal(id);
+        // Only a live autofinish window is preserved: its tracked entry is
+        // still `streaming` (found by id, not tail position, because the
+        // Completion chip trails it).
+        let autofinish_live = self.reveal_autofinish
+            && self.revealed_chars.is_some_and(|(id, _)| {
+                self.entries.iter().any(|entry| {
+                    matches!(entry, ChatEntry::Assistant { id: entry_id, streaming: true, .. }
+                    if *entry_id == id)
+                })
+            });
+        if !autofinish_live {
+            // No live autofinish window: either a live-streamed tail entry
+            // (mark it non-streaming and drop the window — full text is final)
+            // or a stale autofinish window whose tracked entry already
+            // finalized (drop the orphaned window).
+            if !self.reveal_autofinish {
+                if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+                    *streaming = false;
+                }
             }
-        } else if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
-            *streaming = false;
+            self.revealed_chars = None;
+            self.reveal_autofinish = false;
+            self.handoff_hold = None;
         }
-        // Full text is final after a run boundary — stop any reveal window
-        // and settle first-token emphasis immediately. Line wipes converge
-        // to their settled marker so a finished reply keeps its "new turn"
-        // hairline instead of rendering plain (the post-run signature).
-        self.revealed_chars = None;
-        self.reveal_autofinish = false;
+        // First-token emphasis settles at the boundary; in-flight line wipes
+        // *converge* to their settled top-rule marker instead of dropping: a
+        // just-finished reply keeps its visible "new turn" hairline.
         self.first_token_ticks.clear();
         self.settle_line_wipe();
-        self.handoff_hold = None;
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -1382,7 +1363,6 @@ impl State {
             }
             Message::TypingTick => {
                 self.advance_reveal();
-                self.advance_thinking_reveals();
                 self.advance_entrance_ticks();
                 self.advance_first_token_ticks();
                 self.advance_line_wipe_ticks();
@@ -1421,6 +1401,9 @@ impl State {
             }
             Message::ExpandAllThinking => {
                 self.thinking_expand_all = true;
+            }
+            Message::ToggleThinkingAll => {
+                self.toggle_thinking_all();
             }
             Message::CopyCode(_) => {
                 // Handled via clipboard integration in the code_block widget
@@ -1566,31 +1549,29 @@ impl State {
             }
             ChatEntry::Thinking { content, collapsed, id, created_at, finished_at, .. } => {
                 let char_count = content.chars().count();
-                // Thinking preview typewriter-reveals while content arrives,
-                // then shows the full text once the reveal catches up.
-                // (Collapsed entries never reveal — they show the stub line.)
-                let revealed = self.thinking_reveals.get(id).copied().unwrap_or(char_count);
+                // Thinking previews render their full content as it arrives:
+                // a short entrance fade (see `add_thinking`) — no typewriter
+                // reveal, so a cold start never reads as a blank colored
+                // block that fills over seconds. Collapsed entries show the
+                // stub line instead.
                 let preview = if *collapsed {
                     format!("Iteration details hidden ({char_count} chars)")
                 } else {
-                    content.chars().take(revealed).collect::<String>()
+                    content.clone()
                 };
                 // Subtle shimmer while the thinking phase is still open: the
                 // preview color pulses between palette tokens (never
                 // hard-coded RGB). Driven by the `TypingTick` shimmer phase.
                 // Reduced-motion freezes the cue — the preview renders at
-                // the static muted weight.
+                // the static muted weight. The entrance fade applies on top
+                // either way, then the container fades in with the preview.
+                let fade = entrance_alpha(self.entrance_ticks.get(id).copied());
                 let preview_color = if finished_at.is_none() && !self.reduced_motion {
-                    let phase = self.shimmer_phase % (2 * SHIMMER_PERIOD);
-                    let wave = if phase < SHIMMER_PERIOD {
-                        phase as f32 / SHIMMER_PERIOD as f32
-                    } else {
-                        (2 * SHIMMER_PERIOD - phase) as f32 / SHIMMER_PERIOD as f32
-                    };
-                    lerp_color(palette.text_muted, palette.text, 0.5 + 0.5 * wave)
+                    shimmer_color(palette, self.shimmer_phase)
                 } else {
                     palette.text_muted
                 };
+                let preview_color = with_alpha(preview_color, fade);
                 let label = if *collapsed { "▶" } else { "▼" };
                 let toggle_btn = button(text(label).size(11))
                     .style(crate::ui::button::secondary)
@@ -1611,8 +1592,11 @@ impl State {
                 }
                 container(preview_row)
                     .padding(8)
-                    .style(|_theme| container::Style {
-                        background: Some(Background::Color(palette.surface_variant)),
+                    .style(move |_theme| container::Style {
+                        background: Some(Background::Color(with_alpha(
+                            palette.surface_variant,
+                            fade,
+                        ))),
                         border: Border { radius: Radius::from(8.0), ..Default::default() },
                         ..container::Style::default()
                     })
@@ -1628,10 +1612,19 @@ impl State {
                 };
                 let clr = with_alpha(clr, fade);
                 let muted = with_alpha(palette.text_muted, fade);
-                let label = if detail.is_empty() {
+                // Tool rows stay one line with a bounded first-line preview:
+                // a full `detail` dump (multi-KB path lists, JSON blobs) made
+                // the transcript sprawl and hid later entries. The Tool Log
+                // modal holds the full record — the row routes there.
+                let preview_limit = 48;
+                let first_line = detail.lines().next().unwrap_or("");
+                let snippet: String = first_line.chars().take(preview_limit).collect();
+                let label = if first_line.is_empty() {
                     format!("[Tool] {}", tool_name)
+                } else if snippet == first_line {
+                    format!("[Tool] {} — {}", tool_name, snippet)
                 } else {
-                    format!("[Tool] {} — {}", tool_name, detail)
+                    format!("[Tool] {} — {}…", tool_name, snippet)
                 };
                 let tool_button: Element<'_, Message> = button(
                     container(
@@ -1732,6 +1725,26 @@ impl State {
         container(bar).padding([4, 8]).into()
     }
 
+    /// Per-turn agent identity for an assistant block: a compact badge +
+    /// role label above the reply. The assistant entry stores no agent id
+    /// (single-agent transcript), so the label derives from the most recent
+    /// thinking bucket's agent — view-only attribution, never persisted. The
+    /// block's own line-wipe rule (or its settled marker) doubles as the
+    /// hairline underneath.
+    fn agent_turn_header<'a>(
+        &'a self,
+        agent: String,
+        palette: &'a crate::theme::Palette,
+    ) -> Element<'a, Message> {
+        let color =
+            crate::theme::agent_color_from_id(&agent, palette).unwrap_or(palette.text_muted);
+        row![text("◆").size(11).color(color), text(agent).size(11).color(palette.text_muted)]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .padding(iced::Padding::ZERO.top(2).right(8).bottom(0).left(8))
+            .into()
+    }
+
     fn empty_session_view<'a>(
         &'a self,
         theme: &'a AppTheme,
@@ -1823,19 +1836,12 @@ impl State {
         &'a self,
         graph: &'a agent_graph::State,
         palette: &'a crate::theme::Palette,
-        run_entries: &'a [ChatEntry],
     ) -> Element<'a, Message> {
         let mut phases = column![].spacing(0).width(Length::Fill);
-        // Tool events currently carry no role/task id. Render the shared trail
-        // once under the newest Coder phase instead of duplicating it for every
-        // repair or follow-up Coder subtask.
-        let tool_owner = graph
-            .model
-            .nodes
-            .iter()
-            .rev()
-            .find(|node| node.role == AgentId::new("coder"))
-            .map(|node| node.id);
+        // Tool calls are NOT re-listed here: the chat column renders each one
+        // as its own compact entry, so a timeline re-list would double every
+        // tool row (the "tool quarantine" duplication — the timeline stays a
+        // phase overview only).
         for node in &graph.model.nodes {
             let (icon, color) = match node.state {
                 NodeState::Completed => ("✓", palette.success),
@@ -1878,38 +1884,6 @@ impl State {
             .spacing(10)
             .align_y(Alignment::Center);
             phases = phases.push(container(header).padding([10, 2]).width(Length::Fill));
-
-            if tool_owner == Some(node.id) {
-                for entry in run_entries {
-                    if let ChatEntry::ToolCall { tool_name, detail, status, .. } = entry {
-                        let (tool_icon, tool_color) = match status {
-                            ToolCallStatus::Running => ("○", palette.warning),
-                            ToolCallStatus::Completed | ToolCallStatus::Allowed => {
-                                ("▣", palette.text_muted)
-                            }
-                            ToolCallStatus::Failed | ToolCallStatus::Denied => {
-                                ("△", palette.danger)
-                            }
-                            ToolCallStatus::Cancelled => ("−", palette.text_muted),
-                        };
-                        let first_line = detail.lines().next().unwrap_or("");
-                        let compact_detail: String = first_line.chars().take(100).collect();
-                        let label = if compact_detail.is_empty() {
-                            tool_name.clone()
-                        } else {
-                            format!("{} · {}", tool_name, compact_detail)
-                        };
-                        phases = phases.push(
-                            row![
-                                text(tool_icon).size(12).color(tool_color),
-                                text(label).size(12).color(tool_color),
-                            ]
-                            .spacing(8)
-                            .padding([3, 30]),
-                        );
-                    }
-                }
-            }
             phases = phases.push(iced::widget::rule::horizontal(1));
         }
         container(phases).padding([2, 8]).width(Length::Fill).into()
@@ -2039,23 +2013,29 @@ impl State {
         }
 
         // Message list — render with the per-agent thinking accordion (V2).
-        let mut col = column![].spacing(6).padding(8);
+        let mut col = column![].spacing(4).padding(8);
         let has_timeline =
             agent_graph.has_multi_agent_activity && !agent_graph.model.nodes.is_empty();
         let latest_user_index =
             self.entries.iter().rposition(|entry| matches!(entry, ChatEntry::User { .. }));
         if has_timeline && latest_user_index.is_none() {
-            col = col.push(self.orchestration_timeline(agent_graph, palette, &self.entries));
+            col = col.push(self.orchestration_timeline(agent_graph, palette));
         }
         // Full per-agent buckets over ALL thinking entries (not just
         // consecutive runs): one panel per agent in first-appearance order,
         // emitted at the agent's first entry. Muted agents are skipped here
-        // (view-only; the WAL/transcript still hold everything).
+        // (view-only; the WAL/transcript still hold everything). The filter
+        // bar always renders once the chat has entries, so the composer's
+        // position under it stays fixed — no layout jump when the first
+        // bucket appears (the no-entries case returned above).
         let (bucket_order, buckets) = thinking_buckets(&self.entries);
-        if !bucket_order.is_empty() {
-            col = col.push(self.thinking_filter_bar(palette, &bucket_order, &buckets));
-        }
+        col = col.push(self.thinking_filter_bar(palette, &bucket_order, &buckets));
         let mut emitted_buckets = HashSet::new();
+        // Per-turn agent attribution for assistant entries: the assistant
+        // entry carries no agent id (single-agent transcript), so the header
+        // derives the speaker from the most recent thinking bucket's agent,
+        // falling back to the generic "agent" role. View-only — never stored.
+        let mut last_turn_agent: Option<String> = None;
         let mut idx = 0;
         while idx < self.entries.len() {
             let bucket_key = match &self.entries[idx] {
@@ -2065,6 +2045,7 @@ impl State {
                 _ => None,
             };
             if let Some(agent) = bucket_key {
+                last_turn_agent = Some(agent.clone());
                 if self.muted_agents.contains(&agent) {
                     idx += 1;
                     continue;
@@ -2091,19 +2072,22 @@ impl State {
                         &group,
                         &self.entries,
                         palette,
-                        &self.thinking_reveals,
+                        &self.entrance_ticks,
+                        self.reduced_motion,
                         self.shimmer_phase,
                     ));
                 }
                 idx += 1;
             } else {
+                if let ChatEntry::Assistant { .. } = &self.entries[idx] {
+                    col = col.push(self.agent_turn_header(
+                        last_turn_agent.clone().unwrap_or_else(|| "agent".to_string()),
+                        palette,
+                    ));
+                }
                 col = col.push(self.render_entry(&self.entries[idx], palette));
                 if has_timeline && latest_user_index == Some(idx) {
-                    col = col.push(self.orchestration_timeline(
-                        agent_graph,
-                        palette,
-                        &self.entries[idx + 1..],
-                    ));
+                    col = col.push(self.orchestration_timeline(agent_graph, palette));
                 }
                 idx += 1;
             }
@@ -2221,31 +2205,18 @@ fn thinking_headline_from_entries(entries: &[ChatEntry], indices: &[usize]) -> S
 /// shows the agent badge + digest headline + count; expanded shows each
 /// `Headline`/`Detail` entry (`LowLevel` never reaches chat — it is routed
 /// to the AgentGraph logs in `runtime.rs`, and is skipped here defensively).
-/// Reuses existing thinking_reveals, shimmer, and stub logic.
+/// Entries render at full content with their own entrance fade and live
+/// shimmer (fade-only — see `add_thinking`); reduced-motion renders them
+/// static and instantly opaque.
 fn render_thinking_group<'a>(
     group: &ThinkingGroup,
     entries: &'a [ChatEntry],
     palette: &'a crate::theme::Palette,
-    reveals: &'a std::collections::HashMap<EntryId, usize>,
+    entrance_ticks: &'a std::collections::HashMap<EntryId, u8>,
+    reduced_motion: bool,
     shimmer_phase: u32,
 ) -> Element<'a, Message> {
     let count = group.indices.len();
-    let any_open = group
-        .indices
-        .iter()
-        .any(|&idx| matches!(&entries[idx], ChatEntry::Thinking { finished_at: None, .. }));
-
-    let preview_color = if any_open {
-        let phase = shimmer_phase % (2 * SHIMMER_PERIOD);
-        let wave = if phase < SHIMMER_PERIOD {
-            phase as f32 / SHIMMER_PERIOD as f32
-        } else {
-            (2 * SHIMMER_PERIOD - phase) as f32 / SHIMMER_PERIOD as f32
-        };
-        lerp_color(palette.text_muted, palette.text, 0.5 + 0.5 * wave)
-    } else {
-        palette.text_muted
-    };
 
     let agent_color =
         crate::theme::agent_color_from_id(&group.agent_id, palette).unwrap_or(palette.text_muted);
@@ -2266,7 +2237,8 @@ fn render_thinking_group<'a>(
             })
             .into()
     } else {
-        // Expanded: show each entry's content with per-entry reveal.
+        // Expanded: each entry renders its full content with a per-entry
+        // entrance fade and (while the phase is still open) a live shimmer.
         let mut col = column![].spacing(2);
         let header = row![
             button(text("▼").size(11))
@@ -2279,14 +2251,18 @@ fn render_thinking_group<'a>(
         .spacing(4);
         col = col.push(header);
         for &idx in &group.indices {
-            if let ChatEntry::Thinking { id, content, kind, .. } = &entries[idx] {
+            if let ChatEntry::Thinking { id, content, kind, finished_at, .. } = &entries[idx] {
                 if *kind == ThinkingKind::LowLevel {
                     continue;
                 }
-                let revealed = reveals.get(id).copied().unwrap_or(content.chars().count());
-                let preview = content.chars().take(revealed).collect::<String>();
+                let fade = entrance_alpha(entrance_ticks.get(id).copied());
+                let color = if finished_at.is_none() && !reduced_motion {
+                    with_alpha(shimmer_color(palette, shimmer_phase), fade)
+                } else {
+                    with_alpha(palette.text_muted, fade)
+                };
                 col = col
-                    .push(container(text(preview).size(13).color(preview_color)).padding([4, 8]));
+                    .push(container(text(content.clone()).size(13).color(color)).padding([4, 8]));
             }
         }
         container(col)
@@ -2458,6 +2434,19 @@ fn with_alpha(color: Color, alpha: f32) -> Color {
     color
 }
 
+/// Color for the live thinking shimmer at `shimmer_phase`: pulses between
+/// the muted text token and the base text token over `SHIMMER_PERIOD` ticks
+/// each way (triangle wave). Palette colors only — never hard-coded RGB.
+fn shimmer_color(palette: &crate::theme::Palette, shimmer_phase: u32) -> Color {
+    let phase = shimmer_phase % (2 * SHIMMER_PERIOD);
+    let wave = if phase < SHIMMER_PERIOD {
+        phase as f32 / SHIMMER_PERIOD as f32
+    } else {
+        (2 * SHIMMER_PERIOD - phase) as f32 / SHIMMER_PERIOD as f32
+    };
+    lerp_color(palette.text_muted, palette.text, 0.5 + 0.5 * wave)
+}
+
 /// Fractional opacity for an entry's entrance fade: starts near `1/ENTRANCE_TICKS`
 /// on insertion and reaches fully opaque once `ENTRANCE_TICKS` ticks elapse
 /// (the entry is then dropped from `entrance_ticks`). Absent ticks mean the
@@ -2470,10 +2459,10 @@ fn entrance_alpha(ticks: Option<u8>) -> f32 {
 }
 
 /// Alpha for the line-wipe rule at `step` (0-based elapsed ticks): ramps in
-/// equal per-tick increments from faint to near-opaque, always low alpha.
-/// This is the fade-in fallback — even if the width layout is ever
-/// constrained, the cue still reads as an alpha-step fade. Palette colors
-/// only; alpha modulation only, no transform.
+/// equal per-tick increments from faint to near-opaque. The rule renders at
+/// full width the whole time (see `line_wipe_rule`), so this opacity ramp is
+/// the progress cue itself — width never animates. Palette colors only;
+/// alpha modulation only, no transform.
 fn line_wipe_alpha(step: u8) -> f32 {
     let done = f32::from(step.min(LINE_WIPE_TICKS.saturating_sub(1))) + 1.0;
     0.25 + 0.55 * (done / f32::from(LINE_WIPE_TICKS))
@@ -2481,30 +2470,25 @@ fn line_wipe_alpha(step: u8) -> f32 {
 
 /// Top-rule element for the new-assistant line-wipe cue (prototype #7):
 /// `step` is the elapsed tick count (0-based) since the entry was inserted.
-/// The visible 2px segment grows 1/`LINE_WIPE_TICKS` → full width via
-/// `FillPortion` layout only (no transform), while its color lerps
-/// `palette.border` → `palette.accent` at the fallback alpha ramp.
+/// A full-width 2px rule whose color lerps `palette.border` → `palette.accent`
+/// while `line_wipe_alpha` ramps the opacity in — the width never animates,
+/// so the chat column's right edge stays put (the diagnosed right-margin
+/// pull when a partial-width bar collapsed mid-wipe). No transform; alpha
+/// modulation only, same contract as `settled_line_wipe_rule`.
 fn line_wipe_rule<'a>(step: u8, palette: &'a crate::theme::Palette) -> Element<'a, Message> {
     let total = u16::from(LINE_WIPE_TICKS);
     let done = u16::from(step.min(LINE_WIPE_TICKS.saturating_sub(1))) + 1;
     let progress = f32::from(done) / f32::from(total);
     let color =
         with_alpha(lerp_color(palette.border, palette.accent, progress), line_wipe_alpha(step));
-    let bar = container(iced::widget::space::horizontal())
-        .width(Length::FillPortion(done))
+    container(iced::widget::space::horizontal())
+        .width(Length::Fill)
         .height(Length::Fixed(2.0))
         .style(move |_theme: &iced::Theme| container::Style {
             background: Some(Background::Color(color)),
             ..container::Style::default()
-        });
-    if done >= total {
-        row![bar].width(Length::Fill).into()
-    } else {
-        let gap = container(iced::widget::space::horizontal())
-            .width(Length::FillPortion(total - done))
-            .height(Length::Fixed(2.0));
-        row![bar, gap].width(Length::Fill).spacing(0).into()
-    }
+        })
+        .into()
 }
 
 /// Settled top-rule marker for an assistant entry whose line-wipe animation
@@ -2638,6 +2622,18 @@ fn input_bar<'a>(
         .into()
     };
 
+    // `/thinking` accordion toggle: the composer's real button (mirrors the
+    // filter-bar caption; the `/thinking` text command still works too).
+    let thinking_toggle: Element<'a, Message> = tooltip::Tooltip::new(
+        button(text("‖ thinking").size(12))
+            .style(crate::ui::button::secondary)
+            .on_press(Message::ToggleThinkingAll),
+        container(text("Expand/collapse every thinking trace (/thinking)").size(12)).padding(8),
+        tooltip::Position::Top,
+    )
+    .gap(4)
+    .into();
+
     // Guidance hint when multi-agent is ON but no agents are configured
     let setup_hint: Element<'a, Message> = if multi_agent && !has_agent_assignments {
         container(
@@ -2659,10 +2655,11 @@ fn input_bar<'a>(
         container(text("").height(0)).into()
     };
 
-    let bar = row![new_session_btn, model_picker, txt, send, toggle_group, fast_group,]
-        .spacing(8)
-        .padding(8)
-        .align_y(iced::Alignment::Center);
+    let bar =
+        row![new_session_btn, model_picker, txt, send, toggle_group, fast_group, thinking_toggle,]
+            .spacing(8)
+            .padding(8)
+            .align_y(iced::Alignment::Center);
 
     container(column![setup_hint, bar].spacing(2))
         .width(Length::Fill)
@@ -2833,15 +2830,36 @@ mod tests {
             !via_run.line_wipe_ticks.is_empty(),
             "a final reply seeds its wipe before any tick plays"
         );
+        assert!(
+            via_run.reveal_autofinish && via_run.is_revealing(),
+            "a final reply seeds its autofinish reveal before any tick plays"
+        );
         via_run.finalize_run();
-        assert!(via_run.line_wipe_ticks.is_empty(), "the animated wipe drops at the run boundary");
+        // Run finalize must NOT dump an in-flight autofinish reveal to full
+        // text (the "instant dump" defect): the typewriter continues past the
+        // run boundary (the Completion chip trails it), then the tracked
+        // entry auto-finalizes.
+        assert!(
+            via_run.reveal_autofinish && via_run.is_revealing(),
+            "an in-flight autofinish reveal survives the run boundary"
+        );
+        for _ in 0..FIRST_TOKEN_EMPHASIS_TICKS + 20 {
+            let _ = via_run.update(Message::TypingTick);
+        }
+        assert!(!via_run.is_revealing(), "the preserved reveal completes fully and stops the tick");
+        assert!(
+            matches!(
+                via_run.entries().iter().find(|e| {
+                    matches!(e, ChatEntry::Assistant { id: eid, .. } if *eid == id)
+                }),
+                Some(ChatEntry::Assistant { streaming: false, content, .. })
+                    if content == "final reply"
+            ),
+            "the tracked reply auto-finalizes with its full content after the reveal"
+        );
         assert!(
             via_run.line_wipe_settled.contains(&id),
             "the reply keeps its settled marker after the run"
-        );
-        assert!(
-            !via_run.is_revealing(),
-            "the settled marker is static and must not drive the tick"
         );
 
         // Mid-run navigation boundary (`finalize_streaming`) behaves the same,
@@ -3548,42 +3566,57 @@ mod tests {
     }
 
     #[test]
-    fn thinking_reveal_advances_per_tick_and_clamps() {
+    fn thinking_entrance_fade_completes_across_entrance_ticks() {
+        // Thinking previews run a short entrance fade (no typewriter reveal):
+        // full content renders immediately, the opacity ramps in over
+        // `ENTRANCE_TICKS`, then the entry is static.
         let mut state = State::new();
-        state.add_thinking("coder", "0123456789".to_string(), ThinkingKind::Detail); // 10 chars
+        state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
         let id = match state.entries().last() {
             Some(ChatEntry::Thinking { id, .. }) => *id,
             _ => panic!("Expected a thinking entry"),
         };
-        assert_eq!(state.thinking_reveals.get(&id), Some(&0));
-        assert!(state.is_revealing());
+        assert_eq!(state.entrance_ticks.get(&id), Some(&0), "a new preview seeds its fade");
+        assert!(state.is_revealing(), "a pending thinking fade keeps the tick alive");
 
-        // First tick reveals 64 chars, clamped to the 10-char content; the
-        // reveal then completes and is removed (content fully visible).
-        let _ = state.update(Message::TypingTick);
-        assert_eq!(state.thinking_reveals.get(&id), None, "reveal finishes at the content length");
-        // Subsequent ticks must not re-insert the reveal.
-        let _ = state.update(Message::TypingTick);
-        assert!(!state.thinking_reveals.contains_key(&id));
+        // Exactly `ENTRANCE_TICKS` ticks complete the fade and drop it.
+        for _ in 0..ENTRANCE_TICKS {
+            assert!(state.is_revealing(), "fade stays live until the cap");
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(!state.entrance_ticks.contains_key(&id), "fade entry removed at cap");
+        assert!(
+            !state.is_revealing(),
+            "a settled-but-open thinking entry is static: no shimmer tick drives it forever"
+        );
     }
 
     #[test]
-    fn thinking_reveal_clamps_when_content_grows() {
+    fn thinking_merge_never_restarts_the_entrance_fade() {
+        // Appended content merges into the same thinking entry and must NOT
+        // resurrect a finished fade (the old reveal-restart defect).
         let mut state = State::new();
         state.add_thinking("coder", "short".to_string(), ThinkingKind::Detail);
         let id = match state.entries().last() {
             Some(ChatEntry::Thinking { id, .. }) => *id,
             _ => panic!("Expected a thinking entry"),
         };
-        // Reveal finishes instantly (5 chars < 64/tick).
-        let _ = state.update(Message::TypingTick);
-        assert!(!state.thinking_reveals.contains_key(&id));
-        // Content grows; the completed reveal must NOT restart for appended
-        // content (per design: only an in-flight reveal is clamped).
+        for _ in 0..ENTRANCE_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        assert!(!state.entrance_ticks.contains_key(&id), "fade completed under normal motion");
         state.add_thinking("coder", " longer tail".to_string(), ThinkingKind::Detail);
         assert!(
-            !state.thinking_reveals.contains_key(&id),
-            "appended content must not resurrect a completed reveal"
+            !state.entrance_ticks.contains_key(&id),
+            "merged content must not restart the entrance fade"
+        );
+        assert!(
+            matches!(
+                state.entries().last(),
+                Some(ChatEntry::Thinking { content, .. })
+                    if content == "short\n longer tail"
+            ),
+            "the content still merged into the same entry"
         );
     }
 
@@ -3608,21 +3641,32 @@ mod tests {
     }
 
     #[test]
-    fn open_thinking_keeps_is_revealing_for_shimmer() {
+    fn open_thinking_does_not_drive_is_revealing_after_its_fade() {
         let mut state = State::new();
         state.add_thinking("coder", "planning...".to_string(), ThinkingKind::Detail);
         let id = match state.entries().last() {
             Some(ChatEntry::Thinking { id, .. }) => *id,
             _ => panic!("Expected a thinking entry"),
         };
-        // Reveal completes on the first tick...
-        let _ = state.update(Message::TypingTick);
-        assert!(!state.thinking_reveals.contains_key(&id));
-        // ...but the open entry still drives the shimmer, so the tick stays on.
-        assert!(state.is_revealing(), "open thinking keeps the shimmer tick alive");
+        // The entrance fade briefly drives the tick...
+        assert!(state.is_revealing(), "a pending thinking fade keeps the tick alive");
+        for _ in 0..ENTRANCE_TICKS {
+            let _ = state.update(Message::TypingTick);
+        }
+        // ...but a settled open entry is static: its shimmer freezes at the
+        // last color and must NOT hold the 16 ms tick forever (the "thinking
+        // entry pulses forever" defect).
+        assert!(!state.entrance_ticks.contains_key(&id), "the fade completed and dropped");
+        assert!(
+            state.entries().iter().any(|entry| {
+                matches!(entry, ChatEntry::Thinking { id: eid, finished_at: None, .. } if *eid == id)
+            }),
+            "the thinking entry is still open (run not finalized)"
+        );
+        assert!(!state.is_revealing(), "an open but settled thinking entry drives nothing");
 
         state.finalize_run();
-        assert!(!state.is_revealing(), "stamping the end timestamp stops the shimmer");
+        assert!(!state.is_revealing(), "finalizing changes nothing static either");
     }
 
     #[test]
@@ -3753,6 +3797,19 @@ mod tests {
         state.toggle_thinking_all();
         assert!(!state.thinking_expand_all);
         assert_eq!(state.expanded_thinking_id, None);
+    }
+
+    #[test]
+    fn toggle_thinking_all_message_routes_to_toggle() {
+        // The input-bar toggle must reach `toggle_thinking_all` through the
+        // message bus (it is forwarded from App::update unhandled).
+        let mut state = State::new();
+        state.add_error("notes".to_string());
+        assert!(!state.thinking_expand_all, "sanity: nothing open yet");
+        let _ = state.update(Message::ToggleThinkingAll);
+        assert!(state.thinking_expand_all, "first toggle opens all thinking");
+        let _ = state.update(Message::ToggleThinkingAll);
+        assert!(!state.thinking_expand_all, "second toggle collapses all");
     }
 
     #[test]
@@ -3905,11 +3962,7 @@ mod tests {
         state.add_tool_call("read_file".into(), "src/main.rs".into());
         assert!(
             state.entrance_ticks.is_empty(),
-            "reduced-motion chips render fully opaque instantly"
-        );
-        assert!(
-            state.thinking_reveals.is_empty(),
-            "reduced-motion thinking previews show full text instantly"
+            "reduced-motion chips and thinking previews render fully opaque instantly"
         );
     }
 
@@ -3922,7 +3975,6 @@ mod tests {
         state.add_error("blocking".to_string());
         let _ = state.update(Message::AddAssistant("hello world".into()));
         assert!(!state.entrance_ticks.is_empty());
-        assert!(!state.thinking_reveals.is_empty());
         assert!(!state.line_wipe_ticks.is_empty());
         assert!(!state.first_token_ticks.is_empty());
         assert!(state.revealed_chars.is_some());
@@ -3931,7 +3983,6 @@ mod tests {
         state.set_reduced_motion(true);
 
         assert!(state.entrance_ticks.is_empty());
-        assert!(state.thinking_reveals.is_empty());
         assert!(state.line_wipe_ticks.is_empty());
         assert!(state.line_wipe_settled.is_empty());
         assert!(state.first_token_ticks.is_empty());

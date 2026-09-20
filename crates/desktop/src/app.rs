@@ -61,6 +61,9 @@ static TEXT_FOCUSED: AtomicBool = AtomicBool::new(false);
 /// this costs nothing at idle.
 const STREAMING_CURSOR_PERIOD_MS: u64 = 500;
 
+/// Max reading width (logical px) for the centered chat column (`Page::Chat`).
+const CHAT_MAX_WIDTH: f32 = 900.0;
+
 /// How long a toast stays visible before it auto-dismisses. The expiry
 /// subscription ticks once per second while any toast is showing.
 pub const TOAST_LIFETIME_SECS: u64 = 5;
@@ -3935,19 +3938,31 @@ impl App {
             .unwrap_or(false);
 
         let content: Element<'_, Message> = match self.page {
-            Page::Chat => self
-                .chat
-                .view(
-                    &self.current_theme,
-                    self.multi_agent,
-                    self.fast,
-                    &self.active_model,
-                    &self.chat_model_options,
-                    self.model_source_label(),
-                    &self.agent_graph,
-                    !self.runtime_assignments().is_empty() || agents_configured,
-                )
-                .map(Message::Chat),
+            Page::Chat => {
+                // Cap the chat column's reading width and center it: on wide
+                // panels an unbounded Fill left the transcript hugging the
+                // sidebar while the input bar stretched edge-to-edge — the
+                // layout never felt columnar. ~900px is long enough for the
+                // two-pane chart + diff feel without sprawling.
+                let chat = self
+                    .chat
+                    .view(
+                        &self.current_theme,
+                        self.multi_agent,
+                        self.fast,
+                        &self.active_model,
+                        &self.chat_model_options,
+                        self.model_source_label(),
+                        &self.agent_graph,
+                        !self.runtime_assignments().is_empty() || agents_configured,
+                    )
+                    .map(Message::Chat);
+                container(chat)
+                    .width(Length::Fixed(CHAT_MAX_WIDTH))
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .into()
+            }
             Page::ToolLog => self.tool_log.view(&self.current_theme).map(Message::ToolLog),
             Page::DiffViewer => self.diff.view(&self.current_theme).map(Message::Diff),
             Page::Settings => {
@@ -4520,9 +4535,9 @@ impl App {
             Subscription::none()
         };
         // One shared 16 ms tick drives every chat animation — the assistant
-        // typewriter reveal, thinking-preview reveals, entrance fades and the
-        // open-thinking shimmer — active only while at least one is in
-        // flight, so it costs nothing at idle.
+        // typewriter reveal, entrance fades and the open-thinking shimmer —
+        // active only while at least one is in flight, so it costs nothing
+        // at idle.
         let typing_sub = if self.chat.is_revealing() {
             iced::time::every(std::time::Duration::from_millis(circuit_background::TICK_MS))
                 .map(|_| Message::Chat(views::chat::Message::TypingTick))
