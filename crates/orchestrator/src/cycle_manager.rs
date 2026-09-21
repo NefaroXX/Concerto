@@ -6,7 +6,7 @@ use concerto_core::types::TaskId;
 use concerto_core::OrchestratorError;
 use std::collections::HashMap;
 
-/// Tracks review cycle count per task. Max defaults to 3.
+/// Tracks review cycle count per task. Max defaults to 6.
 pub struct ReviewCycleManager {
     max_cycles: u32,
     cycles: HashMap<TaskId, u32>,
@@ -50,11 +50,11 @@ impl ReviewCycleManager {
 
 impl Default for ReviewCycleManager {
     fn default() -> Self {
-        Self::new(3)
+        Self::new(6)
     }
 }
 
-/// Tracks validation cycle count per task. Max defaults to 2.
+/// Tracks validation cycle count per task. Max defaults to 5.
 pub struct ValidationCycleManager {
     max_cycles: u32,
     cycles: HashMap<TaskId, u32>,
@@ -98,7 +98,7 @@ impl ValidationCycleManager {
 
 impl Default for ValidationCycleManager {
     fn default() -> Self {
-        Self::new(2)
+        Self::new(5)
     }
 }
 
@@ -110,7 +110,10 @@ mod tests {
     #[test]
     fn review_cycles_hit_limit() {
         let tid = TaskId::new();
-        let mut mgr = ReviewCycleManager::new(3);
+        let mut mgr = ReviewCycleManager::new(6);
+        assert!(mgr.next_cycle(tid).is_ok());
+        assert!(mgr.next_cycle(tid).is_ok());
+        assert!(mgr.next_cycle(tid).is_ok());
         assert!(mgr.next_cycle(tid).is_ok());
         assert!(mgr.next_cycle(tid).is_ok());
         assert!(mgr.next_cycle(tid).is_ok());
@@ -120,7 +123,10 @@ mod tests {
     #[test]
     fn validation_cycles_hit_limit() {
         let tid = TaskId::new();
-        let mut mgr = ValidationCycleManager::new(2);
+        let mut mgr = ValidationCycleManager::new(5);
+        assert!(mgr.next_cycle(tid).is_ok());
+        assert!(mgr.next_cycle(tid).is_ok());
+        assert!(mgr.next_cycle(tid).is_ok());
         assert!(mgr.next_cycle(tid).is_ok());
         assert!(mgr.next_cycle(tid).is_ok());
         assert!(mgr.next_cycle(tid).is_err());
@@ -139,13 +145,13 @@ mod tests {
     #[test]
     fn default_review_limit() {
         let mgr = ReviewCycleManager::default();
-        assert_eq!(mgr.max_cycles, 3);
+        assert_eq!(mgr.max_cycles, 6);
     }
 
     #[test]
     fn default_validation_limit() {
         let mgr = ValidationCycleManager::default();
-        assert_eq!(mgr.max_cycles, 2);
+        assert_eq!(mgr.max_cycles, 5);
     }
 
     #[test]
@@ -183,13 +189,16 @@ mod tests {
             Err(OrchestratorError::MaxReviewCyclesExceeded { cycles: 1, .. })
         ));
         // Raising the limit clears the per-task counter, so the next cycle is 1.
-        mgr.set_max_cycles(3);
+        mgr.set_max_cycles(6);
         assert!(matches!(mgr.next_cycle(tid), Ok(1)));
         assert!(matches!(mgr.next_cycle(tid), Ok(2)));
         assert!(matches!(mgr.next_cycle(tid), Ok(3)));
+        assert!(matches!(mgr.next_cycle(tid), Ok(4)));
+        assert!(matches!(mgr.next_cycle(tid), Ok(5)));
+        assert!(matches!(mgr.next_cycle(tid), Ok(6)));
         assert!(matches!(
             mgr.next_cycle(tid),
-            Err(OrchestratorError::MaxReviewCyclesExceeded { cycles: 3, .. })
+            Err(OrchestratorError::MaxReviewCyclesExceeded { cycles: 6, .. })
         ));
 
         let tid = TaskId::new();
@@ -200,12 +209,15 @@ mod tests {
             Err(OrchestratorError::MaxValidationCyclesExceeded { cycles: 1, .. })
         ));
         // Raising the limit clears the per-task counter, so the next cycle is 1.
-        mgr.set_max_cycles(2);
+        mgr.set_max_cycles(5);
         assert!(matches!(mgr.next_cycle(tid), Ok(1)));
         assert!(matches!(mgr.next_cycle(tid), Ok(2)));
+        assert!(matches!(mgr.next_cycle(tid), Ok(3)));
+        assert!(matches!(mgr.next_cycle(tid), Ok(4)));
+        assert!(matches!(mgr.next_cycle(tid), Ok(5)));
         assert!(matches!(
             mgr.next_cycle(tid),
-            Err(OrchestratorError::MaxValidationCyclesExceeded { cycles: 2, .. })
+            Err(OrchestratorError::MaxValidationCyclesExceeded { cycles: 5, .. })
         ));
     }
 

@@ -1838,7 +1838,7 @@ pub struct MultiAgentConfig {
     #[serde(default = "default_true")]
     pub default_model_fallback: bool,
     /// Maximum dispatch attempts per subtask before the fallback ladder
-    /// walks in. `None` uses the runtime default (3).
+    /// walks in. `None` uses the runtime default (6).
     #[serde(default)]
     pub max_subtask_attempts: Option<u32>,
     /// Global ceiling on total model-dispatch cycles for one multi-agent

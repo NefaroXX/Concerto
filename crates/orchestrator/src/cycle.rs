@@ -18,7 +18,7 @@ pub struct CycleBudgetTracker {
 
 impl CycleBudgetTracker {
     /// Create a new tracker with the given limit.
-    /// Default limit should be 3.
+    /// Default limit should be 6.
     pub fn new(limit: u32) -> Self {
         Self { limit, calls: HashMap::new() }
     }
@@ -58,7 +58,7 @@ impl CycleBudgetTracker {
 
 impl Default for CycleBudgetTracker {
     fn default() -> Self {
-        Self::new(3)
+        Self::new(6)
     }
 }
 
@@ -68,20 +68,23 @@ mod tests {
 
     #[test]
     fn first_call_passes() {
-        let mut tracker = CycleBudgetTracker::new(3);
+        let mut tracker = CycleBudgetTracker::new(6);
         assert!(tracker.record("shell", "hash1").is_ok());
     }
 
     #[test]
     fn second_call_with_same_input_passes() {
-        let mut tracker = CycleBudgetTracker::new(3);
+        let mut tracker = CycleBudgetTracker::new(6);
         tracker.record("shell", "hash1").unwrap();
         assert!(tracker.record("shell", "hash1").is_ok());
     }
 
     #[test]
-    fn third_call_with_same_input_fires_cycle_detected() {
-        let mut tracker = CycleBudgetTracker::new(3);
+    fn sixth_call_with_same_input_fires_cycle_detected() {
+        let mut tracker = CycleBudgetTracker::new(6);
+        tracker.record("shell", "hash1").unwrap();
+        tracker.record("shell", "hash1").unwrap();
+        tracker.record("shell", "hash1").unwrap();
         tracker.record("shell", "hash1").unwrap();
         tracker.record("shell", "hash1").unwrap();
         let err = tracker.record("shell", "hash1").unwrap_err();
@@ -90,7 +93,7 @@ mod tests {
 
     #[test]
     fn different_inputs_dont_trigger() {
-        let mut tracker = CycleBudgetTracker::new(3);
+        let mut tracker = CycleBudgetTracker::new(6);
         tracker.record("shell", "hash1").unwrap();
         tracker.record("shell", "hash2").unwrap();
         tracker.record("shell", "hash3").unwrap();
@@ -100,7 +103,7 @@ mod tests {
 
     #[test]
     fn different_tools_dont_interfere() {
-        let mut tracker = CycleBudgetTracker::new(3);
+        let mut tracker = CycleBudgetTracker::new(6);
         tracker.record("shell", "hash1").unwrap();
         tracker.record("filesystem", "hash1").unwrap();
         tracker.record("shell", "hash1").unwrap();
@@ -110,7 +113,7 @@ mod tests {
 
     #[test]
     fn reset_clears_state() {
-        let mut tracker = CycleBudgetTracker::new(3);
+        let mut tracker = CycleBudgetTracker::new(6);
         tracker.record("shell", "hash1").unwrap();
         tracker.record("shell", "hash1").unwrap();
         tracker.reset();
@@ -119,8 +122,8 @@ mod tests {
     }
 
     #[test]
-    fn default_limit_is_3() {
+    fn default_limit_is_6() {
         let tracker = CycleBudgetTracker::default();
-        assert_eq!(tracker.limit, 3);
+        assert_eq!(tracker.limit, 6);
     }
 }

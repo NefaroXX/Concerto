@@ -118,7 +118,7 @@ impl BlueprintFacade {
     /// (`from`→`to` pairs and their closed kind), never cycle caps — a
     /// relationship row carries no cap (parity.rs §5). The cap is a property
     /// of the gate's `StageKind` ([`StageKind::default_max_cycles`]:
-    /// Review → 3, Acceptance → 2), which callers pass as `kind_default`. An
+    /// Review → 6, Acceptance → 5), which callers pass as `kind_default`. An
     /// unmatched pair resolves to the same fallback the pre-blueprint
     /// `RelationshipManager::max_cycles(from, to, fallback)` returns with no
     /// rule (relationship.rs:88-90), so standard behavior is preserved.
@@ -548,11 +548,11 @@ mod tests {
     #[test]
     fn max_cycles_resolves_to_kind_default() {
         let facade = standard_facade();
-        // The cap is a StageKind property (Review → 3, Acceptance → 2); the
+        // The cap is a StageKind property (Review → 6, Acceptance → 5); the
         // relationship registry governs topology only (parity.rs §5).
-        assert_eq!(facade.max_cycles(&AgentId::new("reviewer"), &AgentId::new("coder"), 3), 3);
-        assert_eq!(facade.max_cycles(&AgentId::new("validator"), &AgentId::new("coder"), 2), 2);
-        assert_eq!(facade.max_cycles(&AgentId::new("nope"), &AgentId::new("nope"), 3), 3);
+        assert_eq!(facade.max_cycles(&AgentId::new("reviewer"), &AgentId::new("coder"), 6), 6);
+        assert_eq!(facade.max_cycles(&AgentId::new("validator"), &AgentId::new("coder"), 5), 5);
+        assert_eq!(facade.max_cycles(&AgentId::new("nope"), &AgentId::new("nope"), 6), 6);
     }
 
     #[test]

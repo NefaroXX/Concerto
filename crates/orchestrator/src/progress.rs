@@ -78,11 +78,11 @@ use crate::decisions::{DecisionKind, DecisionStatus};
 use crate::fingerprint::work_intent_hash;
 
 /// How many consecutive cycles with an equivalent fingerprint constitute a
-/// stall. Three (a deliberate mirror of the single-agent loop's
-/// `MAX_STALE_ROUNDS`): one repeat is an anomaly guard, three consecutive
+/// stall. Six (a deliberate mirror of the single-agent loop's
+/// `MAX_STALE_ROUNDS`): one repeat is an anomaly guard, six consecutive
 /// equivalent cycles — same dispatch intents, outcomes, artifacts, and an
 /// unchanged workspace — is a stall worth a bounded recovery.
-pub const MAX_STALL_ROUNDS: u32 = 3;
+pub const MAX_STALL_ROUNDS: u32 = 6;
 
 /// Repeats beyond the first identical cycle before a stall fires: a run of
 /// `MAX_STALL_ROUNDS` identical cycles reaches this many repeats.
@@ -92,7 +92,7 @@ const REPEATS_TO_STALL: u32 = MAX_STALL_ROUNDS - 1;
 /// may emit before escalation. Recovery itself must not be able to loop
 /// forever — after this budget the next stall escalates (the caller stops
 /// the loop through the existing note machinery).
-pub const MAX_STALL_RECOVERIES: u32 = 2;
+pub const MAX_STALL_RECOVERIES: u32 = 5;
 
 /// Bounded fingerprint history kept for persistence/debugging (the stall
 /// rule needs only the previous fingerprint; the extra entries make the
@@ -416,17 +416,23 @@ mod tests {
     }
 
     #[test]
-    fn three_identical_cycles_trigger_reconsideration_within_budget() {
+    fn repeated_identical_cycles_trigger_reconsideration_within_budget() {
         let mut tracker = ProgressTracker::new();
         let cycle = dispatch_cycle("coder", "implement the thing", "success");
-        let first = tracker.observe(&cycle);
-        let second = tracker.observe(&cycle);
-        let third = tracker.observe(&cycle);
-        assert_eq!(first, CycleVerdict::Progressing, "first cycle: no predecessor");
-        assert_eq!(second, CycleVerdict::Progressing, "one repeat is an anomaly guard");
+        // The first MAX_STALL_ROUNDS - 1 equivalent cycles are the anomaly
+        // guard (the first has no predecessor); the MAX_STALL_ROUNDS-th
+        // reaches the stall threshold.
+        for round in 1..MAX_STALL_ROUNDS {
+            assert_eq!(
+                tracker.observe(&cycle),
+                CycleVerdict::Progressing,
+                "cycle {round} is still within the anomaly guard"
+            );
+        }
+        let stall = tracker.observe(&cycle);
         assert!(
-            matches!(&third, CycleVerdict::Reconsider(text) if text.contains("Progress guard")),
-            "third equivalent cycle is a stall: {third:?}"
+            matches!(&stall, CycleVerdict::Reconsider(text) if text.contains("Progress guard")),
+            "the MAX_STALL_ROUNDS-th equivalent cycle is a stall: {stall:?}"
         );
         // Detected BEFORE the recovery budget is exhausted (and far before
         // the decision loop's 64-turn structural bound): the guard fires at
@@ -437,12 +443,15 @@ mod tests {
 
     #[test]
     fn stall_detection_precedes_the_iteration_budget() {
-        // The escalation path needs at most 2 * MAX_STALL_ROUNDS + 2 + 1
-        // observed cycles (stall → fresh window → stall → escalation) — 10
-        // here — while the decision loop's structural bound is 64 turns.
-        // Pin the ordering invariant: the guard fires INSIDE the budget,
-        // never after it.
-        assert!((MAX_STALL_ROUNDS as usize) * 3 + 4 < 64);
+        // The escalation path needs at most MAX_STALL_ROUNDS +
+        // MAX_STALL_RECOVERIES * (MAX_STALL_ROUNDS - 1) observed cycles (the
+        // first stall, then one fresh window per remaining recovery, then the
+        // final window that escalates) — 31 here — while the decision loop's
+        // structural bound is 64 turns. Pin the ordering invariant: the guard
+        // fires INSIDE the budget, never after it.
+        let max_cycles_to_escalate = MAX_STALL_ROUNDS as usize
+            + MAX_STALL_RECOVERIES as usize * (MAX_STALL_ROUNDS as usize - 1);
+        assert!(max_cycles_to_escalate < 64);
         let mut tracker = ProgressTracker::new();
         let cycle = dispatch_cycle("coder", "t", "failed");
         let mut non_escalating = 0;
@@ -578,48 +587,70 @@ mod tests {
         let stall_cycle = dispatch_cycle("coder", "t", "failed");
         let recovery = dispatch_cycle("coder", "t (revised approach)", "failed");
 
-        // Stall #1 at the third identical cycle → recovery prompt #1, and
-        // the equivalence window resets to give the recovery a fresh one.
-        assert_eq!(tracker.observe(&stall_cycle), CycleVerdict::Progressing);
-        assert_eq!(tracker.observe(&stall_cycle), CycleVerdict::Progressing);
+        // Stall #1 after MAX_STALL_ROUNDS identical cycles → recovery
+        // prompt #1, and the equivalence window resets to give the recovery
+        // a fresh one.
+        for _ in 0..MAX_STALL_ROUNDS - 1 {
+            assert_eq!(tracker.observe(&stall_cycle), CycleVerdict::Progressing);
+        }
         assert!(matches!(tracker.observe(&stall_cycle), CycleVerdict::Reconsider(_)));
+        assert_eq!(tracker.state().stall_recoveries, 1);
 
         // The recovery changed the observable outcome (a different task) →
         // Progressing, window stays fresh.
         assert_eq!(tracker.observe(&recovery), CycleVerdict::Progressing);
 
-        // Three identical cycles afterwards → stall #2, recovery prompt #2
-        // (budget now exhausted).
+        // The next equivalent cycle differs from the recovery fingerprint
+        // (the fingerprint history tail still ends on the stalled cycle, so
+        // the post-recovery repeats count from there).
         assert_eq!(
             tracker.observe(&stall_cycle),
             CycleVerdict::Progressing,
             "differs from the recovery cycle"
         );
-        assert_eq!(tracker.observe(&stall_cycle), CycleVerdict::Progressing, "repeat 1");
-        assert!(
-            matches!(tracker.observe(&stall_cycle), CycleVerdict::Reconsider(_)),
-            "repeat 2 stalls again"
-        );
-        assert_eq!(tracker.state().stall_recoveries, MAX_STALL_RECOVERIES);
 
-        // The coordinator ignored both prompts: repeated equivalent work
-        // runs over the fresh recovery window — two further identical
-        // cycles (the 5th and 6th consecutive equivalents overall) reach
-        // the escalation (the fingerprint history tail still ends on the
-        // stalled cycle, so the post-recovery repeats count from there).
-        assert_eq!(tracker.observe(&stall_cycle), CycleVerdict::Progressing);
-        assert!(matches!(tracker.observe(&stall_cycle), CycleVerdict::Escalate(_)));
+        // The coordinator ignored every prompt: each fresh window is
+        // MAX_STALL_ROUNDS - 1 equivalent cycles. The first
+        // MAX_STALL_RECOVERIES - 1 windows consume the remaining budget
+        // (recovery prompts #2..#MAX_STALL_RECOVERIES); the final window
+        // escalates.
+        for window in 1..=MAX_STALL_RECOVERIES {
+            for _ in 0..MAX_STALL_ROUNDS - 2 {
+                assert_eq!(
+                    tracker.observe(&stall_cycle),
+                    CycleVerdict::Progressing,
+                    "window {window}: still within the anomaly guard"
+                );
+            }
+            let verdict = tracker.observe(&stall_cycle);
+            if window < MAX_STALL_RECOVERIES {
+                assert!(
+                    matches!(verdict, CycleVerdict::Reconsider(_)),
+                    "window {window} consumes one recovery slot: {verdict:?}"
+                );
+                assert_eq!(tracker.state().stall_recoveries, window + 1);
+            } else {
+                assert!(
+                    matches!(verdict, CycleVerdict::Escalate(_)),
+                    "the final window escalates: {verdict:?}"
+                );
+            }
+        }
+        assert_eq!(tracker.state().stall_recoveries, MAX_STALL_RECOVERIES);
         // Sticky: further equivalent cycles keep escalating.
         assert!(matches!(tracker.observe(&stall_cycle), CycleVerdict::Escalate(_)));
-        assert_eq!(tracker.state().stall_recoveries, MAX_STALL_RECOVERIES);
     }
 
     #[test]
     fn state_round_trips_through_serde_and_detection_survives_a_resume() {
         let mut tracker = ProgressTracker::new();
         let cycle = dispatch_cycle("coder", "t", "success");
-        let _ = tracker.observe(&cycle);
-        let _ = tracker.observe(&cycle);
+        // Prime the streak to just below the stall threshold: the next
+        // equivalent cycle (after the resume) is the MAX_STALL_ROUNDS-th and
+        // stalls.
+        for _ in 0..MAX_STALL_ROUNDS - 1 {
+            let _ = tracker.observe(&cycle);
+        }
 
         let serialized = serde_json::to_string(tracker.state()).expect("state serializes");
         let restored_state: ProgressTrackerState =

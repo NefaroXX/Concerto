@@ -95,6 +95,7 @@ use concerto_sessions::spend::SpendTracker;
 
 use crate::agent_runner::AgentRunner;
 use crate::coordinator::{CoordinatorAgent, CALL_SPECIALIST_TOOL};
+use crate::progress::{MAX_STALL_RECOVERIES, MAX_STALL_ROUNDS};
 use crate::registry::AgentRegistry;
 use crate::testing::MockExpertAgent;
 
@@ -1332,8 +1333,8 @@ async fn duplicate_dispatch_is_bounded_not_infinite() {
     assert!(report.ledger_state_is_coherent(), "{report:?}");
     assert_eq!(report.dispatches_of("researcher"), 2, "{report:?}");
     // Duplicate SUCCESS work does not trigger a stall nudge yet (only
-    // three equivalent cycles do — see the stall scenarios), but the run
-    // ends bounded and correct.
+    // MAX_STALL_ROUNDS equivalent cycles do — see the stall scenarios), but
+    // the run ends bounded and correct.
     assert!(report.guards.len() <= 1, "no runaway duplicate recovery: {report:?}");
 }
 
@@ -1444,7 +1445,7 @@ async fn validator_unavailable_never_silently_accepts() {
         report.final_message
     );
     assert!(
-        report.final_message.contains("remained blocked after 3 attempts"),
+        report.final_message.contains("remained blocked after 6 attempts"),
         "the validator subtask must block at the attempt ceiling: {}",
         report.final_message
     );
@@ -1593,10 +1594,11 @@ async fn external_workspace_modification_surfaces_in_evidence() {
 /// equivalent dispatch cycles (same agent, same task, same success
 /// outcome, no workspace change). Recovery: #53's fingerprint tracker
 /// detects the stall BEFORE the iteration budget — one bounded
-/// reconsideration prompt is injected into the loop conversation.
+/// reconsideration prompt is injected into the loop conversation after
+/// MAX_STALL_ROUNDS equivalent cycles.
 #[tokio::test]
 async fn repeated_identical_dispatch_stall_detected() {
-    let cycles = 3u32;
+    let cycles = MAX_STALL_ROUNDS;
     let turns = (0..cycles)
         .map(|_| Turn::Calls(vec![dispatch_call("researcher", "inspect the codebase")]))
         .chain(std::iter::once(Turn::Text("done".into())))
@@ -1612,7 +1614,7 @@ async fn repeated_identical_dispatch_stall_detected() {
     assert_eq!(
         report.guards.len(),
         1,
-        "three equivalent cycles produce exactly ONE reconsideration: {report:?}"
+        "{MAX_STALL_ROUNDS} equivalent cycles produce exactly ONE reconsideration: {report:?}"
     );
     assert!(
         model.any_message_contains("Progress guard"),
@@ -1681,8 +1683,11 @@ async fn gate_52_invalid_decision_rejected_then_run_recovers() {
 /// before the structural turn ceiling, with a clean Partial exit.
 #[tokio::test]
 async fn gate_53_stall_detected_and_budget_recovered() {
-    let ignored = 9u32;
-    let turns = (0..ignored)
+    // Enough identical turns for the first stall plus one fresh
+    // (MAX_STALL_ROUNDS - 1) window per remaining recovery, then the final
+    // window that escalates.
+    let budget_turns = MAX_STALL_ROUNDS + MAX_STALL_RECOVERIES * (MAX_STALL_ROUNDS - 1);
+    let turns = (0..budget_turns)
         .map(|_| Turn::Calls(vec![dispatch_call("researcher", "inspect the codebase")]))
         .collect();
     let model = ScriptedCoordModel::scripted(turns);
@@ -1693,9 +1698,13 @@ async fn gate_53_stall_detected_and_budget_recovered() {
     let (outcome, events, _dir) = run_coordinator(coordinator, &bus).await;
     let report = RunReport::build(&outcome, &events, &model);
 
-    // The recovery worked: two reconsideration prompts, then the
-    // budgeted escalation.
-    assert_eq!(report.guards.len(), 3, "two nudges + one escalation: {report:?}");
+    // The recovery worked: MAX_STALL_RECOVERIES reconsideration prompts,
+    // then the budgeted escalation.
+    assert_eq!(
+        report.guards.len(),
+        MAX_STALL_RECOVERIES as usize + 1,
+        "MAX_STALL_RECOVERIES nudges + one escalation: {report:?}"
+    );
     assert!(
         report.final_message.contains("Progress guard escalation"),
         "the escalation note is in the final message: {}",
@@ -1714,7 +1723,7 @@ async fn gate_53_stall_detected_and_budget_recovered() {
         "the escalation stopped the loop at {} turns — well below the 64-turn ceiling",
         report.model_turns
     );
-    assert_eq!(report.model_turns, 7, "measured budget: {report:?}");
+    assert_eq!(report.model_turns, budget_turns as usize, "measured budget: {report:?}");
 }
 
 /// Gate 3 (issue #54): a network-disconnect fault surfaces, the loop
@@ -1786,15 +1795,17 @@ async fn gate_54_diagnosis_selects_the_correct_recovery_path() {
 /// cost fails its own scenario before it can slow CI.
 #[test]
 fn cost_bounds() {
-    // The #53 escalation scenario is the suite's worst case: 9 scripted
-    // dispatch turns → the budget stops the loop at 7 model turns and 7
-    // re-dispatches (pinned in gate_53). The structural ceiling is the
-    // loop's 64-turn bound; the suite runs at ~11% of it.
+    // The #53 escalation scenario is the suite's worst case: the first
+    // stall at MAX_STALL_ROUNDS dispatch turns, then one fresh window per
+    // remaining recovery, then the final window that escalates — the same
+    // bound pinned in gate_53. The structural ceiling is the loop's
+    // 64-turn bound; the suite stays under half of it.
+    let budget_turns = MAX_STALL_ROUNDS + MAX_STALL_RECOVERIES * (MAX_STALL_ROUNDS - 1);
     let structural_turn_ceiling: usize = 64;
-    let suite_worst_case_turns: usize = 7;
+    let suite_worst_case_turns: usize = budget_turns as usize;
     assert!(
         suite_worst_case_turns < structural_turn_ceiling / 2,
-        "the suite's worst scripted cost must stay well under half the structural ceiling"
+        "the suite's worst scripted cost must stay under half the structural ceiling"
     );
 }
 

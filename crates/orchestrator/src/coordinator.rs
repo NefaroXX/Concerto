@@ -80,7 +80,7 @@ use tracing::warn;
 /// Default dispatch-attempt ceiling per subtask before the fallback ladder
 /// walks in (ADR-42 §1). Users can raise/lower it per run via
 /// `MultiAgentConfig.max_subtask_attempts` (ADR-45 §4).
-const DEFAULT_MAX_SUBTASK_ATTEMPTS: u32 = 3;
+const DEFAULT_MAX_SUBTASK_ATTEMPTS: u32 = 6;
 
 /// ADR-35 §8: system instructions for the coordinator's self-implement
 /// persona. Used when NO implement-stage agent is registered and the
@@ -162,7 +162,7 @@ const MAX_DISPATCH_ITERATIONS: usize = 64;
 /// other loop turn. Past this bound the caller escalates to the
 /// planning-recovery fallback (ADR-45 tier-1b) and, failing that, a Partial
 /// exit with a preserved checkpoint.
-const MAX_PROSE_STOP_REPROMPTS: u32 = 2;
+const MAX_PROSE_STOP_REPROMPTS: u32 = 5;
 
 /// The explicit dispatch instruction injected after a prose-only
 /// zero-dispatch stop on an action-required planning session. Bounded re-prompt
@@ -13337,6 +13337,7 @@ impl CoordinatorAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::{MAX_STALL_RECOVERIES, MAX_STALL_ROUNDS};
     use crate::testing::{AgentFlowTestHarness, BudgetScenarioBuilder, MockExpertAgent};
     use concerto_core::error::PolicyError;
     use concerto_core::executor::ToolExecutor;
@@ -15968,17 +15969,18 @@ mod tests {
     }
 
     /// Issue #53 acceptance: repeated equivalent work is detected BEFORE
-    /// the maximum iteration budget is exhausted. Three identical
-    /// `researcher` dispatch cycles (same agent, same task, same outcome,
-    /// no file/workspace change) produce ONE bounded reconsideration
-    /// prompt — injected into the existing decision-loop conversation as a
-    /// user message — and the run finishes normally (4 model turns used,
-    /// nowhere near the structural bound; recovery budget unexhausted).
+    /// the maximum iteration budget is exhausted. MAX_STALL_ROUNDS
+    /// identical `researcher` dispatch cycles (same agent, same task, same
+    /// outcome, no file/workspace change) produce ONE bounded
+    /// reconsideration prompt — injected into the existing decision-loop
+    /// conversation as a user message — and the run finishes normally
+    /// (MAX_STALL_ROUNDS + 1 model turns used, nowhere near the structural
+    /// bound; recovery budget unexhausted).
     #[tokio::test]
     async fn progress_guard_nudges_before_the_iteration_budget_when_work_repeats() {
         let bus = EventBus::new(256);
         let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
-        let turns: Vec<CoordinatorTurn> = (0..3)
+        let turns: Vec<CoordinatorTurn> = (0..MAX_STALL_ROUNDS)
             .map(|_| {
                 CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")])
             })
@@ -15995,7 +15997,7 @@ mod tests {
         assert_eq!(
             guards.len(),
             1,
-            "exactly one reconsideration for three equivalent cycles, got: {guards:?}"
+            "exactly one reconsideration for {MAX_STALL_ROUNDS} equivalent cycles, got: {guards:?}"
         );
         assert!(
             guards[0].contains("reconsideration") || guards[0].contains("CHANGE"),
@@ -16004,11 +16006,15 @@ mod tests {
         );
 
         // The nudge was injected as a user message into the decision loop's
-        // conversation: the FOURTH model request carries it (after three
-        // dispatch cycles).
+        // conversation: the NEXT model request carries it (after
+        // MAX_STALL_ROUNDS dispatch cycles).
         let requests = provider.requests.lock().unwrap_or_else(|error| error.into_inner()).clone();
-        assert_eq!(requests.len(), 4, "3 dispatch turns + the final prose turn");
-        let nudge_injected = requests[3]
+        assert_eq!(
+            requests.len(),
+            MAX_STALL_ROUNDS as usize + 1,
+            "{MAX_STALL_ROUNDS} dispatch turns + the final prose turn"
+        );
+        let nudge_injected = requests[MAX_STALL_ROUNDS as usize]
             .messages
             .iter()
             .any(|m| matches!(m.role, Role::User) && m.content.contains("Progress guard"));
@@ -16040,7 +16046,11 @@ mod tests {
     async fn progress_guard_escalates_after_the_recovery_budget_is_exhausted() {
         let bus = EventBus::new(256);
         let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
-        let turns: Vec<CoordinatorTurn> = (0..9)
+        // Enough identical dispatch turns to reach the escalation: the first
+        // stall at MAX_STALL_ROUNDS, then one fresh (MAX_STALL_ROUNDS - 1)
+        // window per remaining recovery, then the final window that escalates.
+        let budget_turns = MAX_STALL_ROUNDS + MAX_STALL_RECOVERIES * (MAX_STALL_ROUNDS - 1);
+        let turns: Vec<CoordinatorTurn> = (0..budget_turns)
             .map(|_| {
                 CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")])
             })
@@ -16066,16 +16076,15 @@ mod tests {
         let guards = progress_guard_events(&events);
         assert_eq!(
             guards.len(),
-            3,
-            "two reconsideration prompts + one escalation, got: {guards:?}"
+            MAX_STALL_RECOVERIES as usize + 1,
+            "MAX_STALL_RECOVERIES reconsideration prompts + one escalation, got: {guards:?}"
         );
-        // The loop stopped after 7 model turns (stall → 2 ignored recovery
-        // cycles → stall → 2 ignored → escalation) — far below the
-        // structural 64-turn bound, which stays untouched as the hard
-        // safety ceiling.
+        // The loop stopped at the recovery budget (the first stall, then one
+        // fresh window per recovery) — far below the structural 64-turn
+        // bound, which stays untouched as the hard safety ceiling.
         let turn_count = provider.turn_count();
         assert_eq!(
-            turn_count, 7,
+            turn_count, budget_turns as usize,
             "escalation stops the loop at the recovery budget, got: {turn_count} turns"
         );
         assert!(turn_count < 64);
@@ -17913,7 +17922,7 @@ mod tests {
     }
 
     /// ADR-45 §4: `max_subtask_attempts` caps the retry arm. With the default
-    /// cap (3) a recoverable error retries to completion; with a cap of 1 the
+    /// cap (6) a recoverable error retries to completion; with a cap of 1 the
     /// retry arm never fires and the ladder walks in immediately (tier 1
     /// rescues on the default model — the ladder note proves the cap).
     #[tokio::test]
@@ -18411,16 +18420,19 @@ mod tests {
     async fn ladder_success_with_failed_outcome_is_bounded() {
         let bus = EventBus::new(256);
         // Every dispatch fails with a Failed outcome. Dispatch budget
-        // (the attempt counter increments at dispatch time): attempts 1, 2, 3
-        // → one escalation retry, which lands at attempt 3 again → the ladder
-        // re-dispatches the SAME agent once more on the default model (tier 1,
-        // still Failed) → tier 2 dispatches the rebuilt role once (still
-        // Failed) → the ladder exhausts. Total: 5 dispatches + 1 tier-2
-        // dispatch = 6 SubTaskStarted events, exactly — the ladder is never
-        // re-entered.
+        // (the attempt counter increments at dispatch time): attempts 1..5
+        // retry, attempt 6 falls through to one escalation retry, which lands
+        // at attempt 6 again → the ladder re-dispatches the SAME agent once
+        // more on the default model (tier 1, still Failed) → tier 2 dispatches
+        // the rebuilt role once (still Failed) → the ladder exhausts. Total:
+        // 7 dispatches + 1 tier-2 dispatch = 9 SubTaskStarted events, exactly —
+        // the ladder is never re-entered.
         let architect = MockExpertAgent::sequence(
             AgentId::new("architect"),
             vec![
+                ok_failed("architect", "cannot proceed"),
+                ok_failed("architect", "cannot proceed"),
+                ok_failed("architect", "cannot proceed"),
                 ok_failed("architect", "cannot proceed"),
                 ok_failed("architect", "cannot proceed"),
                 ok_failed("architect", "cannot proceed"),
@@ -18466,8 +18478,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            architect_dispatches, 6,
-            "expected exactly 5 dispatches + 1 tier-2 dispatch (6 SubTaskStarted), got {architect_dispatches}",
+            architect_dispatches, 9,
+            "expected exactly 7 dispatches + 1 tier-2 dispatch (9 SubTaskStarted), got {architect_dispatches}",
         );
         // The ladder re-dispatched the role on the tier-1 default model
         // (test/mid) — and that attempt still failed.
@@ -19368,7 +19380,7 @@ mod tests {
             output.final_message
         );
         assert!(
-            output.final_message.contains("remained blocked after 3 attempts"),
+            output.final_message.contains("remained blocked after 6 attempts"),
             "the validator subtask must block at the attempt ceiling: {}",
             output.final_message
         );
@@ -23145,7 +23157,7 @@ mod tests {
     ///
     /// The coordinator does NOT accept the first prose close: the decision
     /// loop re-prompts the planning provider with an explicit dispatch
-    /// instruction (`MAX_PROSE_STOP_REPROMPTS` = 2), then escalates to the
+    /// instruction (`MAX_PROSE_STOP_REPROMPTS` = 5), then escalates to the
     /// planning-recovery fallback (ADR-45 tier-1b). With no fallback provider
     /// configured the recovery skips (still recorded as an ADR-65 `Decision`
     /// event) and the run pauses Partial through the vacuous-completion guard.
@@ -23163,7 +23175,7 @@ mod tests {
             // The planning provider answers with prose only: nothing to do,
             // so the Coordinator stops in prose without ever dispatching a
             // subtask (the 22429 harness shape). One scripted turn; the
-            // guard's two re-prompts consume the auto-filled empty turns.
+            // guard's five re-prompts consume the auto-filled empty turns.
             vec![CoordinatorTurn::Text("no dispatch needed".into())],
         );
         coordinator = coordinator.with_review_store(Some(pool.clone()));
@@ -23195,7 +23207,7 @@ mod tests {
             "a prose-only planning session dispatches nothing: {events:?}"
         );
         // The prose-only dispatch guard: the planning provider is re-prompted
-        // with an explicit dispatch instruction on each of the two re-prompts
+        // with an explicit dispatch instruction on each of the five re-prompts
         // before the stop is accepted.
         let reprompts: Vec<_> = events
             .iter()
@@ -23210,13 +23222,13 @@ mod tests {
             .collect();
         assert_eq!(
             reprompts.len(),
-            2,
+            5,
             "the prose-only stop is re-prompted exactly MAX_PROSE_STOP_REPROMPTS times, got: {reprompts:?}"
         );
         assert_eq!(
             primary.turn_count(),
-            3,
-            "the planning provider serves the original turn plus two re-prompt turns"
+            6,
+            "the planning provider serves the original turn plus five re-prompt turns"
         );
         assert_eq!(
             output.completion_status,
@@ -23288,12 +23300,15 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
         ];
-        // The primary planning pipe closes in prose three times (original +
-        // the two re-prompt turns), dispatching nothing.
+        // The primary planning pipe closes in prose six times (original +
+        // the five re-prompt turns), dispatching nothing.
         let primary = Arc::new(TurnProvider::new(vec![
             CoordinatorTurn::Text("nothing to dispatch".into()),
             CoordinatorTurn::Text("still nothing".into()),
             CoordinatorTurn::Text("prose only".into()),
+            CoordinatorTurn::Text("still prose only".into()),
+            CoordinatorTurn::Text("no dispatch yet".into()),
+            CoordinatorTurn::Text("five re-prompts consumed".into()),
         ]));
         // The fallback (ADR-45 tier-1b pipe) finally dispatches the coder and
         // then closes in prose with a NON-empty graph — a legitimate stop.
@@ -23344,8 +23359,8 @@ mod tests {
 
         assert_eq!(
             primary.turn_count(),
-            3,
-            "the primary planning provider serves the original turn plus the two re-prompts"
+            6,
+            "the primary planning provider serves the original turn plus the five re-prompts"
         );
         assert_eq!(
             fallback.turn_count(),
@@ -23504,7 +23519,7 @@ mod tests {
 
     /// Item B audit — evidence-resume prose-only dispatch guard, no fallback:
     /// a checkpointless `continue` whose evidence-resume decision session
-    /// closes in prose with ZERO dispatches is re-prompted twice
+    /// closes in prose with ZERO dispatches is re-prompted five times
     /// (`MAX_PROSE_STOP_REPROMPTS`), then escalates to the planning-recovery
     /// ladder exactly like the fresh decompose path. With no default-model
     /// provider the ladder skips — recording the ADR-65 `Decision` event
@@ -23524,9 +23539,9 @@ mod tests {
         let (coordinator, primary) = coordinator_with_turns_captured(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(mocks)),
-            // The evidence-resume session closes in prose on turn 1; the two
+            // The evidence-resume session closes in prose on turn 1; the five
             // bounded re-prompts consume the auto-filled empty turns, so the
-            // planning provider is read exactly three times.
+            // planning provider is read exactly six times.
             vec![CoordinatorTurn::Text("nothing to dispatch".into())],
         );
         let mut coordinator = coordinator
@@ -23557,8 +23572,8 @@ mod tests {
 
         assert_eq!(
             primary.turn_count(),
-            3,
-            "the evidence-resume planning provider serves the original turn plus two re-prompts"
+            6,
+            "the evidence-resume planning provider serves the original turn plus five re-prompts"
         );
         assert!(
             !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
@@ -23620,12 +23635,15 @@ mod tests {
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
         ];
-        // The primary planning pipe closes in prose three times (original +
-        // the two re-prompt turns), dispatching nothing.
+        // The primary planning pipe closes in prose six times (original +
+        // the five re-prompt turns), dispatching nothing.
         let primary = Arc::new(TurnProvider::new(vec![
             CoordinatorTurn::Text("nothing to dispatch".into()),
             CoordinatorTurn::Text("still nothing".into()),
             CoordinatorTurn::Text("prose only".into()),
+            CoordinatorTurn::Text("still prose only".into()),
+            CoordinatorTurn::Text("no dispatch yet".into()),
+            CoordinatorTurn::Text("five re-prompts consumed".into()),
         ]));
         // The fallback (ADR-45 tier-1b pipe) finally dispatches the coder and
         // then closes in prose with a NON-empty graph.
@@ -23678,8 +23696,8 @@ mod tests {
 
         assert_eq!(
             primary.turn_count(),
-            3,
-            "the primary planning provider serves the original evidence turn plus the two re-prompts"
+            6,
+            "the primary planning provider serves the original evidence turn plus the five re-prompts"
         );
         assert_eq!(
             fallback.turn_count(),

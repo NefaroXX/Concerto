@@ -161,12 +161,12 @@ impl StageKind {
 
     /// Engine-default cycle cap for the kind (used by rulebook (f) when a
     /// stage has no explicit `max_cycles`). Mirrors today's coordinator:
-    /// review/validate gates loop up to 3/2 (the `CollaborationRule`
+    /// review/validate gates loop up to 6/5 (the `CollaborationRule`
     /// fallbacks at `relationship.rs`), everything else runs once.
     pub fn default_max_cycles(self) -> u32 {
         match self {
-            Self::Review => 3,
-            Self::Acceptance => 2,
+            Self::Review => 6,
+            Self::Acceptance => 5,
             _ => 1,
         }
     }
@@ -1395,11 +1395,11 @@ mod tests {
     #[test]
     fn rule_f_vacuous_when_cap_unset_and_bounded_when_set() {
         // Standard blueprint caps: design 1 + research 1 + implement 1 +
-        // review 3 + validate 2 = 8.
+        // review 6 + validate 5 = 14.
         let blueprint = standard_blueprint();
         validate_blueprint(&blueprint, None).expect("vacuous when the cap is unset");
-        validate_blueprint(&blueprint, Some(8)).expect("exactly at the bound is accepted");
-        let err = validate_blueprint(&blueprint, Some(7)).unwrap_err();
+        validate_blueprint(&blueprint, Some(14)).expect("exactly at the bound is accepted");
+        let err = validate_blueprint(&blueprint, Some(13)).unwrap_err();
         assert!(format!("{err}").contains("rule (f)"), "{err}");
     }
 

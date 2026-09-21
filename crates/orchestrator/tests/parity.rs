@@ -228,16 +228,16 @@ fn default_blueprint_resolves_to_runtime_tables() {
     // runtime_runner.rs:86-94): "supervises" → Supervises,
     // "provides_context_to" → ProvidesContextTo, "owns_design" → OwnsDesign.
     let expected: Vec<(&str, &str, AgentRelationship, Option<u32>)> = vec![
-        // relationship.rs:142-145 — reviewer→coder Supervises, cap 3.
-        ("reviewer", "coder", AgentRelationship::Supervises, Some(3)),
-        // relationship.rs:148-152 — researcher→coder ProvidesContextTo, no cap.
+        // relationship.rs:144-149 — reviewer→coder Supervises, cap 6.
+        ("reviewer", "coder", AgentRelationship::Supervises, Some(6)),
+        // relationship.rs:150-155 — researcher→coder ProvidesContextTo, no cap.
         ("researcher", "coder", AgentRelationship::ProvidesContextTo, None),
-        // relationship.rs:153-158 — architect→coder OwnsDesign, no cap.
+        // relationship.rs:156-161 — architect→coder OwnsDesign, no cap.
         ("architect", "coder", AgentRelationship::OwnsDesign, None),
-        // relationship.rs:159-164 — architect→researcher OwnsDesign, no cap.
+        // relationship.rs:162-167 — architect→researcher OwnsDesign, no cap.
         ("architect", "researcher", AgentRelationship::OwnsDesign, None),
-        // relationship.rs:165-170 — validator→coder Supervises, cap 2.
-        ("validator", "coder", AgentRelationship::Supervises, Some(2)),
+        // relationship.rs:168-173 — validator→coder Supervises, cap 5.
+        ("validator", "coder", AgentRelationship::Supervises, Some(5)),
     ];
     let rules = default_collaboration_rules();
     assert_eq!(rules.len(), expected.len(), "runtime default rules changed shape");
@@ -309,21 +309,21 @@ fn default_blueprint_resolves_to_runtime_tables() {
     assert_eq!(run_once.effective_feed(), None);
 
     // -- 5. Cycle caps -------------------------------------------------------
-    // review is Review-kind with no explicit cap → engine default 3
-    // (relationship.rs:142-145 reviewer→coder Some(3); the coordinator uses
-    // the same fallback when running the review gate, coordinator.rs:3513).
+    // review is Review-kind with no explicit cap → engine default 6
+    // (relationship.rs:148 reviewer→coder Some(6); the coordinator uses
+    // the same fallback when running the review gate).
     let review = stage("review");
     assert_eq!(review.def.max_cycles, None, "no explicit cap on the review stage");
-    assert_eq!(review.def.default_max_cycles(), 3);
-    // validate is Acceptance-kind with no explicit cap → engine default 2
-    // (relationship.rs:165-170 validator→coder Some(2); coordinator.rs:3915).
+    assert_eq!(review.def.default_max_cycles(), 6);
+    // validate is Acceptance-kind with no explicit cap → engine default 5
+    // (relationship.rs:172 validator→coder Some(5)).
     let validate = stage("validate");
     assert_eq!(validate.def.max_cycles, None, "no explicit cap on the validate stage");
-    assert_eq!(validate.def.default_max_cycles(), 2);
+    assert_eq!(validate.def.default_max_cycles(), 5);
     // The gate caps sit beneath the single-agent iteration ceiling
-    // `DEFAULT_MAX_ITERATIONS = 25` (runtime_runner.rs:453-454) and the
-    // per-subtask dispatch ceiling `DEFAULT_MAX_SUBTASK_ATTEMPTS = 3`
-    // (coordinator.rs:52) that bound engine loops today.
+    // `DEFAULT_MAX_ITERATIONS = 25` (runtime_runner.rs:449) and the
+    // per-subtask dispatch ceiling `DEFAULT_MAX_SUBTASK_ATTEMPTS = 6`
+    // (coordinator.rs:83) that bound engine loops today.
     assert!(review.def.default_max_cycles() <= 25);
     assert!(validate.def.default_max_cycles() <= 25);
 }

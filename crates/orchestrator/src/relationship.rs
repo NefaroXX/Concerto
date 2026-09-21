@@ -135,14 +135,17 @@ pub enum HandoffDeliverable {
 /// Return the default collaboration rules for the known agent roles.
 ///
 /// These are the rules that govern the standard Architect → Researcher →
-/// Coder pipeline with Reviewer and Validator oversight.
+/// Coder pipeline with Reviewer and Validator oversight. The Reviewer→Coder
+/// gate allows 6 review cycles (the Review gate cap) and the Validator→Coder
+/// gate allows 5 validation cycles (the Acceptance gate cap); parity.rs §5
+/// pins these to the stage-kind defaults.
 pub fn default_collaboration_rules() -> Vec<CollaborationRule> {
     vec![
         CollaborationRule {
             from: AgentId::new("reviewer"),
             to: AgentId::new("coder"),
             relationship: AgentRelationship::Supervises,
-            max_cycles: Some(3),
+            max_cycles: Some(6),
         },
         CollaborationRule {
             from: AgentId::new("researcher"),
@@ -166,7 +169,7 @@ pub fn default_collaboration_rules() -> Vec<CollaborationRule> {
             from: AgentId::new("validator"),
             to: AgentId::new("coder"),
             relationship: AgentRelationship::Supervises,
-            max_cycles: Some(2),
+            max_cycles: Some(5),
         },
     ]
 }

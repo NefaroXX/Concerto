@@ -66,7 +66,7 @@ const SUBMIT_REVIEW_REPORT_TOOL: &str = "submit_review_report";
 /// Maximum `submit_*` submission attempts before the agent fails cleanly.
 /// The loop never restarts the agent or the orchestration run; it returns a
 /// structured `AgentOutcome::Failed` after the bound is reached.
-const MAX_SUBMISSION_ATTEMPTS: u32 = 3;
+const MAX_SUBMISSION_ATTEMPTS: u32 = 6;
 
 /// Per-file and cumulative budget for the changed-file excerpts injected into
 /// the review prompt (ported from the dedicated `ReviewerAgent`).

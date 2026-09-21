@@ -106,7 +106,7 @@ pub struct AgentLoop {
 const MAX_CONTINUATION_ROUNDS: u32 = 8;
 /// Number of consecutive rounds with identical progress before declaring
 /// non-convergence and escalating to the user.
-const MAX_STALE_ROUNDS: u32 = 3;
+const MAX_STALE_ROUNDS: u32 = 6;
 
 /// Character cap for the loop's persisted end-reason note (completion fix:
 /// the terminal reason/surfaces bounded into the session event log).
@@ -3609,12 +3609,15 @@ mod tests {
 
     #[tokio::test]
     async fn cycle_detection_with_deny_fails_loop() {
-        // Provider returns the same tool call 3 times.
+        // Provider returns the same tool call 6 times (the cycle budget limit).
         let tc = make_tool_call("echo", "hello");
         let calls = vec![
             vec![tc.clone()], // iteration 1 — count=1
             vec![tc.clone()], // iteration 2 — count=2
-            vec![tc.clone()], // iteration 3 — count=3 → cycle detected → denied
+            vec![tc.clone()], // iteration 3 — count=3
+            vec![tc.clone()], // iteration 4 — count=4
+            vec![tc.clone()], // iteration 5 — count=5
+            vec![tc.clone()], // iteration 6 — count=6 → cycle detected → denied
         ];
         let provider = Arc::new(ScriptedProvider::new(calls));
         let approval = Arc::new(ApprovalTestHarness::always_deny());
@@ -5800,7 +5803,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_guard_bounds_corrective_retries_then_exhausts() {
-        // Partial args get two corrective retries per tool per run; the third
+        // Partial args get five corrective retries per tool per run; the sixth
         // consecutive rejection flips to the exhausted form so the model
         // stops ping-ponging malformed calls.
         let dir = tempfile::tempdir().unwrap();
@@ -5819,7 +5822,7 @@ mod tests {
 
             ..Default::default()
         };
-        for _ in 0..3 {
+        for _ in 0..6 {
             loop_
                 .execute_single_tool_call(
                     &tc,
@@ -5837,15 +5840,16 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(messages.len(), 3);
-        assert!(messages[0].content.contains("Please retry with corrected arguments"));
-        assert!(messages[1].content.contains("Please retry with corrected arguments"));
+        assert_eq!(messages.len(), 6);
+        for retry in &messages[..5] {
+            assert!(retry.content.contains("Please retry with corrected arguments"));
+        }
         assert!(
-            messages[2].content.contains("Stop calling 'filesystem'"),
-            "third rejection must stop coaching: {}",
-            messages[2].content
+            messages[5].content.contains("Stop calling 'filesystem'"),
+            "sixth rejection must stop coaching: {}",
+            messages[5].content
         );
-        let exhausted_payload = messages[2].tool_results.as_ref().unwrap()[0].content.clone();
+        let exhausted_payload = messages[5].tool_results.as_ref().unwrap()[0].content.clone();
         assert_eq!(exhausted_payload["error"], "tool_guard_exhausted");
     }
 
@@ -6256,9 +6260,9 @@ mod tests {
             ..Default::default()
         };
 
-        // Three rounds against the SAME tool-call id: two repairs, then the
-        // budget is exhausted and the third failure surfaces unchanged.
-        for _ in 0..3 {
+        // Six rounds against the SAME tool-call id: five repairs, then the
+        // budget is exhausted and the sixth failure surfaces unchanged.
+        for _ in 0..6 {
             loop_
                 .execute_single_tool_call(
                     &tc,
@@ -6276,18 +6280,33 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "every round must execute");
+        assert_eq!(calls.load(Ordering::SeqCst), 6, "every round must execute");
         let repairs = repair_turns(&messages);
-        assert_eq!(repairs.len(), 2, "bounded at exactly MAX: {messages:?}");
+        assert_eq!(repairs.len(), 5, "bounded at exactly MAX: {messages:?}");
         assert!(
-            repairs[0].content.contains("[shell-repair attempt 1/2]"),
+            repairs[0].content.contains("[shell-repair attempt 1/5]"),
             "marker missing: {}",
             repairs[0].content
         );
         assert!(
-            repairs[1].content.contains("[shell-repair attempt 2/2]"),
+            repairs[1].content.contains("[shell-repair attempt 2/5]"),
             "marker missing: {}",
             repairs[1].content
+        );
+        assert!(
+            repairs[2].content.contains("[shell-repair attempt 3/5]"),
+            "marker missing: {}",
+            repairs[2].content
+        );
+        assert!(
+            repairs[3].content.contains("[shell-repair attempt 4/5]"),
+            "marker missing: {}",
+            repairs[3].content
+        );
+        assert!(
+            repairs[4].content.contains("[shell-repair attempt 5/5]"),
+            "marker missing: {}",
+            repairs[4].content
         );
         for repair in &repairs {
             assert!(repair.content.contains("diagnostic: shell.process.non-zero-exit"));
@@ -6296,10 +6315,10 @@ mod tests {
             assert!(repair.content.contains("inspect the captured output above and fix"));
             assert!(repair.content.contains("exactly ONE corrected `shell` tool call"));
         }
-        // Three tool results (one per round), each followed by at most one
+        // Six tool results (one per round), each followed by at most one
         // repair turn; the last round has no trailing repair.
         let tool_results = messages.iter().filter(|m| m.role == Role::Tool).collect::<Vec<_>>();
-        assert_eq!(tool_results.len(), 3);
+        assert_eq!(tool_results.len(), 6);
         let last = messages.last().expect("non-empty history");
         assert_eq!(last.role, Role::Tool, "exhaustion leaves only the tool result: {messages:?}");
         assert!(!last.content.contains("shell-repair"));
