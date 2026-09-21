@@ -58,11 +58,12 @@ pub struct ToolCall {
     /// Provider-specific opaque state that must be echoed back verbatim when
     /// this tool call is replayed on a later request.
     ///
-    /// Gemini 3.x models (and sometimes 2.5 under thinking) attach a
-    /// `thought_signature` to each `functionCall` part; Google's API requires
-    /// the client to replay that part exactly on the next request that re-sends
-    /// the call, or it fails with `400 INVALID_ARGUMENT` (`Function call is
-    /// missing a thought_signature`). `None` for every provider that does not
+    /// Gemini 3.x models attach an opaque `thoughtSignature` to (usually the
+    /// first) `functionCall` part; Google's API requires the client to replay
+    /// it verbatim as a part-level sibling of `functionCall` on the next
+    /// request that re-sends the call, or it fails with `400
+    /// INVALID_ARGUMENT`. Presence is per-part: later parallel parts carry
+    /// none and must replay bare. `None` for every provider that does not
     /// emit one. `#[serde(default)]` keeps old persisted JSON (without this
     /// field) deserializable; `skip_serializing_if` keeps the serialized wire
     /// shape of a `None`-carrying call byte-identical to today.

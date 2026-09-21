@@ -90,23 +90,30 @@ impl Dialect for GeminiChatDialect {
                         let tool_calls: Vec<serde_json::Value> = tcs
                             .iter()
                             .map(|tc| {
-                                let mut function_call = serde_json::json!({
-                                    "name": tc.name,
-                                    "args": tc.arguments
+                                let mut part = serde_json::json!({
+                                    "functionCall": {
+                                        "name": tc.name,
+                                        "args": tc.arguments
+                                    }
                                 });
                                 // Gemini 3.x echoes an opaque
-                                // `thoughtSignature` on functionCall parts;
-                                // Google requires it be replayed verbatim when
-                                // the call is re-sent. Emit it only when the
+                                // `thoughtSignature` as a *part-level sibling*
+                                // of `functionCall` — never nested inside it
+                                // (both nested spellings 400 the replay as
+                                // `Unknown name`). Google requires the
+                                // signature be echoed back verbatim on the
+                                // exact parts the model attached it to; sibling
+                                // parts that arrived bare stay bare, because
+                                // forging a signature onto them is itself
+                                // rejectable. Emit the camel key only when the
                                 // call carries one so signature-less calls keep
                                 // the exact legacy wire shape. The canonical IR
                                 // field is snake_case; the wire must use the
                                 // camel spelling Google accepts on replay.
                                 if let Some(signature) = &tc.thought_signature {
-                                    function_call["thoughtSignature"] =
-                                        serde_json::json!(signature);
+                                    part["thoughtSignature"] = serde_json::json!(signature);
                                 }
-                                serde_json::json!({ "functionCall": function_call })
+                                part
                             })
                             .collect();
                         entry["parts"] = serde_json::json!(tool_calls);
@@ -707,9 +714,11 @@ mod tests {
     }
 
     /// Gemini 3.x replay: a tool call carrying the model's opaque
-    /// `thoughtSignature` must echo it back verbatim inside the
-    /// `functionCall` part — omitting it makes Google reject the request
-    /// (`400 INVALID_ARGUMENT: Function call is missing a thought_signature`).
+    /// `thoughtSignature` must echo it back verbatim at *part level*, a
+    /// sibling of `functionCall` (never nested inside it). Omitting the
+    /// signature makes Google reject the request (`400 INVALID_ARGUMENT:
+    /// Function call is missing a thought_signature`), and nesting it inside
+    /// `functionCall` — in either spelling — 400s as `Unknown name`.
     #[test]
     fn assistant_tool_call_replays_thought_signature() {
         let request = CompletionRequest {
@@ -730,22 +739,32 @@ mod tests {
             ..Default::default()
         };
         let body = render(&request);
-        // The camel key sits *inside* the `functionCall` object, a sibling of
-        // `name`/`args` (never at part level), carrying the signature verbatim.
+        // The camel key sits at part level, a sibling of `functionCall`,
+        // carrying the signature verbatim.
         assert_eq!(
             body["contents"][0]["parts"],
             serde_json::json!([{
                 "functionCall": {
                     "name": "shell",
-                    "args": {"command": "ls"},
-                    "thoughtSignature": "sig-9f2a"
-                }
+                    "args": {"command": "ls"}
+                },
+                "thoughtSignature": "sig-9f2a"
             }])
+        );
+        assert!(
+            body["contents"][0]["parts"][0]["functionCall"].get("thoughtSignature").is_none(),
+            "camel thoughtSignature must not be nested inside functionCall: {}",
+            body["contents"][0]["parts"][0]
+        );
+        assert!(
+            body["contents"][0]["parts"][0]["functionCall"].get("thought_signature").is_none(),
+            "snake thought_signature must not be nested inside functionCall: {}",
+            body["contents"][0]["parts"][0]
         );
         let serialized = serde_json::to_string(&body).expect("body serializes");
         assert!(
             serialized.contains("thoughtSignature"),
-            "emitted functionCall must carry camelCase thoughtSignature: {serialized}"
+            "emitted part must carry camelCase thoughtSignature: {serialized}"
         );
         assert!(
             !serialized.contains("thought_signature"),
@@ -795,14 +814,14 @@ mod tests {
         );
     }
 
-    /// A multi-call turn replays the opaque `thoughtSignature` on *every*
-    /// `functionCall` part: Google rejects the replayed message with
-    /// `400 INVALID_ARGUMENT` at position 2+ unless the sibling parts carry it
-    /// too. This is the replay half of the stream-side within-turn propagation
-    /// (the request body is built only after capture has backfilled every
-    /// sibling), so a turn of N calls yields exactly N signed parts.
+    /// Replay preserves the model's per-part signature presence exactly: the
+    /// signature rides only on the parts the model attached it to (usually the
+    /// first of a parallel-call turn), and sibling parts that arrived without
+    /// one replay bare. Native `generateContent` rejects a *forged* signature
+    /// on a sibling as readily as it rejects a missing one, so concatenating
+    /// the signature onto every part would itself 400 the replayed message.
     #[test]
-    fn multi_call_turn_replays_signature_on_every_part() {
+    fn multi_call_turn_replays_per_part_signature_presence() {
         let request = CompletionRequest {
             messages: vec![Message {
                 role: Role::Assistant,
@@ -818,13 +837,13 @@ mod tests {
                         id: "gc_2".into(),
                         name: "read_file".into(),
                         arguments: serde_json::json!({"path": "Cargo.toml"}),
-                        thought_signature: Some("sig-9f2a".into()),
+                        thought_signature: None,
                     },
                     ToolCall {
                         id: "gc_3".into(),
                         name: "grep".into(),
                         arguments: serde_json::json!({"pattern": "fn"}),
-                        thought_signature: Some("sig-9f2a".into()),
+                        thought_signature: None,
                     },
                 ]),
                 tool_results: None,
@@ -837,17 +856,44 @@ mod tests {
         let body = render(&request);
         let parts = body["contents"][0]["parts"].as_array().expect("parts array");
         assert_eq!(parts.len(), 3);
-        for (index, part) in parts.iter().enumerate() {
-            assert_eq!(
-                part["functionCall"]["thoughtSignature"],
-                "sig-9f2a",
-                "every replayed functionCall part must carry the turn's camel thoughtSignature (index {index}): {part}"
-            );
-            assert!(
-                part["functionCall"].get("thought_signature").is_none(),
-                "no replayed part may carry the snake_case key (index {index}): {part}"
-            );
-        }
+        // The part the model signed replays its signature verbatim, at part
+        // level, with nothing nested inside `functionCall`.
+        assert_eq!(
+            parts[0],
+            serde_json::json!({
+                "functionCall": {
+                    "name": "shell",
+                    "args": {"command": "ls"}
+                },
+                "thoughtSignature": "sig-9f2a"
+            }),
+            "the signed part must replay sibling-placed camel thoughtSignature: {}",
+            parts[0]
+        );
+        // Structural equality against the bare legacy shape proves the second
+        // and third parts carry neither a sibling nor a nested signature key.
+        assert_eq!(
+            parts[1],
+            serde_json::json!({
+                "functionCall": {
+                    "name": "read_file",
+                    "args": {"path": "Cargo.toml"}
+                }
+            }),
+            "a part captured without a signature must replay bare: {}",
+            parts[1]
+        );
+        assert_eq!(
+            parts[2],
+            serde_json::json!({
+                "functionCall": {
+                    "name": "grep",
+                    "args": {"pattern": "fn"}
+                }
+            }),
+            "a part captured without a signature must replay bare: {}",
+            parts[2]
+        );
         let serialized = serde_json::to_string(&body).expect("body serializes");
         assert!(
             !serialized.contains("thought_signature"),
