@@ -524,6 +524,22 @@ enum FallbackOutcome {
     Exhausted,
 }
 
+/// Outcome of the coordinator-owned planning-provider recovery.
+///
+/// The recovery mirrors the design-stage ladder that the compiled scheduler
+/// used to own (pre-`4883a92`): on a provider-class failure inside the
+/// planning dispatch session the Coordinator retries `decompose_task` once on
+/// the run's default-model provider (ADR-45 tier-1b semantics), recording the
+/// attempt as an ADR-65 `Decision` event.
+enum PlanningRecoveryOutcome {
+    /// The fallback dispatch session produced a plan; the run uses it.
+    Recovered(Box<(TaskGraph, Option<PlanArtifact>, DispatchLedger, String)>),
+    /// Recovery was unavailable, degenerate, or failed; the ORIGINAL error
+    /// drives the caller's graceful `Partial` exit ("Automation paused"),
+    /// with `planning_recovery_note` carrying the ladder-exhausted note.
+    Exhausted,
+}
+
 fn is_cancellation_error(error: &OrchestratorError) -> bool {
     matches!(
         error,
@@ -1066,6 +1082,19 @@ pub struct CoordinatorAgent {
     /// the ladder skips the default-model-on-default-provider re-dispatch
     /// (ADR-42 behavior).
     default_model_fallback: bool,
+    /// Coordinator-owned planning-provider recovery (ADR-42/45 ladder
+    /// semantics, owned by the Coordinator since the compiled scheduler was
+    /// removed): whether this run may still attempt the one-shot fallback
+    /// retry of the planning dispatch session. `false` until a provider-class
+    /// planning failure either retried on the default-model provider or was
+    /// skipped (degenerate/unavailable/disabled); at most one recovery per
+    /// run. Run-scoped: reset at the start of every `run` invocation.
+    planning_recovery_attempted: bool,
+    /// Set when the coordinator-owned planning recovery was attempted or
+    /// skipped, so `run()`'s decompose error arm renders a ladder-exhausted
+    /// note instead of a silent "Automation paused". Consumed (`take()`n) by
+    /// `run()`; reset at the start of every `run` invocation.
+    planning_recovery_note: Option<String>,
     /// ADR-42 §4 tier 2: the routing profile of the coordinator's own model on
     /// its serving pipe (`planning_provider`). `None` when unresolved (config
     /// error) — tier 2 then skips with a note instead of dispatching a raw
@@ -1877,6 +1906,8 @@ impl CoordinatorAgent {
             default_model_provider: None,
             default_model_profile: None,
             default_model_fallback: true,
+            planning_recovery_attempted: false,
+            planning_recovery_note: None,
             planning_profile: None,
             default_provider_config_id: None,
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
@@ -4138,20 +4169,36 @@ impl CoordinatorAgent {
 
         // Fresh decompose path (also the ADR-65 §7 Replan destination): the
         // Coordinator's decision loop. A provider failure inside the loop
-        // returns a clean Partial result rather than propagating an error
-        // that hard-crashes the session.
-        let (graph, plan_artifact, ledger, summary) =
-            match self.decompose_task(task, context, cancel).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let _ = self.bus.publish_for_session(
-                        task.session_id,
-                        task.id.0,
-                        EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: 0.0 },
-                    );
-                    return Err(e);
+        // is retried once on the run's default-model provider
+        // (coordinator-owned planning recovery) before the run degrades to a
+        // clean Partial result rather than propagating an error that
+        // hard-crashes the session.
+        let (graph, plan_artifact, ledger, summary) = match self
+            .decompose_task(task, context, cancel)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                match self.attempt_planning_provider_recovery(task, context, cancel, &e).await {
+                    PlanningRecoveryOutcome::Recovered(recovered) => {
+                        let (graph, plan, ledger, summary) = *recovered;
+                        (graph, plan, ledger, summary)
+                    }
+                    // Recovery exhausted (or was never possible): the
+                    // ORIGINAL error drives the caller's graceful Partial
+                    // exit. The terminal lifecycle event fires here, once,
+                    // exactly like the pre-regression design stage.
+                    PlanningRecoveryOutcome::Exhausted => {
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task.id.0,
+                            EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: 0.0 },
+                        );
+                        return Err(e);
+                    }
                 }
-            };
+            }
+        };
         // ADR-35 amendment: an EMPTY graph is a legal decompose result — the
         // Coordinator may decide no dispatch is needed (an answer-only run,
         // or a planning decision to stop). Validation applies to non-empty
@@ -7006,6 +7053,11 @@ impl CoordinatorAgent {
         // loop counts toward it too, so loop + graph dispatches share one
         // ceiling.
         self.model_dispatch_count = 0;
+        // The coordinator-owned planning recovery is once per `run`: the
+        // attempt guard and its ladder-exhausted note do not carry across
+        // runs.
+        self.planning_recovery_attempted = false;
+        self.planning_recovery_note = None;
         // Phase 0: Retrieve project memory context. Phase 6 M3a: seed the
         // scope from the run this instance last planned (`last_plan_id`), the
         // run it is currently executing (`run_id`), or — on a resume, where
@@ -7045,13 +7097,21 @@ impl CoordinatorAgent {
             Err(e) => {
                 // If decomposition fails (e.g. a provider error inside the
                 // decision loop) return a clean Partial result rather than
-                // crashing the session.
+                // crashing the session. When the coordinator-owned planning
+                // recovery was attempted or skipped first, its
+                // ladder-exhausted note makes the pause explicit instead of
+                // silent.
+                let note = self.planning_recovery_note.take();
+                let final_message = match note {
+                    Some(note) => {
+                        format!("Automation paused: could not produce a valid plan. {e} — {note}")
+                    }
+                    None => format!("Automation paused: could not produce a valid plan. {e}"),
+                };
                 return Ok(AgentOutput {
                     task_id: task.id,
                     session_id: task.session_id,
-                    final_message: format!(
-                        "Automation paused: could not produce a valid plan. {e}"
-                    ),
+                    final_message,
                     files_modified: vec![],
                     tool_call_count: 0,
                     eval_result: None,
@@ -8259,6 +8319,217 @@ impl CoordinatorAgent {
             .await?;
 
         Ok((graph, advisory_plan, ledger, summary))
+    }
+
+    /// Coordinator-owned recovery for a planning-phase provider failure.
+    ///
+    /// ADR-42/45 ladder semantics, owned by the Coordinator now that the
+    /// compiled scheduler is gone: when the planning dispatch session's
+    /// provider fails with a provider-class error (HTTP status, auth, or
+    /// capability refusal — never cancellation or a structural error), the
+    /// Coordinator retries `decompose_task` ONCE on the run's default-model
+    /// provider (ADR-45 tier-1b pipe) and records the attempt as an ADR-65
+    /// `Decision` whiteboard event. The retry counts toward
+    /// `model_dispatch_count` exactly like any ladder-tier dispatch (ADR-52),
+    /// because the retried `run_dispatch_session` increments it per turn.
+    ///
+    /// The retry is skipped — straight to a graceful `Partial` — when
+    /// cancellation/structural errors surface, the run already consumed its
+    /// one recovery, the tier-1b gate is disabled, no fallback provider is
+    /// configured, or the fallback resolves to the same (provider, model) as
+    /// the failed planning provider (a permanent 400 would just repeat). The
+    /// ORIGINAL error always drives the caller's Partial exit; failure of the
+    /// fallback retry is surfaced through `planning_recovery_note`, never as
+    /// a hard crash.
+    async fn attempt_planning_provider_recovery(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        original_error: &OrchestratorError,
+    ) -> PlanningRecoveryOutcome {
+        // Belt-and-suspenders: the callers check before recovering, but a
+        // misrouted cancellation/structural failure must not be swallowed
+        // into a retry (immediate-exit semantics, ADR-42 NonRecoverable).
+        if is_cancellation_error(original_error) {
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        let recoverable = matches!(
+            original_error,
+            OrchestratorError::Provider(
+                ProviderError::HttpStatus { .. }
+                    | ProviderError::AuthFailure
+                    | ProviderError::CapabilityRefused { .. }
+            )
+        );
+        if !recoverable {
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        if self.planning_recovery_attempted {
+            self.planning_recovery_note = Some(
+                "planning-provider recovery was already attempted or skipped this run".to_owned(),
+            );
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        // Once this run's recovery slot is decided (attempted or skipped) it
+        // is spent — a replan follow-up cannot re-enter recovery.
+        self.planning_recovery_attempted = true;
+
+        // ADR-45 §4 user gate: tier-1b default-model re-dispatch disabled.
+        if !self.default_model_fallback {
+            self.planning_recovery_note = Some(
+                "planning-provider recovery disabled (default-model fallback is off)".to_owned(),
+            );
+            self.append_planning_recovery_decision(
+                task,
+                "planning-provider-recovery-skipped-disabled",
+                "No fallback retry: tier-1b default-model fallback is disabled; \
+                 the run pauses with a Partial outcome",
+            )
+            .await;
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+
+        // The fallback pipe is the run's default-model provider (ADR-45
+        // tier 1b); its routing profile is the (provider, model) the retry
+        // would hit. Absent either, there is no different pipe to retry on.
+        let Some(fallback_provider) = self.default_model_provider.clone() else {
+            self.planning_recovery_note = Some(
+                "planning-provider recovery unavailable: the run has no default-model \
+                 provider configured"
+                    .to_owned(),
+            );
+            self.append_planning_recovery_decision(
+                task,
+                "planning-provider-recovery-skipped-unavailable",
+                "No fallback retry: the run has no default-model provider; \
+                 the run pauses with a Partial outcome",
+            )
+            .await;
+            return PlanningRecoveryOutcome::Exhausted;
+        };
+        let Some(fallback_profile) = self.default_model_profile.clone() else {
+            self.planning_recovery_note = Some(
+                "planning-provider recovery unavailable: no default-model profile could \
+                 be resolved"
+                    .to_owned(),
+            );
+            self.append_planning_recovery_decision(
+                task,
+                "planning-provider-recovery-skipped-unavailable",
+                "No fallback retry: no default-model profile is resolved; \
+                 the run pauses with a Partial outcome",
+            )
+            .await;
+            return PlanningRecoveryOutcome::Exhausted;
+        };
+
+        // Degenerate: a fallback that lands on the SAME (provider, model) as
+        // the failed planning provider would reproduce the failure (e.g. a
+        // permanent 400) — skip straight to the graceful Partial.
+        let degenerate = match (&self.planning_profile, &fallback_profile) {
+            (Some(planned), fallback) => {
+                planned.profile.provider_config_id == fallback.profile.provider_config_id
+                    && planned.profile.model == fallback.profile.model
+            }
+            _ => false,
+        };
+        if degenerate {
+            self.planning_recovery_note = Some(
+                "planning-provider recovery skipped: the fallback default-model provider \
+                 resolves to the same (provider, model) as the failed planning provider"
+                    .to_owned(),
+            );
+            self.append_planning_recovery_decision(
+                task,
+                "planning-provider-recovery-skipped-degenerate",
+                "No fallback retry: the fallback resolves to the same (provider, model) as \
+                 the failed planning provider; the run pauses with a Partial outcome",
+            )
+            .await;
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+
+        self.append_planning_recovery_decision(
+            task,
+            "planning-provider-recovery-attempted",
+            "Retry the planning dispatch session on the run's default-model provider \
+             (ADR-45 tier-1b fallback) after the planning provider failed",
+        )
+        .await;
+
+        // Swap the planning serving pipe/profile to the fallback, re-run the
+        // dispatch session, and restore the original pipe/profile — the
+        // Coordinator instance may serve further runs/replans. Every exit
+        // below restores before returning.
+        let original_provider = std::mem::replace(&mut self.planning_provider, fallback_provider);
+        let original_profile = self.planning_profile.replace(fallback_profile);
+        let retried = self.decompose_task(task, context, cancel).await;
+        self.planning_provider = original_provider;
+        self.planning_profile = original_profile;
+
+        match retried {
+            Ok((graph, advisory_plan, ledger, summary)) => {
+                tracing::info!(
+                    task_id = %task.id,
+                    "coordinator planning recovery succeeded on the default-model provider"
+                );
+                PlanningRecoveryOutcome::Recovered(Box::new((
+                    graph,
+                    advisory_plan,
+                    ledger,
+                    summary,
+                )))
+            }
+            Err(second_error) => {
+                // The fallback also failed. The coordinator never hard-crashes
+                // a run over a planning failure: surface it as the note on the
+                // graceful Partial (the original error still drives the exit).
+                self.planning_recovery_note =
+                    Some(format!("fallback planning-provider retry also failed: {second_error}"));
+                tracing::warn!(
+                    error = %second_error,
+                    "coordinator planning recovery exhausted: the fallback provider also failed"
+                );
+                PlanningRecoveryOutcome::Exhausted
+            }
+        }
+    }
+
+    /// Append the whiteboard `Decision` event recording the coordinator-owned
+    /// planning recovery (ADR-65 §6 shape: `selected_agent`, `reason`,
+    /// `required_output`, `supporting_evidence_ids`). No recorded evidence
+    /// exists at this point (the planning loop never dispatched), so the
+    /// citations are an empty list — the event is fail-soft like every
+    /// continuity write (a missing review store or an append failure never
+    /// blocks the recovery path).
+    async fn append_planning_recovery_decision(
+        &self,
+        task: &AgentTask,
+        reason: &str,
+        required_output: &str,
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(task.session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": "coordinator",
+                "reason": reason,
+                "required_output": required_output,
+                "supporting_evidence_ids": [],
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(error) = append_whiteboard_event(pool, &event).await {
+            warn!(%error, "planning recovery decision append failed (fail-soft)");
+        }
     }
 
     /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): decompose a
@@ -16156,6 +16427,252 @@ mod tests {
             completed_at: None,
         });
         (graph, id)
+    }
+
+    /// A planning provider that fails every completion with a fixed
+    /// [`ProviderError`], bumping a shared atomic counter per request — so
+    /// tests can assert the primary planning provider was consulted exactly
+    /// once before the coordinator-owned recovery swaps the pipe.
+    struct PlanningFailureProvider {
+        error: ProviderError,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PlanningFailureProvider {
+        fn new(error: ProviderError, requests: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { error, requests }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for PlanningFailureProvider {
+        async fn stream_completion(
+            &self,
+            _request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.error.clone())
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "planning-failure"
+        }
+    }
+
+    /// Coordinator-owned planning recovery (ADR-42/45 ladder semantics,
+    /// restored since the compiled scheduler was removed): a planning
+    /// provider HTTP failure is retried ONCE on the run's default-model
+    /// provider, the retry succeeds, and the run proceeds — while the
+    /// attempt is recorded as an ADR-65 `Decision` event.
+    #[tokio::test]
+    async fn planning_provider_http_failure_recovers_on_default_model_provider() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        // The primary planning pipe rejects every completion with a permanent
+        // 400 (DoNotRetry at the retry layer — the raw HttpStatus surfaces).
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests.clone(),
+            ));
+        // The fallback (ADR-45 tier-1b pipe) serves one prose planning turn
+        // and captures every request.
+        let fallback = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Recovered plan\nfallback provider produced it".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("fallback", "default-model"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the recovered planning session must complete the run, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("fallback provider produced it"),
+            "the recovered plan is the run's final message: {}",
+            output.final_message,
+        );
+        // The primary failed exactly once; the retry moved the dispatch to
+        // the fallback provider (never back to the failing pipe).
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the primary planning provider must be consulted exactly once"
+        );
+        assert_eq!(fallback.turn_count(), 1, "the fallback provider must serve the retry");
+
+        // The attempt is recorded as an ADR-65 Decision event.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision, got: {decisions:?}"
+        );
+        assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-attempted");
+        assert_eq!(decisions[0].payload["selected_agent"], "coordinator");
+    }
+
+    /// A fallback that resolves to the SAME (provider, model) as the failed
+    /// planning provider would only reproduce the failure (e.g. a permanent
+    /// 400) — the coordinator-owned recovery skips straight to a graceful
+    /// Partial, still recording the skip as an ADR-65 `Decision` event and
+    /// making the pause explicit with a ladder-exhausted note.
+    #[tokio::test]
+    async fn planning_provider_degenerate_fallback_pauses_with_note() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        // A fallback provider that must NEVER be consulted: the
+        // `test/cheap` profile is identical to the harness's planning profile.
+        let fallback = Arc::new(TurnProvider::new(Vec::new()));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("test", "cheap"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a degenerate fallback must pause the run as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("Automation paused"),
+            "expected the graceful pause, got: {}",
+            output.final_message,
+        );
+        assert!(
+            output.final_message.contains("same (provider, model)"),
+            "the pause must carry the ladder-exhausted note: {}",
+            output.final_message,
+        );
+        assert_eq!(fallback.turn_count(), 0, "the degenerate fallback must never be consulted");
+
+        // The skip is still recorded as an ADR-65 Decision event.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision, got: {decisions:?}"
+        );
+        assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-skipped-degenerate");
+    }
+
+    /// Cancellation is an immediate exit (ADR-42 NonRecoverable): the
+    /// coordinator-owned recovery is never attempted, no Decision event is
+    /// recorded, and the fallback provider is never consulted.
+    #[tokio::test]
+    async fn planning_provider_cancellation_skips_recovery_and_pauses() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(ProviderError::Cancelled, primary_requests));
+        let fallback = Arc::new(TurnProvider::new(Vec::new()));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("fallback", "default-model"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a cancelled planning loop pauses as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("Automation paused"),
+            "expected the graceful pause, got: {}",
+            output.final_message,
+        );
+        assert!(
+            fallback.turn_count() == 0,
+            "cancellation must never consult the fallback provider"
+        );
+        // Cancellation is not a recovery decision: no Decision event exists.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert!(
+            decisions.is_empty(),
+            "cancellation records no planning-recovery decision: {decisions:?}"
+        );
     }
 
     /// Drive a pre-built graph through `execute_graph` and collect the
