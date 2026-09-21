@@ -154,6 +154,28 @@ pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
 /// with the cap disabled.
 const MAX_DISPATCH_ITERATIONS: usize = 64;
 
+/// Prose-only dispatch guard: the number of bounded re-prompts an
+/// ACTION-REQUIRED planning session gets when it stops in prose with ZERO
+/// dispatches (an empty graph would make the run's completion claim vacuous).
+/// Each re-prompt is an explicit dispatch instruction into the existing
+/// conversation and counts toward the ADR-52 run-wide dispatch cap like any
+/// other loop turn. Past this bound the caller escalates to the
+/// planning-recovery fallback (ADR-45 tier-1b) and, failing that, a Partial
+/// exit with a preserved checkpoint.
+const MAX_PROSE_STOP_REPROMPTS: u32 = 2;
+
+/// The explicit dispatch instruction injected after a prose-only
+/// zero-dispatch stop on an action-required planning session. Bounded re-prompt
+/// text, never a forced tool call — the model remains the decision-maker.
+fn prose_stop_dispatch_instruction(attempt: u32) -> String {
+    format!(
+        "This run requires action and no specialist has been dispatched yet. Do not close \
+         the planning session in prose without dispatching: use the `call_specialist` tool \
+         to dispatch actual work before you finish. (coordinator re-prompt {attempt}/\
+         {MAX_PROSE_STOP_REPROMPTS})"
+    )
+}
+
 /// ADR-35 amendment (2026-09-05) §1: built-in instructions for the
 /// Coordinator's decision loop. The roster ([`Self::render_specialist_roster`])
 /// is injected after these instructions; the Orchestration Studio's
@@ -527,10 +549,11 @@ enum FallbackOutcome {
 /// Outcome of the coordinator-owned planning-provider recovery.
 ///
 /// The recovery mirrors the design-stage ladder that the compiled scheduler
-/// used to own (pre-`4883a92`): on a provider-class failure inside the
-/// planning dispatch session the Coordinator retries `decompose_task` once on
-/// the run's default-model provider (ADR-45 tier-1b semantics), recording the
-/// attempt as an ADR-65 `Decision` event.
+/// used to own (pre-`4883a92`): on a planning-phase stop — a provider-class
+/// failure inside the planning dispatch session, or a prose-only zero-dispatch
+/// stop on an action-required run — the Coordinator retries `decompose_task`
+/// once on the run's default-model provider (ADR-45 tier-1b semantics),
+/// recording the attempt as an ADR-65 `Decision` event.
 enum PlanningRecoveryOutcome {
     /// The fallback dispatch session produced a plan; the run uses it.
     Recovered(Box<(TaskGraph, Option<PlanArtifact>, DispatchLedger, String)>),
@@ -4147,7 +4170,13 @@ impl CoordinatorAgent {
                 // dispatches nothing — the fresh decompose below lets the
                 // Coordinator re-decide the new planning.
                 Ok(None) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // Structural terminal class: an unrecoverable checkpoint
+                    // restore/invalidation error is not a provider condition —
+                    // it surfaces to the caller's graceful Partial with no
+                    // recovery ladder replay (ADR-42 NonRecoverable).
+                    return Err(error);
+                }
             }
         }
 
@@ -4163,7 +4192,61 @@ impl CoordinatorAgent {
         // normally below.
         if !checkpoint_present {
             if let Some(seed) = self.headless_resume_seed.take() {
-                return self.decompose_from_evidence(task, context, cancel, seed).await;
+                // The seed's objective contract (approved-plan text + the
+                // ORIGINAL objective hash) must outlive the session call so
+                // the recovered result keeps the resumed run's continuity.
+                let seed_objective = seed.plan_text.clone();
+                let seed_objective_hash = seed.objective_hash.clone();
+                match self.decompose_from_evidence(task, context, cancel, seed).await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        // Terminal-class routing for the evidence-resume
+                        // session is IDENTICAL to the fresh planning session
+                        // (below): provider-class failures are retried once on
+                        // the run's default-model provider (ADR-45 tier-1b)
+                        // with the attempt recorded as an ADR-65 `Decision`
+                        // event; every other error class surfaces through the
+                        // caller's graceful Partial untouched.
+                        match self
+                            .attempt_planning_provider_recovery(task, context, cancel, &e)
+                            .await
+                        {
+                            PlanningRecoveryOutcome::Recovered(recovered) => {
+                                let (graph, plan, ledger, summary) = *recovered;
+                                // The recovered session re-ran the fresh
+                                // planning loop, but the run's objective
+                                // contract stays the SEED's — recorded as the
+                                // approved plan text and hash, so a later
+                                // implicit resume still matches the original
+                                // objective text.
+                                return self
+                                    .finish_decompose_result(
+                                        task,
+                                        graph,
+                                        plan,
+                                        ledger,
+                                        (summary, seed_objective, seed_objective_hash),
+                                    )
+                                    .await;
+                            }
+                            // Recovery exhausted (or never possible): the
+                            // ORIGINAL error drives the caller's graceful
+                            // Partial exit. The terminal lifecycle event fires
+                            // here, once, like every planning-exhausted exit.
+                            PlanningRecoveryOutcome::Exhausted => {
+                                let _ = self.bus.publish_for_session(
+                                    task.session_id,
+                                    task.id.0,
+                                    EventKind::MultiAgentModeCompleted {
+                                        task_id: task.id,
+                                        cost_usd: 0.0,
+                                    },
+                                );
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4172,7 +4255,10 @@ impl CoordinatorAgent {
         // is retried once on the run's default-model provider
         // (coordinator-owned planning recovery) before the run degrades to a
         // clean Partial result rather than propagating an error that
-        // hard-crashes the session.
+        // hard-crashes the session. The recovery attempt (or its skip) is
+        // always recorded as an ADR-65 `Decision` event; the session itself
+        // already records every dispatch decision, so a success here carries
+        // its whiteboard decisions along.
         let (graph, plan_artifact, ledger, summary) = match self
             .decompose_task(task, context, cancel)
             .await
@@ -4199,6 +4285,41 @@ impl CoordinatorAgent {
                 }
             }
         };
+        self.finish_decompose_result(
+            task,
+            graph,
+            plan_artifact,
+            ledger,
+            (
+                summary,
+                task.description.clone(),
+                blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+            ),
+        )
+        .await
+    }
+
+    /// Shared tail for the fresh decompose path and the evidence-resume path:
+    /// validate a non-empty graph, persist the durable plan artifact, fire
+    /// the `MultiAgentModeStarted` lifecycle event, and assemble the
+    /// [`DecomposeResult`] whose objective/hash fields describe WHAT this run
+    /// is executing (the fresh task description, or the evidence seed's
+    /// original plan text + objective hash). Event ordering is load-bearing:
+    /// `MultiAgentModeStarted` must fire before the ADR-55 Phase 2b
+    /// planning-only early return.
+    ///
+    /// Terminal classes do not surface here: this tail runs only after a
+    /// successful (or recovered) planning side. Structural invalidity of the
+    /// produced graph surfaces as an error to the caller's graceful Partial.
+    async fn finish_decompose_result(
+        &mut self,
+        task: &AgentTask,
+        graph: TaskGraph,
+        advisory_plan: Option<PlanArtifact>,
+        ledger: DispatchLedger,
+        run_context: (String, String, String),
+    ) -> Result<DecomposeResult, OrchestratorError> {
+        let (summary, objective, objective_hash) = run_context;
         // ADR-35 amendment: an EMPTY graph is a legal decompose result — the
         // Coordinator may decide no dispatch is needed (an answer-only run,
         // or a planning decision to stop). Validation applies to non-empty
@@ -4206,11 +4327,11 @@ impl CoordinatorAgent {
         if !graph.is_empty() {
             TaskGraphValidator::validate(&graph)?;
         }
-        // durable artifact id, so both decompose paths persist one — the
-        // advisory draft when the Coordinator invoked the advisor, else the
-        // graph record (ADR-52 amendment: plans are advisory records,
+        // A durable plan artifact id, so both decompose paths persist one —
+        // the advisory draft when the Coordinator invoked the advisor, else
+        // the graph record (ADR-52 amendment: plans are advisory records,
         // never an authoritative workload).
-        let plan_id = match plan_artifact {
+        let plan_id = match advisory_plan {
             Some(plan) => self.persist_plan_artifact(&plan),
             None => {
                 let fallback_plan = PlanArtifact::from_graph(
@@ -4251,8 +4372,8 @@ impl CoordinatorAgent {
                 dispatch_summary: String::new(),
                 loop_notes: Vec::new(),
                 requested_user_input: None,
-                objective: task.description.clone(),
-                objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+                objective,
+                objective_hash,
             });
         }
         Ok(DecomposeResult {
@@ -4269,8 +4390,8 @@ impl CoordinatorAgent {
             dispatch_summary: summary,
             loop_notes: ledger.notes,
             requested_user_input: self.requested_user_input.take(),
-            objective: task.description.clone(),
-            objective_hash: blake3::hash(task.description.as_bytes()).to_hex().to_string(),
+            objective,
+            objective_hash,
         })
     }
 
@@ -5122,6 +5243,12 @@ impl CoordinatorAgent {
         // stays alive for the tail's vacuous-completion guard (which must read
         // its None-ness); the run exits the same way either way.
         if let Some(reason) = requested_user_input.as_ref() {
+            // `AwaitingUser` terminal class (user-denied): the Coordinator
+            // itself requested human input via the `request_user_input` tool,
+            // which records its decision in the in-memory decision journal
+            // (DecisionKind::RequestUserInput). The checkpoint is preserved
+            // so the resume waits on the same operator question; lifecycle
+            // completion is fired here. No further dispatch decision occurs.
             let _ = self.bus.publish_for_session(
                 task.session_id,
                 task.id.0,
@@ -5173,6 +5300,11 @@ impl CoordinatorAgent {
 
         loop {
             if cancel.is_cancelled() {
+                // `Cancelled` terminal class (immediate exit, ADR-42
+                // NonRecoverable): the operator cancelled the run — no
+                // Coordinator decision event is recorded and no recovery is
+                // attempted; the run always ends as Err(Cancelled), never as
+                // a silent Completed.
                 // An interrupted provider/tool call has no durable completion
                 // record. Put its graph node back in the ready state and save
                 // that transition before returning so a later Continue never
@@ -5493,6 +5625,11 @@ impl CoordinatorAgent {
                         recoverable_notes,
                     ));
                 }
+                // Structural terminal class (deadlock/undecidable graph): ready queue
+                // empty but the graph not all-completed, with no
+                // terminal-subtask failure to explain it. This is an
+                // invariant violation, not a provider condition — it
+                // surfaces as an error (no Decision event, no recovery).
                 return Err(OrchestratorError::AgentLoopError(
                     "task graph has unblocked but unfinished tasks".into(),
                 ));
@@ -5578,6 +5715,10 @@ impl CoordinatorAgent {
             self.persist_checkpoint(&mut progress_checkpoint, &model_assignments).await;
 
             // ── 2a. Check budget once per batch ─────────────────────
+            // Budget-denied terminal class: the run-wide spend cap is
+            // exhausted. No Coordinator decision is recorded here — the
+            // decision loop's own budget check throws the SAME class and the
+            // cap is user policy, not a recoverable provider condition.
             if self.spend_tracker.check(0.001).is_err() {
                 return Err(OrchestratorError::NoBudgetForDelegation);
             }
@@ -6779,6 +6920,9 @@ impl CoordinatorAgent {
             self.persist_checkpoint(&mut completed_batch_checkpoint, &model_assignments).await;
 
             if cancelled_during_batch {
+                // `Cancelled` terminal class (ADR-42 NonRecoverable): the
+                // batch's own dispatch observed the cancel after the prior
+                // checkpoint save — the checkpoint is preserved for resume.
                 return Err(OrchestratorError::Cancelled);
             }
 
@@ -6792,6 +6936,13 @@ impl CoordinatorAgent {
             // batch; that would waste budget on work we already know will
             // be discarded.
             if let Some((failed_task_id, failed_role, error)) = non_recoverable_exit.take() {
+                // Structural terminal class (ADR-42 NonRecoverable): a
+                // subtask error the recovery/retry machinery declared
+                // non-recoverable (e.g. a policy-rejected write or an
+                // uncorrectable tool failure). The grace exit is a Partial
+                // AgentOutput with the terminal lifecycle event; no further
+                // dispatch decision is recorded — the run stops rather than
+                // spending budget on work that is known to be discarded.
                 let final_message = format!(
                     "Automation paused after a non-recoverable subtask error \
                      ({failed_role:?} subtask {failed_task_id}). Existing \
@@ -6858,12 +7009,17 @@ impl CoordinatorAgent {
         // and every success-tail acceptance check is itself vacuous (the
         // zero-work guard needs a dispatched ledger, C-06 needs a
         // build-stage subtask, the expected-artifact and stall gates need a
-        // non-empty declared set). This is the push site for the "empty
-        // dispatch session on an action-required run" note the `loop_notes`
-        // / `DispatchLedger` docs describe but no decision-loop site ever
-        // pushed. The note downgrades the exit to Partial and the stall gate
-        // below KEEPS the run's checkpoint (persisted with `completed=false`)
-        // so a later bare "continue" can resume the run.
+        // non-empty declared set). Since 2026-09-21 this site is the FALLBACK
+        // push point for the "empty dispatch session on an action-required
+        // run" note the `loop_notes` / `DispatchLedger` docs describe: the
+        // decision loop now pushes it first (prose-only dispatch guard in
+        // `run_dispatch_session` + the planning-recovery escalation in
+        // `decompose_task`), and a run that still arrives here empty is one
+        // whose planning-leg recovery is spent or whose graph was
+        // structurally emptied afterwards. The note downgrades the exit to
+        // Partial and the stall gate below KEEPS the run's checkpoint
+        // (persisted with `completed=false`) so a later bare "continue" can
+        // resume the run.
         // Exempt by construction: AnswerOnly root tasks (prose completion is
         // correct — the mode gate below only arms ActionRequired runs),
         // PlanningOnly depth (returned before `execute_graph`), runs waiting
@@ -6975,6 +7131,9 @@ impl CoordinatorAgent {
         let deliverables_missing =
             expected_artifacts_unproduced(&project_root, &self.expected_artifacts_snapshot());
         let stalled = run_is_stalled(completion_status, deliverables_missing, &graph);
+        // Resume continuity: a stalled/pre-partial run KEEPS its resumable
+        // checkpoint (persisted with completed=false) so a later bare
+        // "continue" can resume; only a clean Completed clears it.
         let checkpoint_json = if stalled {
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
             let mut cp = checkpoint::build_checkpoint(
@@ -7095,12 +7254,23 @@ impl CoordinatorAgent {
         {
             Ok(result) => result,
             Err(e) => {
-                // If decomposition fails (e.g. a provider error inside the
-                // decision loop) return a clean Partial result rather than
-                // crashing the session. When the coordinator-owned planning
-                // recovery was attempted or skipped first, its
-                // ladder-exhausted note makes the pause explicit instead of
-                // silent.
+                // Terminal-class routing for decompose failures: any error
+                // reaching here is already decision-classified upstream.
+                // Provider-class planning failures and prose-only
+                // zero-dispatch stops were retried ONCE on the default-model
+                // provider by the coordinator-owned recovery ladder, whose
+                // attempt/skip was recorded as an ADR-65 `Decision` event.
+                // Errors that bypass or exhaust that ladder are terminal
+                // classes by construction, each documented at its throw site:
+                //   - Cancelled — immediate exit (ADR-42 NonRecoverable);
+                //   - structural — invalid/undecidable graph or unrecoverable
+                //     checkpoint restore (the Replan objective is real, not a
+                //     retry-able provider condition);
+                //   - budget-denied — NoBudgetForDelegation (user cap).
+                // None of them replay the provider ladder. Return a clean
+                // Partial result rather than crashing the session. When the
+                // ladder was attempted or skipped first, its ladder-exhausted
+                // note makes the pause explicit instead of silent.
                 let note = self.planning_recovery_note.take();
                 let final_message = match note {
                     Some(note) => {
@@ -8318,6 +8488,41 @@ impl CoordinatorAgent {
             )
             .await?;
 
+        // ── Prose-only dispatch guard (escalation) ───────────────────────
+        // The bounded re-prompts inside the session ([`MAX_PROSE_STOP_REPROMPTS`])
+        // were exhausted and this ACTION-REQUIRED dispatch session still ends
+        // with ZERO dispatches (empty graph). Escalate to the planning-recovery
+        // path exactly like a provider-class planning failure would: retry the
+        // whole planning session ONCE on the run's default-model provider
+        // (ADR-45 tier-1b) and record the attempt as an ADR-65 `Decision` event.
+        // The retried session may finally dispatch (the run proceeds); if it too
+        // ends empty, the retried result flows into `execute_graph`, whose
+        // vacuous-completion guard reports Partial and KEEPS the checkpoint for
+        // resume. The recovery is once-per-run: the nested retry's own
+        // prose-only stop is skipped via `planning_recovery_attempted`, so this
+        // never recurses deeper than one level.
+        let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
+            && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && graph.is_empty();
+        if prose_only_stop {
+            match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
+                PlanningRecoveryOutcome::Recovered(recovered) => {
+                    let (graph, advisory_plan, ledger, summary) = *recovered;
+                    return Ok((graph, advisory_plan, ledger, summary));
+                }
+                PlanningRecoveryOutcome::Exhausted => {
+                    // The ladder-exhausted note (unavailable / disabled /
+                    // degenerate / already-spent) makes the eventual Partial
+                    // pause explicit; the original empty-graph result stays and
+                    // `execute_graph`'s vacuous-completion guard converts it to
+                    // Partial with a preserved checkpoint.
+                    if let Some(note) = self.planning_recovery_note.take() {
+                        ledger.notes.push(note);
+                    }
+                }
+            }
+        }
+
         Ok((graph, advisory_plan, ledger, summary))
     }
 
@@ -8365,10 +8570,78 @@ impl CoordinatorAgent {
         if !recoverable {
             return PlanningRecoveryOutcome::Exhausted;
         }
+        self.retry_planning_on_default_model(
+            task,
+            context,
+            cancel,
+            "planning-provider-recovery",
+            "Retry the planning dispatch session on the run's default-model provider \
+             (ADR-45 tier-1b fallback) after the planning provider failed",
+        )
+        .await
+    }
+
+    /// Coordinator-owned recovery for a prose-only, zero-dispatch planning
+    /// stop on an action-required run (the prose-only dispatch guard).
+    ///
+    /// The planning provider did not fail — it closed the dispatch session in
+    /// prose after the bounded re-prompts ([`MAX_PROSE_STOP_REPROMPTS`],
+    /// delivered by `run_dispatch_session`) while dispatching zero specialists.
+    /// The same ADR-45 tier-1b ladder applies: retry `decompose_task` ONCE on
+    /// the run's default-model provider and record the attempt as an ADR-65
+    /// `Decision` event. A retried session that finally dispatches makes the
+    /// run proceed; a retried session that AGAIN ends empty flows into
+    /// `execute_graph`, whose vacuous-completion guard reports the run Partial
+    /// and preserves its checkpoint for resume.
+    async fn attempt_prose_only_planning_recovery(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+    ) -> PlanningRecoveryOutcome {
+        self.retry_planning_on_default_model(
+            task,
+            context,
+            cancel,
+            "planning-prose-only-recovery",
+            "Retry the planning dispatch session on the run's default-model provider \
+             (ADR-45 tier-1b fallback) after the planning provider ended an action-required \
+             session in prose with zero dispatches despite the explicit dispatch re-prompts",
+        )
+        .await
+    }
+
+    /// Shared tail of the coordinator-owned planning recovery (ADR-45
+    /// tier-1b): resolve the fallback pipe, record the attempt (or skip) as an
+    /// ADR-65 `Decision` event, retry `decompose_task` ONCE on the fallback,
+    /// and restore the original planning pipe/profile regardless of the
+    /// outcome.
+    ///
+    /// `tag_prefix` seeds every `Decision` reason tag (`{tag}-attempted`,
+    /// `{tag}-skipped-disabled`, `{tag}-skipped-unavailable`,
+    /// `{tag}-skipped-degenerate`); `decision_output` is the
+    /// `required_output` the Decision event records for the retry. Shared by
+    /// the provider-failure recovery ([`Self::attempt_planning_provider_recovery`])
+    /// and the prose-only zero-dispatch recovery
+    /// ([`Self::attempt_prose_only_planning_recovery`]).
+    ///
+    /// The retry is skipped — the caller's graceful `Partial` stands — when
+    /// the run already consumed its one recovery, the tier-1b gate is
+    /// disabled, no fallback provider is configured, or the fallback resolves
+    /// to the same (provider, model) as the current planning provider (the
+    /// failure would just repeat). Failure of the fallback retry is surfaced
+    /// through `planning_recovery_note`, never as a hard crash.
+    async fn retry_planning_on_default_model(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        tag_prefix: &str,
+        decision_output: &str,
+    ) -> PlanningRecoveryOutcome {
         if self.planning_recovery_attempted {
-            self.planning_recovery_note = Some(
-                "planning-provider recovery was already attempted or skipped this run".to_owned(),
-            );
+            self.planning_recovery_note =
+                Some("planning recovery was already attempted or skipped this run".to_owned());
             return PlanningRecoveryOutcome::Exhausted;
         }
         // Once this run's recovery slot is decided (attempted or skipped) it
@@ -8377,12 +8650,11 @@ impl CoordinatorAgent {
 
         // ADR-45 §4 user gate: tier-1b default-model re-dispatch disabled.
         if !self.default_model_fallback {
-            self.planning_recovery_note = Some(
-                "planning-provider recovery disabled (default-model fallback is off)".to_owned(),
-            );
+            self.planning_recovery_note =
+                Some("planning recovery disabled (default-model fallback is off)".to_owned());
             self.append_planning_recovery_decision(
                 task,
-                "planning-provider-recovery-skipped-disabled",
+                &format!("{tag_prefix}-skipped-disabled"),
                 "No fallback retry: tier-1b default-model fallback is disabled; \
                  the run pauses with a Partial outcome",
             )
@@ -8395,13 +8667,13 @@ impl CoordinatorAgent {
         // would hit. Absent either, there is no different pipe to retry on.
         let Some(fallback_provider) = self.default_model_provider.clone() else {
             self.planning_recovery_note = Some(
-                "planning-provider recovery unavailable: the run has no default-model \
-                 provider configured"
+                "planning recovery unavailable: the run has no default-model provider \
+                 configured"
                     .to_owned(),
             );
             self.append_planning_recovery_decision(
                 task,
-                "planning-provider-recovery-skipped-unavailable",
+                &format!("{tag_prefix}-skipped-unavailable"),
                 "No fallback retry: the run has no default-model provider; \
                  the run pauses with a Partial outcome",
             )
@@ -8410,13 +8682,13 @@ impl CoordinatorAgent {
         };
         let Some(fallback_profile) = self.default_model_profile.clone() else {
             self.planning_recovery_note = Some(
-                "planning-provider recovery unavailable: no default-model profile could \
+                "planning recovery unavailable: no default-model profile could \
                  be resolved"
                     .to_owned(),
             );
             self.append_planning_recovery_decision(
                 task,
-                "planning-provider-recovery-skipped-unavailable",
+                &format!("{tag_prefix}-skipped-unavailable"),
                 "No fallback retry: no default-model profile is resolved; \
                  the run pauses with a Partial outcome",
             )
@@ -8425,8 +8697,9 @@ impl CoordinatorAgent {
         };
 
         // Degenerate: a fallback that lands on the SAME (provider, model) as
-        // the failed planning provider would reproduce the failure (e.g. a
-        // permanent 400) — skip straight to the graceful Partial.
+        // the current planning provider would reproduce the failure (e.g. a
+        // permanent 400, or an empty-prose planning model) — skip straight to
+        // the graceful Partial.
         let degenerate = match (&self.planning_profile, &fallback_profile) {
             (Some(planned), fallback) => {
                 planned.profile.provider_config_id == fallback.profile.provider_config_id
@@ -8436,15 +8709,15 @@ impl CoordinatorAgent {
         };
         if degenerate {
             self.planning_recovery_note = Some(
-                "planning-provider recovery skipped: the fallback default-model provider \
-                 resolves to the same (provider, model) as the failed planning provider"
+                "planning recovery skipped: the fallback default-model provider \
+                 resolves to the same (provider, model) as the current planning provider"
                     .to_owned(),
             );
             self.append_planning_recovery_decision(
                 task,
-                "planning-provider-recovery-skipped-degenerate",
+                &format!("{tag_prefix}-skipped-degenerate"),
                 "No fallback retry: the fallback resolves to the same (provider, model) as \
-                 the failed planning provider; the run pauses with a Partial outcome",
+                 the current planning provider; the run pauses with a Partial outcome",
             )
             .await;
             return PlanningRecoveryOutcome::Exhausted;
@@ -8452,19 +8725,27 @@ impl CoordinatorAgent {
 
         self.append_planning_recovery_decision(
             task,
-            "planning-provider-recovery-attempted",
-            "Retry the planning dispatch session on the run's default-model provider \
-             (ADR-45 tier-1b fallback) after the planning provider failed",
+            &format!("{tag_prefix}-attempted"),
+            decision_output,
         )
         .await;
 
         // Swap the planning serving pipe/profile to the fallback, re-run the
         // dispatch session, and restore the original pipe/profile — the
         // Coordinator instance may serve further runs/replans. Every exit
-        // below restores before returning.
+        // below restores before returning. The swap re-enters `decompose_task`
+        // through this shared helper (self-recursion), so the inner call is
+        // boxed to keep the future sized (E0733); the cycle terminates because
+        // the prose-only guard inside the retried `decompose_task` observes
+        // `planning_recovery_attempted` and returns Exhausted instead of
+        // re-entering recovery.
         let original_provider = std::mem::replace(&mut self.planning_provider, fallback_provider);
         let original_profile = self.planning_profile.replace(fallback_profile);
-        let retried = self.decompose_task(task, context, cancel).await;
+        // Reborrow so the `async move` block owns the reference, not `self`
+        // itself; the reborrow dies with the boxed future after `await`.
+        let this = &mut *self;
+        let retried =
+            Box::pin(async move { this.decompose_task(task, context, cancel).await }).await;
         self.planning_provider = original_provider;
         self.planning_profile = original_profile;
 
@@ -8607,7 +8888,7 @@ impl CoordinatorAgent {
             source_revision: self.source_revision.clone(),
             sequence_num: 0,
         };
-        let (summary, advisory_plan) = self
+        let (mut summary, mut advisory_plan) = self
             .run_dispatch_session(
                 &mut graph,
                 task,
@@ -8620,50 +8901,62 @@ impl CoordinatorAgent {
                 &intro,
             )
             .await?;
-        // An empty graph is a legal decompose result (see decompose_task).
-        if !graph.is_empty() {
-            TaskGraphValidator::validate(&graph)?;
+
+        // ── Prose-only dispatch guard (escalation) ───────────────────────
+        // Mirror of `decompose_task`: an ACTION-REQUIRED evidence-resume
+        // dispatch session that closes in prose (after the
+        // [`MAX_PROSE_STOP_REPROMPTS`] bounded re-prompts inside the session)
+        // with ZERO dispatches cannot stand — the empty graph would otherwise
+        // make the resumed run's completion claim vacuous (ADR-65 §7) and
+        // land in `execute_graph`'s vacuous-completion guard with the run's
+        // recovery slot already spent. The SAME ADR-45 tier-1b ladder
+        // applies: retry the planning session ONCE on the run's
+        // default-model provider, recording the attempt as an ADR-65
+        // `Decision` event. The recovery is once-per-run, so the nested
+        // retry's own prose-only stop is skipped via
+        // `planning_recovery_attempted` — never deeper than one level.
+        let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
+            && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && graph.is_empty();
+        if prose_only_stop {
+            match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
+                PlanningRecoveryOutcome::Recovered(recovered) => {
+                    let (recovered_graph, recovered_plan, recovered_ledger, recovered_summary) =
+                        *recovered;
+                    graph = recovered_graph;
+                    advisory_plan = recovered_plan;
+                    ledger = recovered_ledger;
+                    summary = recovered_summary;
+                }
+                PlanningRecoveryOutcome::Exhausted => {
+                    // The ladder-exhausted note (unavailable / disabled /
+                    // degenerate / already-spent) makes the eventual Partial
+                    // pause explicit; the original empty-graph result stays
+                    // and `execute_graph`'s vacuous-completion guard converts
+                    // it to Partial with a preserved checkpoint.
+                    if let Some(note) = self.planning_recovery_note.take() {
+                        ledger.notes.push(note);
+                    }
+                }
+            }
         }
 
-        // Mirror the fresh decompose / checkpoint-restore tail: a durable
-        // plan artifact + the lifecycle event.
-        let plan = match advisory_plan {
-            Some(plan) => plan,
-            None => PlanArtifact::from_graph(
-                Ulid::new().to_string(),
-                task,
-                &graph,
-                &self.expected_artifacts_snapshot(),
-            ),
-        };
-        let plan_id = self.persist_plan_artifact(&plan);
-        self.last_plan_id = plan_id.clone();
-        let _ = self.bus.publish_for_session(
-            task.session_id,
-            task.id.0,
-            EventKind::MultiAgentModeStarted {
-                task_id: task.id,
-                subtask_count: graph.len(),
-                plan_id,
-            },
-        );
-        Ok(DecomposeResult {
+        // An empty graph is a legal decompose result (see decompose_task).
+        self.finish_decompose_result(
+            task,
             graph,
-            completed_results: ledger.completed_results,
-            total_cost: ledger.total_cost,
-            total_tool_calls: ledger.total_tool_calls,
-            all_files: ledger.all_files,
-            provider_metrics: ledger.provider_metrics,
-            subtask_attempts: ledger.subtask_attempts,
-            retry_feedback: HashMap::new(),
-            model_assignments: ledger.model_assignments,
-            action_ledger: ledger.action_ledger,
-            dispatch_summary: summary,
-            loop_notes: ledger.notes,
-            requested_user_input: self.requested_user_input.take(),
-            objective: seed.plan_text,
-            objective_hash: seed.objective_hash,
-        })
+            advisory_plan,
+            ledger,
+            (
+                summary,
+                // The recorded objective is the approved plan text and the
+                // objective hash is the payload's ORIGINAL objective hash, so a
+                // later implicit resume still matches the original objective text.
+                seed.plan_text,
+                seed.objective_hash,
+            ),
+        )
+        .await
     }
 
     /// The Coordinator's decision loop (ADR-35 amendment 2026-09-05 §1).
@@ -8815,9 +9108,17 @@ impl CoordinatorAgent {
         // machinery, so the tail must not add a second, misleading
         // structural-bound note.
         let mut stall_escalated = false;
+        // Prose-only dispatch guard: the bounded re-prompts already served on
+        // a prose-only zero-dispatch stop (see the `tool_calls.is_empty()`
+        // branch below). Bounded by [`MAX_PROSE_STOP_REPROMPTS`]; past that
+        // bound the caller escalates to the planning-recovery fallback.
+        let mut prose_stop_reprompts: u32 = 0;
 
         for _iteration in 0..MAX_DISPATCH_ITERATIONS {
             if cancel.is_cancelled() {
+                // `Cancelled` terminal class (ADR-42 NonRecoverable): the
+                // caller (`decompose_or_restore`) never replays this, so the
+                // run always ends as Err(Cancelled) → graceful Partial.
                 return Err(OrchestratorError::Cancelled);
             }
             // The ADR-52 run-wide doom guard counts THIS loop's model
@@ -8834,6 +9135,8 @@ impl CoordinatorAgent {
                 break;
             }
             self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+            // Budget-denied terminal class: the spend cap is user policy and
+            // not a recoverable provider condition — propagated as-is.
             if self.spend_tracker.check(0.001).is_err() {
                 return Err(OrchestratorError::NoBudgetForDelegation);
             }
@@ -8885,7 +9188,7 @@ impl CoordinatorAgent {
                 task.id,
                 cancel,
             )
-            .await?;
+            .await?; // provider-class errors classify at the decompose level
 
             messages.push(Message {
                 role: Role::Assistant,
@@ -8898,8 +9201,65 @@ impl CoordinatorAgent {
             });
 
             if tool_calls.is_empty() {
+                // ── Prose-only dispatch guard ────────────────────────────
+                // An ACTION-REQUIRED dispatch session is not allowed to close
+                // in prose while ZERO dispatches exist: an empty graph makes
+                // the run's completion claim vacuously true ("nothing to do"
+                // degenerates into "everything done"), so the run would end
+                // Partial with only the tail's vacuous-completion note to
+                // explain it. Nudge the planning provider back onto the
+                // dispatch surface with an explicit instruction, bounded by
+                // `MAX_PROSE_STOP_REPROMPTS`; past that bound the stop stands
+                // and the caller (`decompose_task`) escalates to the
+                // planning-recovery fallback (ADR-45 tier-1b).
+                // Exempt by construction: AnswerOnly task modes (prose is the
+                // correct outcome — the twin tests keep those single-pass)
+                // and PlanningOnly depth (no tools exist to dispatch with).
+                let prose_only_stop =
+                    matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+                        && graph.is_empty();
+                if dispatching && prose_only_stop && prose_stop_reprompts < MAX_PROSE_STOP_REPROMPTS
+                {
+                    prose_stop_reprompts += 1;
+                    let instruction = prose_stop_dispatch_instruction(prose_stop_reprompts);
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: instruction.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: instruction,
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
+                    continue;
+                }
                 summary = text;
                 hit_iteration_bound = false;
+                if dispatching && prose_only_stop {
+                    // The bounded re-prompts did not move the planning
+                    // provider onto the dispatch surface. Make the stop
+                    // explicit: the note (a) downgrades the run to Partial
+                    // through the recoverable-note machinery and (b) tells
+                    // `decompose_task` the planning-recovery fallback is the
+                    // next escalation step.
+                    ledger.notes.push(format!(
+                        "Prose-only dispatch guard: the planning provider closed an \
+                         action-required session in prose {prose_stop_reprompts} time(s) \
+                         after being re-prompted with an explicit dispatch instruction, \
+                         dispatching zero specialists; the empty dispatch session escalates \
+                         to the planning-recovery fallback and, failing that, pauses Partial \
+                         with a preserved checkpoint."
+                    ));
+                }
                 break;
             }
 
@@ -22775,27 +23135,38 @@ mod tests {
         );
     }
 
-    /// Vacuous-completion guard (2026-09-20): an ACTION-REQUIRED run whose
-    /// planning session answers prose-only — zero `call_specialist`
-    /// dispatches, an EMPTY graph, zero files written — must exit `Partial`
-    /// with its checkpoint preserved for resume, never a vacuous `Completed`
-    /// (empty graph vacuously satisfies `all_completed`; every success-tail
-    /// acceptance gate is itself vacuous on zero tasks/artifacts).
+    /// Vacuous-completion guard (2026-09-20) + prose-only dispatch guard
+    /// (2026-09-21): an ACTION-REQUIRED run whose planning session answers
+    /// prose-only — zero `call_specialist` dispatches, an EMPTY graph, zero
+    /// files written — must exit `Partial` with its checkpoint preserved for
+    /// resume, never a vacuous `Completed` (empty graph vacuously satisfies
+    /// `all_completed`; every success-tail acceptance gate is itself vacuous
+    /// on zero tasks/artifacts).
+    ///
+    /// The coordinator does NOT accept the first prose close: the decision
+    /// loop re-prompts the planning provider with an explicit dispatch
+    /// instruction (`MAX_PROSE_STOP_REPROMPTS` = 2), then escalates to the
+    /// planning-recovery fallback (ADR-45 tier-1b). With no fallback provider
+    /// configured the recovery skips (still recorded as an ADR-65 `Decision`
+    /// event) and the run pauses Partial through the vacuous-completion guard.
     #[tokio::test]
     async fn prose_only_action_required_run_is_partial_and_resumable() {
+        let (_dir, pool) = resume_log_pool().await;
         let bus = EventBus::new(256);
         let mocks = vec![
             MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
             MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
         ];
-        let mut coordinator = coordinator_with_turns(
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(mocks)),
             // The planning provider answers with prose only: nothing to do,
             // so the Coordinator stops in prose without ever dispatching a
-            // subtask (the 22429 harness shape).
+            // subtask (the 22429 harness shape). One scripted turn; the
+            // guard's two re-prompts consume the auto-filled empty turns.
             vec![CoordinatorTurn::Text("no dispatch needed".into())],
         );
+        coordinator = coordinator.with_review_store(Some(pool.clone()));
         let mut rx = bus.subscribe();
         let session_id = Ulid::new();
         let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
@@ -22823,6 +23194,30 @@ mod tests {
             !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
             "a prose-only planning session dispatches nothing: {events:?}"
         );
+        // The prose-only dispatch guard: the planning provider is re-prompted
+        // with an explicit dispatch instruction on each of the two re-prompts
+        // before the stop is accepted.
+        let reprompts: Vec<_> = events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::AgentThought { content, .. }
+                    if content.contains("coordinator re-prompt") =>
+                {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reprompts.len(),
+            2,
+            "the prose-only stop is re-prompted exactly MAX_PROSE_STOP_REPROMPTS times, got: {reprompts:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            3,
+            "the planning provider serves the original turn plus two re-prompt turns"
+        );
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
@@ -22835,6 +23230,16 @@ mod tests {
             "the vacuous run keeps its checkpoint for resume"
         );
         assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("no default-model provider"),
+            "the exhausted recovery names why no fallback retry happened: {}",
+            output.final_message
+        );
+        assert!(
             output.final_message.contains("Vacuous-completion guard"),
             "the guard names the omission: {}",
             output.final_message
@@ -22843,6 +23248,163 @@ mod tests {
             output.files_modified.is_empty(),
             "a zero-dispatch, zero-artifact run modifies nothing, got: {:?}",
             output.files_modified
+        );
+        // The skipped recovery is still recorded as an ADR-65 Decision event.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision, got: {decisions:?}"
+        );
+        assert_eq!(
+            decisions[0].payload["reason"], "planning-prose-only-recovery-skipped-unavailable",
+            "the prose-only recovery skip records its tag, got: {decisions:?}"
+        );
+    }
+
+    /// Prose-only dispatch guard recovery: an ACTION-REQUIRED run whose
+    /// planning provider closes in prose with zero dispatches is re-prompted
+    /// twice, then retried ONCE on the run's default-model provider (ADR-45
+    /// tier-1b). The fallback finally dispatches a specialist, so the empty
+    /// dispatch session is RECOVERED — never accepted as a vacuous completion.
+    ///
+    /// The run still exits `Partial`: the recovered specialist is a zero-tool
+    /// mock, so the run's own (pre-existing, orthogonal) zero-work guard
+    /// reports its acceptance gap — but the empty-dispatch/vacuous-completion
+    /// notes are gone and the attempt is recorded as an ADR-65 `Decision`
+    /// event.
+    #[tokio::test]
+    async fn prose_only_action_required_run_reprompts_then_recovers_on_fallback() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        // The primary planning pipe closes in prose three times (original +
+        // the two re-prompt turns), dispatching nothing.
+        let primary = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Text("nothing to dispatch".into()),
+            CoordinatorTurn::Text("still nothing".into()),
+            CoordinatorTurn::Text("prose only".into()),
+        ]));
+        // The fallback (ADR-45 tier-1b pipe) finally dispatches the coder and
+        // then closes in prose with a NON-empty graph — a legitimate stop.
+        let fallback = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![call_specialist_with_artifacts(
+                "coder",
+                "implement the thing",
+                &["src/lib.rs"],
+            )]),
+            CoordinatorTurn::Text("done after dispatching".into()),
+        ]));
+        let planning_provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            primary.clone();
+        let mut coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            concerto_config::ModelPinConfig::default(),
+            planning_provider,
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("fallback", "default-model"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::Full)
+        .with_policy_engine(coordinator_allow_all_policy())
+        .with_review_store(Some(pool.clone()));
+
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert_eq!(
+            primary.turn_count(),
+            3,
+            "the primary planning provider serves the original turn plus the two re-prompts"
+        );
+        assert_eq!(
+            fallback.turn_count(),
+            2,
+            "the fallback serves the retry's dispatch turn and its closing prose turn"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the recovered specialist still trips the run's own zero-work guard (zero-tool mock), \
+             got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "the fallback's dispatch really dispatches a specialist: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the recovered dispatch ran and its own acceptance gate is the only note: {}",
+            output.final_message
+        );
+        // The empty-dispatch session itself was recovered: neither the
+        // prose-only guard nor the vacuous-completion guard fires.
+        assert!(
+            !output.final_message.contains("Prose-only dispatch guard")
+                && !output.final_message.contains("Vacuous-completion guard"),
+            "a recovered run has no empty-dispatch guard notes: {}",
+            output.final_message
+        );
+
+        // The recovery attempt is recorded as an ADR-65 Decision event (alongside
+        // the recovered run's own `coordinator_choice` dispatch decision).
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let recovery_decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["reason"] == "planning-prose-only-recovery-attempted"
+            })
+            .collect();
+        assert_eq!(
+            recovery_decisions.len(),
+            1,
+            "exactly one prose-only recovery attempt decision, got: {logged:?}"
+        );
+        assert_eq!(recovery_decisions[0].payload["selected_agent"], "coordinator");
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["reason"] == "coordinator_choice"
+            }),
+            "the recovered run's own dispatch decision is recorded too: {logged:?}"
         );
     }
 
@@ -22937,6 +23499,399 @@ mod tests {
             provider.turn_count(),
             3,
             "the resume runs the decision loop only — no planner re-entry"
+        );
+    }
+
+    /// Item B audit — evidence-resume prose-only dispatch guard, no fallback:
+    /// a checkpointless `continue` whose evidence-resume decision session
+    /// closes in prose with ZERO dispatches is re-prompted twice
+    /// (`MAX_PROSE_STOP_REPROMPTS`), then escalates to the planning-recovery
+    /// ladder exactly like the fresh decompose path. With no default-model
+    /// provider the ladder skips — recording the ADR-65 `Decision` event
+    /// `planning-prose-only-recovery-skipped-unavailable` — and the empty
+    /// dispatch session is reported Partial with a preserved checkpoint
+    /// (ADR-65 §7: an empty-dispatch session never claims completion).
+    #[tokio::test]
+    async fn headless_resume_prose_only_stop_pauses_with_decision() {
+        let fixture_session = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(fixture_session, true).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            // The evidence-resume session closes in prose on turn 1; the two
+            // bounded re-prompts consume the auto-filled empty turns, so the
+            // planning provider is read exactly three times.
+            vec![CoordinatorTurn::Text("nothing to dispatch".into())],
+        );
+        let mut coordinator = coordinator
+            .with_workspace_snapshot(snapshot)
+            .with_review_store(Some(pool.clone()))
+            .with_headless_resume_seed(seed);
+
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert_eq!(
+            primary.turn_count(),
+            3,
+            "the evidence-resume planning provider serves the original turn plus two re-prompts"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a prose-only evidence-resume session dispatches nothing: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an empty-dispatch-session action-required resume must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "the vacuous evidence-resume keeps its checkpoint for a later continue"
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard")
+                && output.final_message.contains("no default-model provider")
+                && output.final_message.contains("Vacuous-completion guard"),
+            "the pause names the empty dispatch session and why no fallback retry happened: {}",
+            output.final_message
+        );
+
+        // The skipped recovery is still recorded as an ADR-65 Decision event.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision on the evidence resume, got: {decisions:?}"
+        );
+        assert_eq!(
+            decisions[0].payload["reason"], "planning-prose-only-recovery-skipped-unavailable",
+            "the evidence resume's prose-only recovery skip records its tag, got: {decisions:?}"
+        );
+    }
+
+    /// Item B audit — evidence-resume prose-only dispatch guard recovery: a
+    /// checkpointless `continue` whose evidence-resume session closes in
+    /// prose with zero dispatches is re-prompted twice, then retried ONCE on
+    /// the run's default-model provider (ADR-45 tier-1b). The fallback
+    /// finally dispatches a specialist, so the empty dispatch session is
+    /// RECOVERED — the attempt is recorded as an ADR-65 `Decision` event and
+    /// the run's own zero-work guard (zero-tool mock) is the only note.
+    #[tokio::test]
+    async fn headless_resume_prose_only_stop_recovers_on_fallback() {
+        let fixture_session = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(fixture_session, true).await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        // The primary planning pipe closes in prose three times (original +
+        // the two re-prompt turns), dispatching nothing.
+        let primary = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Text("nothing to dispatch".into()),
+            CoordinatorTurn::Text("still nothing".into()),
+            CoordinatorTurn::Text("prose only".into()),
+        ]));
+        // The fallback (ADR-45 tier-1b pipe) finally dispatches the coder and
+        // then closes in prose with a NON-empty graph.
+        let fallback = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![call_specialist_with_artifacts(
+                "coder",
+                "implement the thing",
+                &["src/lib.rs"],
+            )]),
+            CoordinatorTurn::Text("done after dispatching".into()),
+        ]));
+        let planning_provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            primary.clone();
+        let mut coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            concerto_config::ModelPinConfig::default(),
+            planning_provider,
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("fallback", "default-model"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::Full)
+        .with_policy_engine(coordinator_allow_all_policy())
+        .with_workspace_snapshot(snapshot)
+        .with_review_store(Some(pool.clone()))
+        .with_headless_resume_seed(seed);
+
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert_eq!(
+            primary.turn_count(),
+            3,
+            "the primary planning provider serves the original evidence turn plus the two re-prompts"
+        );
+        assert_eq!(
+            fallback.turn_count(),
+            2,
+            "the fallback serves the retry's dispatch turn and its closing prose turn"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the fallback's dispatch really dispatches the coder: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the recovered zero-tool specialist still trips the run's zero-work guard, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the recovered dispatch ran and its own acceptance gate is the only note: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Prose-only dispatch guard")
+                && !output.final_message.contains("Vacuous-completion guard"),
+            "a recovered evidence-resume has no empty-dispatch guard notes: {}",
+            output.final_message
+        );
+
+        // The recovery attempt is recorded as an ADR-65 Decision event
+        // (alongside the recovered run's own `coordinator_choice` dispatch
+        // decision).
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let recovery_decisions: Vec<_> = logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["reason"] == "planning-prose-only-recovery-attempted"
+            })
+            .collect();
+        assert_eq!(
+            recovery_decisions.len(),
+            1,
+            "exactly one prose-only recovery attempt decision, got: {logged:?}"
+        );
+        assert_eq!(recovery_decisions[0].payload["selected_agent"], "coordinator");
+        assert!(
+            logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["reason"] == "coordinator_choice"
+            }),
+            "the recovered evidence-resume's own dispatch decision is recorded too: {logged:?}"
+        );
+    }
+
+    /// Item B audit — evidence-resume planning provider failure recovery: a
+    /// checkpointless `continue` whose evidence-resume decision loop's
+    /// provider rejects with a permanent `HttpStatus` error is retried ONCE
+    /// on the run's default-model provider (ADR-45 tier-1b) — mirroring the
+    /// fresh planning-session recovery. The retry succeeds, the run
+    /// completes, and the attempt is recorded as an ADR-65 `Decision` event.
+    #[tokio::test]
+    async fn headless_resume_planning_provider_failure_recovers_on_default_model() {
+        let fixture_session = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(fixture_session, true).await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection on the evidence resume (100% deliberate)"
+                        .to_owned(),
+                },
+                primary_requests.clone(),
+            ));
+        // The fallback (ADR-45 tier-1b pipe) serves one prose planning turn
+        // and captures every request.
+        let fallback = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Recovered plan\nfallback provider produced it".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("fallback", "default-model"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_workspace_snapshot(snapshot)
+        .with_review_store(Some(pool.clone()))
+        .with_headless_resume_seed(seed);
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the recovered planning session must complete the resumed run, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("fallback provider produced it"),
+            "the recovered plan is the run's final message: {}",
+            output.final_message,
+        );
+        // The primary failed exactly once; the retry moved the dispatch to
+        // the fallback provider (never back to the failing pipe).
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the primary planning provider must be consulted exactly once"
+        );
+        assert_eq!(fallback.turn_count(), 1, "the fallback provider must serve the retry");
+
+        // The attempt is recorded as an ADR-65 Decision event.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision, got: {decisions:?}"
+        );
+        assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-attempted");
+        assert_eq!(decisions[0].payload["selected_agent"], "coordinator");
+    }
+
+    /// Item B audit — evidence-resume cancellation terminal class: a
+    /// `Cancelled` provider error on the evidence-resume decision loop is an
+    /// immediate exit (ADR-42 NonRecoverable) — the planning-recovery ladder
+    /// is never attempted, no `Decision` event is recorded by design, and the
+    /// fallback is never consulted; the run pauses Partial like a cancelled
+    /// fresh run.
+    #[tokio::test]
+    async fn headless_resume_planning_provider_cancellation_skips_recovery() {
+        let fixture_session = Ulid::new();
+        let (_workspace, _store_dir, pool, snapshot, _plan_event_id, seed) =
+            headless_resume_fixture(fixture_session, true).await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> = Arc::new(
+            PlanningFailureProvider::new(ProviderError::Cancelled, primary_requests.clone()),
+        );
+        // A fallback provider that must NEVER be consulted: the immediate
+        // exit semantics of cancellation skip the ladder entirely.
+        let fallback = Arc::new(TurnProvider::new(Vec::new()));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("fallback", "default-model"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_workspace_snapshot(snapshot)
+        .with_review_store(Some(pool.clone()))
+        .with_headless_resume_seed(seed);
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a cancelled evidence-resume pauses Partial, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("could not produce a valid plan"),
+            "the cancellation surfaces as the graceful pause: {}",
+            output.final_message
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the primary planning provider is consulted exactly once"
+        );
+        assert_eq!(fallback.turn_count(), 0, "the fallback must never be consulted");
+
+        // Cancellation is a documented terminal class: NO Decision event is
+        // the design contract, not an omission.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            !logged.iter().any(|event| event.kind == WhiteboardKind::Decision),
+            "cancellation records no Decision event (documented terminal class): {logged:?}"
         );
     }
 
