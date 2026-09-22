@@ -561,6 +561,32 @@ fn versioned_target(req: &GateRequest) -> Option<&str> {
     versioned_targets(req).last().copied()
 }
 
+/// True when a request is a read-only `filesystem` operation that must never
+/// enter the write gate.
+///
+/// `read`, `list`, and `exists` mutate nothing and produce no versioned target;
+/// routing them through the write path is what let a write-oriented policy
+/// (`Deny` / `RequireApproval`) reject a plain read and then durably record a
+/// `write-rejected` decision that replayed forever for the same `call_id`.
+///
+/// Classification is by the explicit `operation` field ONLY — never inferred
+/// from a `content` field — so it can never promote a read to a write (or
+/// vice versa); `copy`/`move`/`delete`/`write` stay fully gated. This mirrors
+/// the Observe tier of `classify_tier` (core authorization) but is deliberately
+/// independent: the gate must decide before invoking policy at all.
+fn is_read_only_request(req: &GateRequest) -> bool {
+    if req.tool != "filesystem" {
+        return false;
+    }
+    req.input.get("operation").and_then(serde_json::Value::as_str).map(str::trim).is_some_and(
+        |operation| {
+            operation.eq_ignore_ascii_case("read")
+                || operation.eq_ignore_ascii_case("list")
+                || operation.eq_ignore_ascii_case("exists")
+        },
+    )
+}
+
 /// Every path whose pre-image must be captured and persisted for attribution:
 /// each [`versioned_targets`] entry plus the read-only `copy` source (the
 /// copy reads the source to produce the destination; its pre-image is
@@ -936,6 +962,13 @@ impl WriteGate {
         if cancel.is_cancelled() {
             return Err(GateError::Cancelled);
         }
+        // Read-only operations bypass the write gate entirely (see
+        // [`Self::run_read_only`]): classify by operation BEFORE any gating so
+        // a read is never denied, never appended as `write-applied`, and never
+        // durably `write-rejected` (which would replay for the same `call_id`).
+        if is_read_only_request(&req) {
+            return self.run_read_only(req, cancel).await;
+        }
         self.submit_dedup(req, cancel).await
     }
 
@@ -1041,6 +1074,87 @@ impl WriteGate {
         }
 
         self.run_gated(req, cancel).await
+    }
+
+    /// Read-only fast path: consult policy advisorily, then execute directly.
+    ///
+    /// Reads (`filesystem` `read`/`list`/`exists`) are not writes: they append
+    /// no `write-applied` row, acquire no ownership/lock, and must never be
+    /// denied by a write-oriented policy. Policy is still consulted through
+    /// [`PolicyEngine::evaluate_advisory`] for observability, but its verdict
+    /// is advisory only — a `Deny`/`RequireApproval` here does not change the
+    /// outcome and is never persisted. Cancellation still propagates.
+    ///
+    /// Fail-open: any gate infrastructure failure (session-id shaping, advisory
+    /// evaluation) degrades to a direct execute with a warning rather than
+    /// hard-failing the run — a read must never be blocked by the write gate's
+    /// own machinery.
+    async fn run_read_only(
+        &self,
+        req: GateRequest,
+        cancel: CancellationToken,
+    ) -> Result<GateOutcome, GateError> {
+        if cancel.is_cancelled() {
+            return Err(GateError::Cancelled);
+        }
+
+        // Session id shaping is infrastructure, not a policy decision: a bad
+        // or absent id must not stop a read (fail open, mint a fresh id).
+        let session_id = match self.session_ulid(&req.session_id) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                tracing::warn!(
+                    call_id = %req.call_id,
+                    %error,
+                    "read-only gate fast path: invalid session id; executing read directly"
+                );
+                new_id()
+            }
+        };
+
+        // Advisory-only policy consult. Never gates, never persists a decision
+        // row, never consumes quota. The action is scoped so its borrow of
+        // `req.input` ends before the input is moved into the executor.
+        {
+            let action = PolicyAction {
+                tool_name: &req.tool,
+                input: &req.input,
+                session_id,
+                correlation_id: new_id(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+            };
+            match self.policy.evaluate_advisory(&action, cancel.clone()).await {
+                Ok(verdict) => tracing::debug!(
+                    call_id = %req.call_id,
+                    tool = %req.tool,
+                    ?verdict,
+                    "read-only gate fast path: advisory verdict (non-binding)"
+                ),
+                Err(PolicyError::Cancelled) => return Err(GateError::Cancelled),
+                Err(error) => tracing::warn!(
+                    call_id = %req.call_id,
+                    %error,
+                    "read-only gate fast path: advisory policy evaluation failed; executing read directly"
+                ),
+            }
+        }
+
+        // Direct execute: no policy decision, no WAL row, no ownership/lock.
+        let session_ctx = self.session(session_id);
+        let output = self
+            .executor
+            .execute_read_only(&req.tool, req.input, &session_ctx, cancel)
+            .await
+            .map_err(GateError::from)?;
+        let result = serde_json::to_value(&output)
+            .map_err(|error| GateError::Execution(format!("output serialization: {error}")))?;
+
+        // `gate_seq` 0 is truthful: no whiteboard row was appended, so the
+        // supervisor's wake coordinate (`mark_append`) is a no-op.
+        Ok(GateOutcome { event_id: req.call_id, gate_seq: 0, replayed: false, result })
     }
 
     /// The gated write itself: policy → pre-image → WAL append → execute.
@@ -1415,14 +1529,19 @@ impl WriteGate {
                 .map_err(SessionError::from)?;
         match row {
             Some((seq, kind)) => {
-                let seq = u64::try_from(seq)
-                    .map_err(|_| GateError::Whiteboard("negative gate_seq".to_string()))?;
-                let decision = if kind == WhiteboardKind::WriteApplied.as_str() {
-                    StoredDecision::Applied(seq)
+                if kind == WhiteboardKind::WriteApplied.as_str() {
+                    let seq = u64::try_from(seq)
+                        .map_err(|_| GateError::Whiteboard("negative gate_seq".to_string()))?;
+                    Ok(Some(StoredDecision::Applied(seq)))
+                } else if kind == WhiteboardKind::WriteRejected.as_str() {
+                    Ok(Some(StoredDecision::Rejected))
                 } else {
-                    StoredDecision::Rejected
-                };
-                Ok(Some(decision))
+                    // A row whose kind is neither a `write-applied` nor a
+                    // `write-rejected` decision is not a terminal write
+                    // decision for this `call_id`; never misread it as a
+                    // rejection (that misreading made replays sticky).
+                    Ok(None)
+                }
             }
             None => Ok(None),
         }
@@ -1998,6 +2117,111 @@ mod tests {
         assert_eq!(whiteboard_row_count(&pool).await, 1, "no second row for the rejected id");
     }
 
+    /// A true write that was denied must keep its set-once replay semantics
+    /// after the `stored_decision` narrowing: a `write-rejected` row still
+    /// maps to `Rejected`, so a same-`call_id` retry under a permissive policy
+    /// replays the denial instead of re-evaluating.
+    #[tokio::test]
+    async fn write_deny_same_call_id_retry_still_replays_reject() {
+        let (_dir, pool) = test_pool(1).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let denied = gate(deny_engine(), calls.clone(), pool.clone(), PathBuf::from("/tmp"));
+        let first = denied.submit(request("write-replay-1"), CancellationToken::new()).await;
+        assert!(matches!(first, Err(GateError::Denied { .. })), "fresh write denied");
+        assert_eq!(whiteboard_row_count(&pool).await, 1, "one write-rejected row");
+
+        let permissive = gate(allow_engine(), calls.clone(), pool.clone(), PathBuf::from("/tmp"));
+        let retry = permissive.submit(request("write-replay-1"), CancellationToken::new()).await;
+        match retry {
+            Err(GateError::Denied { event_id, reason }) => {
+                assert_eq!(event_id, "write-replay-1");
+                assert!(
+                    reason.contains("previously rejected"),
+                    "the retry replays the stored denial, got: {reason}"
+                );
+            }
+            other => panic!("expected a replayed Denied, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "still never executed");
+        assert_eq!(whiteboard_row_count(&pool).await, 1, "no second row");
+    }
+
+    /// A read-only operation must NOT enter the write gate: under a
+    /// deny-everything policy a `filesystem list` still executes directly and
+    /// appends no whiteboard row (no `write-applied`, no `write-rejected`).
+    #[tokio::test]
+    async fn read_only_list_bypasses_write_gate_under_deny_policy() {
+        let (_dir, pool) = test_pool(1).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = gate(deny_engine(), calls.clone(), pool.clone(), PathBuf::from("/tmp"));
+
+        let outcome = gate
+            .submit(filesystem_request("ro-list-1", "list", "."), CancellationToken::new())
+            .await
+            .expect("a list must never be denied by a write-oriented policy");
+        assert!(!outcome.replayed, "a read is not a replay");
+        assert_eq!(outcome.result["data"]["ok"], json!(true), "the tool executed directly");
+        assert_eq!(outcome.gate_seq, 0, "no whiteboard row -> gate_seq 0");
+        assert_eq!(whiteboard_row_count(&pool).await, 0, "reads append no whiteboard row");
+    }
+
+    /// The same `call_id` re-submitted for a read after the policy flips from
+    /// deny to allow must succeed: reads never persist a decision, so there is
+    /// nothing sticky to replay.
+    #[tokio::test]
+    async fn read_only_same_call_id_retry_after_policy_flip_is_not_sticky() {
+        let (_dir, pool) = test_pool(1).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let denied = gate(deny_engine(), calls.clone(), pool.clone(), PathBuf::from("/tmp"));
+        let first = denied
+            .submit(filesystem_request("ro-flip-1", "list", "."), CancellationToken::new())
+            .await;
+        assert!(first.is_ok(), "list succeeds under deny policy: {first:?}");
+
+        let permissive = gate(allow_engine(), calls.clone(), pool.clone(), PathBuf::from("/tmp"));
+        let retry = permissive
+            .submit(filesystem_request("ro-flip-1", "list", "."), CancellationToken::new())
+            .await;
+        assert!(retry.is_ok(), "same-call_id read retry after policy flip: {retry:?}");
+        assert_eq!(whiteboard_row_count(&pool).await, 0, "no row for either read");
+    }
+
+    /// Guard: read-only classification keys off the explicit `operation`
+    /// field only. A stray `content` on a `list` input must never promote it to
+    /// a write (and `write`/`copy`/`move`/`delete` stay gated).
+    #[test]
+    fn read_only_classifier_never_promotes_list_to_write() {
+        let list = filesystem_request("ro-guard-1", "list", ".");
+        assert!(is_read_only_request(&list));
+
+        // A `content` field (the heuristic that infers a write when operation
+        // is absent) must not flip an explicit `list` to a write.
+        let mut list_with_content = filesystem_request("ro-guard-2", "list", ".");
+        list_with_content.input["content"] = json!("should be ignored");
+        assert!(
+            is_read_only_request(&list_with_content),
+            "an explicit list stays read-only even with a stray content field"
+        );
+
+        for op in ["read", "exists"] {
+            assert!(is_read_only_request(&filesystem_request("ro-guard", op, "f.txt")));
+        }
+        for op in ["write", "copy", "move", "delete"] {
+            assert!(
+                !is_read_only_request(&filesystem_request("ro-guard", op, "f.txt")),
+                "filesystem {op} must stay gated"
+            );
+        }
+        // A filesystem request with no operation is NOT read-only (it cannot
+        // be proven a read); non-filesystem tools are never read-bypassed here.
+        let mut no_op = filesystem_request("ro-guard", "list", ".");
+        no_op.input = json!({ "path": "." });
+        assert!(!is_read_only_request(&no_op));
+        let mut other_tool = filesystem_request("ro-guard", "read", "f.txt");
+        other_tool.tool = "gate_test".to_owned();
+        assert!(!is_read_only_request(&other_tool));
+    }
+
     #[tokio::test]
     async fn require_approval_appends_write_rejected() {
         let (_dir, pool) = test_pool(1).await;
@@ -2530,19 +2754,16 @@ mod tests {
         let gate = gate(allow_engine(), Arc::new(AtomicUsize::new(0)), pool.clone(), root.clone());
 
         // `list` has no versioned target: the claim map is metadata, not a
-        // claim, so it is ignored entirely.
+        // claim, so it is ignored entirely — and since `list` is read-only it
+        // now bypasses the write gate and appends nothing at all.
         let mut request = filesystem_request("conf-4", "list", ".");
         request
             .base_versions
             .insert("stale.txt".to_owned(), blake3::hash(b"stale").to_hex().to_string());
         let outcome =
             gate.submit(request, CancellationToken::new()).await.expect("list is not versioned");
-        assert!(!outcome.replayed);
-        assert_eq!(
-            applied_row(&pool, "conf-4").await.pre_image_hash,
-            None,
-            "no pre-image is captured for non-versioned operations"
-        );
+        assert!(!outcome.replayed, "a read is not a replay");
+        assert_eq!(whiteboard_row_count(&pool).await, 0, "read-only list appends no WAL row");
     }
 
     /// A gate whose executor is the REAL `FilesystemTool` rooted at `root` —

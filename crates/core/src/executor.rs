@@ -707,6 +707,44 @@ impl ToolExecutor {
         }
     }
 
+    /// Execute a tool **without** a policy decision, for gate-routed
+    /// read-only operations.
+    ///
+    /// The write gate classifies `read`/`list`/`exists` filesystem operations
+    /// as read-only and routes them here instead of through [`Self::execute`]'s
+    /// policy gate: a read must never be denied by a write-oriented policy
+    /// (nor persisted as a `write-rejected` whiteboard decision). Policy is
+    /// still consulted *advisorily* by the gate — this method performs no
+    /// evaluation and writes no decision row; it does keep the
+    /// post-execution audit completion row, exactly like [`Self::execute`]'s
+    /// allowed path.
+    ///
+    /// The caller is responsible for routing only genuinely read-only
+    /// operations here; this method performs no read/write classification of
+    /// its own.
+    pub async fn execute_read_only(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let tool = self.registry.get(tool_name).ok_or_else(|| ToolError::ExecutionFailed {
+            message: format!("tool not found: {tool_name}"),
+        })?;
+        // Build the audit context the same way `execute`'s allowed path does,
+        // but without evaluating the action: the canonical policy view still
+        // names the completion row's tool, and `command_facts` still enrich it.
+        let (policy_name, policy_input) = tool.policy_view(&input);
+        let action = build_action(&policy_name, &policy_input, tool, session);
+        let audit = ExecutionAuditContext {
+            correlation_id: action.correlation_id,
+            input_hash: crate::policy::compute_input_hash(&input),
+            facts: action.command_facts.clone(),
+        };
+        self.execute_allowed(tool, tool_name, input, session, cancel, audit).await
+    }
+
     /// ADR-65 F1a: side-effect-free policy gate for the read-dedupe serve path.
     ///
     /// Re-evaluates the action through [`PolicyEngine::evaluate_advisory`] (no

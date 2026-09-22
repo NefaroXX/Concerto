@@ -63,6 +63,14 @@ pub struct AgentLoop {
     /// repairs argument SHAPE before execution, this one coaches the model
     /// after an execution failure.
     shell_repair_attempts: HashMap<String, u32>,
+    /// Occurrences of each provider tool-call id within the current run
+    /// (cleared at run start). Used to scope the gate's idempotency key: the
+    /// FIRST occurrence of a `ToolCall.id` keeps that id (so a supervisor
+    /// restart replaying the same script re-submits the same key and the gate
+    /// replays its stored decision), while a genuine retry — the same id
+    /// emitted again in a later turn — gets a fresh suffixed key so it
+    /// re-evaluates instead of replaying a stale `write-rejected`.
+    tool_attempts: HashMap<String, u32>,
     max_iterations: u32,
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
@@ -333,6 +341,7 @@ impl AgentLoop {
             cycle_budget: CycleBudgetTracker::default(),
             tool_guard_rejects: HashMap::new(),
             shell_repair_attempts: HashMap::new(),
+            tool_attempts: HashMap::new(),
             max_iterations,
             fast,
             state: AgentState::Idle,
@@ -415,6 +424,7 @@ impl AgentLoop {
         // previous run on this loop instance.
         self.tool_guard_rejects.clear();
         self.shell_repair_attempts.clear();
+        self.tool_attempts.clear();
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -1880,6 +1890,27 @@ impl AgentLoop {
         }
     }
 
+    /// The per-attempt gate idempotency key for a provider tool-call id.
+    ///
+    /// The FIRST occurrence of `tc_id` keeps that id, so a supervisor restart
+    /// replaying the same script re-submits the same durable key and the gate
+    /// replays its stored `write-applied` decision instead of re-executing
+    /// (WAL-before-execute crash replay). Any later occurrence of the same id
+    /// within the run — the model retrying a denied call — gets a fresh
+    /// suffixed key so it re-evaluates instead of replaying a stale
+    /// `write-rejected` ("write decisions are set-once per call_id").
+    ///
+    /// State lives in [`Self::tool_attempts`], cleared at run start.
+    fn gate_attempt_id(&mut self, tc_id: &str) -> String {
+        let occurrence = self.tool_attempts.entry(tc_id.to_owned()).or_insert(0);
+        *occurrence += 1;
+        if *occurrence == 1 {
+            tc_id.to_owned()
+        } else {
+            format!("{tc_id}#attempt-{}", *occurrence)
+        }
+    }
+
     /// Execute a single tool call: tool-guard validation, cycle-budget check,
     /// approval, execution, and structured result persistence.
     #[allow(clippy::too_many_arguments)]
@@ -2134,9 +2165,14 @@ impl AgentLoop {
             return Ok(());
         }
 
+        // Gate dedup scoping: the idempotency key must be fresh per execution
+        // ATTEMPT, not the provider's `ToolCall.id` reused across retries (see
+        // [`Self::gate_attempt_id`]). `tc.id` stays the provider-visible
+        // `ToolResult.id` in the messages below.
+        let attempt_id = self.gate_attempt_id(&tc.id);
         match self
             .tool_executor
-            .execute(&tc.name, arguments.clone(), &tc.id, session, cancel.clone())
+            .execute(&tc.name, arguments.clone(), &attempt_id, session, cancel.clone())
             .await
         {
             Ok(output) => {
@@ -3605,6 +3641,27 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got Err: {:?}", result.err());
         let output = result.unwrap();
         assert_eq!(output.tool_call_count, 3, "all three tool calls executed");
+    }
+
+    #[tokio::test]
+    async fn gate_attempt_id_keeps_first_occurrence_and_freshens_retries() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 10);
+
+        // First occurrence keeps the provider id (supervisor restart replay).
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1");
+        // A retry of the same id gets a fresh key (re-evaluates, no sticky
+        // `write-rejected` replay).
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1#attempt-2");
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1#attempt-3");
+        // A different provider id is independent and keeps its own first key.
+        assert_eq!(loop_.gate_attempt_id("call-2"), "call-2");
+
+        // A fresh run clears the attempt ledger: the next run's first
+        // occurrence of `call-1` is durable-key stable again.
+        loop_.tool_attempts.clear();
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1");
     }
 
     #[tokio::test]
