@@ -5,7 +5,7 @@
 
 use crate::ids::{new_id, Ulid};
 use crate::sanitizer::SecretSanitizer;
-use crate::types::{AgentId, McpServerState, TaskId};
+use crate::types::{AgentId, McpServerState, PluginState, TaskId};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -491,6 +491,19 @@ pub enum EventKind {
         error: Option<String>,
     },
 
+    // --- WASM plugin lifecycle ---
+    /// A WASM plugin changed lifecycle state (loading/active/failed/disabled/
+    /// unloaded). Published by the plugin manager on load, initialise,
+    /// disable, and violation-threshold transitions so the desktop/CLI and the
+    /// session transcript can render plugin health without polling. `error`
+    /// carries the failure/disable detail for `Failed`/`Disabled` transitions
+    /// and is `None` otherwise.
+    PluginStateChanged {
+        plugin_id: String,
+        state: PluginState,
+        error: Option<String>,
+    },
+
     // --- ADR-43: skill-pack prompt injection ---
     /// One session audit record per run asserting that enabled skill-pack
     /// instructions were injected into the run's system prompt. Emitted by
@@ -760,6 +773,13 @@ impl EventKind {
             EventKind::McpServerStateChanged { server_id, state, error } => {
                 EventKind::McpServerStateChanged {
                     server_id: sanitizer.sanitize(&server_id),
+                    state,
+                    error: error.map(|e| sanitizer.sanitize(&e)),
+                }
+            }
+            EventKind::PluginStateChanged { plugin_id, state, error } => {
+                EventKind::PluginStateChanged {
+                    plugin_id: sanitizer.sanitize(&plugin_id),
                     state,
                     error: error.map(|e| sanitizer.sanitize(&e)),
                 }

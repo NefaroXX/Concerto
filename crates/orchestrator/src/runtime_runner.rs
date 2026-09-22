@@ -1636,6 +1636,8 @@ async fn load_and_configure_plugins(
     project_dir: &std::path::Path,
     registry: &mut ToolRegistry,
     plugins: Option<&concerto_plugins::manager::SharedPluginManager>,
+    bus: &EventBus,
+    audit: Option<Arc<dyn AuditLog>>,
 ) -> HashMap<String, Arc<dyn LlmProvider>> {
     let plugin_providers = HashMap::new();
     let Some(ref plugin_cfg) = config.plugins else {
@@ -1666,6 +1668,10 @@ async fn load_and_configure_plugins(
         let Some((host, manager)) = guard.as_mut() else {
             return plugin_providers;
         };
+        manager.set_event_bus(bus.clone());
+        if let Some(audit) = audit.clone() {
+            manager.set_audit_log(audit);
+        }
         return load_discovered_plugins(manager, host.clone(), disc_cfg, project_dir, registry)
             .await;
     }
@@ -1674,6 +1680,10 @@ async fn load_and_configure_plugins(
     let Some((host, mut manager)) = build_plugin_manager() else {
         return plugin_providers;
     };
+    manager.set_event_bus(bus.clone());
+    if let Some(audit) = audit {
+        manager.set_audit_log(audit);
+    }
     load_discovered_plugins(&mut manager, host, disc_cfg, project_dir, registry).await
 }
 
@@ -1769,6 +1779,28 @@ fn tool_support_override(config: &AppConfig, provider_config_id: Option<&str>) -
         .and_then(|override_config| override_config.supports_tool_calling)
 }
 
+/// Build the run's audit sink and its backing session-DB pool.
+///
+/// Fail-soft: a missing data directory or unopenable/pathological DB degrades
+/// to [`NoopAuditLog`] with a warning rather than failing the run. Shared by
+/// the infra-audit sites (MCP/plugin startup) and the policy engine so every
+/// writer in one run targets the same `sessions.db`.
+async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
+    match concerto_sessions::app_data_dir() {
+        Ok(data_dir) => match create_audit_pool(&data_dir).await {
+            Ok(pool) => (Arc::new(SqliteAuditLog::new(pool.clone())), Some(pool)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open audit DB — audit logging disabled");
+                (Arc::new(NoopAuditLog), None)
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "no data directory available — audit logging disabled");
+            (Arc::new(NoopAuditLog), None)
+        }
+    }
+}
+
 /// Create the policy engine, audit log, spend tracker, and tool executor.
 ///
 /// The spend cap is adjusted for multi-agent runs via the configured multiplier.
@@ -1781,6 +1813,7 @@ fn tool_support_override(config: &AppConfig, provider_config_id: Option<&str>) -
 /// gate must evaluate with the exact policy the executor enforces and append
 /// its whiteboard rows to the same durable DB.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 async fn setup_policy_and_audit(
     config: &AppConfig,
     approval_sink: Arc<dyn ApprovalSink>,
@@ -1788,6 +1821,8 @@ async fn setup_policy_and_audit(
     force_single_agent: bool,
     bus: EventBus,
     intent_auth: Option<Arc<dyn IntentAuthorization>>,
+    audit: Arc<dyn AuditLog>,
+    gate_pool: Option<sqlx::SqlitePool>,
 ) -> Result<
     (Arc<ToolExecutor>, Arc<SpendTracker>, Arc<dyn PolicyEngine>, Option<sqlx::SqlitePool>),
     OrchestratorError,
@@ -1822,20 +1857,6 @@ async fn setup_policy_and_audit(
     if intent_auth.is_some() {
         policy_rules = inject_intent_gate_rule(policy_rules);
     }
-    let (audit, gate_pool): (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) =
-        match concerto_sessions::app_data_dir() {
-            Ok(data_dir) => match create_audit_pool(&data_dir).await {
-                Ok(pool) => (Arc::new(SqliteAuditLog::new(pool.clone())), Some(pool)),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to open audit DB — audit logging disabled");
-                    (Arc::new(NoopAuditLog), None)
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "no data directory available — audit logging disabled");
-                (Arc::new(NoopAuditLog), None)
-            }
-        };
     let _rate_limiter = Arc::new(RpmLimiter::new(60));
     let spend_cap = if force_single_agent {
         config.session_spend_cap_usd
@@ -2969,6 +2990,13 @@ pub async fn run_shared_agent(
     // 1. Build tool registry (filesystem, shell, git, LSP tools)
     let mut registry = build_tool_registry(&req.project_dir, &services.vfs, &services.config);
 
+    // 1a. Audit sink built up front so MCP + plugin infra failures observed
+    // during startup (spawn/handshake, load/init, capability denial) are
+    // audited through the same sink the policy engine uses. Fail-soft: a
+    // missing data directory or DB just disables audit logging.
+    let (audit, gate_pool): (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) =
+        build_audit_sink().await;
+
     // 2. Load WASM plugins and collect plugin-backed providers. The desktop
     // passes a retained manager handle (plugin liveness); CLI/tests pass none
     // and get the per-run behaviour.
@@ -2977,6 +3005,8 @@ pub async fn run_shared_agent(
         &req.project_dir,
         &mut registry,
         services.plugins.as_ref(),
+        &services.bus,
+        Some(audit.clone()),
     )
     .await;
 
@@ -2986,7 +3016,9 @@ pub async fn run_shared_agent(
     // servers connected on a previous run are re-bridged into this run's
     // fresh registry. Registration is fail-soft: per-server errors are logged
     // by the manager and only a config-level defect (e.g. duplicate server id
-    // slipping past validation) surfaces here.
+    // slipping past validation) surfaces here. The infra audit sink is
+    // attached first so startup failures are recorded.
+    services.mcp.set_audit_log(audit.clone());
     if let Err(error) = services.mcp.register_tools(&mut registry).await {
         tracing::warn!(%error, "mcp registration failed; continuing without mcp tools");
     }
@@ -3018,6 +3050,8 @@ pub async fn run_shared_agent(
         req.force_single_agent,
         services.bus.clone(),
         intent_auth,
+        audit,
+        gate_pool,
     )
     .await?;
 

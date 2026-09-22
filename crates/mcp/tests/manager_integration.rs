@@ -40,6 +40,39 @@ impl AuditLog for NoopAudit {
     }
 }
 
+/// Captures infra-failure audit rows so tests can assert what the manager
+/// emitted (MCP duplicate-tool collisions, spawn/handshake failures).
+#[derive(Default)]
+struct CapturingAudit {
+    entries: std::sync::Mutex<Vec<concerto_core::traits::policy::InfraAuditEntry>>,
+}
+
+impl CapturingAudit {
+    fn entries(&self) -> Vec<concerto_core::traits::policy::InfraAuditEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditLog for CapturingAudit {
+    async fn record(
+        &self,
+        _entry: AuditEntry,
+        _cancel: CancellationToken,
+    ) -> Result<(), concerto_core::error::PolicyError> {
+        Ok(())
+    }
+
+    async fn record_infra(
+        &self,
+        entry: concerto_core::traits::policy::InfraAuditEntry,
+        _cancel: CancellationToken,
+    ) -> Result<(), concerto_core::error::PolicyError> {
+        self.entries.lock().unwrap().push(entry);
+        Ok(())
+    }
+}
+
 fn fixture_bin() -> String {
     env!("CARGO_BIN_EXE_fixture-mcp-server").to_string()
 }
@@ -221,6 +254,54 @@ async fn crash_on_start_marks_failed_and_keeps_other_servers() {
     assert_eq!(manager.server_state("fixture"), McpServerState::Connected);
     assert!(registry.get("mcp:fixture:echo").is_some());
     assert!(registry.get("mcp:broken:echo").is_none());
+    manager.stop_all(&mut registry).await;
+}
+
+/// Infra failures — a duplicate-tool collision and a crash-on-start — must be
+/// audited as `McpServerFailed` rows carrying the server id and an error kind.
+#[tokio::test]
+async fn manager_audits_duplicate_tool_and_spawn_failure() {
+    use concerto_core::traits::policy::InfraVerdict;
+
+    let (manager, _bus) = manager_with(vec![
+        server_config("dup", &[]),
+        server_config("broken", &[("FIXTURE_CRASH_ON_START", "1")]),
+    ]);
+    let audit = Arc::new(CapturingAudit::default());
+    manager.set_audit_log(audit.clone());
+    let mut registry = ToolRegistry::default();
+
+    // Pre-own one of `dup`'s namespaced tools to force the collision path.
+    let dummy = McpTool::new(
+        "dup".into(),
+        Arc::new(AsyncMutex::new(McpClient::new("dup"))),
+        concerto_api_types::extension::McpToolDescriptor {
+            name: "echo".into(),
+            description: None,
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+    );
+    registry.register(Box::new(dummy));
+
+    manager.register_tools(&mut registry).await.expect("collision must not abort startup");
+
+    let entries = audit.entries();
+    let dup = entries
+        .iter()
+        .find(|e| e.server_id.as_deref() == Some("dup"))
+        .expect("duplicate-tool failure must be audited");
+    assert_eq!(dup.verdict, InfraVerdict::McpServerFailed);
+    assert_eq!(dup.error_kind.as_deref(), Some("duplicate_tool"));
+    assert_eq!(dup.tool_name, "mcp:dup");
+    assert!(dup.plugin_id.is_none());
+
+    let broken = entries
+        .iter()
+        .find(|e| e.server_id.as_deref() == Some("broken"))
+        .expect("crash-on-start failure must be audited");
+    assert_eq!(broken.verdict, InfraVerdict::McpServerFailed);
+    assert!(broken.error_kind.is_some(), "spawn failure must carry an error kind");
+
     manager.stop_all(&mut registry).await;
 }
 

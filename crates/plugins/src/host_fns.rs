@@ -94,10 +94,52 @@ fn check_enabled(caller: &Caller<'_, PluginStoreData>) -> Result<(), PluginError
 
 /// Increment the violation count and disable the plugin if it hits the
 /// MAX_VIOLATIONS threshold. Returns the UnauthorizedHostCall error.
+///
+/// Audits each violation (`CapabilityDenied`) and, when the threshold trips,
+/// audits the resulting disable (`PluginDisabled`). Emission is fail-soft: the
+/// audit sink is called from a detached task so a slow/broken sink can never
+/// affect the host call's outcome.
 fn handle_violation(caller: &mut Caller<'_, PluginStoreData>, capability: &str) -> anyhow::Error {
     caller.data_mut().violation_count += 1;
-    if caller.data().violation_count >= PluginHost::MAX_VIOLATIONS {
+    let disabled_now = caller.data().violation_count >= PluginHost::MAX_VIOLATIONS;
+    if disabled_now {
         caller.data_mut().disabled = true;
+    }
+    let plugin_id = caller.data().plugin_id.clone();
+    if let Some(audit) = caller.data().audit_log.clone() {
+        // A host call runs inside the agent runtime, so a current-thread
+        // handle is expected; guard anyway so a host call outside a runtime
+        // can never panic (fail-soft audit).
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let violation = concerto_core::traits::policy::InfraAuditEntry::plugin(
+                plugin_id.clone(),
+                concerto_core::traits::policy::InfraVerdict::CapabilityDenied,
+                "unauthorized_host_call",
+                format!("unauthorized host call to {capability}"),
+            );
+            let disable = disabled_now.then(|| {
+                concerto_core::traits::policy::InfraAuditEntry::plugin(
+                    plugin_id.clone(),
+                    concerto_core::traits::policy::InfraVerdict::PluginDisabled,
+                    "violation_threshold",
+                    format!("disabled after unauthorized host call to {capability}"),
+                )
+            });
+            rt.spawn(async move {
+                if let Err(error) =
+                    audit.record_infra(violation, concerto_core::CancellationToken::new()).await
+                {
+                    tracing::warn!(%error, "plugin violation audit write failed; continuing");
+                }
+                if let Some(disable) = disable {
+                    if let Err(error) =
+                        audit.record_infra(disable, concerto_core::CancellationToken::new()).await
+                    {
+                        tracing::warn!(%error, "plugin disable audit write failed; continuing");
+                    }
+                }
+            });
+        }
     }
     into_anyhow(PluginError::UnauthorizedHostCall {
         plugin_id: caller.data().plugin_id.clone(),

@@ -257,6 +257,28 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// How many persisted grants were pruned during one load and why (ADR-37
+/// prune-on-load). Callers audit a non-empty report so grant loss is visible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GrantPruneReport {
+    /// Grants dropped because the pinned WASM hash no longer matches.
+    pub hash_mismatch: usize,
+    /// Grants dropped because their TTL elapsed or their format was invalid.
+    pub expired: usize,
+}
+
+impl GrantPruneReport {
+    /// Total grants pruned.
+    pub fn total(&self) -> usize {
+        self.hash_mismatch + self.expired
+    }
+
+    /// Whether any grant was pruned.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 /// Persisted grant entry — stores the discriminant plus its scope parameters,
 /// with expiry and manifest hash pinning (ADR-37).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -411,13 +433,14 @@ impl CapGrantStore {
         &self,
         plugin_id: &str,
         wasm_hash: Option<&str>,
-    ) -> Vec<(CapabilityDiscriminant, CapabilityScope, u64)> {
+    ) -> (Vec<(CapabilityDiscriminant, CapabilityScope, u64)>, GrantPruneReport) {
         let pruned;
+        let mut report = GrantPruneReport::default();
         let grants = {
             // Recover from poison in an infallible context.
             let mut store = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             let Some(values) = store.get(plugin_id) else {
-                return vec![];
+                return (vec![], report);
             };
             let count_before = values.len();
 
@@ -428,6 +451,7 @@ impl CapGrantStore {
                 .iter()
                 .filter(|g| {
                     if g.hash_mismatch(wasm_hash) {
+                        report.hash_mismatch += 1;
                         tracing::info!(
                             plugin_id,
                             disc = %g.disc,
@@ -436,7 +460,11 @@ impl CapGrantStore {
                         );
                         return false;
                     }
-                    g.to_discriminant_and_scope().is_some()
+                    if g.to_discriminant_and_scope().is_none() {
+                        report.expired += 1;
+                        return false;
+                    }
+                    true
                 })
                 .cloned()
                 .collect();
@@ -457,7 +485,7 @@ impl CapGrantStore {
                 tracing::warn!(plugin_id, error = %e, "failed to persist pruned grants");
             }
         }
-        grants
+        (grants, report)
     }
 
     /// Serialize the current grants map and persist it to disk.
@@ -614,6 +642,17 @@ impl CapabilityManager {
         plugin_id: &str,
         wasm_hash: Option<&str>,
     ) -> Vec<(CapabilityDiscriminant, CapabilityScope, u64)> {
+        self.grant_store.load_for_plugin(plugin_id, wasm_hash).0
+    }
+
+    /// Like [`Self::load_grants`], additionally reporting how many persisted
+    /// grants were pruned and why. Callers use the report to audit
+    /// hash-mismatch / TTL prunes (ADR-37 prune-on-load).
+    pub fn load_grants_with_report(
+        &self,
+        plugin_id: &str,
+        wasm_hash: Option<&str>,
+    ) -> (Vec<(CapabilityDiscriminant, CapabilityScope, u64)>, GrantPruneReport) {
         self.grant_store.load_for_plugin(plugin_id, wasm_hash)
     }
 
@@ -625,6 +664,19 @@ impl CapabilityManager {
     /// List all plugin IDs that currently have non-expired grants.
     pub fn list_granted_plugins(&self) -> Vec<String> {
         self.grant_store.list_plugins()
+    }
+
+    /// Test-only: persist a grant with an explicit (possibly bogus) manifest
+    /// hash, so prune-on-load paths can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn save_grant_for_test(
+        &self,
+        plugin_id: &str,
+        cap: &CapabilityDiscriminant,
+        scope: &CapabilityScope,
+        manifest_hash: Option<String>,
+    ) -> Result<(), PluginError> {
+        self.grant_store.save_grant(plugin_id, cap, scope, manifest_hash)
     }
 }
 

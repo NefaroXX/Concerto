@@ -58,6 +58,7 @@ use crate::tool_bridge::{McpTool, DEFAULT_TIMEOUT_SECS};
 use concerto_api_types::extension::McpToolDescriptor;
 use concerto_config::{McpConfig, McpServerConfig};
 use concerto_core::event::{EventBus, EventKind};
+use concerto_core::traits::policy::{AuditLog, InfraAuditEntry, InfraVerdict};
 use concerto_core::types::ToolRegistry;
 use concerto_core::{CancellationToken, McpServerState};
 use std::collections::{HashMap, HashSet};
@@ -126,13 +127,33 @@ pub struct McpManager {
     /// graceful stop (state `Stopped`) so the UI can render them.
     servers: RwLock<HashMap<String, Arc<McpServerHandle>>>,
     bus: EventBus,
+    /// Optional append-only audit sink for infra failures (spawn/handshake
+    /// failures, duplicate-tool collisions, reader crashes). `None` disables
+    /// infra audit; every emission is fail-soft so a broken sink never fails
+    /// an MCP operation. Late-bound via [`Self::set_audit_log`] so the runtime
+    /// can attach the run's audit log before servers are registered.
+    audit: RwLock<Option<Arc<dyn AuditLog>>>,
 }
 
 impl McpManager {
     /// Create a manager from config. Spawns nothing — processes start on
     /// [`Self::register_tools`] / [`Self::start_server`].
     pub fn new(config: McpConfig, bus: EventBus) -> Self {
-        Self { config, servers: RwLock::new(HashMap::new()), bus }
+        Self { config, servers: RwLock::new(HashMap::new()), bus, audit: RwLock::new(None) }
+    }
+
+    /// Attach an audit sink for infra failures. Additive (no constructor
+    /// churn); call before [`Self::register_tools`] so startup failures are
+    /// captured.
+    pub fn set_audit_log(&self, audit: Arc<dyn AuditLog>) {
+        *self.audit.write().unwrap_or_else(|e| e.into_inner()) = Some(audit);
+    }
+
+    /// Record one infra-failure audit row, swallowing (and logging) any sink
+    /// error — auditing must never fail an MCP operation.
+    async fn record_infra(&self, entry: InfraAuditEntry) {
+        let audit = self.audit.read().unwrap_or_else(|e| e.into_inner()).clone();
+        emit_infra(audit.as_ref(), entry).await;
     }
 
     /// Whether the MCP client is globally enabled in config.
@@ -163,9 +184,11 @@ impl McpManager {
             if !seen.insert(server.id.as_str()) {
                 return Err(McpError::DuplicateServer { server_id: server.id.clone() });
             }
-            if let Some(handle) =
-                self.servers.read().unwrap_or_else(|e| e.into_inner()).get(&server.id).cloned()
-            {
+            // Copy the handle out in its own scope so the read guard is dropped
+            // before any `.await` (infra audit) below.
+            let existing =
+                { self.servers.read().unwrap_or_else(|e| e.into_inner()).get(&server.id).cloned() };
+            if let Some(handle) = existing {
                 // Connected on a previous run (or Failed/Stopped with zero
                 // tools): re-bridge into this run's fresh registry. Same
                 // collision handling as first registration — log loudly,
@@ -180,6 +203,13 @@ impl McpManager {
                             tool = %name,
                             "mcp tool name collision during re-registration"
                         );
+                        self.record_infra(InfraAuditEntry::mcp(
+                            server.id.clone(),
+                            InfraVerdict::McpServerFailed,
+                            "duplicate_tool",
+                            format!("tool name '{name}' already registered"),
+                        ))
+                        .await;
                     }
                     Err(e) => return Err(e),
                 }
@@ -199,11 +229,25 @@ impl McpManager {
                         tool = %name,
                         "mcp tool name collision; server marked failed"
                     );
+                    self.record_infra(InfraAuditEntry::mcp(
+                        server.id.clone(),
+                        InfraVerdict::McpServerFailed,
+                        "duplicate_tool",
+                        format!("tool name '{name}' already registered"),
+                    ))
+                    .await;
                 }
                 Err(e) => {
                     // Failed state was already recorded on the client and the
                     // handle was registered; the event carries the detail.
                     tracing::warn!(server_id = %server.id, error = %e, "mcp server failed to start; continuing");
+                    self.record_infra(InfraAuditEntry::mcp(
+                        server.id.clone(),
+                        InfraVerdict::McpServerFailed,
+                        mcp_error_kind(&e),
+                        e.to_string(),
+                    ))
+                    .await;
                 }
             }
         }
@@ -373,6 +417,7 @@ impl McpManager {
             Arc::downgrade(&client),
             Arc::downgrade(&handle),
             state_rx,
+            self.audit.read().unwrap_or_else(|e| e.into_inner()).clone(),
         );
 
         let timeout_secs = server.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
@@ -385,7 +430,14 @@ impl McpManager {
         let descriptors = match self.handshake(server, &client, timeout_secs, &env).await {
             Ok(tools) => tools,
             Err((err, detail)) => {
-                client.lock().await.record_failure(detail);
+                client.lock().await.record_failure(detail.clone());
+                self.record_infra(InfraAuditEntry::mcp(
+                    server.id.clone(),
+                    InfraVerdict::McpServerFailed,
+                    mcp_error_kind(&err),
+                    detail,
+                ))
+                .await;
                 return Err(err);
             }
         };
@@ -393,7 +445,14 @@ impl McpManager {
         // `tools/list`): register nothing and leave the empty Failed handle.
         if handle.state() != McpServerState::Connected {
             let detail = "server exited during handshake".to_string();
-            client.lock().await.record_failure(detail);
+            client.lock().await.record_failure(detail.clone());
+            self.record_infra(InfraAuditEntry::mcp(
+                server.id.clone(),
+                InfraVerdict::McpServerFailed,
+                "server_exited",
+                detail,
+            ))
+            .await;
             return Err(McpError::NotConnected);
         }
 
@@ -410,7 +469,14 @@ impl McpManager {
                     registry.unregister(registered);
                 }
                 let detail = format!("tool name '{name}' already registered");
-                client.lock().await.record_failure(detail);
+                client.lock().await.record_failure(detail.clone());
+                self.record_infra(InfraAuditEntry::mcp(
+                    server.id.clone(),
+                    InfraVerdict::McpServerFailed,
+                    "duplicate_tool",
+                    detail,
+                ))
+                .await;
                 return Err(McpError::DuplicateTool { name });
             }
             let tool = McpTool::new(server.id.clone(), client.clone(), descriptor)
@@ -450,6 +516,37 @@ impl McpManager {
     }
 }
 
+/// Machine-readable failure category for an [`McpError`], stored in the audit
+/// row's `error_kind` column.
+fn mcp_error_kind(error: &McpError) -> &'static str {
+    match error {
+        McpError::Io { .. } => "spawn_failed",
+        McpError::JsonRpc { .. } => "jsonrpc",
+        McpError::Protocol { .. } => "protocol",
+        McpError::VersionMismatch { .. } => "version_mismatch",
+        McpError::Timeout { .. } => "timeout",
+        McpError::Cancelled => "cancelled",
+        McpError::NotConnected => "not_connected",
+        McpError::ServerExited { .. } => "server_exited",
+        McpError::LineTooLong { .. } => "line_too_long",
+        McpError::AlreadySpawned => "already_spawned",
+        McpError::DuplicateServer { .. } => "duplicate_server",
+        McpError::DuplicateTool { .. } => "duplicate_tool",
+        McpError::UnknownServer { .. } => "unknown_server",
+        McpError::ServerDisabled { .. } => "server_disabled",
+    }
+}
+
+/// Fail-soft infra-audit emission: a missing or failing sink only logs.
+pub(crate) async fn emit_infra(audit: Option<&Arc<dyn AuditLog>>, entry: InfraAuditEntry) {
+    let Some(audit) = audit else {
+        return;
+    };
+    if let Err(error) = audit.record_infra(entry, CancellationToken::new()).await {
+        tracing::warn!(%error, "mcp infra audit write failed; continuing");
+    }
+}
+
 /// Publish [`EventKind::McpServerStateChanged`] for every transition on the
 /// client's state watch channel. `Failed` transitions carry the client's last
 /// failure detail and clear the server handle's tools (tools marked
@@ -461,6 +558,7 @@ fn spawn_state_watcher(
     client_weak: Weak<Mutex<McpClient>>,
     handle_weak: Weak<McpServerHandle>,
     mut rx: watch::Receiver<McpServerState>,
+    audit: Option<Arc<dyn AuditLog>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -480,6 +578,20 @@ fn spawn_state_watcher(
             } else {
                 None
             };
+            // A `Failed` transition is a reader crash / crash-on-exit observed
+            // by the watcher: audit it with the same detail the event carries.
+            if state == McpServerState::Failed {
+                emit_infra(
+                    audit.as_ref(),
+                    InfraAuditEntry::mcp(
+                        server_id.clone(),
+                        InfraVerdict::McpServerFailed,
+                        "server_failed",
+                        error.clone().unwrap_or_else(|| "server entered Failed state".to_string()),
+                    ),
+                )
+                .await;
+            }
             let kind =
                 EventKind::McpServerStateChanged { server_id: server_id.clone(), state, error };
             if let Err(e) = bus.publish_raw(kind) {

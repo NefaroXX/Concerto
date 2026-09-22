@@ -364,6 +364,26 @@ pub fn transcript_entry_from_event_with_labels(
             })
         }
 
+        // ---- ADR-43 / plugin lifecycle: surface MCP + plugin health. ----
+        EventKind::McpServerStateChanged { server_id, state, error } => {
+            Some(TranscriptEntry::Activity {
+                agent: "MCP".to_string(),
+                content: match error {
+                    Some(error) => format!("MCP server '{server_id}' is {state:?}: {error}"),
+                    None => format!("MCP server '{server_id}' is {state:?}"),
+                },
+            })
+        }
+        EventKind::PluginStateChanged { plugin_id, state, error } => {
+            Some(TranscriptEntry::Activity {
+                agent: "Plugins".to_string(),
+                content: match error {
+                    Some(error) => format!("Plugin '{plugin_id}' is {state:?}: {error}"),
+                    None => format!("Plugin '{plugin_id}' is {state:?}"),
+                },
+            })
+        }
+
         // ---- Everything else is noise for the transcript. ----
         _ => None,
     }
@@ -377,6 +397,37 @@ mod tests {
 
     fn task_id() -> TaskId {
         TaskId::new()
+    }
+
+    /// MCP and plugin lifecycle events surface as `Activity` entries so a
+    /// failed server/plugin is visible in the transcript, not silently dropped.
+    #[test]
+    fn mcp_and_plugin_state_changes_map_to_activity() {
+        let mcp = transcript_entry_from_event(&EventKind::McpServerStateChanged {
+            server_id: "srv".into(),
+            state: crate::types::McpServerState::Failed,
+            error: Some("spawn failed".into()),
+        });
+        assert_eq!(
+            mcp,
+            Some(TranscriptEntry::Activity {
+                agent: "MCP".into(),
+                content: "MCP server 'srv' is Failed: spawn failed".into(),
+            })
+        );
+
+        let plugin = transcript_entry_from_event(&EventKind::PluginStateChanged {
+            plugin_id: "plug".into(),
+            state: crate::types::PluginState::Disabled,
+            error: Some("violation threshold".into()),
+        });
+        assert_eq!(
+            plugin,
+            Some(TranscriptEntry::Activity {
+                agent: "Plugins".into(),
+                content: "Plugin 'plug' is Disabled: violation threshold".into(),
+            })
+        );
     }
 
     /// Representative noise events must not produce transcript entries.

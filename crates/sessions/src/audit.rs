@@ -1,6 +1,6 @@
 use concerto_core::error::PolicyError;
 use concerto_core::ids::Ulid;
-use concerto_core::traits::policy::{AuditEntry, AuditLog};
+use concerto_core::traits::policy::{AuditEntry, AuditLog, InfraAuditEntry, RULE_INFRA_FAILURE};
 use concerto_core::CancellationToken;
 use sqlx::SqlitePool;
 
@@ -64,6 +64,46 @@ impl AuditLog for SqliteAuditLog {
         .await
         .map_err(|e| {
             tracing::error!("audit log write failed: {e}");
+            PolicyError::AuditLogWriteFailed(e.to_string())
+        })?;
+
+        Ok(())
+    }
+
+    /// Persist an infrastructure-failure row (MCP/plugin).
+    ///
+    /// Infra rows carry no agent session (they happen at startup, in the MCP
+    /// state watcher, or against a plugin that outlives a session), so
+    /// `session_id` is written as `NULL`. The synthetic verdict,
+    /// [`RULE_INFRA_FAILURE`] sentinel, and the `error_kind` / `server_id` /
+    /// `plugin_id` attribution columns are populated. `input_hash` is stored
+    /// as an empty string because no tool input is hashed for an infra event.
+    async fn record_infra(
+        &self,
+        entry: InfraAuditEntry,
+        _cancel: CancellationToken,
+    ) -> Result<(), PolicyError> {
+        let created_at_unix = entry.timestamp.unix_timestamp();
+        sqlx::query(
+            "INSERT INTO audit_log (\
+                id, session_id, correlation_id, tool_name, verdict, input_hash, \
+                rule_matched, user_response, created_at, error_kind, server_id, plugin_id) \
+             VALUES (?, NULL, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(entry.correlation_id.to_string())
+        .bind(&entry.tool_name)
+        .bind(entry.verdict.to_string())
+        .bind(RULE_INFRA_FAILURE)
+        .bind(&entry.detail)
+        .bind(created_at_unix)
+        .bind(&entry.error_kind)
+        .bind(&entry.server_id)
+        .bind(&entry.plugin_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("audit log infra write failed: {e}");
             PolicyError::AuditLogWriteFailed(e.to_string())
         })?;
 
@@ -209,6 +249,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/024_audit_intent_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/032_audit_infra_columns.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -581,5 +625,149 @@ mod tests {
         assert_eq!(entry.toolchain_version, clone.toolchain_version);
         assert_eq!(entry.plan_id, clone.plan_id);
         assert_eq!(entry.source_revision, clone.source_revision);
+    }
+
+    /// Infra-failure rows (MCP/plugin) must land in `audit_log` with a NULL
+    /// session id, the synthetic verdict, the `infra_failure` rule sentinel,
+    /// and the `error_kind` / `server_id` / `plugin_id` attribution columns.
+    ///
+    /// Three representative failures are written: a duplicate MCP tool, a
+    /// plugin `init` failure (fake `InitFailed(-2)`), and a hash-mismatch grant
+    /// prune. One row's `correlation_id` is shared with a `session_events` row
+    /// to prove the two tables can be correlated.
+    #[tokio::test]
+    async fn sqlite_audit_infra_rows() {
+        use concerto_core::traits::policy::{InfraAuditEntry, InfraVerdict, RULE_INFRA_FAILURE};
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrations apply");
+
+        // A session exists so the correlated `session_events` row can be
+        // written; the infra audit rows themselves stay session-less.
+        let session_id = Ulid::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, project_dir, provider, model) \
+             VALUES (?, 0, '/tmp', 'test', 'test')",
+        )
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let audit = SqliteAuditLog::new(pool.clone());
+
+        // 1. MCP duplicate-tool collision.
+        let duplicate = InfraAuditEntry::mcp(
+            "srv-a",
+            InfraVerdict::McpServerFailed,
+            "duplicate_tool",
+            "tool name 'mcp:srv-a:search' already registered",
+        );
+        let duplicate_correlation = duplicate.correlation_id;
+        audit.record_infra(duplicate, CancellationToken::new()).await.unwrap();
+
+        // 2. Plugin init failure with a fake `InitFailed(-2)` code.
+        let init_failed = InfraAuditEntry::plugin(
+            "plug-init",
+            InfraVerdict::PluginLoadFailed,
+            "init_failed",
+            "plugin init failed with code -2",
+        );
+        audit.record_infra(init_failed, CancellationToken::new()).await.unwrap();
+
+        // 3. Hash-mismatch grant prune.
+        let pruned = InfraAuditEntry::plugin(
+            "plug-pruned",
+            InfraVerdict::CapabilityDenied,
+            "grant_pruned_hash",
+            "1 persisted grant pruned: wasm hash mismatch",
+        );
+        audit.record_infra(pruned, CancellationToken::new()).await.unwrap();
+
+        // Three rows, all session-less, all tagged with the infra sentinel.
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE session_id IS NULL AND rule_matched = ?",
+        )
+        .bind(RULE_INFRA_FAILURE)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 3, "expected three session-less infra rows");
+
+        // Duplicate-tool row: MCP verdict + server_id, no plugin_id.
+        let (verdict, error_kind, server_id, plugin_id, detail): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT verdict, error_kind, server_id, plugin_id, user_response \
+             FROM audit_log WHERE tool_name = 'mcp:srv-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(verdict, "McpServerFailed");
+        assert_eq!(error_kind.as_deref(), Some("duplicate_tool"));
+        assert_eq!(server_id.as_deref(), Some("srv-a"));
+        assert_eq!(plugin_id, None);
+        assert_eq!(detail.as_deref(), Some("tool name 'mcp:srv-a:search' already registered"));
+
+        // Plugin init-failure row: Wasm verdict attribution in plugin_id.
+        let (verdict, error_kind, server_id, plugin_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT verdict, error_kind, server_id, plugin_id \
+             FROM audit_log WHERE tool_name = 'plugin:plug-init'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(verdict, "PluginLoadFailed");
+        assert_eq!(error_kind.as_deref(), Some("init_failed"));
+        assert_eq!(server_id, None);
+        assert_eq!(plugin_id.as_deref(), Some("plug-init"));
+
+        // Hash-mismatch prune row: CapabilityDenied verdict + prune error kind.
+        let (verdict, error_kind, plugin_id): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT verdict, error_kind, plugin_id \
+                 FROM audit_log WHERE tool_name = 'plugin:plug-pruned'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(verdict, "CapabilityDenied");
+        assert_eq!(error_kind.as_deref(), Some("grant_pruned_hash"));
+        assert_eq!(plugin_id.as_deref(), Some("plug-pruned"));
+
+        // Correlated session_events row: same correlation_id joins back to the
+        // duplicate-tool audit row.
+        sqlx::query(
+            "INSERT INTO session_events \
+                (id, session_id, sequence_num, correlation_id, event_kind, payload, created_at) \
+             VALUES (?, ?, 1, ?, 'PluginStateChanged', '{}', 0)",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(session_id.to_string())
+        .bind(duplicate_correlation.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let joined: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM audit_log a \
+             JOIN session_events e ON a.correlation_id = e.correlation_id \
+             WHERE a.tool_name = 'mcp:srv-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(joined.0, 1, "audit infra row must correlate with its session event");
     }
 }

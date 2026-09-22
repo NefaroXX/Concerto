@@ -42,9 +42,14 @@ pub use policy::{RpmLimiter, SpendTracker};
 pub use policy_presets::{inject_intent_gate_rule, PolicyPresets};
 
 pub use types::{
-    AgentId, AgentOutput, AgentStage, AgentTask, McpServerState, ModelInfo, ProjectId,
+    AgentId, AgentOutput, AgentStage, AgentTask, McpServerState, ModelInfo, PluginState, ProjectId,
     SubTaskStatus, TaskId,
 };
+
+// Infra-failure audit vocabulary (MCP/plugin): synthetic verdicts, the shared
+// `rule_matched` sentinel, and the session-less entry type written through
+// `AuditLog::record_infra`.
+pub use traits::policy::{InfraAuditEntry, InfraVerdict, RULE_INFRA_FAILURE};
 
 // Phase 0 intent-routing vocabulary (ADR-55): types plus the confidence
 // threshold the router uses for path selection.

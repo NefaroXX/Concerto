@@ -638,6 +638,29 @@ pub enum McpServerState {
     Stopped,
 }
 
+/// Lifecycle state of one WASM plugin, mirroring [`McpServerState`].
+///
+/// Surfaced to the desktop/CLI via [`crate::event::EventKind::PluginStateChanged`]
+/// so plugin load/initialise/disable transitions are visible in the UI and the
+/// session transcript, not only in logs. A plugin is `Loading` while its module
+/// is loaded and its `init` export runs, `Active` once initialisation
+/// succeeded, `Failed` when load/initialise failed, `Disabled` when an
+/// administrative disable or violation threshold applied, and `Unloaded` after
+/// it is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginState {
+    /// Module load + `init` export in progress.
+    Loading,
+    /// Initialised and ready for tool/provider calls.
+    Active,
+    /// Load or initialisation failed (trap/fuel exhaustion, bad manifest, ...).
+    Failed,
+    /// Administratively disabled (violation threshold or explicit disable).
+    Disabled,
+    /// Removed from the manager.
+    Unloaded,
+}
+
 // ---- TaskId newtype -------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

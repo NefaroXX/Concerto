@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use wasmtime::{Engine, Store};
 
+use concerto_core::traits::policy::AuditLog;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::CancellationToken;
 
@@ -123,6 +124,10 @@ pub struct PluginStoreData {
     /// means no token was threaded through — host functions fall back to a
     /// fresh per-call token (ADR-38 documented fallback).
     pub cancel: Option<CancellationToken>,
+    /// Optional infra-failure audit sink for host-function violations and
+    /// violation-threshold disables. `None` disables emission; every write is
+    /// fail-soft (a detached task).
+    pub audit_log: Option<Arc<dyn AuditLog>>,
 }
 
 impl Default for PluginStoreData {
@@ -139,6 +144,7 @@ impl Default for PluginStoreData {
             violation_count: 0,
             disabled: false,
             cancel: None,
+            audit_log: None,
         }
     }
 }
