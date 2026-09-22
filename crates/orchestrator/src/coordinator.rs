@@ -9826,6 +9826,7 @@ impl CoordinatorAgent {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: true,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -10445,6 +10446,7 @@ impl CoordinatorAgent {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -10657,6 +10659,7 @@ impl CoordinatorAgent {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -11117,6 +11120,7 @@ impl CoordinatorAgent {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -11839,6 +11843,7 @@ impl CoordinatorAgent {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -12828,7 +12833,7 @@ impl CoordinatorAgent {
         );
         ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(1);
         match executor
-            .execute(tool_name, arguments.clone(), &base_ctx.session, cancel.clone())
+            .execute_with_authority(tool_name, arguments.clone(), &base_ctx.session, cancel.clone())
             .await
         {
             Ok(output) => {
@@ -22264,6 +22269,214 @@ mod tests {
         assert_eq!(graph.len(), 1, "no new node materializes: only the open parent");
     }
 
+    /// Orchestrator-authority regression (the bug this change fixes): the
+    /// Coordinator's own `call_specialist` dispatch must NOT be blocked by the
+    /// intent-derived restrictions that gate a *specialist's* tool choices.
+    /// The run is read-only-intent (the exact state a negation/unresolved
+    /// route leaves), so a plain specialist-path action would be denied
+    /// `intent_readonly_deny`; the dispatch action carries
+    /// `orchestrator_authority`, so it proceeds.
+    #[tokio::test]
+    async fn coordinator_dispatch_survives_read_only_intent_via_authority() {
+        use crate::intent_grants::{IntentGrantStore, SessionIntentAuth};
+        use concerto_core::types::Condition;
+
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+
+        // The default-preset shape that actually carries the intent gate: the
+        // danger AutoDeny first, then the bare IntentAuthorized gate, then the
+        // broad approval rules.
+        let store = Arc::new(IntentGrantStore::new());
+        let intent_auth = SessionIntentAuth::new(store.clone());
+        // Read-only intent: every mutation is a hard pre-sink Deny for
+        // non-authority actions.
+        intent_auth.set_read_only(true);
+        let policy: Arc<dyn concerto_core::traits::policy::PolicyEngine> = Arc::new(
+            SimplePolicyEngine::new(
+                vec![
+                    PolicyRule::AutoDeny(Condition::Any(vec![Condition::CommandPattern(
+                        r"rm\s+(-rf\s+)?/".into(),
+                    )])),
+                    PolicyRule::RequireApproval(Condition::IntentAuthorized),
+                    PolicyRule::RequireApproval(Condition::ToolName("filesystem".into())),
+                    PolicyRule::RequireApproval(Condition::Always),
+                ],
+                Arc::new(TestAudit),
+            )
+            .with_intent_auth(Arc::new(intent_auth)),
+        );
+
+        let mut coordinator = coordinator_with_turns_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+            policy,
+        );
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+
+        let decision_value = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "implement it" }),
+            )
+            .await;
+
+        assert_ne!(
+            decision_value["error"], "policy_denied",
+            "the coordinator's own dispatch must not be intent-denied: {decision_value:?}"
+        );
+        assert!(
+            ledger.action_ledger.iter().any(|action| action.kind == "dispatched"),
+            "the authority dispatch materialized a SubTask: {ledger:?}"
+        );
+    }
+
+    /// Counterpart regression: the SAME read-only policy DENIES a
+    /// non-authority action, proving the authority flag is what makes the
+    /// difference and the shared `SessionIntentAuth` behavior is unchanged for
+    /// specialists. This is the `read_only_denies_call_specialist` /
+    /// `no_grant_un_granted` behavior the change must preserve.
+    #[tokio::test]
+    async fn non_authority_action_is_still_read_only_denied_by_the_same_policy() {
+        use crate::intent_grants::{IntentGrantStore, SessionIntentAuth};
+        use concerto_core::types::Condition;
+
+        let store = Arc::new(IntentGrantStore::new());
+        let intent_auth = SessionIntentAuth::new(store.clone());
+        intent_auth.set_read_only(true);
+        let policy = SimplePolicyEngine::new(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            Arc::new(TestAudit),
+        )
+        .with_intent_auth(Arc::new(intent_auth));
+
+        // A specialist-path action (no authority) is denied outright.
+        let input = serde_json::json!({ "agent_id": "coder", "task": "implement it" });
+        let action = concerto_core::types::PolicyAction {
+            tool_name: crate::coordinator::CALL_SPECIALIST_TOOL,
+            input: &input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+            orchestrator_authority: false,
+        };
+        let verdict = policy.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            verdict,
+            concerto_core::types::PolicyVerdict::Deny,
+            "a non-authority dispatch action in a read-only run stays denied"
+        );
+    }
+
+    /// Orchestrator-authority regression: the Coordinator's OWN executor tool
+    /// call (`handle_executor_tool`) must survive a read-only-intent policy —
+    /// it carries `orchestrator_authority` through
+    /// `ToolExecutor::execute_with_authority`. A specialist-path call through
+    /// the same executor (without authority) is denied.
+    #[tokio::test]
+    async fn coordinator_self_execution_survives_read_only_intent_via_authority() {
+        use crate::intent_grants::{IntentGrantStore, SessionIntentAuth};
+        use concerto_core::types::Condition;
+
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+
+        // One policy shape shared by the coordinator's dispatch gate and the
+        // self-execution executor: bare intent gate under read-only intent.
+        let make_policy = || {
+            let store = Arc::new(IntentGrantStore::new());
+            let intent_auth = SessionIntentAuth::new(store);
+            intent_auth.set_read_only(true);
+            Arc::new(
+                SimplePolicyEngine::new(
+                    vec![
+                        PolicyRule::RequireApproval(Condition::IntentAuthorized),
+                        PolicyRule::RequireApproval(Condition::Always),
+                    ],
+                    Arc::new(TestAudit),
+                )
+                .with_intent_auth(Arc::new(intent_auth)),
+            ) as Arc<dyn concerto_core::traits::policy::PolicyEngine>
+        };
+
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(TestWriteTool));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), make_policy()));
+
+        let mut coordinator = coordinator_with_turns_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            make_policy(),
+        )
+        .with_executor(executor.clone());
+
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut ledger = DispatchLedger::default();
+        let arguments =
+            serde_json::json!({ "path": "self_out.rs", "content": "// by coordinator" });
+
+        let result = coordinator
+            .handle_executor_tool(
+                &context,
+                &CancellationToken::new(),
+                &mut ledger,
+                &arguments,
+                "test_write_file",
+            )
+            .await;
+
+        assert_ne!(
+            result["error"], "tool_execution_failed",
+            "authority self-execution must not be policy-denied: {result:?}"
+        );
+        assert!(
+            workspace.path().join("self_out.rs").exists(),
+            "the coordinator's own write landed under authority"
+        );
+
+        // Counterpart: a non-authority executor call through the SAME policy is
+        // denied (the specialist path is unchanged).
+        let denied = executor
+            .execute(
+                "test_write_file",
+                serde_json::json!({ "path": "denied.rs", "content": "// nope" }),
+                &concerto_core::types::SessionContext::new(
+                    session_id,
+                    workspace.path().to_path_buf(),
+                ),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(denied.is_err(), "a non-authority write in a read-only run is denied");
+        assert!(!workspace.path().join("denied.rs").exists(), "the denied write never landed");
+    }
+
     // ── Issue #57: dynamic task splitting and merging ────────────────────
 
     /// Build a split_task tool call for a test turn.
@@ -26155,6 +26368,7 @@ mod tests {
             plan_id: None,
             causation: None,
             base_versions: std::collections::BTreeMap::new(),
+            orchestrator_authority: false,
         };
         gate.submit(acquire, CancellationToken::new()).await.expect("owner acquires");
         assert_eq!(gate.ownership_owner("shared.txt").as_deref(), Some("agent-a"));
@@ -26268,6 +26482,7 @@ mod tests {
             plan_id: None,
             causation: None,
             base_versions: std::collections::BTreeMap::new(),
+            orchestrator_authority: false,
         };
         gate.submit(acquire, CancellationToken::new()).await.expect("owner acquires");
         assert_eq!(gate.ownership_owner("multi.txt").as_deref(), Some("coder"));

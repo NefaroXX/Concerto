@@ -2009,6 +2009,7 @@ impl AgentLoop {
                 sandbox_profile: None,
                 estimated_cost_usd: None,
                 command_facts: None,
+                orchestrator_authority: false,
             };
 
             match self.approval.request_approval(&action, cancel.clone()).await {
@@ -2172,7 +2173,13 @@ impl AgentLoop {
         let attempt_id = self.gate_attempt_id(&tc.id);
         match self
             .tool_executor
-            .execute(&tc.name, arguments.clone(), &attempt_id, session, cancel.clone())
+            .execute_with_authority(
+                &tc.name,
+                arguments.clone(),
+                &attempt_id,
+                session,
+                cancel.clone(),
+            )
             .await
         {
             Ok(output) => {

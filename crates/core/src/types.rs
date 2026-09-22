@@ -339,6 +339,25 @@ pub struct PolicyAction<'a> {
     /// the producing tool has not populated them. Kept optional so existing
     /// call sites and non-shell tools are unaffected.
     pub command_facts: Option<CommandPolicyFacts>,
+    /// Orchestrator-authority marker (additive; default `false`).
+    ///
+    /// Set `true` ONLY at the orchestrator's own top-level call sites — the
+    /// Coordinator's decision loop (`call_specialist` dispatch,
+    /// self-executor tool calls) and the single-agent `AgentLoop` executor
+    /// calls. It tells the intent gate that this action is the orchestrator
+    /// acting under its own, already-confirmed intent rather than a
+    /// specialist's independently-gated tool call.
+    ///
+    /// When `true`, the engine skips ONLY intent-derived restrictions (the
+    /// `Condition::IntentAuthorized` gate upgrade, the read-only-intent
+    /// pre-sink `Deny`, and `un_granted` / `shell_requires_approval`). It
+    /// KEEPS every hard invariant: deny-class rules (`AutoDeny`,
+    /// `DenyNetworkEgress`) still run first, Consequential actions still
+    /// prompt through the approval sink, plan binding/guard still applies,
+    /// and the audit row records `rule_matched = "coordinator_authority"`.
+    /// Specialists, gate-proxy/supervisor children, and MCP/plugin bridges
+    /// never set this flag, so their gating is unchanged.
+    pub orchestrator_authority: bool,
 }
 
 // ---- ADR-28 §6: structured command-policy facts ----------------------------

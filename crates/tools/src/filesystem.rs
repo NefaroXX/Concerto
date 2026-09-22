@@ -1416,6 +1416,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         }
     }
 

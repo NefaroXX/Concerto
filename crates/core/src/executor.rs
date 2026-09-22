@@ -39,6 +39,7 @@ fn build_action<'a>(
     input: &'a serde_json::Value,
     tool: &dyn Tool,
     session: &SessionContext,
+    orchestrator_authority: bool,
 ) -> PolicyAction<'a> {
     PolicyAction {
         tool_name,
@@ -58,6 +59,9 @@ fn build_action<'a>(
         // shell tool resolves executable/argv/cwd), so the policy engine
         // and audit log reason about what actually runs, not just a string.
         command_facts: tool.command_facts(input, session),
+        // Orchestrator-authority marker: only the authority execute path sets
+        // this; every ordinary (specialist / gate / bridge) path passes false.
+        orchestrator_authority,
     }
 }
 
@@ -620,6 +624,38 @@ impl ToolExecutor {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(tool_name, input, session, cancel, false).await
+    }
+
+    /// Orchestrator-authority execute: identical to [`Self::execute`], but the
+    /// policy action carries [`PolicyAction::orchestrator_authority`] = `true`.
+    ///
+    /// Called ONLY by the orchestrator's own top-level call sites (the
+    /// Coordinator's self-executor tool calls and the single-agent `AgentLoop`
+    /// executor calls). The engine then skips intent-derived restrictions
+    /// (the grant-upgrade requirement, the read-only-intent pre-sink deny, and
+    /// `un_granted` / `shell_requires_approval`) while keeping deny-class
+    /// first, Consequential approval sinks, plan guards, and audit rows.
+    /// Specialists, gate-proxy/supervisor children, and MCP/plugin bridges use
+    /// [`Self::execute`] and stay fully intent-gated.
+    pub async fn execute_with_authority(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(tool_name, input, session, cancel, true).await
+    }
+
+    async fn execute_inner(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+        orchestrator_authority: bool,
+    ) -> Result<ToolOutput, ToolError> {
         let tool = self.registry.get(tool_name).ok_or_else(|| ToolError::ExecutionFailed {
             message: format!("tool not found: {tool_name}"),
         })?;
@@ -628,7 +664,8 @@ impl ToolExecutor {
         // canonical tool name and operation-bearing input); execution and
         // audit below still use the registered name and the caller's input.
         let (policy_name, policy_input) = tool.policy_view(&input);
-        let action = build_action(&policy_name, &policy_input, tool, session);
+        let action =
+            build_action(&policy_name, &policy_input, tool, session, orchestrator_authority);
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
@@ -736,7 +773,7 @@ impl ToolExecutor {
         // but without evaluating the action: the canonical policy view still
         // names the completion row's tool, and `command_facts` still enrich it.
         let (policy_name, policy_input) = tool.policy_view(&input);
-        let action = build_action(&policy_name, &policy_input, tool, session);
+        let action = build_action(&policy_name, &policy_input, tool, session, false);
         let audit = ExecutionAuditContext {
             correlation_id: action.correlation_id,
             input_hash: crate::policy::compute_input_hash(&input),
@@ -768,7 +805,7 @@ impl ToolExecutor {
             return false;
         };
         let (policy_name, policy_input) = tool.policy_view(input);
-        let action = build_action(&policy_name, &policy_input, tool, session);
+        let action = build_action(&policy_name, &policy_input, tool, session, false);
         matches!(self.policy.evaluate_advisory(&action, cancel).await, Ok(PolicyVerdict::Allow))
     }
 
@@ -1094,6 +1131,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PolicyDenied { .. }));
+    }
+
+    /// Records the `orchestrator_authority` flag of the last action it saw, so
+    /// the two executor entry points can be told apart.
+    #[derive(Default)]
+    struct FlagRecordingPolicy {
+        saw_authority: std::sync::Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl PolicyEngine for FlagRecordingPolicy {
+        async fn evaluate(
+            &self,
+            action: &PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> Result<PolicyVerdict, PolicyError> {
+            *self.saw_authority.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(action.orchestrator_authority);
+            // Deny is sufficient: the test only observes the action shape.
+            Ok(PolicyVerdict::Deny)
+        }
+
+        fn audit_log(&self) -> &dyn crate::traits::policy::AuditLog {
+            &NullTestAuditLog
+        }
+    }
+
+    struct NullTestAuditLog;
+
+    #[async_trait]
+    impl crate::traits::policy::AuditLog for NullTestAuditLog {
+        async fn record(
+            &self,
+            _entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_marks_action_non_authority() {
+        let policy = Arc::new(FlagRecordingPolicy::default());
+        let executor = ToolExecutor::new(test_registry(), policy.clone());
+        let _ = executor
+            .execute("echo", serde_json::json!({}), &test_session(), CancellationToken::new())
+            .await;
+        assert_eq!(
+            *policy.saw_authority.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(false),
+            "the ordinary execute path never sets the authority marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_authority_marks_action_authority() {
+        let policy = Arc::new(FlagRecordingPolicy::default());
+        let executor = ToolExecutor::new(test_registry(), policy.clone());
+        let _ = executor
+            .execute_with_authority(
+                "echo",
+                serde_json::json!({}),
+                &test_session(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            *policy.saw_authority.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(true),
+            "the authority path sets the marker"
+        );
     }
 
     #[tokio::test]

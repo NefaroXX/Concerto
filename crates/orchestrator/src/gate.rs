@@ -228,6 +228,19 @@ pub struct GateRequest {
     /// an empty map via `#[serde(default)]`).
     #[serde(default)]
     pub base_versions: BTreeMap<String, String>,
+    /// Orchestrator-authority marker carried onto the [`PolicyAction`] the gate
+    /// builds for this request (see [`WriteGate::run_gated`]).
+    ///
+    /// TRUST BOUNDARY: only the in-process orchestrator path
+    /// ([`crate::in_process_gate::InProcessGateBackend`]) may set this `true`;
+    /// [`WriteGate::submit`] itself treats it as an ordinary request field. The
+    /// supervisor's `handle_execute_tool` unconditionally forces it to `false`
+    /// before evaluating any child-supplied request, so a supervised agent
+    /// process can never acquire orchestrator authority by smuggling `true`
+    /// over the wire — the child is untrusted by design. Defaults to `false`,
+    /// including for every client that predates the field (`#[serde(default)]`).
+    #[serde(default)]
+    pub orchestrator_authority: bool,
 }
 
 /// Outcome of a gated write.
@@ -1125,6 +1138,10 @@ impl WriteGate {
                 sandbox_profile: None,
                 estimated_cost_usd: None,
                 command_facts: None,
+                // Advisory only — a read is never gated — but the action stays
+                // truthful about the caller's authority so its audit row
+                // reflects who issued it.
+                orchestrator_authority: req.orchestrator_authority,
             };
             match self.policy.evaluate_advisory(&action, cancel.clone()).await {
                 Ok(verdict) => tracing::debug!(
@@ -1177,6 +1194,10 @@ impl WriteGate {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            // Authority rides the request; the in-process backend may set it
+            // `true`, and the supervisor boundary always forces it `false` for
+            // child-supplied requests (see `GateRequest::orchestrator_authority`).
+            orchestrator_authority: req.orchestrator_authority,
         };
 
         // Only `Allow` executes. Every other verdict is a durable
@@ -1384,9 +1405,19 @@ impl WriteGate {
         // Execute AFTER the WAL append commits. Cancellation propagates as-is
         // (no `failure` event — the attempt was abandoned, not failed); other
         // errors log a `failure` event causally linked to the applied write.
+        //
+        // The executor re-evaluates policy on its own execute path, so an
+        // authority request must go through the executor's authority variant
+        // too — otherwise the gate's `Allow` would be reversed by a second,
+        // non-authoritative evaluation (the exact read-only-intent deny the
+        // authority marker exists to skip).
         let session_ctx = self.session(session_id);
         let input = req.input.clone(); // keep `req` intact for failure logging below
-        let output = self.executor.execute(&req.tool, input, &session_ctx, cancel).await;
+        let output = if req.orchestrator_authority {
+            self.executor.execute_with_authority(&req.tool, input, &session_ctx, cancel).await
+        } else {
+            self.executor.execute(&req.tool, input, &session_ctx, cancel).await
+        };
         let output = match output {
             Ok(output) => output,
             Err(ToolError::Cancelled) => return Err(GateError::Cancelled),
@@ -1994,6 +2025,7 @@ mod tests {
             plan_id: None,
             causation: None,
             base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
         }
     }
 
@@ -2008,6 +2040,7 @@ mod tests {
             plan_id: None,
             causation: None,
             base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
         }
     }
 
@@ -2396,6 +2429,7 @@ mod tests {
             plan_id: None,
             causation: None,
             base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
         }
     }
 

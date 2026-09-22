@@ -1,4 +1,7 @@
-use crate::authorization::{IntentAuthorization, IntentVerdict};
+use crate::authorization::{
+    classify_tier, IntentAuthorization, IntentTier, IntentVerdict, RULE_CONSEQUENTIAL,
+    RULE_COORDINATOR_AUTHORITY,
+};
 use crate::error::PolicyError;
 use crate::traits::policy::{AuditEntry, AuditLog, PolicyEngine};
 use crate::types::{
@@ -157,6 +160,59 @@ impl SimplePolicyEngine {
         None
     }
 
+    /// Orchestrator-authority branch of the bare intent gate (additive, default
+    /// `false` actions are unaffected).
+    ///
+    /// The orchestrator's own top-level calls (`call_specialist` dispatch,
+    /// self-executor tool calls, and the single-agent `AgentLoop` executor
+    /// calls) act under an intent the run already confirmed, so the
+    /// intent-derived restrictions that exist to gate an *agent's* tool
+    /// choices do not apply to them:
+    ///
+    /// - the `RequireApproval` → `Allow` grant upgrade requirement
+    ///   (`intent_authorized` / `intent_authorized_shell` /
+    ///   `intent_authorized_delegation`) is unnecessary — authority implies it;
+    /// - the read-only-intent pre-sink `Deny`
+    ///   (`intent_readonly_deny`, B-1) is skipped;
+    /// - `un_granted` and `shell_requires_approval` approval prompts are
+    ///   skipped.
+    ///
+    /// What it KEEPS (never bypassed):
+    /// - **deny-class first**: this function is only reached from the bare
+    ///   `Condition::IntentAuthorized` approval rule, which the default preset
+    ///   places *after* the `AutoDeny` / `DenyNetworkEgress` rules, so those
+    ///   still decide first (a `Deny` is never upgraded);
+    /// - **Consequential still prompts**: a Consequential action resolves to
+    ///   `RequireApproval` and "keep" means it keeps the approval path — it is
+    ///   never auto-allowed;
+    /// - **Observe still allows, plan/audit unchanged**: the row is audited
+    ///   with `rule_matched = "coordinator_authority"` instead of the
+    ///   intent-derived rule names.
+    ///
+    /// Returns `None` when the action does not carry the authority flag, so the
+    /// caller falls through to the ordinary intent-gate path unchanged.
+    fn eval_orchestrator_authority_gate(
+        &self,
+        cond: &Condition,
+        timeout: std::time::Duration,
+        action: &PolicyAction<'_>,
+    ) -> Option<(PolicyVerdict, String)> {
+        if !matches!(cond, Condition::IntentAuthorized) || !action.orchestrator_authority {
+            return None;
+        }
+        // Deny-class stays untouched: a Consequential action (network egress,
+        // destructive, secrets/install/force) keeps the approval path — never
+        // auto-allowed by authority. Observe keeps its existing Allow (the
+        // preset's read-only AutoApprove handles typical reads; an Observe
+        // action reaching the bare gate is auto-allowed as observed behavior).
+        match classify_tier(action) {
+            IntentTier::Consequential => {
+                Some((PolicyVerdict::RequireApproval { timeout }, RULE_CONSEQUENTIAL.to_owned()))
+            }
+            _ => Some((PolicyVerdict::Allow, RULE_COORDINATOR_AUTHORITY.to_owned())),
+        }
+    }
+
     /// ADR-55 §2 intent gate: apply the attached authorization's verdict
     /// mechanically to the rule's normal outcome. `Allow` upgrades
     /// `RequireApproval` → `Allow` (audit `rule_matched` = the verdict's rule);
@@ -170,6 +226,11 @@ impl SimplePolicyEngine {
     /// never upgrade, only match). Returns `None` when no authorization
     /// provider is attached, so the caller's rule walk keeps its pre-ADR-55
     /// semantics.
+    ///
+    /// When the action carries [`PolicyAction::orchestrator_authority`], the
+    /// authority branch ([`Self::eval_orchestrator_authority_gate`]) decides
+    /// first — deny-class and Consequential keep their paths, Observe and
+    /// MutateLocal are allowed with the `coordinator_authority` audit row.
     fn eval_intent_gate(
         &self,
         cond: &Condition,
@@ -178,6 +239,9 @@ impl SimplePolicyEngine {
     ) -> Option<(PolicyVerdict, String)> {
         if !matches!(cond, Condition::IntentAuthorized) {
             return None;
+        }
+        if let Some(decision) = self.eval_orchestrator_authority_gate(cond, timeout, action) {
+            return Some(decision);
         }
         let auth = self.intent_auth.as_ref()?;
         match auth.verdict(action) {
@@ -1129,8 +1193,8 @@ pub(crate) fn compute_input_hash(input: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::authorization::{
-        RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_READONLY_DENY, RULE_OBSERVE,
-        RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
+        RULE_CONSEQUENTIAL, RULE_COORDINATOR_AUTHORITY, RULE_INTENT_AUTHORIZED,
+        RULE_INTENT_READONLY_DENY, RULE_OBSERVE, RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
     };
     use crate::ids::Ulid;
     use crate::policy_presets::inject_intent_gate_rule;
@@ -1169,6 +1233,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         }
     }
 
@@ -1498,6 +1563,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let cond = Condition::Capability(rule_caps);
         let engine = SimplePolicyEngine::new(
@@ -1524,6 +1590,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let cond = Condition::Capability(rule_caps);
         let engine = SimplePolicyEngine::new(
@@ -1665,6 +1732,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: Some(facts),
+            orchestrator_authority: false,
         }
     }
 
@@ -1783,6 +1851,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Allow);
@@ -1803,6 +1872,7 @@ mod tests {
             sandbox_profile: Some(SandboxProfile::ReadOnlyFs),
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -1823,6 +1893,7 @@ mod tests {
             sandbox_profile: Some(SandboxProfile::NetworkIsolated),
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -1842,6 +1913,7 @@ mod tests {
             sandbox_profile: Some(SandboxProfile::Containerized),
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -2032,6 +2104,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: Some(0.6),
             command_facts: None,
+            orchestrator_authority: false,
         };
 
         // Preflight succeeds without charging the estimate.
@@ -2062,6 +2135,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
 
         // First 3 calls should succeed.
@@ -2091,6 +2165,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
 
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
@@ -2746,6 +2821,7 @@ mod tests {
             sandbox_profile: Some(SandboxProfile::ReadOnlyFs),
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -2779,6 +2855,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: Some(0.6),
             command_facts: None,
+            orchestrator_authority: false,
         };
         tracker.record(0.6);
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
@@ -2992,6 +3069,190 @@ mod tests {
         assert_eq!(
             audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
             Some(RULE_INTENT_READONLY_DENY)
+        );
+    }
+
+    // ---- orchestrator-authority branch (additive; default false) -----------
+
+    /// `make_action` with the orchestrator-authority marker set.
+    fn make_authority_action<'a>(
+        tool_name: &'a str,
+        input: &'a serde_json::Value,
+    ) -> PolicyAction<'a> {
+        PolicyAction { orchestrator_authority: true, ..make_action(tool_name, input) }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_authority_allows_mutate_local_with_authority_rule() {
+        // A MutateLocal filesystem write under orchestrator authority skips the
+        // grant-upgrade requirement: Allow with `coordinator_authority` — even
+        // though a read-only-intent provider would have denied it outright.
+        let (engine, audit) = engine_with_auth(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            IntentVerdict::Deny { rule: RULE_INTENT_READONLY_DENY },
+        );
+        let input = serde_json::json!({"operation": "write", "path": "src/main.rs"});
+        let verdict = engine
+            .evaluate(&make_authority_action("filesystem", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some(RULE_COORDINATOR_AUTHORITY)
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_authority_allows_un_granted_shell_and_skips_shell_approval() {
+        // Both `un_granted` (a grantable class without a grant) and
+        // `shell_requires_approval` are intent-derived restrictions: authority
+        // skips them and lands Allow with the authority rule.
+        let (engine, audit) = engine_with_auth(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            IntentVerdict::RequireApproval { rule: RULE_UN_GRANTED },
+        );
+        let input = serde_json::json!({"command": "cargo", "args": ["build"]});
+        let verdict = engine
+            .evaluate(&make_authority_action("shell", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some(RULE_COORDINATOR_AUTHORITY)
+        );
+
+        let (engine, audit) = engine_with_auth(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            IntentVerdict::RequireApproval { rule: RULE_SHELL_REQUIRES_APPROVAL },
+        );
+        let verdict = engine
+            .evaluate(&make_authority_action("shell", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some(RULE_COORDINATOR_AUTHORITY)
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_authority_keeps_deny_class_first() {
+        // Deny-class rules still run first: authority never upgrades an
+        // AutoDeny or a DenyNetworkEgress.
+        let (engine, audit) = engine_with_auth(
+            vec![
+                PolicyRule::AutoDeny(Condition::ToolName("filesystem".into())),
+                PolicyRule::RequireApproval(Condition::IntentAuthorized),
+            ],
+            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED },
+        );
+        let input = serde_json::json!({"operation": "write", "path": "src/main.rs"});
+        let verdict = engine
+            .evaluate(&make_authority_action("filesystem", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(audit.entries.lock().unwrap()[0].rule_matched.as_deref(), Some("auto_deny"));
+
+        let (engine, audit) = engine_with_auth(
+            vec![
+                PolicyRule::DenyNetworkEgress(Condition::ToolName("http".into())),
+                PolicyRule::RequireApproval(Condition::IntentAuthorized),
+            ],
+            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED },
+        );
+        let input = serde_json::json!({});
+        let verdict = engine
+            .evaluate(&make_authority_action("http", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("deny_network_egress")
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_authority_keeps_consequential_under_approval() {
+        // Consequential actions are not intent-derived: authority KEEPS the
+        // approval path and labels it `consequential` — never auto-allows.
+        let (engine, audit) = engine_with_auth(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            IntentVerdict::Allow { rule: RULE_INTENT_AUTHORIZED },
+        );
+        let push = serde_json::json!({"operation": "push"});
+        let verdict = engine
+            .evaluate(&make_authority_action("git", &push), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            verdict,
+            PolicyVerdict::RequireApproval { timeout: std::time::Duration::from_secs(30) }
+        );
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some(RULE_CONSEQUENTIAL)
+        );
+
+        // Network egress tools classify Consequential by construction.
+        let input = serde_json::json!({});
+        let verdict = engine
+            .evaluate(&make_authority_action("http", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            verdict,
+            PolicyVerdict::RequireApproval { timeout: std::time::Duration::from_secs(30) }
+        );
+        assert_eq!(
+            audit.entries.lock().unwrap()[1].rule_matched.as_deref(),
+            Some(RULE_CONSEQUENTIAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_authority_action_is_unaffected_by_authority_branch() {
+        // The default `false` behaves exactly as before: the read-only-intent
+        // deny stays final and pre-sink.
+        let (engine, audit) = engine_with_auth(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            IntentVerdict::Deny { rule: RULE_INTENT_READONLY_DENY },
+        );
+        let input = serde_json::json!({"operation": "write", "path": "src/main.rs"});
+        let verdict = engine
+            .evaluate(&make_action("filesystem", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some(RULE_INTENT_READONLY_DENY)
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_authority_works_without_attached_provider() {
+        // Authority is decided by the engine branch itself, independent of any
+        // attached intent provider (the orchestrator's own authority is not a
+        // grant).
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            audit.clone(),
+        );
+        let input = serde_json::json!({"operation": "write", "path": "src/main.rs"});
+        let verdict = engine
+            .evaluate(&make_authority_action("filesystem", &input), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some(RULE_COORDINATOR_AUTHORITY)
         );
     }
 }

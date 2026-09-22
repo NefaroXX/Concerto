@@ -62,6 +62,7 @@ fn make_action<'a>(tool_name: &'a str, input: &'a serde_json::Value) -> PolicyAc
         sandbox_profile: None,
         estimated_cost_usd: None,
         command_facts: None,
+        orchestrator_authority: false,
     }
 }
 
@@ -124,6 +125,7 @@ fn bench_policy_evaluate(c: &mut Criterion) {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
 
         c.bench_function("policy/100_rules/glob_match", |b| {

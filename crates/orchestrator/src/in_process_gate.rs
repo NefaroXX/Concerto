@@ -82,67 +82,25 @@ impl ToolExecutionBackend for InProcessGateBackend {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let mut input = input;
-        // ADR-60 D5: `base_versions` is a gate-level concurrency claim map,
-        // not tool input — lift it out of the payload and forward the rest
-        // (identical to the supervised backend's lift).
-        let mut base_versions = BTreeMap::new();
-        if let Some(map) = input.as_object_mut() {
-            if let Some(serde_json::Value::Object(claims)) = map.remove("base_versions") {
-                for (target, claim) in claims {
-                    if let serde_json::Value::String(hash) = claim {
-                        base_versions.insert(target, hash);
-                    }
-                }
-            }
-        }
+        self.execute_gated(tool_name, input, call_id, session, cancel, false).await
+    }
 
-        let mut request = GateRequest {
-            call_id: call_id.to_owned(),
-            agent_id: self.agent_id.clone(),
-            tool: tool_name.to_owned(),
-            input,
-            session_id: Some(session.session_id.to_string()),
-            scope: self.scope.clone(),
-            plan_id: None,
-            causation: None,
-            base_versions,
-        };
-        // ADR-60 D5 always-on: stamp each mutated target's current pre-image
-        // hash before submission — the same injection the supervisor applies
-        // in `handle_execute_tool` — so the in-process loop's base_version
-        // claims are attested from the same reader the gate conflict-checks
-        // against. The gate refuses a sibling-altared target loudly.
-        stamp_base_versions(&self.gate, &mut request).await;
-        let outcome = match self.gate.submit(request, cancel.clone()).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                // ADR-60 D5: a base_version collision is the loud signal that
-                // agents raced on shared files — record it at warn so the
-                // operator has a manual-resolution trail (mirrors the
-                // supervisor's `handle_execute_tool`).
-                if let GateError::Conflict { event_id, reason } = &error {
-                    tracing::warn!(
-                        agent_id = %self.agent_id,
-                        %event_id,
-                        %reason,
-                        "in-process: optimistic write conflict"
-                    );
-                }
-                return Err(gate_error_to_tool_error(error));
-            }
-        };
-        // Mirror the supervised child's post-round-trip cancellation check:
-        // a write that already applied while the run was cancelled surfaces
-        // as a cancellation, not a success.
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        serde_json::from_value::<ToolOutput>(outcome.result).map_err(|error| {
-            ToolError::ExecutionFailed {
-                message: format!("gate outcome did not carry a ToolOutput: {error}"),
-            }
-        })
+    /// Orchestrator-authority execute for the in-process single-agent loop:
+    /// identical to [`Self::execute`] but the [`GateRequest`] carries
+    /// `orchestrator_authority = true`, so the gate builds an authoritative
+    /// [`concerto_core::types::PolicyAction`] (intent-derived restrictions
+    /// skipped; deny-class, Consequential sinks, plan guards and audit rows
+    /// kept). In-process only — the supervised `GateProxyBackend` never sets
+    /// this, and the supervisor forces it `false` at the wire boundary.
+    async fn execute_with_authority(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        call_id: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_gated(tool_name, input, call_id, session, cancel, true).await
     }
 
     async fn record_ack_decision(
@@ -213,6 +171,84 @@ impl ToolExecutionBackend for InProcessGateBackend {
                 cancel,
             )
             .await;
+    }
+}
+
+impl InProcessGateBackend {
+    /// Shared dispatch for both trait entry points: lift the gate-level
+    /// `base_versions` claims, stamp, submit, and translate the outcome. The
+    /// only difference between the two callers is `orchestrator_authority`.
+    async fn execute_gated(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        call_id: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+        orchestrator_authority: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        let mut input = input;
+        // ADR-60 D5: `base_versions` is a gate-level concurrency claim map,
+        // not tool input — lift it out of the payload and forward the rest
+        // (identical to the supervised backend's lift).
+        let mut base_versions = BTreeMap::new();
+        if let Some(map) = input.as_object_mut() {
+            if let Some(serde_json::Value::Object(claims)) = map.remove("base_versions") {
+                for (target, claim) in claims {
+                    if let serde_json::Value::String(hash) = claim {
+                        base_versions.insert(target, hash);
+                    }
+                }
+            }
+        }
+
+        let mut request = GateRequest {
+            call_id: call_id.to_owned(),
+            agent_id: self.agent_id.clone(),
+            tool: tool_name.to_owned(),
+            input,
+            session_id: Some(session.session_id.to_string()),
+            scope: self.scope.clone(),
+            plan_id: None,
+            causation: None,
+            base_versions,
+            orchestrator_authority,
+        };
+        // ADR-60 D5 always-on: stamp each mutated target's current pre-image
+        // hash before submission — the same injection the supervisor applies
+        // in `handle_execute_tool` — so the in-process loop's base_version
+        // claims are attested from the same reader the gate conflict-checks
+        // against. The gate refuses a sibling-altared target loudly.
+        stamp_base_versions(&self.gate, &mut request).await;
+        let outcome = match self.gate.submit(request, cancel.clone()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // ADR-60 D5: a base_version collision is the loud signal that
+                // agents raced on shared files — record it at warn so the
+                // operator has a manual-resolution trail (mirrors the
+                // supervisor's `handle_execute_tool`).
+                if let GateError::Conflict { event_id, reason } = &error {
+                    tracing::warn!(
+                        agent_id = %self.agent_id,
+                        %event_id,
+                        %reason,
+                        "in-process: optimistic write conflict"
+                    );
+                }
+                return Err(gate_error_to_tool_error(error));
+            }
+        };
+        // Mirror the supervised child's post-round-trip cancellation check:
+        // a write that already applied while the run was cancelled surfaces
+        // as a cancellation, not a success.
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        serde_json::from_value::<ToolOutput>(outcome.result).map_err(|error| {
+            ToolError::ExecutionFailed {
+                message: format!("gate outcome did not carry a ToolOutput: {error}"),
+            }
+        })
     }
 }
 
@@ -291,11 +327,21 @@ mod tests {
         root: camino::Utf8PathBuf,
         pool: sqlx::SqlitePool,
     ) -> (Arc<WriteGate>, Arc<ToolExecutor>) {
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = SimplePolicyEngine::new(allow_all, Arc::new(TestAudit));
+        fs_gate_with_policy(root, pool, Arc::new(policy))
+    }
+
+    /// Same as [`fs_gate`] but under a caller-supplied policy — lets a test
+    /// exercise the gate's real policy path (e.g. read-only intent) instead of
+    /// allow-all.
+    fn fs_gate_with_policy(
+        root: camino::Utf8PathBuf,
+        pool: sqlx::SqlitePool,
+        policy: Arc<SimplePolicyEngine>,
+    ) -> (Arc<WriteGate>, Arc<ToolExecutor>) {
         let mut registry = ToolRegistry::default();
         registry.register(Box::new(FilesystemTool::new(root.clone())));
-        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
-        let policy: Arc<dyn concerto_core::traits::policy::PolicyEngine> =
-            Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
         let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy.clone()));
         let gate = Arc::new(WriteGate::new(
             policy,
@@ -404,5 +450,64 @@ mod tests {
 
     fn blake3_hex(bytes: &[u8]) -> String {
         blake3::hash(bytes).to_hex().to_string()
+    }
+
+    /// A run whose intent is read-only hard-denies any mutation pre-sink. The
+    /// in-process orchestrator's own authority must survive the
+    /// `InProcessGateBackend -> GateRequest -> WriteGate -> PolicyAction`
+    /// path, so the same write that is denied for an ordinary caller is
+    /// allowed (and audited `coordinator_authority`) for the orchestrator.
+    #[tokio::test]
+    async fn authority_write_through_the_gate_survives_read_only_intent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+
+        // The run is read-only-intent: every filesystem mutation would be a
+        // final pre-sink Deny absent orchestrator authority.
+        let store = Arc::new(crate::intent_grants::IntentGrantStore::new());
+        let auth = Arc::new(crate::intent_grants::SessionIntentAuth::new(store));
+        auth.set_read_only(true);
+        let policy = SimplePolicyEngine::new(
+            vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+            Arc::new(TestAudit),
+        )
+        .with_intent_auth(auth);
+
+        let (gate, executor) = fs_gate_with_policy(utf8_root, pool.clone(), Arc::new(policy));
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        // Without authority the write is denied by the read-only invariant.
+        let denied = backend
+            .execute(
+                "filesystem",
+                json!({ "operation": "write", "path": "auth.txt", "content": "x" }),
+                "call-deny",
+                &session,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(denied.is_err(), "an ordinary caller's write is denied under read-only intent");
+
+        // With authority the same write reaches the gate's policy action with
+        // `orchestrator_authority = true` and applies.
+        let output = backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "auth.txt", "content": "authoritative" }),
+                "call-auth",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("authority write applies through the gate");
+        assert!(!output.summary.is_empty(), "summary flows back to the loop");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("auth.txt")).expect("file on disk"),
+            "authoritative",
+            "the authority write materialized"
+        );
     }
 }

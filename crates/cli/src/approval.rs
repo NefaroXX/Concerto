@@ -394,6 +394,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "command: rm -rf /tmp/foo");
@@ -411,6 +412,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "path: /home/user/secret.txt");
@@ -428,6 +430,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let summary = summarize_input(&action);
         assert!(summary.contains("foo"));
@@ -445,6 +448,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "operation: commit");
@@ -462,6 +466,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "command: ls");
@@ -479,6 +484,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let summary = summarize_input(&action);
         // The truncated form takes the first 119 chars + Unicode ellipsis.
@@ -576,6 +582,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         let cancel = concerto_core::CancellationToken::new();
         let decision = sink.request_approval(&action, cancel.clone()).await;

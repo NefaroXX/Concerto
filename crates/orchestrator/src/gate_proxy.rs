@@ -341,6 +341,11 @@ impl ToolExecutionBackend for GateProxyBackend {
             plan_id: self.plan_id.clone(),
             causation: None,
             base_versions,
+            // TRUST BOUNDARY: this child process is untrusted by design; its
+            // calls never carry orchestrator authority. The supervisor forces
+            // `false` again at the wire boundary (`handle_execute_tool`), so
+            // this is defense in depth, not the guard itself.
+            orchestrator_authority: false,
         };
         let response = self
             .client
@@ -372,6 +377,24 @@ impl ToolExecutionBackend for GateProxyBackend {
                 message: format!("gate outcome did not carry a ToolOutput: {error}"),
             }
         })
+    }
+
+    /// The supervised child NEVER executes with orchestrator authority. This
+    /// backend serves an untrusted agent process, so the authority variant is
+    /// deliberately identical to [`Self::execute`] — authority is not a
+    /// capability the child can hold, request, or smuggle. The supervisor
+    /// enforces the same rule independently at the wire boundary
+    /// (`handle_execute_tool`), so the guarantee does not depend on this
+    /// override.
+    async fn execute_with_authority(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        call_id: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute(tool_name, input, call_id, session, cancel).await
     }
 
     async fn record_ack_decision(
@@ -590,6 +613,7 @@ mod tests {
                     plan_id: None,
                     causation: None,
                     base_versions: BTreeMap::new(),
+                    orchestrator_authority: false,
                 },
             },
         };

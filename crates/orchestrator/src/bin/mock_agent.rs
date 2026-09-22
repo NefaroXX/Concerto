@@ -386,6 +386,7 @@ where
                     // `base_versions` travel inside the scripted turn JSON
                     // (the tool-call arguments), not via a separate knob.
                     base_versions: BTreeMap::new(),
+                    orchestrator_authority: false,
                 },
             },
         };

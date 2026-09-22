@@ -424,7 +424,9 @@ pub fn apply_intent_gate(
 mod tests {
     use super::*;
     use concerto_core::ids::Ulid;
-    use concerto_core::types::CapabilitySet;
+    use concerto_core::policy::SimplePolicyEngine;
+    use concerto_core::traits::policy::PolicyEngine;
+    use concerto_core::types::{CapabilitySet, Condition, PolicyRule};
     use concerto_core::{
         IntentVerdict, RULE_CONSEQUENTIAL, RULE_INTENT_AUTHORIZED, RULE_INTENT_AUTHORIZED_SHELL,
         RULE_INTENT_READONLY_DENY, RULE_OBSERVE, RULE_SHELL_REQUIRES_APPROVAL, RULE_UN_GRANTED,
@@ -441,6 +443,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         }
     }
 
@@ -849,6 +852,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: Some(facts),
+            orchestrator_authority: false,
         }
     }
 
@@ -1221,5 +1225,99 @@ mod tests {
         let input = dispatch_input();
         let dispatch = action("call_specialist", &input);
         assert_eq!(classify_tier(&dispatch), IntentTier::MutateLocal);
+    }
+
+    // ------------------------------------------------------------------
+    // orchestrator-authority branch through the real engine (additive)
+    // ------------------------------------------------------------------
+
+    /// The engine wired with the run's `SessionIntentAuth`, exactly as the
+    /// runtime builds it (bare gate + general approval + intent auth).
+    fn engine_with_session_auth(auth: Arc<SessionIntentAuth>) -> SimplePolicyEngine {
+        SimplePolicyEngine::new(
+            vec![
+                PolicyRule::RequireApproval(Condition::IntentAuthorized),
+                PolicyRule::RequireApproval(Condition::ToolName("call_specialist".into())),
+                PolicyRule::RequireApproval(Condition::Always),
+            ],
+            Arc::new(NoopAudit),
+        )
+        .with_intent_auth(auth)
+    }
+
+    struct NoopAudit;
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::policy::AuditLog for NoopAudit {
+        async fn record(
+            &self,
+            _entry: concerto_core::traits::policy::AuditEntry,
+            _cancel: concerto_core::CancellationToken,
+        ) -> Result<(), concerto_core::error::PolicyError> {
+            Ok(())
+        }
+    }
+
+    /// Specialist path (no authority): the coordinator's `call_specialist` in a
+    /// read-only-intent run is a final pre-sink Deny through the REAL engine —
+    /// the `read_only_denies_call_specialist` behavior, engine-level.
+    #[tokio::test]
+    async fn engine_denies_non_authority_dispatch_in_read_only_run() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = Arc::new(SessionIntentAuth::new(store));
+        auth.set_read_only(true);
+        let engine = engine_with_session_auth(auth);
+
+        let input = dispatch_input();
+        let dispatch = action("call_specialist", &input);
+        let verdict = engine.evaluate(&dispatch, concerto_core::CancellationToken::new()).await;
+        assert_eq!(
+            verdict.expect("evaluate"),
+            concerto_core::types::PolicyVerdict::Deny,
+            "non-authority dispatch in a read-only run stays denied"
+        );
+    }
+
+    /// Orchestrator path (authority): the SAME `call_specialist` action with
+    /// `orchestrator_authority` is allowed through the same engine, despite the
+    /// read-only-intent auth that denies the specialist path.
+    #[tokio::test]
+    async fn engine_allows_authority_dispatch_in_read_only_run() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = Arc::new(SessionIntentAuth::new(store));
+        auth.set_read_only(true);
+        let engine = engine_with_session_auth(auth);
+
+        let input = dispatch_input();
+        let dispatch =
+            PolicyAction { orchestrator_authority: true, ..action("call_specialist", &input) };
+        let verdict = engine.evaluate(&dispatch, concerto_core::CancellationToken::new()).await;
+        assert_eq!(
+            verdict.expect("evaluate"),
+            concerto_core::types::PolicyVerdict::Allow,
+            "the coordinator's own authority dispatch is allowed"
+        );
+    }
+
+    /// Authority does NOT widen a Consequential action: a `git push` under
+    /// authority keeps the approval path (never auto-allowed), so the deny-class
+    /// + sink invariants survive the authority branch.
+    #[tokio::test]
+    async fn engine_authority_keeps_consequential_dispatch_under_approval() {
+        let store = Arc::new(IntentGrantStore::new());
+        let auth = Arc::new(SessionIntentAuth::new(store));
+        auth.set_read_only(true);
+        let engine = engine_with_session_auth(auth);
+
+        let push_input = serde_json::json!({ "operation": "push" });
+        let push = PolicyAction { orchestrator_authority: true, ..action("git", &push_input) };
+        let verdict = engine.evaluate(&push, concerto_core::CancellationToken::new()).await;
+        assert!(
+            matches!(
+                verdict.expect("evaluate"),
+                concerto_core::types::PolicyVerdict::RequireApproval { .. }
+            ),
+            "a Consequential action keeps the approval path even under authority"
+        );
     }
 }

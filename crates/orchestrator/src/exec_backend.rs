@@ -41,6 +41,26 @@ pub trait ToolExecutionBackend: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError>;
 
+    /// Execute one tool call carrying the orchestrator-authority marker.
+    ///
+    /// The in-process single-agent loop calls this so its own executor calls
+    /// evaluate under [`concerto_core::types::PolicyAction::orchestrator_authority`]
+    /// (intent-derived restrictions skipped; deny-class, Consequential sinks,
+    /// plan guards and audit rows kept). The default delegates to
+    /// [`Self::execute`]: the supervised gate-proxy backend runs in a child
+    /// process whose calls are gated by the supervisor write gate and MUST NOT
+    /// acquire authority, so it keeps the fully intent-gated path unchanged.
+    async fn execute_with_authority(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        call_id: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute(tool_name, input, call_id, session, cancel).await
+    }
+
     /// Persist an acknowledgment decision through the audit channel (ADR-55
     /// §5 / audit H-04). The supervised path logs a warning instead: in the
     /// ADR-60 model the audit trail is written supervisor-side (D4/D5).
@@ -157,6 +177,17 @@ impl ToolExecutionBackend for ToolExecutor {
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         ToolExecutor::execute(self, tool_name, input, session, cancel).await
+    }
+
+    async fn execute_with_authority(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        _call_id: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        ToolExecutor::execute_with_authority(self, tool_name, input, session, cancel).await
     }
 
     async fn record_ack_decision(
