@@ -2069,6 +2069,12 @@ async fn execute_agent_loop(
         // skills section and the environment card.
         .with_project_context(Some(project_context));
 
+    // ADR-43: one audit record + `info` log per run proving which enabled
+    // skill packs (and how many characters) were injected into this loop's
+    // system prompt. Content-free (ids and sizes only) and silent when no
+    // section is injected.
+    services.skills.report_injection(&services.bus, session_id);
+
     let retry_policy = RetryPolicy::new(services.config.retry.clone());
     let metrics_store = session_store.clone();
     let mut agent = AgentLoop::with_project_root(
@@ -4117,6 +4123,13 @@ async fn run_multi_agent(
     // run and shared by the planner and every registered specialist. A UI
     // toggle (Task 7) refreshes `services.skills`; the next run picks it up.
     let skills_section = services.skills.section();
+    // ADR-43: one audit record + `info` log per run proving which enabled
+    // skill packs (and how many characters) were injected into the
+    // coordinator's dispatch system prompt. Content-free (ids and sizes only)
+    // and silent when no section is injected. Emitted here — after the
+    // supervised-path early return above — so the record only claims what this
+    // in-process coordinator actually injects.
+    services.skills.report_injection(&services.bus, session_id);
 
     // `agent_configs` is built above (next to the tool-calling role
     // derivation) and reused here for the registry and the coordinator. The

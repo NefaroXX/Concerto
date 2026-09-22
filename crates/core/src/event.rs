@@ -491,6 +491,23 @@ pub enum EventKind {
         error: Option<String>,
     },
 
+    // --- ADR-43: skill-pack prompt injection ---
+    /// One session audit record per run asserting that enabled skill-pack
+    /// instructions were injected into the run's system prompt. Emitted by
+    /// [`crate::event::EventBus`] consumers at run start, after the skills
+    /// section has been assembled and budgeted.
+    ///
+    /// Carries only identifiers and sizes — `skill_ids` are the resolved pack
+    /// ids, `total_chars` the assembled section length, and `budget_chars` the
+    /// configured cap. Pack instruction *content* is deliberately never
+    /// included; this record proves *that* and *how much* was injected without
+    /// persisting secrets-adjacent prompt text.
+    SkillsInjected {
+        skill_ids: Vec<String>,
+        total_chars: usize,
+        budget_chars: usize,
+    },
+
     // --- Phase 8: API ---
     OpenAPIDocGenerated {
         path: String,

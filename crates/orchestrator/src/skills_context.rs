@@ -20,8 +20,10 @@
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use concerto_core::event::{EventBus, EventKind};
+use concerto_core::ids::Ulid;
 use concerto_skills::{SkillDescriptor, SkillManager, SkillsError};
-use tracing::error;
+use tracing::{error, info, warn};
 
 /// Default budget for the injected skills section (characters) when
 /// `SkillsConfig.max_chars` is unset. Mirrors the budget documented in
@@ -184,6 +186,46 @@ impl SkillsContext {
     /// The resolved skill descriptors from the last successful refresh.
     pub fn descriptors(&self) -> Vec<SkillDescriptor> {
         self.state.read().unwrap_or_else(|poison| poison.into_inner()).descriptors.clone()
+    }
+
+    /// Emit the one-per-run skills-injection audit record and an `info` log
+    /// line.
+    ///
+    /// Publishes a single [`EventKind::SkillsInjected`] bound to `session_id`
+    /// (persisted by the session event recorder and surfaced as a transcript
+    /// activity entry) and logs the same summary at `info` level, so a default
+    /// log level proves *which* enabled skill packs — and *how many*
+    /// characters against the configured budget — were injected into this
+    /// run's system prompt.
+    ///
+    /// Deliberately content-free: only sorted, deduplicated pack ids and
+    /// character counts are reported, never pack instruction text (ADR-43
+    /// secrets-adjacent caution). No-op when no section is currently injected,
+    /// so a disabled configuration stays silent. Publishing is fail-soft: a
+    /// publish error is warned about and the run proceeds.
+    pub fn report_injection(&self, bus: &EventBus, session_id: Ulid) {
+        let (skill_ids, total_chars, budget_chars) = {
+            let state = self.state.read().unwrap_or_else(|poison| poison.into_inner());
+            if state.section.is_empty() {
+                return;
+            }
+            let mut ids: Vec<String> = state.descriptors.iter().map(|d| d.id.clone()).collect();
+            ids.sort();
+            ids.dedup();
+            (ids, state.section.chars().count(), self.max_chars)
+        };
+
+        info!(
+            ?skill_ids,
+            total_chars, budget_chars, "skill instructions injected into the session prompt"
+        );
+        if let Err(error) = bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::SkillsInjected { skill_ids, total_chars, budget_chars },
+        ) {
+            warn!(%error, %session_id, "failed to publish the skills injection event");
+        }
     }
 
     /// Update config-level enablement live (Task 7 calls this from the UI).
@@ -429,5 +471,76 @@ mod tests {
         );
         context.refresh().expect("refresh succeeds without touching the filesystem");
         assert_eq!(context.section(), "");
+    }
+
+    #[tokio::test]
+    async fn report_injection_publishes_ids_sizes_and_no_content() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_toml_pack(temp.path(), "alpha", "SECRET-ALPHA-CONTENT");
+        write_toml_pack(temp.path(), "beta", "SECRET-BETA-CONTENT");
+        let context = SkillsContext::new(manager(temp.path()), None, true, 4000);
+        context.refresh().expect("refresh succeeds");
+        let section = context.section();
+
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe();
+        context.report_injection(&bus, Ulid::new());
+
+        let event = receiver.recv().await.expect("skills injection event");
+        match &event.kind {
+            EventKind::SkillsInjected { skill_ids, total_chars, budget_chars } => {
+                assert_eq!(skill_ids, &vec!["alpha".to_string(), "beta".to_string()]);
+                assert_eq!(*total_chars, section.chars().count());
+                assert_eq!(*budget_chars, 4000);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // The audit record must never carry pack instruction content.
+        let rendered = format!("{:?}", event.kind);
+        assert!(!rendered.contains("SECRET-ALPHA-CONTENT"), "pack content leaked: {rendered}");
+        assert!(!rendered.contains("SECRET-BETA-CONTENT"), "pack content leaked: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn report_injection_reflects_enabled_subset_and_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_toml_pack(temp.path(), "alpha", "Do alpha.");
+        write_toml_pack(temp.path(), "beta", "Do beta.");
+        let context =
+            SkillsContext::new(manager(temp.path()), Some(vec!["beta".to_string()]), true, 512);
+        context.refresh().expect("refresh succeeds");
+
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe();
+        context.report_injection(&bus, Ulid::new());
+
+        let event = receiver.recv().await.expect("skills injection event");
+        match &event.kind {
+            EventKind::SkillsInjected { skill_ids, total_chars, budget_chars } => {
+                assert_eq!(skill_ids, &vec!["beta".to_string()]);
+                assert!(*total_chars > 0, "injected section must be non-empty");
+                assert_eq!(*budget_chars, 512);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_injection_is_silent_when_no_skills_injected() {
+        let context = SkillsContext::new(
+            Arc::new(SkillManager::new(Vec::new())),
+            Some(Vec::new()),
+            false,
+            4000,
+        );
+        context.refresh().expect("refresh succeeds");
+
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe();
+        context.report_injection(&bus, Ulid::new());
+        assert!(
+            receiver.try_recv().is_err(),
+            "no event must be published when nothing is injected"
+        );
     }
 }

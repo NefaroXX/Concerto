@@ -324,6 +324,18 @@ pub fn transcript_entry_from_event_with_labels(
             agent: "Agent".to_string(),
             content: format!("Task {task_id} changed state from {from:?} to {to:?}."),
         }),
+        // ADR-43: skill-pack instructions were injected into this run's prompt.
+        // Ids and sizes only — never pack content.
+        EventKind::SkillsInjected { skill_ids, total_chars, budget_chars } => {
+            Some(TranscriptEntry::Activity {
+                agent: "Skills".to_string(),
+                content: format!(
+                    "Injected {} skill pack(s) [{}]: {total_chars}/{budget_chars} chars",
+                    skill_ids.len(),
+                    skill_ids.join(", "),
+                ),
+            })
+        }
 
         // ---- Provider retry status (rendered as chat thinking lines). ----
         EventKind::ProviderRetryScheduled { attempt, delay_ms, reason, source, .. } => {
