@@ -3,7 +3,7 @@
 //! Phase 3: basic sequential loop with memory, undo, and eval hooks.
 //! Multi-agent coordination is Phase 5.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -115,6 +115,65 @@ const MAX_CONTINUATION_ROUNDS: u32 = 8;
 /// Number of consecutive rounds with identical progress before declaring
 /// non-convergence and escalating to the user.
 const MAX_STALE_ROUNDS: u32 = 6;
+
+/// Acknowledgement condition marker for "the undo stash could not be created
+/// (project is not a git repository, or git is unavailable)". Part of the
+/// [`ACK_REMEMBERED`] key `(session_id, project_root, condition)`.
+const UNDO_NOT_A_REPO_CONDITION: &str = "undo-commit-failed";
+
+/// Key identifying one acknowledgement condition:
+/// `(session_id, project_root, condition)`. The session id is stored in its
+/// string form so the key is `Hash + Send` without depending on `Ulid`.
+type AckKey = (String, std::path::PathBuf, &'static str);
+
+/// Process-lifetime record of acknowledgement conditions a continuing run has
+/// already answered, keyed by [`AckKey`].
+///
+/// Why process-lifetime rather than an [`AgentLoop`] field: the runtime builds
+/// a fresh loop for every user message (`runtime_runner.rs`,
+/// `bin/agent_process.rs`), so a continue turn runs on a different instance
+/// than the turn that prompted. Only the desktop process lives across messages
+/// (its continues are covered); a CLI invocation is a fresh process and
+/// correctly re-asks once per invocation. Deliberately not persisted to any
+/// store — a fresh process re-asks once, which is the safe direction. Only
+/// continuing acknowledgements are recorded: an abort ends the run and must
+/// never be replayed as consent (see `setup_undo_stash`).
+static ACK_REMEMBERED: std::sync::LazyLock<std::sync::Mutex<HashSet<AckKey>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Returns `true` when `(session_id, project_root, condition)` was already
+/// acknowledged by a continuing run in this process. A poisoned lock is treated
+/// as "not remembered" so the caller re-asks rather than panicking.
+fn ack_is_remembered(
+    session_id: Ulid,
+    project_root: &std::path::Path,
+    condition: &'static str,
+) -> bool {
+    let guard = match ACK_REMEMBERED.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                "ack-remembered lock poisoned ({e}); treating '{condition}' as not remembered"
+            );
+            return false;
+        }
+    };
+    guard.contains(&(session_id.to_string(), project_root.to_path_buf(), condition))
+}
+
+/// Records a continuing acknowledgement for `(session_id, project_root,
+/// condition)`. Best-effort: a poisoned lock logs and drops the record (a later
+/// round then re-asks), never panics.
+fn remember_ack(session_id: Ulid, project_root: &std::path::Path, condition: &'static str) {
+    let mut guard = match ACK_REMEMBERED.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("ack-remembered lock poisoned ({e}); not recording '{condition}'");
+            return;
+        }
+    };
+    guard.insert((session_id.to_string(), project_root.to_path_buf(), condition));
+}
 
 /// Character cap for the loop's persisted end-reason note (completion fix:
 /// the terminal reason/surfaces bounded into the session event log).
@@ -955,11 +1014,29 @@ impl AgentLoop {
             let warning = "This project is not a git repository (or git is unavailable), so \
                             changes made during this task cannot be automatically undone. \
                             Continue anyway?";
-            let ack = self.approval.request_ack(session_id, warning, cancel.clone()).await;
+            // Ask once per `(session_id, project_root, condition)` across the
+            // whole process: a non-git project cannot become a git repo
+            // mid-run, and the runtime rebuilds the loop for every user
+            // message, so this must outlive any single loop instance. Only a
+            // continuing run is ever remembered, so a skipped prompt is
+            // truthfully acknowledged.
+            let ack =
+                if ack_is_remembered(session_id, &self.project_root, UNDO_NOT_A_REPO_CONDITION) {
+                    true
+                } else {
+                    let ack = self.approval.request_ack(session_id, warning, cancel.clone()).await;
+                    // Only a continuing acknowledgement is remembered: an abort
+                    // ends the run and must never be silently replayed as consent.
+                    if ack {
+                        remember_ack(session_id, &self.project_root, UNDO_NOT_A_REPO_CONDITION);
+                    }
+                    ack
+                };
             // Audit seam (ADR-55 §5 / audit H-04): persist the ack outcome
             // through the same channel as approval decisions, sharing the run's
             // correlation_id chain. Pure observability — the ack bool still
-            // drives the same abort branch below.
+            // drives the same abort branch below. A remembered (skipped) prompt
+            // records a row too, so the audit trail shows every decision point.
             self.tool_executor
                 .record_ack_decision(session_id, correlation_id, warning, ack, cancel)
                 .await;
@@ -3116,6 +3193,12 @@ mod tests {
         fn entries(&self) -> Vec<AuditEntry> {
             self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
         }
+
+        /// Number of `request_ack` audit rows (one per ack decision point,
+        /// prompted or remembered).
+        fn ack_rows(&self) -> usize {
+            self.entries().into_iter().filter(|entry| entry.tool_name == "request_ack").count()
+        }
     }
 
     /// A simple tool that echoes input back as output.
@@ -3437,6 +3520,47 @@ mod tests {
         }))
     }
 
+    /// Like `make_loop_with_dir` but with a [`CapturingAudit`] policy log,
+    /// returned so tests can assert the audit rows an ack decision writes.
+    fn make_loop_with_dir_capturing(
+        provider: Arc<dyn LlmProvider>,
+        approval: Arc<dyn ApprovalSink>,
+        max_iterations: u32,
+        project_dir: &str,
+    ) -> (AgentLoop, CapturingAudit) {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let audit = CapturingAudit::new();
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(audit.clone())));
+        let executor = Arc::new(
+            ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(approval.clone()),
+        );
+        let loop_ = AgentLoop::with_project_root(
+            EventBus::new(256),
+            approval.clone(),
+            provider,
+            executor,
+            Arc::new(NoopMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new(project_dir))),
+            EvalEngine::new(project_dir),
+            PromptBuilder::new("test system prompt"),
+            max_iterations,
+            true, // fast mode
+            std::path::PathBuf::from(project_dir),
+            None, // no budget allocator
+        )
+        .with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
+            // Fast, deterministic retries for tests.
+            initial_delay_ms: 5,
+            max_delay_ms: 50,
+            jitter: false,
+            multiplier: 2.0,
+            ..concerto_config::RetryConfig::default()
+        }));
+        (loop_, audit)
+    }
+
     /// Build a loop with extra tools alongside the default EchoTool.
     fn make_loop_with_extra_tools(
         provider: Arc<dyn LlmProvider>,
@@ -3596,6 +3720,73 @@ mod tests {
         }
     }
 
+    /// An approval sink that counts `request_ack` prompts and always
+    /// acknowledges (for asserting the prompt is asked once per condition).
+    #[derive(Clone)]
+    struct CountingAckApproval {
+        prompts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ApprovalSink for CountingAckApproval {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: concerto_core::CancellationToken,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+        async fn approve_all_for_session(
+            &self,
+            _session_id: Ulid,
+            _cancel: concerto_core::CancellationToken,
+        ) {
+        }
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: concerto_core::CancellationToken,
+        ) -> bool {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// An approval sink that aborts the first `request_ack` and acknowledges
+    /// every later one, counting prompts (for proving an abort is never
+    /// remembered and must therefore be re-asked).
+    #[derive(Clone)]
+    struct FirstDenyThenAckApproval {
+        prompts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ApprovalSink for FirstDenyThenAckApproval {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: concerto_core::CancellationToken,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+        async fn approve_all_for_session(
+            &self,
+            _session_id: Ulid,
+            _cancel: concerto_core::CancellationToken,
+        ) {
+        }
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: concerto_core::CancellationToken,
+        ) -> bool {
+            let call = self.prompts.fetch_add(1, Ordering::SeqCst);
+            call > 0
+        }
+    }
+
     /// An approval sink that returns `false` for request_ack.
     struct DenyAckApproval;
     #[async_trait]
@@ -3722,6 +3913,105 @@ mod tests {
 
         assert!(result.is_err(), "expected Err, got Ok");
         assert!(matches!(result.unwrap_err(), OrchestratorError::Cancelled));
+    }
+
+    /// The runtime builds a fresh `AgentLoop` for every user message, so the
+    /// remembered acknowledgement must live at process scope: a second loop
+    /// instance on the same `(session, project)` must not re-prompt, yet must
+    /// still audit its decision point (1 prompt + 2 audit rows total).
+    #[tokio::test]
+    async fn undo_ack_prompt_remembered_across_loop_instances() {
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let approval: Arc<dyn ApprovalSink> =
+            Arc::new(CountingAckApproval { prompts: prompts.clone() });
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "test task");
+        let cancel = CancellationToken::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_str().expect("utf8 tempdir");
+
+        // Instance 1: prompts (ack true) and records the continuation.
+        let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop1, audit1) =
+            make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
+        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 1");
+
+        // Instance 2 (a later user message): same session + project, no re-prompt.
+        let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop2, audit2) =
+            make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 2");
+
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            1,
+            "the non-git warning must be asked once per (session, project) across loop instances"
+        );
+        assert_eq!(
+            audit1.ack_rows() + audit2.ack_rows(),
+            2,
+            "both decision points are audited (1 prompt + 1 remembered skip)"
+        );
+    }
+
+    /// A different project root is a different condition triple: it must be
+    /// asked again rather than silently inheriting another project's ack.
+    #[tokio::test]
+    async fn undo_ack_prompt_asked_again_for_a_different_project() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![], vec![]]));
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let approval = Arc::new(CountingAckApproval { prompts: prompts.clone() });
+
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        let (mut loop_, audit) =
+            make_loop_with_dir_capturing(provider, approval, 10, first.path().to_str().unwrap());
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let cancel = CancellationToken::new();
+
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 1");
+        loop_.project_root = std::path::PathBuf::from(second.path());
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 2");
+
+        assert_eq!(prompts.load(Ordering::SeqCst), 2, "a different project must be asked again");
+        assert_eq!(audit.ack_rows(), 2, "both prompts are audited");
+    }
+
+    /// An aborted acknowledgement ends the run and is never remembered: a later
+    /// loop on the same `(session, project)` must prompt again rather than
+    /// replay the abort's non-consent as consent.
+    #[tokio::test]
+    async fn undo_ack_not_remembered_after_abort() {
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let approval: Arc<dyn ApprovalSink> =
+            Arc::new(FirstDenyThenAckApproval { prompts: prompts.clone() });
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "test task");
+        let cancel = CancellationToken::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_str().expect("utf8 tempdir");
+
+        // Instance 1: request_ack returns false → the run is cancelled.
+        let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop1, _audit1) =
+            make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
+        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await;
+        assert!(matches!(aborted.unwrap_err(), OrchestratorError::Cancelled));
+
+        // Instance 2: same triple; request_ack now returns true. Because the
+        // abort was not remembered, the condition must be asked again.
+        let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop2, _audit2) =
+            make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("second run");
+
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            2,
+            "an aborted acknowledgement must be asked again, never replayed as consent"
+        );
     }
 
     #[tokio::test]
