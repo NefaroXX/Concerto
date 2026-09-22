@@ -376,6 +376,66 @@ impl ToolExecutor {
         }
     }
 
+    /// Persist the coordinator's FINAL run-shape decision (advisor-mode intent
+    /// routing) as a distinct audit entry.
+    ///
+    /// The deterministic router hint keeps its own `intent_router` row as the
+    /// hint source of truth ([`Self::record_routing_decision`] /
+    /// [`Self::record_auto_intent_decision`]); this row records the shape the
+    /// coordinator actually chose AFTER consulting session context, plus the
+    /// reason, so an override of the hint is observable and diagnosable rather
+    /// than a silent divergence. `tool_name` is the synthetic
+    /// `"coordinator_shape"`, `verdict` carries the final shape (`Plan` |
+    /// `Execute`), `rule_matched` the reason code, and `user_response` a
+    /// compact JSON envelope `{hint, final_shape, reason}`. The ADR-28 §6
+    /// execution fields stay `None`: there is no command behind a shape
+    /// decision.
+    pub async fn record_coordinator_shape_decision(
+        &self,
+        session_id: crate::ids::Ulid,
+        correlation_id: crate::ids::Ulid,
+        hint: &str,
+        final_shape: &str,
+        reason: &str,
+        cancel: CancellationToken,
+    ) {
+        let entry = AuditEntry {
+            tool_name: "coordinator_shape".to_owned(),
+            verdict: final_shape.to_owned(),
+            input_hash: String::new(),
+            session_id,
+            correlation_id,
+            timestamp: OffsetDateTime::now_utc(),
+            user_response: Some(
+                serde_json::json!({
+                    "hint": hint,
+                    "final_shape": final_shape,
+                    "reason": reason,
+                })
+                .to_string(),
+            ),
+            rule_matched: Some(reason.to_owned()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            // A shape decision binds no plan and names no source revision.
+            plan_id: None,
+            source_revision: None,
+        };
+        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
+            tracing::error!(%error, "coordinator-shape audit write failed");
+        } else {
+            tracing::debug!(hint, final_shape, reason, "coordinator shape recorded");
+        }
+    }
+
     /// Persist an automatic intent-routing decision (ADR-55 Phase 2d §5) as a
     /// distinct audit entry through the same channel as
     /// [`Self::record_routing_decision`].
@@ -1274,6 +1334,62 @@ mod tests {
         // Shell capabilities expose neither (the fs tool requires read).
         let shell_caps = CapabilitySet::default().with_requirement("shell");
         assert_eq!(executor.tool_definitions_for(&shell_caps).len(), 1);
+    }
+
+    /// Advisor-mode intent routing writes BOTH audit rows: the deterministic
+    /// router hint (`intent_router`) stays the hint source of truth, and the
+    /// coordinator's final shape gets its own `coordinator_shape` row carrying
+    /// the final shape + reason. Neither write replaces the other.
+    #[tokio::test]
+    async fn coordinator_shape_row_coexists_with_intent_router_row() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = Ulid::new();
+
+        executor
+            .record_routing_decision(
+                session,
+                Ulid::new(),
+                "run the approved plan",
+                "plan_keyword",
+                "Plan",
+                0.8,
+                "auto_granted",
+                CancellationToken::new(),
+            )
+            .await;
+        executor
+            .record_coordinator_shape_decision(
+                session,
+                Ulid::new(),
+                "Plan",
+                "Execute",
+                "approved_plan_overrides_plan_hint",
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.tool_name == "intent_router"),
+            "the hint row is the source of truth and must be present: {entries:?}"
+        );
+        let shape = entries
+            .iter()
+            .find(|entry| entry.tool_name == "coordinator_shape")
+            .expect("the coordinator shape row is recorded");
+        assert_eq!(shape.verdict, "Execute", "verdict carries the final shape");
+        assert_eq!(
+            shape.rule_matched.as_deref(),
+            Some("approved_plan_overrides_plan_hint"),
+            "rule_matched carries the override reason"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(shape.user_response.as_deref().unwrap_or("{}"))
+                .expect("the response is a JSON envelope");
+        assert_eq!(envelope["hint"], "Plan");
+        assert_eq!(envelope["final_shape"], "Execute");
     }
 
     #[tokio::test]

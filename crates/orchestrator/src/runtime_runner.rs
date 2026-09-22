@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent_runner::AgentRunner;
 use crate::coordinator::{
-    ApprovedPlanSeed, CoordinatorAgent, HeadlessResumeSeed, OrchestrationDepth,
+    ApprovedPlanSeed, CoordinatorAgent, HeadlessResumeSeed, RunShape, RunShapeContext, RunShapeHint,
 };
 use crate::intent_grants::{
     apply_intent_gate, auto_grant_envelope, flavor_hint, is_confident_auto_grant_execute,
@@ -2452,25 +2452,97 @@ pub fn task_action_required(effective: RequestedOutcome, gate_read_only: bool) -
     matches!(effective, RequestedOutcome::Execute) && !gate_read_only
 }
 
-/// The authoritative acting-run vehicle (ADR-55 Phase 2e fix, 2026-09-09).
+/// The authoritative acting-run vehicle (advisor-mode intent routing).
 ///
-/// The single/multi switch (the desktop toggle wired through
-/// `RequestBuilder::with_single_agent` into [`AgentRunRequest::
-/// force_single_agent`], or the `force_single_agent` config lever) is the
-/// dispatch decision for ACTING runs — no outcome-based exceptions:
+/// The deterministic router is an ADVISOR: its outcome never selects the code
+/// path on its own. The single/multi switch and the permission envelope still
+/// bound WHERE a run may go:
 ///
-/// - Multi mode (`force_single_agent == false`) + [`RunEnvelope::Acting`] →
-///   the coordinator (`run_multi_agent`) for every acting outcome (Execute,
-///   Plan, Verify, Diagnose, Review, Answer) — the envelope is the only
-///   branch, exactly as ADR-55 Phase 2e §2 demands the router decide only
-///   the permission envelope.
-/// - Single mode, `force_single_agent`, or a [`RunEnvelope::ReadOnly`]
-///   envelope → the single-agent loop.
+/// - Single mode / `force_single_agent` → the single-agent loop.
+/// - [`RunEnvelope::ReadOnly`] (task-level prohibition, unresolved `AskUser`,
+///   gate denial) → the single-agent loop: the negation veto and consent
+///   safety stay read-only and are decided by gate policy, never by routing.
+/// - [`RunEnvelope::Acting`] → the coordinator, EXCEPT the cheap fresh-chat
+///   fast path: a pure small-talk / question `Answer` hint with NO active
+///   objective (no approved plan, no prior outcomes) stays on the single-agent
+///   loop so a fresh greeting never pays for a coordinator spin. Any other
+///   acting hint — including an `Answer` hint over an established objective —
+///   goes to the coordinator, which makes the final run-shape decision with
+///   session context.
 ///
-/// Published so tests can pin all four dispatch permutations without a full
-/// run.
-pub fn dispatches_to_coordinator(force_single_agent: bool, envelope: RunEnvelope) -> bool {
-    !force_single_agent && envelope.is_acting()
+/// Pure so tests can pin the permutations without a full run.
+pub fn dispatches_to_coordinator(
+    force_single_agent: bool,
+    envelope: RunEnvelope,
+    routing: &RouterOutput,
+    context: &RunShapeContext,
+) -> bool {
+    if force_single_agent || !envelope.is_acting() {
+        return false;
+    }
+    !is_cheap_single_agent_answer(routing, context)
+}
+
+/// The preserved single-agent fast path: a pure `Answer` hint (small-talk or a
+/// plain question) with no active objective stays cheap. The hint is an
+/// advisor here only — a non-Answer hint, or an Answer over an established
+/// objective, is coordinator-bound.
+fn is_cheap_single_agent_answer(routing: &RouterOutput, context: &RunShapeContext) -> bool {
+    if context.has_active_objective() || routing.outcome != RequestedOutcome::Answer {
+        return false;
+    }
+    matches!(
+        routing.route,
+        RouterRoute::RuleHit { rule: "smalltalk" }
+            | RouterRoute::RuleHit { rule: "question" }
+            | RouterRoute::AskUser
+    )
+}
+
+/// Translate the routing hint into the coordinator's advisor-mode shape hint.
+fn run_shape_hint_from_routing(routing: &RouterOutput, utterance: &str) -> RunShapeHint {
+    RunShapeHint {
+        outcome: routing.outcome,
+        route: routing.route,
+        confidence: routing.confidence,
+        utterance: utterance.to_owned(),
+    }
+}
+
+/// Resolve the session context the coordinator's final shape decision consults.
+///
+/// Fail-soft: any lookup error degrades to "no active objective" for that
+/// facet (a missing session store simply yields `false`); the run is never
+/// failed by context gathering. Kept synchronous and side-effect-free apart
+/// from a process-local registry read and the already-loaded session store.
+async fn resolve_run_shape_context(
+    session_id: Ulid,
+    plan_objective_hash: &str,
+    applied_plan: Option<&PlanBinding>,
+    pending_binding_exists: bool,
+    session_store: Option<&Arc<dyn SessionStore>>,
+    cancel: CancellationToken,
+) -> RunShapeContext {
+    let registry_has_binding = plan_registry().pending(session_id, plan_objective_hash).is_some();
+    let mut has_approved_plan = applied_plan.is_some() || registry_has_binding;
+    // Durable bindings survive a restart: check the session-newest row too so
+    // an approved plan that never rehydrated this process still counts. A
+    // storage error is logged and treated as absent (fail-soft).
+    if !has_approved_plan {
+        if let Some(store) = session_store {
+            match store.load_newest_plan_binding(session_id, cancel).await {
+                Ok(binding) => has_approved_plan = binding.is_some(),
+                Err(error) => {
+                    tracing::warn!(%error, "run-shape context: durable plan binding lookup failed")
+                }
+            }
+        }
+    }
+    RunShapeContext {
+        has_approved_plan,
+        has_prior_outcomes: has_approved_plan || pending_binding_exists,
+        pending_approval: pending_binding_exists && applied_plan.is_none(),
+    }
 }
 
 /// ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
@@ -3141,6 +3213,10 @@ pub async fn run_shared_agent(
     // AFTER this snapshot — a change between decision and dispatch is silent
     // divergence, never something a user saw.
     let mut approval_time_revision: Option<String> = None;
+    // Advisor-mode intent routing: whether an approved binding existed at all
+    // (before the auto-Apply consumes it below). Feeds the coordinator's
+    // session context as evidence of an established objective.
+    let bound_is_some = bound.is_some();
     let (effective, confirmation) = match bound {
         Some(binding) => {
             // ADR-55 Phase 2d §3: auto-Apply — no dialog. The binding was
@@ -3610,15 +3686,23 @@ pub async fn run_shared_agent(
         );
     }
 
-    // 7. Multi-agent dispatch. ADR-55 Phase 2e §1: the text-only fork is
-    // deleted — every non-empty run enters the unified agent loop, and Chat
-    // is what the loop does when the model uses no tools (≈ one text-only
-    // call in cost, zero forks). Single-vs-coordinator selection is the
-    // authoritative acting-run switch (2026-09-09 fix): the multi switch
-    // (`!force_single_agent`) routes EVERY Acting-envelope run to the
-    // coordinator — all acting outcomes, no flavor-hint exceptions; single
-    // mode, `force_single_agent`, and ReadOnly envelopes run the loop.
-    if dispatches_to_coordinator(req.force_single_agent, envelope) {
+    // 7. Multi-agent dispatch (advisor-mode intent routing). The routing hint
+    // is ADVISORY: the router no longer branches the run shape up front. The
+    // coordinator receives the hint plus session context and finalizes the
+    // shape itself (Plan vs Execute) at run start. The preserved fast path is
+    // the cheap fresh-chat route: a pure small-talk/question Answer hint with
+    // no active objective stays on the single-agent loop; every other acting
+    // run goes to the coordinator.
+    let run_shape_context = resolve_run_shape_context(
+        session_id,
+        &plan_objective_hash,
+        applied_plan.as_ref(),
+        bound_is_some,
+        session_store.as_ref(),
+        req.cancel_token.clone(),
+    )
+    .await;
+    if dispatches_to_coordinator(req.force_single_agent, envelope, &routing, &run_shape_context) {
         return run_multi_agent(
             &req,
             &services,
@@ -3631,7 +3715,6 @@ pub async fn run_shared_agent(
             event_recorder,
             transcript_recorder,
             action_required,
-            effective_outcome,
             plan_objective_hash,
             approved_context.as_ref(),
             &stage_tracker,
@@ -3640,6 +3723,8 @@ pub async fn run_shared_agent(
             resume_updated_at_ms,
             headless_resume,
             project_context.clone(),
+            run_shape_hint_from_routing(&routing, &req.input),
+            run_shape_context,
         )
         .await;
     }
@@ -3807,7 +3892,6 @@ async fn run_multi_agent(
     event_recorder: EventRecorderGuard,
     transcript_recorder: TranscriptRecorderGuard,
     action_required: bool,
-    effective_outcome: RequestedOutcome,
     plan_objective_hash: String,
     approved_plan: Option<&ApprovedPlanContext>,
     stage_tracker: &Arc<Mutex<StageTracker>>,
@@ -3826,6 +3910,11 @@ async fn run_multi_agent(
     // environment card; its refresh cadence also gates the coordinator's
     // maintenance nudge. Refreshed once at run start by `run_shared_agent`.
     project_context: Arc<crate::project_context::ProjectContext>,
+    // Advisor-mode intent routing: the router's ADVISORY hint + the session
+    // context. The coordinator finalizes the run shape from these at run
+    // start; the wrapper no longer branches the shape up front.
+    run_shape_hint: RunShapeHint,
+    run_shape_context: RunShapeContext,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -4368,16 +4457,19 @@ async fn run_multi_agent(
             coordinator = coordinator.with_collaboration_rules(rules)?;
         }
     }
-    // ADR-55 Phase 2b: a Plan outcome runs the FULL coordinator (memory +
-    // design stage, planner, graph validation) capped at planning-only depth:
-    // it renders and persists a real plan artifact and touches no tools. The
-    // stage feed thus stays at Planning/Complete and reports no Execute/Verify
-    // (M1); no checkpoint is written for the run; the rendered plan is bound
-    // to the objective below (M3).
-    let planning_only = effective_outcome == RequestedOutcome::Plan;
-    if planning_only {
-        coordinator = coordinator.with_orchestration_depth(OrchestrationDepth::PlanningOnly);
-    }
+    // Advisor-mode intent routing: hand the coordinator the router hint + the
+    // session context. The coordinator finalizes the run shape (Plan vs
+    // Execute) itself at run start, overriding the hint when context
+    // contradicts it. The wrapper's local `planning_only` prediction is
+    // derived from the SAME pure decision so the stage feed and the post-run
+    // plan binding agree with the coordinator's choice.
+    let (predicted_shape, _predicted_reason) =
+        crate::coordinator::decide_run_shape(&run_shape_hint, &run_shape_context);
+    let planning_only = predicted_shape == RunShape::Plan;
+    // Attach the hint + context unconditionally: the coordinator decides and
+    // records the shape (ADR-65 Decision + `coordinator_shape` audit row).
+    coordinator =
+        coordinator.with_run_shape_hint(run_shape_hint).with_run_shape_context(run_shape_context);
     // ADR-60 D7 (#152): an approved-plan run seeds the whiteboard-verified
     // structured state so decompose skips the architect — re-deriving an
     // approved plan (silent re-decompose) is forbidden. The supervised path
@@ -6961,25 +7053,45 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // dispatches_to_coordinator (ADR-55 Phase 2e acting-run vehicle fix):
-    // the single/multi switch routes Acting runs, with no outcome-based
-    // exceptions — four pinning permutations.
+    // dispatches_to_coordinator (advisor-mode intent routing): the single/multi
+    // switch and the permission envelope still bound WHERE a run may go, but
+    // the routing hint is advisory — only a pure fresh-chat Answer keeps the
+    // single-agent fast path.
     // ------------------------------------------------------------------
+
+    /// A routing hint as the deterministic router emits it. Built through
+    /// `route()` so the non-exhaustive output type is never constructed by
+    /// struct literal in tests.
+    fn routed(input: &str) -> RouterOutput {
+        concerto_core::intent::route(input, std::path::PathBuf::from("."))
+    }
 
     #[test]
     fn multi_mode_acting_envelope_dispatches_coordinator_for_every_acting_outcome() {
-        // The envelope is the only branch: Verify (and every other acting
-        // outcome) dispatches the coordinator in multi mode, not just
-        // Execute/Plan.
-        assert!(dispatches_to_coordinator(false, RunEnvelope::Acting));
+        // The envelope is the only branch for acting runs with an established
+        // objective: Verify (and every other acting outcome) dispatches the
+        // coordinator in multi mode, not just Execute/Plan.
+        let context = RunShapeContext { has_prior_outcomes: true, ..Default::default() };
+        let verify = routed("run the tests");
+        assert_eq!(verify.outcome, RequestedOutcome::Verify);
+        assert!(dispatches_to_coordinator(false, RunEnvelope::Acting, &verify, &context));
         // Execute still dispatches (sanity for the previous behavior).
-        assert!(dispatches_to_coordinator(false, RunEnvelope::from_confirmation("auto_granted")));
+        let execute = routed("fix the parser");
+        assert_eq!(execute.outcome, RequestedOutcome::Execute);
+        assert!(dispatches_to_coordinator(
+            false,
+            RunEnvelope::from_confirmation("auto_granted"),
+            &execute,
+            &context
+        ));
     }
 
     #[test]
     fn single_mode_acting_execute_stays_single_loop() {
+        let context = RunShapeContext::default();
+        let execute = routed("fix the parser");
         assert!(
-            !dispatches_to_coordinator(true, RunEnvelope::Acting),
+            !dispatches_to_coordinator(true, RunEnvelope::Acting, &execute, &context),
             "single mode keeps even an acting Execute on the single-agent loop"
         );
     }
@@ -6988,8 +7100,11 @@ mod runtime_runner_tests {
     fn forced_single_agent_overrides_multi_mode() {
         // `with_single_agent(false)` is the multi-mode signal; a forced
         // single-agent request never routes to the coordinator.
-        assert!(!dispatches_to_coordinator(true, RunEnvelope::Acting));
-        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly));
+        let context = RunShapeContext::default();
+        let execute = routed("fix the parser");
+        let smalltalk = routed("hi");
+        assert!(!dispatches_to_coordinator(true, RunEnvelope::Acting, &execute, &context));
+        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly, &smalltalk, &context));
     }
 
     #[test]
@@ -6997,8 +7112,32 @@ mod runtime_runner_tests {
         // A ReadOnly envelope (negation veto, unresolved AskUser, gate
         // denial) runs the single-agent loop even in multi mode: the
         // coordinator path exists only for acting runs.
-        assert!(!dispatches_to_coordinator(false, RunEnvelope::ReadOnly));
-        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly));
+        let context = RunShapeContext::default();
+        let smalltalk = routed("hi");
+        assert!(!dispatches_to_coordinator(false, RunEnvelope::ReadOnly, &smalltalk, &context));
+        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly, &smalltalk, &context));
+    }
+
+    #[test]
+    fn fresh_smalltalk_answer_stays_single_agent() {
+        // The preserved fast path: a pure smalltalk/question Answer with no
+        // active objective stays cheap on the single-agent loop.
+        let context = RunShapeContext::default();
+        let smalltalk = routed("hi");
+        assert_eq!(smalltalk.outcome, RequestedOutcome::Answer);
+        assert!(
+            !dispatches_to_coordinator(false, RunEnvelope::Acting, &smalltalk, &context),
+            "a fresh greeting never spins the coordinator"
+        );
+    }
+
+    #[test]
+    fn answer_over_active_objective_goes_to_coordinator() {
+        // An Answer hint with an established objective is coordinator-bound:
+        // the coordinator decides the shape with context.
+        let context = RunShapeContext { has_approved_plan: true, ..Default::default() };
+        let smalltalk = routed("hi");
+        assert!(dispatches_to_coordinator(false, RunEnvelope::Acting, &smalltalk, &context));
     }
 
     // ------------------------------------------------------------------

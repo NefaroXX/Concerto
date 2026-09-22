@@ -17,6 +17,7 @@ use concerto_core::error::ProviderError;
 use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
+use concerto_core::intent::{RequestedOutcome, RouterRoute};
 use concerto_core::memory::{
     ChunkType, Decision, DecisionCategory, DecisionId, MemoryChunk, MemoryNamespace, MemoryQuery,
     TaskNode, TaskNodeId, TaskStatus,
@@ -940,6 +941,268 @@ pub enum OrchestrationDepth {
     PlanningOnly,
 }
 
+/// Advisor-mode intent routing: the deterministic router's hint for this run.
+///
+/// The hint is ADVICE, never a decision — the coordinator treats it as one
+/// input to its final run-shape decision (see [`decide_run_shape`]).
+#[derive(Debug, Clone)]
+pub struct RunShapeHint {
+    /// The outcome the deterministic router suggested.
+    pub outcome: RequestedOutcome,
+    /// The rule/path that produced the suggestion.
+    pub route: RouterRoute,
+    /// The router's confidence in the suggestion.
+    pub confidence: f32,
+    /// The raw user request the hint was derived from (context for overrides).
+    pub utterance: String,
+}
+
+/// Session context the coordinator consults when finalizing the run shape.
+///
+/// Deliberately booleans (not I/O): the caller resolves them fail-soft from
+/// the plan registry, durable plan bindings, and session history, so the
+/// coordinator's decision stays pure and testable.
+#[derive(Debug, Clone, Default)]
+pub struct RunShapeContext {
+    /// An approved/active plan binding exists for this session/objective.
+    pub has_approved_plan: bool,
+    /// The session has prior outcomes (an established objective).
+    pub has_prior_outcomes: bool,
+    /// A plan binding exists but no apply decision was made this run.
+    pub pending_approval: bool,
+}
+
+impl RunShapeContext {
+    /// True when the session carries an established objective — an approved
+    /// plan, prior outcomes, or a pending plan approval.
+    pub fn has_active_objective(&self) -> bool {
+        self.has_approved_plan || self.has_prior_outcomes || self.pending_approval
+    }
+}
+
+/// The coordinator's FINAL run shape (the decided depth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunShape {
+    /// Produce a plan/design artifact; dispatch nothing.
+    Plan,
+    /// Run the full lifecycle (decompose, dispatch, review, validate).
+    Execute,
+}
+
+impl RunShape {
+    /// Stable name for audit rows and whiteboard payloads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Execute => "Execute",
+        }
+    }
+
+    /// The orchestration depth this shape maps onto.
+    pub fn depth(self) -> OrchestrationDepth {
+        match self {
+            Self::Plan => OrchestrationDepth::PlanningOnly,
+            Self::Execute => OrchestrationDepth::Full,
+        }
+    }
+}
+
+/// Decide the coordinator's final run shape from the routing hint plus session
+/// context (advisor-mode intent routing).
+///
+/// The deterministic [`route()`](concerto_core::intent::route) hint is an
+/// input, not a verdict. The coordinator overrides it when session context
+/// contradicts it:
+///
+/// - **hint `Plan`, but an approved plan exists** and the request carries
+///   action verbs (and no task-level negation): the objective was already
+///   planned, so this run executes it — `Execute`.
+/// - **hint `Execute`, but the request explicitly asks for a plan artifact**
+///   and no plan exists: the user wants a plan produced, not run — `Plan`.
+/// - Otherwise the hint's own shape stands (`Plan` -> planning-only,
+///   everything else -> full/`Execute`).
+///
+/// Pure and deterministic so both the coordinator and the run wrapper can call
+/// it for the same answer.
+pub fn decide_run_shape(
+    hint: &RunShapeHint,
+    context: &RunShapeContext,
+) -> (RunShape, &'static str) {
+    match hint.outcome {
+        RequestedOutcome::Plan => {
+            if context.has_approved_plan
+                && utterance_has_action_verbs(&hint.utterance)
+                && !utterance_has_task_negation(&hint.utterance)
+            {
+                (RunShape::Execute, "approved_plan_overrides_plan_hint")
+            } else {
+                (RunShape::Plan, "hint_plan")
+            }
+        }
+        RequestedOutcome::Execute => {
+            if utterance_requests_plan_artifact(&hint.utterance) && !context.has_approved_plan {
+                (RunShape::Plan, "plan_artifact_overrides_execute_hint")
+            } else {
+                (RunShape::Execute, "hint_execute")
+            }
+        }
+        _ => (RunShape::Execute, "non_plan_hint"),
+    }
+}
+
+/// Narrow local detector for the plan-hint override: does the request carry an
+/// explicit action verb? This is NOT a second router — it runs only when the
+/// coordinator must test whether context contradicts a `Plan` hint, and it
+/// never re-implements `route()`'s priority order.
+fn utterance_has_action_verbs(text: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "implement",
+        "fix",
+        "add",
+        "create",
+        "write",
+        "build",
+        "refactor",
+        "update",
+        "remove",
+        "migrate",
+        "install",
+        "execute",
+        "run",
+        "apply",
+    ];
+    let lower = text.to_lowercase();
+    lower.split_whitespace().any(|token| {
+        let token = token.trim_matches(|c: char| !c.is_alphanumeric());
+        VERBS.contains(&token)
+    })
+}
+
+/// Narrow local detector for the execute-hint override: does the request
+/// explicitly ask for a plan artifact (a document to be produced) rather than
+/// an action to run? Hyphens are normalized to spaces so `write-a-plan` and
+/// `write a plan` match alike.
+fn utterance_requests_plan_artifact(text: &str) -> bool {
+    let lower = text.to_lowercase().replace('-', " ");
+    const PHRASES: &[&str] = &[
+        "write a plan",
+        "create a plan",
+        "produce a plan",
+        "draft a plan",
+        "plan document",
+        "planning document",
+        "design doc",
+        "plan only",
+        "just plan",
+        "planning only",
+        "write the plan",
+    ];
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Narrow local detector for a task-level negation, used only to veto the
+/// `Plan` -> `Execute` override. The hard read-only veto itself stays in
+/// `concerto_core::intent` (routing) — this helper never decides safety.
+fn utterance_has_task_negation(text: &str) -> bool {
+    let lower = text.to_lowercase().replace(['\u{2018}', '\u{2019}'], "'").replace('-', " ");
+    const PHRASES: &[&str] = &[
+        "don't",
+        "do not",
+        "never",
+        "without changing",
+        "without modifying",
+        "without touching",
+        "read only",
+        "no changes",
+        "just answer",
+        "just review",
+        "just explain",
+    ];
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+#[cfg(test)]
+mod run_shape_tests {
+    use super::*;
+
+    fn hint(outcome: RequestedOutcome, utterance: &str) -> RunShapeHint {
+        RunShapeHint {
+            outcome,
+            route: RouterRoute::RuleHit { rule: "plan_keyword" },
+            confidence: 0.8,
+            utterance: utterance.to_owned(),
+        }
+    }
+
+    #[test]
+    fn hint_plan_with_approved_plan_and_run_verbs_becomes_execute() {
+        // The misrouting class this change kills: a Plan hint over an already
+        // approved objective with action verbs must execute, not re-plan.
+        let context = RunShapeContext {
+            has_approved_plan: true,
+            has_prior_outcomes: true,
+            pending_approval: false,
+        };
+        let (shape, reason) =
+            decide_run_shape(&hint(RequestedOutcome::Plan, "run the approved plan"), &context);
+        assert_eq!(shape, RunShape::Execute);
+        assert_eq!(reason, "approved_plan_overrides_plan_hint");
+        assert_eq!(shape.depth(), OrchestrationDepth::Full);
+    }
+
+    #[test]
+    fn hint_plan_without_approved_plan_stays_plan() {
+        let context = RunShapeContext::default();
+        let (shape, reason) =
+            decide_run_shape(&hint(RequestedOutcome::Plan, "plan the refactor"), &context);
+        assert_eq!(shape, RunShape::Plan);
+        assert_eq!(reason, "hint_plan");
+        assert_eq!(shape.depth(), OrchestrationDepth::PlanningOnly);
+    }
+
+    #[test]
+    fn hint_plan_with_negation_does_not_override_to_execute() {
+        // A task-level negation vetoes the override even with an approved
+        // plan: consent/safety is not overridden by context.
+        let context = RunShapeContext { has_approved_plan: true, ..Default::default() };
+        let (shape, reason) = decide_run_shape(
+            &hint(RequestedOutcome::Plan, "run the plan but do not change anything"),
+            &context,
+        );
+        assert_eq!(shape, RunShape::Plan);
+        assert_eq!(reason, "hint_plan");
+    }
+
+    #[test]
+    fn hint_execute_with_plan_artifact_request_and_no_plan_becomes_plan() {
+        let context = RunShapeContext::default();
+        let (shape, reason) = decide_run_shape(
+            &hint(RequestedOutcome::Execute, "write-a-plan for the refactor"),
+            &context,
+        );
+        assert_eq!(shape, RunShape::Plan);
+        assert_eq!(reason, "plan_artifact_overrides_execute_hint");
+    }
+
+    #[test]
+    fn hint_execute_with_existing_plan_is_not_downgraded_to_plan() {
+        let context = RunShapeContext { has_approved_plan: true, ..Default::default() };
+        let (shape, reason) =
+            decide_run_shape(&hint(RequestedOutcome::Execute, "write a plan"), &context);
+        assert_eq!(shape, RunShape::Execute);
+        assert_eq!(reason, "hint_execute");
+    }
+
+    #[test]
+    fn non_plan_hints_fall_through_to_execute() {
+        let context = RunShapeContext::default();
+        let (shape, reason) =
+            decide_run_shape(&hint(RequestedOutcome::Verify, "run the tests"), &context);
+        assert_eq!(shape, RunShape::Execute);
+        assert_eq!(reason, "non_plan_hint");
+    }
+}
+
 /// Result of graph decomposition or checkpoint restoration.
 struct DecomposeResult {
     graph: TaskGraph,
@@ -1174,7 +1437,26 @@ pub struct CoordinatorAgent {
     project_context_nudge_count: u64,
     /// ADR-55 Phase 2b: how far this run may go — full lifecycle (default)
     /// or planning-only (produce + render + persist the plan, nothing else).
+    ///
+    /// Advisor-mode intent routing: this is the DECIDED depth. When a
+    /// [`RunShapeHint`] is attached, [`Self::run`] finalizes it from the hint
+    /// plus [`RunShapeContext`] at run start; absent a hint the builder-set
+    /// depth stands unchanged.
     orchestration_depth: OrchestrationDepth,
+    /// Advisor-mode intent routing: the router's ADVISORY hint for this run.
+    /// `None` (bare test constructions, non-routing callers) keeps the
+    /// builder-set depth.
+    run_shape_hint: Option<RunShapeHint>,
+    /// Advisor-mode intent routing: session context the final shape decision
+    /// consults. Defaults to empty (no active objective) when unattached.
+    run_shape_context: RunShapeContext,
+    /// Advisor-mode intent routing: the FINAL shape the most recent hint-driven
+    /// `run` decided (`None` when the run was not hint-driven).
+    decided_run_shape: Option<RunShape>,
+    /// Advisor-mode intent routing: the reason code behind
+    /// [`Self::decided_run_shape`], mirrored into the audit row and whiteboard
+    /// payload (`None` when the run was not hint-driven).
+    run_shape_decision_label: Option<String>,
     /// ADR-55 Phase 2b: plan id of the most recently persisted PlanArtifact
     /// (ADR-52), surfaced so the runtime runner can bind a planning-only
     /// run's rendered plan to its durable artifact.
@@ -1951,6 +2233,10 @@ impl CoordinatorAgent {
             model_dispatch_count: 0,
             plans: None,
             orchestration_depth: OrchestrationDepth::Full,
+            run_shape_hint: None,
+            run_shape_context: RunShapeContext::default(),
+            decided_run_shape: None,
+            run_shape_decision_label: None,
             last_plan_id: None,
             settled_metrics: Vec::new(),
             tool_executor: None,
@@ -2751,6 +3037,38 @@ impl CoordinatorAgent {
     pub fn with_orchestration_depth(mut self, depth: OrchestrationDepth) -> Self {
         self.orchestration_depth = depth;
         self
+    }
+
+    /// Advisor-mode intent routing: hand the coordinator the deterministic
+    /// router's ADVISORY hint. When set, [`Self::run`] finalizes the run shape
+    /// from this hint plus the attached [`RunShapeContext`] at run start — the
+    /// hint is never the decision, and the builder-set
+    /// [`Self::with_orchestration_depth`] is overwritten by the outcome.
+    pub fn with_run_shape_hint(mut self, hint: RunShapeHint) -> Self {
+        self.run_shape_hint = Some(hint);
+        self
+    }
+
+    /// Advisor-mode intent routing: the session context the final run-shape
+    /// decision consults (approved/active plan, prior outcomes, pending plan
+    /// approval). Defaults to empty when unattached.
+    pub fn with_run_shape_context(mut self, context: RunShapeContext) -> Self {
+        self.run_shape_context = context;
+        self
+    }
+
+    /// The FINAL run shape decided by the most recent [`Self::run`] when a
+    /// hint was attached (`None` when the run was not hint-driven). Surfaced
+    /// so the runtime wrapper keys its post-run plan binding on the decided
+    /// shape rather than the raw hint.
+    pub fn decided_run_shape(&self) -> Option<RunShape> {
+        self.decided_run_shape
+    }
+
+    /// The whiteboard/audit decision label from the most recent hint-driven
+    /// [`Self::run`] (`None` when the run was not hint-driven).
+    pub fn run_shape_decision_label(&self) -> Option<&str> {
+        self.run_shape_decision_label.as_deref()
     }
 
     /// ADR-55 Phase 2b: the plan id of the most recently persisted plan
@@ -5059,6 +5377,70 @@ impl CoordinatorAgent {
         }
     }
 
+    /// Record the coordinator's FINAL run-shape decision (advisor-mode intent
+    /// routing) on BOTH channels:
+    ///
+    /// - an ADR-65 whiteboard `Decision` event (`kind: Decision`) carrying
+    ///   `{hint, final_shape, reason, overridden_from, supporting_evidence_ids}`
+    ///   through the same append path as every other decision; and
+    /// - a `coordinator_shape` audit row (final shape + reason) via the run's
+    ///   executor, alongside — never instead of — the `intent_router` hint row.
+    ///
+    /// Fail-soft by contract: continuity/audit writes must never fail a run.
+    /// The whiteboard append needs a session-DB pool; without one it is
+    /// skipped and only the audit row is written (the executor's audit log is
+    /// a separate sink).
+    async fn record_run_shape_decision(
+        &self,
+        hint: &RunShapeHint,
+        shape: RunShape,
+        reason: &str,
+        session_id: Ulid,
+    ) {
+        let hint_name = format!("{:?}", hint.outcome);
+        let overridden_from = if shape.name() != hint_name { hint_name.as_str() } else { "" };
+        if let Some(pool) = self.review_store.as_ref() {
+            let event = NewWhiteboardEvent {
+                event_id: Ulid::new().to_string(),
+                agent_id: "coordinator".to_owned(),
+                kind: WhiteboardKind::Decision,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "selected_agent": "",
+                    "reason": reason,
+                    "required_output": format!(
+                        "Run shape {} (router hint was {hint_name})",
+                        shape.name()
+                    ),
+                    "hint": hint_name,
+                    "final_shape": shape.name(),
+                    "overridden_from": overridden_from,
+                    "supporting_evidence_ids": [],
+                }),
+                pre_image_hash: None,
+                created_at: crate::tool_facts::unix_ms(),
+            };
+            if let Err(error) = append_whiteboard_event(pool, &event).await {
+                warn!(%error, "advisor-mode run-shape decision append failed (fail-soft)");
+            }
+        }
+        if let Some(executor) = self.tool_executor.as_ref() {
+            executor
+                .record_coordinator_shape_decision(
+                    session_id,
+                    Ulid::new(),
+                    &hint_name,
+                    shape.name(),
+                    reason,
+                    CancellationToken::new(),
+                )
+                .await;
+        }
+    }
+
     /// Append the whiteboard `Decision` event for a resume outcome
     /// (ADR-65 §7): `selected_agent, reason, required_output,
     /// supporting_evidence_ids` — real ids only (the append validates them,
@@ -7264,6 +7646,32 @@ impl CoordinatorAgent {
         // runs.
         self.planning_recovery_attempted = false;
         self.planning_recovery_note = None;
+        // Advisor-mode intent routing: finalize the run shape from the router's
+        // ADVISORY hint plus session context BEFORE any planning work. The hint
+        // is never the decision — when context contradicts it (an approved
+        // plan exists under a Plan hint, or an explicit plan-artifact request
+        // under an Execute hint) the coordinator overrides it here and records
+        // the decision (ADR-65 whiteboard `Decision` + a `coordinator_shape`
+        // audit row) so the override is observable, never silent. Absent a
+        // hint, the builder-set depth stands unchanged.
+        self.decided_run_shape = None;
+        self.run_shape_decision_label = None;
+        if let Some(hint) = self.run_shape_hint.clone() {
+            let context = self.run_shape_context.clone();
+            let (shape, reason) = decide_run_shape(&hint, &context);
+            self.orchestration_depth = shape.depth();
+            self.decided_run_shape = Some(shape);
+            self.run_shape_decision_label = Some(reason.to_owned());
+            tracing::info!(
+                hint = ?hint.outcome,
+                final_shape = shape.name(),
+                reason,
+                has_approved_plan = context.has_approved_plan,
+                has_active_objective = context.has_active_objective(),
+                "coordinator finalized the run shape (advisor-mode intent routing)"
+            );
+            self.record_run_shape_decision(&hint, shape, reason, task.session_id).await;
+        }
         // Phase 0: Retrieve project memory context. Phase 6 M3a: seed the
         // scope from the run this instance last planned (`last_plan_id`), the
         // run it is currently executing (`run_id`), or — on a resume, where
@@ -27176,5 +27584,168 @@ mod tests {
             completed.contains(&"architect") && completed.contains(&"coder"),
             "the checkpoint still records the settled subtasks as completed: {completed:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Advisor-mode intent routing: the coordinator finalizes the run shape
+    // from the router hint + session context and records the decision on BOTH
+    // channels (ADR-65 whiteboard Decision + `coordinator_shape` audit row),
+    // alongside the `intent_router` hint row.
+    // ------------------------------------------------------------------
+
+    /// A recording audit probe that also backs the coordinator's executor, so
+    /// `record_coordinator_shape_decision` writes are observable in the test.
+    fn coordinator_with_recording_audit(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        provider: Arc<dyn concerto_core::traits::provider::LlmProvider>,
+        audit: Arc<ConsultAuditProbe>,
+    ) -> CoordinatorAgent {
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, audit));
+        let registry_tools = Arc::new(ToolRegistry::default());
+        let executor = Arc::new(ToolExecutor::new(registry_tools, policy.clone()));
+        coordinator_with_provider_and_policy(bus, registry, provider, policy)
+            .with_executor(executor)
+    }
+
+    #[tokio::test]
+    async fn hint_plan_with_approved_plan_decides_execute_and_records_decision() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "planned"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "validated"),
+        ]));
+        let mut coordinator =
+            coordinator_with_recording_audit(bus.clone(), registry, provider, audit.clone())
+                .with_review_store(Some(pool.clone()))
+                .with_run_shape_hint(RunShapeHint {
+                    outcome: RequestedOutcome::Plan,
+                    route: RouterRoute::RuleHit { rule: "plan_keyword" },
+                    confidence: 0.8,
+                    utterance: "run the approved plan".to_owned(),
+                })
+                .with_run_shape_context(RunShapeContext {
+                    has_approved_plan: true,
+                    has_prior_outcomes: true,
+                    pending_approval: false,
+                });
+
+        // The coordinator overrides the Plan hint to Execute with context.
+        assert_eq!(coordinator.decided_run_shape(), None, "no decision before the run");
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "run the approved plan");
+        let workspace = tempfile::tempdir().expect("tempdir for the run-shape workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        // (1) The final shape was Execute, not the hint's Plan.
+        assert_eq!(coordinator.decided_run_shape(), Some(RunShape::Execute));
+        assert_eq!(
+            coordinator.run_shape_decision_label(),
+            Some("approved_plan_overrides_plan_hint")
+        );
+
+        // (2) The whiteboard carries the ADR-65 Decision with hint + final
+        //     shape + override reason.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let shape_decision = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["final_shape"] == serde_json::Value::String("Execute".into())
+                    && event.payload["hint"] == serde_json::Value::String("Plan".into())
+            })
+            .expect("the run-shape Decision event was recorded");
+        assert_eq!(
+            shape_decision.payload["reason"],
+            serde_json::Value::String("approved_plan_overrides_plan_hint".into())
+        );
+        assert_eq!(
+            shape_decision.payload["overridden_from"],
+            serde_json::Value::String("Plan".into())
+        );
+
+        // (3) The audit row mirrors the final shape + reason.
+        let rows = audit.rows();
+        let shape_row = rows
+            .iter()
+            .find(|row| row.tool_name == "coordinator_shape")
+            .expect("the coordinator_shape audit row was recorded");
+        assert_eq!(shape_row.verdict, "Execute");
+        assert_eq!(shape_row.rule_matched.as_deref(), Some("approved_plan_overrides_plan_hint"));
+        // The hint row (`intent_router`) is written by the wrapper, not the
+        // coordinator; the coordinator's Decision event above carries the hint
+        // so both sides of the override are observable. The `coordinator_shape`
+        // row and the Decision event together are the required pair.
+        let _ = events;
+    }
+
+    #[tokio::test]
+    async fn hint_execute_with_plan_artifact_request_decides_plan() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("architect"),
+            "planned",
+        )]));
+        let mut coordinator =
+            coordinator_with_recording_audit(bus.clone(), registry, provider, audit.clone())
+                .with_review_store(Some(pool.clone()))
+                .with_run_shape_hint(RunShapeHint {
+                    outcome: RequestedOutcome::Execute,
+                    route: RouterRoute::RuleHit { rule: "execute_keyword" },
+                    confidence: 0.8,
+                    utterance: "write-a-plan for the refactor".to_owned(),
+                })
+                .with_run_shape_context(RunShapeContext::default());
+
+        let workspace = tempfile::tempdir().expect("tempdir for the run-shape workspace");
+        let task = AgentTask::new(Ulid::new(), "write-a-plan for the refactor");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(coordinator.decided_run_shape(), Some(RunShape::Plan));
+        assert_eq!(
+            coordinator.run_shape_decision_label(),
+            Some("plan_artifact_overrides_execute_hint")
+        );
+        let rows = audit.rows();
+        let shape_row = rows
+            .iter()
+            .find(|row| row.tool_name == "coordinator_shape")
+            .expect("the coordinator_shape audit row was recorded");
+        assert_eq!(shape_row.verdict, "Plan");
+        assert_eq!(shape_row.rule_matched.as_deref(), Some("plan_artifact_overrides_execute_hint"));
     }
 }
