@@ -624,7 +624,11 @@ impl ToolExecutor {
             message: format!("tool not found: {tool_name}"),
         })?;
 
-        let action = build_action(tool_name, &input, tool, session);
+        // Policy evaluates the tool's canonical view (alias tools present the
+        // canonical tool name and operation-bearing input); execution and
+        // audit below still use the registered name and the caller's input.
+        let (policy_name, policy_input) = tool.policy_view(&input);
+        let action = build_action(&policy_name, &policy_input, tool, session);
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
@@ -725,7 +729,8 @@ impl ToolExecutor {
         let Some(tool) = self.registry.get(tool_name) else {
             return false;
         };
-        let action = build_action(tool_name, input, tool, session);
+        let (policy_name, policy_input) = tool.policy_view(input);
+        let action = build_action(&policy_name, &policy_input, tool, session);
         matches!(self.policy.evaluate_advisory(&action, cancel).await, Ok(PolicyVerdict::Allow))
     }
 

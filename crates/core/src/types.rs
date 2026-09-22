@@ -1102,6 +1102,36 @@ pub struct EvalResult {
     /// Optional coverage measurement collected alongside the test run.
     #[serde(default)]
     pub coverage: Option<CoverageInfo>,
+    /// Where this result came from: the project's detected harness, or the
+    /// plain `cargo test` fallback used when no eval config was found.
+    #[serde(default)]
+    pub provenance: EvalProvenance,
+}
+
+/// Provenance of an [`EvalResult`].
+///
+/// Declared so an unvalidated project is never confused with a properly
+/// harnessed one: the coordinator's validation report records whether the
+/// result came from the project's own detected runner or from the no-config
+/// `cargo test` fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum EvalProvenance {
+    /// Ran through the project's detected harness (`cargo`/`npm`/`pytest`/`make`).
+    #[default]
+    Harness,
+    /// No eval config was found; ran a plain `cargo test` fallback.
+    Fallback,
+}
+
+impl fmt::Display for EvalProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvalProvenance::Harness => write!(f, "harness"),
+            EvalProvenance::Fallback => write!(f, "fallback"),
+        }
+    }
 }
 
 /// Detected test runner for a project.

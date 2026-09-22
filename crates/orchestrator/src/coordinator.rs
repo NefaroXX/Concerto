@@ -1083,6 +1083,14 @@ pub struct CoordinatorAgent {
     /// Prevents infinite escalation loops by ensuring at most one escalation
     /// attempt per task per run.
     escalation_attempted: HashSet<TaskId>,
+    /// Smoke fix (clap-derive 101): consecutive identical failure signatures
+    /// per subtask. After
+    /// [`crate::failure_diagnosis::IDENTICAL_FAILURE_ESCALATION_THRESHOLD`]
+    /// identical repeats the coordinator stops retrying the same agent and
+    /// forces the alternate/replan path instead of burning the remaining
+    /// attempts. Run-scoped (not checkpointed): a resume re-observes failures
+    /// from its own retries.
+    identical_failures: crate::failure_diagnosis::IdenticalFailureTracker,
     /// ADR-42 §4 tier 1 guard: whether the global-default-model fallback has
     /// already been attempted for a task this run (at most once per task).
     default_model_attempted: HashSet<TaskId>,
@@ -1923,6 +1931,7 @@ impl CoordinatorAgent {
             session_store: None,
             source_revision: None,
             escalation_attempted: HashSet::new(),
+            identical_failures: crate::failure_diagnosis::IdenticalFailureTracker::default(),
             default_model_attempted: HashSet::new(),
             self_execute_attempted: HashSet::new(),
             default_model_provider_attempted: HashSet::new(),
@@ -6191,6 +6200,8 @@ impl CoordinatorAgent {
                         }
                         completed_results.insert(task_id, result.clone());
                         retry_feedback.remove(&task_id);
+                        // A success ends any identical-failure run.
+                        self.identical_failures.record_success(task_id);
                         graph.mark_done(&task_id);
                         // Issue #61: the subtask settled completed — the role's
                         // ownerships release (evented via the attached gate).
@@ -6506,7 +6517,43 @@ impl CoordinatorAgent {
                             &diagnosis,
                         )
                         .await;
-                        if attempt < self.max_subtask_attempts {
+                        // Smoke fix (clap-derive 101): identical failures
+                        // repeated consecutively are deterministic — another
+                        // same-agent retry cannot make progress. Once the
+                        // threshold is reached, force escalation by skipping
+                        // the normal retry arm and falling through to the
+                        // EXISTING escalation/replan/ladder flow (order
+                        // unchanged).
+                        let identical_repeat =
+                            self.identical_failures.record_failure(task_id, &error);
+                        if identical_repeat {
+                            let repeated = self.identical_failures.consecutive(task_id);
+                            let repeat_diag = crate::failure_diagnosis::diagnose_identical_repeat(
+                                &error, repeated,
+                            );
+                            self.record_failure_diagnosis(
+                                task.session_id,
+                                Some(task_id),
+                                &role,
+                                &repeat_diag,
+                            )
+                            .await;
+                            let _ = self.bus.publish_for_session(
+                                task.session_id,
+                                task_id.0,
+                                EventKind::AgentThought {
+                                    agent_id: "coordinator".into(),
+                                    content: format!(
+                                        "Forcing escalation for {role} subtask {task_id}: identical \
+                                         failure repeated {repeated}× consecutively (threshold {}); \
+                                         skipping the remaining same-agent retries.",
+                                        crate::failure_diagnosis::IDENTICAL_FAILURE_ESCALATION_THRESHOLD,
+                                    ),
+                                    kind: ThinkingKind::Detail,
+                                },
+                            );
+                        }
+                        if attempt < self.max_subtask_attempts && !identical_repeat {
                             retry_feedback.entry(task_id).or_default().push(result.clone());
                             graph.mark_pending(&task_id);
                             let _ = self.bus.publish_for_session(task.session_id, task_id.0, EventKind::AgentThought {
@@ -18430,15 +18477,19 @@ mod tests {
         let architect = MockExpertAgent::sequence(
             AgentId::new("architect"),
             vec![
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
-                ok_failed("architect", "cannot proceed"),
+                // Distinct messages (smoke: clap-derive 101 identical-repeat
+                // guard): this test bounds the LADDER, not the retry loop, so
+                // the identical-failure escalation trigger must stay inert
+                // here — differing signatures retry the full envelope.
+                ok_failed("architect", "cannot proceed (1)"),
+                ok_failed("architect", "cannot proceed (2)"),
+                ok_failed("architect", "cannot proceed (3)"),
+                ok_failed("architect", "cannot proceed (4)"),
+                ok_failed("architect", "cannot proceed (5)"),
+                ok_failed("architect", "cannot proceed (6)"),
+                ok_failed("architect", "cannot proceed (7)"),
+                ok_failed("architect", "cannot proceed (8)"),
+                ok_failed("architect", "cannot proceed (9)"),
             ],
         );
         let session_id = Ulid::new();

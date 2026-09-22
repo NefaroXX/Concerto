@@ -43,9 +43,9 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
-    CompletionRequest, CompletionUsage, DesignDoc, EvalResult, Message, OutputMode, ResearchReport,
-    ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall, ToolChoice,
-    ToolDefinition, ToolOutput, ToolResult,
+    CompletionRequest, CompletionUsage, DesignDoc, EvalProvenance, EvalResult, Message, OutputMode,
+    ResearchReport, ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall,
+    ToolChoice, ToolDefinition, ToolOutput, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -1027,15 +1027,32 @@ impl GenericSpecialistAgent {
             })
             .unwrap_or_default();
 
+        // Fallback results are NOT a harness run: say so, so an acceptance
+        // decision never mistakes "plain cargo test in a project with no eval
+        // config" for a properly harnessed validation.
+        let provenance_note = match result.provenance {
+            EvalProvenance::Harness => String::new(),
+            EvalProvenance::Fallback => {
+                " [provenance=fallback: no eval config found; ran plain `cargo test`]".to_string()
+            }
+            // `EvalProvenance` is non-exhaustive: an unknown future variant is
+            // reported without a fallback marker (fail-open, never mislabels).
+            _ => String::new(),
+        };
+
         let default_summary = if passed {
             format!(
-                "Tests passed (exit_code={}, duration={}ms).{}",
-                result.exit_code, result.duration_ms, coverage_note
+                "Tests passed (exit_code={}, duration={}ms).{}{}",
+                result.exit_code, result.duration_ms, coverage_note, provenance_note
             )
         } else {
             format!(
-                "Tests failed (exit_code={}, duration={}ms).{}\nLatest output:\n{}",
-                result.exit_code, result.duration_ms, coverage_note, result.output_tail
+                "Tests failed (exit_code={}, duration={}ms).{}{}\nLatest output:\n{}",
+                result.exit_code,
+                result.duration_ms,
+                coverage_note,
+                provenance_note,
+                result.output_tail
             )
         };
 
@@ -1049,12 +1066,12 @@ impl GenericSpecialistAgent {
         if fmt_lower.contains("pass") && fmt_lower.contains("fail") {
             if passed {
                 format!(
-                    "Pass: {coverage_note} (exit_code={}, duration={}ms, runner={})",
+                    "Pass: {coverage_note}{provenance_note} (exit_code={}, duration={}ms, runner={})",
                     result.exit_code, result.duration_ms, result.runner
                 )
             } else {
                 format!(
-                    "Fail: {coverage_note} (exit_code={}, duration={}ms, runner={})\nLatest output:\n{}",
+                    "Fail: {coverage_note}{provenance_note} (exit_code={}, duration={}ms, runner={})\nLatest output:\n{}",
                     result.exit_code, result.duration_ms, result.runner, result.output_tail
                 )
             }
@@ -4413,6 +4430,7 @@ mod tests {
             duration_ms: 1234,
             output_tail: "ok".into(),
             coverage: None,
+            provenance: EvalProvenance::Harness,
         };
         let s = GenericSpecialistAgent::format_summary(true, &result, "");
         assert!(s.contains("Tests passed"));
@@ -4429,6 +4447,7 @@ mod tests {
             duration_ms: 500,
             output_tail: "ok".into(),
             coverage: None,
+            provenance: EvalProvenance::Harness,
         };
         let s = GenericSpecialistAgent::format_summary(true, &result, "Pass/Fail report");
         assert!(s.starts_with("Pass:"));
@@ -4441,11 +4460,72 @@ mod tests {
             duration_ms: 300,
             output_tail: "FAILED test_foo".into(),
             coverage: None,
+            provenance: EvalProvenance::Harness,
         };
         let s2 = GenericSpecialistAgent::format_summary(false, &result_fail, "Pass/Fail report");
         assert!(s2.starts_with("Fail:"));
         assert!(s2.contains("runner=pytest"));
         assert!(s2.contains("FAILED test_foo"));
+    }
+
+    #[test]
+    fn eval_format_summary_marks_fallback_provenance() {
+        let result = EvalResult {
+            runner: TestRunner::Cargo,
+            exit_code: 101,
+            passed: false,
+            duration_ms: 10,
+            output_tail: "error: could not find `Cargo.toml`".into(),
+            coverage: None,
+            provenance: EvalProvenance::Fallback,
+        };
+        let s = GenericSpecialistAgent::format_summary(false, &result, "");
+        assert!(s.contains("provenance=fallback"), "fallback must be visible: {s}");
+        assert!(
+            s.contains("Tests failed"),
+            "acceptance still reflects the fallback pass/fail: {s}"
+        );
+
+        // A harness result carries no fallback marker.
+        let harness = EvalResult { provenance: EvalProvenance::Harness, ..result };
+        let s = GenericSpecialistAgent::format_summary(false, &harness, "");
+        assert!(!s.contains("provenance=fallback"), "harness runs must not be marked: {s}");
+    }
+
+    /// Issue: a project with no eval config used to hard-fail validation,
+    /// leaving the run unvalidated. When a Cargo project is reachable the
+    /// engine now runs a plain `cargo test` fallback; acceptance reflects its
+    /// pass/fail and the report is marked.
+    #[tokio::test]
+    async fn eval_missing_config_falls_back_and_acceptance_reflects_it() {
+        // The session root has no manifest, but a Cargo workspace lives above
+        // it — the fallback resolves and runs `cargo test` there.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let build_dir = root.path().join("build");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        assert!(matches!(EvalEngine::detect_runner(&build_dir), TestRunner::Unknown(_)));
+
+        let agent =
+            eval_agent(Some(Arc::new(EvalEngine::new(&build_dir))), PromptSections::default());
+
+        let result = agent
+            .run(&eval_task(), ctx_at(build_dir.clone()), "test-model", CancellationToken::new())
+            .await
+            .expect("validation must report a result, not hard-fail");
+
+        // The fallback cargo test fails (empty workspace has no tests to
+        // pass), so acceptance is Failed and the summary is marked fallback.
+        assert!(
+            matches!(result.outcome, AgentOutcome::Failed { .. }),
+            "a failed fallback must fail acceptance: {:?}",
+            result.outcome
+        );
+        assert!(
+            result.summary.contains("provenance=fallback"),
+            "the report must mark fallback provenance: {}",
+            result.summary
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4635,12 +4715,21 @@ mod tests {
 
     #[tokio::test]
     async fn eval_engine_error_maps_to_failed_outcome() {
-        // An empty project dir has no detectable test runner; the engine
-        // fails and the agent maps that to a clean Failed outcome carrying
-        // the engine error (never an Err / never a Success).
+        // An engine error that is NOT a missing config (an unavailable build
+        // shell profile) maps to a clean Failed outcome carrying the engine
+        // error — never an Err, never a Success. A missing config no longer
+        // errors: it falls back to plain `cargo test` (see
+        // `eval_missing_config_falls_back_and_acceptance_reflects_it`).
         let dir = tempfile::tempdir().unwrap();
-        let agent =
-            eval_agent(Some(Arc::new(EvalEngine::new(dir.path()))), PromptSections::default());
+        let profile = concerto_config::ShellProfileConfig {
+            id: "missing".to_owned(),
+            name: "Missing build shell".to_owned(),
+            backend: concerto_config::ShellBackendType::System,
+            executable: "definitely-not-a-real-build-shell".to_owned(),
+            ..Default::default()
+        };
+        let engine = EvalEngine::new(dir.path()).with_shell_profile(profile);
+        let agent = eval_agent(Some(Arc::new(engine)), PromptSections::default());
 
         let result = agent
             .run(&eval_task(), ctx(), "test-model", CancellationToken::new())

@@ -203,7 +203,7 @@ fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
     }
     if matches!(
         event.tool_name.as_str(),
-        "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
+        "write" | "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
     ) {
         return true;
     }

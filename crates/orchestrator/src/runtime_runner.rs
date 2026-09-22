@@ -72,7 +72,7 @@ use concerto_providers::model_registry::ModelRegistry;
 use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::RoutingEngine;
-use concerto_tools::filesystem::FilesystemTool;
+use concerto_tools::filesystem::{FilesystemTool, WriteTool};
 use concerto_tools::shell::ShellTool;
 use concerto_tools::undo::UndoManager;
 use concerto_tools::virtual_fs::VirtualFs;
@@ -1696,8 +1696,12 @@ fn build_tool_registry(
     };
     if let Some(vfs) = vfs {
         registry.register(Box::new(FilesystemTool::new_shared(cwd_path.clone(), vfs.clone())));
+        // Claude-habit `write` alias: same VFS, canonical filesystem-write
+        // policy coverage (see `WriteTool::policy_view`).
+        registry.register(Box::new(WriteTool::new_shared(cwd_path.clone(), vfs.clone())));
     } else {
         registry.register(Box::new(FilesystemTool::new(cwd_path.clone())));
+        registry.register(Box::new(WriteTool::new(cwd_path.clone())));
     }
     let shell_tool = {
         let settings = config.resolved_shell_settings();
