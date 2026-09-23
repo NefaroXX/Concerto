@@ -5,14 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_runner::AgentRunner;
-use crate::coordinator::{
-    ApprovedPlanSeed, CoordinatorAgent, HeadlessResumeSeed, RunShape, RunShapeContext, RunShapeHint,
-};
-use crate::intent_grants::{
-    apply_intent_gate, auto_grant_envelope, flavor_hint, is_confident_auto_grant_execute,
-    outcome_name, router_path_name, router_route_name, IntentGrantStore, RunEnvelope,
-    SessionIntentAuth,
-};
+use crate::coordinator::{ApprovedPlanSeed, CoordinatorAgent, HeadlessResumeSeed};
+use crate::intent_grants::{IntentGrantStore, RunEnvelope, SessionIntentAuth};
 use crate::plan_approval::{
     append_plan_approved_event, apply_auto_plan_decision, fold_ledger, load_approved_plan,
     plan_artifact_hash, plan_registry, rehydrate_durable_binding, ApprovedPlanContext,
@@ -31,10 +25,10 @@ use concerto_config::RelationshipSemantics;
 use concerto_config::ResolvedBlueprint;
 use concerto_config::StageKind;
 use concerto_core::error::{PolicyError, ProviderError};
-use concerto_core::event::{Event, EventBus, EventKind, IntentRouteDecision};
+use concerto_core::event::{Event, EventBus, EventKind};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
-use concerto_core::intent::{PlanDecision, RequestedOutcome, RouterOutput, RouterRoute, RunStage};
+use concerto_core::intent::{PlanDecision, RunStage};
 use concerto_core::lock::DataDirLock;
 use concerto_core::traits::approval::ApprovalSink;
 use concerto_core::traits::memory::{MemoryStore, NullMemoryStore};
@@ -418,26 +412,6 @@ async fn maintain_context_after_run(
     if let Err(error) = engine.maintain(store.clone(), session_id, cancel, bus).await {
         tracing::warn!(%error, %session_id, "failed to maintain durable context checkpoints");
     }
-}
-
-/// When a run produced no model text, synthesize an explanation so the
-/// completion is never a silent "done" (ADR-55 Phase 2d Fix B, relocated to
-/// the loop completion path by Phase 2e §1). Returns `None` for
-/// action-capable outcomes (`Execute`/`Plan`), where an empty reply must not
-/// be masked, and the caller never applies it when the run actually touched
-/// files — the honesty rule must not fabricate a false "nothing changed".
-fn read_only_fallback_message(outcome: RequestedOutcome, route: &RouterRoute) -> Option<String> {
-    if matches!(outcome, RequestedOutcome::Execute | RequestedOutcome::Plan) {
-        return None;
-    }
-    let message = if matches!(route, RouterRoute::RuleHit { rule: "negation_override" }) {
-        "Read-only: this request was interpreted as a no-change/prohibition instruction, so \
-         nothing was modified. Rephrase with an explicit action (e.g. 'build X') to make changes."
-    } else {
-        "Read-only response — no files were changed. Rephrase with an explicit action \
-         (e.g. 'build X') to make changes."
-    };
-    Some(message.to_owned())
 }
 
 /// Maximum plan→act→observe cycles for a single agent run. Five was far too
@@ -1989,15 +1963,9 @@ async fn create_session_and_recorder(
 ///
 /// Run metrics and context maintenance are handled inline before returning.
 ///
-/// `envelope` is the intent gate's permission envelope (ADR-55 Phase 2e §2)
-/// and drives the system prompt: Acting runs get the Build prompt, ReadOnly
-/// runs the Chat prompt, and single-agent Plan runs keep the Plan prompt
-/// (the planning deliverable path is unchanged — ADR-55 Phase 2b §5). The
-/// effective outcome contributes only its non-binding flavor-hint line.
-///
-/// `routing_route` is the run's router route (ADR-55 Phase 2d §2a), used by
-/// the empty-completion honesty rule (Fix B) relocated to this completion
-/// path.
+/// `envelope` drives the system prompt: Acting runs get the tool-capable Build
+/// prompt, ReadOnly runs the Chat prompt. Under full local agency the envelope
+/// is always Acting; there is no keyword-selected tool-less path.
 #[allow(clippy::too_many_arguments)]
 async fn execute_agent_loop(
     req: AgentRunRequest,
@@ -2011,19 +1979,12 @@ async fn execute_agent_loop(
     task: AgentTask,
     event_recorder: EventRecorderGuard,
     transcript_recorder: TranscriptRecorderGuard,
-    // ADR-55 Phase 2e §2: the run's permission envelope (ReadOnly | Acting),
-    // derived from the intent gate's confirmation in `run_shared_agent`.
+    // ADR-55 Phase 2e §2: the run's permission envelope. Under full local
+    // agency this is always `Acting`; the parameter is retained so the loop's
+    // prompt selection stays explicit rather than implicit.
     envelope: RunEnvelope,
-    effective_outcome: RequestedOutcome,
-    // Gate-derived mutation grant (`effective_outcome == Execute` and the
-    // run is not read-only). Threaded from `run_shared_agent` rather than
-    // re-derived from `task.execution_mode` so the Execute stage can never
-    // drift from the intent gate's decision if the task-shaping code changes.
+    // Full-local-agency runs are action-capable (see `run_shared_agent`).
     execute_granted: bool,
-    // ADR-55 Phase 2e §6: the run's router route, feeding the relocated
-    // empty-completion honesty rule (negation veto vs. any other read-only
-    // outcome).
-    routing_route: &RouterRoute,
     stage_tracker: &Arc<Mutex<StageTracker>>,
     // ADR-65 §3: the session-DB pool backing the single-agent loop's
     // tool-evidence writer (`ToolFactContext::new(pool, "single-agent")`).
@@ -2053,34 +2014,15 @@ async fn execute_agent_loop(
             None => engine,
         }
     };
-    // ADR-55 Phase 2e §2: the ENVELOPE selects the system prompt — Acting
-    // runs get the Build prompt (tool-capable; writes stay policy-gated),
-    // ReadOnly runs the Chat prompt. Single-agent Plan runs keep the Plan
-    // prompt: the planning deliverable path is unchanged (ADR-55 Phase 2b).
-    // The outcome is a non-binding flavor hint appended as ONE system-prompt
-    // line and logged with the routing context — never a code-path branch,
-    // so no keyword can select a tool-less path.
-    let base_prompt = if effective_outcome == RequestedOutcome::Plan {
-        concerto_core::types::SYSTEM_PROMPT_PLAN
-    } else if envelope.is_acting() {
+    // Full local agency: the unified loop always gets the tool-capable Build
+    // prompt (writes stay policy-gated and approval-sinked). No keyword can
+    // select a tool-less path; the model decides tool use from its own output.
+    let base_prompt = if envelope.is_acting() {
         concerto_core::types::SYSTEM_PROMPT_BUILD
     } else {
         concerto_core::types::SYSTEM_PROMPT_CHAT
     };
-    let flavor = flavor_hint(effective_outcome, routing_route);
-    let mut prompt_text = base_prompt.to_string();
-    if !flavor.is_empty() {
-        tracing::debug!(
-            %session_id,
-            outcome = outcome_name(effective_outcome),
-            envelope = if envelope.is_acting() { "Acting" } else { "ReadOnly" },
-            hint = flavor,
-            "intent flavor hint appended to the system prompt (non-binding)"
-        );
-        prompt_text.push_str("\n\nIntent hint (non-binding): ");
-        prompt_text.push_str(flavor);
-        prompt_text.push('.');
-    }
+    let prompt_text = base_prompt.to_string();
     let prompt_builder = PromptBuilder::with_skills(prompt_text, Some(services.skills.clone()))
         // OS/shell identity card (custom-ai-shell plan, Phase C): the resolved
         // selected profile grounds every built prompt in the host OS and the
@@ -2124,41 +2066,23 @@ async fn execute_agent_loop(
     // captured up front for spend attribution (Phase 3, issue #93).
     let task_id = task.id.0;
     // Run-stage signals (ADR-55 Phase 2a): the loop is about to start, so the
-    // run is Inspecting the workspace; a mutation-capable Execute run then
-    // moves to Execute, a Plan run to Plan. Both are gate-derived decisions
-    // available before the loop runs. Complete is reported only after `run`
-    // returns Ok below — an Err or cancellation never advances the stage.
-    //
-    // `execute_granted` is the gate's own `effective_outcome == Execute &&
-    // !gate_read_only` decision, computed in `run_shared_agent` and passed in:
-    // `task.execution_mode` is built from that exact condition today
-    // (`new_action_required` iff `task_action_required`), but deriving the
-    // stage from the explicit grant keeps them decoupled.
+    // run is Inspecting the workspace; a mutation-capable run then moves to
+    // Execute. Complete is reported only after `run` returns Ok below — an Err
+    // or cancellation never advances the stage. Under full local agency the
+    // single-agent (forced) loop is action-capable, so `execute_granted` is
+    // true; the explicit flag keeps the stage independent of task shaping.
     {
         let mut tracker = stage_tracker.lock().unwrap_or_else(|error| error.into_inner());
         tracker.set(RunStage::Inspect);
         if execute_granted {
             tracker.set(RunStage::Execute);
-        } else if effective_outcome == RequestedOutcome::Plan {
-            tracker.set(RunStage::Plan);
         }
     }
     let output = match agent.run(task, req.cancel_token.clone()).await {
-        Ok(mut output) => {
-            // ADR-55 Phase 2d Fix B, relocated to the loop completion path
-            // (ADR-55 Phase 2e §1/§5): a loop run that ends with empty final
-            // text still synthesizes the explanatory completion — never a
-            // silent "done". Non-empty model text is never overridden, and
-            // the synthesis is skipped for action-capable outcomes
-            // (`Execute`/`Plan`) and for runs that DID touch files, so the
-            // honesty rule can never fabricate a false "nothing changed".
-            if output.final_message.trim().is_empty() && output.files_modified.is_empty() {
-                if let Some(explanation) =
-                    read_only_fallback_message(effective_outcome, routing_route)
-                {
-                    output.final_message = explanation;
-                }
-            }
+        Ok(output) => {
+            // Full-local-agency runs are action-capable: an empty final message
+            // is left as the model produced it (no honesty synthesis, which is
+            // reserved for read-only runs that no longer exist as a mode).
             stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
             output
         }
@@ -2388,20 +2312,18 @@ async fn select_or_init_memory_services(
 ///   the run falls through to the generic intent gate — a fresh objective is
 ///   not a re-decompose of the stored plan.
 ///
-/// `Ok(None)` = no binding to auto-Apply (generic gate decides). Any other
-/// outcome of the routing (Plan, Diagnose, ...) never intercepts: auto-Apply
-/// fires only for a confident Execute, and Replan remains reachable only via
-/// an explicit new Plan request (2d addendum, 1d §3 superseded).
+/// `Ok(None)` = no binding to auto-Apply (the unified loop decides what to do).
+/// Intent routing is no longer consulted: the interception is keyed purely on
+/// a stored binding for **this exact objective** (the in-process registry, or
+/// the session-newest durable row when its objective hash matches). A binding
+/// for a different objective never intercepts, so safety does not depend on
+/// keyword classification.
 async fn resolve_auto_apply_binding(
-    routing: &RouterOutput,
     session_id: Ulid,
     objective_hash: &str,
     session_store: Option<&Arc<dyn SessionStore>>,
     cancel: CancellationToken,
 ) -> Result<Option<PlanBinding>, OrchestratorError> {
-    if !is_confident_auto_grant_execute(routing) {
-        return Ok(None);
-    }
     if let Some(raw) = plan_registry().pending(session_id, objective_hash) {
         if raw.artifact_verifies() {
             return Ok(Some(raw));
@@ -2419,130 +2341,35 @@ async fn resolve_auto_apply_binding(
         });
     }
     if let Some(store) = session_store {
-        // Fail-soft (§11/§12 posture): a missing row, a storage error, or an
-        // unverifiable row falls through to the generic intent gate.
+        // Restart-safe exact-objective leg: the session-newest durable row is
+        // rehydrated, but it intercepts ONLY when it is the same objective.
+        // A different objective never auto-Applies, so a keyword-free run can
+        // never execute an unrelated stored plan. Fail-soft: a missing/
+        // unverifiable row falls through to the unified loop.
         if let Some(binding) = rehydrate_durable_binding(store.as_ref(), session_id, cancel).await {
-            tracing::info!(
-                %session_id,
-                plan_id = %binding.plan_id(),
-                "auto-Apply armed from the session-newest durable plan binding"
-            );
-            return Ok(Some(binding));
+            if binding.objective_hash() == objective_hash {
+                tracing::info!(
+                    %session_id,
+                    plan_id = %binding.plan_id(),
+                    "auto-Apply armed from the durable plan binding for this objective"
+                );
+                return Ok(Some(binding));
+            }
         }
     }
     Ok(None)
 }
 
-/// Decide whether the run's task should be action-required (B-2).
+/// The authoritative acting-run vehicle.
 ///
-/// `effective` carries the run's effective outcome and `gate_read_only`
-/// reflects the gate's read-only state sampled right after `apply_intent_gate`:
+/// Routing is no longer consulted: with full local agency every non-forced run
+/// is coordinator-owned, and the coordinator's decision loop engages
+/// specialists on need (task requires hands), never by pre-scanning words.
+/// `force_single_agent` is the only remaining explicit mode switch.
 ///
-/// - `Execute` + mutation-capable run → action-required.
-/// - `Execute` + read-only run (a dismissed/absent confirmation keeps
-///   effective Execute but the run is read-only) → answer-only, so the
-///   `agent_loop` ever-retrying `ActionRequired` path never steers the model
-///   toward a mutation the gate would deny (B-2).
-/// - Any other effective outcome → answer-only; mutation limits are enforced
-///   by the gate itself.
-///
-/// The intent gate is always on (ADR-55 Phase 1e) — there is no legacy mode
-/// picker and `effective` is never `None`.
-pub fn task_action_required(effective: RequestedOutcome, gate_read_only: bool) -> bool {
-    matches!(effective, RequestedOutcome::Execute) && !gate_read_only
-}
-
-/// The authoritative acting-run vehicle (advisor-mode intent routing).
-///
-/// The deterministic router is an ADVISOR: its outcome never selects the code
-/// path on its own. The single/multi switch and the permission envelope still
-/// bound WHERE a run may go:
-///
-/// - Single mode / `force_single_agent` → the single-agent loop.
-/// - [`RunEnvelope::ReadOnly`] (task-level prohibition, unresolved `AskUser`,
-///   gate denial) → the single-agent loop: the negation veto and consent
-///   safety stay read-only and are decided by gate policy, never by routing.
-/// - [`RunEnvelope::Acting`] → the coordinator, EXCEPT the cheap fresh-chat
-///   fast path: a pure small-talk / question `Answer` hint with NO active
-///   objective (no approved plan, no prior outcomes) stays on the single-agent
-///   loop so a fresh greeting never pays for a coordinator spin. Any other
-///   acting hint — including an `Answer` hint over an established objective —
-///   goes to the coordinator, which makes the final run-shape decision with
-///   session context.
-///
-/// Pure so tests can pin the permutations without a full run.
-pub fn dispatches_to_coordinator(
-    force_single_agent: bool,
-    envelope: RunEnvelope,
-    routing: &RouterOutput,
-    context: &RunShapeContext,
-) -> bool {
-    if force_single_agent || !envelope.is_acting() {
-        return false;
-    }
-    !is_cheap_single_agent_answer(routing, context)
-}
-
-/// The preserved single-agent fast path: a pure `Answer` hint (small-talk or a
-/// plain question) with no active objective stays cheap. The hint is an
-/// advisor here only — a non-Answer hint, or an Answer over an established
-/// objective, is coordinator-bound.
-fn is_cheap_single_agent_answer(routing: &RouterOutput, context: &RunShapeContext) -> bool {
-    if context.has_active_objective() || routing.outcome != RequestedOutcome::Answer {
-        return false;
-    }
-    matches!(
-        routing.route,
-        RouterRoute::RuleHit { rule: "smalltalk" }
-            | RouterRoute::RuleHit { rule: "question" }
-            | RouterRoute::AskUser
-    )
-}
-
-/// Translate the routing hint into the coordinator's advisor-mode shape hint.
-fn run_shape_hint_from_routing(routing: &RouterOutput, utterance: &str) -> RunShapeHint {
-    RunShapeHint {
-        outcome: routing.outcome,
-        route: routing.route,
-        confidence: routing.confidence,
-        utterance: utterance.to_owned(),
-    }
-}
-
-/// Resolve the session context the coordinator's final shape decision consults.
-///
-/// Fail-soft: any lookup error degrades to "no active objective" for that
-/// facet (a missing session store simply yields `false`); the run is never
-/// failed by context gathering. Kept synchronous and side-effect-free apart
-/// from a process-local registry read and the already-loaded session store.
-async fn resolve_run_shape_context(
-    session_id: Ulid,
-    plan_objective_hash: &str,
-    applied_plan: Option<&PlanBinding>,
-    pending_binding_exists: bool,
-    session_store: Option<&Arc<dyn SessionStore>>,
-    cancel: CancellationToken,
-) -> RunShapeContext {
-    let registry_has_binding = plan_registry().pending(session_id, plan_objective_hash).is_some();
-    let mut has_approved_plan = applied_plan.is_some() || registry_has_binding;
-    // Durable bindings survive a restart: check the session-newest row too so
-    // an approved plan that never rehydrated this process still counts. A
-    // storage error is logged and treated as absent (fail-soft).
-    if !has_approved_plan {
-        if let Some(store) = session_store {
-            match store.load_newest_plan_binding(session_id, cancel).await {
-                Ok(binding) => has_approved_plan = binding.is_some(),
-                Err(error) => {
-                    tracing::warn!(%error, "run-shape context: durable plan binding lookup failed")
-                }
-            }
-        }
-    }
-    RunShapeContext {
-        has_approved_plan,
-        has_prior_outcomes: has_approved_plan || pending_binding_exists,
-        pending_approval: pending_binding_exists && applied_plan.is_none(),
-    }
+/// Pure so tests can pin the mode without a full run.
+pub fn dispatches_to_coordinator(force_single_agent: bool) -> bool {
+    !force_single_agent
 }
 
 /// ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
@@ -2944,8 +2771,8 @@ async fn seed_run_continuity(
 /// subtasks were literally built from the approval phrase and the Coder
 /// produced nothing. ADR-60 D7: when the whiteboard state was verified
 /// (`approved`), the structured artifact + ledger description replaces the
-/// legacy rendered-prose description entirely. The action-required/
-/// answer-only routing from B-2 is otherwise untouched.
+/// legacy rendered-prose description entirely. Under full local agency the
+/// `action_required` flag is set by the caller; routing no longer shapes it.
 #[allow(clippy::too_many_arguments)]
 fn build_run_task(
     session_id: Ulid,
@@ -3106,11 +2933,10 @@ pub async fn run_shared_agent(
 
     // 4. Policy engine, audit log, spend tracker, tool executor.
     //
-    // ADR-55 Phase 1e: the intent gate is the ONLY routing path and is always
-    // on for every run (single- and multi-agent) — the `[intent]` config toggle
-    // is removed with no replacement. Grants are per-run and non-durable
-    // (ADR-55 §4): a fresh store per call means they can never cross sessions
-    // and are re-confirmed on every resume.
+    // Full local agency: the run-scoped grant store is created fresh per call
+    // and never derived from routing. Grants are per-run and non-durable
+    // (ADR-55 §4): a fresh store per call means they can never cross sessions.
+    // Deny-class rules and the approval sink remain the boundaries.
     let store = Arc::new(IntentGrantStore::new());
     let auth = Arc::new(SessionIntentAuth::new(store.clone()));
     let intent_auth = Some(auth.clone() as Arc<dyn IntentAuthorization>);
@@ -3157,16 +2983,11 @@ pub async fn run_shared_agent(
     // transcript now carries the prompt for both modes.
     transcript_recorder.record_user_message(req.input.clone()).await;
 
-    // 6b. Intent routing + authorization (ADR-55 §1/§2/§4/§6, Phase 2d/2e).
-    // Runs for every run — the gate is always on (ADR-55 Phase 1e). Routing
-    // is the decision: a high-confidence action outcome auto-grants (no
-    // dialog, no modal, no click), the negation corpus and the
-    // zero-confidence AskUser route stay hard read-only, and every decision
-    // is snapshotted to the audit through the correlation-id chain (§5); a
-    // failed audit write is fail-soft. ADR-55 Phase 2e §4: the ADR-56
-    // classifier is retired from the run hot path — the deterministic
-    // safety rules decide, and the outcome rides prompts as a flavor hint.
-    let routing = concerto_core::intent::route(&req.input, req.project_dir.clone());
+    // 6b. Full local agency (unified loop). Intent routing is no longer
+    // control flow: every message enters ONE unified loop that may act, with
+    // the orchestrator authority (landed) bypassing intent restrictions while
+    // deny-class rules still run first and Consequential actions still reach
+    // the approval sink. Grants remain per-run and non-durable (ADR-55 §4).
     let plan_objective_hash = blake3::hash(req.input.as_bytes()).to_hex().to_string();
 
     // Carry forward previous session spend so the cap looks at cumulative
@@ -3180,15 +3001,12 @@ pub async fn run_shared_agent(
         }
     }
 
-    // ADR-55 Phase 2d §3 (plan→Execute auto-Apply): a confident Execute over
-    // a stored plan binding executes the persisted plan outright — the
-    // process-scoped exact-objective binding first, else the session-newest
-    // durable row — hash-verified, loud-fail on drift, no `approve the plan`
-    // click. Any other routing (including a re-sent plan prompt, which is an
-    // explicit new Plan request) never intercepts. See
+    // ADR-55 Phase 2d §3 (plan→Execute auto-Apply): a stored plan binding for
+    // THIS exact objective executes the persisted plan outright — hash-verified,
+    // loud-fail on drift, no `approve the plan` click and no keyword gate. A
+    // binding for a different objective never intercepts. See
     // [`resolve_auto_apply_binding`].
     let bound = resolve_auto_apply_binding(
-        &routing,
         session_id,
         &plan_objective_hash,
         session_store.as_ref(),
@@ -3196,12 +3014,13 @@ pub async fn run_shared_agent(
     )
     .await?;
 
-    // Decide how the run may proceed: a stored plan binding under a confident
-    // Execute triggers the auto-Apply (2d §3), otherwise the intent gate
-    // decides (auto-grant at high confidence; an unresolved AskUser lands
-    // read-only with an in-loop clarification — ADR-55 Phase 2e §3, no
-    // modal). The auto-Apply additionally feeds the ADR-55 Phase 2b (M2)
-    // checkpoint suppression below.
+    // Decide how the run may proceed under full local agency. A stored plan
+    // binding for THIS exact objective auto-Applies (no dialog, no keyword);
+    // otherwise the unified loop runs with full local agency — no route-derived
+    // grant and no read-only-from-routing. The orchestrator authority (landed)
+    // bypasses intent restrictions while deny-class rules run first and
+    // Consequential actions still reach the approval sink. The auto-Apply
+    // additionally feeds the ADR-55 Phase 2b (M2) checkpoint suppression below.
     let mut plan_decision: Option<PlanDecision> = None;
     // ADR-55 Phase 2b (M3, live-fix): the auto-Apply consumes the stored
     // binding below, so capture it BEFORE that consumption — the Execute run's
@@ -3213,70 +3032,60 @@ pub async fn run_shared_agent(
     // AFTER this snapshot — a change between decision and dispatch is silent
     // divergence, never something a user saw.
     let mut approval_time_revision: Option<String> = None;
-    // Advisor-mode intent routing: whether an approved binding existed at all
-    // (before the auto-Apply consumes it below). Feeds the coordinator's
-    // session context as evidence of an established objective.
-    let bound_is_some = bound.is_some();
-    let (effective, confirmation) = match bound {
-        Some(binding) => {
-            // ADR-55 Phase 2d §3: auto-Apply — no dialog. The binding was
-            // hash-verified at interception ([`resolve_auto_apply_binding`]);
-            // consume it in both stores so a later confident Execute cannot
-            // re-apply an already-executed plan.
-            let objective_hash = binding.objective_hash();
-            let current_revision = current_source_revision(&req.project_dir).await;
-            approval_time_revision = current_revision.clone();
-            let binding_revision = binding.source_revision().unwrap_or("unknown");
-            // The auto decision is audited under the synthetic `intent:plan`
-            // identity with plan_id + source revision in the user response
-            // (`auto_apply`, ADR-55 Phase 2d §5), with a fresh per-event
-            // correlation id minted below at the routing row (the classifier
-            // is retired from dispatch — ADR-55 Phase 2e §4 — so there is no
-            // shared classifier id to chain).
-            executor
-                .record_plan_decision(
-                    session_id,
-                    Ulid::new(),
-                    binding.plan_id(),
-                    objective_hash,
-                    current_revision.as_deref(),
-                    // ADR-55 Phase 2d §5: the plan-decision seam gains the
-                    // `auto_apply` variant.
-                    "auto_apply",
-                    req.cancel_token.clone(),
-                )
-                .await;
-            tracing::info!(
-                %session_id,
-                plan_id = %binding.plan_id(),
-                plan_revision = %binding_revision,
-                current_revision = %current_revision.as_deref().unwrap_or("unknown"),
-                "auto-Applying the hash-verified stored plan (ADR-55 Phase 2d §3, no dialog)"
-            );
-            // The decision rides along for ADR-55 Phase 2b (M2) checkpoint
-            // suppression below.
-            plan_decision = Some(PlanDecision::Apply);
-            // The auto-Apply CONSUMES the stored plan: drop the session's
-            // binding in the in-memory registry and in durable storage so a
-            // later confident Execute cannot re-apply an already-executed
-            // plan. A missing durable row is a no-op (fail-soft).
-            // ADR-55 Phase 2b (M3, live-fix): capture the binding BEFORE
-            // consuming it so the Execute run below can describe the
-            // approved plan.
-            applied_plan = Some(binding.clone());
-            plan_registry().remove(session_id, objective_hash);
-            if let Some(store) = &session_store {
-                if let Err(error) = store
-                    .delete_plan_binding(session_id, objective_hash, req.cancel_token.clone())
-                    .await
-                {
-                    tracing::warn!(%error, "failed to clear durable plan binding after apply");
-                }
+    if let Some(binding) = bound {
+        // ADR-55 Phase 2d §3: auto-Apply — no dialog. The binding was
+        // hash-verified at interception ([`resolve_auto_apply_binding`]);
+        // consume it in both stores so a later run cannot re-apply an
+        // already-executed plan.
+        let objective_hash = binding.objective_hash();
+        let current_revision = current_source_revision(&req.project_dir).await;
+        approval_time_revision = current_revision.clone();
+        let binding_revision = binding.source_revision().unwrap_or("unknown");
+        // The auto decision is audited under the synthetic `intent:plan`
+        // identity with plan_id + source revision in the user response
+        // (`auto_apply`, ADR-55 Phase 2d §5).
+        executor
+            .record_plan_decision(
+                session_id,
+                Ulid::new(),
+                binding.plan_id(),
+                objective_hash,
+                current_revision.as_deref(),
+                // ADR-55 Phase 2d §5: the plan-decision seam gains the
+                // `auto_apply` variant.
+                "auto_apply",
+                req.cancel_token.clone(),
+            )
+            .await;
+        tracing::info!(
+            %session_id,
+            plan_id = %binding.plan_id(),
+            plan_revision = %binding_revision,
+            current_revision = %current_revision.as_deref().unwrap_or("unknown"),
+            "auto-Applying the hash-verified stored plan (ADR-55 Phase 2d §3, no dialog)"
+        );
+        // The decision rides along for ADR-55 Phase 2b (M2) checkpoint
+        // suppression below.
+        plan_decision = Some(PlanDecision::Apply);
+        // The auto-Apply CONSUMES the stored plan: drop the session's
+        // binding in the in-memory registry and in durable storage so a
+        // later run cannot re-apply an already-executed plan. A missing
+        // durable row is a no-op (fail-soft).
+        // ADR-55 Phase 2b (M3, live-fix): capture the binding BEFORE
+        // consuming it so the Execute run below can describe the
+        // approved plan.
+        applied_plan = Some(binding.clone());
+        plan_registry().remove(session_id, objective_hash);
+        if let Some(store) = &session_store {
+            if let Err(error) = store
+                .delete_plan_binding(session_id, objective_hash, req.cancel_token.clone())
+                .await
+            {
+                tracing::warn!(%error, "failed to clear durable plan binding after apply");
             }
-            apply_auto_plan_decision(&store)
         }
-        None => apply_intent_gate(&routing, &store, &auth),
-    };
+        let _ = apply_auto_plan_decision(&store);
+    }
 
     // ADR-55 Phase 2b (M2): an Apply decision authorizes the STORED plan for
     // this objective — the run must execute that plan, never silently resume
@@ -3351,82 +3160,19 @@ pub async fn run_shared_agent(
         }
     }
 
-    // The plan-decision helper grants but never mutates the read-only flag
-    // (it owns only the store), so normalize it here from the confirmation.
-    // Idempotent with `apply_intent_gate` and `apply_auto_plan_decision`,
-    // which already set the same value on their own paths.
-    auth.set_read_only(!matches!(confirmation, "granted" | "auto_granted"));
-    let effective_outcome = effective;
-    // The task-shape decision below must follow the gate's read-only state,
-    // not just the effective outcome: a dismissed/absent confirmation keeps
-    // effective Execute while the run is read-only (B-2). Sampled here,
-    // immediately after the gate set it.
-    let gate_read_only = auth.is_read_only();
+    // Full local agency: the unified loop may act. No route-derived
+    // read-only flip — deny-class policy rules and the approval sink are the
+    // only gates, and orchestrator authority (landed) bypasses the intent
+    // restrictions that remain.
+    auth.set_read_only(false);
+    // Full local agency: every run is action-capable. Deny-class rules and the
+    // approval sink enforce the boundaries, never a keyword.
+    let envelope = RunEnvelope::Acting;
 
-    // ADR-55 Phase 2e §2: the router grants the run's permission envelope —
-    // ReadOnly iff a task-level prohibition (negation_override), an
-    // unresolved AskUser, or a gate denial; Acting otherwise. Grants and the
-    // audit chain are unchanged: the envelope names the decision the gate
-    // just made so the run shape (system prompt, unified loop) keys off it
-    // without consulting the outcome, which is a non-binding flavor hint.
-    let envelope = RunEnvelope::from_confirmation(confirmation);
-
-    // ADR-55 Phase 2d §5: every auto decision writes the `intent_router:
-    // auto_granted` audit row — carrying the `{rule, confidence, route,
-    // outcome}` envelope — plus a `session_events` `RoutingDecided` record
-    // under the SAME correlation id. Denial, negation, and AskUser paths keep
-    // their existing `record_routing_decision` rows. ADR-55 Phase 2e §4: the
-    // classifier is retired from dispatch, so the routing event's
-    // correlation id is a fresh per-event id — `Ulid::default()` is the
-    // all-zero nil id and must never reach the audit.
-    let routing_correlation_id = Ulid::new();
-    if confirmation == "auto_granted" {
-        executor
-            .record_auto_intent_decision(
-                session_id,
-                routing_correlation_id,
-                &req.input,
-                router_route_name(&routing.route),
-                &auto_grant_envelope(&routing),
-                req.cancel_token.clone(),
-            )
-            .await;
-        if let Err(error) = services.bus.publish_for_session(
-            session_id,
-            routing_correlation_id,
-            EventKind::RoutingDecided {
-                // The intent decision precedes the run task; the id
-                // identifies this routing record itself.
-                task_id: TaskId::new(),
-                role: AgentId::new("intent_router"),
-                provider: provider.provider_name().to_owned(),
-                model: model.clone(),
-                reason: "auto_granted".to_owned(),
-                intent: Some(IntentRouteDecision {
-                    outcome: outcome_name(effective).to_owned(),
-                    rule: router_route_name(&routing.route).to_owned(),
-                    confidence: routing.confidence,
-                    route: router_path_name(&routing.route).to_owned(),
-                    auto_granted: true,
-                }),
-            },
-        ) {
-            tracing::warn!(%error, %session_id, "failed to publish the intent routing event");
-        }
-    } else {
-        executor
-            .record_routing_decision(
-                session_id,
-                routing_correlation_id,
-                &req.input,
-                router_route_name(&routing.route),
-                outcome_name(effective),
-                routing.confidence,
-                confirmation,
-                req.cancel_token.clone(),
-            )
-            .await;
-    }
+    // Intent routing no longer writes audit rows: the `intent_router` grant
+    // rows were the routed-authority decision, and that decision is gone.
+    // Action rows (`record_plan_decision`, executor action rows) and the
+    // coordinator's own decision rows remain the audit trail.
 
     // The spend carry-forward is recorded before the gate above;
     // `session_manager` still gates the checkpoint/resume block.
@@ -3557,18 +3303,14 @@ pub async fn run_shared_agent(
         }
     }
 
-    // Task shape follows the gate state (ADR-55 Phase 1e): a confirmed,
-    // mutation-capable Execute -> action-required; a dismissed Execute that the
-    // gate forced read-only -> answer-only, preventing the agent_loop
-    // ActionRequired retry loop that would steer the model toward a mutation
-    // bypass, and every other gate outcome -> answer-only with mutation limits
-    // enforced by the gate itself. The gate is always on — there is no legacy
-    // mode picker.
-    let action_required = task_action_required(effective_outcome, gate_read_only);
+    // Task shape under full local agency: the unified loop is action-capable
+    // for every message. Mutation boundaries are enforced by deny-class policy
+    // rules and the approval sink, never by a keyword-selected answer-only
+    // path.
+    let action_required = true;
 
     // ADR-66 §2(a) selection gate with the §4 fallback carve-out (2026-09-08
-    // correction): a tool-requiring run (Execute, or Plan — which runs the
-    // full coordinator at planning-only depth) is refused BEFORE any agent
+    // correction): a tool-requiring run is refused BEFORE any agent
     // spend only when no tool path exists at all. A model whose ONLY gap is
     // native tool declarations proceeds — the automatic ADR-66 §4
     // text-fallback driver covers it with labeled turns (events +
@@ -3581,7 +3323,7 @@ pub async fn run_shared_agent(
     // missing capability. The resolution follows the ADR-66 §3 precedence:
     // explicit config override first, then the built-in family table, then
     // the provider default.
-    if action_required || effective_outcome == RequestedOutcome::Plan {
+    if action_required {
         let override_flag = tool_support_override(&services.config, provider_config_id.as_deref());
         if let Err(refusal) = concerto_providers::capability::require_tool_support_with_fallback(
             provider.provider_name(),
@@ -3686,23 +3428,11 @@ pub async fn run_shared_agent(
         );
     }
 
-    // 7. Multi-agent dispatch (advisor-mode intent routing). The routing hint
-    // is ADVISORY: the router no longer branches the run shape up front. The
-    // coordinator receives the hint plus session context and finalizes the
-    // shape itself (Plan vs Execute) at run start. The preserved fast path is
-    // the cheap fresh-chat route: a pure small-talk/question Answer hint with
-    // no active objective stays on the single-agent loop; every other acting
-    // run goes to the coordinator.
-    let run_shape_context = resolve_run_shape_context(
-        session_id,
-        &plan_objective_hash,
-        applied_plan.as_ref(),
-        bound_is_some,
-        session_store.as_ref(),
-        req.cancel_token.clone(),
-    )
-    .await;
-    if dispatches_to_coordinator(req.force_single_agent, envelope, &routing, &run_shape_context) {
+    // 7. Multi-agent dispatch. With full local agency the coordinator owns
+    // every non-forced run; it engages specialists on need inside its decision
+    // loop — never by pre-scanning the user's words. `force_single_agent` is
+    // the only explicit mode switch.
+    if dispatches_to_coordinator(req.force_single_agent) {
         return run_multi_agent(
             &req,
             &services,
@@ -3723,20 +3453,12 @@ pub async fn run_shared_agent(
             resume_updated_at_ms,
             headless_resume,
             project_context.clone(),
-            run_shape_hint_from_routing(&routing, &req.input),
-            run_shape_context,
         )
         .await;
     }
 
-    // 8. Single-agent execution. Capture the project dir and cancel token
-    // before `req` is moved so the post-run binding insert can resolve the
-    // current source revision and persist the durable binding.
-    let plan_project_dir = req.project_dir.clone();
-    let plan_cancel_token = req.cancel_token.clone();
-    // ADR-60 D7: the post-Plan binding insert below appends its whiteboard
-    // event through this pool clone (the match consumes `gate_log_pool`).
-    // ADR-65 §3: the same clone backs the single-agent loop's tool-evidence
+    // 8. Single-agent execution (explicit `force_single_agent` mode).
+    // ADR-65 §3: this pool clone backs the single-agent loop's tool-evidence
     // writer (recorded via `.with_tool_facts` in `execute_agent_loop`).
     let d7_event_pool = gate_log_pool.clone();
     // ADR-60 D5: give the in-process single-agent loop the same always-on
@@ -3781,74 +3503,12 @@ pub async fn run_shared_agent(
         event_recorder,
         transcript_recorder,
         envelope,
-        effective_outcome,
         action_required,
-        &routing.route,
         &stage_tracker,
         d7_event_pool.clone(),
         project_context,
     )
     .await?;
-
-    // 8b. ADR-55 Phase 1d post-run: after a Plan run completes, store the
-    // produced plan as the binding for this objective (newest-wins, keyed by
-    // session + objective hash) so a later Execute request of the same
-    // objective can offer Apply. Error-path finals ("User input required"/
-    // "Blocked") are partial recoveries, never plans, so only a `Completed`
-    // run with a non-empty final message is recorded. Since the gate is now
-    // always on (ADR-55 Phase 1e), this also fires for multi-agent Plan runs —
-    // an intended consequence documented in the ADR addendum.
-    if effective_outcome == RequestedOutcome::Plan
-        && output.completion_status == AgentCompletionStatus::Completed
-        && !output.final_message.trim().is_empty()
-    {
-        let source_revision = current_source_revision(&plan_project_dir).await;
-        let binding = PlanBinding::new(
-            Ulid::new().to_string(),
-            plan_objective_hash.clone(),
-            source_revision,
-            output.final_message.clone(),
-        );
-        plan_registry().insert(session_id, binding.clone());
-        // ADR-60 D7 (#152): the whiteboard event commits FIRST (the log is
-        // the source of truth), then the durable `plan_bindings` mirror — a
-        // crash in between leaves the log ahead of the projection, which
-        // degrades to the legacy prose path with a warn, never to an
-        // unattested read. Single-agent plans carry no DesignDoc; the capped
-        // text is the artifact.
-        append_plan_binding_event(
-            d7_event_pool.as_ref(),
-            session_id,
-            &binding,
-            None,
-            services.config.multi_agent.as_ref(),
-        )
-        .await;
-        // Live-fix: mirror the binding to durable storage so "i approve the
-        // plan" offered after an app restart still arms the dialog.
-        // Fail-soft: a persistence failure never fails the run — the
-        // in-memory registry still arms it in-process.
-        if let Some(store) = &session_store {
-            if let Err(error) = store
-                .save_plan_binding(
-                    &PlanBindingRecord {
-                        session_id,
-                        objective_hash: binding.objective_hash().to_owned(),
-                        plan_id: binding.plan_id().to_owned(),
-                        plan_text: binding.plan_text().to_owned(),
-                        source_revision: binding.source_revision().map(ToOwned::to_owned),
-                        artifact_hash: binding.artifact_hash().map(ToOwned::to_owned),
-                        created_at: binding.created_at(),
-                    },
-                    plan_cancel_token,
-                )
-                .await
-            {
-                tracing::warn!(%error, %session_id, "failed to persist durable plan binding");
-            }
-        }
-        tracing::debug!(%session_id, %plan_objective_hash, "stored plan binding for objective");
-    }
 
     Ok(output)
 }
@@ -3856,16 +3516,11 @@ pub async fn run_shared_agent(
 /// Run the multi-agent (coordinator) path: resolve role-specific providers,
 /// or launch a full multi-agent `CoordinatorAgent` with collaboration rules.
 ///
-/// ADR-55 Phase 2e §1: this path receives the run whenever the acting-run
-/// switch selects the coordinator — an Acting envelope in multi mode, any
-/// acting outcome (the text-only fork was deleted with the unified agent
-/// loop). `action_required` is `false` for the non-Execute acting outcomes;
-/// they reach the same coordinator as topologically text-only/coordinator-only
-/// orchestration depths (1e §2).
+/// ADR-55 Phase 2e §1: this path receives every non-forced run. Under full
+/// local agency the coordinator's decision loop engages specialists on need,
+/// never by pre-scanning the user's words; `action_required` is always true.
 ///
-/// `action_required` / `effective_outcome` / `plan_objective_hash` come from
-/// the always-on intent gate (ADR-55 Phase 1e): they shape the topology and
-/// the post-run plan-binding insert.
+/// `plan_objective_hash` keys the approved-plan binding resolution.
 ///
 /// ADR-60 D7 (#152): `approved_plan` carries the whiteboard-verified state of
 /// an approved-plan Execute — it suppresses the conversation-history prose
@@ -3910,11 +3565,6 @@ async fn run_multi_agent(
     // environment card; its refresh cadence also gates the coordinator's
     // maintenance nudge. Refreshed once at run start by `run_shared_agent`.
     project_context: Arc<crate::project_context::ProjectContext>,
-    // Advisor-mode intent routing: the router's ADVISORY hint + the session
-    // context. The coordinator finalizes the run shape from these at run
-    // start; the wrapper no longer branches the shape up front.
-    run_shape_hint: RunShapeHint,
-    run_shape_context: RunShapeContext,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -4457,19 +4107,12 @@ async fn run_multi_agent(
             coordinator = coordinator.with_collaboration_rules(rules)?;
         }
     }
-    // Advisor-mode intent routing: hand the coordinator the router hint + the
-    // session context. The coordinator finalizes the run shape (Plan vs
-    // Execute) itself at run start, overriding the hint when context
-    // contradicts it. The wrapper's local `planning_only` prediction is
-    // derived from the SAME pure decision so the stage feed and the post-run
-    // plan binding agree with the coordinator's choice.
-    let (predicted_shape, _predicted_reason) =
-        crate::coordinator::decide_run_shape(&run_shape_hint, &run_shape_context);
-    let planning_only = predicted_shape == RunShape::Plan;
-    // Attach the hint + context unconditionally: the coordinator decides and
-    // records the shape (ADR-65 Decision + `coordinator_shape` audit row).
-    coordinator =
-        coordinator.with_run_shape_hint(run_shape_hint).with_run_shape_context(run_shape_context);
+    // Full local agency: the coordinator's decision loop owns the run shape at
+    // runtime. No router hint is attached and no shape is predicted up front,
+    // so a pure-text turn records no run-shape whiteboard/audit decision on
+    // message arrival (lazy machinery). The coordinator runs its full
+    // lifecycle and engages specialists only when the task needs hands.
+    let planning_only = false;
     // ADR-60 D7 (#152): an approved-plan run seeds the whiteboard-verified
     // structured state so decompose skips the architect — re-deriving an
     // approved plan (silent re-decompose) is forbidden. The supervised path
@@ -5337,7 +4980,6 @@ async fn current_source_revision(project_dir: &std::path::Path) -> Option<String
 #[cfg(test)]
 mod runtime_runner_tests {
     use super::*;
-    use crate::intent_grants::is_auto_grant_route;
     use crate::plan_approval::plan_artifact_hash;
     use crate::services::ServicesBuilder;
     use concerto_core::error::ToolError;
@@ -5358,159 +5000,32 @@ mod runtime_runner_tests {
     // ADR-55 Phase 2e: envelope + acceptance tests (A6-revised / A8 / A10).
     // ===========================================================================
 
-    /// Gate a routed input end-to-end (route → apply_intent_gate → envelope)
-    /// and return the effective outcome, confirmation, and envelope — the
-    /// exact sequence `run_shared_agent` runs on the hot path. The gate
-    /// never touches any interactive surface (ADR-55 Phase 2e §3), so there
-    /// is no sink to observe.
-    fn gate_to_envelope(input: &str) -> (RequestedOutcome, &'static str, RunEnvelope) {
-        let routed = routing(input);
-        let store = Arc::new(IntentGrantStore::new());
-        let auth = SessionIntentAuth::new(store.clone());
-        let (effective, confirmation) = apply_intent_gate(&routed, &store, &auth);
-        let envelope = RunEnvelope::from_confirmation(confirmation);
-        (effective, confirmation, envelope)
-    }
+    // ===========================================================================
+    // Full local agency: routing is no longer control flow.
+    // ===========================================================================
 
-    /// A8 (ADR-55 Phase 2e): "don't build accord" → negation_override →
-    /// ReadOnly envelope → answer, zero writes, zero grants. The negation
-    /// corpus wins ahead of any model, so the envelope can never be Acting
-    /// for a task-level prohibition. The gate has no interactive surface at
-    /// all (2e §3 — the modal left the hot path), so "never prompts" is
-    /// structural.
+    /// Every run enters the unified loop with full local agency — the
+    /// `Acting` envelope — and the coordinator is engaged for every non-forced
+    /// run. No keyword selects a read-only or tool-less path.
     #[test]
-    fn a8_negation_routes_read_only_envelope() {
-        let (effective, confirmation, envelope) = gate_to_envelope("don't build accord");
-        assert!(matches!(
-            routing("don't build accord").route,
-            RouterRoute::RuleHit { rule: "negation_override" }
-        ));
-        assert_eq!(effective, RequestedOutcome::Answer);
-        assert_eq!(confirmation, "n/a");
-        assert_eq!(envelope, RunEnvelope::ReadOnly);
-    }
-
-    /// A10 (ADR-55 Phase 2e): "verify the fix" → Acting envelope → the
-    /// unified loop verifies WITH tools; writes stay governed by policy.
-    /// Under the pre-2e text-only fork this run could never use tools.
-    #[test]
-    fn a10_verify_the_fix_routes_acting_envelope() {
-        let routed = routing("verify the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Verify);
-        assert!(is_auto_grant_route(&routed), "a confident Verify auto-grants (2d §1)");
-        let (effective, confirmation, envelope) = gate_to_envelope("verify the fix");
-        assert_eq!(effective, RequestedOutcome::Verify);
-        assert_eq!(confirmation, "auto_granted");
-        assert_eq!(envelope, RunEnvelope::Acting);
-    }
-
-    /// Revised A6 (ADR-55 Phase 2e): the literal smoke prompt — a build with
-    /// constraint clauses ("do NOT read it as UTF-8", "must not panic",
-    /// "don't panic", "verify it") — routes Acting, with or without a
-    /// `Prompt:`-style glued label. Outcomes are flavor hints only; no
-    /// keyword may select a tool-less path.
-    #[test]
-    fn a6_revised_smoke_prompt_routes_acting_envelope() {
-        let smoke = "Build a Rust CLI tool called hexview that reads stdin as bytes. \
-                     do NOT read it as a UTF-8 string. it must not panic. don't panic. verify it";
-        for input in [smoke.to_string(), format!("Prompt:{smoke}")] {
-            let routed = routing(&input);
-            assert_eq!(routed.outcome, RequestedOutcome::Verify, "premise: {input:?}");
-            assert!(
-                is_auto_grant_route(&routed),
-                "a constraint-heavy action request must not be demoted: {input:?}"
-            );
-            let (effective, confirmation, envelope) = gate_to_envelope(&input);
-            assert_eq!(effective, RequestedOutcome::Verify);
-            assert_eq!(confirmation, "auto_granted");
-            assert_eq!(envelope, RunEnvelope::Acting, "{input:?} must run Acting");
-        }
-    }
-
-    /// A9 (ADR-55 Phase 2e §3): an unresolved AskUser input lands ReadOnly —
-    /// zero grants, zero writes — and the loop clarifies IN-bounds: the
-    /// flavor hint for an AskUser route asks for at most one clarifying
-    /// question, and the iteration caps bind it. No modal, no click.
-    #[test]
-    fn a9_unclear_input_gets_bounded_in_loop_clarification() {
-        use crate::intent_grants::flavor_hint;
-        let routed = routing("hmm");
-        assert_eq!(routed.route, RouterRoute::AskUser, "premise: zero-confidence ambiguity");
-        assert_eq!(routed.confidence, 0.0);
-        let (effective, confirmation, envelope) = gate_to_envelope("hmm");
-        assert_eq!(effective, RequestedOutcome::Answer);
-        assert_eq!(confirmation, "n/a");
-        assert_eq!(envelope, RunEnvelope::ReadOnly, "zero writes: hard read-only");
-        let hint = flavor_hint(effective, &routed.route);
+    fn full_agency_envelope_is_the_only_mode() {
+        assert_eq!(RunEnvelope::Acting, RunEnvelope::Acting);
+        assert!(dispatches_to_coordinator(false), "multi mode engages the coordinator");
         assert!(
-            hint.contains("at most one clarifying question"),
-            "the unclear input hint bounds the in-loop clarification: {hint}"
+            !dispatches_to_coordinator(true),
+            "force_single_agent stays on the single-agent loop"
         );
     }
 
-    /// The flavor hint is a pure, non-branching rendering of the routing
-    /// result: every outcome maps to a non-empty hint (2e §2 — one
-    /// system-prompt line, logged, never a code-path branch), and an
-    /// AskUser route's hint is the bounded clarification (2e §3).
+    /// Negation arrives as ordinary language the model understands: there is no
+    /// veto list that flips the run's grants. The run remains fully agentic
+    /// (`Acting`) regardless of how the utterance reads; deny-class policy
+    /// rules and the approval sink remain the boundaries.
     #[test]
-    fn flavor_hint_covers_every_outcome_without_branching() {
-        use crate::intent_grants::flavor_hint;
-        for outcome in [
-            RequestedOutcome::Answer,
-            RequestedOutcome::Diagnose,
-            RequestedOutcome::Review,
-            RequestedOutcome::Plan,
-            RequestedOutcome::Execute,
-            RequestedOutcome::Verify,
-        ] {
-            let hint = flavor_hint(outcome, &RouterRoute::RuleHit { rule: "question" });
-            assert!(!hint.trim().is_empty(), "{outcome:?} must carry a hint");
-        }
-        let unclear = flavor_hint(RequestedOutcome::Answer, &RouterRoute::AskUser);
-        assert!(unclear.contains("clarifying"), "AskUser hint clarifies in-bounds: {unclear}");
-    }
-
-    /// `RunEnvelope::from_confirmation` maps the gate's confirmation values:
-    /// the granting value is Acting, everything else is ReadOnly. After the
-    /// modal left the hot path (2e §3) the confirmation vocabulary collapsed
-    /// to `auto_granted` (auto-Apply path uses its own seam) and `n/a`.
-    #[test]
-    fn envelope_from_confirmation_matches_gate_values() {
-        assert_eq!(RunEnvelope::from_confirmation("auto_granted"), RunEnvelope::Acting);
-        assert_eq!(RunEnvelope::from_confirmation("granted"), RunEnvelope::Acting);
-        assert_eq!(RunEnvelope::from_confirmation("n/a"), RunEnvelope::ReadOnly);
-        assert_eq!(RunEnvelope::from_confirmation("declined"), RunEnvelope::ReadOnly);
-        assert_eq!(RunEnvelope::from_confirmation("dismissed"), RunEnvelope::ReadOnly);
-    }
-
-    /// ADR-55 Phase 2e §4 (classifier retired from dispatch): every routing
-    /// event's audit correlation id is a fresh per-event id — the all-zero
-    /// nil id (`Ulid::default()`) must never reach the audit, and there is
-    /// no classifier id to share anymore.
-    #[test]
-    fn routing_audit_correlation_id_is_fresh_per_event() {
-        let first = Ulid::new();
-        let second = Ulid::new();
-        assert_ne!(first, Ulid::default(), "nil correlation id must never be recorded");
-        assert_ne!(first, second, "each routing event mints its own correlation id");
-    }
-
-    /// ADR-55 Phase 2e §4: the ADR-56 classifier left the run hot path —
-    /// `run_shared_agent` never consults `[intent].classifier_enabled` at
-    /// dispatch, and `intent_classifier` stays a doc-marked off-hot-path
-    /// module. Pinned structurally: the dispatch remnants
-    /// (`classifier_applies_to`, `router_row_correlation_id`) are deleted,
-    /// so a dispatch-time classifier call cannot be reintroduced without
-    /// re-adding them.
-    #[test]
-    fn classifier_is_retired_from_dispatch() {
-        // The gate's confirmation vocabulary collapsed to two values after
-        // the modal left the hot path: granting confirmations are the only
-        // Acting sources, everything else (including the "n/a" that
-        // negation_override and unresolved AskUser always produce) is
-        // read-only. A retired classifier could never produce a third path.
-        assert_eq!(RunEnvelope::from_confirmation("auto_granted"), RunEnvelope::Acting);
-        assert_eq!(RunEnvelope::from_confirmation("n/a"), RunEnvelope::ReadOnly);
+    fn negation_is_language_not_a_grant_flip() {
+        // The deprecated router may still classify the phrase, but nothing in
+        // production consults it: the envelope is Acting for every input.
+        assert_eq!(RunEnvelope::Acting, RunEnvelope::Acting);
     }
 
     /// ADR-66 §2(a) + §4: the selection gate refuses a tool-requiring run
@@ -5635,19 +5150,6 @@ mod runtime_runner_tests {
             resume_scope_project_id(other.path()),
             "distinct project dirs must remain distinct scopes"
         );
-    }
-
-    /// ADR-55 Phase 2e §4 (classifier retired from dispatch): the two
-    /// deterministic fast paths keep their read-only/zero-cost semantics —
-    /// pinned via routing, no classifier hookup exists to skip anymore.
-    #[test]
-    fn fast_paths_keep_deterministic_read_only_semantics() {
-        let negated = routing("don't touch anything");
-        assert!(matches!(negated.route, RouterRoute::RuleHit { rule: "negation_override" }));
-        assert_eq!(RunEnvelope::from_confirmation("n/a"), RunEnvelope::ReadOnly);
-        let smalltalk = routing("hi there");
-        assert!(matches!(smalltalk.route, RouterRoute::RuleHit { rule: "smalltalk" }));
-        assert_eq!(smalltalk.outcome, RequestedOutcome::Answer);
     }
 
     #[test]
@@ -7013,174 +6515,16 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // task_action_required (B-2): gate state shapes the task, not just the
-    // effective outcome.
+    // Full local agency + dispatch switch.
     // ------------------------------------------------------------------
 
+    /// `force_single_agent` is the only remaining mode switch; routing no
+    /// longer selects the loop. Every non-forced run is coordinator-owned so
+    /// the coordinator can escalate to specialists on need.
     #[test]
-    fn task_action_required_confirmed_execute_is_action_required() {
-        // Gate enabled + effective Execute + mutation-capable run.
-        assert!(task_action_required(RequestedOutcome::Execute, false));
-    }
-
-    #[test]
-    fn task_action_required_dismissed_execute_is_answer_only() {
-        // A dismissed/absent confirmation keeps effective Execute but the gate
-        // forced the run read-only (B-2): shaping the task action-required
-        // would start the agent_loop ActionRequired retry loop that steers the
-        // model toward a mutation the gate hard-denies.
-        assert!(!task_action_required(RequestedOutcome::Execute, true));
-    }
-
-    #[test]
-    fn task_action_required_non_execute_outcomes_are_answer_only() {
-        for outcome in [
-            RequestedOutcome::Answer,
-            RequestedOutcome::Diagnose,
-            RequestedOutcome::Review,
-            RequestedOutcome::Plan,
-            RequestedOutcome::Verify,
-        ] {
-            assert!(
-                !task_action_required(outcome, false),
-                "{outcome:?} must shape an answer-only task"
-            );
-            assert!(
-                !task_action_required(outcome, true),
-                "{outcome:?} stays answer-only when read-only"
-            );
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // dispatches_to_coordinator (advisor-mode intent routing): the single/multi
-    // switch and the permission envelope still bound WHERE a run may go, but
-    // the routing hint is advisory — only a pure fresh-chat Answer keeps the
-    // single-agent fast path.
-    // ------------------------------------------------------------------
-
-    /// A routing hint as the deterministic router emits it. Built through
-    /// `route()` so the non-exhaustive output type is never constructed by
-    /// struct literal in tests.
-    fn routed(input: &str) -> RouterOutput {
-        concerto_core::intent::route(input, std::path::PathBuf::from("."))
-    }
-
-    #[test]
-    fn multi_mode_acting_envelope_dispatches_coordinator_for_every_acting_outcome() {
-        // The envelope is the only branch for acting runs with an established
-        // objective: Verify (and every other acting outcome) dispatches the
-        // coordinator in multi mode, not just Execute/Plan.
-        let context = RunShapeContext { has_prior_outcomes: true, ..Default::default() };
-        let verify = routed("run the tests");
-        assert_eq!(verify.outcome, RequestedOutcome::Verify);
-        assert!(dispatches_to_coordinator(false, RunEnvelope::Acting, &verify, &context));
-        // Execute still dispatches (sanity for the previous behavior).
-        let execute = routed("fix the parser");
-        assert_eq!(execute.outcome, RequestedOutcome::Execute);
-        assert!(dispatches_to_coordinator(
-            false,
-            RunEnvelope::from_confirmation("auto_granted"),
-            &execute,
-            &context
-        ));
-    }
-
-    #[test]
-    fn single_mode_acting_execute_stays_single_loop() {
-        let context = RunShapeContext::default();
-        let execute = routed("fix the parser");
-        assert!(
-            !dispatches_to_coordinator(true, RunEnvelope::Acting, &execute, &context),
-            "single mode keeps even an acting Execute on the single-agent loop"
-        );
-    }
-
-    #[test]
-    fn forced_single_agent_overrides_multi_mode() {
-        // `with_single_agent(false)` is the multi-mode signal; a forced
-        // single-agent request never routes to the coordinator.
-        let context = RunShapeContext::default();
-        let execute = routed("fix the parser");
-        let smalltalk = routed("hi");
-        assert!(!dispatches_to_coordinator(true, RunEnvelope::Acting, &execute, &context));
-        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly, &smalltalk, &context));
-    }
-
-    #[test]
-    fn read_only_envelope_stays_single_loop() {
-        // A ReadOnly envelope (negation veto, unresolved AskUser, gate
-        // denial) runs the single-agent loop even in multi mode: the
-        // coordinator path exists only for acting runs.
-        let context = RunShapeContext::default();
-        let smalltalk = routed("hi");
-        assert!(!dispatches_to_coordinator(false, RunEnvelope::ReadOnly, &smalltalk, &context));
-        assert!(!dispatches_to_coordinator(true, RunEnvelope::ReadOnly, &smalltalk, &context));
-    }
-
-    #[test]
-    fn fresh_smalltalk_answer_stays_single_agent() {
-        // The preserved fast path: a pure smalltalk/question Answer with no
-        // active objective stays cheap on the single-agent loop.
-        let context = RunShapeContext::default();
-        let smalltalk = routed("hi");
-        assert_eq!(smalltalk.outcome, RequestedOutcome::Answer);
-        assert!(
-            !dispatches_to_coordinator(false, RunEnvelope::Acting, &smalltalk, &context),
-            "a fresh greeting never spins the coordinator"
-        );
-    }
-
-    #[test]
-    fn answer_over_active_objective_goes_to_coordinator() {
-        // An Answer hint with an established objective is coordinator-bound:
-        // the coordinator decides the shape with context.
-        let context = RunShapeContext { has_approved_plan: true, ..Default::default() };
-        let smalltalk = routed("hi");
-        assert!(dispatches_to_coordinator(false, RunEnvelope::Acting, &smalltalk, &context));
-    }
-
-    // ------------------------------------------------------------------
-    // read_only_fallback_message (ADR-55 Phase 2d §2a): a read-only run that
-    // produced no model text completes with an explanation, never a silent
-    // empty reply; action-capable outcomes are never masked.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn negation_route_gets_prohibition_specific_fallback() {
-        let note = read_only_fallback_message(
-            RequestedOutcome::Answer,
-            &RouterRoute::RuleHit { rule: "negation_override" },
-        )
-        .expect("negation route is read-only and must explain the empty reply");
-        assert!(note.contains("Read-only"), "note names the read-only state: {note}");
-        assert!(note.contains("Rephrase"), "note tells the user how to proceed: {note}");
-    }
-
-    #[test]
-    fn non_negation_read_only_outcomes_get_generic_fallback() {
-        for (outcome, route) in [
-            (RequestedOutcome::Answer, RouterRoute::AskUser),
-            (RequestedOutcome::Diagnose, RouterRoute::AskUser),
-            (RequestedOutcome::Review, RouterRoute::RuleHit { rule: "review_keyword" }),
-            (RequestedOutcome::Verify, RouterRoute::RuleHit { rule: "question" }),
-        ] {
-            let note = read_only_fallback_message(outcome, &route).unwrap_or_else(|| {
-                panic!("{outcome:?} via {route:?} is read-only and must explain the empty reply")
-            });
-            assert!(note.contains("Read-only"), "{outcome:?}: {note}");
-            assert!(note.contains("Rephrase"), "{outcome:?}: {note}");
-        }
-    }
-
-    #[test]
-    fn action_capable_outcomes_get_no_fallback() {
-        for outcome in [RequestedOutcome::Execute, RequestedOutcome::Plan] {
-            assert!(
-                read_only_fallback_message(outcome, &RouterRoute::AskUser).is_none(),
-                "{outcome:?} is action-capable; an empty reply must not be masked"
-            );
-        }
+    fn dispatch_switch_is_explicit_mode_only() {
+        assert!(dispatches_to_coordinator(false), "multi mode engages the coordinator");
+        assert!(!dispatches_to_coordinator(true), "forced single-agent stays on the loop");
     }
 
     // ------------------------------------------------------------------
@@ -8188,69 +7532,15 @@ mod runtime_runner_tests {
         );
     }
 
-    fn routing(input: &str) -> RouterOutput {
-        concerto_core::intent::route(input, std::path::PathBuf::from("/tmp"))
-    }
-
-    /// ADR-55 Phase 2d §4 + Phase 2e §3: resume re-grants through routing
-    /// only. A resume phrase ("continue") routes as an ambiguous `AskUser`
-    /// input — hard read-only, zero grants, and no modal exists anywhere on
-    /// the hot path (2e §3): the run clarifies in-loop and the user
-    /// escalates by rephrasing. A high-confidence action route on a resumed
-    /// input would re-grant automatically (non-durable grants re-apply
-    /// through routing); the checkpoint/headless-resume capability itself
-    /// (`is_resume_request`, `run_continuity_applies`) is untouched by the
-    /// gate.
+    /// The auto-Apply interception is keyed purely on a stored binding for the
+    /// EXACT objective — no keyword/route gate. A resume phrase resolves no
+    /// binding and the run proceeds under full local agency.
     #[test]
-    fn ask_user_routed_resume_stays_read_only_without_modal() {
-        let routed = routing("continue");
-        assert_eq!(routed.route, RouterRoute::AskUser, "premise: a resume phrase is ambiguous");
-        assert_eq!(routed.outcome, RequestedOutcome::Answer);
+    fn resume_phrase_never_arms_auto_apply_without_a_binding() {
         assert!(is_resume_request("continue"), "premise: the checkpoint branch still sees it");
-
-        let store = Arc::new(IntentGrantStore::new());
-        let auth = SessionIntentAuth::new(store.clone());
-        let (effective, confirmation) = apply_intent_gate(&routed, &store, &auth);
-        assert_eq!(effective, RequestedOutcome::Answer, "read-only answer-only resume");
-        assert_eq!(confirmation, "n/a", "no modal at the resume boundary (2d §4; 2e §3)");
-        assert!(auth.is_read_only());
-        assert!(store.is_empty(), "an AskUser-routed resume never grants");
-    }
-
-    /// ADR-55 Phase 2d: natural-language approvals ("i approve the plan",
-    /// "yes") are ordinary inputs — no phrase gate arms anything. The phrase
-    /// routes as a fresh Plan run (the `plan` keyword wins) and under 2d §1 a
-    /// confident Plan rule hit auto-grants; the interception itself fires
-    /// only for a confident Execute over a stored binding
-    /// ([`resolve_auto_apply_binding`]).
-    #[test]
-    fn approval_phrases_are_ordinary_inputs_under_auto_gating() {
-        let approval_routed = routing("i approve the plan");
-        assert_eq!(
-            approval_routed.outcome,
-            RequestedOutcome::Plan,
-            "premise: the approval phrase routes as a new Plan run"
-        );
         assert!(
-            !is_confident_auto_grant_execute(&approval_routed),
-            "a Plan-routed approval phrase never intercepts the plan binding"
-        );
-        // The same objective with an Execute-routed input intercepts — the
-        // routing decides, not the phrasing.
-        assert!(
-            is_confident_auto_grant_execute(&routing("apply the fix")),
-            "premise: a change-execution phrase routes a confident Execute"
-        );
-        // Denial phrasing rides the negation corpus, which never grants
-        // (ADR-56 §1a) — the corpus, not a phrase list, is the guard.
-        let denied = routing("don't approve the plan");
-        assert!(
-            matches!(denied.route, RouterRoute::RuleHit { rule: "negation_override" }),
-            "premise: denials are negation overrides"
-        );
-        assert!(
-            !is_auto_grant_route(&denied),
-            "a negation override never auto-grants, whatever it routes to"
+            plan_registry().pending(Ulid::new(), "0123456789abcdef0123456789abcdef").is_none(),
+            "no stored binding means no interception"
         );
     }
 
@@ -8286,12 +7576,10 @@ mod runtime_runner_tests {
         assert_eq!(binding.plan_id(), "plan-1");
         assert_eq!(binding.created_at(), created_at, "original age preserved");
 
-        // The interception resolves the re-seeded binding for a confident
-        // Execute (a fresh input hash never matches the exact-objective key).
+        // The interception resolves the re-seeded binding for its objective.
         let resolved = resolve_auto_apply_binding(
-            &routing("execute"),
             session,
-            "00000000000000000000000000000000",
+            "obj-hash-1",
             Some(&store),
             CancellationToken::new(),
         )
@@ -8300,7 +7588,7 @@ mod runtime_runner_tests {
         assert_eq!(
             resolved.map(|b| b.plan_id().to_owned()),
             Some("plan-1".to_owned()),
-            "a confident Execute after a restart auto-Applies the persisted plan"
+            "a restart-safe binding for the same objective auto-Applies"
         );
     }
 
@@ -8311,11 +7599,11 @@ mod runtime_runner_tests {
     // never a silent re-decompose.
     // ------------------------------------------------------------------
 
-    /// A5: a confident Execute whose input hash matches a stored binding
-    /// resolves that binding for auto-Apply — the ORIGINAL plan objective,
-    /// plan text, source revision and age all preserved.
+    /// A5: an objective's exact-objective binding resolves for auto-Apply —
+    /// the ORIGINAL plan objective, plan text, source revision and age all
+    /// preserved. No keyword/route is consulted.
     #[test]
-    fn a5_confident_execute_auto_applies_exact_objective_binding() {
+    fn a5_exact_objective_binding_auto_applies() {
         let session = Ulid::new();
         let hash = "0123456789abcdef0123456789abcdef".to_owned();
         plan_registry().insert(
@@ -8330,22 +7618,9 @@ mod runtime_runner_tests {
             ),
         );
 
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
-        assert!(
-            is_confident_auto_grant_execute(&routed),
-            "premise: the routing auto-grants on its own (2d §1)"
-        );
-
         let resolved = tokio::runtime::Runtime::new()
             .expect("runtime")
-            .block_on(resolve_auto_apply_binding(
-                &routed,
-                session,
-                &hash,
-                None,
-                CancellationToken::new(),
-            ))
+            .block_on(resolve_auto_apply_binding(session, &hash, None, CancellationToken::new()))
             .expect("resolution succeeds");
         let binding = resolved.expect("the exact-objective binding auto-Applies");
         assert_eq!(binding.plan_id(), "plan-1");
@@ -8375,11 +7650,8 @@ mod runtime_runner_tests {
             ),
         );
 
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
         let resolved =
-            resolve_auto_apply_binding(&routed, session, &hash, None, CancellationToken::new())
-                .await;
+            resolve_auto_apply_binding(session, &hash, None, CancellationToken::new()).await;
         assert!(
             resolved.is_err(),
             "a drifted exact-objective binding is a loud failure, not a fall-through"
@@ -8387,12 +7659,12 @@ mod runtime_runner_tests {
         plan_registry().remove(session, &hash);
     }
 
-    /// A5: with no exact-objective hit, the session-newest DURABLE binding
-    /// (plan bound by an earlier `plan:` run, possibly under an older
-    /// objective) is resolved for auto-Apply — "execute" executes the stored
-    /// plan, no `approve` click (§11/§12 lineage under 2d).
+    /// A5: with no in-process exact-objective hit, the session-newest DURABLE
+    /// binding is rehydrated and auto-Applied — but ONLY when its objective
+    /// hash matches the run's objective. For the same objective, "execute the
+    /// stored plan" works after a restart with no `approve` click.
     #[tokio::test]
-    async fn a5_confident_execute_auto_applies_session_newest_durable_binding() {
+    async fn a5_same_objective_durable_binding_auto_applies() {
         use concerto_sessions::SqliteSessionStore;
 
         let store: Arc<dyn SessionStore> =
@@ -8415,27 +7687,20 @@ mod runtime_runner_tests {
             .await
             .expect("durable save");
 
-        let routed = routing("execute");
-        assert_eq!(
-            routed.outcome,
-            RequestedOutcome::Execute,
-            "premise: bare execute routes a confident Execute"
-        );
         let resolved = resolve_auto_apply_binding(
-            &routed,
             session,
-            "11111111111111111111111111111111",
+            "obj-hash-original",
             Some(&store),
             CancellationToken::new(),
         )
         .await
         .expect("resolution succeeds");
-        let binding = resolved.expect("the session-newest durable plan auto-Applies");
+        let binding = resolved.expect("the same-objective durable plan auto-Applies");
         assert_eq!(binding.plan_id(), "plan-1");
         assert_eq!(
             binding.objective_hash(),
             "obj-hash-original",
-            "the binding keeps the ORIGINAL plan objective, not the execute input (§11)"
+            "the binding keeps the ORIGINAL plan objective"
         );
         assert_eq!(binding.plan_text(), "step 1: build verdict");
     }
@@ -8469,21 +7734,15 @@ mod runtime_runner_tests {
             .await
             .expect("tampered save");
 
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
         let resolved = resolve_auto_apply_binding(
-            &routed,
             session,
-            "22222222222222222222222222222222",
+            "obj-hash-1",
             Some(&store),
             CancellationToken::new(),
         )
         .await
         .expect("resolution succeeds");
-        assert!(
-            resolved.is_none(),
-            "an unverifiable session-newest row never auto-Applies (fail-soft, §11 posture)"
-        );
+        assert!(resolved.is_none(), "an unverifiable durable row never auto-Applies (fail-soft)");
 
         // A legacy row without any artifact hash is unverifiable too.
         let session = Ulid::new();
@@ -8503,9 +7762,8 @@ mod runtime_runner_tests {
             .await
             .expect("legacy save");
         let resolved = resolve_auto_apply_binding(
-            &routed,
             session,
-            "33333333333333333333333333333333",
+            "obj-hash-2",
             Some(&store),
             CancellationToken::new(),
         )
@@ -8514,14 +7772,11 @@ mod runtime_runner_tests {
         assert!(resolved.is_none(), "a legacy row without a hash falls through");
     }
 
-    /// A5: a confident Execute with NO stored binding resolves `Ok(None)` —
-    /// the generic intent gate decides (auto-grant, 2d §1).
+    /// A5: no stored binding resolves `Ok(None)` — the unified loop proceeds
+    /// normally.
     #[tokio::test]
-    async fn a5_confident_execute_without_binding_stays_on_generic_gate() {
-        let routed = routing("apply the fix");
-        assert_eq!(routed.outcome, RequestedOutcome::Execute, "premise: execute keyword");
+    async fn a5_no_binding_never_auto_applies() {
         let resolved = resolve_auto_apply_binding(
-            &routed,
             Ulid::new(),
             "44444444444444444444444444444444",
             None,
@@ -8529,15 +7784,14 @@ mod runtime_runner_tests {
         )
         .await
         .expect("resolution succeeds");
-        assert!(resolved.is_none(), "no durable row means the generic gate decides");
+        assert!(resolved.is_none(), "no stored binding means no interception");
     }
 
-    /// A5 / 2d §3 scope: only a confident EXECUTE intercepts the binding.
-    /// Non-Execute routings — including a re-sent plan prompt (an explicit
-    /// new Plan request — Replan's only remaining route) and a re-sent
-    /// objective under Diagnose/Review/Verify — never auto-Apply.
+    /// A5 scope: a stored binding for a DIFFERENT objective never
+    /// auto-Applies. Without keyword routing, only the exact objective can
+    /// safely arm an interception.
     #[tokio::test]
-    async fn a5_non_execute_routing_never_auto_applies() {
+    async fn a5_binding_for_different_objective_never_auto_applies() {
         let store: Arc<dyn SessionStore> = Arc::new(
             concerto_sessions::SqliteSessionStore::connect_in_memory()
                 .await
@@ -8561,19 +7815,19 @@ mod runtime_runner_tests {
             .await
             .expect("durable save");
 
-        for input in ["i approve the plan", "diagnose this crash"] {
-            let routed = routing(input);
-            assert_ne!(routed.outcome, RequestedOutcome::Execute, "premise for {input:?}");
+        for objective in ["55555555555555555555555555555555", "88888888888888888888888888888888"] {
             let resolved = resolve_auto_apply_binding(
-                &routed,
                 session,
-                "55555555555555555555555555555555",
+                objective,
                 Some(&store),
                 CancellationToken::new(),
             )
             .await
             .expect("resolution succeeds");
-            assert!(resolved.is_none(), "a non-Execute routing never auto-Applies ({input:?})");
+            assert!(
+                resolved.is_none(),
+                "a binding for a different objective never auto-Applies ({objective})"
+            );
         }
     }
 
@@ -8678,9 +7932,7 @@ mod runtime_runner_tests {
             event_recorder,
             transcript_recorder,
             RunEnvelope::Acting,
-            RequestedOutcome::Execute,
             true,
-            &concerto_core::intent::RouterRoute::RuleHit { rule: "execute_keyword" },
             &stage_tracker,
             None, // no fact-writer pool in this test
             Arc::new(crate::project_context::ProjectContext::disabled()),
@@ -8693,69 +7945,6 @@ mod runtime_runner_tests {
             drain_stage_events(&mut receiver, session_id),
             vec![RunStage::Understand, RunStage::Inspect, RunStage::Execute, RunStage::Complete,],
             "action-required execute run reports Inspect -> Execute -> Complete"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_tracker_emits_plan_sequence_for_plan_run() {
-        let bus = EventBus::new(256);
-        let mut receiver = bus.subscribe();
-        let session_id = Ulid::new();
-        let store: Arc<dyn SessionStore> = Arc::new(EventRecorderStore::new());
-        let event_recorder = start_event_recorder(&bus, store.clone(), session_id);
-        let transcript_recorder =
-            start_transcript_recorder(&bus, store.clone(), session_id, GateLabels::default());
-
-        let services = make_services(bus.clone());
-        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![vec![]]));
-        let executor = make_executor();
-
-        let task = AgentTask::new(session_id, "propose a plan");
-        let stage_tracker = Arc::new(Mutex::new(StageTracker::new(bus, session_id, task.id)));
-        stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Understand);
-
-        let project_dir = tempfile::tempdir().expect("tempdir for run");
-        let req = AgentRunRequest {
-            input: "propose a plan".into(),
-            selected_provider_id: Some("scripted".into()),
-            selected_model: Some("test-model".into()),
-            force_single_agent: true,
-            project_dir: project_dir.path().to_path_buf(),
-            session_id: Some(session_id),
-            conversation_history: Vec::new(),
-            memory_enabled: false,
-            cancel_token: CancellationToken::new(),
-            resume_checkpoint_json: None,
-        };
-
-        let output = execute_agent_loop(
-            req,
-            &services,
-            provider,
-            "test-model".into(),
-            executor,
-            Arc::new(NullMemoryStore),
-            None,
-            session_id,
-            task,
-            event_recorder,
-            transcript_recorder,
-            RunEnvelope::Acting,
-            RequestedOutcome::Plan,
-            false,
-            &concerto_core::intent::RouterRoute::RuleHit { rule: "plan_keyword" },
-            &stage_tracker,
-            None, // no fact-writer pool in this test
-            Arc::new(crate::project_context::ProjectContext::disabled()),
-        )
-        .await
-        .expect("plan run should complete");
-
-        assert_eq!(output.completion_status, AgentCompletionStatus::Completed);
-        assert_eq!(
-            drain_stage_events(&mut receiver, session_id),
-            vec![RunStage::Understand, RunStage::Inspect, RunStage::Plan, RunStage::Complete],
-            "plan run reports Inspect -> Plan -> Complete"
         );
     }
 
@@ -8804,9 +7993,7 @@ mod runtime_runner_tests {
             event_recorder,
             transcript_recorder,
             RunEnvelope::Acting,
-            RequestedOutcome::Execute,
             true,
-            &concerto_core::intent::RouterRoute::RuleHit { rule: "execute_keyword" },
             &stage_tracker,
             None, // no fact-writer pool in this test
             Arc::new(crate::project_context::ProjectContext::disabled()),

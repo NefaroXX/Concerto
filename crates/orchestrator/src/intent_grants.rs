@@ -1,5 +1,15 @@
 //! Session-scoped, non-durable intent grants (ADR-55 §4, Phase 2d §1).
 //!
+//! # Deprecated as control flow
+//!
+//! Intent routing is no longer consulted as control flow: every run enters one
+//! unified loop with full local agency (the orchestrator authority bypasses the
+//! intent restrictions while deny-class rules run first), and the coordinator
+//! owns run-shape triage. The routing-derived grant helpers below
+//! ([`apply_intent_gate`], [`is_auto_grant_route`]) are retained for
+//! compatibility and unit tests only; production no longer calls them and
+//! `run_shared_agent` writes no `intent_router` grant rows.
+//!
 //! ADR-55 Phase 2d: routing **is** the decision. A high-confidence route to
 //! one of the five action-grantable outcomes auto-grants the same
 //! `filesystem`/`git` scopes a confirmed `Apply` holds today — no
@@ -335,6 +345,10 @@ pub enum RunEnvelope {
 impl RunEnvelope {
     /// Derive the envelope from the intent gate's confirmation value
     /// (`auto_granted` | `granted` | `declined` | `dismissed` | `n/a`).
+    ///
+    /// Legacy/test-only: under full local agency the run envelope is always
+    /// [`RunEnvelope::Acting`], so production no longer derives it from a
+    /// routed confirmation.
     ///
     /// A `negation_override` route and an unresolved `AskUser` route never
     /// produce a granting confirmation ([`apply_intent_gate`] audits them

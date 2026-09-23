@@ -5618,7 +5618,20 @@ impl CoordinatorAgent {
         // back into this parameter on the resume path. `None` except when
         // the run is waiting on the operator (fresh or restored).
         initial_execution_checkpoint.pending_user_input = requested_user_input.clone();
-        self.persist_checkpoint(&mut initial_execution_checkpoint, &model_assignments).await;
+        // Lazy machinery: a text-only run (an empty graph that will dispatch
+        // nothing) must leave no orchestration checkpoint behind. Persist the
+        // initial execution checkpoint only when there is dispatchable work or
+        // an AwaitingUser pause that must survive a resume. The later
+        // checkpoint persists happen around real dispatch/progress by
+        // construction.
+        if !graph.is_empty() || requested_user_input.is_some() {
+            self.persist_checkpoint(&mut initial_execution_checkpoint, &model_assignments).await;
+        } else {
+            tracing::debug!(
+                session_id = %task.session_id,
+                "text-only run: no dispatchable work — initial checkpoint not persisted (lazy machinery)"
+            );
+        }
 
         // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
         // The Coordinator requested human input during its decision loop
@@ -27747,5 +27760,60 @@ mod tests {
             .expect("the coordinator_shape audit row was recorded");
         assert_eq!(shape_row.verdict, "Plan");
         assert_eq!(shape_row.rule_matched.as_deref(), Some("plan_artifact_overrides_execute_hint"));
+    }
+
+    /// Lazy machinery: with no routing hint attached (the production wiring
+    /// after intent routing left the hot path), the coordinator records NO
+    /// run-shape whiteboard Decision and NO `coordinator_shape` audit row at
+    /// message arrival. Run-shape bookkeeping engages only once the run
+    /// actually dispatches/mutates.
+    #[tokio::test]
+    async fn no_hint_records_no_run_shape_decision() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(MockProvider::default());
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("architect"),
+            "planned",
+        )]));
+        let mut coordinator =
+            coordinator_with_recording_audit(bus.clone(), registry, provider, audit.clone())
+                .with_review_store(Some(pool.clone()));
+
+        let workspace = tempfile::tempdir().expect("tempdir for the run-shape workspace");
+        let task = AgentTask::new(Ulid::new(), "hello there");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+
+        assert_eq!(
+            coordinator.decided_run_shape(),
+            None,
+            "no hint means no up-front shape decision"
+        );
+        let rows = audit.rows();
+        assert!(
+            !rows.iter().any(|row| row.tool_name == "coordinator_shape"),
+            "no coordinator_shape audit row without a hint"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            !logged.iter().any(|event| {
+                event.kind == WhiteboardKind::Decision && event.payload.get("final_shape").is_some()
+            }),
+            "no run-shape Decision whiteboard event without a hint"
+        );
     }
 }

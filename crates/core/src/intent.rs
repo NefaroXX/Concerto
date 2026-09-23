@@ -211,6 +211,14 @@ impl fmt::Display for RunStage {
 /// Route `input` to a requested outcome with a deterministic, pure,
 /// negation-aware rule set.
 ///
+/// # Deprecated (as control flow)
+///
+/// This function is retained **only** for compatibility and unit tests. It is
+/// no longer consulted as control flow anywhere in production: the unified
+/// orchestrator loop runs with full local agency, and run-shape triage is owned
+/// by the coordinator. Do not introduce new branching on its output; treat it
+/// as inert data.
+///
 /// The input is lowercased, then a leading glued `Label:` ahead of an
 /// explicit action keyword is detached (ADR-55 Phase 2e §6 — see
 /// [`strip_glued_label`]). Order of evaluation (first match wins):
