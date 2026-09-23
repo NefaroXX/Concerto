@@ -165,6 +165,62 @@ const MAX_DISPATCH_ITERATIONS: usize = 64;
 /// exit with a preserved checkpoint.
 const MAX_PROSE_STOP_REPROMPTS: u32 = 5;
 
+/// ADR-35 same-role dispatch cap: the number of CONSECUTIVE dispatches to one
+/// role on the same objective, with no implement/code artifact produced, at
+/// which the loop guard fires. It is a pure loop invariant — a guard, never a
+/// compiled dispatch policy (the guard only stops the circle or guides a
+/// different role; it never selects or auto-dispatches a role).
+const MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES: u32 = 3;
+
+/// The bounded guidance turns the same-role guard may emit before escalating.
+/// At the ceiling the guard stops forcing prose guidance and escalates to
+/// `AwaitingUser` with the loop evidence instead of letting the circle stand.
+const MAX_SAME_ROLE_GUARD_NUDGES: u32 = 1;
+
+/// Whether a produced path is an implement/code artifact (as opposed to a
+/// docs-only deliverable). Extension-based, deliberately conservative: the
+/// same-role guard only treats a streak as productive when a code artifact
+/// landed, so a docs-only streak keeps counting toward the cap.
+fn is_code_artifact_path(path: &camino::Utf8Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "kts"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "h"
+                | "hpp"
+                | "rb"
+                | "cs"
+                | "swift"
+                | "php"
+                | "scala"
+                | "sh"
+                | "bash"
+                | "sql"
+                | "lua"
+                | "ex"
+                | "exs"
+                | "hs"
+                | "dart"
+                | "vue"
+                | "svelte"
+        )
+    })
+}
+
 /// The explicit dispatch instruction injected after a prose-only
 /// zero-dispatch stop on an action-required planning session. Bounded re-prompt
 /// text, never a forced tool call — the model remains the decision-maker.
@@ -2109,10 +2165,20 @@ pub(crate) fn parse_string_array(arguments: &serde_json::Value, key: &str) -> Ve
 /// Mutable working state of one Coordinator decision session: the current
 /// DesignDoc claim, its verifier verdict (ADR-65 §5), and the last
 /// dispatched node (the chain parent of the next `call_specialist`).
+#[derive(Debug, Default)]
 struct DispatchSessionState {
     doc: Option<DesignDoc>,
     doc_verdict: Option<DesignDocVerdict>,
     last_node: Option<TaskId>,
+    /// ADR-35 same-role dispatch cap (in-memory run state, reset per
+    /// objective because a fresh session state is built for each objective):
+    /// the role of the last settled dispatch and how many consecutive
+    /// dispatches to it have settled without an implement/code artifact.
+    last_role: Option<AgentId>,
+    consecutive_role_count: u32,
+    /// Bounded guidance turns the same-role guard has emitted; at the ceiling
+    /// the guard escalates to `AwaitingUser` instead of nudging again.
+    role_guard_nudges: u32,
 }
 
 /// The binding DesignDoc for expected-artifact derivation: a Verified doc
@@ -9263,8 +9329,12 @@ impl CoordinatorAgent {
         let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
 
         let intro = self.dispatch_context_intro(design_doc.as_ref(), None, cancel).await;
-        let mut state =
-            DispatchSessionState { doc: design_doc, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: design_doc,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
         let mut ledger = DispatchLedger::default();
         let mut scope = self.fresh_checkpoint_scope(task, context);
         let (summary, advisory_plan) = self
@@ -9684,7 +9754,8 @@ impl CoordinatorAgent {
 
         let intro = self.dispatch_context_intro(doc.as_ref(), Some(&seed), cancel).await;
         let mut graph = TaskGraph::new();
-        let mut state = DispatchSessionState { doc, doc_verdict: None, last_node: None };
+        let mut state =
+            DispatchSessionState { doc, doc_verdict: None, last_node: None, ..Default::default() };
         let mut ledger = DispatchLedger::default();
         let mut scope = checkpoint::CheckpointScope {
             run_id: Ulid::new(),
@@ -10445,6 +10516,127 @@ impl CoordinatorAgent {
         Ok((summary, advisory_plan))
     }
 
+    /// ADR-35 same-role dispatch cap — a pure loop-invariant GUARD beside the
+    /// vacuous-completion and zero-work guards.
+    ///
+    /// The decision loop tracks, in memory for one objective, how many
+    /// consecutive dispatches have settled against the same role without any
+    /// implement/code artifact landing. At
+    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it fires:
+    ///
+    /// - with a binding (Verified) DesignDoc and nudge budget left, it returns
+    ///   a bounded `directive` in the tool result forcing the model to target a
+    ///   DIFFERENT role next — guidance only, it never selects or dispatches a
+    ///   role itself (ADR-35: no compiled dispatch policy);
+    /// - otherwise it escalates to `AwaitingUser` with the loop evidence
+    ///   instead of letting the circle stand and silently completing.
+    ///
+    /// Either way it pushes a ledger note, which downgrades the run exit to
+    /// `Partial` and keeps the resume checkpoint (never a silent `Completed`).
+    /// A code artifact on the ledger resets the streak: a run making real
+    /// implement progress is never flagged by the cap.
+    ///
+    /// It also YIELDS to the #53 progress guard: once that guard is engaged
+    /// (`progress_guard_engaged` — equivalent cycles accumulating or any
+    /// reconsideration already emitted), it owns the repetition and the cap
+    /// stays silent. The cap only catches the same-role circles the progress
+    /// guard sees as *progressing*, which is exactly the production failure.
+    fn apply_same_role_dispatch_cap(
+        &mut self,
+        state: &mut DispatchSessionState,
+        agent_id: &AgentId,
+        subtask_id: TaskId,
+        session_id: Ulid,
+        progress_guard_engaged: bool,
+        ledger: &mut DispatchLedger,
+    ) -> Option<serde_json::Value> {
+        let produced_code = ledger.all_files.iter().any(|path| is_code_artifact_path(path));
+        if produced_code {
+            // Implement progress: the role is not circling. Reset the streak.
+            state.last_role = Some(agent_id.clone());
+            state.consecutive_role_count = 1;
+            return None;
+        }
+        if state.last_role.as_ref() == Some(agent_id) {
+            state.consecutive_role_count = state.consecutive_role_count.saturating_add(1);
+        } else {
+            state.last_role = Some(agent_id.clone());
+            state.consecutive_role_count = 1;
+            return None;
+        }
+        if state.consecutive_role_count < MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES {
+            return None;
+        }
+        if progress_guard_engaged {
+            // The #53 progress guard owns repetition stalls; yield to it.
+            return None;
+        }
+
+        let count = state.consecutive_role_count;
+        // A binding DesignDoc is the one cheap signal that implement work is
+        // the legitimate next step, so the guard may nudge toward it.
+        let design_binds =
+            state.doc_verdict.as_ref().is_some_and(|verdict| verdict.state.is_active());
+        let can_nudge = design_binds && state.role_guard_nudges < MAX_SAME_ROLE_GUARD_NUDGES;
+        let note = format!(
+            "Same-role dispatch guard: specialist {agent_id} settled {count} consecutive \
+             dispatches on this objective with no implement/code artifact produced; the \
+             coordinator cannot keep re-dispatching the same role in circles. {}",
+            if can_nudge {
+                "A verified DesignDoc binds, so the next dispatch must target a DIFFERENT \
+                 (implement-stage) role — the guard guides, it never selects."
+            } else {
+                "The guard escalates to AwaitingUser with this loop evidence rather than \
+                 reporting completion."
+            }
+        );
+        let _ = self.bus.publish_for_session(
+            session_id,
+            subtask_id.0,
+            EventKind::AgentThought {
+                agent_id: "coordinator".into(),
+                content: note.clone(),
+                kind: ThinkingKind::Detail,
+            },
+        );
+        ledger.notes.push(note);
+
+        if can_nudge {
+            state.role_guard_nudges += 1;
+            let directive = format!(
+                "Same-role dispatch guard: you have dispatched {agent_id} {count} times \
+                 consecutively without any implement/code artifact. The verified DesignDoc \
+                 binds, so dispatch a DIFFERENT implement-stage specialist now. Do not call \
+                 {agent_id} again for this objective."
+            );
+            let _ = self.bus.publish_for_session(
+                session_id,
+                subtask_id.0,
+                EventKind::AgentThought {
+                    agent_id: "coordinator".into(),
+                    content: directive.clone(),
+                    kind: ThinkingKind::Detail,
+                },
+            );
+            return Some(serde_json::json!({
+                "same_role_guard": "redirect",
+                "directive": directive,
+            }));
+        }
+
+        // Nudge budget exhausted (or no binding design): escalate to the
+        // operator with the loop evidence. The run ends `AwaitingUser` on the
+        // preserved checkpoint — never a silent completion.
+        self.requested_user_input = Some(format!(
+            "Same-role dispatch guard: the coordinator dispatched {agent_id} {count} \
+             consecutive times on this objective with no implement/code artifact produced \
+             and did not progress to a different role; the decision loop was circling the \
+             same role instead of implementing. Give direction (or confirm the objective is \
+             design-only) and resume."
+        ));
+        Some(serde_json::json!({ "same_role_guard": "awaiting_user" }))
+    }
+
     /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
     /// validate → policy-gate → record the evidence-backed Decision event →
     /// materialize the chained SubTask → dispatch through the existing
@@ -11064,6 +11256,24 @@ impl CoordinatorAgent {
         }
         state.last_node = Some(subtask_id);
 
+        // ── ADR-35 same-role dispatch cap ───────────────────────────────
+        // The settled dispatch updates the in-memory same-role streak before
+        // checkpointing. Firing the guard records the loop evidence (a ledger
+        // note → Partial) and either guides the model toward a different role
+        // or escalates the run to AwaitingUser — never an auto-dispatch. The
+        // cap yields to the #53 progress guard once that guard is engaged.
+        let progress_state = self.progress_tracker.state();
+        let progress_guard_engaged =
+            progress_state.repeated_rounds > 0 || progress_state.stall_recoveries > 0;
+        let same_role_guard = self.apply_same_role_dispatch_cap(
+            state,
+            &agent_id,
+            subtask_id,
+            task.session_id,
+            progress_guard_engaged,
+            ledger,
+        );
+
         // ── Checkpoint the settled dispatch ─────────────────────────────────
         self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
 
@@ -11075,6 +11285,9 @@ impl CoordinatorAgent {
             "tool_call_count": result.tool_call_count,
             "cost_usd": result.cost_usd,
         });
+        if let Some(guard) = same_role_guard {
+            tool_result["guard"] = guard;
+        }
         if let Some(diagnosis) = &outcome_diagnosis {
             tool_result["diagnosis"] = diagnosis.tool_summary();
         }
@@ -11431,7 +11644,15 @@ impl CoordinatorAgent {
         self.decision_journal.record(decision);
 
         // ── Policy gate (the SAME engine the dispatch decisions evaluate
-        // under) — the consult op itself is gated like any tool call ──────
+        // under) — the consult op itself is gated like any tool call. The
+        // action carries the coordinator-authority flag exactly like
+        // `call_specialist`: it is the coordinator's own top-level
+        // read-only Q&A delegation (strictly lower risk than a dispatch), so
+        // the intent-derived approval prompt has no sink to answer here. The
+        // authority branch allows it in the coordinator context and never
+        // widens deny-class/Consequential actions; a non-authority consult
+        // (a specialist's own or an external caller's action) still takes
+        // the ordinary approval path.
         let Some(policy) = self.policy.clone() else {
             return serde_json::json!({
                 "error": "policy_unavailable",
@@ -11447,7 +11668,7 @@ impl CoordinatorAgent {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
-            orchestrator_authority: false,
+            orchestrator_authority: true,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -14270,6 +14491,19 @@ mod tests {
     ) -> Arc<dyn concerto_core::traits::policy::PolicyEngine> {
         let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
         Arc::new(SimplePolicyEngine::new(allow_all, audit))
+    }
+
+    /// The production default preset wired to a recording audit probe: an
+    /// unknown tool (like `consult_specialist`) falls to the catch-all
+    /// `RequireApproval`, so the coordinator-authority flag is what lets the
+    /// coordinator's own top-level consult through in-loop.
+    fn coordinator_default_policy(
+        audit: Arc<ConsultAuditProbe>,
+    ) -> Arc<dyn concerto_core::traits::policy::PolicyEngine> {
+        Arc::new(SimplePolicyEngine::new(
+            concerto_core::policy_presets::PolicyPresets::default_rules(),
+            audit,
+        ))
     }
 
     // Pin the three-way failure classification that the dispatch loop relies
@@ -23350,8 +23584,12 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             completed_at: None,
         });
-        let mut state =
-            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(open_parent) };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: Some(open_parent),
+            ..Default::default()
+        };
         let mut ledger = DispatchLedger::default();
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
@@ -23435,7 +23673,12 @@ mod tests {
         let mut graph = TaskGraph::new();
         let mut ledger = DispatchLedger::default();
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
-        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
 
         let decision_value = coordinator
             .handle_call_specialist(
@@ -23672,8 +23915,12 @@ mod tests {
                 tokens_out: 0,
             },
         );
-        let mut state =
-            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(open) };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: Some(open),
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -23776,7 +24023,12 @@ mod tests {
             completed_at: None,
         });
         let mut ledger = DispatchLedger::default();
-        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -23862,8 +24114,12 @@ mod tests {
             expected.insert(survivor, vec![camino::Utf8PathBuf::from("src/ours.rs")]);
             expected.insert(loser, vec![camino::Utf8PathBuf::from("src/theirs.rs")]);
         }
-        let mut state =
-            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(loser) };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: Some(loser),
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -23958,7 +24214,12 @@ mod tests {
             completed_at: None,
         });
         let mut ledger = DispatchLedger::default();
-        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -27217,8 +27478,12 @@ mod tests {
             completed_at: Some(time::OffsetDateTime::now_utc()),
         });
         let mut ledger = DispatchLedger::default();
-        let mut state =
-            DispatchSessionState { doc: None, doc_verdict: None, last_node: Some(pending) };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: Some(pending),
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -27292,7 +27557,12 @@ mod tests {
             workspace.path().to_path_buf(),
         ));
         let mut ledger = DispatchLedger::default();
-        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
         let mut graph = TaskGraph::new();
         let pending = TaskId::new();
@@ -27435,7 +27705,12 @@ mod tests {
             completed_at: Some(time::OffsetDateTime::now_utc()),
         });
         let mut ledger = DispatchLedger::default();
-        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -27507,7 +27782,12 @@ mod tests {
             completed_at: None,
         });
         let mut ledger = DispatchLedger::default();
-        let mut state = DispatchSessionState { doc: None, doc_verdict: None, last_node: None };
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
         let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
 
         let result = coordinator
@@ -29119,6 +29399,353 @@ mod tests {
         assert!(
             attempt.payload["required_output"].as_str().unwrap_or_default().contains("default-nim"),
             "the failover names the alternate pipe's model: {attempt:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-35 same-role dispatch cap (guard) — regression for the coordinator
+    // re-dispatching one role in circles without implementing.
+    // ------------------------------------------------------------------
+
+    /// A code artifact is recognized by extension; docs-only paths are not.
+    #[test]
+    fn code_artifact_detection_is_extension_based() {
+        assert!(is_code_artifact_path(camino::Utf8Path::new("src/lib.rs")));
+        assert!(is_code_artifact_path(camino::Utf8Path::new("app/Main.TS")));
+        assert!(!is_code_artifact_path(camino::Utf8Path::new("docs/design.md")));
+        assert!(!is_code_artifact_path(camino::Utf8Path::new("NOTES")));
+    }
+
+    /// Three consecutive `architect` dispatches on one objective with no
+    /// implement/code artifact: the guard fires and the run stops in
+    /// `AwaitingUser` with the loop evidence and a preserved checkpoint —
+    /// never a silent `Completed`.
+    #[tokio::test]
+    async fn same_role_dispatch_cap_escalates_after_three_repeats() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("architect"), "designed")];
+        let registry = AgentRegistry::from_mocks(mocks);
+        let (output, _events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it again")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it once more",
+                    )]),
+                    CoordinatorTurn::Text("should not be reached".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "the same-role cap must escalate, not complete: {:?}",
+            output.completion_status
+        );
+        assert!(
+            output.final_message.contains("Same-role dispatch guard"),
+            "the guard evidence must surface in the final message: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "the escalated run must keep its checkpoint for resume"
+        );
+    }
+
+    /// Alternating roles never trip the cap: the streak resets on every
+    /// different role, so a legitimate multi-role session is untouched.
+    #[tokio::test]
+    async fn same_role_dispatch_cap_ignores_mixed_roles() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "researched"),
+        ];
+        let registry = AgentRegistry::from_mocks(mocks);
+        let (output, _events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design"),
+                        call_specialist("researcher", "investigate"),
+                        call_specialist("architect", "refine"),
+                        call_specialist("researcher", "confirm"),
+                    ]),
+                    CoordinatorTurn::Text("mixed roles done".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "alternating roles must not trip the same-role cap"
+        );
+        assert!(
+            !output.final_message.contains("Same-role dispatch guard"),
+            "mixed roles must not record guard evidence: {}",
+            output.final_message
+        );
+    }
+
+    /// A design → implement → review progression is never flagged: the roles
+    /// differ consecutively and the implement dispatch lands a code artifact
+    /// (which also resets the streak).
+    #[tokio::test]
+    async fn same_role_dispatch_cap_allows_design_implement_review() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "reviewed"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        let (output, events) = run_for_test(
+            coordinator_with_grounded_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design it"),
+                        call_specialist("coder", "implement"),
+                        call_specialist("reviewer", "review"),
+                    ]),
+                    CoordinatorTurn::Text("progression complete".into()),
+                ],
+                &["src/a.rs"],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a design→implement→review progression must not trip the cap"
+        );
+        assert!(
+            !output.final_message.contains("Same-role dispatch guard"),
+            "progression must not record guard evidence: {}",
+            output.final_message
+        );
+        for role in ["architect", "coder", "reviewer"] {
+            assert!(
+                events.iter().any(|kind| matches!(
+                    kind,
+                    EventKind::SubTaskStarted { role: started, .. }
+                        if started == &AgentId::new(role)
+                )),
+                "role {role} must still be dispatched"
+            );
+        }
+    }
+
+    /// A code artifact on the ledger resets the streak: repeating a role after
+    /// real implement work is never flagged, even when the role repeats.
+    #[tokio::test]
+    async fn same_role_dispatch_cap_resets_on_code_artifact() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        let (output, _events) = run_for_test(
+            coordinator_with_grounded_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![
+                        call_specialist("architect", "design it"),
+                        call_specialist("coder", "implement"),
+                        call_specialist("architect", "refine the design"),
+                        call_specialist("architect", "refine once more"),
+                    ]),
+                    CoordinatorTurn::Text("design iterations after code".into()),
+                ],
+                &["src/a.rs"],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an artifact-present run must not trip the same-role cap"
+        );
+        assert!(
+            !output.final_message.contains("Same-role dispatch guard"),
+            "a code artifact resets the streak: {}",
+            output.final_message
+        );
+    }
+
+    /// With a BINDING (Verified) DesignDoc the guard does not escalate: it
+    /// returns a bounded directive forcing the model toward a DIFFERENT
+    /// implement-stage role — guidance, never an auto-dispatch.
+    #[tokio::test]
+    async fn same_role_dispatch_cap_redirects_when_design_doc_binds() {
+        let bus = EventBus::new(256);
+        let mocks =
+            vec![MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON)];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                CoordinatorTurn::Calls(vec![call_specialist("architect", "refine the design")]),
+                CoordinatorTurn::Calls(vec![call_specialist("architect", "revisit the design")]),
+                CoordinatorTurn::Text("stopping after the guard redirect".into()),
+            ],
+        );
+        let coord = coordinator.with_workspace_snapshot(grounded_snapshot(&["src/a.rs"]));
+        let (output, _events) = run_for_test(coord, bus.clone()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a binding DesignDoc means the guard redirects instead of escalating"
+        );
+        let redirect = provider
+            .tool_result_contents()
+            .into_iter()
+            .find_map(|result| {
+                let guard = result.get("guard")?;
+                (guard.get("same_role_guard").and_then(serde_json::Value::as_str)
+                    == Some("redirect"))
+                .then(|| {
+                    guard.get("directive").and_then(serde_json::Value::as_str).map(str::to_owned)
+                })
+                .flatten()
+            })
+            .expect("the guard redirect must ride the tool result");
+        assert!(
+            redirect.contains("DIFFERENT implement-stage"),
+            "the redirect must require a different role without picking it: {redirect}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #59 / consult parity: `consult_specialist` under coordinator
+    // authority must clear the same approval gate `call_specialist` does.
+    // ------------------------------------------------------------------
+
+    /// The coordinator's own consult succeeds under the PRODUCTION default
+    /// policy (where an unknown tool falls to `RequireApproval`): the
+    /// coordinator-authority flag is what clears the gate, recorded as the
+    /// `coordinator_authority` audit row.
+    #[tokio::test]
+    async fn coordinator_consult_allowed_under_authority_with_default_policy() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "advisory")];
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![consult_specialist(
+                "researcher",
+                "assess the module graph",
+            )]),
+            CoordinatorTurn::Text("advisory answer".into()),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let workspace = tempfile::tempdir().expect("tempdir for the consult workspace");
+        let (_output, _events) = run_for_test_in_dir(
+            coordinator_with_provider_and_policy(
+                bus.clone(),
+                Arc::new(AgentRegistry::from_mocks(mocks)),
+                provider.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                coordinator_default_policy(audit.clone()),
+            ),
+            bus.clone(),
+            workspace.path(),
+        )
+        .await;
+
+        // The consult reached the consultant and settled (not `policy_denied`).
+        let consult_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("consultative").is_some())
+            .expect("the coordinator consult must succeed under authority");
+        assert_eq!(consult_result["outcome"], "consulted");
+        assert_eq!(consult_result["agent_id"], "researcher");
+        // The gate cleared through the authority branch, not a grant/auto rule.
+        let rows = audit.rows();
+        assert!(
+            rows.iter().any(|row| {
+                row.tool_name == CONSULT_SPECIALIST_TOOL
+                    && row.rule_matched.as_deref() == Some("coordinator_authority")
+                    && row.verdict == "Allow"
+            }),
+            "the consult must clear via the coordinator_authority row: {rows:?}"
+        );
+    }
+
+    /// Without the coordinator-authority flag (a specialist-initiated or
+    /// external consult action) the same policy still requires approval — the
+    /// authority grant is scoped to the coordinator's own top-level call.
+    #[tokio::test]
+    async fn non_authority_consult_still_requires_approval() {
+        let audit = Arc::new(ConsultAuditProbe::default());
+        let policy = coordinator_default_policy(audit);
+        let input = serde_json::json!({});
+        let authority_action = PolicyAction {
+            tool_name: CONSULT_SPECIALIST_TOOL,
+            input: &input,
+            session_id: Ulid::new(),
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+            orchestrator_authority: true,
+        };
+        let plain_action =
+            PolicyAction { orchestrator_authority: false, ..authority_action.clone() };
+
+        let authority_verdict = policy
+            .evaluate(&authority_action, CancellationToken::new())
+            .await
+            .expect("the authority consult evaluates");
+        assert!(
+            matches!(authority_verdict, PolicyVerdict::Allow),
+            "the coordinator's own consult must be allowed: {authority_verdict:?}"
+        );
+        let plain_verdict = policy
+            .evaluate(&plain_action, CancellationToken::new())
+            .await
+            .expect("the plain consult evaluates");
+        assert!(
+            matches!(
+                plain_verdict,
+                PolicyVerdict::RequireApproval { .. }
+                    | PolicyVerdict::RequireApprovalWithTimeout { .. }
+            ),
+            "a non-authority consult must still require approval: {plain_verdict:?}"
         );
     }
 }
