@@ -67,13 +67,25 @@ impl ProviderFactory {
         }
     }
 
-    /// Resolve the provider configuration that advertises a model.
+    /// Whether one provider configuration advertises a model.
     ///
     /// A provider config offers a model when the name equals its primary
-    /// `model`, appears in `extra_models`, or is offered by the static/cached
-    /// catalog paths. `extra_models` is purely additive — it can never shadow
-    /// the primary `model` (the primary always wins on exact match).
+    /// `model`, appears in `extra_models` or `cached_models`, or is offered by
+    /// the static catalog paths. `extra_models` is purely additive — it can
+    /// never shadow the primary `model` (the primary always wins on exact
+    /// match). This is the single offer predicate behind
+    /// [`ProviderFactory::config_for_model`].
+    pub fn config_offers_model(provider: &ProviderConfig, model: &str) -> bool {
+        let definition = crate::provider_defs::provider_definition(&provider.provider);
+        let mut options = crate::provider_defs::model_options_for(provider, &definition, None);
+        options.extend(provider.cached_models.iter().cloned());
+        options.extend(provider.extra_models.iter().cloned());
+        options.iter().any(|candidate| candidate == model)
+    }
+
+    /// Resolve the provider configuration that advertises a model.
     ///
+    /// See [`ProviderFactory::config_offers_model`] for the offer predicate.
     /// An existing route wins when it remains valid; otherwise configuration
     /// order is the deterministic tie-breaker for duplicate model IDs.
     pub fn config_for_model<'a>(
@@ -81,18 +93,15 @@ impl ProviderFactory {
         model: &str,
         preferred_provider_id: Option<&str>,
     ) -> Option<&'a ProviderConfig> {
-        let offers_model = |provider: &ProviderConfig| {
-            let definition = crate::provider_defs::provider_definition(&provider.provider);
-            let mut options = crate::provider_defs::model_options_for(provider, &definition, None);
-            options.extend(provider.cached_models.iter().cloned());
-            options.extend(provider.extra_models.iter().cloned());
-            options.iter().any(|candidate| candidate == model)
-        };
-
         preferred_provider_id
             .and_then(|id| settings.providers.iter().find(|provider| provider.id == id))
-            .filter(|provider| offers_model(provider))
-            .or_else(|| settings.providers.iter().find(|provider| offers_model(provider)))
+            .filter(|provider| Self::config_offers_model(provider, model))
+            .or_else(|| {
+                settings
+                    .providers
+                    .iter()
+                    .find(|provider| Self::config_offers_model(provider, model))
+            })
     }
 
     /// Build a single provider from its config.
@@ -1170,6 +1179,23 @@ mod tests {
         let resolved = ProviderFactory::config_for_model(&settings, "gpt-4-turbo", None);
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap().id, "provider-a");
+    }
+
+    #[test]
+    fn config_offers_model_checks_primary_extra_and_cached_models() {
+        let config = ProviderConfig {
+            id: "gateway".into(),
+            provider: "openai".into(),
+            model: "primary".into(),
+            extra_models: vec!["alias".into()],
+            cached_models: vec!["discovered".into()],
+            ..Default::default()
+        };
+
+        assert!(ProviderFactory::config_offers_model(&config, "primary"));
+        assert!(ProviderFactory::config_offers_model(&config, "alias"));
+        assert!(ProviderFactory::config_offers_model(&config, "discovered"));
+        assert!(!ProviderFactory::config_offers_model(&config, "not-offered"));
     }
 
     #[test]

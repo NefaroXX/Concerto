@@ -266,6 +266,74 @@ fn legacy_pins_from_config(
     pins
 }
 
+/// The live provider a custom agent pins for `role`, when it serves `model`.
+///
+/// ADR-31 precedence: an explicit, valid `settings.agent_assignments` entry is
+/// resolved by the caller *before* this helper is consulted and always wins.
+/// When no assignment exists, a custom agent's `provider_id` (persisted from
+/// the Orchestration Studio) is honoured only if it names a live
+/// `settings.providers` config — matched by [`ProviderFactory::config_id`] —
+/// **and** that config advertises the role's resolved model
+/// ([`ProviderFactory::config_offers_model`]: primary/extra/cached/catalog).
+///
+/// Otherwise the helper returns `None` and the caller keeps the run's default
+/// provider. A set-but-stale `provider_id` (provider removed) or one that does
+/// not offer the resolved model is logged and silently ignored — the existing
+/// fallback behavior for removed providers.
+fn custom_agent_provider<'a>(
+    settings: &'a concerto_config::ModelSettings,
+    agent_configs: &HashMap<AgentId, concerto_config::CustomAgentConfig>,
+    role: &AgentId,
+    model: &str,
+) -> Option<&'a concerto_config::ProviderConfig> {
+    let provider_id =
+        non_empty(agent_configs.get(role).and_then(|agent| agent.provider_id.as_deref()))?;
+    let Some(config) =
+        settings.providers.iter().find(|config| ProviderFactory::config_id(config) == provider_id)
+    else {
+        tracing::warn!(
+            role = %role,
+            provider_id,
+            "custom agent provider is no longer configured; falling back to the default provider"
+        );
+        return None;
+    };
+    if !ProviderFactory::config_offers_model(config, model) {
+        tracing::warn!(
+            role = %role,
+            provider_id,
+            model,
+            "custom agent provider does not offer the resolved model; falling back to the default provider"
+        );
+        return None;
+    }
+    Some(config)
+}
+
+/// The provider configuration that serves `role`.
+///
+/// ADR-31 precedence: an explicit, valid `agent_assignments` entry
+/// (`assignment_provider_config`, already validated live by the caller) always
+/// wins; otherwise a custom agent's live `provider_id` that offers the resolved
+/// `model` ([`custom_agent_provider`]); otherwise the run's default provider.
+///
+/// Model resolution is independent and handled by the caller — this function
+/// only picks the serving pipe, so the legacy `assignment override → legacy pin
+/// → default` model order is untouched.
+fn resolve_role_provider_config<'a>(
+    settings: &'a concerto_config::ModelSettings,
+    agent_configs: &HashMap<AgentId, concerto_config::CustomAgentConfig>,
+    role: &AgentId,
+    assignment_provider_config: Option<&'a concerto_config::ProviderConfig>,
+    model: &str,
+    default_provider_config: &'a concerto_config::ProviderConfig,
+) -> &'a concerto_config::ProviderConfig {
+    if let Some(provider_config) = assignment_provider_config {
+        return provider_config;
+    }
+    custom_agent_provider(settings, agent_configs, role, model).unwrap_or(default_provider_config)
+}
+
 /// The coordinator's model.
 ///
 /// The coordinator is hardcoded (maintainer decision 2026-09) and always
@@ -3752,26 +3820,36 @@ async fn run_multi_agent(
                     ProviderFactory::config_id(config) == assignment.provider_config_id
                 })
             });
-        let provider_config = if let Some(assignment) = assignment {
+        let assignment_provider_config = assignment.and_then(|assignment| {
             settings
                 .providers
                 .iter()
                 .find(|config| ProviderFactory::config_id(config) == assignment.provider_config_id)
-                .unwrap_or(default_provider_config)
-        } else {
-            default_provider_config
-        };
-        let provider_id = ProviderFactory::config_id(provider_config);
+        });
         let model = assignment
             .and_then(|assignment| non_empty(assignment.model_override.as_deref()))
             .or_else(|| legacy_pins.get(&role).and_then(|model| non_empty(Some(model))))
             .unwrap_or_else(|| {
-                if assignment.is_some() {
+                if let Some(provider_config) = assignment_provider_config {
                     provider_config.model.trim()
                 } else {
                     default_model
                 }
             });
+        // ADR-31 precedence for the serving provider: an explicit, valid
+        // `agent_assignments` entry wins; otherwise a custom agent's live
+        // `provider_id` that offers the resolved model; otherwise the run's
+        // default provider. Model resolution above is independent and
+        // unchanged (assignment override → legacy pin → default).
+        let provider_config = resolve_role_provider_config(
+            settings,
+            &agent_configs,
+            &role,
+            assignment_provider_config,
+            model,
+            default_provider_config,
+        );
+        let provider_id = ProviderFactory::config_id(provider_config);
         if model.is_empty() {
             event_recorder.stop().await;
             transcript_recorder.stop().await;
@@ -5446,6 +5524,310 @@ mod runtime_runner_tests {
             resolve_coordinator_model(&pins, "global-default-model"),
             "global-default-model",
             "the coordinator must ignore the pin and use the global default"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Custom-agent provider pin resolution (role serving pipe)
+    // ------------------------------------------------------------------
+
+    /// Sets an env var and restores the previous value (or removes it) on drop.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// A custom agent's `provider_id` must select the serving pipe for its
+    /// role when no `agent_assignments` entry exists — even when the run's
+    /// global default resolves to a different provider. Historically the pin
+    /// was ignored, so a google-pinned role was dispatched to the default
+    /// (nim) provider carrying a Google model id → HTTP 404 on every dispatch.
+    #[test]
+    fn custom_agent_provider_id_wins_over_default_when_it_offers_the_model() {
+        use concerto_config::{CustomAgentConfig, ModelSettings, MultiAgentConfig, ProviderConfig};
+
+        let google = ProviderConfig {
+            id: "google".into(),
+            provider: "google".into(),
+            model: "gemini-2.5-flash-lite".into(),
+            keyring_key: "google_pin_test".into(),
+            cached_models: vec!["gemini-2.5-flash-lite".into()],
+            ..Default::default()
+        };
+        let nim = ProviderConfig {
+            id: "nim".into(),
+            provider: "nim".into(),
+            model: "nim-default-model".into(),
+            keyring_key: "nim_pin_test".into(),
+            ..Default::default()
+        };
+        let settings = ModelSettings {
+            providers: vec![nim.clone(), google],
+            global_default_model: Some("nim-default-model".into()),
+            ..Default::default()
+        };
+        let multi_agent = MultiAgentConfig {
+            custom_agents: vec![CustomAgentConfig {
+                id: "coder".into(),
+                name: "Coder".into(),
+                role: "coder".into(),
+                model_override: Some("gemini-2.5-flash-lite".into()),
+                provider_id: Some("google".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent_configs = build_agent_config_map(&Some(multi_agent.clone()));
+        let legacy_pins = legacy_pins_from_config(&Some(multi_agent));
+        let role = AgentId::new("coder");
+        let model = legacy_pins.get(&role).cloned().unwrap_or_default();
+        assert_eq!(model, "gemini-2.5-flash-lite", "legacy pin model resolution unchanged");
+
+        // No `agent_assignments` entry: the custom-agent provider pin decides.
+        let chosen =
+            resolve_role_provider_config(&settings, &agent_configs, &role, None, &model, &nim);
+        let provider_id = ProviderFactory::config_id(chosen);
+        assert_eq!(provider_id, "google", "custom-agent provider pin must be honoured");
+        assert_ne!(
+            provider_id,
+            ProviderFactory::config_id(&nim),
+            "the default (nim) provider must not serve a google-pinned role"
+        );
+
+        // The recorded provider-pin map carries the honoured id, not the
+        // default, so RoutingDecided events report google.
+        let provider_pins = HashMap::from([(role.clone(), provider_id)]);
+        assert_eq!(provider_pins.get(&role).map(String::as_str), Some("google"));
+
+        // And the built provider is Google, not Nim.
+        let _guard = EnvVarGuard::set("CONCERTO_GOOGLE_PIN_TEST", "test-key");
+        let store = CredentialStore::from_env();
+        let mut resolved_config = chosen.clone();
+        resolved_config.model = model;
+        let built =
+            ProviderFactory::build(&resolved_config, &store).expect("google provider must build");
+        assert_eq!(built.provider_name(), "google");
+        assert_ne!(built.provider_name(), "nim");
+    }
+
+    /// A stale custom-agent `provider_id` (provider removed) keeps the existing
+    /// silent fallback to the default provider — no error.
+    #[test]
+    fn stale_custom_agent_provider_id_falls_back_to_default() {
+        use concerto_config::{CustomAgentConfig, ModelSettings, MultiAgentConfig, ProviderConfig};
+
+        let nim = ProviderConfig {
+            id: "nim".into(),
+            provider: "nim".into(),
+            model: "nim-default-model".into(),
+            keyring_key: "nim_pin_test".into(),
+            ..Default::default()
+        };
+        let settings = ModelSettings {
+            providers: vec![nim.clone()],
+            global_default_model: Some("nim-default-model".into()),
+            ..Default::default()
+        };
+        let multi_agent = MultiAgentConfig {
+            custom_agents: vec![CustomAgentConfig {
+                id: "coder".into(),
+                name: "Coder".into(),
+                role: "coder".into(),
+                model_override: Some("gemini-2.5-flash-lite".into()),
+                provider_id: Some("removed-provider".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent_configs = build_agent_config_map(&Some(multi_agent.clone()));
+        let legacy_pins = legacy_pins_from_config(&Some(multi_agent));
+        let role = AgentId::new("coder");
+        let model = legacy_pins.get(&role).cloned().unwrap_or_default();
+
+        let chosen =
+            resolve_role_provider_config(&settings, &agent_configs, &role, None, &model, &nim);
+        assert_eq!(
+            ProviderFactory::config_id(chosen),
+            "nim",
+            "a stale provider_id must fall back to the default provider without erroring"
+        );
+    }
+
+    /// A live custom-agent provider that does not offer the resolved model is
+    /// ignored, keeping the default provider (never a guaranteed 404 pipe).
+    #[test]
+    fn custom_agent_provider_without_the_model_falls_back_to_default() {
+        use concerto_config::{CustomAgentConfig, ModelSettings, MultiAgentConfig, ProviderConfig};
+
+        let openai = ProviderConfig {
+            id: "openai".into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            keyring_key: "openai_pin_test".into(),
+            ..Default::default()
+        };
+        let nim = ProviderConfig {
+            id: "nim".into(),
+            provider: "nim".into(),
+            model: "nim-default-model".into(),
+            keyring_key: "nim_pin_test".into(),
+            ..Default::default()
+        };
+        let settings = ModelSettings {
+            providers: vec![openai, nim.clone()],
+            global_default_model: Some("nim-default-model".into()),
+            ..Default::default()
+        };
+        let multi_agent = MultiAgentConfig {
+            custom_agents: vec![CustomAgentConfig {
+                id: "coder".into(),
+                name: "Coder".into(),
+                role: "coder".into(),
+                model_override: Some("gemini-2.5-flash-lite".into()),
+                provider_id: Some("openai".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent_configs = build_agent_config_map(&Some(multi_agent.clone()));
+        let legacy_pins = legacy_pins_from_config(&Some(multi_agent));
+        let role = AgentId::new("coder");
+        let model = legacy_pins.get(&role).cloned().unwrap_or_default();
+
+        let chosen =
+            resolve_role_provider_config(&settings, &agent_configs, &role, None, &model, &nim);
+        assert_eq!(
+            ProviderFactory::config_id(chosen),
+            "nim",
+            "a custom provider that does not offer the model must not serve the role"
+        );
+    }
+
+    /// With no custom-agent provider pin the behavior is unchanged: the run
+    /// default provider serves the role.
+    #[test]
+    fn no_custom_agent_provider_keeps_default_provider() {
+        use concerto_config::{CustomAgentConfig, ModelSettings, MultiAgentConfig, ProviderConfig};
+
+        let google = ProviderConfig {
+            id: "google".into(),
+            provider: "google".into(),
+            model: "gemini-2.5-flash-lite".into(),
+            keyring_key: "google_pin_test".into(),
+            ..Default::default()
+        };
+        let nim = ProviderConfig {
+            id: "nim".into(),
+            provider: "nim".into(),
+            model: "nim-default-model".into(),
+            keyring_key: "nim_pin_test".into(),
+            ..Default::default()
+        };
+        let settings = ModelSettings {
+            providers: vec![google, nim.clone()],
+            global_default_model: Some("nim-default-model".into()),
+            ..Default::default()
+        };
+        // A custom agent with a model pin but no provider pin.
+        let multi_agent = MultiAgentConfig {
+            custom_agents: vec![CustomAgentConfig {
+                id: "coder".into(),
+                name: "Coder".into(),
+                role: "coder".into(),
+                model_override: Some("nim-default-model".into()),
+                provider_id: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent_configs = build_agent_config_map(&Some(multi_agent.clone()));
+        let legacy_pins = legacy_pins_from_config(&Some(multi_agent));
+        let role = AgentId::new("coder");
+        let model = legacy_pins.get(&role).cloned().unwrap_or_default();
+
+        let chosen =
+            resolve_role_provider_config(&settings, &agent_configs, &role, None, &model, &nim);
+        assert_eq!(
+            ProviderFactory::config_id(chosen),
+            "nim",
+            "no custom-agent provider pin keeps the run default provider"
+        );
+    }
+
+    /// ADR-31: an explicit, valid `agent_assignments` entry wins over a
+    /// custom-agent `provider_id` when both are present.
+    #[test]
+    fn explicit_assignment_wins_over_custom_agent_provider_pin() {
+        use concerto_config::{CustomAgentConfig, ModelSettings, MultiAgentConfig, ProviderConfig};
+
+        let assignment_provider = ProviderConfig {
+            id: "anthropic".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet".into(),
+            keyring_key: "anthropic_pin_test".into(),
+            ..Default::default()
+        };
+        let google = ProviderConfig {
+            id: "google".into(),
+            provider: "google".into(),
+            model: "gemini-2.5-flash-lite".into(),
+            keyring_key: "google_pin_test".into(),
+            ..Default::default()
+        };
+        let nim = ProviderConfig {
+            id: "nim".into(),
+            provider: "nim".into(),
+            model: "nim-default-model".into(),
+            keyring_key: "nim_pin_test".into(),
+            ..Default::default()
+        };
+        let settings = ModelSettings {
+            providers: vec![assignment_provider.clone(), google, nim.clone()],
+            global_default_model: Some("nim-default-model".into()),
+            ..Default::default()
+        };
+        let multi_agent = MultiAgentConfig {
+            custom_agents: vec![CustomAgentConfig {
+                id: "coder".into(),
+                name: "Coder".into(),
+                role: "coder".into(),
+                model_override: Some("gemini-2.5-flash-lite".into()),
+                provider_id: Some("google".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent_configs = build_agent_config_map(&Some(multi_agent));
+
+        let chosen = resolve_role_provider_config(
+            &settings,
+            &agent_configs,
+            &AgentId::new("coder"),
+            Some(&assignment_provider),
+            "claude-sonnet",
+            &nim,
+        );
+        assert_eq!(
+            ProviderFactory::config_id(chosen),
+            "anthropic",
+            "an explicit assignment must win over the custom-agent provider pin"
         );
     }
 
