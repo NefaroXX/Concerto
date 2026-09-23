@@ -1005,7 +1005,22 @@ impl RunShape {
             Self::Execute => OrchestrationDepth::Full,
         }
     }
+
+    /// The shape implied by a builder-set orchestration depth. Used when a run
+    /// carries no routing hint: the builder-set depth IS the final shape, and
+    /// the coordinator still records it.
+    fn from_depth(depth: OrchestrationDepth) -> Self {
+        match depth {
+            OrchestrationDepth::Full => Self::Execute,
+            OrchestrationDepth::PlanningOnly => Self::Plan,
+        }
+    }
 }
+
+/// The `hint` label recorded when a run carries no routing hint. The shape
+/// decision is recorded for EVERY run, hint or not; absent a hint there is
+/// nothing to override, so `overridden_from` stays empty.
+const NO_RUN_SHAPE_HINT: &str = "none";
 
 /// Decide the coordinator's final run shape from the routing hint plus session
 /// context (advisor-mode intent routing).
@@ -3057,16 +3072,18 @@ impl CoordinatorAgent {
         self
     }
 
-    /// The FINAL run shape decided by the most recent [`Self::run`] when a
-    /// hint was attached (`None` when the run was not hint-driven). Surfaced
-    /// so the runtime wrapper keys its post-run plan binding on the decided
-    /// shape rather than the raw hint.
+    /// The FINAL run shape decided by the most recent [`Self::run`]. Set for
+    /// EVERY run: a hint-driven run consults the hint plus context, a
+    /// hint-less run uses the builder-set depth. Surfaced so the runtime
+    /// wrapper keys its post-run plan binding on the decided shape rather than
+    /// the raw hint.
     pub fn decided_run_shape(&self) -> Option<RunShape> {
         self.decided_run_shape
     }
 
-    /// The whiteboard/audit decision label from the most recent hint-driven
-    /// [`Self::run`] (`None` when the run was not hint-driven).
+    /// The whiteboard/audit decision label from the most recent [`Self::run`]
+    /// (`None` only before the first run). A hint-less run records the `none`
+    /// hint label and the reason `hint_none`.
     pub fn run_shape_decision_label(&self) -> Option<&str> {
         self.run_shape_decision_label.as_deref()
     }
@@ -3914,6 +3931,151 @@ impl CoordinatorAgent {
             .insert(revised_id, expected);
         graph.add_child(revised, task_id, Dependency::MustFinishBefore);
         revised_id
+    }
+
+    /// Dead-pipe failover (smoke audit 01M35YG93): a dispatch failure that is
+    /// PERMANENT for the assigned pipe yet ALTERNATE-viable — the assignment's
+    /// provider/model is dead (HTTP 404 model-not-found, auth, capability
+    /// refusal, model-unavailable) — would fail again if redecomposed onto the
+    /// SAME assignment. Retry the SAME subtask ONCE on the run's default-model
+    /// pipe (ADR-45 tier-1b machinery: the same role rebuilt on
+    /// `default_model_provider` and run with `default_model_profile`) BEFORE
+    /// handing the failure back to the Coordinator model for redecomposition.
+    ///
+    /// Bounded by the checkpointed per-subtask `default_model_provider_attempted`
+    /// guard (at most once per subtask per run), gated on the user's
+    /// `default_model_fallback`, and skipped with a recorded note when the
+    /// fallback resolves to the SAME (provider, model) as the failed dispatch
+    /// (degenerate) or the role has no rebuild factory. The attempt and its
+    /// outcome are recorded as an ADR-65 `Decision` event. Returns the fallback
+    /// result only on a genuine `Success`; `None` leaves the caller's existing
+    /// redecompose/blocked path unchanged.
+    async fn attempt_dispatch_failover(
+        &mut self,
+        subtask: &SubTask,
+        agent_id: &AgentId,
+        failed_profile: &ModelProfile,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+    ) -> Option<AgentRunResult> {
+        if !self.default_model_fallback {
+            self.append_dispatch_failover_decision(
+                subtask.session_id,
+                "dispatch-failover-skipped-disabled",
+                "No fallback retry: the default-model fallback is disabled; the dead-pipe \
+                 failure is surfaced to the decision loop",
+            )
+            .await;
+            return None;
+        }
+        if self.default_model_provider_attempted.contains(&subtask.id) {
+            // The one failover slot for this subtask is already spent.
+            return None;
+        }
+        let (Some(provider), Some(default_profile)) =
+            (self.default_model_provider.clone(), self.default_model_profile.clone())
+        else {
+            self.append_dispatch_failover_decision(
+                subtask.session_id,
+                "dispatch-failover-skipped-unavailable",
+                "No fallback retry: the run has no default-model provider/profile; the \
+                 dead-pipe failure is surfaced to the decision loop",
+            )
+            .await;
+            return None;
+        };
+        // Degenerate: the fallback lands on the SAME (provider, model) pipe as
+        // the dispatch that just failed — a retry would reproduce the failure.
+        let degenerate = failed_profile.profile.provider_config_id
+            == default_profile.profile.provider_config_id
+            && failed_profile.profile.model == default_profile.profile.model;
+        if degenerate {
+            self.append_dispatch_failover_decision(
+                subtask.session_id,
+                "dispatch-failover-skipped-degenerate",
+                "No fallback retry: the fallback resolves to the same (provider, model) as \
+                 the failed dispatch; the failure is surfaced to the decision loop",
+            )
+            .await;
+            return None;
+        }
+        if !self.registry.has_rebuild_factory(agent_id) {
+            self.append_dispatch_failover_decision(
+                subtask.session_id,
+                "dispatch-failover-skipped-no-factory",
+                "No fallback retry: the role has no rebuild factory to serve the default \
+                 provider; the failure is surfaced to the decision loop",
+            )
+            .await;
+            return None;
+        }
+
+        // Spend the one-shot guard, then re-dispatch the SAME subtask on the
+        // default-model pipe. A failover dispatch is a real model dispatch and
+        // counts toward the run-wide cap (ADR-52).
+        self.default_model_provider_attempted.insert(subtask.id);
+        self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+        self.append_dispatch_failover_decision(
+            subtask.session_id,
+            "dispatch-failover-attempted",
+            &format!(
+                "Retrying {agent_id} subtask {} once on the default-model pipe {}/{} \
+                 after the assigned pipe failed",
+                subtask.id, default_profile.profile.provider, default_profile.profile.model
+            ),
+        )
+        .await;
+        match self
+            .runner
+            .run_with_provider(
+                agent_id.clone(),
+                provider,
+                subtask,
+                context.clone(),
+                &default_profile,
+                cancel.clone(),
+            )
+            .await
+        {
+            Ok(result) if matches!(result.outcome, AgentOutcome::Success) => {
+                self.append_dispatch_failover_decision(
+                    subtask.session_id,
+                    "dispatch-failover-succeeded",
+                    &format!(
+                        "Fallback dispatch of {agent_id} subtask {} succeeded on {}/{}",
+                        subtask.id, default_profile.profile.provider, default_profile.profile.model
+                    ),
+                )
+                .await;
+                Some(result)
+            }
+            Ok(_) => {
+                self.append_dispatch_failover_decision(
+                    subtask.session_id,
+                    "dispatch-failover-failed",
+                    &format!(
+                        "Fallback dispatch of {agent_id} subtask {} on {}/{} returned a \
+                         non-success outcome; the original failure stands",
+                        subtask.id, default_profile.profile.provider, default_profile.profile.model
+                    ),
+                )
+                .await;
+                None
+            }
+            Err(error) => {
+                self.append_dispatch_failover_decision(
+                    subtask.session_id,
+                    "dispatch-failover-failed",
+                    &format!(
+                        "Fallback dispatch of {agent_id} subtask {} failed: {error}; the \
+                         original failure stands",
+                        subtask.id
+                    ),
+                )
+                .await;
+                None
+            }
+        }
     }
 
     /// ADR-42 §4 + ADR-45: walk the fallback ladder for a `LimitReached`
@@ -5386,19 +5548,25 @@ impl CoordinatorAgent {
     /// - a `coordinator_shape` audit row (final shape + reason) via the run's
     ///   executor, alongside — never instead of — the `intent_router` hint row.
     ///
-    /// Fail-soft by contract: continuity/audit writes must never fail a run.
-    /// The whiteboard append needs a session-DB pool; without one it is
-    /// skipped and only the audit row is written (the executor's audit log is
-    /// a separate sink).
+    /// Called for EVERY run: a hint-less run records `hint: "none"` with the
+    /// builder-set depth as the final shape. Fail-soft by contract:
+    /// continuity/audit writes must never fail a run. The whiteboard append
+    /// needs a session-DB pool; without one it is skipped and only the audit
+    /// row is written (the executor's audit log is a separate sink).
     async fn record_run_shape_decision(
         &self,
-        hint: &RunShapeHint,
+        hint_name: &str,
         shape: RunShape,
         reason: &str,
         session_id: Ulid,
     ) {
-        let hint_name = format!("{:?}", hint.outcome);
-        let overridden_from = if shape.name() != hint_name { hint_name.as_str() } else { "" };
+        // A hint-less run has nothing to override; only a real hint whose
+        // shape lost to context is recorded as `overridden_from`.
+        let overridden_from = if shape.name() != hint_name && hint_name != NO_RUN_SHAPE_HINT {
+            hint_name
+        } else {
+            ""
+        };
         if let Some(pool) = self.review_store.as_ref() {
             let event = NewWhiteboardEvent {
                 event_id: Ulid::new().to_string(),
@@ -5432,7 +5600,7 @@ impl CoordinatorAgent {
                 .record_coordinator_shape_decision(
                     session_id,
                     Ulid::new(),
-                    &hint_name,
+                    hint_name,
                     shape.name(),
                     reason,
                     CancellationToken::new(),
@@ -7666,25 +7834,41 @@ impl CoordinatorAgent {
         // under an Execute hint) the coordinator overrides it here and records
         // the decision (ADR-65 whiteboard `Decision` + a `coordinator_shape`
         // audit row) so the override is observable, never silent. Absent a
-        // hint, the builder-set depth stands unchanged.
+        // hint, the builder-set depth IS the final shape — and the decision is
+        // STILL recorded (`hint: "none"`), so every run carries an observable
+        // shape decision.
         self.decided_run_shape = None;
         self.run_shape_decision_label = None;
-        if let Some(hint) = self.run_shape_hint.clone() {
-            let context = self.run_shape_context.clone();
-            let (shape, reason) = decide_run_shape(&hint, &context);
-            self.orchestration_depth = shape.depth();
-            self.decided_run_shape = Some(shape);
-            self.run_shape_decision_label = Some(reason.to_owned());
-            tracing::info!(
-                hint = ?hint.outcome,
-                final_shape = shape.name(),
-                reason,
-                has_approved_plan = context.has_approved_plan,
-                has_active_objective = context.has_active_objective(),
-                "coordinator finalized the run shape (advisor-mode intent routing)"
-            );
-            self.record_run_shape_decision(&hint, shape, reason, task.session_id).await;
-        }
+        let (hint_label, shape, reason, has_approved_plan, has_active_objective) =
+            match self.run_shape_hint.clone() {
+                Some(hint) => {
+                    let context = self.run_shape_context.clone();
+                    let (shape, reason) = decide_run_shape(&hint, &context);
+                    (
+                        format!("{:?}", hint.outcome),
+                        shape,
+                        reason,
+                        context.has_approved_plan,
+                        context.has_active_objective(),
+                    )
+                }
+                None => {
+                    let shape = RunShape::from_depth(self.orchestration_depth);
+                    (NO_RUN_SHAPE_HINT.to_owned(), shape, "hint_none", false, false)
+                }
+            };
+        self.orchestration_depth = shape.depth();
+        self.decided_run_shape = Some(shape);
+        self.run_shape_decision_label = Some(reason.to_owned());
+        tracing::info!(
+            hint = %hint_label,
+            final_shape = shape.name(),
+            reason,
+            has_approved_plan,
+            has_active_objective,
+            "coordinator finalized the run shape (advisor-mode intent routing)"
+        );
+        self.record_run_shape_decision(&hint_label, shape, reason, task.session_id).await;
         // Phase 0: Retrieve project memory context. Phase 6 M3a: seed the
         // scope from the run this instance last planned (`last_plan_id`), the
         // run it is currently executing (`run_id`), or — on a resume, where
@@ -9281,6 +9465,40 @@ impl CoordinatorAgent {
         }
     }
 
+    /// Append the ADR-65 `Decision` event recording a dead-pipe failover
+    /// attempt/skip/outcome (smoke 01M35YG93). Fail-soft like every continuity
+    /// write: a missing review store or an append failure never blocks the
+    /// recovery path. No recorded evidence exists at failover time (the
+    /// dispatch failed before settling), so the citations are an empty list.
+    async fn append_dispatch_failover_decision(
+        &self,
+        session_id: Ulid,
+        reason: &str,
+        required_output: &str,
+    ) {
+        let Some(pool) = self.review_store.as_ref() else { return };
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coordinator".to_owned(),
+            kind: WhiteboardKind::Decision,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "selected_agent": "coordinator",
+                "reason": reason,
+                "required_output": required_output,
+                "supporting_evidence_ids": [],
+            }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        if let Err(error) = append_whiteboard_event(pool, &event).await {
+            warn!(%error, "dispatch failover decision append failed (fail-soft)");
+        }
+    }
+
     /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): decompose a
     /// checkpointless `continue` run from the logged evidence chain.
     ///
@@ -10452,6 +10670,10 @@ impl CoordinatorAgent {
         // re-consults the model — the strategy is the record from here on).
         self.decision_journal
             .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        // The primary dispatch consumes `run_ctx`; keep a clone for the
+        // dead-pipe failover, which re-dispatches the SAME subtask/context on
+        // the default-model pipe when the assigned pipe is permanently dead.
+        let failover_ctx = run_ctx.clone();
         let result = match self
             .runner
             .run(agent_id.clone(), &run_subtask, run_ctx, &profile, cancel.clone())
@@ -10479,20 +10701,43 @@ impl CoordinatorAgent {
                     &diagnosis,
                 )
                 .await;
-                self.suitability.record(
-                    agent_id.as_str(),
-                    suitability_class,
-                    crate::suitability::OutcomeKind::Failure,
-                    Some(diagnosis.kind.as_str()),
-                    suitability_now,
-                    0,
-                );
-                self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
-                return serde_json::json!({
-                    "error": "dispatch_failed",
-                    "message": error.to_string(),
-                    "diagnosis": diagnosis.tool_summary(),
-                });
+                // Smoke 01M35YG93: a PERMANENT, alternate-viable failure means
+                // the assignment's pipe is dead (404 model-not-found, auth,
+                // capability) and a redecomposed SAME assignment would fail
+                // again. Retry the SAME subtask ONCE on the default-model pipe
+                // BEFORE handing the failure back to the decision loop; a
+                // successful failover flows through the normal post-dispatch
+                // handling above.
+                let failover = if !diagnosis.transient && diagnosis.alternate_agent_viable {
+                    self.attempt_dispatch_failover(
+                        &run_subtask,
+                        &agent_id,
+                        &profile,
+                        &failover_ctx,
+                        cancel,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if let Some(failover_result) = failover {
+                    failover_result
+                } else {
+                    self.suitability.record(
+                        agent_id.as_str(),
+                        suitability_class,
+                        crate::suitability::OutcomeKind::Failure,
+                        Some(diagnosis.kind.as_str()),
+                        suitability_now,
+                        0,
+                    );
+                    self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                    return serde_json::json!({
+                        "error": "dispatch_failed",
+                        "message": error.to_string(),
+                        "diagnosis": diagnosis.tool_summary(),
+                    });
+                }
             }
         };
         // ── ADR-65 §5: a design-mode call may produce a DesignDoc — the
@@ -17105,6 +17350,31 @@ mod tests {
         Err(OrchestratorError::Provider(ProviderError::AuthFailure))
     }
 
+    /// The smoke-01M35YG93 dead-pipe failure: an HTTP 404 model-not-found.
+    /// Permanent for the assigned pipe (never same-agent viable), yet
+    /// alternate-viable — exactly the class the dispatch failover rescues.
+    fn err_model_not_found() -> Result<AgentRunResult, OrchestratorError> {
+        Err(OrchestratorError::Provider(ProviderError::HttpStatus {
+            status: 404,
+            retry_after: None,
+            message: "model not found".into(),
+        }))
+    }
+
+    /// Decision events EXCLUDING the always-recorded run-shape decision (which
+    /// carries a `final_shape` payload key). Planning/dispatch/recovery tests
+    /// count only the operational decisions.
+    fn operational_decisions(
+        logged: &[concerto_sessions::whiteboard::WhiteboardEvent],
+    ) -> Vec<&concerto_sessions::whiteboard::WhiteboardEvent> {
+        logged
+            .iter()
+            .filter(|event| {
+                event.kind == WhiteboardKind::Decision && event.payload.get("final_shape").is_none()
+            })
+            .collect()
+    }
+
     /// A hard budget-exhaustion failure (`PinnedModelBudgetExceeded` →
     /// ADR-42 §1 LimitReached) — the "no affordable model left in budget"
     /// class that enters the fallback ladder on first dispatch.
@@ -17378,8 +17648,7 @@ mod tests {
         )
         .await
         .expect("the log loads");
-        let decisions: Vec<_> =
-            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        let decisions = operational_decisions(&logged);
         assert_eq!(
             decisions.len(),
             1,
@@ -17451,8 +17720,7 @@ mod tests {
         )
         .await
         .expect("the log loads");
-        let decisions: Vec<_> =
-            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        let decisions = operational_decisions(&logged);
         assert_eq!(
             decisions.len(),
             1,
@@ -17509,8 +17777,7 @@ mod tests {
         )
         .await
         .expect("the log loads");
-        let decisions: Vec<_> =
-            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        let decisions = operational_decisions(&logged);
         assert!(
             decisions.is_empty(),
             "cancellation records no planning-recovery decision: {decisions:?}"
@@ -20715,6 +20982,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.kind == WhiteboardKind::Decision
+                    && event.payload.get("final_shape").is_none()
                     && event.payload.get("selected_agent").is_some()
             })
             .collect();
@@ -20808,6 +21076,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.kind == WhiteboardKind::Decision
+                    && event.payload.get("final_shape").is_none()
                     && event.payload.get("selected_agent").is_some()
             })
             .collect();
@@ -22307,6 +22576,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.kind == WhiteboardKind::Decision
+                    && event.payload.get("final_shape").is_none()
                     && event.payload.get("selected_agent").is_some()
             })
             .collect();
@@ -22406,6 +22676,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.kind == WhiteboardKind::Decision
+                    && event.payload.get("final_shape").is_none()
                     && event.payload.get("selected_agent").is_some()
             })
             .collect();
@@ -22473,6 +22744,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.kind == WhiteboardKind::Decision
+                    && event.payload.get("final_shape").is_none()
                     && event.payload.get("selected_agent").is_some()
             })
             .collect();
@@ -22561,8 +22833,8 @@ mod tests {
         .await
         .expect("whiteboard loads");
         assert!(
-            !logged.iter().any(|event| event.kind == WhiteboardKind::Decision),
-            "a rejected decision leaves no ledger record: {logged:?}"
+            operational_decisions(&logged).is_empty(),
+            "a rejected decision leaves no operational ledger record: {logged:?}"
         );
     }
 
@@ -23953,8 +24225,7 @@ mod tests {
         )
         .await
         .expect("the log loads");
-        let decisions: Vec<_> =
-            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        let decisions = operational_decisions(&logged);
         assert_eq!(
             decisions.len(),
             1,
@@ -24290,8 +24561,7 @@ mod tests {
         )
         .await
         .expect("the log loads");
-        let decisions: Vec<_> =
-            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        let decisions = operational_decisions(&logged);
         assert_eq!(
             decisions.len(),
             1,
@@ -24518,8 +24788,7 @@ mod tests {
         )
         .await
         .expect("the log loads");
-        let decisions: Vec<_> =
-            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        let decisions = operational_decisions(&logged);
         assert_eq!(
             decisions.len(),
             1,
@@ -24593,8 +24862,9 @@ mod tests {
         .await
         .expect("the log loads");
         assert!(
-            !logged.iter().any(|event| event.kind == WhiteboardKind::Decision),
-            "cancellation records no Decision event (documented terminal class): {logged:?}"
+            operational_decisions(&logged).is_empty(),
+            "cancellation records no operational Decision event (documented terminal class): \
+             {logged:?}"
         );
     }
 
@@ -27762,13 +28032,13 @@ mod tests {
         assert_eq!(shape_row.rule_matched.as_deref(), Some("plan_artifact_overrides_execute_hint"));
     }
 
-    /// Lazy machinery: with no routing hint attached (the production wiring
-    /// after intent routing left the hot path), the coordinator records NO
-    /// run-shape whiteboard Decision and NO `coordinator_shape` audit row at
-    /// message arrival. Run-shape bookkeeping engages only once the run
-    /// actually dispatches/mutates.
+    /// Record-always (smoke 01M35YG93 gap 1): with no routing hint attached
+    /// (the production wiring after intent routing left the hot path), the
+    /// coordinator STILL records its final run-shape decision — the builder-set
+    /// depth IS the final shape, recorded with the `none` hint label and an
+    /// empty `overridden_from` — on BOTH channels.
     #[tokio::test]
-    async fn no_hint_records_no_run_shape_decision() {
+    async fn no_hint_records_run_shape_decision_with_none_hint() {
         let (_dir, pool) = resume_log_pool().await;
         let bus = EventBus::new(256);
         let audit = Arc::new(ConsultAuditProbe::default());
@@ -27793,15 +28063,214 @@ mod tests {
             .await
             .expect("coordinator run should succeed");
 
+        // The producer default is Full depth → Execute; recorded despite no hint.
         assert_eq!(
             coordinator.decided_run_shape(),
-            None,
-            "no hint means no up-front shape decision"
+            Some(RunShape::Execute),
+            "a hint-less run records the builder-set depth as its final shape"
+        );
+        assert_eq!(
+            coordinator.run_shape_decision_label(),
+            Some("hint_none"),
+            "the hint-less decision carries the `hint_none` reason"
         );
         let rows = audit.rows();
+        let shape_row = rows
+            .iter()
+            .find(|row| row.tool_name == "coordinator_shape")
+            .expect("the coordinator_shape audit row is recorded even without a hint");
+        assert_eq!(shape_row.verdict, "Execute");
+        assert_eq!(shape_row.rule_matched.as_deref(), Some("hint_none"));
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let shape_decision = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["final_shape"] == serde_json::Value::String("Execute".into())
+            })
+            .expect("the run-shape Decision event is recorded even without a hint");
+        assert_eq!(shape_decision.payload["hint"], serde_json::Value::String("none".into()));
+        assert_eq!(
+            shape_decision.payload["overridden_from"],
+            serde_json::Value::String(String::new())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Smoke 01M35YG93 gap 2: dead-pipe dispatch failover. A permanent,
+    // alternate-viable dispatch failure retries the SAME subtask ONCE on the
+    // default-model pipe BEFORE the decision loop can redecompose the same
+    // dead assignment.
+    // ------------------------------------------------------------------
+
+    /// The failover rescues a dead pipe: the primary dispatch 404s, the
+    /// rebuilt role succeeds on the default-model pipe, and the run completes
+    /// without a redecompose turn. The subtask id/assignment is preserved and
+    /// the attempt/outcome are recorded as ADR-65 Decisions.
+    #[tokio::test]
+    async fn dispatch_failover_rescues_dead_pipe_before_redecompose() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        // The bound pipe is dead: the single primary dispatch 404s.
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        // The rebuild factory binds the same role to the default provider,
+        // which succeeds.
+        let rescued = Arc::new(MockExpertAgent::always_succeed(
+            role.clone(),
+            "default pipe rescued the dead assignment",
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| rescued.clone()),
+        );
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        let mut coordinator =
+            coordinator.with_review_store(Some(pool.clone())).with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            );
+        let mut rx = bus.subscribe();
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let task = AgentTask::new(Ulid::new(), "investigate the codebase");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("a dead pipe must not crash the run");
+
+        // No redecompose: exactly the scripted dispatch + the final text.
+        assert_eq!(provider.turn_count(), 2, "the failover avoided a redecompose turn");
+        assert_eq!(
+            coordinator.default_model_provider_attempted.len(),
+            1,
+            "the failover is attempted once for the rescued subtask"
+        );
+        // Assignment preserved: the failover did NOT materialize a new subtask.
+        let mut created = 0usize;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.kind, EventKind::SubTaskCreated { .. }) {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 1, "the failover reuses the SAME subtask, never a new one");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
         assert!(
-            !rows.iter().any(|row| row.tool_name == "coordinator_shape"),
-            "no coordinator_shape audit row without a hint"
+            reasons.contains(&"dispatch-failover-attempted"),
+            "the failover attempt is recorded: {reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"dispatch-failover-succeeded"),
+            "the failover outcome is recorded: {reasons:?}"
+        );
+        let attempt = logged
+            .iter()
+            .find(|event| event.payload["reason"] == "dispatch-failover-attempted")
+            .expect("the attempt event exists");
+        assert!(
+            attempt.payload["required_output"].as_str().unwrap_or_default().contains("researcher"),
+            "the failover audit names the same assignment: {attempt:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the rescued subtask completes: {}",
+            output.final_message
+        );
+    }
+
+    /// Bounded: when the default-model pipe ALSO fails, the failure is
+    /// surfaced unchanged and the decision loop redecomposes — each subtask id
+    /// gets at most one failover, and the redecomposed assignment is a NEW
+    /// subtask.
+    #[tokio::test]
+    async fn dispatch_failover_failure_falls_back_to_redecompose_bounded() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        // Both the primary dispatch and the redecomposed dispatch 404.
+        let bound = Arc::new(MockExpertAgent::sequence(
+            role.clone(),
+            vec![err_model_not_found(), err_model_not_found()],
+        ));
+        // The default pipe is dead too: every rebuild 404s.
+        let factory_role = role.clone();
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| {
+                Arc::new(MockExpertAgent::sequence(
+                    factory_role.clone(),
+                    vec![err_model_not_found()],
+                ))
+            }),
+        );
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        let mut coordinator =
+            coordinator.with_review_store(Some(pool.clone())).with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            );
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let task = AgentTask::new(Ulid::new(), "investigate");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("a failed failover must not crash the run");
+
+        assert_eq!(
+            provider.turn_count(),
+            3,
+            "the failed failover does not eat the redecompose turn"
+        );
+        assert_eq!(
+            coordinator.default_model_provider_attempted.len(),
+            2,
+            "each redecomposed subtask id gets exactly one bounded failover attempt"
         );
         let logged = load_whiteboard_events(
             &pool,
@@ -27809,11 +28278,170 @@ mod tests {
         )
         .await
         .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-attempted").count(),
+            2,
+            "one attempt per redecomposed subtask: {reasons:?}"
+        );
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-failed").count(),
+            2,
+            "each failed failover is recorded: {reasons:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "with no viable pipe the run surfaces Partial, never a vacuous completion"
+        );
+    }
+
+    /// ADR-45 §4: the user gate disables the failover too. The dead-pipe
+    /// failure is recorded as a skipped failover, the guard is NOT spent, and
+    /// the existing redecompose path is unchanged.
+    #[tokio::test]
+    async fn dispatch_failover_skipped_when_disabled() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        let rescued = Arc::new(MockExpertAgent::always_succeed(role.clone(), "must not run"));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| rescued.clone()),
+        );
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        let mut coordinator = coordinator
+            .with_review_store(Some(pool.clone()))
+            .with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            )
+            .with_default_model_fallback(false);
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let task = AgentTask::new(Ulid::new(), "investigate");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("a disabled failover must not crash the run");
+
+        assert_eq!(provider.turn_count(), 3, "the disabled failover redecomposes as before");
         assert!(
-            !logged.iter().any(|event| {
-                event.kind == WhiteboardKind::Decision && event.payload.get("final_shape").is_some()
-            }),
-            "no run-shape Decision whiteboard event without a hint"
+            coordinator.default_model_provider_attempted.is_empty(),
+            "a skipped failover must not spend the one-shot guard"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert!(
+            reasons.contains(&"dispatch-failover-skipped-disabled"),
+            "the skip is recorded: {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&"dispatch-failover-succeeded"),
+            "no failover ran while disabled: {reasons:?}"
+        );
+    }
+
+    /// Degenerate guard: when the fallback resolves to the SAME (provider,
+    /// model) as the failed dispatch, the failover is skipped with a note and
+    /// the one-shot guard is NOT spent (a retry would reproduce the failure).
+    #[tokio::test]
+    async fn dispatch_failover_skips_degenerate_same_pipe() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        let rescued = Arc::new(MockExpertAgent::always_succeed(role.clone(), "must not run"));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            Arc::new(MockExpertAgent::always_succeed(role.clone(), "bound")),
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| rescued.clone()),
+        );
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("noop".into())],
+        );
+        let mut coordinator =
+            coordinator.with_review_store(Some(pool.clone())).with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            );
+
+        let subtask = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: role.clone(),
+            description: "degenerate failover probe".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            subtask.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // The failed profile IS the fallback profile: same (provider, model).
+        let failed = fallback_profile("fallback", "default-model");
+        let result = coordinator
+            .attempt_dispatch_failover(
+                &subtask,
+                &role,
+                &failed,
+                &context,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_none(), "a degenerate failover must not dispatch");
+        assert!(
+            coordinator.default_model_provider_attempted.is_empty(),
+            "a degenerate skip must not spend the one-shot guard"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert!(
+            reasons.contains(&"dispatch-failover-skipped-degenerate"),
+            "the degenerate skip is recorded: {reasons:?}"
         );
     }
 }
