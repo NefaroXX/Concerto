@@ -68,6 +68,14 @@ const SUBMIT_REVIEW_REPORT_TOOL: &str = "submit_review_report";
 /// structured `AgentOutcome::Failed` after the bound is reached.
 const MAX_SUBMISSION_ATTEMPTS: u32 = 6;
 
+/// Number of trailing submission attempts that form the *closing phase* of the
+/// bounded investigate-then-close loop. The leading
+/// `MAX_SUBMISSION_ATTEMPTS - CLOSING_SUBMISSION_ATTEMPTS` attempts may
+/// investigate freely (Auto choice, executor tools offered); the closing turns
+/// force the contract tool so a weak model cannot burn the whole budget
+/// writing prose and never calling `submit_*`.
+const CLOSING_SUBMISSION_ATTEMPTS: u32 = 2;
+
 /// Per-file and cumulative budget for the changed-file excerpts injected into
 /// the review prompt (ported from the dedicated `ReviewerAgent`).
 const MAX_REVIEW_FILE_CHARS: usize = 16_000;
@@ -1856,20 +1864,17 @@ impl GenericSpecialistAgent {
         // Dedupe by name: if the executor somehow exposes the same tool as the
         // contract, the contract's definition wins. Capability-free agents
         // are offered the contract tool only — no non-selectable noise.
-        let mut tools = Vec::new();
+        // `investigate_tools` is the Auto-phase set; the closing phase narrows
+        // the wire tool list to the contract tool alone.
+        let mut investigate_tools = Vec::new();
         if has_executor_tools {
-            tools.extend(
+            investigate_tools.extend(
                 executor_tools
                     .into_iter()
                     .filter(|definition| definition.name != contract.tool_name),
             );
         }
-        tools.push(tool_def.clone());
-        let tool_choice = if has_executor_tools {
-            ToolChoice::Auto
-        } else {
-            ToolChoice::Forced(contract.tool_name.into())
-        };
+        investigate_tools.push(tool_def.clone());
         let start = std::time::Instant::now();
         let mut messages = vec![Message {
             role: Role::User,
@@ -1886,6 +1891,11 @@ impl GenericSpecialistAgent {
         let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
         let mut submission_attempts = 0_u32;
+        // Closing-phase latch: set once a text-only (prose) turn ignored the
+        // contract tool, so the next turn forces submission.
+        let mut prose_without_submission = false;
+        // Whether the one-time "submit now" closing instruction was injected.
+        let mut closing_notice_sent = false;
         let mut validation_errors: Vec<String> = Vec::new();
         let mut files_modified: Vec<camino::Utf8PathBuf> = Vec::new();
         let mut iteration = 0_u32;
@@ -1898,11 +1908,43 @@ impl GenericSpecialistAgent {
                 return Err(OrchestratorError::Cancelled);
             }
 
+            // Bounded investigate-then-close. Only agents that actually have a
+            // free investigation phase (capability-gated executor tools) can
+            // enter the closing phase; capability-free agents are already
+            // forced every turn. Closing is triggered when the trailing
+            // attempt budget is reached, or once the model has answered in
+            // prose without submitting.
+            let closing = has_executor_tools
+                && (prose_without_submission
+                    || submission_attempts
+                        >= MAX_SUBMISSION_ATTEMPTS.saturating_sub(CLOSING_SUBMISSION_ATTEMPTS));
+            let (request_tools, request_choice) = if !has_executor_tools || closing {
+                (vec![tool_def.clone()], ToolChoice::Forced(contract.tool_name.into()))
+            } else {
+                (investigate_tools.clone(), ToolChoice::Auto)
+            };
+            if closing && !closing_notice_sent {
+                closing_notice_sent = true;
+                messages.push(Message {
+                    role: Role::User,
+                    content: format!(
+                        "Investigation is over. Do not begin new investigation. Submit your {} \
+                         now by calling {} with the fields you have already gathered.",
+                        contract.label, contract.tool_name
+                    ),
+                    tool_calls: None,
+                    tool_results: None,
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                });
+            }
+
             let request = CompletionRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: Some(tools.clone()),
-                tool_choice: Some(tool_choice.clone()),
+                tools: Some(request_tools),
+                tool_choice: Some(request_choice),
                 temperature: Some(0.7),
                 max_tokens: Some(8192),
                 stream: false,
@@ -1968,6 +2010,11 @@ impl GenericSpecialistAgent {
                     }
                     Err(reasons) => {
                         submission_attempts = submission_attempts.saturating_add(1);
+                        // A non-empty text-only turn is a prose answer that
+                        // ignored the contract tool: close on the next turn.
+                        if !text.trim().is_empty() {
+                            prose_without_submission = true;
+                        }
                         validation_errors.extend(reasons.clone());
                         // No tool call exists to answer, so carry the same
                         // structured feedback in a user turn. A tool-role
@@ -3850,6 +3897,214 @@ mod tests {
                     .is_some_and(|results| results.iter().any(|result| result.name == "read_file"))
             }),
             "the model must receive the filesystem tool result"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Bounded investigate-then-close submission loop
+    // ------------------------------------------------------------------
+
+    /// Wire tool names offered to the model in a recorded request.
+    fn request_tool_names(request: &CompletionRequest) -> Vec<&str> {
+        request
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|definition| definition.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A capability-gated (fs_read) specialist for the investigate/close tests,
+    /// so the contract tool would otherwise be optional (Auto choice).
+    fn executor_capable_agent(
+        provider: Arc<dyn LlmProvider>,
+        executor: Arc<ToolExecutor>,
+        output_mode: OutputMode,
+        id: &str,
+        stage: &str,
+    ) -> GenericSpecialistAgent {
+        GenericSpecialistAgent::new(
+            AgentId::new(id),
+            id.to_string(),
+            Some(AgentStage::new(stage)),
+            provider,
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities { fs_read: Some(true), ..Default::default() },
+        )
+        .with_output_mode(output_mode)
+    }
+
+    #[tokio::test]
+    async fn review_report_prose_only_investigation_submits_on_forced_close() {
+        // Production defect: a reviewer with executor tools got Auto choice and
+        // answered in prose every turn, never calling submit_review_report.
+        // The closing phase must force the contract tool so submission happens
+        // well within the six-attempt budget.
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            text_chunk("Verdict: Fail. Here is my review as prose, no tool call."),
+            text_chunk("Still describing findings in prose."),
+            text_chunk("More prose, still no submission."),
+            text_chunk("One more prose paragraph."),
+            review_chunk("call_submit", valid_pass_review_args()),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::ReviewReport,
+            "reviewer",
+            "review",
+        );
+
+        let result = agent
+            .run(&review_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1, "only the closing submission is a tool call");
+        let report: ReviewReport = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(report.verdict, ReviewVerdict::Pass);
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5, "four investigate turns then the closing submission");
+        assert!(
+            matches!(calls[0].tool_choice, Some(ToolChoice::Auto)),
+            "the first turn must investigate freely"
+        );
+        let closing = calls
+            .iter()
+            .find(|request| matches!(request.tool_choice, Some(ToolChoice::Forced(_))))
+            .expect("a forced closing turn must be sent");
+        assert_eq!(
+            request_tool_names(closing),
+            vec![SUBMIT_REVIEW_REPORT_TOOL],
+            "the closing turn offers only the contract tool"
+        );
+        assert!(
+            closing.messages.iter().any(|message| message.role == Role::User
+                && message.content.contains("Investigation is over")),
+            "the forced turn must instruct the model to submit now"
+        );
+    }
+
+    #[tokio::test]
+    async fn design_doc_prose_only_investigation_submits_on_forced_close() {
+        // Same behavior in design mode, not just review.
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            text_chunk("Here is the design, written as prose without any tool call."),
+            text_chunk("More design prose."),
+            submission_chunk("call_submit", valid_doc_args()),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::DesignDoc,
+            "designer",
+            "design",
+        );
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1, "only the closing submission is a tool call");
+        let doc: DesignDoc = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(doc.proposed_files[0].as_str(), "src/auth.rs");
+
+        let calls = provider.calls.lock().unwrap();
+        assert!(matches!(calls[0].tool_choice, Some(ToolChoice::Auto)));
+        assert!(
+            matches!(calls[1].tool_choice, Some(ToolChoice::Forced(_))),
+            "a prose-only turn must close the next turn"
+        );
+        assert_eq!(request_tool_names(&calls[1]), vec![SUBMIT_DESIGN_DOC_TOOL]);
+    }
+
+    #[tokio::test]
+    async fn submission_budget_split_forces_contract_on_trailing_attempts() {
+        // Even a model that keeps choosing the contract tool freely still gets
+        // the trailing attempts forced (the explicit 6-attempt budget split).
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let invalid = || submission_chunk("call_invalid", serde_json::json!({ "goals": ["ship"] }));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            invalid(),
+            invalid(),
+            invalid(),
+            invalid(),
+            submission_chunk("call_submit", valid_doc_args()),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::DesignDoc,
+            "designer",
+            "design",
+        );
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 5);
+
+        let calls = provider.calls.lock().unwrap();
+        for (index, call) in calls.iter().take(4).enumerate() {
+            assert!(
+                matches!(call.tool_choice, Some(ToolChoice::Auto)),
+                "attempt {index} (investment phase) must stay Auto"
+            );
+        }
+        assert!(
+            matches!(calls[4].tool_choice, Some(ToolChoice::Forced(_))),
+            "the trailing attempt must be forced"
+        );
+        assert_eq!(request_tool_names(&calls[4]), vec![SUBMIT_DESIGN_DOC_TOOL]);
+    }
+
+    #[tokio::test]
+    async fn closing_phase_invalid_payload_feedback_is_bounded() {
+        // An invalid payload on a forced closing turn still yields the
+        // structured corrective feedback, and the loop stays bounded at
+        // MAX_SUBMISSION_ATTEMPTS — a prose turn plus five invalid closes.
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let invalid = || submission_chunk("call_invalid", serde_json::json!({ "goals": ["ship"] }));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            text_chunk("Prose that ignores the contract tool."),
+            invalid(),
+            invalid(),
+            invalid(),
+            invalid(),
+            invalid(),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::DesignDoc,
+            "designer",
+            "design",
+        );
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("a bounded failure is a clean AgentOutcome, not an Err");
+        assert!(matches!(result.outcome, AgentOutcome::Failed { .. }));
+        assert!(
+            result.summary.contains("bounded submission attempts"),
+            "failure must cite the attempt bound: {}",
+            result.summary
+        );
+        // One prose attempt + five invalid submits = six counted submission
+        // attempts; only the five tool calls register in `tool_call_count`.
+        assert_eq!(result.tool_call_count, MAX_SUBMISSION_ATTEMPTS - 1);
+        assert!(
+            provider.request_contained_validation_result("interface_sketch"),
+            "the forced closing turns must still carry corrective feedback"
         );
     }
 
