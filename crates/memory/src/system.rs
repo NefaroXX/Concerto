@@ -1042,6 +1042,55 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// ADR-54 re-enable: with a global store configured, a
+    /// `MemoryNamespace::Global` entry round-trips through `MemorySystem` and
+    /// is scoped to the querying user's `user_id_hash`.
+    #[tokio::test]
+    async fn global_store_round_trips_through_memory_system() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let global = Arc::new(GlobalMemoryStore::new(pool).await.expect("global store opens"));
+        let system = MemorySystem::new(
+            Arc::new(InMemoryVectorStore::new()),
+            Arc::new(InMemoryFullTextStore::new()),
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
+            None,
+            ProjectId("test".into()),
+            Some(global),
+        );
+
+        let user_id_hash = "user-global";
+        let entry = MemoryEntry {
+            id: MemoryId(ulid::Ulid::new()),
+            project_id: ProjectId(user_id_hash.to_string()),
+            namespace: MemoryNamespace::Global { user_id_hash: user_id_hash.to_string() },
+            content: "remember the global preference".into(),
+            chunk_type: ChunkType::Fact,
+            model_id: None,
+            model_version: None,
+            metadata: serde_json::json!({}),
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let expected_id = entry.id;
+        let stored = system.store(entry, CancellationToken::new()).await.expect("global store");
+        assert_eq!(stored, expected_id);
+
+        let mut query = make_query("global preference");
+        query.namespace = MemoryNamespace::Global { user_id_hash: user_id_hash.to_string() };
+        let results =
+            system.retrieve(&query, CancellationToken::new()).await.expect("global query");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "remember the global preference");
+
+        // A different user never sees the entry (namespace isolation).
+        let mut other = make_query("global preference");
+        other.namespace = MemoryNamespace::Global { user_id_hash: "someone-else".into() };
+        let other_results =
+            system.retrieve(&other, CancellationToken::new()).await.expect("other user query");
+        assert!(other_results.is_empty(), "global store must isolate by user_id_hash");
+    }
+
     // ---------------------------------------------------------------------
     // L1 dedup judge (with_dedup_judge)
     // ---------------------------------------------------------------------

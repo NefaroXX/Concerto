@@ -2759,6 +2759,7 @@ mod write_path_tests {
             pool.clone(),
             store,
             ProjectId("proj-d6-supervisor".to_owned()),
+            None,
         )));
 
         // Fewer than the threshold: no pass may run.

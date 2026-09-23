@@ -7,6 +7,7 @@
 //! Schema is intentionally simple — a KV-like table with an FTS5 index for
 //! text search. No embedding pipeline, no chunk metadata.
 
+use camino::Utf8Path;
 use concerto_core::error::MemoryError as CoreMemoryError;
 use concerto_core::memory::{
     ChunkType, MemoryChunk, MemoryEntry, MemoryId, MemoryNamespace, MemoryQuery, ProjectId,
@@ -49,6 +50,67 @@ impl GlobalMemoryStore {
         .map_err(|e| CoreMemoryError::Persistence(format!("create global_memory index: {e}")))?;
 
         Ok(Self { pool })
+    }
+
+    /// Open (or create) the global memory database at `path`, self-healing a
+    /// corrupted file (ADR-54 §2/§97).
+    ///
+    /// When the first open fails **and** the file is not a valid SQLite
+    /// database, the file is quarantined to `<name>.corrupt-<ts>.bak` and the
+    /// open is retried once against a fresh database. A file with a valid
+    /// SQLite header (a schema problem on real data) is never quarantined —
+    /// the original error is surfaced so user data is never silently deleted.
+    ///
+    /// Callers on the run path treat any error here as fail-soft: global memory
+    /// is optional and an unreadable database must never abort a run.
+    pub async fn connect(path: &Utf8Path) -> Result<Self, CoreMemoryError> {
+        match Self::try_connect(path).await {
+            Ok(store) => Ok(store),
+            Err(original) => {
+                match concerto_core::helpers::quarantine_corrupt_db_file(path.as_std_path()) {
+                    Some(quarantine) => {
+                        tracing::warn!(
+                            path = %path,
+                            quarantine = %quarantine.display(),
+                            "global memory database was not a valid SQLite file; quarantined \
+                             corrupted file and retrying with a fresh database"
+                        );
+                        match Self::try_connect(path).await {
+                            Ok(store) => Ok(store),
+                            // The retry failed too — surface the original
+                            // failure so the cause is never masked.
+                            Err(_) => Err(original),
+                        }
+                    }
+                    None => Err(original),
+                }
+            }
+        }
+    }
+
+    /// Open the database without quarantine recovery, failing deterministically
+    /// at open time (including a `PRAGMA schema_version` probe) so a
+    /// garbage/truncated file is not deferred to the first query.
+    async fn try_connect(path: &Utf8Path) -> Result<Self, CoreMemoryError> {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path.as_std_path())
+            .create_if_missing(true);
+
+        let pool = SqlitePool::connect_with(options).await.map_err(|e| {
+            CoreMemoryError::Persistence(format!("failed to open global memory db: {e}"))
+        })?;
+
+        let _schema_version: i64 =
+            sqlx::query_scalar("PRAGMA schema_version;").fetch_one(&pool).await.map_err(|e| {
+                CoreMemoryError::Persistence(format!("global memory db header check failed: {e}"))
+            })?;
+
+        sqlx::query("PRAGMA journal_mode=WAL;")
+            .execute(&pool)
+            .await
+            .map_err(|e| CoreMemoryError::Persistence(format!("failed to set WAL mode: {e}")))?;
+
+        Self::new(pool).await
     }
 
     /// Insert or upsert a global memory entry.
@@ -303,5 +365,64 @@ mod tests {
         let store = create_store().await;
         let result = store.invalidate(MemoryId(Ulid::new()), CancellationToken::new()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_creates_database_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("global_memory.db")).unwrap();
+
+        let store = GlobalMemoryStore::connect(&path).await.expect("connect");
+        assert!(path.is_file(), "connect must create the database file");
+
+        let entry = make_global_entry("connected hello", "user-connect");
+        store.store(&entry, CancellationToken::new()).await.expect("store");
+        let results = store
+            .retrieve(&make_global_query("hello", "user-connect"), CancellationToken::new())
+            .await
+            .expect("retrieve");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("connected hello"));
+
+        // A second connect succeeds against the existing store.
+        GlobalMemoryStore::connect(&path).await.expect("reconnect");
+    }
+
+    /// ADR-54 §2/§97 self-heal: a garbage file at the store path is quarantined
+    /// to `<name>.corrupt-<ts>.bak` and a fresh database is created; a file with
+    /// a valid SQLite header is NEVER quarantined — the original error is
+    /// surfaced so real data is never silently deleted.
+    #[tokio::test]
+    async fn connect_self_heals_garbage_file_but_never_a_valid_header_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("global.db")).unwrap();
+
+        // Garbage file -> quarantine + fresh store on retry.
+        std::fs::write(db_path.as_std_path(), b"this is definitely not a sqlite database file")
+            .unwrap();
+        let store = GlobalMemoryStore::connect(&db_path).await;
+        assert!(store.is_ok(), "connect must recover from a garbage db file");
+        let quarantine_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(quarantine_count, 1, "exactly one quarantine backup expected");
+        assert!(db_path.is_file(), "a fresh global db must exist after recovery");
+
+        // Valid SQLite header but broken contents -> error surfaced, file kept.
+        let valid_header = camino::Utf8PathBuf::from_path_buf(dir.path().join("valid.db")).unwrap();
+        std::fs::write(
+            valid_header.as_std_path(),
+            *b"SQLite format 3\0followed-by-garbage-that-is-not-a-real-database",
+        )
+        .unwrap();
+        let result = GlobalMemoryStore::connect(&valid_header).await;
+        assert!(result.is_err(), "valid-header but broken db must fail, not self-heal");
+        let touched = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("valid.db.corrupt"));
+        assert!(!touched, "valid-header file must never be quarantined");
     }
 }

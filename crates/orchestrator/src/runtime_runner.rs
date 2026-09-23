@@ -1262,6 +1262,11 @@ pub async fn init_memory_system_with_handles(
         .map_err(|e| OrchestratorError::AgentLoopError(format!("MemoryDb connect error: {}", e)))?,
     );
     let pool = db.pool().clone();
+    // ADR-69 slice 1 link store: built here (over the same pool the vector
+    // store uses) so the init retention prunes below can also run the
+    // slice-2 orphan-evidence prune against it. Fail-open: an unopenable
+    // store leaves links off and memory behaves exactly as before.
+    let link_store = build_link_store(&pool, config.memory.max_out_degree).await;
     let vector_store: Arc<dyn VectorStore> = Arc::new(
         SqliteVectorStore::new(pool.clone())
             .await
@@ -1293,6 +1298,26 @@ pub async fn init_memory_system_with_handles(
         .await
     {
         tracing::warn!(%error, "failed to prune derived summaries past retention");
+    }
+    // ADR-69 slice 2: prune DERIVED rows whose incoming link evidence has
+    // decayed cold — NEVER source chunks and NEVER unlinked rows. Same policy
+    // knob as the retrieval cascade (`cascade_decay_days`; `None` → the
+    // 90-day ADR A5 floor, `Some(0)` disables decay). Fail-open: a failed
+    // prune only logs.
+    if let Some(store) = &link_store {
+        if let Err(error) = ttl
+            .prune_orphaned_derived(
+                &project_id,
+                store,
+                config.memory.cascade_decay_days.or(Some(DECAY_FLOOR_DAYS as u16)),
+                CancellationToken::new(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to prune orphaned derived memory");
+        }
+    } else {
+        tracing::debug!("link store unavailable — orphan-evidence prune skipped (fail-open)");
     }
     let decision_store = Arc::new(DecisionStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
@@ -1350,14 +1375,30 @@ pub async fn init_memory_system_with_handles(
     *reindex.lock().unwrap_or_else(|e| e.into_inner()) = Some(indexer.clone());
     *reindex_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(sync.clone());
 
-    // NOTE (ADR-54): global memory is part of the tiered memory system, which
-    // is not implemented yet. It is intentionally STUBBED here: no global
-    // database is opened or connected (a missing or unreadable
-    // `global_memory.db` can no longer abort a run), and `None` is passed for
-    // the global store — `MemorySystem` treats an absent global store
-    // gracefully and never routes to it. The `GlobalMemoryStore` type,
-    // `MemoryNamespace::Global`, and the `MemorySystem` wiring remain in
-    // place; re-enable this block when the tiered system lands.
+    // ADR-54 re-enable: global (user-scoped) memory lives in its own SQLite
+    // database beside the project DB. Opening it is fail-soft — an unreadable
+    // or non-UTF-8 path logs and leaves the global tier disabled; the run
+    // never aborts. `GlobalMemoryStore::connect` self-heals a corrupted file
+    // (quarantine + fresh open) before surfacing an error.
+    let global_store = match camino::Utf8PathBuf::from_path_buf(data_dir.join("global_memory.db")) {
+        Ok(path) => match concerto_memory::global::GlobalMemoryStore::connect(&path).await {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "global memory store unavailable; global tier disabled (ADR-54)"
+                );
+                None
+            }
+        },
+        Err(path) => {
+            tracing::warn!(
+                path = %path.display(),
+                "global memory DB path is not valid UTF-8; global tier disabled"
+            );
+            None
+        }
+    };
     let system = concerto_memory::system::MemorySystem::new(
         vector_store,
         fts_store,
@@ -1365,7 +1406,7 @@ pub async fn init_memory_system_with_handles(
         task_tree.clone(),
         Some(embedder.clone()),
         project_id.clone(),
-        None, // global store (stubbed, ADR-54)
+        global_store,
     );
     // L1 dedup judge (ADR-46 symbolic offload): attach it inside this
     // initializer so EVERY runtime path that builds a project memory system
@@ -1380,12 +1421,11 @@ pub async fn init_memory_system_with_handles(
     // ADR-69 slice 1 link store: attach it inside this initializer so EVERY
     // runtime path that builds a project memory system gets it — desktop
     // pre-init, the persistent runner, and `run_shared_agent` alike (the
-    // store is cached per project and reused). It borrows the SAME pool the
-    // vector store was built on (see `build_link_store`), so `memory_links`
-    // rows live in the same database as the chunks they reference. Fail-open:
-    // an unopenable store leaves links off and memory behaves exactly as
-    // before (plain writes).
-    let link_store = build_link_store(&pool, config.memory.max_out_degree).await;
+    // store is cached per project and reused). It was built above over the
+    // SAME pool the vector store uses (see `build_link_store`), so
+    // `memory_links` rows live in the same database as the chunks they
+    // reference. Fail-open: an unopenable store leaves links off and memory
+    // behaves exactly as before (plain writes).
     let system = match &link_store {
         Some(store) => system.with_link_store(store.clone()),
         None => system,
@@ -4751,7 +4791,12 @@ async fn build_supervised_consolidation(
             return None;
         }
     };
-    Some(Arc::new(crate::consolidation::Consolidator::new(pool, store, project_id)))
+    // Use the same on-device embedder the project indexer uses. The model
+    // downloads on first embed; a failed embed fails soft to the projection's
+    // deterministic hash vector, so a pass never fails on a missing model.
+    let embedder: Arc<dyn EmbeddingGenerator> =
+        Arc::new(ProviderEmbedder::new("bge-small-en-v1.5"));
+    Some(Arc::new(crate::consolidation::Consolidator::new(pool, store, project_id, Some(embedder))))
 }
 
 /// Locate the ADR-60 agent-process child binary: an explicit
@@ -8834,6 +8879,13 @@ mod runtime_runner_tests {
     /// in `concerto-cli`).
     static MEMORY_INIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes the `XDG_DATA_HOME`-redirecting init tests for their WHOLE
+    /// duration. `MEMORY_INIT_ENV_LOCK` only guards the synchronous
+    /// set/restore (it must not be held across an `.await`); without this
+    /// process-wide async lock two init tests can interleave their redirects
+    /// and read each other's data root.
+    static MEMORY_INIT_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// RAII redirect of `XDG_DATA_HOME` to a fresh temp directory; restores
     /// the previous value on drop (panic-safe). The serialization lock is only
     /// held around the synchronous set/restore, never across an `.await`
@@ -8883,6 +8935,7 @@ mod runtime_runner_tests {
     async fn init_path_attaches_link_store_over_project_pool() {
         use concerto_core::memory::{MemoryLink, MemoryLinkKind};
 
+        let _serial = MEMORY_INIT_TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let _xdg = XdgDataHomeGuard::redirect(temp.path());
 
@@ -8958,5 +9011,132 @@ mod runtime_runner_tests {
             .await
             .expect("read the link back");
         assert_eq!(read_back, vec![link], "production memory db must round-trip a persisted link");
+    }
+
+    /// ADR-54 re-enable + ADR-69 slice 2 wiring on the production init path:
+    /// global memory is opened beside the project DB, and the init retention
+    /// pass prunes cold-but-linked derived rows while never touching source
+    /// chunks.
+    #[tokio::test]
+    async fn init_path_opens_global_store_and_prunes_orphaned_derived() {
+        use concerto_core::memory::{ChunkType, EmbeddingRecord, MemoryLinkKind, ProjectId};
+
+        let _serial = MEMORY_INIT_TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _xdg = XdgDataHomeGuard::redirect(temp.path());
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Pre-seed the production project DB (the path init will open) with a
+        // cold-linked derived Fact, a fresh source Function, and an old link.
+        let memory_dir = temp.path().join("xdg-data/concerto/memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(memory_dir.join("memory.db")).unwrap();
+        let db = MemoryDb::connect(&db_path).await.expect("seed db");
+        let pool = db.pool().clone();
+        let project_id = ProjectId(concerto_core::helpers::project_id_hash(&project_dir));
+        let store = SqliteVectorStore::new(pool.clone()).await.expect("vector store");
+
+        let record = |id: &str, chunk_type: ChunkType| EmbeddingRecord {
+            id: id.to_string(),
+            project_id: project_id.clone(),
+            chunk_hash: format!("hash-{id}"),
+            content: id.to_string(),
+            file_path: format!("seed/{id}").into(),
+            start_line: None,
+            end_line: None,
+            chunk_type,
+            vector: vec![0.5, -0.25],
+            model_id: "test".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        store
+            .store_projection(
+                &record("cold-linked", ChunkType::Fact),
+                &serde_json::json!({ "session_id": "sess" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("seed derived row");
+        store
+            .store(&[record("fn-src", ChunkType::Function)], CancellationToken::new())
+            .await
+            .expect("seed source chunk");
+
+        // Cold evidence: a 120-day-old link on the 90-day ADR A5 floor.
+        let cold = (time::OffsetDateTime::now_utc() - time::Duration::days(120)).to_string();
+        sqlx::query(
+            "INSERT INTO memory_links (source_id, target_id, link_type, weight, created_at) \
+             VALUES (?, ?, ?, 1.0, ?)",
+        )
+        .bind("src-cold")
+        .bind("cold-linked")
+        .bind(MemoryLinkKind::Supports.as_str())
+        .bind(&cold)
+        .execute(&pool)
+        .await
+        .expect("seed cold link");
+        drop(store);
+        drop(pool);
+
+        let reindex: Arc<Mutex<Option<Arc<ProjectIndexer>>>> = Arc::new(Mutex::new(None));
+        let reindex_sync: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
+        let memory_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+        let data_dir_lock: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
+
+        let mut config = AppConfig::default();
+        config.memory.dedup_judge = false;
+
+        let handles = init_memory_system_with_handles(
+            EventBus::default(),
+            &config,
+            &project_dir,
+            &reindex,
+            &reindex_sync,
+            &memory_cancel,
+            &data_dir_lock,
+        )
+        .await
+        .expect("production memory init must succeed under a temp data root");
+        drop(handles.store);
+
+        // Global tier: the database is created with its table.
+        let global_path = temp.path().join("xdg-data/concerto/memory/global_memory.db");
+        assert!(global_path.is_file(), "init must create global_memory.db (ADR-54 re-enable)");
+        let global_options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&global_path)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let global_pool = sqlx::SqlitePool::connect_with(global_options)
+            .await
+            .expect("open the production global db");
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'global_memory'",
+        )
+        .fetch_one(&global_pool)
+        .await
+        .expect("query sqlite_master for global_memory");
+        assert_eq!(table, 1, "global memory table must exist after init");
+
+        // Orphan prune: cold-but-linked derived row gone, source chunk kept.
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let pool =
+            sqlx::SqlitePool::connect_with(options).await.expect("reopen the production memory db");
+        let cold_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vector_store WHERE id = 'cold-linked'")
+                .fetch_one(&pool)
+                .await
+                .expect("count cold-linked");
+        assert_eq!(cold_left, 0, "cold-but-linked derived row must be pruned at init");
+        let src_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vector_store WHERE id = 'fn-src'")
+                .fetch_one(&pool)
+                .await
+                .expect("count fn-src");
+        assert_eq!(src_left, 1, "source chunk with old evidence must never be pruned");
     }
 }
