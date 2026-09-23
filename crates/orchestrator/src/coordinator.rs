@@ -1391,6 +1391,16 @@ pub struct CoordinatorAgent {
     /// the ladder skips the default-model-on-default-provider re-dispatch
     /// (ADR-42 behavior).
     default_model_fallback: bool,
+    /// ADR-45 tier-1b amendment: the run's pre-built alternate pipes — every
+    /// configured provider that advertises tool-calling and whose credentials
+    /// resolved, as `(provider, routing profile)`, ordered by configuration.
+    /// Consulted ONLY when the default-model pipe is degenerate (it resolves
+    /// to the failed dispatch's own `(provider_config_id, model)`): the ladder
+    /// then re-dispatches the same role on the first alternate whose pipe id
+    /// differs from the failed pipe's. Empty when no alternate is configured
+    /// (the historical degenerate skip stands unchanged). Built by the runtime
+    /// from the run's routing profiles / provider configs.
+    fallback_pipes: Vec<(Arc<dyn concerto_core::traits::provider::LlmProvider>, ModelProfile)>,
     /// Coordinator-owned planning-provider recovery (ADR-42/45 ladder
     /// semantics, owned by the Coordinator since the compiled scheduler was
     /// removed): whether this run may still attempt the one-shot fallback
@@ -2235,6 +2245,7 @@ impl CoordinatorAgent {
             default_model_provider: None,
             default_model_profile: None,
             default_model_fallback: true,
+            fallback_pipes: Vec::new(),
             planning_recovery_attempted: false,
             planning_recovery_note: None,
             planning_profile: None,
@@ -2631,6 +2642,77 @@ impl CoordinatorAgent {
     pub fn with_default_model_fallback(mut self, enabled: bool) -> Self {
         self.default_model_fallback = enabled;
         self
+    }
+
+    /// ADR-45 tier-1b amendment: attach the run's alternate fallback pipes —
+    /// `(provider, routing profile)` pairs for configured providers other than
+    /// the default pipe, already filtered to tool-calling-capable pipes whose
+    /// credentials resolved. Consulted only when the default-model pipe is
+    /// degenerate; empty means the historical degenerate skip stands.
+    pub fn with_fallback_pipes(
+        mut self,
+        pipes: Vec<(Arc<dyn concerto_core::traits::provider::LlmProvider>, ModelProfile)>,
+    ) -> Self {
+        self.fallback_pipes = pipes;
+        self
+    }
+
+    /// Resolve the fallback pipe for a failed dispatch/planning profile (ADR-45
+    /// tier-1b amendment): prefer the run's default-model pipe when it differs
+    /// from the failed `(provider_config_id, model)`; otherwise the first
+    /// tool-calling-capable alternate pipe whose pipe id differs from the
+    /// failed pipe's (credential resolution and capability were filtered at
+    /// attach time). `None` means no non-degenerate fallback is available, so
+    /// the caller records the historical skip.
+    fn resolve_fallback_pipe(
+        &self,
+        failed_profile: Option<&ModelProfile>,
+    ) -> Option<(Arc<dyn concerto_core::traits::provider::LlmProvider>, ModelProfile)> {
+        let failed = failed_profile.map(|profile| &profile.profile);
+        let differs = |profile: &ModelProfile| match failed {
+            Some(failed) => {
+                profile.profile.provider_config_id != failed.provider_config_id
+                    || profile.profile.model != failed.model
+            }
+            None => true,
+        };
+        if let (Some(provider), Some(profile)) =
+            (self.default_model_provider.as_ref(), self.default_model_profile.as_ref())
+        {
+            if differs(profile) {
+                return Some((provider.clone(), profile.clone()));
+            }
+        }
+        self.fallback_pipes
+            .iter()
+            .find(|(_, profile)| {
+                profile.supports_tool_calling
+                    && failed.is_none_or(|failed| {
+                        profile.profile.provider_config_id != failed.provider_config_id
+                    })
+            })
+            .map(|(provider, profile)| (provider.clone(), profile.clone()))
+    }
+
+    /// The skip reason tag + note for a fallback that could not be resolved:
+    /// `skipped-unavailable` when the run has no default-model pipe at all,
+    /// otherwise the historical `skipped-degenerate` (the fallback would
+    /// reproduce the failed `(provider, model)` and no capable alternate is
+    /// configured).
+    fn fallback_skip_reason(&self) -> (&'static str, &'static str) {
+        if self.default_model_provider.is_none() || self.default_model_profile.is_none() {
+            (
+                "skipped-unavailable",
+                "planning recovery unavailable: the run has no default-model provider/profile \
+                 and no alternate fallback pipe is configured",
+            )
+        } else {
+            (
+                "skipped-degenerate",
+                "the fallback resolves to the same (provider, model) as the current fallback \
+                 source and no capable alternate pipe is available",
+            )
+        }
     }
 
     /// ADR-42 §4 tier 2: the routing profile of the coordinator's model on its
@@ -3972,38 +4054,29 @@ impl CoordinatorAgent {
             // The one failover slot for this subtask is already spent.
             return None;
         }
-        let (Some(provider), Some(default_profile)) =
-            (self.default_model_provider.clone(), self.default_model_profile.clone())
+        // ADR-45 tier-1b amendment: the default-model pipe is preferred, but a
+        // degenerate default (SAME provider/model as the failed dispatch) falls
+        // through to the first capable alternate pipe. No non-degenerate
+        // fallback at all -> the historical skip.
+        let Some((provider, fallback_profile)) = self.resolve_fallback_pipe(Some(failed_profile))
         else {
+            let (reason_tag, note) = self.fallback_skip_reason();
             self.append_dispatch_failover_decision(
                 subtask.session_id,
-                "dispatch-failover-skipped-unavailable",
-                "No fallback retry: the run has no default-model provider/profile; the \
-                 dead-pipe failure is surfaced to the decision loop",
+                &format!("dispatch-failover-{reason_tag}"),
+                &format!(
+                    "No fallback retry: {note}; the dead-pipe failure is surfaced to the \
+                     decision loop"
+                ),
             )
             .await;
             return None;
         };
-        // Degenerate: the fallback lands on the SAME (provider, model) pipe as
-        // the dispatch that just failed — a retry would reproduce the failure.
-        let degenerate = failed_profile.profile.provider_config_id
-            == default_profile.profile.provider_config_id
-            && failed_profile.profile.model == default_profile.profile.model;
-        if degenerate {
-            self.append_dispatch_failover_decision(
-                subtask.session_id,
-                "dispatch-failover-skipped-degenerate",
-                "No fallback retry: the fallback resolves to the same (provider, model) as \
-                 the failed dispatch; the failure is surfaced to the decision loop",
-            )
-            .await;
-            return None;
-        }
         if !self.registry.has_rebuild_factory(agent_id) {
             self.append_dispatch_failover_decision(
                 subtask.session_id,
                 "dispatch-failover-skipped-no-factory",
-                "No fallback retry: the role has no rebuild factory to serve the default \
+                "No fallback retry: the role has no rebuild factory to serve the fallback \
                  provider; the failure is surfaced to the decision loop",
             )
             .await;
@@ -4011,7 +4084,7 @@ impl CoordinatorAgent {
         }
 
         // Spend the one-shot guard, then re-dispatch the SAME subtask on the
-        // default-model pipe. A failover dispatch is a real model dispatch and
+        // fallback pipe. A failover dispatch is a real model dispatch and
         // counts toward the run-wide cap (ADR-52).
         self.default_model_provider_attempted.insert(subtask.id);
         self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
@@ -4019,9 +4092,9 @@ impl CoordinatorAgent {
             subtask.session_id,
             "dispatch-failover-attempted",
             &format!(
-                "Retrying {agent_id} subtask {} once on the default-model pipe {}/{} \
+                "Retrying {agent_id} subtask {} once on the fallback pipe {}/{} \
                  after the assigned pipe failed",
-                subtask.id, default_profile.profile.provider, default_profile.profile.model
+                subtask.id, fallback_profile.profile.provider, fallback_profile.profile.model
             ),
         )
         .await;
@@ -4032,7 +4105,7 @@ impl CoordinatorAgent {
                 provider,
                 subtask,
                 context.clone(),
-                &default_profile,
+                &fallback_profile,
                 cancel.clone(),
             )
             .await
@@ -4043,7 +4116,9 @@ impl CoordinatorAgent {
                     "dispatch-failover-succeeded",
                     &format!(
                         "Fallback dispatch of {agent_id} subtask {} succeeded on {}/{}",
-                        subtask.id, default_profile.profile.provider, default_profile.profile.model
+                        subtask.id,
+                        fallback_profile.profile.provider,
+                        fallback_profile.profile.model
                     ),
                 )
                 .await;
@@ -4056,7 +4131,9 @@ impl CoordinatorAgent {
                     &format!(
                         "Fallback dispatch of {agent_id} subtask {} on {}/{} returned a \
                          non-success outcome; the original failure stands",
-                        subtask.id, default_profile.profile.provider, default_profile.profile.model
+                        subtask.id,
+                        fallback_profile.profile.provider,
+                        fallback_profile.profile.model
                     ),
                 )
                 .await;
@@ -5568,7 +5645,7 @@ impl CoordinatorAgent {
             ""
         };
         if let Some(pool) = self.review_store.as_ref() {
-            let event = NewWhiteboardEvent {
+            let event = |evidence_ids: &[String]| NewWhiteboardEvent {
                 event_id: Ulid::new().to_string(),
                 agent_id: "coordinator".to_owned(),
                 kind: WhiteboardKind::Decision,
@@ -5586,13 +5663,24 @@ impl CoordinatorAgent {
                     "hint": hint_name,
                     "final_shape": shape.name(),
                     "overridden_from": overridden_from,
-                    "supporting_evidence_ids": [],
+                    "supporting_evidence_ids": evidence_ids,
                 }),
                 pre_image_hash: None,
                 created_at: crate::tool_facts::unix_ms(),
             };
-            if let Err(error) = append_whiteboard_event(pool, &event).await {
-                warn!(%error, "advisor-mode run-shape decision append failed (fail-soft)");
+            // ADR-65 §1 acceptance 8: a rejected evidence id drops the append.
+            // Re-append WITHOUT the citations so the record always lands
+            // (mirrors `append_dispatch_decision`). The shape leg cites no
+            // evidence, so the retry is the same record.
+            if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(
+                    %error,
+                    "advisor-mode run-shape decision append rejected; re-appending without \
+                     citations (fail-soft, the record still lands)"
+                );
+                if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+                    warn!(%error, "advisor-mode run-shape decision append failed (fail-soft)");
+                }
             }
         }
         if let Some(executor) = self.tool_executor.as_ref() {
@@ -5641,7 +5729,7 @@ impl CoordinatorAgent {
                     .to_owned()
             }
         };
-        let event = NewWhiteboardEvent {
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
             event_id: Ulid::new().to_string(),
             agent_id: "coordinator".to_owned(),
             kind: WhiteboardKind::Decision,
@@ -5658,8 +5746,18 @@ impl CoordinatorAgent {
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
         };
-        if let Err(error) = append_whiteboard_event(pool, &event).await {
-            warn!(%error, "ADR-65 §7: resume decision append failed (fail-soft)");
+        // ADR-65 §1 acceptance 8: a rejected evidence id drops the append.
+        // Re-append WITHOUT the citations so the record always lands
+        // (mirrors `append_dispatch_decision`).
+        if let Err(error) = append_whiteboard_event(pool, &event(evidence_ids)).await {
+            warn!(
+                %error,
+                "ADR-65 §7: resume decision append rejected; re-appending without the \
+                 rejected citations (fail-soft, the record still lands)"
+            );
+            if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(%error, "ADR-65 §7: resume decision append failed (fail-soft)");
+            }
         }
     }
 
@@ -9315,65 +9413,24 @@ impl CoordinatorAgent {
         }
 
         // The fallback pipe is the run's default-model provider (ADR-45
-        // tier 1b); its routing profile is the (provider, model) the retry
-        // would hit. Absent either, there is no different pipe to retry on.
-        let Some(fallback_provider) = self.default_model_provider.clone() else {
-            self.planning_recovery_note = Some(
-                "planning recovery unavailable: the run has no default-model provider \
-                 configured"
-                    .to_owned(),
-            );
+        // tier 1b), UNLESS that resolves to the SAME (provider, model) as the
+        // current planning provider — then the first capable alternate pipe
+        // takes its place (ADR-45 tier-1b amendment; `resolve_fallback_pipe`).
+        // Absent a non-degenerate fallback, there is nothing to retry on.
+        let Some((fallback_provider, fallback_profile)) =
+            self.resolve_fallback_pipe(self.planning_profile.as_ref())
+        else {
+            let (reason_tag, note) = self.fallback_skip_reason();
+            self.planning_recovery_note = Some(format!("planning recovery {note}"));
             self.append_planning_recovery_decision(
                 task,
-                &format!("{tag_prefix}-skipped-unavailable"),
-                "No fallback retry: the run has no default-model provider; \
+                &format!("{tag_prefix}-{reason_tag}"),
+                "No fallback retry: no non-degenerate fallback pipe is available; \
                  the run pauses with a Partial outcome",
             )
             .await;
             return PlanningRecoveryOutcome::Exhausted;
         };
-        let Some(fallback_profile) = self.default_model_profile.clone() else {
-            self.planning_recovery_note = Some(
-                "planning recovery unavailable: no default-model profile could \
-                 be resolved"
-                    .to_owned(),
-            );
-            self.append_planning_recovery_decision(
-                task,
-                &format!("{tag_prefix}-skipped-unavailable"),
-                "No fallback retry: no default-model profile is resolved; \
-                 the run pauses with a Partial outcome",
-            )
-            .await;
-            return PlanningRecoveryOutcome::Exhausted;
-        };
-
-        // Degenerate: a fallback that lands on the SAME (provider, model) as
-        // the current planning provider would reproduce the failure (e.g. a
-        // permanent 400, or an empty-prose planning model) — skip straight to
-        // the graceful Partial.
-        let degenerate = match (&self.planning_profile, &fallback_profile) {
-            (Some(planned), fallback) => {
-                planned.profile.provider_config_id == fallback.profile.provider_config_id
-                    && planned.profile.model == fallback.profile.model
-            }
-            _ => false,
-        };
-        if degenerate {
-            self.planning_recovery_note = Some(
-                "planning recovery skipped: the fallback default-model provider \
-                 resolves to the same (provider, model) as the current planning provider"
-                    .to_owned(),
-            );
-            self.append_planning_recovery_decision(
-                task,
-                &format!("{tag_prefix}-skipped-degenerate"),
-                "No fallback retry: the fallback resolves to the same (provider, model) as \
-                 the current planning provider; the run pauses with a Partial outcome",
-            )
-            .await;
-            return PlanningRecoveryOutcome::Exhausted;
-        }
 
         self.append_planning_recovery_decision(
             task,
@@ -9443,7 +9500,7 @@ impl CoordinatorAgent {
         required_output: &str,
     ) {
         let Some(pool) = self.review_store.as_ref() else { return };
-        let event = NewWhiteboardEvent {
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
             event_id: Ulid::new().to_string(),
             agent_id: "coordinator".to_owned(),
             kind: WhiteboardKind::Decision,
@@ -9455,13 +9512,24 @@ impl CoordinatorAgent {
                 "selected_agent": "coordinator",
                 "reason": reason,
                 "required_output": required_output,
-                "supporting_evidence_ids": [],
+                "supporting_evidence_ids": evidence_ids,
             }),
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
         };
-        if let Err(error) = append_whiteboard_event(pool, &event).await {
-            warn!(%error, "planning recovery decision append failed (fail-soft)");
+        // ADR-65 §1 acceptance 8: a rejected evidence id drops the append.
+        // Re-append WITHOUT the citations so the record always lands
+        // (mirrors `append_dispatch_decision`). The planning leg cites no
+        // evidence, so the retry is the same record.
+        if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+            warn!(
+                %error,
+                "planning recovery decision append rejected; re-appending without citations \
+                 (fail-soft, the record still lands)"
+            );
+            if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(%error, "planning recovery decision append failed (fail-soft)");
+            }
         }
     }
 
@@ -9477,7 +9545,7 @@ impl CoordinatorAgent {
         required_output: &str,
     ) {
         let Some(pool) = self.review_store.as_ref() else { return };
-        let event = NewWhiteboardEvent {
+        let event = |evidence_ids: &[String]| NewWhiteboardEvent {
             event_id: Ulid::new().to_string(),
             agent_id: "coordinator".to_owned(),
             kind: WhiteboardKind::Decision,
@@ -9489,13 +9557,24 @@ impl CoordinatorAgent {
                 "selected_agent": "coordinator",
                 "reason": reason,
                 "required_output": required_output,
-                "supporting_evidence_ids": [],
+                "supporting_evidence_ids": evidence_ids,
             }),
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
         };
-        if let Err(error) = append_whiteboard_event(pool, &event).await {
-            warn!(%error, "dispatch failover decision append failed (fail-soft)");
+        // ADR-65 §1 acceptance 8: a rejected evidence id drops the append.
+        // Re-append WITHOUT the citations so the record always lands
+        // (mirrors `append_dispatch_decision`). The failover leg cites no
+        // evidence, so the retry is the same record.
+        if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+            warn!(
+                %error,
+                "dispatch failover decision append rejected; re-appending without citations \
+                 (fail-soft, the record still lands)"
+            );
+            if let Err(error) = append_whiteboard_event(pool, &event(&[])).await {
+                warn!(%error, "dispatch failover decision append failed (fail-soft)");
+            }
         }
     }
 
@@ -17729,6 +17808,261 @@ mod tests {
         assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-skipped-degenerate");
     }
 
+    /// ADR-45 tier-1b amendment: when the default-model pipe is degenerate
+    /// (it resolves to the SAME provider/model as the failed planning pipe),
+    /// the recovery falls through to the first capable alternate pipe rather
+    /// than skipping. The alternate serves the retry and the run completes.
+    #[tokio::test]
+    async fn planning_recovery_falls_through_to_alternate_pipe_when_default_degenerate() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        // The default-model pipe is degenerate: same `test/cheap` pair as the
+        // coordinator's planning profile, so it must NOT be retried.
+        let default_pipe = Arc::new(TurnProvider::new(Vec::new()));
+        // The alternate pipe serves the recovered planning turn.
+        let alternate = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Recovered plan\nalternate provider produced it".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("test", "cheap"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+        let coordinator = with_alternate_pipe(
+            coordinator,
+            alternate.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            "nim",
+            "default-nim",
+        );
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the alternate-pipe recovery must complete the run, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("alternate provider produced it"),
+            "the recovered plan is the run's final message: {}",
+            output.final_message,
+        );
+        assert_eq!(
+            default_pipe.turn_count(),
+            0,
+            "the degenerate default-model pipe must never be consulted"
+        );
+        assert_eq!(alternate.turn_count(), 1, "the alternate pipe must serve the retry");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision, got: {decisions:?}"
+        );
+        assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-attempted");
+    }
+
+    /// ADR-45 tier-1b amendment: with NO capable alternate pipe, a degenerate
+    /// default-model resolution skips exactly as before (the single-pipe
+    /// default config) and records the degenerate Decision.
+    #[tokio::test]
+    async fn planning_recovery_skips_degenerate_when_no_alternate_pipe() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        // Single-pipe default config: the only fallback IS the planning pipe.
+        let default_pipe = Arc::new(TurnProvider::new(Vec::new()));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("test", "cheap"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a degenerate fallback with no alternate must pause as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(default_pipe.turn_count(), 0, "the degenerate pipe must never be consulted");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one planning-recovery decision, got: {decisions:?}"
+        );
+        assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-skipped-degenerate");
+    }
+
+    /// ADR-45 tier-1b amendment: multi-pipe config where the failed planning
+    /// pipe (`google`) differs from the default-model pipe (`nim`) — the
+    /// default pipe is preferred and serves the retry.
+    #[tokio::test]
+    async fn planning_recovery_attempts_default_pipe_when_not_degenerate() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        // Default-model pipe: `nim/default-nim` — differs from the failed
+        // planning pipe below.
+        let default_pipe =
+            Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text("# plan from nim".to_owned())]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("nim", "default-nim"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        // The planning pipe the failure came from is `google/google-model`,
+        // so the default `nim` pipe is NOT degenerate.
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the default-pipe recovery must complete the run, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("plan from nim"),
+            "the default pipe's plan is the final message: {}",
+            output.final_message,
+        );
+        assert_eq!(default_pipe.turn_count(), 1, "the default pipe must serve the retry");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        assert_eq!(decisions.len(), 1, "exactly one planning-recovery decision: {decisions:?}");
+        assert_eq!(decisions[0].payload["reason"], "planning-provider-recovery-attempted");
+    }
+
+    /// ADR-45 tier-1b amendment: no default-model provider and no alternate
+    /// pipe at all -> the historical `skipped-unavailable` (and the
+    /// ladder-exhausted note names the missing default-model provider).
+    #[tokio::test]
+    async fn planning_recovery_skips_unavailable_without_any_fallback_pipe() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        // No default-model provider and no alternate pipes attach.
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "no fallback pipe must pause as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("no default-model provider"),
+            "the pause must name the missing default-model provider: {}",
+            output.final_message,
+        );
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        assert_eq!(decisions.len(), 1, "exactly one planning-recovery decision: {decisions:?}");
+        assert_eq!(
+            decisions[0].payload["reason"],
+            "planning-provider-recovery-skipped-unavailable"
+        );
+    }
+
     /// Cancellation is an immediate exit (ADR-42 NonRecoverable): the
     /// coordinator-owned recovery is never attempted, no Decision event is
     /// recorded, and the fallback provider is never consulted.
@@ -18465,6 +18799,20 @@ mod tests {
                 description: None,
             },
         }
+    }
+
+    /// ADR-45 tier-1b amendment fixture: attach one alternate fallback pipe
+    /// (provider + profile) under the given `provider_config_id`/`model`, for
+    /// tests that need a capable non-default pipe to escape a degenerate
+    /// default-model resolution.
+    fn with_alternate_pipe(
+        coordinator: CoordinatorAgent,
+        provider: Arc<dyn concerto_core::traits::provider::LlmProvider>,
+        provider_config_id: &str,
+        model: &str,
+    ) -> CoordinatorAgent {
+        coordinator
+            .with_fallback_pipes(vec![(provider, fallback_profile(provider_config_id, model))])
     }
 
     /// ADR-45 tier 1b: when the role's bound provider is the failure, the
@@ -28108,6 +28456,42 @@ mod tests {
     // dead assignment.
     // ------------------------------------------------------------------
 
+    /// Item A: a fresh (non-resume, non-supervisor) run with a review store
+    /// attached records its run-shape `Decision` row in `whiteboard_events`
+    /// with `kind = decision`. Before the runtime attached the pool
+    /// unconditionally, this leg had no store in a normal run and the row was
+    /// silently dropped.
+    #[tokio::test]
+    async fn fresh_run_records_run_shape_decision_row() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "did it")];
+        let coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("done".into())],
+        )
+        .with_review_store(Some(pool.clone()));
+        let (_output, _events) = run_for_test(coordinator, bus.clone()).await;
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decision_rows: Vec<_> =
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Decision).collect();
+        assert!(
+            !decision_rows.is_empty(),
+            "a fresh run must persist at least one Decision row (kind=decision), got none"
+        );
+        let shape_decision = decision_rows
+            .iter()
+            .find(|event| event.payload.get("final_shape").is_some())
+            .expect("the run-shape Decision row exists on a fresh run");
+        assert_eq!(shape_decision.payload["hint"], serde_json::Value::String("none".into()));
+    }
+
     /// The failover rescues a dead pipe: the primary dispatch 404s, the
     /// rebuilt role succeeds on the default-model pipe, and the run completes
     /// without a redecompose turn. The subtask id/assignment is preserved and
@@ -28442,6 +28826,108 @@ mod tests {
         assert!(
             reasons.contains(&"dispatch-failover-skipped-degenerate"),
             "the degenerate skip is recorded: {reasons:?}"
+        );
+    }
+
+    /// ADR-45 tier-1b amendment: when the default-model pipe is degenerate
+    /// (same (provider, model) as the failed dispatch) but a capable alternate
+    /// pipe is configured, the failover dispatches on the ALTERNATE instead of
+    /// skipping, and the run completes.
+    #[tokio::test]
+    async fn dispatch_failover_uses_alternate_pipe_when_default_degenerate() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        let rescued = Arc::new(MockExpertAgent::always_succeed(
+            role.clone(),
+            "alternate pipe rescued the dead assignment",
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| rescued.clone()),
+        );
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        // The default-model pipe is degenerate with the failed dispatch; the
+        // alternate `nim` pipe is the only non-degenerate option.
+        let mut coordinator =
+            coordinator.with_review_store(Some(pool.clone())).with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            );
+        coordinator = with_alternate_pipe(
+            coordinator,
+            Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>,
+            "nim",
+            "default-nim",
+        );
+
+        let subtask = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: role.clone(),
+            description: "alternate failover probe".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            subtask.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // The failed profile IS the default-model profile: degenerate default.
+        let failed = fallback_profile("fallback", "default-model");
+        let result = coordinator
+            .attempt_dispatch_failover(
+                &subtask,
+                &role,
+                &failed,
+                &context,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_some(), "the alternate pipe must rescue the dead dispatch");
+        assert_eq!(
+            coordinator.default_model_provider_attempted.len(),
+            1,
+            "the alternate failover spends the one-shot guard"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert!(
+            reasons.contains(&"dispatch-failover-attempted"),
+            "the alternate failover attempt is recorded: {reasons:?}"
+        );
+        let attempt = logged
+            .iter()
+            .find(|event| event.payload["reason"] == "dispatch-failover-attempted")
+            .expect("the attempt event exists");
+        assert!(
+            attempt.payload["required_output"].as_str().unwrap_or_default().contains("default-nim"),
+            "the failover names the alternate pipe's model: {attempt:?}"
         );
     }
 }

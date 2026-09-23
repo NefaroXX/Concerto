@@ -3916,6 +3916,39 @@ async fn run_multi_agent(
             }
         });
 
+    // ADR-45 tier-1b amendment: the alternate fallback pipes for the ladder.
+    // On default configs the default-model pipe IS the coordinator's planning
+    // pipe, so a "fallback to the default" would be a degenerate no-op; the
+    // ladder instead prefers the first OTHER configured tool-calling pipe whose
+    // credentials resolve. `base_profiles` is the run's configured routing
+    // surface; the default pipe is excluded here (it is the primary preference
+    // inside `resolve_fallback_pipe`). Credential resolution failures skip the
+    // pipe rather than failing the run — a fallback is best-effort.
+    let fallback_pipes: Vec<(Arc<dyn LlmProvider>, concerto_providers::model::ModelProfile)> =
+        base_profiles
+            .iter()
+            .filter(|profile| profile.provider_config_id != coordinator_pipe_id)
+            .filter(|profile| profile.supports_tool_calling)
+            .filter_map(|profile| {
+                let config = settings.providers.iter().find(|config| {
+                    ProviderFactory::config_id(config) == profile.provider_config_id
+                })?;
+                let mut resolved_config = config.clone();
+                resolved_config.model = profile.model.clone();
+                let provider = ProviderFactory::build(&resolved_config, &creds).ok()?;
+                Some((
+                    provider,
+                    concerto_providers::model::ModelProfile {
+                        context_window: profile.context_window,
+                        supports_tool_calling: profile.supports_tool_calling,
+                        base_url: profile.base_url.clone(),
+                        description: profile.description.clone(),
+                        profile: profile.clone(),
+                    },
+                ))
+            })
+            .collect();
+
     // ADR-60 Phase 1 thin slice: an opt-in supervised run dispatches through
     // the process supervisor (real `orchestrator-agent-process` children under
     // one write gate) instead of the in-process coordinator waves. Only
@@ -4096,6 +4129,9 @@ async fn run_multi_agent(
     .with_blueprint_facade(facade)
     .with_default_model_provider(Some(default_model_provider), default_model_profile)
     .with_planning_profile(planning_profile)
+    // ADR-45 tier-1b amendment: alternate (non-default) tool-calling pipes for
+    // the fallback ladder's degenerate escape (see `resolve_fallback_pipe`).
+    .with_fallback_pipes(fallback_pipes)
     // ADR-35 §8: the shared executor backs coordinator self-execution when a
     // lifecycle stage has no registered agent. Attached unconditionally; the
     // coordinator only uses it when it actually self-executes.
@@ -4238,6 +4274,15 @@ async fn run_multi_agent(
         }
         coordinator = coordinator.with_review_store(gate_log_pool.clone());
     }
+    // Decision-event persistence: the session-DB pool backs every ADR-65
+    // `Decision` whiteboard append this in-process coordinator performs
+    // (run-shape, planning/prose recovery, resume, dispatch failover). The
+    // conditional arms above are retained for their explicit degradation
+    // logging, but the pool is attached UNCONDITIONALLY so a fresh
+    // (non-resume, non-supervisor) run still persists its decisions instead
+    // of silently dropping them. Fail-soft by contract: a `None` pool simply
+    // skips the appends.
+    coordinator = coordinator.with_review_store(gate_log_pool.clone());
     // ADR-60 D7: an approved-plan run does NOT inject the conversation
     // history as prose — that transcript carries the rendered plan markdown,
     // and the whiteboard-verified structured artifact governs instead.
