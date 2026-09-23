@@ -1005,6 +1005,27 @@ pub enum AgentCompletionStatus {
     AwaitingUser,
 }
 
+/// Pending-approval payload carried on a checkpoint (and surfaced on a paused
+/// run) so a resume can re-attach to the SAME approval request instead of
+/// re-asking the model or burning a retry. Identifies the action by tool name
+/// and input hash; `correlation_id` pairs it with the executor's preserved
+/// request and the `RequireApproval` audit row. Additive/optional on the
+/// checkpoint (serde default) so older records still load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PendingApprovalInfo {
+    /// Canonical tool name awaiting approval.
+    pub tool_name: String,
+    /// Human-readable action detail (summarized input).
+    pub detail: String,
+    /// Hash of the action input.
+    pub input_hash: String,
+    /// Correlation id of the paused action.
+    pub correlation_id: String,
+    /// Configured approval deadline in seconds (0 when unknown).
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
 /// One structured record of a single tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExecutionSummary {
@@ -1040,6 +1061,11 @@ pub enum AgentRunExit {
     Done(AgentOutput),
     /// The model indicated it needs user input before it can proceed.
     NeedsUser { reason: String, partial: AgentOutput },
+    /// An approval request timed out. The run is PAUSED awaiting the user
+    /// (never a denial, never a model retry): `pending` carries the preserved
+    /// request so a resume re-attaches to it, and `partial` carries the
+    /// progress made so far. The run surfaces as `AwaitingUser`.
+    AwaitingApproval { reason: String, pending: PendingApprovalInfo, partial: AgentOutput },
     /// A real blocker stopped progress (e.g. minimum tool calls unmet, or no
     /// file-changing action succeeded).
     Blocked { reason: String, partial: AgentOutput },

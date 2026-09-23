@@ -20,7 +20,13 @@ pub struct ApprovalPrompt {
 
 struct PendingApproval {
     prompt: ApprovalPrompt,
-    responder: tokio::sync::oneshot::Sender<ApprovalDecision>,
+    /// Decision slot. A `watch` (not a `oneshot`) so the pending request
+    /// survives the requester dropping its awaiting future on a timeout and so
+    /// a re-request can re-attach by cloning the receiver. `receiver` is kept
+    /// here to hold the channel open (a late `resolve` still lands even when
+    /// no waiter is currently attached).
+    sender: tokio::sync::watch::Sender<Option<ApprovalDecision>>,
+    receiver: tokio::sync::watch::Receiver<Option<ApprovalDecision>>,
 }
 
 /// The intent confirmation question plus its selectable outcomes, exposed to
@@ -72,30 +78,61 @@ pub struct CliApprovalState {
 }
 
 impl CliApprovalState {
+    /// The unresolved pending prompt, if any. A resolved entry (decision
+    /// delivered but not yet consumed by a re-attached request) reports `None`
+    /// so the TUI stops rendering the dialog.
     pub fn prompt(&self) -> Option<ApprovalPrompt> {
-        self.pending
-            .lock()
-            .ok()
-            .and_then(|pending| pending.as_ref().map(|request| request.prompt.clone()))
+        self.pending.lock().ok().and_then(|pending| {
+            pending.as_ref().and_then(|request| {
+                if request.receiver.borrow().is_none() {
+                    Some(request.prompt.clone())
+                } else {
+                    None
+                }
+            })
+        })
     }
 
+    /// Deliver the user's decision to the pending request. The entry is kept
+    /// (not taken) so a late `resolve` after a timeout still lands and a
+    /// resume can re-attach to it; `prompt()` reports it resolved.
     pub fn resolve(&self, decision: ApprovalDecision) {
-        let pending = self.pending.lock().ok().and_then(|mut pending| pending.take());
-        if let Some(pending) = pending {
-            let _ = pending.responder.send(decision);
+        if let Ok(pending) = self.pending.lock() {
+            if let Some(request) = pending.as_ref() {
+                let _ = request.sender.send(Some(decision));
+            }
         }
     }
 
+    /// Install (or REUSE) the pending approval. An identical request while a
+    /// dialog is already open re-attaches to the EXISTING receiver rather than
+    /// insta-denying — the production failure mode (identical retries) no
+    /// longer burns retries. `None` only when a DIFFERENT live dialog is
+    /// already pending (the single-slot busy case).
     fn request(
         &self,
         prompt: ApprovalPrompt,
-    ) -> Option<tokio::sync::oneshot::Receiver<ApprovalDecision>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+    ) -> Option<tokio::sync::watch::Receiver<Option<ApprovalDecision>>> {
         let mut pending = self.pending.lock().ok()?;
-        if pending.is_some() {
-            return None;
+        if let Some(existing) = pending.as_ref() {
+            let same = existing.prompt.tool_name == prompt.tool_name
+                && existing.prompt.detail == prompt.detail;
+            let unresolved = existing.receiver.borrow().is_none();
+            if same && unresolved {
+                // Reuse the LIVE dialog's decision slot: a resume re-attaches
+                // here and a concurrent identical request waits on the same
+                // decision instead of insta-denying. A resolved entry is never
+                // reused (that would silently re-approve a genuine repeat).
+                return Some(existing.receiver.clone());
+            }
+            if unresolved {
+                // A different live dialog occupies the single slot.
+                return None;
+            }
+            // The existing entry is resolved: replace it with a fresh prompt.
         }
-        *pending = Some(PendingApproval { prompt, responder: sender });
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        *pending = Some(PendingApproval { prompt, sender, receiver: receiver.clone() });
         Some(receiver)
     }
 
@@ -256,7 +293,7 @@ impl ApprovalSink for CliApprovalSink {
             acknowledgement: false,
         };
         let decision = match self.state.request(prompt) {
-            Some(receiver) => receiver.await.unwrap_or(ApprovalDecision::Deny),
+            Some(receiver) => await_decision(receiver).await,
             None => ApprovalDecision::Deny,
         };
 
@@ -288,7 +325,7 @@ impl ApprovalSink for CliApprovalSink {
             acknowledgement: true,
         };
         let decision = match self.state.request(prompt) {
-            Some(receiver) => receiver.await.unwrap_or(ApprovalDecision::Deny),
+            Some(receiver) => await_decision(receiver).await,
             None => return false,
         };
         if decision == ApprovalDecision::ApproveAllForSession {
@@ -329,6 +366,24 @@ impl ApprovalSink for CliApprovalSink {
         match self.state.request_plan(session_id, plan_id, question, plan_text.to_string()) {
             Some(receiver) => receiver.await.unwrap_or(None),
             None => None,
+        }
+    }
+}
+
+/// Await the decision on a pending-approval watch receiver. Returns the value
+/// immediately when it was already resolved (a resume re-attaching to a
+/// preserved request), otherwise waits for the change. A dropped sender
+/// (dialog dismissed) conservatively denies.
+async fn await_decision(
+    mut receiver: tokio::sync::watch::Receiver<Option<ApprovalDecision>>,
+) -> ApprovalDecision {
+    loop {
+        let current = *receiver.borrow();
+        if let Some(decision) = current {
+            return decision;
+        }
+        if receiver.changed().await.is_err() {
+            return ApprovalDecision::Deny;
         }
     }
 }
@@ -535,6 +590,65 @@ mod tests {
         // Resolve on empty state should not panic.
         state.resolve(ApprovalDecision::Deny);
         assert!(state.prompt().is_none());
+    }
+
+    /// The production fix: an identical request while the dialog is open
+    /// reuses the EXISTING receiver instead of insta-denying, and both waiters
+    /// receive the same decision.
+    #[tokio::test]
+    async fn approval_state_identical_request_reuses_pending_receiver() {
+        let state = CliApprovalState::default();
+        let prompt = ApprovalPrompt {
+            session_id: Ulid::new(),
+            tool_name: "shell".into(),
+            detail: "command: rm -rf build".into(),
+            acknowledgement: false,
+        };
+
+        let first = state.request(prompt.clone()).expect("first request installs a prompt");
+        let second =
+            state.request(prompt.clone()).expect("identical request reuses the prompt, not deny");
+
+        state.resolve(ApprovalDecision::Approve);
+        assert_eq!(await_decision(first).await, ApprovalDecision::Approve);
+        assert_eq!(await_decision(second).await, ApprovalDecision::Approve);
+        assert!(state.prompt().is_none(), "resolved entry no longer renders a dialog");
+    }
+
+    /// A resume after a timeout re-attaches to the PRESERVED pending request
+    /// (the requester dropped its awaiting future, but the sink's entry
+    /// survives) and a later user decision fulfils it. A resolved entry is not
+    /// reused, so a genuine identical repeat still prompts.
+    #[tokio::test]
+    async fn approval_state_resume_reattaches_and_late_resolve_delivers() {
+        let state = CliApprovalState::default();
+        let prompt = ApprovalPrompt {
+            session_id: Ulid::new(),
+            tool_name: "shell".into(),
+            detail: "command: cargo publish".into(),
+            acknowledgement: false,
+        };
+
+        // First request "times out": the receiver is dropped unconsumed.
+        let timed_out = state.request(prompt.clone()).expect("first request installs a prompt");
+        drop(timed_out);
+        assert!(state.prompt().is_some(), "the pending dialog survives the timeout");
+
+        // The resume re-attaches to the SAME preserved entry.
+        let resumed = state
+            .request(prompt.clone())
+            .expect("resume re-attaches to the preserved request, not deny");
+
+        // The user resolves after the deadline; the re-attached waiter is
+        // fulfilled (no orphaned loss).
+        state.resolve(ApprovalDecision::Approve);
+        assert_eq!(await_decision(resumed).await, ApprovalDecision::Approve);
+
+        // A genuinely new identical request after resolution prompts afresh
+        // rather than silently reusing the old approval.
+        let fresh = state.request(prompt).expect("a new identical request prompts afresh");
+        assert!(state.prompt().is_some(), "a resolved entry is not reused");
+        drop(fresh);
     }
 
     // ------------------------------------------------------------------

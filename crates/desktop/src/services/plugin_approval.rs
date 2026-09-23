@@ -26,22 +26,27 @@ impl CapabilityApprovalUI for PluginApprovalService {
         plugin: &PluginManifest,
         capabilities: &[CapabilityRequest],
     ) -> Result<Vec<GrantDecision>, PluginError> {
-        // Create a oneshot channel for the decision.
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Create a coalescable channel for the decision.
+        let (tx, rx) = tokio::sync::watch::channel(None);
 
         // Set the pending approval state.
         {
             let mut guard = self.pending.lock().map_err(|e| {
                 PluginError::ToolCallFailed(format!("failed to lock pending approval: {e}"))
             })?;
+            let key = format!("plugin:{}", plugin.id);
             guard.push_back(capability_dialog::PendingApproval {
                 plugin: plugin.clone(),
                 capabilities: capabilities.to_vec(),
+                key,
                 sender: tx,
+                receiver: rx.clone(),
             });
         }
 
-        // Wait for the user's decision via the oneshot channel.
-        rx.await.map_err(|e| PluginError::ToolCallFailed(format!("approval dialog closed: {e}")))
+        // Wait for the user's decision via the coalescable channel.
+        capability_dialog::await_decision(rx)
+            .await
+            .ok_or_else(|| PluginError::ToolCallFailed("approval dialog closed".to_owned()))
     }
 }

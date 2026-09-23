@@ -721,7 +721,11 @@ impl State {
         cfg.primary_provider = None;
         cfg.primary_provider_config = None;
 
-        cfg.policy = Some(PolicyConfig { rules: self.policy_rules.clone(), time_window: None });
+        cfg.policy = Some(PolicyConfig {
+            rules: self.policy_rules.clone(),
+            time_window: None,
+            approval_timeout_secs: None,
+        });
         // Only the studio may publish relationships unless the user explicitly
         // edited them here; otherwise this startup snapshot would silently
         // revert relationships the studio saved meanwhile.

@@ -106,6 +106,12 @@ pub struct AgentLoop {
     usage_tokens_out: u64,
     usage_cost_usd: f64,
     usage_latency_ms: u64,
+
+    /// A tool call whose approval request timed out. Set by
+    /// `execute_single_tool_call`; `run_once` turns it into
+    /// `AgentRunExit::AwaitingApproval` (stop the loop, never retry the same
+    /// call). `None` in the common case; cleared at run start.
+    pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
 }
 
 /// Maximum number of auto-continuation rounds before escalating a run to a
@@ -415,6 +421,7 @@ impl AgentLoop {
             usage_tokens_out: 0,
             usage_cost_usd: 0.0,
             usage_latency_ms: 0,
+            pending_approval: None,
         }
     }
 
@@ -484,6 +491,7 @@ impl AgentLoop {
         self.tool_guard_rejects.clear();
         self.shell_repair_attempts.clear();
         self.tool_attempts.clear();
+        self.pending_approval = None;
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -550,6 +558,28 @@ impl AgentLoop {
                     );
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
                     return Ok(output);
+                }
+                AgentRunExit::AwaitingApproval { reason, pending, mut partial } => {
+                    // Approval timeout: PAUSE, never deny or retry. The run
+                    // stops AwaitingUser with a checkpoint carrying the
+                    // preserved request so a resume re-attaches to it (same
+                    // tool/input) instead of re-asking the model or issuing a
+                    // second identical call.
+                    partial.final_message = reason;
+                    partial.completion_status =
+                        concerto_core::types::AgentCompletionStatus::AwaitingUser;
+                    partial.checkpoint_json = serde_json::to_string(&pending).ok();
+                    if let Some(accumulated) = &mut cumulative_progress {
+                        merge_run_progress(accumulated, &partial);
+                    }
+                    self.publish_end_reason(
+                        session_id,
+                        "awaiting approval",
+                        &partial.final_message,
+                        cancel.clone(),
+                    );
+                    self.persist_run_partial(session_id, &partial, cancel.clone()).await;
+                    return Ok(partial);
                 }
                 AgentRunExit::Blocked { reason, partial } => {
                     let mut output = partial;
@@ -939,6 +969,28 @@ impl AgentLoop {
                 &mut messages,
             )
             .await?;
+
+            // An approval timeout pauses the loop HERE: the model is NOT
+            // re-consulted and the identical tool call is NOT re-issued. The
+            // run surfaces `AwaitingApproval` with the preserved request.
+            if let Some(pending) = self.pending_approval.take() {
+                self.state = AgentState::AwaitingApproval;
+                let reason = format!(
+                    "Awaiting approval for tool '{}': {} (timed out after {}s). \
+                     Approve the pending request to resume.",
+                    pending.tool_name, pending.detail, pending.timeout_secs
+                );
+                let partial = self.build_agent_output(
+                    &task,
+                    &final_message,
+                    &files_modified,
+                    tool_call_count,
+                    &None,
+                    &tool_events,
+                    &verification,
+                );
+                return Ok(AgentRunExit::AwaitingApproval { reason, pending, partial });
+            }
         }
 
         // Phase 8: Run evaluation
@@ -1476,6 +1528,12 @@ impl AgentLoop {
                 messages,
             )
             .await?;
+            // An approval timeout pauses the run: stop the remaining calls in
+            // this batch so no further tool call is issued while awaiting the
+            // user. `run_once` turns it into `AgentRunExit::AwaitingApproval`.
+            if self.pending_approval.is_some() {
+                break;
+            }
         }
         Ok(())
     }
@@ -2385,6 +2443,46 @@ impl AgentLoop {
                         messages.push(repair);
                     }
                 }
+            }
+            Err(ToolError::PausedAwaitingApproval {
+                tool_name,
+                detail,
+                input_hash,
+                correlation_id,
+                timeout_secs,
+            }) => {
+                // A timeout is a PAUSE, not a denial: the executor already
+                // emitted the `ApprovalTimeout` event and recorded the
+                // `TimedOut` audit row. Record the preserved request and let
+                // `run_once` stop the loop AwaitingApproval — no model retry,
+                // no second identical call, no burned subtask retry.
+                tool_events.push(ToolExecutionSummary {
+                    tool_name: tc.name.clone(),
+                    operation: filesystem_operation.map(|s| s.to_string()),
+                    path: detail_path.clone().map(camino::Utf8PathBuf::from),
+                    success: false,
+                    summary: format!(
+                        "awaiting approval (timed out after {timeout_secs}s): {detail}"
+                    ),
+                });
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    correlation_id,
+                    EventKind::ToolExecutionFinished {
+                        tool_name: tc.name.clone(),
+                        duration_ms: 0,
+                        success: false,
+                        detail: Some(format!("awaiting approval: {detail}")),
+                    },
+                );
+                self.state = AgentState::AwaitingApproval;
+                self.pending_approval = Some(concerto_core::types::PendingApprovalInfo {
+                    tool_name,
+                    detail,
+                    input_hash,
+                    correlation_id: correlation_id.to_string(),
+                    timeout_secs,
+                });
             }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
@@ -6493,6 +6591,8 @@ mod tests {
         Deny(String),
         /// Timeout error.
         Timeout(u64),
+        /// Approval-timeout pause returned straight from the executor.
+        Paused,
         /// Process-start / execution failure.
         SpawnFailed(String),
     }
@@ -6568,6 +6668,13 @@ mod tests {
                 ScriptedShellOutcome::Timeout(timeout_secs) => {
                     Err(ToolError::Timeout { timeout_secs })
                 }
+                ScriptedShellOutcome::Paused => Err(ToolError::PausedAwaitingApproval {
+                    tool_name: "shell".into(),
+                    detail: "command: rm -rf build".into(),
+                    input_hash: "scripted-input-hash".into(),
+                    correlation_id: concerto_core::ids::Ulid::new(),
+                    timeout_secs: 30,
+                }),
                 ScriptedShellOutcome::SpawnFailed(message) => {
                     Err(ToolError::ExecutionFailed { message })
                 }
@@ -6592,6 +6699,51 @@ mod tests {
     /// Count the corrective repair turns (User messages) in `messages`.
     fn repair_turns(messages: &[Message]) -> Vec<&Message> {
         messages.iter().filter(|m| m.role == Role::User).collect()
+    }
+
+    /// An approval timeout stops the loop AwaitingUser: the model is NOT
+    /// re-consulted and the identical tool call is NOT re-issued (the
+    /// production deny-and-burn-retries failure mode). The checkpoint carries
+    /// the preserved request for the resume.
+    #[tokio::test]
+    async fn approval_timeout_pauses_the_loop_without_a_second_identical_call() {
+        let tc = ToolCall {
+            id: "call_pause".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "rm", "args": ["-rf", "build"] }),
+            ..Default::default()
+        };
+        // Turn 1 emits the call; turn 2 is the identical call a broken retry
+        // would emit; turn 3 would complete. Only turn 1 may ever run.
+        let provider =
+            Arc::new(ScriptedProvider::new(vec![vec![tc.clone()], vec![tc.clone()], vec![]]));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (tool, calls) = ScriptedShellTool::new(ScriptedShellOutcome::Paused);
+        let mut loop_ =
+            make_loop_with_extra_tools(provider_dyn, approval, 10, vec![Box::new(tool)]);
+        let task = AgentTask::new_action_required(Ulid::new(), "approval pause");
+        let output = loop_.run(task, CancellationToken::new()).await.expect("run");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an approval timeout must pause the run AwaitingUser, not fail it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the identical call must not be retried");
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            1,
+            "the model must not be re-consulted after the pause"
+        );
+
+        let pending: concerto_core::types::PendingApprovalInfo = serde_json::from_str(
+            output.checkpoint_json.as_deref().expect("a pause must carry a checkpoint"),
+        )
+        .expect("checkpoint carries the pending-approval payload");
+        assert_eq!(pending.tool_name, "shell");
+        assert_eq!(pending.timeout_secs, 30);
+        assert!(!pending.input_hash.is_empty());
     }
 
     #[tokio::test]

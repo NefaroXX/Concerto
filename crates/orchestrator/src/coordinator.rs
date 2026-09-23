@@ -1252,6 +1252,11 @@ struct DecomposeResult {
     /// preserved checkpoint. `None` on a checkpoint restore (the resume
     /// re-decides) and on any run that never asked.
     requested_user_input: Option<String>,
+    /// Approval-timeout pause: the preserved approval request the Coordinator's
+    /// decision loop paused on. Threaded to `execute_graph` so the run ends
+    /// `AwaitingUser` with the request preserved on the checkpoint (a resume
+    /// re-attaches to it). `None` on any run that never paused on an approval.
+    pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
 }
 
 /// State accumulated by the Coordinator's decision loop (each
@@ -1642,6 +1647,13 @@ pub struct CoordinatorAgent {
     /// request either surfaces as the run's outcome or, on a later resume,
     /// the Coordinator re-decides from the restored world.
     requested_user_input: Option<String>,
+    /// Approval-timeout pause: the preserved approval request the run is
+    /// paused on (set when the Coordinator's own executor tool call times
+    /// out). The decision loop unwinds on it and `execute_graph` returns an
+    /// `AwaitingUser` output carrying it on the checkpoint so a resume
+    /// re-attaches to the SAME request. `None` in the common case; reset at
+    /// the start of each `run`.
+    pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
 }
 
 /// ADR-60 D7 (#152): the whiteboard-verified state attached to a coordinator
@@ -2316,6 +2328,9 @@ impl CoordinatorAgent {
             // request at startup; set only by the request_user_input tool
             // in the decision loop.
             requested_user_input: None,
+            // No pending approval at startup; set only by a timed-out
+            // executor tool call in the decision loop.
+            pending_approval: None,
         }
     }
 
@@ -4938,6 +4953,7 @@ impl CoordinatorAgent {
                 dispatch_summary: String::new(),
                 loop_notes: Vec::new(),
                 requested_user_input: None,
+                pending_approval: None,
                 objective,
                 objective_hash,
             });
@@ -4956,6 +4972,7 @@ impl CoordinatorAgent {
             dispatch_summary: summary,
             loop_notes: ledger.notes,
             requested_user_input: self.requested_user_input.take(),
+            pending_approval: self.pending_approval.take(),
             objective,
             objective_hash,
         })
@@ -5212,6 +5229,10 @@ impl CoordinatorAgent {
             // so the live decision loop (the `is_some()` breaks in
             // `run_dispatch_session`) can never re-await on stale state.
             requested_user_input: cp.pending_user_input.clone(),
+            // Approval pause: the resume restores the preserved request so the
+            // run ends AwaitingUser on the SAME request (the sink re-attaches)
+            // instead of re-asking the model or burning an identical retry.
+            pending_approval: cp.pending_approval.clone(),
             objective,
             objective_hash,
         }))
@@ -5783,6 +5804,7 @@ impl CoordinatorAgent {
         run_objective_hash: String,
         loop_notes: Vec<String>,
         requested_user_input: Option<String>,
+        pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
         // ADR-52: the run-wide dispatch cap is counted across the whole `run`
         // invocation (the Coordinator decision loop + this graph loop share
@@ -5884,13 +5906,17 @@ impl CoordinatorAgent {
         // back into this parameter on the resume path. `None` except when
         // the run is waiting on the operator (fresh or restored).
         initial_execution_checkpoint.pending_user_input = requested_user_input.clone();
+        // Approval-timeout pause: persist the preserved request on the
+        // checkpoint so a resume re-attaches to the SAME approval (the sink
+        // reuses the pending entry) instead of re-asking the model.
+        initial_execution_checkpoint.pending_approval = pending_approval.clone();
         // Lazy machinery: a text-only run (an empty graph that will dispatch
         // nothing) must leave no orchestration checkpoint behind. Persist the
         // initial execution checkpoint only when there is dispatchable work or
         // an AwaitingUser pause that must survive a resume. The later
         // checkpoint persists happen around real dispatch/progress by
         // construction.
-        if !graph.is_empty() || requested_user_input.is_some() {
+        if !graph.is_empty() || requested_user_input.is_some() || pending_approval.is_some() {
             self.persist_checkpoint(&mut initial_execution_checkpoint, &model_assignments).await;
         } else {
             tracing::debug!(
@@ -5909,10 +5935,23 @@ impl CoordinatorAgent {
         // reason rides the final message; the status is `AwaitingUser`.
         // Injecting the operator's answer is the deferred web-UI channel
         // (#23).
-        // The short-circuit below matches by reference so `requested_user_input`
-        // stays alive for the tail's vacuous-completion guard (which must read
-        // its None-ness); the run exits the same way either way.
-        if let Some(reason) = requested_user_input.as_ref() {
+        // The short-circuit below matches against a recomputed reason so
+        // `requested_user_input` stays alive for the tail's vacuous-completion
+        // guard (which must read its None-ness); the run exits the same way
+        // either way. An approval-timeout pause (`pending_approval`) is the
+        // same terminal class: the run pauses AwaitingUser on the preserved
+        // request rather than denying or retrying.
+        let awaiting_reason: Option<String> = match requested_user_input.as_ref() {
+            Some(reason) => Some(reason.clone()),
+            None => pending_approval.as_ref().map(|pending| {
+                format!(
+                    "Awaiting approval for tool '{}': {} (timed out after {}s). \
+                     Approve the pending request to resume.",
+                    pending.tool_name, pending.detail, pending.timeout_secs
+                )
+            }),
+        };
+        if let Some(reason) = awaiting_reason.as_ref() {
             // `AwaitingUser` terminal class (user-denied): the Coordinator
             // itself requested human input via the `request_user_input` tool,
             // which records its decision in the in-memory decision journal
@@ -7915,6 +7954,8 @@ impl CoordinatorAgent {
         self.settled_metrics.clear();
         // Fresh run: no pending human-input request carries across runs.
         self.requested_user_input = None;
+        // Fresh run: no pending approval pause carries across runs.
+        self.pending_approval = None;
         // ADR-52: the run-wide dispatch cap is per `run` invocation (a fresh
         // run or a resume restarts the counter). The Coordinator's decision
         // loop counts toward it too, so loop + graph dispatches share one
@@ -7998,6 +8039,7 @@ impl CoordinatorAgent {
             dispatch_summary,
             loop_notes,
             requested_user_input,
+            pending_approval,
             objective: run_objective,
             objective_hash: run_objective_hash,
         } = match self.decompose_or_restore(&task, &context, &cancel, resume_checkpoint_json).await
@@ -8098,6 +8140,7 @@ impl CoordinatorAgent {
             run_objective_hash,
             loop_notes,
             requested_user_input,
+            pending_approval,
         )
         .await
         .map(|(output, _notes)| output)
@@ -10266,7 +10309,7 @@ impl CoordinatorAgent {
                 // delivered and the Coordinator requested human input — stop
                 // this batch's remaining tool calls; the outer break below
                 // ends the loop.
-                if self.requested_user_input.is_some() {
+                if self.requested_user_input.is_some() || self.pending_approval.is_some() {
                     break;
                 }
             }
@@ -10275,7 +10318,7 @@ impl CoordinatorAgent {
             //       operator a question — the decision loop ends here. This is
             //       a deliberate stop (not the iteration bound), so the tail's
             //       structural-bound note is suppressed below.
-            if self.requested_user_input.is_some() {
+            if self.requested_user_input.is_some() || self.pending_approval.is_some() {
                 hit_iteration_bound = false;
                 break;
             }
@@ -13599,6 +13642,30 @@ impl CoordinatorAgent {
                     "summary": output.summary,
                 }))
             }
+            Err(concerto_core::ToolError::PausedAwaitingApproval {
+                tool_name,
+                detail,
+                input_hash,
+                correlation_id,
+                timeout_secs,
+            }) => {
+                // Approval timeout: PAUSE, not a tool fault. Record the
+                // preserved request and unwind the decision loop; the run ends
+                // AwaitingUser with the request on the checkpoint.
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                self.pending_approval = Some(concerto_core::types::PendingApprovalInfo {
+                    tool_name,
+                    detail,
+                    input_hash,
+                    correlation_id: correlation_id.to_string(),
+                    timeout_secs,
+                });
+                serde_json::json!({
+                    "status": "awaiting_approval",
+                    "message": "The run is paused awaiting your approval.",
+                })
+            }
             Err(error) => {
                 self.decision_journal
                     .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
@@ -16558,6 +16625,7 @@ mod tests {
                 blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
+                None,       // pending_approval
             )
             .await
             .expect("execute_graph returns");
@@ -17349,6 +17417,7 @@ mod tests {
                 run_objective_hash,
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
+                None,       // pending_approval
             )
             .await;
 
@@ -18153,6 +18222,7 @@ mod tests {
                 blake3::hash("test task".as_bytes()).to_hex().to_string(),
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
+                None,       // pending_approval
             )
             .await
             .expect("execute_graph should succeed");
@@ -20052,6 +20122,7 @@ mod tests {
                 run_objective_hash,
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
+                None,       // pending_approval
             )
             .await;
 
@@ -25367,6 +25438,126 @@ mod tests {
             stored.pending_user_input.as_deref(),
             Some(reason),
             "the durable row keeps the pending question across the resume"
+        );
+    }
+
+    /// An approval-timeout pause restores through the SAME machinery as the
+    /// pending user question: the preserved `PendingApprovalInfo` on an
+    /// AwaitingUser checkpoint makes a resume stop again on the SAME request
+    /// (the sink re-attaches to it) instead of re-asking the model. Process 2
+    /// uses an EMPTY provider script, so a second AwaitingUser result is proof
+    /// the resume short-circuited on the restored approval.
+    #[tokio::test]
+    async fn awaiting_approval_resume_restores_pending_request() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let bus = EventBus::new(256);
+        let (coordinator, store, session_id) = coordinator_with_store(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            Vec::new(),
+            dir.path(),
+        )
+        .await;
+
+        // A checkpoint carrying a preserved approval request (as "process 1"
+        // persists when an executor tool call times out).
+        let pending = concerto_core::types::PendingApprovalInfo {
+            tool_name: "shell".into(),
+            detail: "command: cargo publish".into(),
+            input_hash: "abc123".into(),
+            correlation_id: Ulid::new().to_string(),
+            timeout_secs: 30,
+        };
+        let checkpoint_context = coordinator.checkpoint_context(&HashMap::new(), &[]);
+        let graph = TaskGraph::new();
+        let project_id =
+            concerto_core::types::SessionContext::new(session_id, dir.path().to_path_buf())
+                .project_id
+                .0
+                .clone();
+        let payload = checkpoint::build_checkpoint(
+            &checkpoint::CheckpointScope {
+                run_id: Ulid::new(),
+                session_id,
+                root_task_id: TaskId::new(),
+                project_id,
+                objective: "publish a crate".into(),
+                objective_hash: "hash".into(),
+                source_revision: None,
+                sequence_num: 0,
+            },
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &concerto_core::memory::WorkingMemorySnapshot {
+                id: Ulid::new(),
+                session_id,
+                decisions: vec![],
+                task_tree: vec![],
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            &graph,
+            &HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &checkpoint_context,
+        );
+        let mut checkpoint = payload;
+        checkpoint.pending_approval = Some(pending.clone());
+        let checkpoint_json = serde_json::to_string(&checkpoint).expect("serialize checkpoint");
+
+        // "Process 2": a resume restores the request and stops again on it.
+        let mut coordinator2 = coordinator_on_store(
+            EventBus::new(256),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            Vec::new(),
+            store.clone(),
+        );
+        let resume_task = AgentTask::new(session_id, "continue");
+        let resume_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let second = coordinator2
+            .run(resume_task, resume_ctx, CancellationToken::new(), Some(checkpoint_json))
+            .await
+            .expect("the resumed run returns Ok");
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "the resume must stop on the SAME preserved approval: {}",
+            second.final_message
+        );
+        assert!(
+            second.final_message.contains("Awaiting approval")
+                && second.final_message.contains("shell"),
+            "the restored reason must name the pending tool: {}",
+            second.final_message
+        );
+        let resumed_cp: checkpoint::GraphCheckpoint = serde_json::from_str(
+            &second.checkpoint_json.expect("the resumed pause carries a checkpoint"),
+        )
+        .expect("valid resumed checkpoint");
+        assert_eq!(
+            resumed_cp.pending_approval.as_ref(),
+            Some(&pending),
+            "the resumed pause re-attaches to the SAME request"
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the resumed pause keeps its checkpoint");
+        let stored: checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("valid stored checkpoint");
+        assert_eq!(
+            stored.pending_approval.as_ref(),
+            Some(&pending),
+            "the durable row keeps the pending approval across the resume"
         );
     }
 

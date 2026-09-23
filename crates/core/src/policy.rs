@@ -27,12 +27,36 @@ pub struct SimplePolicyEngine {
     /// authorization state consulted by `Condition::IntentAuthorized`.
     /// `None` (the default) preserves exact pre-ADR-55 behavior.
     intent_auth: Option<Arc<dyn IntentAuthorization>>,
+    /// Effective approval deadline for approval-producing rules that do not
+    /// carry an explicit timeout (`RequireApproval`,
+    /// `RequireManagedToolApproval`, `RequireToolchainApproval`). Defaults to
+    /// 30s (pre-existing behavior); configurable through `[policy]
+    /// approval_timeout_secs`. A timeout now PAUSES the run awaiting the user
+    /// instead of denying it.
+    approval_timeout: std::time::Duration,
 }
 
 impl SimplePolicyEngine {
     pub fn new(rules: Vec<PolicyRule>, audit: Arc<dyn AuditLog>) -> Self {
         let compiled = precompile_command_patterns(&rules);
-        Self { rules, audit, compiled, spend_tracker: None, rate_limiter: None, intent_auth: None }
+        Self {
+            rules,
+            audit,
+            compiled,
+            spend_tracker: None,
+            rate_limiter: None,
+            intent_auth: None,
+            approval_timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// Override the default approval deadline (30s) used by approval-producing
+    /// rules that do not carry an explicit timeout. Wired from `[policy]
+    /// approval_timeout_secs`; `RequireApprovalWithTimeout` always keeps its
+    /// own per-rule value.
+    pub fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.approval_timeout = timeout;
+        self
     }
 
     /// Attach a spend tracker to enforce session/task/daily cost caps.
@@ -74,13 +98,12 @@ impl SimplePolicyEngine {
                     }
                 }
                 PolicyRule::RequireApproval(cond) => {
+                    let timeout = self.approval_timeout;
                     if let Some((verdict, rule)) = self.eval_approval_rule(
                         cond,
-                        std::time::Duration::from_secs(30),
+                        timeout,
                         "require_approval",
-                        PolicyVerdict::RequireApproval {
-                            timeout: std::time::Duration::from_secs(30),
-                        },
+                        PolicyVerdict::RequireApproval { timeout },
                         action,
                     ) {
                         return Some((verdict, rule));
@@ -100,26 +123,24 @@ impl SimplePolicyEngine {
                     }
                 }
                 PolicyRule::RequireManagedToolApproval(cond) => {
+                    let timeout = self.approval_timeout;
                     if let Some((verdict, rule)) = self.eval_approval_rule(
                         cond,
-                        std::time::Duration::from_secs(30),
+                        timeout,
                         "require_managed_tool_approval",
-                        PolicyVerdict::RequireApproval {
-                            timeout: std::time::Duration::from_secs(30),
-                        },
+                        PolicyVerdict::RequireApproval { timeout },
                         action,
                     ) {
                         return Some((verdict, rule));
                     }
                 }
                 PolicyRule::RequireToolchainApproval(cond) => {
+                    let timeout = self.approval_timeout;
                     if let Some((verdict, rule)) = self.eval_approval_rule(
                         cond,
-                        std::time::Duration::from_secs(30),
+                        timeout,
                         "require_toolchain_approval",
-                        PolicyVerdict::RequireApproval {
-                            timeout: std::time::Duration::from_secs(30),
-                        },
+                        PolicyVerdict::RequireApproval { timeout },
                         action,
                     ) {
                         return Some((verdict, rule));
@@ -1270,6 +1291,24 @@ mod tests {
         assert_eq!(
             verdict,
             PolicyVerdict::RequireApproval { timeout: std::time::Duration::from_secs(30) }
+        );
+    }
+
+    /// `RequireApproval` uses the configured `[policy] approval_timeout_secs`
+    /// (default 30s) instead of a hardcoded value; the deadline rides the
+    /// verdict so the executor and the audit row agree.
+    #[tokio::test]
+    async fn require_approval_uses_configured_timeout() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let rules = vec![PolicyRule::RequireApproval(Condition::ToolName("shell".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit)
+            .with_approval_timeout(std::time::Duration::from_secs(7));
+        let input = empty_input();
+        let verdict =
+            engine.evaluate(&make_action("shell", &input), CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            verdict,
+            PolicyVerdict::RequireApproval { timeout: std::time::Duration::from_secs(7) }
         );
     }
 

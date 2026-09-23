@@ -1912,8 +1912,15 @@ async fn setup_policy_and_audit(
         config.session_spend_cap_usd.map(|cap| cap * multiplier)
     };
     let spend_tracker = Arc::new(SpendTracker::new(spend_cap, None, None));
-    let mut policy_engine =
-        SimplePolicyEngine::new(policy_rules, audit).with_spend_tracker(spend_tracker.clone());
+    // Approval deadline from `[policy] approval_timeout_secs` (default 30s).
+    // The deadline rides the policy verdict, so the executor uses the same
+    // value the audit row records; a timeout pauses the run, never denies it.
+    let approval_timeout = std::time::Duration::from_secs(
+        config.policy.as_ref().and_then(|policy| policy.approval_timeout_secs).unwrap_or(30),
+    );
+    let mut policy_engine = SimplePolicyEngine::new(policy_rules, audit)
+        .with_spend_tracker(spend_tracker.clone())
+        .with_approval_timeout(approval_timeout);
     if let Some(auth) = intent_auth {
         policy_engine = policy_engine.with_intent_auth(auth);
     }

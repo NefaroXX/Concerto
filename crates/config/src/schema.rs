@@ -1245,6 +1245,12 @@ pub struct PolicyConfig {
     pub rules: Vec<PolicyRuleDef>,
     /// Optional time window configuration for auto-approval.
     pub time_window: Option<PolicyTimeWindowConfig>,
+    /// Approval deadline (seconds) for approval-producing rules that do not
+    /// carry an explicit timeout. Additive/optional: absent configs default to
+    /// 30s, preserving pre-existing behavior. A timeout now PAUSES the run
+    /// awaiting the user instead of denying it.
+    #[serde(default)]
+    pub approval_timeout_secs: Option<u64>,
 }
 
 /// Time window configuration for auto-approval of low-cost operations

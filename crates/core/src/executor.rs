@@ -198,24 +198,47 @@ impl ToolExecutor {
         decision: ApprovalDecision,
         cancel: CancellationToken,
     ) {
+        let (verdict, user_response) = match decision {
+            ApprovalDecision::Approve => ("Approved", "user approved"),
+            ApprovalDecision::ApproveAllForSession => {
+                ("ApprovedAllForSession", "user approved all for session")
+            }
+            ApprovalDecision::Deny => ("Denied", "user denied"),
+        };
+        self.record_approval_outcome(action, verdict, user_response, cancel).await;
+    }
+
+    /// Persist a timeout as its own approval-decision row (verdict `TimedOut`)
+    /// so the trail shows the request expired and the run paused — the
+    /// pre-fix path wrote no row at all on timeout.
+    async fn record_approval_timeout(
+        &self,
+        action: &PolicyAction<'_>,
+        timeout_secs: u64,
+        cancel: CancellationToken,
+    ) {
+        let response = format!("approval timed out after {timeout_secs}s; awaiting user");
+        self.record_approval_outcome(action, "TimedOut", &response, cancel).await;
+    }
+
+    /// Shared builder for an approval-decision audit row. `verdict` is the
+    /// decision outcome (`Approved` / `ApprovedAllForSession` / `Denied` /
+    /// `TimedOut`); `user_response` is the human-readable detail.
+    async fn record_approval_outcome(
+        &self,
+        action: &PolicyAction<'_>,
+        verdict: &str,
+        user_response: &str,
+        cancel: CancellationToken,
+    ) {
         let entry = AuditEntry {
             tool_name: action.tool_name.to_string(),
-            verdict: match decision {
-                ApprovalDecision::Approve => "Approved".to_owned(),
-                ApprovalDecision::ApproveAllForSession => "ApprovedAllForSession".to_owned(),
-                ApprovalDecision::Deny => "Denied".to_owned(),
-            },
+            verdict: verdict.to_owned(),
             input_hash: crate::policy::compute_input_hash(action.input),
             session_id: action.session_id,
             correlation_id: action.correlation_id,
             timestamp: OffsetDateTime::now_utc(),
-            user_response: Some(match decision {
-                ApprovalDecision::Approve => "user approved".to_owned(),
-                ApprovalDecision::ApproveAllForSession => {
-                    "user approved all for session".to_owned()
-                }
-                ApprovalDecision::Deny => "user denied".to_owned(),
-            }),
+            user_response: Some(user_response.to_owned()),
             rule_matched: Some("user_approval".to_owned()),
             // ---- ADR-28 §6/§7: carry structured facts forward to the log ----
             profile_id: action.command_facts.as_ref().and_then(|f| f.shell_profile_id.clone()),
@@ -920,11 +943,15 @@ impl ToolExecutor {
     /// at the requester.
     ///
     /// H-02 remediation: the timeout is enforced here, not by wrapping the
-    /// sink — a silent sink must not hang the caller, and an approval granted
-    /// after the deadline must never let the action execute. A timeout is an
-    /// explicit deny-by-default state: it fails the action deterministically
-    /// and publishes an [`EventKind::ApprovalTimeout`] so subscribers see the
-    /// same outcome.
+    /// sink — a silent sink must not hang the caller. On timeout the action is
+    /// **paused**, not denied: the request is left with the sink (which owns
+    /// its pending entry, so dropping this future does not lose it), an
+    /// [`EventKind::ApprovalTimeout`] is published, the timeout is recorded as
+    /// an approval-decision audit row (`TimedOut`), and a
+    /// [`ToolError::PausedAwaitingApproval`] is returned. A late user decision
+    /// still fulfils the preserved request and a resume re-attaches to it — the
+    /// run stops `AwaitingUser` instead of burning identical retries. Only an
+    /// explicit `Deny` or a dropped/dismissed pending request denies.
     async fn request_approval_decision(
         &self,
         sink: &dyn ApprovalSink,
@@ -950,11 +977,52 @@ impl ToolExecutor {
                 tracing::warn!(
                     tool_name = %action.tool_name,
                     timeout_secs = timeout.as_secs(),
-                    "approval timed out; action denied by default"
+                    "approval timed out; run paused awaiting the user"
                 );
-                Err(ToolError::PolicyDenied { rule: "approval_timeout".into() })
+                // Record the timeout on the same audit trail as the other
+                // approval outcomes (pre-fix, a timeout wrote no row at all).
+                self.record_approval_timeout(action, timeout.as_secs(), cancel.clone()).await;
+                Err(ToolError::PausedAwaitingApproval {
+                    tool_name: action.tool_name.to_string(),
+                    detail: action_detail(action.input),
+                    input_hash: crate::policy::compute_input_hash(action.input),
+                    correlation_id: action.correlation_id,
+                    timeout_secs: timeout.as_secs(),
+                })
             }
         }
+    }
+}
+
+/// Compact human-readable detail for a paused approval action, used to carry
+/// the action identity onto the checkpoint without shipping the whole input.
+fn action_detail(input: &serde_json::Value) -> String {
+    if let Some(command) = input.get("command").and_then(serde_json::Value::as_str) {
+        let args = input
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            return format!("command: {command}");
+        }
+        return format!("command: {command} {}", args.join(" "));
+    }
+    let key = match input.get("path").and_then(serde_json::Value::as_str) {
+        Some(path) => return format!("path: {path}"),
+        None => input.get("operation").and_then(serde_json::Value::as_str),
+    };
+    if let Some(operation) = key {
+        return format!("operation: {operation}");
+    }
+    let json = serde_json::to_string(input).unwrap_or_default();
+    if json.chars().count() > 120 {
+        let truncated: String = json.chars().take(119).collect();
+        format!("{truncated}…")
+    } else {
+        json
     }
 }
 
@@ -1518,22 +1586,56 @@ mod tests {
         }
     }
 
-    /// Approval sink whose decision is delivered through a oneshot channel,
-    /// so tests control exactly when — and whether — the "user" responds.
+    /// Await a decision on a watch receiver (see the CLI/desktop sinks): return
+    /// the value immediately when already resolved, else wait for the change.
+    async fn watch_decision(
+        mut receiver: tokio::sync::watch::Receiver<Option<ApprovalDecision>>,
+    ) -> ApprovalDecision {
+        loop {
+            let current = *receiver.borrow();
+            if let Some(decision) = current {
+                return decision;
+            }
+            if receiver.changed().await.is_err() {
+                return ApprovalDecision::Deny;
+            }
+        }
+    }
+
+    /// Approval sink whose decision is delivered through a `watch` channel, so
+    /// tests control exactly when — and whether — the "user" responds. The
+    /// sink keeps its own receiver so a decision resolved AFTER the requester
+    /// dropped its awaiting future (a timeout) is still delivered — the
+    /// "no orphaned oneshot loss" property.
     struct ControlledApprovalSink {
-        pending: Mutex<Option<tokio::sync::oneshot::Sender<ApprovalDecision>>>,
+        pending: Mutex<Option<tokio::sync::watch::Sender<Option<ApprovalDecision>>>>,
+        preserved: Mutex<Option<tokio::sync::watch::Receiver<Option<ApprovalDecision>>>>,
         requests: AtomicUsize,
     }
 
     impl ControlledApprovalSink {
         fn new() -> Self {
-            Self { pending: Mutex::new(None), requests: AtomicUsize::new(0) }
+            Self {
+                pending: Mutex::new(None),
+                preserved: Mutex::new(None),
+                requests: AtomicUsize::new(0),
+            }
         }
 
         fn resolve(&self, decision: ApprovalDecision) {
-            if let Some(sender) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                let _ = sender.send(decision);
+            if let Some(sender) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                let _ = sender.send(Some(decision));
             }
+        }
+
+        /// The decision currently preserved on the sink (delivered even when
+        /// no requester is attached).
+        fn preserved_decision(&self) -> Option<ApprovalDecision> {
+            self.preserved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|receiver| *receiver.borrow())
         }
     }
 
@@ -1545,9 +1647,10 @@ mod tests {
             _cancel: CancellationToken,
         ) -> ApprovalDecision {
             self.requests.fetch_add(1, Ordering::SeqCst);
-            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let (sender, receiver) = tokio::sync::watch::channel(None);
             *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
-            receiver.await.unwrap_or(ApprovalDecision::Deny)
+            *self.preserved.lock().unwrap_or_else(|e| e.into_inner()) = Some(receiver.clone());
+            watch_decision(receiver).await
         }
 
         async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
@@ -1615,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn approval_timeout_denies_without_executing_and_emits_event() {
+    async fn approval_timeout_pauses_without_executing_and_emits_event() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1644,10 +1747,20 @@ mod tests {
         let error = handle
             .await
             .expect("executor task must not panic")
-            .expect_err("approval timeout must fail the action");
+            .expect_err("approval timeout must pause the action");
+        // The timeout PAUSES (resumable), it does NOT deny: the run must never
+        // burn a retry on a timed-out approval.
+        match &error {
+            ToolError::PausedAwaitingApproval { tool_name, input_hash, timeout_secs, .. } => {
+                assert_eq!(tool_name, "echo");
+                assert_eq!(*timeout_secs, 10);
+                assert!(!input_hash.is_empty(), "the paused action carries its input hash");
+            }
+            other => panic!("expected PausedAwaitingApproval, got {other:?}"),
+        }
         assert!(
-            matches!(&error, ToolError::PolicyDenied { rule } if rule == "approval_timeout"),
-            "expected approval_timeout denial, got {error:?}"
+            !matches!(&error, ToolError::PolicyDenied { .. }),
+            "a timeout must never be a policy denial"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "tool must never execute after timeout");
 
@@ -1660,6 +1773,16 @@ mod tests {
             }
             other => panic!("expected ApprovalTimeout event, got {other:?}"),
         }
+
+        // Late resolve after the timeout STILL lands on the preserved request
+        // (the executor dropped its awaiting future, but the sink kept the
+        // channel open) — no orphaned oneshot loss.
+        sink.resolve(ApprovalDecision::Approve);
+        assert_eq!(
+            sink.preserved_decision(),
+            Some(ApprovalDecision::Approve),
+            "a late resolve must fulfil the preserved request"
+        );
     }
 
     #[tokio::test(start_paused = true)]

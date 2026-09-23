@@ -13,20 +13,47 @@ use concerto_core::intent::{PlanDecision, RequestedOutcome};
 use concerto_plugins::capability::GrantDecision;
 use time::OffsetDateTime;
 
-/// Shared channel for delivering the user's decision.
-type DecisionSender = tokio::sync::oneshot::Sender<Vec<GrantDecision>>;
+/// Shared channel for delivering the user's decision. A `watch` (not a
+/// `oneshot`) so an identical request can coalesce onto the same decision slot
+/// (cloneable receiver) and a late decision still lands even when the original
+/// requester dropped its awaiting future on a timeout.
+type DecisionSender = tokio::sync::watch::Sender<Option<Vec<GrantDecision>>>;
+
+/// Type of the coalescable decision receiver handed to each waiter.
+pub type DecisionReceiver = tokio::sync::watch::Receiver<Option<Vec<GrantDecision>>>;
 
 /// A pending capability approval request.
 #[derive(Debug)]
 pub struct PendingApproval {
     pub plugin: PluginManifest,
     pub capabilities: Vec<CapabilityRequest>,
+    /// Coalescing key (tool/action identity + input). An identical request
+    /// reuses this entry's receiver instead of stacking a duplicate dialog.
+    pub key: String,
     pub sender: DecisionSender,
+    /// Kept alongside the sender so the channel stays open (and the value is
+    /// retained) even when no waiter is attached.
+    pub receiver: DecisionReceiver,
 }
 
 /// Shared pending-approval queue — a FIFO queue so concurrent multi-agent
-/// requests do not overwrite each other (each gets its own oneshot channel).
+/// requests do not overwrite each other (each distinct action gets its own
+/// decision slot; identical actions coalesce onto one).
 pub type SharedPending = Arc<Mutex<VecDeque<PendingApproval>>>;
+
+/// Await a capability decision on a coalescable receiver. Returns the decision
+/// immediately when it was already delivered, otherwise waits for the change.
+/// `None` when the dialog was dropped without a decision.
+pub async fn await_decision(mut receiver: DecisionReceiver) -> Option<Vec<GrantDecision>> {
+    loop {
+        if let Some(decisions) = receiver.borrow().clone() {
+            return Some(decisions);
+        }
+        if receiver.changed().await.is_err() {
+            return None;
+        }
+    }
+}
 
 /// Create a new shared pending-approval queue.
 pub fn shared_pending() -> SharedPending {
@@ -224,7 +251,7 @@ pub fn resolve(state: &SharedPending, decision: &Message) -> bool {
         })
         .collect();
 
-    let _ = pending.sender.send(decisions);
+    let _ = pending.sender.send(Some(decisions));
     true
 }
 

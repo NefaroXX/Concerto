@@ -327,6 +327,25 @@ pub enum ToolError {
         rule: String,
     },
 
+    /// The approval request expired before the user responded. The action is
+    /// PAUSED, not denied: the pending request is preserved by the approval
+    /// sink so a late decision can still fulfil it, and the run resumes
+    /// awaiting the user. Distinct from [`Self::PolicyDenied`] so callers
+    /// never burn a retry on a timeout.
+    #[error("awaiting approval for '{tool_name}' (timed out after {timeout_secs}s)")]
+    PausedAwaitingApproval {
+        /// Canonical tool name awaiting approval.
+        tool_name: String,
+        /// Human-readable action detail (e.g. the summarized input).
+        detail: String,
+        /// Hash of the action input (pairs with the policy audit row).
+        input_hash: String,
+        /// Correlation id of the paused action.
+        correlation_id: crate::ids::Ulid,
+        /// Configured approval deadline that elapsed, in seconds.
+        timeout_secs: u64,
+    },
+
     /// Tool execution failed.
     ///
     /// The tool encountered an error during execution. The message contains
