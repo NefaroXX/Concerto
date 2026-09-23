@@ -2226,6 +2226,136 @@ fn outcome_label(outcome: &AgentOutcome) -> &'static str {
     }
 }
 
+/// The lifecycle phase the run's present artifacts imply. Rendered as ONE
+/// advisory line above the roster — context for the Coordinator's model, never
+/// a dispatch order and never a rule. The phase is derived deterministically
+/// from present artifacts (a bound design, produced code, and whether a
+/// review-stage dispatch has settled), classified through stage kinds, so no
+/// role name ever participates in the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunPhase {
+    /// No design document is present yet: design work is the open step.
+    Design,
+    /// A binding design exists with no code artifact yet: implement is open.
+    Implement,
+    /// Code artifacts exist and no review-stage dispatch has settled.
+    Review,
+    /// No single stage is clearly open (already progressed, or mixed signals).
+    Open,
+}
+
+impl RunPhase {
+    /// The phase's short word (rendered in the advisory line).
+    fn as_str(self) -> &'static str {
+        match self {
+            RunPhase::Design => "design",
+            RunPhase::Implement => "implement",
+            RunPhase::Review => "review",
+            RunPhase::Open => "open",
+        }
+    }
+
+    /// One short clause explaining the phase (advisory only).
+    fn meaning(self) -> &'static str {
+        match self {
+            RunPhase::Design => {
+                "no design document is present yet; deriving the design is the open step"
+            }
+            RunPhase::Implement => {
+                "a design binds with no code artifact produced yet; implementation is the \
+                 open step"
+            }
+            RunPhase::Review => {
+                "code artifacts exist without a settled review; reviewing the produced code \
+                 is the open step"
+            }
+            RunPhase::Open => {
+                "no single stage is clearly open; decide the next step from the work and \
+                 the evidence"
+            }
+        }
+    }
+}
+
+/// The pure phase rule (no role names, no ordering side effects):
+/// no design → design; a binding design with no code → implement; code without
+/// a settled review → review; everything else → open. The branch order is the
+/// specification — a docs+code+reviewed run lands on `Open`.
+fn derive_run_phase(
+    has_doc: bool,
+    doc_binds: bool,
+    code_present: bool,
+    reviewed: bool,
+) -> RunPhase {
+    if !has_doc {
+        RunPhase::Design
+    } else if doc_binds && !code_present {
+        RunPhase::Implement
+    } else if code_present && !reviewed {
+        RunPhase::Review
+    } else {
+        RunPhase::Open
+    }
+}
+
+/// One settled-dispatch observation for the dispatch-history section: the
+/// role, the short outcome word, and the artifacts it produced. Borrowed from
+/// the in-memory ledger so rendering performs no store read.
+struct DispatchObservation<'a> {
+    role: &'a AgentId,
+    outcome: &'static str,
+    files: &'a [camino::Utf8PathBuf],
+}
+
+/// Render the objective's settled dispatch history as bounded advisory
+/// context: per role (iterated from the registry ids, so no role name is ever
+/// part of the logic), the settled dispatch count, the last outcome word, and
+/// the code-vs-docs artifact split (`is_code_artifact_path` over the ledger
+/// files). Only counts and short words are emitted — never a path, never a
+/// directive. A fresh run renders the nothing-yet line. `observations` must be
+/// in dispatch order so "last" is meaningful.
+fn render_dispatch_history_section(
+    registry_ids: &[AgentId],
+    observations: &[DispatchObservation<'_>],
+) -> String {
+    let mut out = String::from(
+        "\n[Dispatch history (advisory — settled dispatches on this objective only; counts, \
+         last outcome word, and the code/doc artifact split; never a rule and never an \
+         instruction to call anyone)]\n",
+    );
+    let mut ids: Vec<&AgentId> = registry_ids.iter().collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut any = false;
+    for id in ids {
+        let role_observations: Vec<&DispatchObservation<'_>> =
+            observations.iter().filter(|obs| obs.role == id).collect();
+        if role_observations.is_empty() {
+            continue;
+        }
+        any = true;
+        let count = role_observations.len();
+        let last = role_observations.last().map(|obs| obs.outcome).unwrap_or("unknown");
+        let mut code = 0usize;
+        let mut docs = 0usize;
+        for obs in &role_observations {
+            for path in obs.files {
+                if is_code_artifact_path(path) {
+                    code += 1;
+                } else {
+                    docs += 1;
+                }
+            }
+        }
+        out.push_str(&format!(
+            "- {id}: {count} dispatch(es), last {last}, {code} code / {docs} doc artifact(s)\n"
+        ));
+    }
+    if !any {
+        out.push_str("- none yet\n");
+    }
+    out
+}
+
 /// Render a config `AgentCapabilities` as a compact readable list for the
 /// roster (declared metadata, not enforcement).
 fn render_agent_capabilities(caps: &concerto_config::AgentCapabilities) -> String {
@@ -9873,7 +10003,8 @@ impl CoordinatorAgent {
         // rendered so the injected block reflects the state the decisions
         // run against (restored checkpoint state included).
         self.refresh_world_model(task, &[], Vec::new(), cancel).await;
-        let system_prompt = self.render_dispatch_system_prompt(task, intro, dispatching);
+        let system_prompt =
+            self.render_dispatch_system_prompt(task, intro, dispatching, state, ledger);
         let mut tool_defs: Vec<ToolDefinition> = Vec::new();
         if dispatching {
             tool_defs.push(call_specialist_tool_definition());
@@ -14035,7 +14166,7 @@ impl CoordinatorAgent {
     /// system-instruction excerpt. Deleted/disabled agents are absent by
     /// construction (the registry never holds them) — this is how the
     /// Coordinator "knows" who to call: context, not policy.
-    fn render_specialist_roster(&self, task: &AgentTask) -> String {
+    fn render_specialist_roster(&self, task: &AgentTask, ledger: &DispatchLedger) -> String {
         let mut ids = self.registry.ids();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut out = String::from("[Available specialists]\n");
@@ -14063,7 +14194,58 @@ impl CoordinatorAgent {
             ));
         }
         out.push_str(&self.render_suitability_advisory(task));
+        out.push_str(&self.render_dispatch_history(ledger));
         out
+    }
+
+    /// The objective's settled dispatch observations in dispatch order — the
+    /// in-memory ledger's completed results, ordered by their (Ulid,
+    /// time-ordered) subtask id. No store read happens here: the ledger is the
+    /// same accumulator that checkpoints and restores, so a resumed run renders
+    /// the same history without a DB round-trip.
+    fn dispatch_observations<'a>(
+        &self,
+        ledger: &'a DispatchLedger,
+    ) -> Vec<DispatchObservation<'a>> {
+        let mut entries: Vec<(&TaskId, &AgentRunResult)> =
+            ledger.completed_results.iter().collect();
+        entries.sort_by_key(|(task_id, _)| task_id.0);
+        entries
+            .into_iter()
+            .map(|(_, result)| DispatchObservation {
+                role: &result.role,
+                outcome: outcome_label(&result.outcome),
+                files: &result.files_modified,
+            })
+            .collect()
+    }
+
+    /// Issue: the agent-agnostic dispatch-history section rendered under the
+    /// roster. Agent-agnostic by construction: the free renderer walks the
+    /// REGISTRY ids and attributes each role's settled outcomes from the
+    /// ledger — no role name appears in the logic and no directive language is
+    /// emitted. Advisory only: it states what happened, never what to call.
+    fn render_dispatch_history(&self, ledger: &DispatchLedger) -> String {
+        let ids = self.registry.ids();
+        let observations = self.dispatch_observations(ledger);
+        render_dispatch_history_section(&ids, &observations)
+    }
+
+    /// The one-line stage-phase marker rendered ABOVE the roster. The phase is
+    /// derived deterministically from present artifacts: a design document's
+    /// presence/binding (`binding_doc` — verified or approved), whether any
+    /// code artifact exists in the ledger, and whether a review-stage dispatch
+    /// has settled (`role_in_kind_stage` — stage kinds from config, never role
+    /// names). Advisory context only; it never gates or selects a dispatch.
+    fn render_phase_marker(&self, state: &DispatchSessionState, ledger: &DispatchLedger) -> String {
+        let has_doc = state.doc.is_some();
+        let doc_binds = binding_doc(state).is_some();
+        let code_present = ledger.all_files.iter().any(|path| is_code_artifact_path(path));
+        let reviewed = ledger.completed_results.values().any(|result| {
+            self.role_in_kind_stage(&result.role, StageKind::Review, AgentStage::is_review)
+        });
+        let phase = derive_run_phase(has_doc, doc_binds, code_present, reviewed);
+        format!("[Run phase (advisory): {} — {}]\n\n", phase.as_str(), phase.meaning())
     }
 
     /// Issue #60: the suitability ranking as ADVISORY context under the
@@ -14107,12 +14289,17 @@ impl CoordinatorAgent {
         task: &AgentTask,
         intro: &str,
         dispatching: bool,
+        state: &DispatchSessionState,
+        ledger: &DispatchLedger,
     ) -> String {
         let mut prompt = String::new();
         if dispatching {
             prompt.push_str(COORDINATOR_DISPATCH_PROMPT);
             prompt.push_str("\n\n");
-            prompt.push_str(&self.render_specialist_roster(task));
+            // The stage-phase marker sits directly above the roster — one
+            // advisory line derived from present artifacts.
+            prompt.push_str(&self.render_phase_marker(state, ledger));
+            prompt.push_str(&self.render_specialist_roster(task, ledger));
         } else {
             prompt.push_str(
                 "You are the Coordinator. This run is PLANNING-ONLY: produce the plan for \
@@ -29648,6 +29835,234 @@ mod tests {
             redirect.contains("DIFFERENT implement-stage"),
             "the redirect must require a different role without picking it: {redirect}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Dispatch-history context + stage-phase marker (advisory prompt
+    // sections): agent-agnostic, bounded, and never directive.
+    // ------------------------------------------------------------------
+
+    /// A fresh objective with no settled dispatch renders the nothing-yet line
+    /// and no per-role lines at all.
+    #[test]
+    fn dispatch_history_fresh_run_reports_none_yet() {
+        let ids = vec![AgentId::new("architect"), AgentId::new("coder")];
+        let out = render_dispatch_history_section(&ids, &[]);
+        assert!(out.contains("[Dispatch history"), "the advisory header is present: {out}");
+        assert!(out.contains("- none yet"), "fresh runs get the nothing-yet line: {out}");
+        assert!(!out.contains("- architect"), "an undispatched role is not listed: {out}");
+        assert!(!out.contains("- coder"), "an undispatched role is not listed: {out}");
+    }
+
+    /// Two settled dispatches of one role render the count, the last outcome
+    /// word, and the code/doc artifact split in dispatch order — bounded to
+    /// counts (no paths) and free of any directive language.
+    #[test]
+    fn dispatch_history_lists_counts_outcomes_and_artifacts_without_directives() {
+        let architect = AgentId::new("architect");
+        let coder = AgentId::new("coder");
+        let ids = vec![coder.clone(), architect.clone()];
+        let doc_files = vec![camino::Utf8PathBuf::from("docs/plan.md")];
+        let code_files =
+            vec![camino::Utf8PathBuf::from("src/a.rs"), camino::Utf8PathBuf::from("src/b.rs")];
+        let observations = vec![
+            DispatchObservation { role: &architect, outcome: "success", files: &doc_files },
+            DispatchObservation { role: &architect, outcome: "failed", files: &code_files },
+        ];
+        let out = render_dispatch_history_section(&ids, &observations);
+
+        assert!(
+            out.contains("- architect: 2 dispatch(es), last failed, 2 code / 1 doc artifact(s)"),
+            "count, last outcome, and artifact split render in dispatch order: {out}"
+        );
+        assert!(!out.contains("- coder"), "a role with no settled dispatch is omitted: {out}");
+        assert!(
+            !out.contains("a.rs") && !out.contains("plan.md"),
+            "artifact paths are never rendered (bounded to counts): {out}"
+        );
+        let lower = out.to_ascii_lowercase();
+        for banned in ["must", "required", "should"] {
+            assert!(!lower.contains(banned), "no directive language ({banned}): {out}");
+        }
+    }
+
+    /// Mixed roles are all listed, each attributed to its own settled outcomes;
+    /// the section renders the registry (alphabetical) order — it never
+    /// reorders the roster.
+    #[test]
+    fn dispatch_history_lists_mixed_roles_generically() {
+        let architect = AgentId::new("architect");
+        let coder = AgentId::new("coder");
+        let reviewer = AgentId::new("reviewer");
+        let ids = vec![reviewer.clone(), coder.clone(), architect.clone()];
+        let files = vec![camino::Utf8PathBuf::from("src/x.rs")];
+        let observations = vec![
+            DispatchObservation { role: &reviewer, outcome: "success", files: &files },
+            DispatchObservation { role: &coder, outcome: "blocked", files: &[] },
+            DispatchObservation { role: &architect, outcome: "success", files: &[] },
+        ];
+        let out = render_dispatch_history_section(&ids, &observations);
+
+        let architect_at = out.find("- architect").expect("architect listed");
+        let coder_at = out.find("- coder").expect("coder listed");
+        let reviewer_at = out.find("- reviewer").expect("reviewer listed");
+        assert!(
+            architect_at < coder_at && coder_at < reviewer_at,
+            "roles render in registry order, not dispatch order: {out}"
+        );
+        assert!(out.contains("- coder: 1 dispatch(es), last blocked"), "blocked word: {out}");
+    }
+
+    /// The history source is the ledger's `completed_results` — exactly the map
+    /// the checkpoint round-trips — so a restored ledger renders the SAME
+    /// history. Cheap restore proxy: serde round-trip the map the way the
+    /// checkpoint JSON does, rebuild the ledger, and compare the renders.
+    #[test]
+    fn dispatch_history_is_resume_consistent() {
+        let coordinator = coordinator_with_turns(
+            EventBus::new(16),
+            Arc::new(AgentRegistry::from_mocks(vec![
+                MockExpertAgent::always_succeed(AgentId::new("architect"), "design"),
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implement"),
+            ])),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let architect_result = AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new("architect"),
+            outcome: AgentOutcome::Success,
+            summary: "design".into(),
+            files_modified: vec![camino::Utf8PathBuf::from("docs/plan.md")],
+            tool_call_count: 1,
+            cost_usd: 0.0,
+            latency_ms: 1,
+            provider: "test".into(),
+            model: "test".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        let coder_result = AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            outcome: AgentOutcome::Success,
+            summary: "implemented".into(),
+            files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
+            tool_call_count: 2,
+            cost_usd: 0.0,
+            latency_ms: 1,
+            provider: "test".into(),
+            model: "test".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        let mut live = DispatchLedger::default();
+        live.completed_results.insert(architect_result.task_id, architect_result);
+        live.completed_results.insert(coder_result.task_id, coder_result);
+        live.all_files.push(camino::Utf8PathBuf::from("docs/plan.md"));
+        live.all_files.push(camino::Utf8PathBuf::from("src/a.rs"));
+        let live_history = coordinator.render_dispatch_history(&live);
+
+        // The checkpoint persists `completed_results` as JSON; a restore
+        // rebuilds the ledger from the deserialized map.
+        let json = serde_json::to_string(&live.completed_results).expect("ledger serializes");
+        let restored_map: std::collections::HashMap<TaskId, AgentRunResult> =
+            serde_json::from_str(&json).expect("ledger restores");
+        let restored = DispatchLedger { completed_results: restored_map, ..Default::default() };
+
+        assert_eq!(
+            coordinator.render_dispatch_history(&restored),
+            live_history,
+            "a restored ledger renders identical dispatch history (resume consistency)"
+        );
+    }
+
+    /// The pure phase rule follows the artifact signals; the
+    /// docs+code+reviewed combination lands on open.
+    #[test]
+    fn derive_run_phase_follows_artifacts() {
+        assert_eq!(derive_run_phase(false, false, false, false), RunPhase::Design);
+        assert_eq!(derive_run_phase(true, true, false, false), RunPhase::Implement);
+        assert_eq!(derive_run_phase(true, true, true, false), RunPhase::Review);
+        assert_eq!(derive_run_phase(true, true, true, true), RunPhase::Open);
+        // A doc that exists but does not bind, with no code, is not implement.
+        assert_eq!(derive_run_phase(true, false, false, false), RunPhase::Open);
+    }
+
+    /// A successful `AgentRunResult` for the phase-marker test.
+    fn phase_run_result(role: &str) -> AgentRunResult {
+        AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new(role),
+            outcome: AgentOutcome::Success,
+            summary: "done".into(),
+            files_modified: vec![],
+            tool_call_count: 1,
+            cost_usd: 0.0,
+            latency_ms: 1,
+            provider: "test".into(),
+            model: "test".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+        }
+    }
+
+    /// The rendered phase line follows the coordinator's present artifacts:
+    /// no doc → design; a verified doc with no code → implement; produced code
+    /// without a settled review → review; a settled review-STAGE dispatch →
+    /// open. The review signal is classified by the agent's STAGE, so the
+    /// unrelated role name ("quality") still counts as a review — no role name
+    /// participates in the rule.
+    #[test]
+    fn phase_marker_follows_present_artifacts() {
+        let architect = MockExpertAgent::always_succeed(AgentId::new("architect"), "design")
+            .with_stage(Some(AgentStage::new(AgentStage::DESIGN)));
+        let coder = MockExpertAgent::always_succeed(AgentId::new("coder"), "implement")
+            .with_stage(Some(AgentStage::new(AgentStage::IMPLEMENT)));
+        let quality = MockExpertAgent::always_succeed(AgentId::new("quality"), "review")
+            .with_stage(Some(AgentStage::new(AgentStage::REVIEW)));
+        let coordinator = coordinator_with_turns(
+            EventBus::new(16),
+            Arc::new(AgentRegistry::from_mocks(vec![architect, coder, quality])),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+
+        // No design doc, no code → design.
+        let state = DispatchSessionState::default();
+        let ledger = DispatchLedger::default();
+        let line = coordinator.render_phase_marker(&state, &ledger);
+        assert!(line.contains("design — "), "no design renders the design phase: {line}");
+
+        // A verified doc binds, no code yet → implement.
+        let state = DispatchSessionState {
+            doc: Some(DesignDoc {
+                goals: vec!["do the thing".into()],
+                constraints: vec![],
+                proposed_files: vec![camino::Utf8PathBuf::from("src/a.rs")],
+                interface_sketch: "s".into(),
+                risks: vec![],
+            }),
+            doc_verdict: Some(crate::design_doc_verifier::DesignDocVerdict {
+                state: crate::design_doc_verifier::DesignDocState::Verified,
+                reasons: vec![],
+                author_read_count: 1,
+                reject_count: 0,
+                contract_paths: vec!["src/a.rs".into()],
+            }),
+            ..Default::default()
+        };
+        let line = coordinator.render_phase_marker(&state, &ledger);
+        assert!(line.contains("implement — "), "a bound doc without code: {line}");
+
+        // Code present, no settled review → review.
+        let mut ledger = DispatchLedger::default();
+        ledger.all_files.push(camino::Utf8PathBuf::from("src/a.rs"));
+        let line = coordinator.render_phase_marker(&state, &ledger);
+        assert!(line.contains("review — "), "code without a review: {line}");
+
+        // A settled review-STAGE dispatch (unrelated id) → open.
+        ledger.completed_results.insert(TaskId::new(), phase_run_result("quality"));
+        let line = coordinator.render_phase_marker(&state, &ledger);
+        assert!(line.contains("open — "), "docs+code+reviewed is open: {line}");
     }
 
     // ------------------------------------------------------------------
