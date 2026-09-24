@@ -50,7 +50,8 @@ use crate::consultation::{consult_tool_definition, CONSULT_SPECIALIST_TOOL};
 use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
 use crate::delta::FileDeltaTracker;
 use crate::design_doc_verifier::{
-    collect_design_doc_evidence, degraded_verdict, verify_design_doc, DesignDocVerdict,
+    collect_design_doc_evidence, degraded_verdict, verify_design_doc, DesignDocState,
+    DesignDocVerdict,
 };
 use crate::graph::{Dependency, TaskGraph, TaskGraphValidator};
 use crate::plan_approval::{
@@ -793,6 +794,36 @@ fn expected_artifacts_unproduced(
 ) -> bool {
     let expected = expected_artifact_list(expected_artifacts);
     !expected.is_empty() && verify_expected_artifacts(project_root, &expected).is_err()
+}
+
+/// The declared expected artifacts NOT produced on disk (missing, empty, or
+/// placeholder content), de-duplicated, each with its per-file reason. The
+/// list-valued view of [`expected_artifacts_unproduced`] for the completion
+/// guard's note. An empty declared set is vacuously produced.
+fn unproduced_expected_artifacts(
+    project_root: &camino::Utf8Path,
+    expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+) -> Vec<(camino::Utf8PathBuf, String)> {
+    let expected = expected_artifact_list(expected_artifacts);
+    if expected.is_empty() {
+        return Vec::new();
+    }
+    verify_expected_artifacts(project_root, &expected).err().unwrap_or_default()
+}
+
+/// Whether a subtask is UNFINISHED — still in a non-terminal state at the
+/// run's completion evaluation. `Completed` is settled; `Failed` is terminal
+/// and already handled by the failure/retry paths. Every other status is a
+/// node the run never settled: `Pending`/`Running` were never completed,
+/// `AwaitingReview`/`NeedsRevision` were left mid-cycle, and `Blocked` is an
+/// unresolved dependency. Unfinished work contradicts a `Completed` claim.
+fn is_unfinished_subtask_status(status: SubTaskStatus) -> bool {
+    !matches!(status, SubTaskStatus::Completed | SubTaskStatus::Failed)
+}
+
+/// Whether the graph holds any unfinished (non-terminal) subtask.
+fn graph_has_unfinished_work(graph: &TaskGraph) -> bool {
+    graph.all_tasks().iter().any(|subtask| is_unfinished_subtask_status(subtask.status))
 }
 
 /// Run-continuity Phase 1: the stall predicate evaluated at a run's final
@@ -1586,6 +1617,13 @@ pub struct CoordinatorAgent {
     /// the architect is NOT re-invoked on the same objective — re-deriving an
     /// already-approved plan (silent re-decompose) is forbidden.
     approved_plan_seed: Option<ApprovedPlanSeed>,
+    /// ADR-60 D7 (same attachment as [`Self::approved_plan_seed`], but NOT
+    /// consumed): whether an approved plan was attached to this run at any
+    /// point. The seed itself is `take()`n by `decompose_task`, so this
+    /// run-local flag preserves the "a plan was promised" fact for the
+    /// completion-time unattempted-implementation guard. Reset only by
+    /// constructing a fresh coordinator, exactly like the seed.
+    approved_plan_attached: bool,
     /// ADR-60 D7 (interrupt-safe resume, 2026-09-05): the logged-evidence
     /// dispatch seed for a checkpointless `continue` run. Consumed once by
     /// `decompose_or_restore` (only when no checkpoint governs the run);
@@ -2192,6 +2230,23 @@ fn binding_doc(state: &DispatchSessionState) -> Option<DesignDoc> {
     }
 }
 
+/// The DesignDoc whose `proposed_files` seed an implement dispatch's expected
+/// artifacts (audit C-06). A Verified/approved doc binds as before; a
+/// QUARANTINED doc contributes its proposed files TOO, so a quarantined
+/// contract that is never produced is caught as an unproduced deliverable
+/// instead of silently evaporating into a vacuous acceptance pass. A Skipped
+/// doc proposes nothing (its `proposed_files` is empty by definition).
+fn expected_artifact_doc(state: &DispatchSessionState) -> Option<DesignDoc> {
+    match (&state.doc_verdict, state.doc.as_ref()) {
+        (Some(verdict), Some(doc)) => match verdict.state {
+            DesignDocState::Verified | DesignDocState::Quarantined => Some(doc.clone()),
+            DesignDocState::Skipped => None,
+        },
+        (Some(_), None) => None,
+        (None, other) => other.cloned(),
+    }
+}
+
 /// The dispatched specialist's task description: the Coordinator's task text
 /// plus its optional notes.
 fn specialist_task_description(task: &str, notes: Option<&str>) -> String {
@@ -2479,6 +2534,7 @@ impl CoordinatorAgent {
             eval_engine: None,
             blueprint_facade: None,
             approved_plan_seed: None,
+            approved_plan_attached: false,
             headless_resume_seed: None,
             review_store: None,
             write_gate: None,
@@ -3396,6 +3452,7 @@ impl CoordinatorAgent {
     /// forbidden). Unseeded runs (the default) are byte-identical to pre-D7.
     pub fn with_approved_plan_seed(mut self, seed: ApprovedPlanSeed) -> Self {
         self.approved_plan_seed = Some(seed);
+        self.approved_plan_attached = true;
         self
     }
 
@@ -3951,6 +4008,92 @@ impl CoordinatorAgent {
 
     fn expected_artifacts_snapshot(&self) -> HashMap<TaskId, Vec<camino::Utf8PathBuf>> {
         self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+
+    /// Whether this run PROMISED implementation work: an approved/active plan
+    /// is attached (advisor-mode context or the D7 approved-plan seed), or a
+    /// DesignDoc with a non-empty contract (`proposed_files`/`goals`) governs
+    /// the run. An ad-hoc run with neither promised nothing, so its completion
+    /// without code is legitimate. The approved-plan attachment is carried by
+    /// the run-local [`Self::approved_plan_attached`] flag because the seed
+    /// itself is consumed by `decompose_task`.
+    fn run_has_promised_plan(&self) -> bool {
+        if self.approved_plan_attached || self.run_shape_context.has_approved_plan {
+            return true;
+        }
+        self.design_doc_snapshot()
+            .is_some_and(|doc| !doc.proposed_files.is_empty() || !doc.goals.is_empty())
+    }
+
+    /// Whether any IMPLEMENT-stage specialist was actually dispatched this run
+    /// (the action ledger's `dispatched` rows, resolved to their graph subtask
+    /// and classified by stage KIND — `AgentStage::is_implement` — never by
+    /// role name). A dispatched task missing from the graph contributes no
+    /// implement evidence; that only makes the guard MORE conservative, never
+    /// less.
+    fn implement_stage_dispatch_occurred(
+        &self,
+        graph: &TaskGraph,
+        action_ledger: &[checkpoint::CheckpointAction],
+    ) -> bool {
+        action_ledger
+            .iter()
+            .filter(|action| action.kind == "dispatched")
+            .filter_map(|action| action.task_id)
+            .filter_map(|task_id| graph.get(&task_id))
+            .any(|subtask| {
+                self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
+            })
+    }
+
+    /// Record a completion-tail guard decision: the run was downgraded to
+    /// `Partial` because unfinished/unattempted work contradicted a
+    /// `Completed` claim. Fail-soft like every other coordinator decision
+    /// surface — the whiteboard `Decision` event lands when a log is attached,
+    /// the audit row when an executor is; a missing sink is a no-op, never a
+    /// run error.
+    async fn record_completion_guard_decision(
+        &self,
+        session_id: Ulid,
+        decision_code: &str,
+        reason: &str,
+    ) {
+        if let Some(pool) = self.review_store.as_ref() {
+            let event = NewWhiteboardEvent {
+                event_id: Ulid::new().to_string(),
+                agent_id: "coordinator".to_owned(),
+                kind: WhiteboardKind::Decision,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "selected_agent": "",
+                    "reason": decision_code,
+                    "required_output": reason,
+                    "supporting_evidence_ids": [],
+                }),
+                pre_image_hash: None,
+                created_at: crate::tool_facts::unix_ms(),
+            };
+            if let Err(error) = append_whiteboard_event(pool, &event).await {
+                warn!(
+                    %error, decision_code,
+                    "completion guard decision append failed (fail-soft)"
+                );
+            }
+        }
+        if let Some(executor) = self.tool_executor.as_ref() {
+            executor
+                .record_coordinator_decision(
+                    session_id,
+                    Ulid::new(),
+                    decision_code,
+                    reason,
+                    CancellationToken::new(),
+                )
+                .await;
+        }
     }
 
     /// ADR-60 D7 (#152): snapshot of the most recent DesignDoc — the
@@ -6558,6 +6701,17 @@ impl CoordinatorAgent {
                         recoverable_notes,
                     ));
                 }
+                // Unfinished-work routing: ready queue empty but the graph is
+                // not all-completed because non-terminal subtask(s) remain
+                // (Pending/Running/AwaitingReview/NeedsRevision/Blocked). This
+                // is unfinished work, not a crash condition: stop the loop and
+                // let the completion tail record it as Partial (note +
+                // Decision) with the checkpoint preserved. The invariant error
+                // below is reserved for a graph that is genuinely wedged with
+                // no unfinished-work explanation.
+                if graph_has_unfinished_work(&graph) {
+                    break;
+                }
                 // Structural terminal class (deadlock/undecidable graph): ready queue
                 // empty but the graph not all-completed, with no
                 // terminal-subtask failure to explain it. This is an
@@ -8039,6 +8193,11 @@ impl CoordinatorAgent {
             );
         }
 
+        // The project root resolves the C-06 acceptance view and the
+        // completion guards' on-disk deliverable checks.
+        let project_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
+            .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
+
         let mut completion_status = if recoverable_notes.is_empty() {
             concerto_core::types::AgentCompletionStatus::Completed
         } else {
@@ -8071,9 +8230,6 @@ impl CoordinatorAgent {
                 // succeeded. Invoke acceptance_rejection to enforce artifact
                 // checks and record the accepted/rejected decision in the
                 // action ledger.
-                let project_root =
-                    camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
-                        .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
                 if let Some(rejected) =
                     self.acceptance_rejection(&task, build_task, &project_root, &mut action_ledger)
                 {
@@ -8081,15 +8237,94 @@ impl CoordinatorAgent {
                     completion_status = concerto_core::types::AgentCompletionStatus::Partial;
                 }
             } else {
-                // No verification evidence was declared for this run.
+                // No verification evidence was declared for this run. Name
+                // any declared-but-unproduced deliverables (a quarantined
+                // DesignDoc's carried contract paths included) so the
+                // omission is concrete, not generic.
                 completion_status = concerto_core::types::AgentCompletionStatus::Partial;
-                recoverable_notes.push(
+                let unproduced = unproduced_expected_artifacts(
+                    &project_root,
+                    &self.expected_artifacts_snapshot(),
+                );
+                let detail = if unproduced.is_empty() {
+                    String::new()
+                } else {
+                    let list = unproduced
+                        .iter()
+                        .map(|(path, reason)| format!("{path} ({reason})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(" Unproduced declared deliverable(s): {list}.")
+                };
+                recoverable_notes.push(format!(
                     "Acceptance gate C-06: the run contained implement-stage work but no \
                      verification evidence was declared for this run; the completion claim \
- is reported Partial."
-                        .to_owned(),
-                );
+                     is reported Partial.{detail}"
+                ));
             }
+        }
+        // ── Completion-time unfinished-work guards ───────────────────────
+        // A Completed claim is only valid when the run actually settled its
+        // work. These guards evaluate the run's REAL state after the C-06
+        // acceptance gate and, when unfinished/unattempted work is present,
+        // push a recoverable note (downgrading the exit to Partial) and
+        // record a Coordinator Decision — never a silent Completed.
+        //
+        // 1. Unfinished subtasks: any node still in a non-terminal state
+        // (Pending/Running/AwaitingReview/NeedsRevision/Blocked) was never
+        // settled. Completed is settled; Failed is terminal and handled by
+        // the failure/retry paths.
+        if graph_has_unfinished_work(&graph) {
+            let detail = graph
+                .all_tasks()
+                .iter()
+                .filter(|subtask| is_unfinished_subtask_status(subtask.status))
+                .map(|subtask| format!("{} [{}]", subtask.role, subtask.status.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let note = format!(
+                "Unfinished-work guard: the graph still holds non-terminal subtask(s) ({detail}); \
+                 unfinished work contradicts a Completed run, so the run is reported Partial and \
+                 its checkpoint is preserved for resume."
+            );
+            recoverable_notes.push(note.clone());
+            completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+            self.record_completion_guard_decision(
+                task.session_id,
+                "completion-blocked-unfinished-subtasks",
+                &note,
+            )
+            .await;
+        }
+
+        // 2. Unattempted implementation: an action-required, full-depth run
+        // that carried a plan (an approved plan or a non-empty DesignDoc
+        // contract) but dispatched NO implement-stage specialist and produced
+        // NO code artifact never attempted the implementation it promised.
+        // Ad-hoc runs with no plan are exempt (nothing was promised), as are
+        // runs where any implement dispatch occurred (success or failure —
+        // those failure paths already handle themselves). Stage kinds come
+        // from config via `AgentStage::is_implement`; no role name participates.
+        let has_code_artifact = all_files.iter().any(|path| is_code_artifact_path(path));
+        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && self.orchestration_depth == OrchestrationDepth::Full
+            && self.run_has_promised_plan()
+            && !self.implement_stage_dispatch_occurred(&graph, &action_ledger)
+            && !has_code_artifact
+        {
+            let note = "Unattempted-implementation guard: this action-required run carried a \
+                 plan but dispatched no implement-stage specialist and produced no code \
+                 artifact; the promised implementation was never attempted, so the run is \
+                 reported Partial and its checkpoint is preserved for resume."
+                .to_owned();
+            recoverable_notes.push(note.clone());
+            completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+            self.record_completion_guard_decision(
+                task.session_id,
+                "completion-blocked-unattempted-implementation",
+                &note,
+            )
+            .await;
         }
         // ── Run-continuity Phase 1: stall gate at the final exit ────────
         // A stalled run (declared-Completion false, declared deliverables
@@ -8097,8 +8332,6 @@ impl CoordinatorAgent {
         // checkpoint — persisted with completed=false — instead of
         // clearing it; only a clean success clears, byte-identical to the
         // pre-Phase-1 behavior.
-        let project_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
-            .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
         let deliverables_missing =
             expected_artifacts_unproduced(&project_root, &self.expected_artifacts_snapshot());
         let stalled = run_is_stalled(completion_status, deliverables_missing, &graph);
@@ -11069,13 +11302,16 @@ impl CoordinatorAgent {
         });
 
         // ── Expected artifacts: a BINDING doc's contract paths ride the
-        // implement-stage dispatch (C-06 acceptance). The implement roster
-        // check is output-mode typing only — it never selects dispatch. ────
+        // implement-stage dispatch (C-06 acceptance). A QUARANTINED doc's
+        // proposed files ride along too (see `expected_artifact_doc`), so a
+        // quarantined contract cannot silently evaporate into a vacuous
+        // acceptance pass. The implement roster check is output-mode typing
+        // only — it never selects dispatch. ────────────────────────────────
         let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
         let is_implement_role =
             agent.stage().as_ref().is_some_and(|stage| stage.as_str() == implement_tag);
         if is_implement_role {
-            if let Some(doc) = binding_doc(state) {
+            if let Some(doc) = expected_artifact_doc(state) {
                 self.expected_artifacts
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -25423,6 +25659,301 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Completion-tail unfinished/unattempted-work guards
+    // ------------------------------------------------------------------
+
+    /// A one-node graph whose single root subtask carries `status`.
+    fn graph_with_status(session_id: Ulid, role: &str, status: SubTaskStatus) -> TaskGraph {
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id,
+            role: AgentId::new(role),
+            description: "guard subtask".into(),
+            status,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph
+    }
+
+    /// Drive a pre-built graph through `execute_graph` as an ACTION-REQUIRED
+    /// full-depth run with an explicit action ledger.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_action_required_graph_for_test(
+        coordinator: &mut CoordinatorAgent,
+        session_id: Ulid,
+        graph: TaskGraph,
+        action_ledger: Vec<checkpoint::CheckpointAction>,
+    ) -> AgentOutput {
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let (output, _notes) = coordinator
+            .execute_graph(
+                task,
+                context,
+                CancellationToken::new(),
+                graph,
+                HashMap::new(), // completed_results
+                0.0,            // total_cost
+                0,              // total_tool_calls
+                vec![],         // all_files
+                vec![],         // provider_metrics
+                HashMap::new(), // subtask_attempts
+                HashMap::new(), // retry_feedback
+                HashMap::new(), // model_assignments
+                action_ledger,
+                "build the thing".to_string(),
+                blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+                Vec::new(), // loop_notes
+                None,       // requested_user_input
+                None,       // pending_approval
+            )
+            .await
+            .expect("execute_graph returns");
+        output
+    }
+
+    /// Whether a completion-guard Decision with `reason` landed on the log.
+    async fn completion_guard_decision(pool: &sqlx::SqlitePool, reason: &str) -> bool {
+        let logged = concerto_sessions::whiteboard::load_whiteboard_events(
+            pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts {
+                after_gate_seq: 0,
+                session_id: None,
+                scope: None,
+                limit: usize::MAX,
+            },
+        )
+        .await
+        .expect("whiteboard loads");
+        logged.iter().any(|event| {
+            event.kind == WhiteboardKind::Decision
+                && event.payload["reason"].as_str() == Some(reason)
+        })
+    }
+
+    /// Guard 1: a graph that still holds a non-terminal subtask
+    /// (`AwaitingReview`) can never claim Completed — the run stops Partial,
+    /// keeps its resumable checkpoint, and records the downgrade as a
+    /// Coordinator Decision.
+    #[tokio::test]
+    async fn unfinished_awaiting_review_subtask_blocks_completion() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("done".into())],
+        )
+        .with_review_store(Some(pool.clone()));
+        let session_id = Ulid::new();
+        let graph = graph_with_status(session_id, "reviewer", SubTaskStatus::AwaitingReview);
+
+        let output =
+            run_action_required_graph_for_test(&mut coordinator, session_id, graph, Vec::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a non-terminal subtask must block Completed: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unfinished-work guard"),
+            "the unfinished-work guard names the omission: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "an unfinished run keeps its resumable checkpoint"
+        );
+        assert!(
+            completion_guard_decision(&pool, "completion-blocked-unfinished-subtasks").await,
+            "the downgrade is recorded as a Coordinator Decision"
+        );
+    }
+
+    /// Guard 1 (Blocked): a Blocked subtask whose retry attempts are NOT
+    /// exhausted is still unfinished work — the run stops Partial instead of
+    /// wedging on the structural invariant-error path.
+    #[tokio::test]
+    async fn blocked_subtask_blocks_completion() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("done".into())],
+        )
+        .with_review_store(Some(pool.clone()));
+        let session_id = Ulid::new();
+        let graph = graph_with_status(session_id, "researcher", SubTaskStatus::Blocked);
+
+        let output =
+            run_action_required_graph_for_test(&mut coordinator, session_id, graph, Vec::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a Blocked (never-settled) subtask must block Completed: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unfinished-work guard"),
+            "the unfinished-work guard names the blocked work: {}",
+            output.final_message
+        );
+    }
+
+    /// Guard 3: an ACTION-REQUIRED, full-depth run that carried an approved
+    /// plan but dispatched NO implement-stage specialist and produced NO code
+    /// artifact never attempted the promised implementation — it must be
+    /// Partial + note + Decision, never Completed. The graph holds a Completed
+    /// DESIGN subtask so the empty-graph vacuous guard cannot account for the
+    /// downgrade.
+    #[tokio::test]
+    async fn unattempted_implementation_with_approved_plan_is_partial() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("architect"), "designed")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("done".into())],
+        )
+        .with_review_store(Some(pool.clone()))
+        // An approved/active plan exists for this session: implementation was
+        // promised.
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+        let session_id = Ulid::new();
+        let graph = graph_with_status(session_id, "architect", SubTaskStatus::Completed);
+
+        let output =
+            run_action_required_graph_for_test(&mut coordinator, session_id, graph, Vec::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a promised-but-unattempted implementation must not claim Completed: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unattempted-implementation guard"),
+            "the guard names the omission: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "an unattempted run keeps its resumable checkpoint"
+        );
+        assert!(
+            completion_guard_decision(&pool, "completion-blocked-unattempted-implementation").await,
+            "the downgrade is recorded as a Coordinator Decision"
+        );
+    }
+
+    /// Guard 3 exemption: a review-only run with NO plan promised nothing, so
+    /// it still completes — the guard must not false-Partial legit no-code
+    /// work that was never planned as implementation.
+    #[tokio::test]
+    async fn review_only_run_without_a_plan_still_completes() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("done".into())],
+        );
+        let session_id = Ulid::new();
+        let graph = graph_with_status(session_id, "reviewer", SubTaskStatus::Completed);
+
+        let output =
+            run_action_required_graph_for_test(&mut coordinator, session_id, graph, Vec::new())
+                .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a no-plan review-only run promised no implementation: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Unattempted-implementation guard"),
+            "the guard must not fire without a promised plan: {}",
+            output.final_message
+        );
+    }
+
+    /// Guard 2: a QUARANTINED DesignDoc's contract paths are carried as
+    /// expected artifacts, so the C-06 acceptance gate sees them — a coder
+    /// dispatch that claims but does not produce the file is reported Partial
+    /// naming the unproduced path. The contract no longer evaporates into a
+    /// vacuous acceptance pass.
+    #[tokio::test]
+    async fn quarantined_doc_contract_is_reported_as_unproduced() {
+        let (_store_dir, pool) = fallback_evidence_pool().await;
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            // The coder CLAIMS the quarantined contract path without writing
+            // it, so the per-call zero-work guard does not pre-empt the C-06
+            // acceptance gate this test exercises.
+            MockExpertAgent::sequence(
+                AgentId::new("coder"),
+                vec![claimed_files("coder", "implemented", &["src/a.rs"])],
+            ),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        let (output, _events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+                    CoordinatorTurn::Text("done".into()),
+                ],
+            )
+            .with_review_store(Some(pool.clone())),
+            bus.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an unproduced quarantined-doc contract must not claim Completed: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unproduced declared deliverable"),
+            "the acceptance gate names the unproduced deliverables: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("src/a.rs"),
+            "the unproduced contract path is named: {}",
+            output.final_message
+        );
+    }
+
     /// Prose-only dispatch guard recovery: an ACTION-REQUIRED run whose
     /// planning provider closes in prose with zero dispatches is re-prompted
     /// twice, then retried ONCE on the run's default-model provider (ADR-45
@@ -25740,7 +26271,9 @@ mod tests {
             output.final_message
         );
 
-        // The skipped recovery is still recorded as an ADR-65 Decision event.
+        // The skipped recovery is still recorded as an ADR-65 Decision event,
+        // and the approved plan it left unimplemented trips the completion-time
+        // unattempted-implementation guard (the run already paused Partial).
         let logged = load_whiteboard_events(
             &pool,
             &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
@@ -25748,14 +26281,15 @@ mod tests {
         .await
         .expect("the log loads");
         let decisions = operational_decisions(&logged);
-        assert_eq!(
-            decisions.len(),
-            1,
-            "exactly one planning-recovery decision on the evidence resume, got: {decisions:?}"
-        );
-        assert_eq!(
-            decisions[0].payload["reason"], "planning-prose-only-recovery-skipped-unavailable",
+        assert!(
+            decisions.iter().any(|decision| decision.payload["reason"]
+                == "planning-prose-only-recovery-skipped-unavailable"),
             "the evidence resume's prose-only recovery skip records its tag, got: {decisions:?}"
+        );
+        assert!(
+            decisions.iter().any(|decision| decision.payload["reason"]
+                == "completion-blocked-unattempted-implementation"),
+            "the unimplemented approved plan records the completion guard decision, got: {decisions:?}"
         );
     }
 
