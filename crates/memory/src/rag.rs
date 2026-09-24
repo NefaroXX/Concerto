@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use concerto_core::CancellationToken;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,10 @@ use concerto_core::memory::{FtsResult, MemoryChunk, MemoryQuery, ProjectId, Vect
 
 use crate::embedder_health::{EmbedderHealth, EMBEDDER_DEGRADED_NOTICE};
 use crate::fts::FullTextStore;
+use crate::recall::{
+    allocate_char_budget, truncate_to_chars, RecallCapabilityEnvelope, RecallCostBounds,
+    RecallFailure,
+};
 use crate::scoring::LINK_SCORE_MAX;
 use crate::vector_store::VectorStore;
 
@@ -123,11 +128,39 @@ pub struct FusedResult {
 pub struct HybridRetriever {
     vector_store: Arc<dyn VectorStore>,
     fts_store: Arc<dyn FullTextStore>,
+    /// Cost bounds applied to every recall pass: result/char caps plus the
+    /// per-recall timeout guard (see [`crate::recall`]).
+    bounds: RecallCostBounds,
+    /// Recall passes skipped because the timeout budget was breached —
+    /// the observable half of "skip with a warning".
+    recalls_skipped: AtomicUsize,
 }
 
 impl HybridRetriever {
     pub fn new(vector_store: Arc<dyn VectorStore>, fts_store: Arc<dyn FullTextStore>) -> Self {
-        Self { vector_store, fts_store }
+        Self {
+            vector_store,
+            fts_store,
+            bounds: RecallCostBounds::default(),
+            recalls_skipped: AtomicUsize::new(0),
+        }
+    }
+
+    /// Override the recall cost bounds (char caps + timeout). Defaults are
+    /// [`RecallCostBounds::default`]: unlimited chars, a 5000 ms timeout.
+    pub fn with_recall_bounds(mut self, bounds: RecallCostBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// The declared cost bounds of one recall pass (capability envelope).
+    pub fn recall_capability(&self) -> RecallCapabilityEnvelope {
+        self.bounds.envelope()
+    }
+
+    /// How many recall passes were skipped by the timeout guard.
+    pub fn recalls_skipped(&self) -> usize {
+        self.recalls_skipped.load(Ordering::Relaxed)
     }
 
     pub async fn browse(
@@ -216,7 +249,11 @@ impl HybridRetriever {
     /// 3. Reciprocal-rank fusion of both result sets
     /// 4. Return top-k by fused score
     ///
-    /// `top_k` overrides `query.top_k` if supplied.
+    /// The pass runs under the configured recall cost bounds
+    /// ([`crate::recall`]): a timeout breach skips the recall with a warning
+    /// (empty result, counted in [`Self::recalls_skipped`]), and the char
+    /// caps are applied across the selected results before they are
+    /// returned. `top_k` overrides `query.top_k` if supplied.
     pub async fn retrieve(
         &self,
         query: &MemoryQuery,
@@ -230,9 +267,11 @@ impl HybridRetriever {
         // retriever (which owns both stores) can produce the FTS-only
         // fallback, so the degraded branch lives here.
         if EmbedderHealth::for_project(&query.project_id).is_broken(std::time::Instant::now()) {
-            return self.degraded_fts_results(query, k, cancel).await;
+            let degraded = self.bounded_recall(self.degraded_fts_results(query, k, cancel)).await;
+            return apply_recall_bounds(degraded, &self.bounds);
         }
-        self.fetch_fused(query, embedding, k, 1, cancel).await
+        let fused = self.bounded_recall(self.fetch_fused(query, embedding, k, 1, cancel)).await;
+        apply_recall_bounds(fused, &self.bounds)
     }
 
     /// Retrieve like [`Self::retrieve`] but re-rank the fused top-k with
@@ -251,6 +290,10 @@ impl HybridRetriever {
     ///
     /// Fail-open by design (ADR-69): any scorer error, timeout, or
     /// cancellation leaves the plain fused order untouched.
+    ///
+    /// Like [`Self::retrieve`], the whole pass runs under the recall cost
+    /// bounds: a timeout breach skips the recall (warning + empty result)
+    /// and the char caps are applied across the selected results.
     #[allow(clippy::too_many_arguments)]
     pub async fn retrieve_with_cascade(
         &self,
@@ -265,9 +308,32 @@ impl HybridRetriever {
         let k = top_k.unwrap_or(query.top_k).max(1);
 
         if EmbedderHealth::for_project(&query.project_id).is_broken(std::time::Instant::now()) {
-            return self.degraded_fts_results(query, k, cancel).await;
+            let degraded = self.bounded_recall(self.degraded_fts_results(query, k, cancel)).await;
+            return apply_recall_bounds(degraded, &self.bounds);
         }
 
+        let fused = self
+            .bounded_recall(
+                self.cascade_fetch(query, embedding, k, start_tier, scorer, config, cancel),
+            )
+            .await;
+        apply_recall_bounds(fused, &self.bounds)
+    }
+
+    /// The cascade body (fetch → escalate → score → reorder); kept separate
+    /// so [`Self::bounded_recall`] can guard the whole pass with one
+    /// timeout instead of one budget per tier fetch.
+    #[allow(clippy::too_many_arguments)]
+    async fn cascade_fetch(
+        &self,
+        query: &MemoryQuery,
+        embedding: &[f32],
+        k: usize,
+        start_tier: CascadeTier,
+        scorer: &dyn LinkScorer,
+        config: &LinkCascadeConfig,
+        cancel: CancellationToken,
+    ) -> Vec<FusedResult> {
         let mut tier = start_tier;
         let mut fused = self
             .fetch_fused(query, embedding, k, tier.candidate_multiplier(), cancel.clone())
@@ -295,6 +361,27 @@ impl HybridRetriever {
             })
         });
         ranked.into_iter().map(|(_, result)| result).collect()
+    }
+
+    /// One recall pass under the per-recall timeout.
+    ///
+    /// On breach the pass is SKIPPED with a structured warning
+    /// ([`RecallFailure`]) and yields no results — recall is advisory and
+    /// must never block the turn. Skips are counted in
+    /// [`Self::recalls_skipped`].
+    async fn bounded_recall(
+        &self,
+        fetch: impl std::future::Future<Output = Vec<FusedResult>>,
+    ) -> Vec<FusedResult> {
+        match tokio::time::timeout(self.bounds.timeout, fetch).await {
+            Ok(results) => results,
+            Err(_elapsed) => {
+                self.recalls_skipped.fetch_add(1, Ordering::Relaxed);
+                let failure = RecallFailure::timed_out(self.bounds.timeout);
+                tracing::warn!(code = %failure.code, timeout_ms = self.bounds.timeout.as_millis(), "{failure}");
+                Vec::new()
+            }
+        }
     }
 
     /// FTS-only fallback for a project whose embedder is broken (ADR-39).
@@ -406,6 +493,36 @@ fn cascade_key(
     let link_score =
         scores.get(&result.chunk_id).copied().unwrap_or(0.0).clamp(0.0, LINK_SCORE_MAX);
     rank as f64 + gamma * (LINK_SCORE_MAX - link_score)
+}
+
+/// Apply the recall cost bounds ([`RecallCostBounds`]) to a fused result
+/// set: the result cap first, then the per-memory char cap, then the total
+/// char budget DISTRIBUTED across the selected results by
+/// [`allocate_char_budget`] — the budget is split, never spent whole on the
+/// top results while later ones are dropped. Chars are cut only at `char`
+/// boundaries.
+fn apply_recall_bounds(
+    mut results: Vec<FusedResult>,
+    bounds: &RecallCostBounds,
+) -> Vec<FusedResult> {
+    if bounds.max_results > 0 {
+        results.truncate(bounds.max_results);
+    }
+    if bounds.max_chars_per_memory > 0 {
+        for result in &mut results {
+            truncate_to_chars(&mut result.content, bounds.max_chars_per_memory);
+        }
+    }
+    if bounds.max_total_chars > 0 {
+        let counts: Vec<usize> = results.iter().map(|r| r.content.chars().count()).collect();
+        if counts.iter().sum::<usize>() > bounds.max_total_chars {
+            let shares = allocate_char_budget(&counts, bounds.max_total_chars);
+            for (result, share) in results.iter_mut().zip(shares) {
+                truncate_to_chars(&mut result.content, share);
+            }
+        }
+    }
+    results
 }
 
 /// Fuse two result sets using reciprocal-rank fusion.
@@ -1077,5 +1194,250 @@ mod tests {
             vec!["a_plain", "b_linked"],
             "timeout must not re-rank"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Recall cost bounds (TODO.md "Recall budget caps + timeout guard")
+    // ------------------------------------------------------------------
+
+    /// Two records whose contents are 60 chars each, so a total budget below
+    /// 120 forces a split across the selected results instead of a top-k cut.
+    fn long_content_retriever() -> (HybridRetriever, ProjectId) {
+        use concerto_core::memory::{ChunkType, EmbeddingRecord};
+
+        let pid = ProjectId("recall-bounds-proj".into());
+        let records = [("a_first", "A"), ("b_second", "B")]
+            .iter()
+            .map(|(id, ch)| EmbeddingRecord {
+                id: (*id).into(),
+                project_id: pid.clone(),
+                chunk_hash: format!("h-{id}"),
+                content: ch.repeat(60),
+                file_path: format!("{id}.rs").into(),
+                start_line: Some(1),
+                end_line: Some(1),
+                chunk_type: ChunkType::Function,
+                vector: vec![0.1; 4],
+                model_id: "m".into(),
+                model_version: "1".into(),
+                stale: false,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .collect::<Vec<_>>();
+        let vs = Arc::new(crate::testing::InMemoryVectorStore::with_records(
+            records.into_iter().map(|r| (pid.clone(), r)).collect(),
+        ));
+        let fts = Arc::new(crate::testing::InMemoryFullTextStore::new());
+        (HybridRetriever::new(vs, fts), pid)
+    }
+
+    /// A store that answers `search` only after a fixed delay, so a recall
+    /// can be driven past its timeout budget.
+    struct SlowVectorStore {
+        inner: Arc<dyn VectorStore>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl VectorStore for SlowVectorStore {
+        async fn store(
+            &self,
+            records: &[concerto_core::memory::EmbeddingRecord],
+            cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            self.inner.store(records, cancel).await
+        }
+
+        async fn search(
+            &self,
+            project_id: &ProjectId,
+            query: &[f32],
+            top_k: usize,
+            cancel: CancellationToken,
+        ) -> Result<Vec<VectorResult>, MemoryError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.search(project_id, query, top_k, cancel).await
+        }
+
+        async fn tombstone(
+            &self,
+            chunk_id: &str,
+            project_id: &ProjectId,
+            cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            self.inner.tombstone(chunk_id, project_id, cancel).await
+        }
+
+        async fn delete_tombstoned(
+            &self,
+            project_id: &ProjectId,
+            cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            self.inner.delete_tombstoned(project_id, cancel).await
+        }
+
+        async fn mark_stale(
+            &self,
+            project_id: &ProjectId,
+            model_version: &str,
+            cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            self.inner.mark_stale(project_id, model_version, cancel).await
+        }
+
+        async fn delete_by_project(
+            &self,
+            project_id: &ProjectId,
+            cancel: CancellationToken,
+        ) -> Result<(), MemoryError> {
+            self.inner.delete_by_project(project_id, cancel).await
+        }
+
+        async fn delete_by_file_path(
+            &self,
+            project_id: &ProjectId,
+            file_path: &camino::Utf8PathBuf,
+            cancel: CancellationToken,
+        ) -> Result<Vec<String>, MemoryError> {
+            self.inner.delete_by_file_path(project_id, file_path, cancel).await
+        }
+    }
+
+    /// The total char budget is DISTRIBUTED across the selected results —
+    /// neither result is dropped whole and no result hoards the budget.
+    #[tokio::test]
+    async fn recall_char_budget_is_distributed_across_selected_results() {
+        let (retriever, pid) = long_content_retriever();
+        let query = cascade_query(pid, 10);
+        let retriever = retriever.with_recall_bounds(RecallCostBounds {
+            max_results: 0,
+            max_chars_per_memory: 0,
+            max_total_chars: 40,
+            timeout: Duration::from_millis(5000),
+        });
+
+        let results = retriever.retrieve(&query, &[0.1; 4], None, CancellationToken::new()).await;
+        assert_eq!(results.len(), 2, "caps bound chars; they never drop a selected result");
+        let lengths: Vec<usize> = results.iter().map(|r| r.content.chars().count()).collect();
+        assert_eq!(lengths.iter().sum::<usize>(), 40, "exactly the total budget is spent");
+        assert!(
+            lengths.iter().all(|&len| len == 20),
+            "the budget is split across the results, not spent whole on one: {lengths:?}"
+        );
+    }
+
+    /// The result cap and the per-memory cap apply on top of `top_k`.
+    #[tokio::test]
+    async fn recall_result_and_per_memory_caps_apply() {
+        let (retriever, pid) = long_content_retriever();
+        let query = cascade_query(pid, 10);
+        let retriever = retriever.with_recall_bounds(RecallCostBounds {
+            max_results: 1,
+            max_chars_per_memory: 7,
+            max_total_chars: 0,
+            timeout: Duration::from_millis(5000),
+        });
+
+        let results = retriever.retrieve(&query, &[0.1; 4], None, CancellationToken::new()).await;
+        assert_eq!(results.len(), 1, "max_results caps the set on top of top_k");
+        assert!(
+            results[0].content.chars().count() <= 7,
+            "each memory is capped at max_chars_per_memory"
+        );
+    }
+
+    /// Default bounds are inert apart from the timeout guard: content comes
+    /// back whole (a browse-style query must not be silently truncated).
+    #[tokio::test]
+    async fn default_recall_bounds_keep_content_untruncated() {
+        let (retriever, pid) = long_content_retriever();
+        let query = cascade_query(pid, 10);
+
+        let results = retriever.retrieve(&query, &[0.1; 4], None, CancellationToken::new()).await;
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.content.chars().count() == 60),
+            "unconfigured char caps leave every result intact"
+        );
+        assert_eq!(retriever.recalls_skipped(), 0);
+    }
+
+    /// Per-recall timeout: a store slower than the budget SKIPS the recall
+    /// with a warning (observable via the skip counter) instead of blocking
+    /// the caller for the store's full latency.
+    #[tokio::test]
+    async fn recall_timeout_skips_with_warning_instead_of_blocking() {
+        use concerto_core::memory::{ChunkType, EmbeddingRecord};
+
+        let pid = ProjectId("recall-timeout-proj".into());
+        let record = EmbeddingRecord {
+            id: "slow_chunk".into(),
+            project_id: pid.clone(),
+            chunk_hash: "h-slow".into(),
+            content: "unique timeout marker".into(),
+            file_path: "slow.rs".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            chunk_type: ChunkType::Function,
+            vector: vec![0.1; 4],
+            model_id: "m".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let inner = Arc::new(crate::testing::InMemoryVectorStore::with_records(vec![(
+            pid.clone(),
+            record,
+        )]));
+        let vs = Arc::new(SlowVectorStore { inner, delay: Duration::from_millis(1000) });
+        let fts = Arc::new(crate::testing::InMemoryFullTextStore::new());
+        let bounds = RecallCostBounds {
+            max_results: 0,
+            max_chars_per_memory: 0,
+            max_total_chars: 0,
+            timeout: Duration::from_millis(50),
+        };
+        let slow = HybridRetriever::new(vs, fts).with_recall_bounds(bounds);
+        let query = cascade_query(pid, 5);
+
+        let started = std::time::Instant::now();
+        let results = slow.retrieve(&query, &[0.1; 4], None, CancellationToken::new()).await;
+        let elapsed = started.elapsed();
+        assert!(results.is_empty(), "a timed-out recall yields no results");
+        assert_eq!(slow.recalls_skipped(), 1, "the skip is observable beside the warning");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the guard must not wait out the store (took {} ms)",
+            elapsed.as_millis()
+        );
+
+        // Control: a responsive store under the SAME bounds completes and
+        // never counts as a skip.
+        let (fast, fast_pid) = long_content_retriever();
+        let fast = fast.with_recall_bounds(bounds);
+        let fast_results = fast
+            .retrieve(&cascade_query(fast_pid, 5), &[0.1; 4], None, CancellationToken::new())
+            .await;
+        assert!(!fast_results.is_empty(), "in-budget recalls still return results");
+        assert_eq!(fast.recalls_skipped(), 0);
+    }
+
+    /// The capability envelope surfaces the retriever's configured bounds.
+    #[tokio::test]
+    async fn retriever_declares_its_recall_capability_envelope() {
+        let (retriever, _pid) = long_content_retriever();
+        assert_eq!(retriever.recall_capability(), RecallCostBounds::default().envelope());
+
+        let configured = retriever.with_recall_bounds(RecallCostBounds {
+            max_results: 5,
+            max_chars_per_memory: 800,
+            max_total_chars: 4000,
+            timeout: Duration::from_millis(1200),
+        });
+        let envelope = configured.recall_capability();
+        assert_eq!(envelope.max_results, 5);
+        assert_eq!(envelope.max_chars_per_memory, 800);
+        assert_eq!(envelope.max_total_chars, 4000);
+        assert_eq!(envelope.timeout_ms, 1200);
     }
 }

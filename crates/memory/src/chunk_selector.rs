@@ -4,6 +4,12 @@
 //! Retained as an independent, tested selection utility. The overflow
 //! strategy it served (`SummarizeOldest`) was removed under ADR-67 M-01;
 //! the selector remains public API with its own tests.
+//!
+//! **Naming trap:** the constants below (`target_recovery_pct`,
+//! `trigger_pct`, `target_pct`) are *compaction* selection, not retrieval
+//! recall. Recall cost bounds — char-budget allocation across the selected
+//! chunks and the per-recall timeout — live in [`crate::recall`] and are
+//! applied by [`crate::rag::HybridRetriever`].
 
 use concerto_core::types::{Message, Role};
 

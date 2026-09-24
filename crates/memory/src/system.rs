@@ -31,6 +31,7 @@ use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
 use crate::links::{links_from_metadata, LinkStore};
 use crate::rag::{HybridRetriever, LinkCascadeConfig, LinkScorer};
+use crate::recall::{RecallCapabilityEnvelope, RecallCostBounds};
 use crate::scoring::chunk_link_score;
 use crate::sync::ChunkSyncService;
 use crate::task_tree::TaskTreeStore;
@@ -247,6 +248,26 @@ impl MemorySystem {
     pub fn with_link_cascade(mut self, config: LinkCascadeConfig) -> Self {
         self.link_cascade = Some(config);
         self
+    }
+
+    /// Set the recall cost bounds for [`MemoryStore::retrieve`] — the char
+    /// caps (distributed across the selected results) and the per-recall
+    /// timeout guard (TODO.md "Recall budget caps + timeout guard"). Default:
+    /// unlimited chars and a 5000 ms timeout that skips a breached recall
+    /// with a warning instead of blocking the turn.
+    pub fn with_recall_bounds(mut self, bounds: RecallCostBounds) -> Self {
+        self.retriever = self.retriever.with_recall_bounds(bounds);
+        self
+    }
+
+    /// The declared recall cost bounds of this system (capability envelope).
+    pub fn recall_capability(&self) -> RecallCapabilityEnvelope {
+        self.retriever.recall_capability()
+    }
+
+    /// How many recall passes were skipped by the timeout guard.
+    pub fn recalls_skipped(&self) -> usize {
+        self.retriever.recalls_skipped()
     }
 
     /// Outcome counters for the L1 dedup judge pass (verdicts + fail-open
