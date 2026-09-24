@@ -5703,11 +5703,14 @@ mod tests {
         // Slice 3 (spec §2): deleting a stage also drops the relationships
         // whose `from`/`to` the stage owned — their row endpoints would
         // otherwise dangle past the stage-tag picker's catalog. The standard
-        // blueprint ties its five relationships to AGENT ids, not stage tags,
-        // so the test adds a stage-tag relationship first ("design" → "design")
-        // and asserts exactly that row is pruned while the others survive.
+        // blueprint's five relationships are stage-tag based (`design` owns two
+        // of them), so deleting `design` prunes every row touching that tag,
+        // exactly. The test also adds a stage-tag relationship first
+        // ("design" → "design") and asserts the prune count matches the
+        // design-touching rows and no others.
         let mut state = standard_blueprint_state();
         let relationships_before_len = state.blueprint.as_ref().unwrap().relationships.len();
+        assert_eq!(relationships_before_len, 5, "standard blueprint ships five stage-tag rows");
         // `RelationshipAdded` seeds a default row from/to the FIRST stage tag.
         let _ = state.update(StudioMessage::RelationshipAdded);
         let blueprint = state.blueprint.as_ref().unwrap();
@@ -5718,7 +5721,16 @@ mod tests {
             "added row targets the first stage tag"
         );
 
-        // Deleting the "design" stage prunes the design-targeting row only.
+        // Two standard rows touch `design` (`design → implement`,
+        // `design → research`) plus the added `design → design` row.
+        let design_rows = blueprint
+            .relationships
+            .iter()
+            .filter(|relationship| relationship.from == "design" || relationship.to == "design")
+            .count();
+        assert_eq!(design_rows, 3, "two standard design rows + the added row");
+
+        // Deleting the "design" stage prunes exactly those design-touching rows.
         let _ = state.update(StudioMessage::StageDeleted(0));
         let blueprint = state.blueprint.as_ref().unwrap();
         assert!(
@@ -5727,8 +5739,8 @@ mod tests {
         );
         assert_eq!(
             blueprint.relationships.len(),
-            relationships_before_len,
-            "only the dangling design row is pruned"
+            relationships_before_len + 1 - design_rows,
+            "exactly the relationships touching the deleted stage are pruned"
         );
         assert!(
             blueprint.relationships.iter().all(|r| r.from != "design" && r.to != "design"),
@@ -5899,9 +5911,11 @@ mod tests {
     #[test]
     fn relationship_field_edits_mutate_and_revalidate_immediately() {
         let mut state = standard_blueprint_state();
+        // The standard blueprint's rows are stage-tag based (spec §3): row 0 is
+        // `review → implement`, not the legacy agent-role id.
         assert_eq!(
             state.blueprint.as_ref().expect("blueprint loaded").relationships[0].from,
-            "reviewer"
+            "review"
         );
 
         let _ = state.update(StudioMessage::RelationshipFromChanged(0, "design".into()));
