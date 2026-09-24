@@ -228,11 +228,10 @@ impl RetryConfig {
 fn default_classifier_enabled() -> bool {
     // ADR-56 (model-first): when `[intent] classifier_enabled` is true the LLM
     // classifier is the PRIMARY intent decider for every non-fast-path
-    // message. The deterministic router (concerto_core::intent::route) remains
-    // the offline / fail-soft fallback and supplies the two fast-path
-    // detections (negation-override, smalltalk). Default is ON — one bounded
-    // model call per non-fast-path message is the intended primary path, not
-    // an opt-in extra (ADR-56 §1/§2).
+    // message. The deterministic rule corpora remain the offline / fail-soft
+    // fallback and supply the two fast-path detections (negation-override,
+    // smalltalk). Default is ON — one bounded model call per non-fast-path
+    // message is the intended primary path, not an opt-in extra (ADR-56 §1/§2).
     true
 }
 

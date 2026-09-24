@@ -56,7 +56,7 @@ use crate::graph::{Dependency, TaskGraph, TaskGraphValidator};
 use crate::planner::{PlanArtifact, PlannerAgentInfo, TaskPlanner};
 use crate::registry::AgentRegistry;
 use crate::relationship::{
-    AgentHandoff, CollaborationRule, HandoffDeliverable, RelationshipManager,
+    stage_kind_for_tag, AgentHandoff, CollaborationRule, HandoffDeliverable, RelationshipManager,
 };
 use crate::resolver_integration::{self, ResolverOutcome};
 use crate::resume::{self, ResumeOutcome};
@@ -1089,9 +1089,8 @@ const NO_RUN_SHAPE_HINT: &str = "none";
 /// Decide the coordinator's final run shape from the routing hint plus session
 /// context (advisor-mode intent routing).
 ///
-/// The deterministic [`route()`](concerto_core::intent::route) hint is an
-/// input, not a verdict. The coordinator overrides it when session context
-/// contradicts it:
+/// The routing hint is an input, not a verdict. The coordinator overrides it
+/// when session context contradicts it:
 ///
 /// - **hint `Plan`, but an approved plan exists** and the request carries
 ///   action verbs (and no task-level negation): the objective was already
@@ -1394,6 +1393,9 @@ pub struct CoordinatorAgent {
     /// Rules governing how agents relate during orchestration (e.g. who
     /// supervises whom, max review cycles, etc.).
     relationships: RelationshipManager,
+    /// True once [`Self::with_collaboration_rules`] supplied an explicit
+    /// topology: a later blueprint-facade attachment must not clobber it.
+    collaboration_rules_custom: bool,
     /// Memory store for retrieving project context. Used to populate
     /// `retrieved_chunks` in agent contexts at task start (audit §3.3).
     memory_store: Arc<dyn MemoryStore>,
@@ -2423,6 +2425,37 @@ fn tool_executor_offers(executor: Option<&ToolExecutor>, tool_name: &str) -> boo
         executor.tool_definitions().iter().any(|definition| definition.name == tool_name)
     })
 }
+/// Resolve each registered agent to the stage kind it staffs, for building the
+/// engine-default collaboration topology (ADR-58 D2/ADR-35).
+///
+/// Prefers the resolved blueprint's tag→kind mapping when a facade is attached
+/// (honoring renamed/custom stage tags); otherwise falls back to the agent's
+/// canonical stage tag via [`stage_kind_for_tag`]. Agents with no resolvable
+/// kind (e.g. freeform/`run_once` agents) are omitted — they contribute no
+/// relationship edges.
+fn default_agent_kinds(
+    registry: &AgentRegistry,
+    facade: Option<&BlueprintFacade>,
+) -> Vec<(AgentId, StageKind)> {
+    registry
+        .ids()
+        .into_iter()
+        .filter_map(|id| {
+            let kind = facade
+                .and_then(|facade| facade.stage_for_agent(&id))
+                .and_then(|stage| stage.def.known_kind())
+                .or_else(|| {
+                    registry
+                        .get(&id)
+                        .and_then(|agent| agent.stage())
+                        .as_ref()
+                        .and_then(stage_kind_for_tag)
+                })?;
+            Some((id, kind))
+        })
+        .collect()
+}
+
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -2435,6 +2468,8 @@ impl CoordinatorAgent {
         memory_store: Arc<dyn MemoryStore>,
     ) -> Self {
         let cycle_state = OrchestratorState::with_bus(bus.clone());
+        let relationships =
+            RelationshipManager::defaults_for_agents(&default_agent_kinds(&registry, None));
         Self {
             registry,
             runner,
@@ -2444,7 +2479,8 @@ impl CoordinatorAgent {
             planning_provider,
             cycle_state,
             file_delta: FileDeltaTracker::new(),
-            relationships: RelationshipManager::defaults(),
+            relationships,
+            collaboration_rules_custom: false,
             memory_store,
             agent_configs: HashMap::new(),
             expected_artifacts: Mutex::new(HashMap::new()),
@@ -2986,6 +3022,16 @@ impl CoordinatorAgent {
     pub fn with_blueprint_facade(mut self, facade: Option<BlueprintFacade>) -> Self {
         if let Some(facade) = &facade {
             self.cycle_state = self.cycle_state.clone().with_blueprint_facade(Some(facade.clone()));
+        }
+        // The engine-default topology is expressed over stage kinds; with the
+        // resolved blueprint now attached, re-resolve it so renamed/custom
+        // stage tags map to the right kinds. An explicit topology supplied by
+        // the caller always wins.
+        if !self.collaboration_rules_custom {
+            self.relationships = RelationshipManager::defaults_for_agents(&default_agent_kinds(
+                &self.registry,
+                facade.as_ref(),
+            ));
         }
         self.blueprint_facade = facade;
         self
@@ -4799,6 +4845,7 @@ impl CoordinatorAgent {
         self.relationships = RelationshipManager::new(rules).map_err(|error| {
             OrchestratorError::AgentLoopError(format!("invalid collaboration rules: {error}"))
         })?;
+        self.collaboration_rules_custom = true;
         Ok(self)
     }
 

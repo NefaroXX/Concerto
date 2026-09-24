@@ -327,87 +327,13 @@ impl ToolExecutor {
         }
     }
 
-    /// Persist a deterministic routing decision (ADR-55 §6) as a distinct
-    /// audit entry through the same channel as
-    /// [`Self::record_ack_decision`].
-    ///
-    /// A routing decision is not tied to any tool call, so `tool_name` is the
-    /// synthetic `"intent_router"` and `input_hash` is the empty string (no
-    /// input exists). The winning rule name — one of the rule constants from
-    /// `crate::intent` (`execute_keyword`, `verify_keyword`, ...), or the
-    /// `"llm_classifier"` / `"ask_user"` path names — becomes `rule_matched`;
-    /// `user_response` carries the outcome label (`Execute`, `Verify`, ...);
-    /// and `verdict` records the user's confirmation for the decision
-    /// (`granted` | `declined` | `timed_out` | `canceled` | `n/a` — `n/a` when
-    /// no confirmation was solicited, e.g. an unanswered `AskUser`). The
-    /// ADR-28 §6 execution fields stay `None`: there is no command behind a
-    /// routing decision.
-    ///
-    /// Phase 0 ships the channel only: the fixed [`AuditEntry`] schema has no
-    /// dedicated columns for the originating `utterance` or the router's
-    /// `confidence`, so those are surfaced at `debug` level here and durable
-    /// coverage lands with ADR-55 Phase 2 ("durable audit coverage for the new
-    /// records"). Wiring the run loop call site is a later, explicitly
-    /// additive batch; until then nothing calls this method in production, so
-    /// this is zero-behavioral.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn record_routing_decision(
-        &self,
-        session_id: crate::ids::Ulid,
-        correlation_id: crate::ids::Ulid,
-        utterance: &str,
-        route: &str,
-        outcome: &str,
-        confidence: f32,
-        confirmation: &str,
-        cancel: CancellationToken,
-    ) {
-        let entry = AuditEntry {
-            tool_name: "intent_router".to_owned(),
-            verdict: confirmation.to_owned(),
-            input_hash: String::new(),
-            session_id,
-            correlation_id,
-            timestamp: OffsetDateTime::now_utc(),
-            user_response: Some(outcome.to_owned()),
-            rule_matched: Some(route.to_owned()),
-            profile_id: None,
-            resolved_executable: None,
-            argv: None,
-            working_directory: None,
-            network_requested: None,
-            filesystem_scope: None,
-            destructive_classification: None,
-            exit_code: None,
-            duration_ms: None,
-            toolchain_version: None,
-            // Routing decisions stay JSON-only (ADR-55 §6): no plan is bound.
-            plan_id: None,
-            source_revision: None,
-        };
-        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
-            tracing::error!(%error, "routing-decision audit write failed");
-        } else {
-            tracing::debug!(
-                route,
-                outcome,
-                confirmation,
-                %confidence,
-                utterance,
-                "routing decision recorded"
-            );
-        }
-    }
-
     /// Persist the coordinator's FINAL run-shape decision (advisor-mode intent
     /// routing) as a distinct audit entry.
     ///
-    /// The deterministic router hint keeps its own `intent_router` row as the
-    /// hint source of truth ([`Self::record_routing_decision`] /
-    /// [`Self::record_auto_intent_decision`]); this row records the shape the
-    /// coordinator actually chose AFTER consulting session context, plus the
-    /// reason, so an override of the hint is observable and diagnosable rather
-    /// than a silent divergence. `tool_name` is the synthetic
+    /// This row records the shape the coordinator actually chose AFTER
+    /// consulting session context, plus the reason, so an override of the
+    /// routing hint is observable and diagnosable rather than a silent
+    /// divergence. `tool_name` is the synthetic
     /// `"coordinator_shape"`, `verdict` carries the final shape (`Plan` |
     /// `Execute`), `rule_matched` the reason code, and `user_response` a
     /// compact JSON envelope `{hint, final_shape, reason}`. The ADR-28 §6
@@ -514,62 +440,8 @@ impl ToolExecutor {
         }
     }
 
-    /// Persist an automatic intent-routing decision (ADR-55 Phase 2d §5) as a
-    /// distinct audit entry through the same channel as
-    /// [`Self::record_routing_decision`].
-    ///
-    /// Routing is the decision (2d §1): when the run loop auto-grants from a
-    /// high-confidence route, the row is labeled `intent_router:
-    /// auto_granted` — `tool_name = "intent_router"`, `verdict =
-    /// "auto_granted"` — and `user_response` carries the
-    /// `{rule, confidence, route, outcome}` envelope so the grant is
-    /// observable (never blocking; §5). `rule_matched` keeps the caller's
-    /// pre-replacement deterministic route name, preserving the ADR-55 Phase
-    /// 2c §5 row-chain invariant (the classifier's own row stays
-    /// distinguishable by `rule_matched`/`verdict`). Non-auto decisions
-    /// (denial, negation, AskUser) keep their existing
-    /// [`Self::record_routing_decision`] rows unchanged.
-    pub async fn record_auto_intent_decision(
-        &self,
-        session_id: crate::ids::Ulid,
-        correlation_id: crate::ids::Ulid,
-        utterance: &str,
-        route: &str,
-        detail: &str,
-        cancel: CancellationToken,
-    ) {
-        let entry = AuditEntry {
-            tool_name: "intent_router".to_owned(),
-            verdict: "auto_granted".to_owned(),
-            input_hash: String::new(),
-            session_id,
-            correlation_id,
-            timestamp: OffsetDateTime::now_utc(),
-            user_response: Some(detail.to_owned()),
-            rule_matched: Some(route.to_owned()),
-            profile_id: None,
-            resolved_executable: None,
-            argv: None,
-            working_directory: None,
-            network_requested: None,
-            filesystem_scope: None,
-            destructive_classification: None,
-            exit_code: None,
-            duration_ms: None,
-            toolchain_version: None,
-            // Routing decisions stay JSON-only (ADR-55 §6): no plan is bound.
-            plan_id: None,
-            source_revision: None,
-        };
-        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
-            tracing::error!(%error, "auto-intent-decision audit write failed");
-        } else {
-            tracing::debug!(route, detail, utterance, "auto intent decision recorded");
-        }
-    }
-
     /// Persist a plan-approval decision (ADR-55 Phase 1d) as a distinct audit
-    /// entry through the same channel as [`Self::record_routing_decision`].
+    /// entry.
     ///
     /// A plan decision is not tied to any tool call, so `tool_name` is the
     /// synthetic `"intent:plan"`. `rule_matched` and `verdict` both carry the
@@ -1459,29 +1331,15 @@ mod tests {
         assert_eq!(executor.tool_definitions_for(&shell_caps).len(), 1);
     }
 
-    /// Advisor-mode intent routing writes BOTH audit rows: the deterministic
-    /// router hint (`intent_router`) stays the hint source of truth, and the
-    /// coordinator's final shape gets its own `coordinator_shape` row carrying
-    /// the final shape + reason. Neither write replaces the other.
+    /// The coordinator's final run-shape decision records its own
+    /// `coordinator_shape` row carrying the final shape + reason.
     #[tokio::test]
-    async fn coordinator_shape_row_coexists_with_intent_router_row() {
+    async fn coordinator_shape_row_carries_the_final_shape_and_reason() {
         let audit = Arc::new(RecordingAudit::default());
         let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
         let executor = ToolExecutor::new(test_registry(), policy);
         let session = Ulid::new();
 
-        executor
-            .record_routing_decision(
-                session,
-                Ulid::new(),
-                "run the approved plan",
-                "plan_keyword",
-                "Plan",
-                0.8,
-                "auto_granted",
-                CancellationToken::new(),
-            )
-            .await;
         executor
             .record_coordinator_shape_decision(
                 session,
@@ -1494,10 +1352,6 @@ mod tests {
             .await;
 
         let entries = audit.entries.lock().unwrap();
-        assert!(
-            entries.iter().any(|entry| entry.tool_name == "intent_router"),
-            "the hint row is the source of truth and must be present: {entries:?}"
-        );
         let shape = entries
             .iter()
             .find(|entry| entry.tool_name == "coordinator_shape")
@@ -2215,133 +2069,6 @@ mod tests {
         assert_eq!(entries[0].session_id, caller_session_id);
         assert_eq!(entries[0].correlation_id, correlation_id);
         assert_eq!(entries[0].verdict, "RequestContinue");
-    }
-
-    /// A deterministic routing decision records a single row under the
-    /// synthetic `intent_router` tool identity with the route rule in
-    /// `rule_matched`, the outcome label in `user_response`, and the
-    /// confirmation in `verdict` (`n/a` when no confirmation was solicited).
-    #[tokio::test]
-    async fn routing_decision_records_rule_row() {
-        let audit = Arc::new(RecordingAudit::default());
-        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
-        let executor = ToolExecutor::new(test_registry(), policy);
-        let session = test_session();
-        let correlation_id = Ulid::new();
-
-        executor
-            .record_routing_decision(
-                session.session_id,
-                correlation_id,
-                "add a retry to the uploader",
-                "execute_keyword",
-                "Execute",
-                0.8,
-                "n/a",
-                CancellationToken::new(),
-            )
-            .await;
-
-        let entries = audit.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1, "exactly one routing row is recorded");
-        assert_eq!(entries[0].tool_name, "intent_router");
-        assert_eq!(entries[0].verdict, "n/a");
-        assert_eq!(entries[0].rule_matched.as_deref(), Some("execute_keyword"));
-        assert_eq!(entries[0].user_response.as_deref(), Some("Execute"));
-        assert_eq!(entries[0].session_id, session.session_id);
-        assert_eq!(entries[0].correlation_id, correlation_id);
-        // A routing decision has no input, no command facts, no execution.
-        assert_eq!(entries[0].input_hash, "");
-        assert_eq!(entries[0].profile_id, None);
-        assert_eq!(entries[0].argv, None);
-        assert_eq!(entries[0].network_requested, None);
-        assert_eq!(entries[0].exit_code, None);
-        assert_eq!(entries[0].duration_ms, None);
-    }
-
-    /// A classifier route that solicited a confirmation carries the user's
-    /// answer in `verdict`, so a declined execution leaves a deny-side trace.
-    #[tokio::test]
-    async fn routing_decision_records_declined_confirmation() {
-        let audit = Arc::new(RecordingAudit::default());
-        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
-        let executor = ToolExecutor::new(test_registry(), policy);
-        let session = test_session();
-        let correlation_id = Ulid::new();
-
-        executor
-            .record_routing_decision(
-                session.session_id,
-                correlation_id,
-                "move the repo to a mono crate layout",
-                "ask_user",
-                "Execute",
-                0.6,
-                "declined",
-                CancellationToken::new(),
-            )
-            .await;
-
-        let entries = audit.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool_name, "intent_router");
-        assert_eq!(entries[0].verdict, "declined");
-        assert_eq!(entries[0].rule_matched.as_deref(), Some("ask_user"));
-        assert_eq!(entries[0].user_response.as_deref(), Some("Execute"));
-        assert_eq!(entries[0].session_id, session.session_id);
-        assert_eq!(entries[0].correlation_id, correlation_id);
-    }
-
-    /// A2 (ADR-55 Phase 2d §5/A2): an automatic intent-routing decision
-    /// records a row labeled `intent_router: auto_granted` carrying the
-    /// `{rule, confidence, route, outcome}` envelope in `user_response`, so
-    /// the audit shows `auto_granted` + `RuleHit|LlmClassifier` + the
-    /// decision-time confidence. `rule_matched` keeps the caller's
-    /// pre-replacement deterministic route name (2c §5 row-chain invariant).
-    #[tokio::test]
-    async fn auto_intent_decision_records_auto_granted_row_with_envelope() {
-        let audit = Arc::new(RecordingAudit::default());
-        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
-        let executor = ToolExecutor::new(test_registry(), policy);
-        let session = test_session();
-        let correlation_id = Ulid::new();
-
-        executor
-            .record_auto_intent_decision(
-                session.session_id,
-                correlation_id,
-                "build accord",
-                "execute_keyword",
-                r#"{"rule":"execute_keyword","route":"RuleHit","outcome":"Execute","confidence":0.8}"#,
-                CancellationToken::new(),
-            )
-            .await;
-
-        let entries = audit.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1, "exactly one auto-decision row is recorded");
-        assert_eq!(entries[0].tool_name, "intent_router");
-        assert_eq!(entries[0].verdict, "auto_granted", "the row is labeled auto_granted");
-        assert_eq!(
-            entries[0].rule_matched.as_deref(),
-            Some("execute_keyword"),
-            "rule_matched keeps the caller's pre-replacement route name"
-        );
-        assert_eq!(entries[0].input_hash, "");
-        let envelope: serde_json::Value =
-            serde_json::from_str(entries[0].user_response.as_deref().unwrap_or_default())
-                .expect("valid envelope JSON");
-        assert_eq!(envelope["route"], "RuleHit", "the envelope names the routing path kind");
-        assert_eq!(envelope["rule"], "execute_keyword");
-        assert_eq!(envelope["outcome"], "Execute");
-        assert!(
-            envelope["confidence"].as_f64().unwrap_or_default() >= 0.7,
-            "the envelope carries the decision-time confidence (A2: >= 0.7)"
-        );
-        assert_eq!(entries[0].session_id, session.session_id);
-        assert_eq!(entries[0].correlation_id, correlation_id);
-        // No plan is bound by a routing decision; no command ran.
-        assert_eq!(entries[0].plan_id, None);
-        assert_eq!(entries[0].argv, None);
     }
 
     /// A plan-approval decision records a single row under the synthetic

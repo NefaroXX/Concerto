@@ -675,7 +675,7 @@ fn resolve_blueprint_validated(blueprint: &Blueprint) -> Result<ResolvedBlueprin
     let feed_map =
         stages.iter().map(|s| (s.def.tag.clone(), s.effective_feed)).collect::<HashMap<_, _>>();
     // N5: an empty relationship registry falls back to the engine's default
-    // five rows (the pre-blueprint `default_collaboration_rules`), so an
+    // five rows (the pre-blueprint `default_stage_relationships`), so an
     // include/inline blueprint that omits `relationships` still pins the
     // standard topology instead of silently resolving to an empty one.
     let relationship_defaults = if blueprint.relationships.is_empty() {
@@ -981,41 +981,44 @@ pub fn coordinator_self_implement_fallback() -> FallbackPersonaDef {
 }
 
 /// `standard` relationship defaults as data rows over closed semantics
-/// (ADR-58 §4), mirroring `default_collaboration_rules()`
-/// (`relationship.rs`): reviewer→coder & validator→coder `Supervises`
-/// (Delegation), researcher→coder `ProvidesContextTo` (ContextFlow),
-/// architect→coder & architect→researcher `OwnsDesign` (Delegation).
+/// (ADR-58 §4), mirroring `default_stage_relationships()`
+/// (`relationship.rs`): review→implement & validate→implement `Supervises`
+/// (Delegation), research→implement `ProvidesContextTo` (ContextFlow),
+/// design→implement & design→research `OwnsDesign` (Delegation).
+///
+/// `from`/`to` are **stage tags** (the Studio's stage pickers restrict
+/// endpoints to the pipeline's stage tags), never agent role ids.
 fn standard_relationships() -> Vec<RelationshipDef> {
     vec![
         RelationshipDef {
             kind: "supervises".into(),
             semantics: RelationshipSemantics::Delegation,
-            from: "reviewer".into(),
-            to: "coder".into(),
+            from: "review".into(),
+            to: "implement".into(),
         },
         RelationshipDef {
             kind: "provides_context_to".into(),
             semantics: RelationshipSemantics::ContextFlow,
-            from: "researcher".into(),
-            to: "coder".into(),
+            from: "research".into(),
+            to: "implement".into(),
         },
         RelationshipDef {
             kind: "owns_design".into(),
             semantics: RelationshipSemantics::Delegation,
-            from: "architect".into(),
-            to: "coder".into(),
+            from: "design".into(),
+            to: "implement".into(),
         },
         RelationshipDef {
             kind: "owns_design".into(),
             semantics: RelationshipSemantics::Delegation,
-            from: "architect".into(),
-            to: "researcher".into(),
+            from: "design".into(),
+            to: "research".into(),
         },
         RelationshipDef {
             kind: "supervises".into(),
             semantics: RelationshipSemantics::Delegation,
-            from: "validator".into(),
-            to: "coder".into(),
+            from: "validate".into(),
+            to: "implement".into(),
         },
     ]
 }
@@ -1295,11 +1298,11 @@ mod tests {
             assert_eq!(resolved.feed_map.get(tag).copied().flatten(), feed, "{tag} feed");
         }
 
-        // Relationship defaults mirror default_collaboration_rules() data
-        // rows (ADR-58 §4).
+        // Relationship defaults mirror default_stage_relationships() data
+        // rows, keyed by stage tag (ADR-58 §4).
         assert_eq!(resolved.relationship_defaults.len(), 5);
-        assert_eq!(resolved.relationship_defaults[0].from, "reviewer");
-        assert_eq!(resolved.relationship_defaults[0].to, "coder");
+        assert_eq!(resolved.relationship_defaults[0].from, "review");
+        assert_eq!(resolved.relationship_defaults[0].to, "implement");
     }
 
     // ---- rulebook (relaxed): (c)/(d)/(e)/(f)/(g)/(j) kept; (a)/(b)/(i) and
@@ -1701,8 +1704,8 @@ mod tests {
         let resolved = resolve_blueprint(&mutate(|b| b.relationships.clear()))
             .expect("empty relationships must resolve to defaults");
         assert_eq!(resolved.relationship_defaults.len(), 5);
-        assert_eq!(resolved.relationship_defaults[0].from, "reviewer");
-        assert_eq!(resolved.relationship_defaults[0].to, "coder");
+        assert_eq!(resolved.relationship_defaults[0].from, "review");
+        assert_eq!(resolved.relationship_defaults[0].to, "implement");
         assert_eq!(resolved.relationship_defaults, standard_relationships());
     }
 

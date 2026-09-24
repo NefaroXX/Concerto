@@ -4606,10 +4606,9 @@ mod tests {
     /// in one site cannot silently drift the others. Sites checked: config
     /// `builtin_agent_seeds`, the standard blueprint's staffed agents, the
     /// saving materialization (`seed_orchestration_roster` round-trip), the
-    /// Studio's default agents, and the relationship defaults (orchestrator
-    /// `default_collaboration_rules` + the blueprint's relationship rows).
-    /// The coordinator is the one hardcoded actor and is excluded from the
-    /// specialist set.
+    /// Studio's default agents, and the relationship defaults (whose endpoints
+    /// are pipeline stage tags, checked separately). The coordinator is the one
+    /// hardcoded actor and is excluded from the specialist set.
     #[test]
     fn seed_sites_agree_on_builtin_specialist_ids() {
         use std::collections::BTreeSet;
@@ -4663,18 +4662,21 @@ mod tests {
             .collect();
         assert_eq!(saved_ids, canonical, "saving materialization drifted");
 
-        // Relationship defaults: orchestrator rules + blueprint rows.
-        let mut relationship_ids: BTreeSet<String> = BTreeSet::new();
-        for rule in concerto_orchestrator::relationship::default_collaboration_rules() {
-            relationship_ids.insert(rule.from.to_string());
-            relationship_ids.insert(rule.to.to_string());
-        }
+        // Relationship defaults are stage-kind/tag keyed (never role ids), so
+        // they are checked against the pipeline's stage tags rather than the
+        // specialist id set.
+        let stage_tags: BTreeSet<String> = concerto_config::blueprint::standard_blueprint()
+            .pipeline
+            .stages
+            .iter()
+            .map(|stage| stage.tag.clone())
+            .collect();
         for rel in concerto_config::blueprint::standard_blueprint().relationships {
-            relationship_ids.insert(rel.from);
-            relationship_ids.insert(rel.to);
+            assert!(
+                stage_tags.contains(&rel.from) && stage_tags.contains(&rel.to),
+                "relationship endpoints must be pipeline stage tags: {rel:?}"
+            );
         }
-        relationship_ids.retain(|id| !id.eq_ignore_ascii_case("coordinator"));
-        assert_eq!(relationship_ids, canonical, "relationship defaults drifted");
     }
 
     #[test]
