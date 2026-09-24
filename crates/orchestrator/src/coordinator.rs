@@ -626,6 +626,29 @@ fn is_cancellation_error(error: &OrchestratorError) -> bool {
     )
 }
 
+/// The maximum number of fallback pipes one guarded scope (a planning recovery
+/// or a single subtask's dispatch failover) may attempt before the ladder
+/// surfaces exhaustion. Bounded so a run can never loop pipes; every attempt
+/// still counts toward the ADR-52 run-wide dispatch cap.
+const MAX_FALLBACK_ATTEMPTS: usize = 3;
+
+/// `(provider_config_id, model)` — the identity of a fallback pipe, used to
+/// record which pipes a guarded scope has already tried so the bounded
+/// iteration never repeats one.
+fn fallback_pipe_identity(profile: &ModelProfile) -> (String, String) {
+    (profile.profile.provider_config_id.clone(), profile.profile.model.clone())
+}
+
+/// True when a fallback attempt failed because the pipe does not serve the
+/// requested model — an HTTP 404 model-not-found. This is the ONE failure
+/// class where trying the NEXT alternate pipe is strictly more correct: the
+/// pipe itself is wrong, not its credentials, capability, or transport. Every
+/// other class (auth/capability/network/5xx) keeps the historical
+/// single-attempt semantics.
+fn is_model_not_found_error(error: &OrchestratorError) -> bool {
+    matches!(error, OrchestratorError::Provider(ProviderError::HttpStatus { status: 404, .. }))
+}
+
 fn failed_attempt_result(task_id: TaskId, role: AgentId, error: String) -> AgentRunResult {
     AgentRunResult {
         task_id,
@@ -1483,6 +1506,15 @@ pub struct CoordinatorAgent {
     /// note instead of a silent "Automation paused". Consumed (`take()`n) by
     /// `run()`; reset at the start of every `run` invocation.
     planning_recovery_note: Option<String>,
+    /// Files the planning dispatch session produced (coordinator
+    /// self-execution and settled specialist dispatches) before a LATER
+    /// planning turn failed and unwound `decompose_task`. The planning
+    /// ledger is dropped on that error path, so this run-scoped accumulator
+    /// preserves the produced artifacts: `run()`'s decompose error arm
+    /// reports them instead of an empty `files[]`, and a recovered planning
+    /// session merges them back into its result. Run-scoped: reset at the
+    /// start of every `run` invocation.
+    planning_produced_files: Vec<camino::Utf8PathBuf>,
     /// ADR-42 §4 tier 2: the routing profile of the coordinator's own model on
     /// its serving pipe (`planning_provider`). `None` when unresolved (config
     /// error) — tier 2 then skips with a note instead of dispatching a raw
@@ -2500,6 +2532,7 @@ impl CoordinatorAgent {
             fallback_pipes: Vec::new(),
             planning_recovery_attempted: false,
             planning_recovery_note: None,
+            planning_produced_files: Vec::new(),
             planning_profile: None,
             default_provider_config_id: None,
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
@@ -2918,11 +2951,16 @@ impl CoordinatorAgent {
     /// from the failed `(provider_config_id, model)`; otherwise the first
     /// tool-calling-capable alternate pipe whose pipe id differs from the
     /// failed pipe's (credential resolution and capability were filtered at
-    /// attach time). `None` means no non-degenerate fallback is available, so
-    /// the caller records the historical skip.
-    fn resolve_fallback_pipe(
+    /// attach time). Pipes whose identity is already in `tried` are skipped,
+    /// so the bounded 404 iteration walks to the NEXT capable pipe without ever
+    /// repeating one; `failed_profile` rotates to the pipe that just failed, so
+    /// the default pipe is not re-selected once it has been tried. `None` means
+    /// no non-degenerate fallback is available, so the caller records the
+    /// historical skip.
+    fn resolve_fallback_pipe_excluding(
         &self,
         failed_profile: Option<&ModelProfile>,
+        tried: &HashSet<(String, String)>,
     ) -> Option<(Arc<dyn concerto_core::traits::provider::LlmProvider>, ModelProfile)> {
         let failed = failed_profile.map(|profile| &profile.profile);
         let differs = |profile: &ModelProfile| match failed {
@@ -2932,10 +2970,11 @@ impl CoordinatorAgent {
             }
             None => true,
         };
+        let is_fresh = |profile: &ModelProfile| !tried.contains(&fallback_pipe_identity(profile));
         if let (Some(provider), Some(profile)) =
             (self.default_model_provider.as_ref(), self.default_model_profile.as_ref())
         {
-            if differs(profile) {
+            if differs(profile) && is_fresh(profile) {
                 return Some((provider.clone(), profile.clone()));
             }
         }
@@ -2943,6 +2982,7 @@ impl CoordinatorAgent {
             .iter()
             .find(|(_, profile)| {
                 profile.supports_tool_calling
+                    && is_fresh(profile)
                     && failed.is_none_or(|failed| {
                         profile.profile.provider_config_id != failed.provider_config_id
                     })
@@ -4274,23 +4314,29 @@ impl CoordinatorAgent {
     /// provider/model is dead (HTTP 404 model-not-found, auth, capability
     /// refusal, model-unavailable) or its retry budget was exhausted on
     /// throttling / transient 5xx — would fail again if redecomposed onto the
-    /// SAME assignment. Retry the SAME subtask ONCE on the run's default-model
-    /// pipe (ADR-45 tier-1b machinery: the same role rebuilt on
-    /// `default_model_provider` and run with `default_model_profile`) BEFORE
-    /// handing the failure back to the Coordinator model for redecomposition.
+    /// SAME assignment. Retry the SAME subtask on the run's fallback pipes
+    /// (ADR-45 tier-1b machinery: the same role rebuilt on the resolved pipe)
+    /// BEFORE handing the failure back to the Coordinator model for
+    /// redecomposition.
     ///
     /// `failure_cause` is the diagnosis code of the failed dispatch, recorded
     /// in the attempt note so a throttle-exhausted failover is distinguishable
     /// from a permanent-400 / model-not-found one.
     ///
-    /// Bounded by the checkpointed per-subtask `default_model_provider_attempted`
-    /// guard (at most once per subtask per run), gated on the user's
-    /// `default_model_fallback`, and skipped with a recorded note when the
-    /// fallback resolves to the SAME (provider, model) as the failed dispatch
-    /// (degenerate) or the role has no rebuild factory. The attempt and its
-    /// outcome are recorded as an ADR-65 `Decision` event. Returns the fallback
-    /// result only on a genuine `Success`; `None` leaves the caller's existing
-    /// redecompose/blocked path unchanged.
+    /// Bounded alternate walk: the default-model pipe is preferred, then the
+    /// configured alternate pipes in order. On a fallback failure that is a
+    /// model-not-found (HTTP 404) — the pipe itself is wrong — the NEXT
+    /// capable alternate is tried, up to [`MAX_FALLBACK_ATTEMPTS`] pipes
+    /// total; every other failure class keeps the single-attempt semantics.
+    /// No pipe is ever repeated. The walk is bounded by the checkpointed
+    /// per-subtask `default_model_provider_attempted` guard (spent on the
+    /// first real attempt) and by the per-scope attempt ceiling, gated on the
+    /// user's `default_model_fallback`, and skipped with a recorded note when
+    /// the fallback resolves to the SAME (provider, model) as the failed
+    /// dispatch (degenerate) or the role has no rebuild factory. Each attempt
+    /// and its outcome are recorded as ADR-65 `Decision` events. Returns the
+    /// fallback result only on a genuine `Success`; `None` leaves the caller's
+    /// existing redecompose/blocked path unchanged.
     async fn attempt_dispatch_failover(
         &mut self,
         subtask: &SubTask,
@@ -4314,24 +4360,6 @@ impl CoordinatorAgent {
             // The one failover slot for this subtask is already spent.
             return None;
         }
-        // ADR-45 tier-1b amendment: the default-model pipe is preferred, but a
-        // degenerate default (SAME provider/model as the failed dispatch) falls
-        // through to the first capable alternate pipe. No non-degenerate
-        // fallback at all -> the historical skip.
-        let Some((provider, fallback_profile)) = self.resolve_fallback_pipe(Some(failed_profile))
-        else {
-            let (reason_tag, note) = self.fallback_skip_reason();
-            self.append_dispatch_failover_decision(
-                subtask.session_id,
-                &format!("dispatch-failover-{reason_tag}"),
-                &format!(
-                    "No fallback retry: {note}; the dead-pipe failure is surfaced to the \
-                     decision loop"
-                ),
-            )
-            .await;
-            return None;
-        };
         if !self.registry.has_rebuild_factory(agent_id) {
             self.append_dispatch_failover_decision(
                 subtask.session_id,
@@ -4343,76 +4371,145 @@ impl CoordinatorAgent {
             return None;
         }
 
-        // Spend the one-shot guard, then re-dispatch the SAME subtask on the
-        // fallback pipe. A failover dispatch is a real model dispatch and
-        // counts toward the run-wide cap (ADR-52).
-        self.default_model_provider_attempted.insert(subtask.id);
-        self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+        // Bounded alternate walk: re-dispatch the SAME subtask on the fallback
+        // pipe. A model-not-found (404) failure means the PIPE is wrong, so
+        // the next capable alternate is tried (up to MAX_FALLBACK_ATTEMPTS
+        // pipes total); every other failure class keeps the original
+        // single-attempt semantics. The one-shot guard is spent on the FIRST
+        // real attempt; the loop is bounded by construction and never repeats
+        // a pipe. Each attempt is a real model dispatch and counts toward the
+        // run-wide cap (ADR-52).
+        let mut tried: HashSet<(String, String)> = HashSet::new();
+        let mut failed_profile = failed_profile.clone();
+        let mut attempts = 0usize;
+        loop {
+            if attempts >= MAX_FALLBACK_ATTEMPTS {
+                break;
+            }
+            let Some((provider, fallback_profile)) =
+                self.resolve_fallback_pipe_excluding(Some(&failed_profile), &tried)
+            else {
+                if attempts == 0 {
+                    let (reason_tag, note) = self.fallback_skip_reason();
+                    self.append_dispatch_failover_decision(
+                        subtask.session_id,
+                        &format!("dispatch-failover-{reason_tag}"),
+                        &format!(
+                            "No fallback retry: {note}; the dead-pipe failure is surfaced to the \
+                             decision loop"
+                        ),
+                    )
+                    .await;
+                } else {
+                    self.append_dispatch_failover_decision(
+                        subtask.session_id,
+                        "dispatch-failover-exhausted",
+                        &format!(
+                            "Fallback failover for {agent_id} subtask {} exhausted its \
+                             {attempts} attempted pipe(s); the original failure stands",
+                            subtask.id
+                        ),
+                    )
+                    .await;
+                }
+                return None;
+            };
+            if attempts == 0 {
+                // A non-degenerate fallback exists: spend the guard now.
+                self.default_model_provider_attempted.insert(subtask.id);
+            }
+            tried.insert(fallback_pipe_identity(&fallback_profile));
+            attempts += 1;
+            self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+            self.append_dispatch_failover_decision(
+                subtask.session_id,
+                "dispatch-failover-attempted",
+                &format!(
+                    "Retrying {agent_id} subtask {} on the fallback pipe {}/{} \
+                     (attempt {attempts}) after the assigned pipe failed ({failure_cause})",
+                    subtask.id, fallback_profile.profile.provider, fallback_profile.profile.model
+                ),
+            )
+            .await;
+            match self
+                .runner
+                .run_with_provider(
+                    agent_id.clone(),
+                    provider,
+                    subtask,
+                    context.clone(),
+                    &fallback_profile,
+                    cancel.clone(),
+                )
+                .await
+            {
+                Ok(result) if matches!(result.outcome, AgentOutcome::Success) => {
+                    self.append_dispatch_failover_decision(
+                        subtask.session_id,
+                        "dispatch-failover-succeeded",
+                        &format!(
+                            "Fallback dispatch of {agent_id} subtask {} succeeded on {}/{} \
+                             (attempt {attempts})",
+                            subtask.id,
+                            fallback_profile.profile.provider,
+                            fallback_profile.profile.model
+                        ),
+                    )
+                    .await;
+                    return Some(result);
+                }
+                Ok(_) => {
+                    self.append_dispatch_failover_decision(
+                        subtask.session_id,
+                        "dispatch-failover-failed",
+                        &format!(
+                            "Fallback dispatch of {agent_id} subtask {} on {}/{} returned a \
+                             non-success outcome (attempt {attempts}); the original failure \
+                             stands",
+                            subtask.id,
+                            fallback_profile.profile.provider,
+                            fallback_profile.profile.model
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+                Err(error) => {
+                    let model_not_found = is_model_not_found_error(&error);
+                    self.append_dispatch_failover_decision(
+                        subtask.session_id,
+                        "dispatch-failover-failed",
+                        &format!(
+                            "Fallback dispatch of {agent_id} subtask {} on {}/{} failed \
+                             (attempt {attempts}): {error}; the original failure stands",
+                            subtask.id,
+                            fallback_profile.profile.provider,
+                            fallback_profile.profile.model
+                        ),
+                    )
+                    .await;
+                    // Only a wrong-pipe (404 model-not-found) failure advances
+                    // to the next alternate; every other class is terminal for
+                    // this guarded scope.
+                    if model_not_found && attempts < MAX_FALLBACK_ATTEMPTS {
+                        failed_profile = fallback_profile;
+                        continue;
+                    }
+                    return None;
+                }
+            }
+        }
         self.append_dispatch_failover_decision(
             subtask.session_id,
-            "dispatch-failover-attempted",
+            "dispatch-failover-exhausted",
             &format!(
-                "Retrying {agent_id} subtask {} once on the fallback pipe {}/{} \
-                 after the assigned pipe failed ({failure_cause})",
-                subtask.id, fallback_profile.profile.provider, fallback_profile.profile.model
+                "Fallback failover for {agent_id} subtask {} exhausted the \
+                 {MAX_FALLBACK_ATTEMPTS}-attempt pipe ceiling; the original failure stands",
+                subtask.id
             ),
         )
         .await;
-        match self
-            .runner
-            .run_with_provider(
-                agent_id.clone(),
-                provider,
-                subtask,
-                context.clone(),
-                &fallback_profile,
-                cancel.clone(),
-            )
-            .await
-        {
-            Ok(result) if matches!(result.outcome, AgentOutcome::Success) => {
-                self.append_dispatch_failover_decision(
-                    subtask.session_id,
-                    "dispatch-failover-succeeded",
-                    &format!(
-                        "Fallback dispatch of {agent_id} subtask {} succeeded on {}/{}",
-                        subtask.id,
-                        fallback_profile.profile.provider,
-                        fallback_profile.profile.model
-                    ),
-                )
-                .await;
-                Some(result)
-            }
-            Ok(_) => {
-                self.append_dispatch_failover_decision(
-                    subtask.session_id,
-                    "dispatch-failover-failed",
-                    &format!(
-                        "Fallback dispatch of {agent_id} subtask {} on {}/{} returned a \
-                         non-success outcome; the original failure stands",
-                        subtask.id,
-                        fallback_profile.profile.provider,
-                        fallback_profile.profile.model
-                    ),
-                )
-                .await;
-                None
-            }
-            Err(error) => {
-                self.append_dispatch_failover_decision(
-                    subtask.session_id,
-                    "dispatch-failover-failed",
-                    &format!(
-                        "Fallback dispatch of {agent_id} subtask {} failed: {error}; the \
-                         original failure stands",
-                        subtask.id
-                    ),
-                )
-                .await;
-                None
-            }
-        }
+        None
     }
 
     /// ADR-42 §4 + ADR-45: walk the fallback ladder for a `LimitReached`
@@ -5204,12 +5301,22 @@ impl CoordinatorAgent {
                 objective_hash,
             });
         }
+        // Completion superset: a planning attempt that failed after producing
+        // artifacts kept them on the run-scoped accumulator; merge them into
+        // the returned ledger so the completion `files[]` reflects every file
+        // the run produced, including a failed-then-recovered planning attempt.
+        let mut all_files = ledger.all_files;
+        for path in std::mem::take(&mut self.planning_produced_files) {
+            if !all_files.contains(&path) {
+                all_files.push(path);
+            }
+        }
         Ok(DecomposeResult {
             graph,
             completed_results: ledger.completed_results,
             total_cost: ledger.total_cost,
             total_tool_calls: ledger.total_tool_calls,
-            all_files: ledger.all_files,
+            all_files,
             provider_metrics: ledger.provider_metrics,
             subtask_attempts: ledger.subtask_attempts,
             retry_feedback: HashMap::new(),
@@ -5383,6 +5490,14 @@ impl CoordinatorAgent {
             // Replan. The restored plan is superseded by workspace reality:
             // clear the restored per-plan bookkeeping so the fresh decompose
             // repopulates it for the new graph.
+            //
+            // The checkpoint's produced files survive the supersede: the
+            // artifacts are real on disk, and the replan re-enters planning,
+            // which may fail LATER (the run already implemented phases). Seed
+            // the run-scoped accumulator so a failed replan's pause reports
+            // them and a successful replan merges them into its completion
+            // superset instead of dropping the ledger's files on the floor.
+            self.planning_produced_files.extend(all_files.iter().cloned());
             self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).clear();
             self.last_doc_resolution = None;
             self.last_dispatch_decision = None;
@@ -8325,6 +8440,7 @@ impl CoordinatorAgent {
         // runs.
         self.planning_recovery_attempted = false;
         self.planning_recovery_note = None;
+        self.planning_produced_files.clear();
         // Advisor-mode intent routing: finalize the run shape from the router's
         // ADVISORY hint plus session context BEFORE any planning work. The hint
         // is never the decision — when context contradicts it (an approved
@@ -8423,17 +8539,33 @@ impl CoordinatorAgent {
                 // ladder was attempted or skipped first, its ladder-exhausted
                 // note makes the pause explicit instead of silent.
                 let note = self.planning_recovery_note.take();
-                let final_message = match note {
-                    Some(note) => {
-                        format!("Automation paused: could not produce a valid plan. {e} — {note}")
-                    }
-                    None => format!("Automation paused: could not produce a valid plan. {e}"),
+                // A planning failure that came AFTER the run already produced
+                // artifacts (a later planning dispatch failed) must not read
+                // as "no plan was ever made": report the produced files and
+                // the implemented count so the pause is truthful. The
+                // accumulator is sanitized like every completion list (only
+                // real, in-root regular files survive).
+                let produced_files = crate::tool_facts::sanitize_files_modified(
+                    &context.session.project_dir,
+                    &self.planning_produced_files,
+                );
+                let produced_count = produced_files.len();
+                let note_suffix = note.map(|note| format!(" — {note}")).unwrap_or_default();
+                let final_message = if produced_count > 0 {
+                    format!(
+                        "Automation paused: a later planning dispatch could not produce a valid \
+                         plan after the run had already implemented {produced_count} file(s); \
+                         the produced artifacts and the session context were preserved. \
+                         {e}{note_suffix}"
+                    )
+                } else {
+                    format!("Automation paused: could not produce a valid plan. {e}{note_suffix}")
                 };
                 return Ok(AgentOutput {
                     task_id: task.id,
                     session_id: task.session_id,
                     final_message,
-                    files_modified: vec![],
+                    files_modified: produced_files,
                     tool_call_count: 0,
                     eval_result: None,
                     tool_events: vec![],
@@ -8676,7 +8808,7 @@ impl CoordinatorAgent {
         };
         let mut ledger = DispatchLedger::default();
         let mut scope = self.fresh_checkpoint_scope(task, context);
-        let (summary, advisory_plan) = self
+        let (summary, advisory_plan) = match self
             .run_dispatch_session(
                 &mut graph,
                 task,
@@ -8688,7 +8820,24 @@ impl CoordinatorAgent {
                 design_role.as_ref(),
                 &intro,
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A LATER planning turn failed after the session already
+                // produced artifacts (coordinator self-execution or settled
+                // specialist dispatches). The ledger is dropped when the error
+                // unwinds, so preserve the files on the run-scoped
+                // accumulator: `run()`'s pause arm reports them instead of an
+                // empty `files[]`, and a recovered planning session merges them
+                // back into its result.
+                self.planning_produced_files.extend(ledger.all_files.iter().cloned());
+                return Err(error);
+            }
+        };
+        // Keep every produced path for the completion superset even when the
+        // recovered (or prose-only retried) session returns its own ledger.
+        self.planning_produced_files.extend(ledger.all_files.iter().cloned());
 
         // ── Prose-only dispatch guard (escalation) ───────────────────────
         // The bounded re-prompts inside the session ([`MAX_PROSE_STOP_REPROMPTS`])
@@ -8735,11 +8884,12 @@ impl CoordinatorAgent {
     /// provider fails with a provider-class error (HTTP status, auth,
     /// capability refusal, or a throttle/transient-5xx-caused retry exhaustion
     /// — never cancellation or a structural error), the Coordinator retries
-    /// `decompose_task` ONCE on the run's default-model provider (ADR-45
-    /// tier-1b pipe) and records the attempt as an ADR-65 `Decision` whiteboard
-    /// event. The retry counts toward `model_dispatch_count` exactly like any
-    /// ladder-tier dispatch (ADR-52), because the retried
-    /// `run_dispatch_session` increments it per turn.
+    /// `decompose_task` on the run's fallback pipes (ADR-45 tier-1b pipe; then
+    /// the next capable alternate on a 404 model-not-found fallback failure,
+    /// up to [`MAX_FALLBACK_ATTEMPTS`] total) and records each attempt as an
+    /// ADR-65 `Decision` whiteboard event. The retry counts toward
+    /// `model_dispatch_count` exactly like any ladder-tier dispatch (ADR-52),
+    /// because the retried `run_dispatch_session` increments it per turn.
     ///
     /// The retry is skipped — straight to a graceful `Partial` — when
     /// cancellation/structural errors surface, the run already consumed its
@@ -8841,24 +8991,29 @@ impl CoordinatorAgent {
 
     /// Shared tail of the coordinator-owned planning recovery (ADR-45
     /// tier-1b): resolve the fallback pipe, record the attempt (or skip) as an
-    /// ADR-65 `Decision` event, retry `decompose_task` ONCE on the fallback,
-    /// and restore the original planning pipe/profile regardless of the
-    /// outcome.
+    /// ADR-65 `Decision` event, retry `decompose_task` on the fallback, and
+    /// restore the original planning pipe/profile regardless of the outcome.
     ///
     /// `tag_prefix` seeds every `Decision` reason tag (`{tag}-attempted`,
-    /// `{tag}-skipped-disabled`, `{tag}-skipped-unavailable`,
-    /// `{tag}-skipped-degenerate`); `decision_output` is the
-    /// `required_output` the Decision event records for the retry. Shared by
-    /// the provider-failure recovery ([`Self::attempt_planning_provider_recovery`])
-    /// and the prose-only zero-dispatch recovery
-    /// ([`Self::attempt_prose_only_planning_recovery`]).
+    /// `{tag}-failed`, `{tag}-exhausted`, `{tag}-skipped-disabled`,
+    /// `{tag}-skipped-unavailable`, `{tag}-skipped-degenerate`);
+    /// `decision_output` is the `required_output` the Decision event records
+    /// for the retry. Shared by the provider-failure recovery
+    /// ([`Self::attempt_planning_provider_recovery`]) and the prose-only
+    /// zero-dispatch recovery ([`Self::attempt_prose_only_planning_recovery`]).
     ///
+    /// The first retry enters as ONE recovery per run (the run-scoped
+    /// `planning_recovery_attempted` latch also stops the nested retry from
+    /// re-entering). From there, a fallback failure that is a model-not-found
+    /// (HTTP 404) advances to the NEXT capable alternate pipe, bounded to
+    /// [`MAX_FALLBACK_ATTEMPTS`] total attempts and never repeating a pipe.
+    /// Other failure classes keep the historical single-attempt semantics.
     /// The retry is skipped — the caller's graceful `Partial` stands — when
-    /// the run already consumed its one recovery, the tier-1b gate is
-    /// disabled, no fallback provider is configured, or the fallback resolves
-    /// to the same (provider, model) as the current planning provider (the
-    /// failure would just repeat). Failure of the fallback retry is surfaced
-    /// through `planning_recovery_note`, never as a hard crash.
+    /// the run already consumed its recovery, the tier-1b gate is disabled, no
+    /// fallback provider is configured, or the fallback resolves to the same
+    /// (provider, model) as the current planning provider (the failure would
+    /// just repeat). Failure of the fallback retry is surfaced through
+    /// `planning_recovery_note`, never as a hard crash.
     async fn retry_planning_on_default_model(
         &mut self,
         task: &AgentTask,
@@ -8893,75 +9048,139 @@ impl CoordinatorAgent {
         // The fallback pipe is the run's default-model provider (ADR-45
         // tier 1b), UNLESS that resolves to the SAME (provider, model) as the
         // current planning provider — then the first capable alternate pipe
-        // takes its place (ADR-45 tier-1b amendment; `resolve_fallback_pipe`).
-        // Absent a non-degenerate fallback, there is nothing to retry on.
-        let Some((fallback_provider, fallback_profile)) =
-            self.resolve_fallback_pipe(self.planning_profile.as_ref())
-        else {
-            let (reason_tag, note) = self.fallback_skip_reason();
-            self.planning_recovery_note = Some(format!("planning recovery {note}"));
+        // takes its place (ADR-45 tier-1b amendment; `resolve_fallback_pipe`);
+        // a fallback failure that is a model-not-found (HTTP 404) advances to
+        // the NEXT capable alternate (bounded by [`MAX_FALLBACK_ATTEMPTS`]
+        // total attempts). Absent a non-degenerate fallback, there is nothing
+        // to retry on.
+        let mut tried: HashSet<(String, String)> = HashSet::new();
+        let mut failed_profile = self.planning_profile.clone();
+        let mut attempts = 0usize;
+        loop {
+            if attempts >= MAX_FALLBACK_ATTEMPTS {
+                break;
+            }
+            let Some((fallback_provider, fallback_profile)) =
+                self.resolve_fallback_pipe_excluding(failed_profile.as_ref(), &tried)
+            else {
+                if attempts == 0 {
+                    let (reason_tag, note) = self.fallback_skip_reason();
+                    self.planning_recovery_note = Some(format!("planning recovery {note}"));
+                    self.append_planning_recovery_decision(
+                        task,
+                        &format!("{tag_prefix}-{reason_tag}"),
+                        "No fallback retry: no non-degenerate fallback pipe is available; \
+                         the run pauses with a Partial outcome",
+                    )
+                    .await;
+                } else {
+                    self.planning_recovery_note = Some(format!(
+                        "planning recovery exhausted its {attempts} attempted fallback pipe(s)"
+                    ));
+                    self.append_planning_recovery_decision(
+                        task,
+                        &format!("{tag_prefix}-exhausted"),
+                        &format!(
+                            "No further fallback pipe: the {attempts} attempted pipe(s) all \
+                             failed; the run pauses with a Partial outcome"
+                        ),
+                    )
+                    .await;
+                }
+                return PlanningRecoveryOutcome::Exhausted;
+            };
+            tried.insert(fallback_pipe_identity(&fallback_profile));
+            attempts += 1;
+            let pipe_label = format!(
+                "{}/{}",
+                fallback_profile.profile.provider_config_id, fallback_profile.profile.model
+            );
             self.append_planning_recovery_decision(
                 task,
-                &format!("{tag_prefix}-{reason_tag}"),
-                "No fallback retry: no non-degenerate fallback pipe is available; \
-                 the run pauses with a Partial outcome",
+                &format!("{tag_prefix}-attempted"),
+                &format!("{decision_output} (fallback attempt {attempts} on {pipe_label})"),
             )
             .await;
-            return PlanningRecoveryOutcome::Exhausted;
-        };
 
-        self.append_planning_recovery_decision(
-            task,
-            &format!("{tag_prefix}-attempted"),
-            decision_output,
-        )
-        .await;
+            // Swap the planning serving pipe/profile to the fallback, re-run
+            // the dispatch session, and restore the original pipe/profile —
+            // the Coordinator instance may serve further runs/replans. Every
+            // exit below restores before returning. The swap re-enters
+            // `decompose_task` through this shared helper (self-recursion), so
+            // the inner call is boxed to keep the future sized (E0733); the
+            // cycle terminates because the prose-only guard inside the retried
+            // `decompose_task` observes `planning_recovery_attempted` and
+            // returns Exhausted instead of re-entering recovery.
+            let original_provider =
+                std::mem::replace(&mut self.planning_provider, fallback_provider);
+            let original_profile = self.planning_profile.replace(fallback_profile.clone());
+            // Reborrow so the `async move` block owns the reference, not `self`
+            // itself; the reborrow dies with the boxed future after `await`.
+            let this = &mut *self;
+            let retried =
+                Box::pin(async move { this.decompose_task(task, context, cancel).await }).await;
+            self.planning_provider = original_provider;
+            self.planning_profile = original_profile;
 
-        // Swap the planning serving pipe/profile to the fallback, re-run the
-        // dispatch session, and restore the original pipe/profile — the
-        // Coordinator instance may serve further runs/replans. Every exit
-        // below restores before returning. The swap re-enters `decompose_task`
-        // through this shared helper (self-recursion), so the inner call is
-        // boxed to keep the future sized (E0733); the cycle terminates because
-        // the prose-only guard inside the retried `decompose_task` observes
-        // `planning_recovery_attempted` and returns Exhausted instead of
-        // re-entering recovery.
-        let original_provider = std::mem::replace(&mut self.planning_provider, fallback_provider);
-        let original_profile = self.planning_profile.replace(fallback_profile);
-        // Reborrow so the `async move` block owns the reference, not `self`
-        // itself; the reborrow dies with the boxed future after `await`.
-        let this = &mut *self;
-        let retried =
-            Box::pin(async move { this.decompose_task(task, context, cancel).await }).await;
-        self.planning_provider = original_provider;
-        self.planning_profile = original_profile;
-
-        match retried {
-            Ok((graph, advisory_plan, ledger, summary)) => {
-                tracing::info!(
-                    task_id = %task.id,
-                    "coordinator planning recovery succeeded on the default-model provider"
-                );
-                PlanningRecoveryOutcome::Recovered(Box::new((
-                    graph,
-                    advisory_plan,
-                    ledger,
-                    summary,
-                )))
-            }
-            Err(second_error) => {
-                // The fallback also failed. The coordinator never hard-crashes
-                // a run over a planning failure: surface it as the note on the
-                // graceful Partial (the original error still drives the exit).
-                self.planning_recovery_note =
-                    Some(format!("fallback planning-provider retry also failed: {second_error}"));
-                tracing::warn!(
-                    error = %second_error,
-                    "coordinator planning recovery exhausted: the fallback provider also failed"
-                );
-                PlanningRecoveryOutcome::Exhausted
+            match retried {
+                Ok((graph, advisory_plan, ledger, summary)) => {
+                    tracing::info!(
+                        task_id = %task.id,
+                        "coordinator planning recovery succeeded on the default-model provider"
+                    );
+                    return PlanningRecoveryOutcome::Recovered(Box::new((
+                        graph,
+                        advisory_plan,
+                        ledger,
+                        summary,
+                    )));
+                }
+                Err(second_error) => {
+                    let model_not_found = is_model_not_found_error(&second_error);
+                    self.append_planning_recovery_decision(
+                        task,
+                        &format!("{tag_prefix}-failed"),
+                        &format!(
+                            "Fallback planning attempt {attempts} on {pipe_label} failed: \
+                             {second_error}"
+                        ),
+                    )
+                    .await;
+                    // Only a wrong-pipe (404 model-not-found) failure advances
+                    // to the next alternate; every other class is terminal for
+                    // this guarded scope (the historical single-attempt path).
+                    if model_not_found && attempts < MAX_FALLBACK_ATTEMPTS {
+                        failed_profile = Some(fallback_profile);
+                        continue;
+                    }
+                    // The fallback also failed. The coordinator never
+                    // hard-crashes a run over a planning failure: surface it as
+                    // the note on the graceful Partial (the original error
+                    // still drives the exit).
+                    self.planning_recovery_note = Some(format!(
+                        "fallback planning-provider retry also failed: {second_error}"
+                    ));
+                    tracing::warn!(
+                        error = %second_error,
+                        "coordinator planning recovery exhausted: the fallback provider also failed"
+                    );
+                    return PlanningRecoveryOutcome::Exhausted;
+                }
             }
         }
+        self.planning_recovery_note = Some(format!(
+            "planning recovery exhausted the {MAX_FALLBACK_ATTEMPTS}-attempt pipe ceiling"
+        ));
+        self.append_planning_recovery_decision(
+            task,
+            &format!("{tag_prefix}-exhausted"),
+            &format!(
+                "No further fallback pipe: the {MAX_FALLBACK_ATTEMPTS}-attempt ceiling was \
+                 reached; the run pauses with a Partial outcome"
+            ),
+        )
+        .await;
+        PlanningRecoveryOutcome::Exhausted
     }
 
     /// Append the whiteboard `Decision` event recording the coordinator-owned
@@ -9132,7 +9351,7 @@ impl CoordinatorAgent {
             source_revision: self.source_revision.clone(),
             sequence_num: 0,
         };
-        let (mut summary, mut advisory_plan) = self
+        let (mut summary, mut advisory_plan) = match self
             .run_dispatch_session(
                 &mut graph,
                 task,
@@ -9144,7 +9363,18 @@ impl CoordinatorAgent {
                 design_role.as_ref(),
                 &intro,
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Mirror of `decompose_task`: preserve the files produced
+                // before a later planning turn failed (the ledger is dropped
+                // when the error unwinds).
+                self.planning_produced_files.extend(ledger.all_files.iter().cloned());
+                return Err(error);
+            }
+        };
+        self.planning_produced_files.extend(ledger.all_files.iter().cloned());
 
         // ── Prose-only dispatch guard (escalation) ───────────────────────
         // Mirror of `decompose_task`: an ACTION-REQUIRED evidence-resume
@@ -14379,6 +14609,11 @@ mod tests {
     struct TurnProvider {
         turns: std::sync::Mutex<std::collections::VecDeque<CoordinatorTurn>>,
         requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
+        /// When set, the provider fails every request that arrives AFTER the
+        /// scripted turns are exhausted (instead of serving empty prose). Used
+        /// to model a LATER planning turn failing after earlier dispatches
+        /// already produced artifacts.
+        terminal_error: Option<ProviderError>,
     }
 
     impl TurnProvider {
@@ -14386,7 +14621,14 @@ mod tests {
             Self {
                 turns: std::sync::Mutex::new(turns.into()),
                 requests: std::sync::Mutex::new(Vec::new()),
+                terminal_error: None,
             }
+        }
+
+        /// Fail every request beyond the scripted turns with `error`.
+        fn with_terminal_error(mut self, error: ProviderError) -> Self {
+            self.terminal_error = Some(error);
+            self
         }
 
         /// The prompts this provider has seen so far (first message content).
@@ -14449,12 +14691,13 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
             self.requests.lock().unwrap().push(request);
-            let turn = self
-                .turns
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(CoordinatorTurn::Text(String::new()));
+            let turn = match self.turns.lock().unwrap().pop_front() {
+                Some(turn) => turn,
+                None => match &self.terminal_error {
+                    Some(error) => return Err(error.clone()),
+                    None => CoordinatorTurn::Text(String::new()),
+                },
+            };
             let chunks: Vec<concerto_core::types::CompletionChunk> = match turn {
                 CoordinatorTurn::Text(text) => {
                     vec![concerto_core::types::CompletionChunk {
@@ -14729,6 +14972,17 @@ mod tests {
         turns: Vec<CoordinatorTurn>,
     ) -> (CoordinatorAgent, Arc<TurnProvider>) {
         let provider = Arc::new(TurnProvider::new(turns));
+        let coordinator = coordinator_with_turn_provider(bus, registry, provider.clone());
+        (coordinator, provider)
+    }
+
+    /// [`coordinator_with_turns_captured`] with a caller-built [`TurnProvider`]
+    /// (so a test can attach a terminal error or pre-populate captures).
+    fn coordinator_with_turn_provider(
+        bus: EventBus,
+        registry: Arc<AgentRegistry>,
+        provider: Arc<TurnProvider>,
+    ) -> CoordinatorAgent {
         let spend_tracker = Arc::new(SpendTracker::default());
         let runner = AgentRunner::new(registry.clone(), bus.clone(), spend_tracker.clone());
         let profiles: Vec<concerto_core::types::RoutingProfile> = vec![
@@ -14766,7 +15020,7 @@ mod tests {
         ));
         let model_registry = Arc::new(ModelRegistry::from_profiles(profiles));
         let model_selector = Arc::new(ModelSelector::new(model_registry, routing));
-        let coordinator = CoordinatorAgent::new(
+        CoordinatorAgent::new(
             registry,
             runner,
             model_selector,
@@ -14775,8 +15029,7 @@ mod tests {
             Arc::clone(&provider) as Arc<dyn concerto_core::traits::provider::LlmProvider>,
             Arc::new(NullMemoryStore),
         )
-        .with_policy_engine(coordinator_allow_all_policy());
-        (coordinator, provider)
+        .with_policy_engine(coordinator_allow_all_policy())
     }
 
     /// A pre-planning `WorkspaceSnapshot` whose inventory grounds the given
@@ -29506,6 +29759,645 @@ mod tests {
         assert!(
             attempt.payload["required_output"].as_str().unwrap_or_default().contains("default-nim"),
             "the failover names the alternate pipe's model: {attempt:?}"
+        );
+    }
+
+    /// Bounded alternate walk (smoke follow-up): a fallback failure that is a
+    /// 404 model-not-found means the PIPE is wrong, so the failover advances to
+    /// the NEXT capable alternate. With two dead pipes (default + first
+    /// alternate) and a live third, the third rescues the subtask after exactly
+    /// THREE attempts — never a fourth. Every attempt/outcome is recorded with
+    /// its pipe identity.
+    #[tokio::test]
+    async fn dispatch_failover_iterates_alternates_on_model_not_found() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        // The bound pipe is dead; the rebuild factory pops one scripted result
+        // per failover attempt: two 404s, then a success on the third pipe.
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        let rebuilt = Arc::new(MockExpertAgent::sequence(
+            role.clone(),
+            vec![
+                err_model_not_found(),
+                err_model_not_found(),
+                ok_result("researcher", "third pipe rescued the dead assignment"),
+            ],
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| {
+                rebuilt.clone() as Arc<dyn concerto_core::traits::agent::ExpertAgent>
+            }),
+        );
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("noop".into())],
+        );
+        let mut coordinator = coordinator
+            .with_review_store(Some(pool.clone()))
+            .with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            )
+            .with_fallback_pipes(vec![
+                (
+                    Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>,
+                    fallback_profile("alt1", "alt1-model"),
+                ),
+                (
+                    Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>,
+                    fallback_profile("alt2", "alt2-model"),
+                ),
+            ]);
+
+        let subtask = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: role.clone(),
+            description: "bounded alternate walk probe".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            subtask.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let failed = fallback_profile("bound", "bound-model");
+        let result = coordinator
+            .attempt_dispatch_failover(
+                &subtask,
+                &role,
+                &failed,
+                &context,
+                &CancellationToken::new(),
+                "test-failure",
+            )
+            .await;
+
+        assert!(result.is_some(), "the third pipe must rescue the dead dispatch");
+        assert_eq!(
+            coordinator.model_dispatch_count, 3,
+            "the bounded walk spends exactly three fallback attempts"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-attempted").count(),
+            3,
+            "three attempts are recorded, one per pipe: {reasons:?}"
+        );
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-failed").count(),
+            2,
+            "the two dead pipes are recorded as failed: {reasons:?}"
+        );
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-succeeded").count(),
+            1,
+            "the live third pipe is recorded as succeeded: {reasons:?}"
+        );
+        let attempts: Vec<&str> = logged
+            .iter()
+            .filter(|event| event.payload["reason"] == "dispatch-failover-attempted")
+            .filter_map(|event| event.payload["required_output"].as_str())
+            .collect();
+        assert!(
+            attempts.iter().any(|note| note.contains("default-model"))
+                && attempts.iter().any(|note| note.contains("alt1-model"))
+                && attempts.iter().any(|note| note.contains("alt2-model")),
+            "each attempt names its own pipe identity: {attempts:?}"
+        );
+    }
+
+    /// Hard ceiling: with FOUR dead pipes (default + three alternates), the
+    /// walk attempts exactly [`MAX_FALLBACK_ATTEMPTS`] (3) and never reaches
+    /// the fourth, so the failover can never loop pipes.
+    #[tokio::test]
+    async fn dispatch_failover_caps_at_three_attempts() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        // Four scripted results: three 404s then a success. The success is the
+        // fourth pipe and must NEVER be consulted.
+        let rebuilt = Arc::new(MockExpertAgent::sequence(
+            role.clone(),
+            vec![
+                err_model_not_found(),
+                err_model_not_found(),
+                err_model_not_found(),
+                ok_result("researcher", "fourth pipe must never run"),
+            ],
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| {
+                rebuilt.clone() as Arc<dyn concerto_core::traits::agent::ExpertAgent>
+            }),
+        );
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("noop".into())],
+        );
+        let make_pipe = || Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>;
+        let mut coordinator = coordinator
+            .with_review_store(Some(pool.clone()))
+            .with_default_model_provider(
+                Some(make_pipe()),
+                Some(fallback_profile("fallback", "default-model")),
+            )
+            .with_fallback_pipes(vec![
+                (make_pipe(), fallback_profile("alt1", "alt1-model")),
+                (make_pipe(), fallback_profile("alt2", "alt2-model")),
+                (make_pipe(), fallback_profile("alt3", "alt3-model")),
+            ]);
+
+        let subtask = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: role.clone(),
+            description: "attempt ceiling probe".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            subtask.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let failed = fallback_profile("bound", "bound-model");
+        let result = coordinator
+            .attempt_dispatch_failover(
+                &subtask,
+                &role,
+                &failed,
+                &context,
+                &CancellationToken::new(),
+                "test-failure",
+            )
+            .await;
+
+        assert!(result.is_none(), "the fourth pipe must never rescue the walk");
+        assert_eq!(
+            coordinator.model_dispatch_count, MAX_FALLBACK_ATTEMPTS,
+            "the walk is capped at {MAX_FALLBACK_ATTEMPTS} attempts"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-attempted").count(),
+            MAX_FALLBACK_ATTEMPTS,
+            "exactly the ceiling number of attempts is recorded: {reasons:?}"
+        );
+    }
+
+    /// Bounded walk guard: with only ONE fallback pipe, a 404 failure has
+    /// nowhere to advance to, so the failover attempts exactly once and the
+    /// original failure stands — unchanged from the historical behavior.
+    #[tokio::test]
+    async fn dispatch_failover_single_fallback_pipe_attempts_once() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        // Exactly one scripted 404: a second attempt (if any) would succeed,
+        // so a non-None result would reveal an unbounded walk.
+        let rebuilt = Arc::new(MockExpertAgent::sequence(
+            role.clone(),
+            vec![err_model_not_found(), ok_result("researcher", "must never be consulted")],
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| {
+                rebuilt.clone() as Arc<dyn concerto_core::traits::agent::ExpertAgent>
+            }),
+        );
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("noop".into())],
+        );
+        let mut coordinator =
+            coordinator.with_review_store(Some(pool.clone())).with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            );
+
+        let subtask = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: role.clone(),
+            description: "single fallback probe".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            subtask.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let failed = fallback_profile("bound", "bound-model");
+        let result = coordinator
+            .attempt_dispatch_failover(
+                &subtask,
+                &role,
+                &failed,
+                &context,
+                &CancellationToken::new(),
+                "test-failure",
+            )
+            .await;
+
+        assert!(result.is_none(), "with no further pipe the failover must surface the failure");
+        assert_eq!(
+            coordinator.model_dispatch_count, 1,
+            "the single fallback pipe is attempted exactly once"
+        );
+    }
+
+    /// Non-404 fallback failure keeps the historical single-attempt semantics:
+    /// an auth failure is a credential problem, not a wrong pipe, so the
+    /// configured alternate is NOT tried and the failure surfaces immediately.
+    #[tokio::test]
+    async fn dispatch_failover_non_model_not_found_keeps_single_attempt() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        let bound = Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_model_not_found()]));
+        // The default pipe fails auth; the alternate would succeed — it must
+        // never be consulted because the failure class is not model-not-found.
+        let rebuilt = Arc::new(MockExpertAgent::sequence(
+            role.clone(),
+            vec![err_auth(), ok_result("researcher", "alternate must never run")],
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| {
+                rebuilt.clone() as Arc<dyn concerto_core::traits::agent::ExpertAgent>
+            }),
+        );
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![CoordinatorTurn::Text("noop".into())],
+        );
+        let mut coordinator = coordinator
+            .with_review_store(Some(pool.clone()))
+            .with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            )
+            .with_fallback_pipes(vec![(
+                Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>,
+                fallback_profile("alt1", "alt1-model"),
+            )]);
+
+        let subtask = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: Ulid::new(),
+            role: role.clone(),
+            description: "auth fallback probe".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            subtask.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let failed = fallback_profile("bound", "bound-model");
+        let result = coordinator
+            .attempt_dispatch_failover(
+                &subtask,
+                &role,
+                &failed,
+                &context,
+                &CancellationToken::new(),
+                "test-failure",
+            )
+            .await;
+
+        assert!(result.is_none(), "an auth fallback failure must surface, not advance");
+        assert_eq!(
+            coordinator.model_dispatch_count, 1,
+            "a non-404 failure keeps single-attempt semantics"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<&str> = logged
+            .iter()
+            .filter_map(|event| event.payload.get("reason").and_then(|reason| reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "dispatch-failover-attempted").count(),
+            1,
+            "only the default pipe is attempted: {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&"dispatch-failover-succeeded"),
+            "the alternate must never rescue an auth class: {reasons:?}"
+        );
+    }
+
+    /// Planning-recovery counterpart of the bounded walk: the planning pipe
+    /// fails, then the default pipe and the first alternate both 404 (wrong
+    /// pipe), and the second alternate serves the recovered planning turn.
+    /// Exactly three fallback attempts, each recorded with its pipe identity.
+    #[tokio::test]
+    async fn planning_recovery_iterates_alternates_on_model_not_found() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        let default_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let default_pipe: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 404,
+                    retry_after: None,
+                    message: "model not found".to_owned(),
+                },
+                default_requests.clone(),
+            ));
+        let alt1_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let alt1: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 404,
+                    retry_after: None,
+                    message: "model not found".to_owned(),
+                },
+                alt1_requests.clone(),
+            ));
+        let alt2 = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Recovered plan\nsecond alternate produced it".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((default_pipe.clone(), fallback_profile("nim", "default-nim"))),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")))
+        .with_fallback_pipes(vec![
+            (alt1.clone(), fallback_profile("alt1", "alt1-model")),
+            (
+                alt2.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("alt2", "alt2-model"),
+            ),
+        ]);
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the second alternate must complete the recovery, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("second alternate produced it"),
+            "the recovered plan is the final message: {}",
+            output.final_message,
+        );
+        assert_eq!(
+            default_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the default pipe is consulted once"
+        );
+        assert_eq!(
+            alt1_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first alternate is consulted once"
+        );
+        assert_eq!(alt2.turn_count(), 1, "the second alternate serves the recovered turn");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        let reasons: Vec<&str> =
+            decisions.iter().filter_map(|event| event.payload["reason"].as_str()).collect();
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| **reason == "planning-provider-recovery-attempted")
+                .count(),
+            3,
+            "three fallback attempts are recorded: {reasons:?}"
+        );
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == "planning-provider-recovery-failed").count(),
+            2,
+            "the two wrong pipes are recorded as failed: {reasons:?}"
+        );
+    }
+
+    /// Planning-recovery guard: a fallback failure that is NOT a model-not-found
+    /// (auth) keeps the historical single attempt — the alternate is never
+    /// consulted even though it is configured and would succeed.
+    #[tokio::test]
+    async fn planning_recovery_non_model_not_found_keeps_single_attempt() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::HttpStatus {
+                    status: 400,
+                    retry_after: None,
+                    message: "planning rejection (100% deliberate)".to_owned(),
+                },
+                primary_requests,
+            ));
+        let default_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let default_pipe: Arc<dyn concerto_core::traits::provider::LlmProvider> = Arc::new(
+            PlanningFailureProvider::new(ProviderError::AuthFailure, default_requests.clone()),
+        );
+        let alternate = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# must never be produced".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((default_pipe.clone(), fallback_profile("nim", "default-nim"))),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")))
+        .with_fallback_pipes(vec![(
+            alternate.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+            fallback_profile("alt1", "alt1-model"),
+        )]);
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an auth fallback failure must pause as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(
+            default_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the default pipe is consulted exactly once"
+        );
+        assert_eq!(
+            alternate.turn_count(),
+            0,
+            "a non-404 failure must not advance to the alternate"
+        );
+    }
+
+    /// The pause text and the completion `files[]` must reflect artifacts a
+    /// LATER planning failure interrupted. The coordinator self-writes one file
+    /// during planning, then the next planning turn 404s and recovery is
+    /// unavailable, pausing the run: the produced file must appear in
+    /// `files_modified` and the message must name the implemented-file count
+    /// instead of claiming no plan was ever made.
+    #[tokio::test]
+    async fn planning_pause_reports_produced_files_and_count() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let provider = Arc::new(
+            TurnProvider::new(vec![CoordinatorTurn::Calls(vec![test_write_tool_call(
+                "src/impl.rs",
+            )])])
+            .with_terminal_error(ProviderError::HttpStatus {
+                status: 404,
+                retry_after: None,
+                message: "model not found".to_owned(),
+            }),
+        );
+        let coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            provider.clone(),
+        )
+        .with_executor(self_execute_executor())
+        .with_review_store(Some(pool.clone()));
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (output, _events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a planning pause is Partial: {}",
+            output.final_message,
+        );
+        assert!(
+            output.files_modified.iter().any(|path| path.as_str() == "src/impl.rs"),
+            "the produced artifact must survive into the completion files[]: {:?}",
+            output.files_modified
+        );
+        assert!(
+            output.final_message.contains("implemented 1 file"),
+            "the pause text must name the implemented-file count: {}",
+            output.final_message
+        );
+    }
+
+    /// Regression guard for the pause text: when the run produced NO files, the
+    /// original "could not produce a valid plan" wording is preserved.
+    #[tokio::test]
+    async fn planning_pause_without_files_keeps_original_text() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let provider = Arc::new(TurnProvider::new(Vec::new()).with_terminal_error(
+            ProviderError::HttpStatus {
+                status: 404,
+                retry_after: None,
+                message: "model not found".to_owned(),
+            },
+        ));
+        let coordinator =
+            coordinator_with_turn_provider(bus.clone(), Arc::new(AgentRegistry::new()), provider)
+                .with_review_store(Some(pool.clone()));
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (output, _events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert!(
+            output.files_modified.is_empty(),
+            "a run that produced nothing reports no files: {:?}",
+            output.files_modified
+        );
+        assert!(
+            output.final_message.contains("could not produce a valid plan"),
+            "with no artifacts the original pause wording stands: {}",
+            output.final_message
         );
     }
 
