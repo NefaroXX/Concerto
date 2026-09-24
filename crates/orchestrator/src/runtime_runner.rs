@@ -491,13 +491,14 @@ async fn maintain_context_after_run(
 const DEFAULT_MAX_ITERATIONS: u32 = 25;
 use concerto_eval::EvalEngine;
 use concerto_memory::embedder::{EmbeddingGenerator, ProviderEmbedder};
-use concerto_memory::entities::L1DedupJudge;
+use concerto_memory::entities::{L1DedupJudge, L1Extractor};
 use concerto_memory::fts::SqliteFullTextStore;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
 use concerto_memory::links::LinkStore;
 use concerto_memory::rag::{CascadeTier, LinkCascadeConfig};
 use concerto_memory::scoring::DECAY_FLOOR_DAYS;
 use concerto_memory::storage::MemoryDb;
+use concerto_memory::summarizer::LLMSummarizer;
 use concerto_memory::sync::ChunkSyncService;
 use concerto_memory::vector_store::SqliteVectorStore;
 use concerto_memory::watcher::{FileWatcher, ReindexQueueDrainer};
@@ -1402,14 +1403,19 @@ pub async fn init_memory_system_with_handles(
         project_id.clone(),
         global_store,
     );
-    // L1 dedup judge (ADR-46 symbolic offload): attach it inside this
-    // initializer so EVERY runtime path that builds a project memory system
-    // gets it — desktop pre-init, the persistent runner, and
-    // `run_shared_agent` alike (the store is cached per project and reused).
+    // ADR-46 L1 symbolic pass: the dedup judge AND the typed extractor
+    // (TODO.md "L1 typed extraction") share ONE summarizer — one resolved
+    // provider/model — and the same `[memory] dedup_judge` gate, so no new
+    // config key is introduced. Attach both inside this initializer so EVERY
+    // runtime path that builds a project memory system gets them — desktop
+    // pre-init, the persistent runner, and `run_shared_agent` alike (the
+    // store is cached per project and reused).
     // Fail-open: dedup disabled by config or an unresolvable model provider
-    // leaves the judge off and stores behave exactly as before (plain writes).
-    let system = match build_dedup_judge(config, &lifecycle) {
-        Some(judge) => system.with_dedup_judge(judge),
+    // leaves both off and stores behave exactly as before (plain writes).
+    let system = match build_llm_summarizer(config, &lifecycle) {
+        Some(summarizer) => system
+            .with_dedup_judge(L1DedupJudge::new(Arc::clone(&summarizer)))
+            .with_l1_extractor(L1Extractor::new(summarizer)),
         None => system,
     };
     // ADR-69 slice 1 link store: attach it inside this initializer so EVERY
@@ -1512,21 +1518,27 @@ pub async fn init_memory_system_with_handles(
     Ok(MemorySystemHandles { store: system as Arc<dyn MemoryStore>, decision_store, task_tree })
 }
 
-/// Build the L1 dedup judge for project-namespace memory stores, or `None`.
+/// Build the shared summarizer behind the ADR-46 L1 symbolic pass, or `None`.
 ///
-/// The judge is wired from the *default* resolved model rather than the
-/// model a specific run selects: it is advisory (ADR-46 symbolic offload),
-/// so a cheap, stable judge model is preferable to chasing per-run parity.
+/// One summarizer serves BOTH consumers of the pass: the L1 dedup judge and
+/// the L1 typed extractor (TODO.md "L1 typed extraction"), so both always
+/// talk to the same resolved model. It is wired from the *default* resolved
+/// model rather than the model a specific run selects: the pass is advisory
+/// (ADR-46 symbolic offload), so a cheap, stable model is preferable to
+/// chasing per-run parity.
 ///
 /// Fail-open by construction:
-/// - `[memory] dedup_judge = false` disables the service entirely;
+/// - `[memory] dedup_judge = false` disables the whole pass;
 /// - a provider that cannot be resolved at init time (e.g. plugin-backed
 ///   only configs, or a missing model configuration) logs at debug and
 ///   yields `None`, leaving `MemorySystem` stores byte-identical to the
-///   pre-judge behavior.
-fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Option<L1DedupJudge> {
+///   pre-pass behavior.
+fn build_llm_summarizer(
+    config: &AppConfig,
+    lifecycle: &CancellationToken,
+) -> Option<Arc<dyn LLMSummarizer>> {
     if !config.memory.dedup_judge {
-        tracing::debug!("l1 dedup judge disabled by [memory] dedup_judge=false");
+        tracing::debug!("l1 symbolic pass disabled by [memory] dedup_judge=false");
         return None;
     }
     // No plugin providers are loaded inside memory init; resolution is
@@ -1538,16 +1550,12 @@ fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Optio
             Err(error) => {
                 tracing::debug!(
                     %error,
-                    "l1 dedup judge not attached: no resolvable model provider at memory init"
+                    "l1 symbolic pass not attached: no resolvable model provider at memory init"
                 );
                 return None;
             }
         };
-    Some(L1DedupJudge::new(Arc::new(ProviderSummarizer::new(
-        provider,
-        model,
-        lifecycle.child_token(),
-    ))))
+    Some(Arc::new(ProviderSummarizer::new(provider, model, lifecycle.child_token())))
 }
 
 /// Build the ADR-69 slice-1 symbolic link store over the project memory pool,

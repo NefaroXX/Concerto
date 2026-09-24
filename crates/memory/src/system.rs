@@ -18,6 +18,7 @@ use concerto_core::memory::{
     MemoryLinkKind, MemoryNamespace, MemoryQuery, ProjectId,
 };
 use concerto_core::traits::memory::MemoryStore;
+use concerto_core::types::{Message, Role};
 use concerto_core::CancellationToken;
 
 use tracing;
@@ -26,7 +27,7 @@ use crate::budget::ContextBudgetAllocator;
 use crate::decision_store::DecisionStore;
 use crate::embedder::EmbeddingGenerator;
 use crate::embedder_health::EmbedderHealth;
-use crate::entities::{L1Candidate, L1DedupJudge, L1DedupVerdict};
+use crate::entities::{L1Candidate, L1DedupJudge, L1DedupVerdict, L1ExtractedMemory, L1Extractor};
 use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
 use crate::links::{links_from_metadata, LinkStore};
@@ -109,6 +110,23 @@ pub struct DedupJudgeCounters {
     pub failures: AtomicUsize,
 }
 
+/// Outcome counters for the L1 typed-extraction pass (TODO.md "L1 typed
+/// extraction").
+///
+/// Only conversation-derived `SessionSummary` stores run the pass, so a
+/// store call that never reached the extractor (no extractor configured, or
+/// a non-summary entry) leaves every counter untouched. `failures` counts
+/// every fail-soft pass — an extractor error or a derived-write error — which
+/// is exactly the signal that typed extraction silently degraded to the plain
+/// parent store.
+#[derive(Debug, Default)]
+pub struct L1ExtractCounters {
+    /// Typed memories derived from a stored slice and written through `store`.
+    pub extracted: AtomicUsize,
+    /// Fail-soft passes (extraction error or a derived-write error).
+    pub failures: AtomicUsize,
+}
+
 /// The integrated Phase 4 memory system.
 ///
 /// Wraps all memory layers and presents a unified `MemoryStore` interface.
@@ -141,6 +159,18 @@ pub struct MemorySystem {
     /// [`StoreLinkScorer`]; when either is missing, `retrieve` keeps the
     /// plain RRF path (unchanged).
     link_cascade: Option<LinkCascadeConfig>,
+    /// Optional L1 typed extractor (TODO.md "L1 typed extraction"). When set,
+    /// storing a conversation-derived `SessionSummary` slice additionally
+    /// extracts typed long-horizon memories (`persona` / `episodic` /
+    /// `instruction` / `work_fact`) and writes EACH of them through the same
+    /// `store` path, so the dedup judge, ADR-69 links, the embedder and FTS
+    /// all treat derived memories exactly like hand-written ones. Fail-soft:
+    /// an extractor or derived-write error logs a warning and never changes
+    /// the parent store's result. Recursion is impossible — derived memories
+    /// are `Fact` entries, which never re-enter the pass.
+    l1_extractor: Option<L1Extractor>,
+    /// L1 typed-extraction outcome counters (see [`L1ExtractCounters`]).
+    l1_counters: L1ExtractCounters,
 }
 
 impl MemorySystem {
@@ -170,6 +200,8 @@ impl MemorySystem {
             dedup_counters: DedupJudgeCounters::default(),
             link_store: None,
             link_cascade: None,
+            l1_extractor: None,
+            l1_counters: L1ExtractCounters::default(),
         }
     }
     /// Access the decision store.
@@ -218,6 +250,23 @@ impl MemorySystem {
     /// judge / recall error logs a warning and stores the entry unchanged.
     pub fn with_dedup_judge(mut self, judge: L1DedupJudge) -> Self {
         self.dedup_judge = Some(judge);
+        self
+    }
+
+    /// Enable the L1 typed extractor for conversation-derived stores (TODO.md
+    /// "L1 typed extraction").
+    ///
+    /// When configured, every successful project-namespace store of a
+    /// `SessionSummary` entry (the conversation-derived slice written at task
+    /// completion) additionally extracts typed long-horizon memories and
+    /// writes each through [`MemoryStore::store`], so the ADR-46 dedup judge
+    /// and ADR-69 links apply to derived memories too. The pass is opt-in
+    /// (nothing selects it unless attached here) and fail-soft: an extractor
+    /// or derived-write error logs a warning, bumps
+    /// [`L1ExtractCounters::failures`], and leaves the parent store's result
+    /// untouched.
+    pub fn with_l1_extractor(mut self, extractor: L1Extractor) -> Self {
+        self.l1_extractor = Some(extractor);
         self
     }
 
@@ -276,6 +325,69 @@ impl MemorySystem {
     /// infrastructure.
     pub fn dedup_counters(&self) -> &DedupJudgeCounters {
         &self.dedup_counters
+    }
+
+    /// Outcome counters for the L1 typed-extraction pass (see
+    /// [`L1ExtractCounters`]). Exposed for observability and tests.
+    pub fn l1_counters(&self) -> &L1ExtractCounters {
+        &self.l1_counters
+    }
+
+    /// Derive typed L1 memories from a stored conversation-derived slice.
+    ///
+    /// Live seam for TODO.md "L1 typed extraction": only `SessionSummary`
+    /// entries (the conversation-derived slice written at task completion)
+    /// are extracted, and each derived memory is written through the SAME
+    /// [`MemoryStore::store`] path, so the dedup judge, ADR-69 links, the
+    /// embedder and FTS apply to derived memories exactly as to hand-written
+    /// ones. Derived memories are `Fact` entries, so the pass cannot recurse.
+    ///
+    /// Fail-soft by contract: no extractor, a non-summary entry, a cancelled
+    /// token, an extractor error, or a derived-write error logs at most a
+    /// warning and leaves the parent store's result untouched.
+    async fn extract_l1_memories(&self, entry: &MemoryEntry, cancel: CancellationToken) {
+        let Some(extractor) = self.l1_extractor.as_ref() else {
+            return;
+        };
+        if entry.chunk_type != ChunkType::SessionSummary || cancel.is_cancelled() {
+            return;
+        }
+        let messages = vec![Message {
+            role: Role::User,
+            content: entry.content.clone(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }];
+        let extracted = match extractor.extract(&messages).await {
+            Ok(memories) => memories,
+            Err(error) => {
+                self.l1_counters.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%error, entry = %entry.id.0, "l1 typed extraction failed; continuing");
+                return;
+            }
+        };
+        for memory in extracted {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let derived = derived_l1_entry(entry, &memory);
+            match <Self as MemoryStore>::store(self, derived, cancel.clone()).await {
+                Ok(_) => {
+                    self.l1_counters.extracted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    self.l1_counters.failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        %error,
+                        kind = ?memory.kind,
+                        "failed to store L1 typed memory; continuing"
+                    );
+                }
+            }
+        }
     }
 
     /// Decide how a project-namespace entry relates to already-stored chunks.
@@ -653,8 +765,8 @@ impl MemoryStore for MemorySystem {
             end_line: None,
             chunk_type: entry.chunk_type,
             vector,
-            model_id: entry.model_id.unwrap_or_default(),
-            model_version: entry.model_version.unwrap_or_default(),
+            model_id: entry.model_id.clone().unwrap_or_default(),
+            model_version: entry.model_version.clone().unwrap_or_default(),
             stale: false,
             created_at: entry.created_at,
         };
@@ -688,11 +800,19 @@ impl MemoryStore for MemorySystem {
 
         // Supersede the replaced/merged chunk ONLY after the write succeeded,
         // so a tombstone failure is logged-and-kept rather than data loss.
+        let derive_cancel = cancel.clone();
         if let Some(target_id) = tombstone_after {
             self.sync.tombstone(&target_id, &self.project_id, cancel).await.map_err(|e| {
                 CoreMemoryError::Persistence(format!("failed to supersede memory {target_id}: {e}"))
             })?;
         }
+
+        // L1 typed extraction (live store path): a conversation-derived
+        // summary additionally yields typed long-horizon memories, each
+        // written through this same `store` path — so the dedup judge, links,
+        // embedding and FTS all apply to derived memories. Fail-soft: any
+        // problem here logs and never changes the parent's `Ok(entry.id)`.
+        self.extract_l1_memories(&entry, derive_cancel).await;
 
         Ok(entry.id)
     }
@@ -758,6 +878,45 @@ fn validate_scope(
         // still uses validate_scope for project-scoped browsing.
         MemoryNamespace::Global { .. } => Ok(()),
         _ => Err(CoreMemoryError::RetrievalFailed("unknown namespace".into())),
+    }
+}
+
+/// Build the `Fact` entry for one L1-extracted memory.
+///
+/// The derived entry inherits the parent slice's project and namespace, and
+/// its `session_id` metadata when present, so it lands in the same recall
+/// scope. Provenance and the typed attributes ride along as metadata
+/// (`l1_kind`, `derived_from`, plus optional `scene` / `owner` / `deadline` /
+/// `status`), which is how recall and the desktop browser can tell a typed
+/// memory apart from a plain fact.
+fn derived_l1_entry(parent: &MemoryEntry, memory: &L1ExtractedMemory) -> MemoryEntry {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("l1_kind".into(), memory.kind.as_str().into());
+    metadata.insert("derived_from".into(), parent.id.0.to_string().into());
+    for (key, value) in [
+        ("scene", &memory.scene),
+        ("owner", &memory.owner),
+        ("deadline", &memory.deadline),
+        ("status", &memory.status),
+    ] {
+        if let Some(value) = value {
+            metadata.insert(key.to_owned(), value.as_str().into());
+        }
+    }
+    if let Some(session_id) = parent.metadata.get("session_id") {
+        metadata.insert("session_id".into(), session_id.clone());
+    }
+    MemoryEntry {
+        id: MemoryId(ulid::Ulid::new()),
+        project_id: parent.project_id.clone(),
+        namespace: parent.namespace.clone(),
+        content: memory.content.clone(),
+        chunk_type: ChunkType::Fact,
+        model_id: None,
+        model_version: None,
+        metadata: serde_json::Value::Object(metadata),
+        expires_at: None,
+        created_at: parent.created_at,
     }
 }
 
@@ -1684,5 +1843,116 @@ mod tests {
             "without the cascade, links must not change RRF order"
         );
         assert_eq!(results[1].id, "b_linked");
+    }
+
+    // ------------------------------------------------------------------
+    // L1 typed extraction — the live store-path seam (TODO.md
+    // "L1 typed extraction": extractor + typed memories land on `store`).
+    // ------------------------------------------------------------------
+
+    /// A conversation-derived `SessionSummary` slice, as written at task
+    /// completion (see `AgentLoop::store_task_summary`).
+    fn summary_entry(content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: MemoryId(ulid::Ulid::new()),
+            project_id: ProjectId("test".into()),
+            namespace: MemoryNamespace::Project(ProjectId("test".into())),
+            content: content.into(),
+            chunk_type: ChunkType::SessionSummary,
+            model_id: None,
+            model_version: None,
+            metadata: serde_json::json!({ "session_id": "session-1" }),
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_of_session_summary_extracts_typed_memories() {
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        let extractor = L1Extractor::new(Arc::new(FakeSummarizer::new(
+            r#"{"memories":[
+                {"type":"episodic","scene":"setup","content":"user prefers rust edition 2024"},
+                {"type":"work_fact","owner":"me","content":"concerto workspace uses sqlx"}
+            ]}"#,
+        )));
+        let system =
+            dedup_system(vector_store.clone(), fts_store, None).with_l1_extractor(extractor);
+
+        let parent = summary_entry("Task: wire the L1 extractor\nResult: done");
+        let stored = system.store(parent.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(stored, parent.id);
+
+        let records = stored_records(&vector_store, &ProjectId("test".into())).await;
+        // The parent summary plus exactly two derived memories: a derived
+        // `Fact` never re-enters the pass, so extraction cannot recurse.
+        assert_eq!(records.len(), 3);
+        assert_eq!(system.l1_counters().extracted.load(Ordering::Relaxed), 2);
+        assert_eq!(system.l1_counters().failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn l1_extraction_failure_keeps_the_parent_store() {
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        let extractor = L1Extractor::new(Arc::new(FakeSummarizer::new_err("extractor down")));
+        let system =
+            dedup_system(vector_store.clone(), fts_store, None).with_l1_extractor(extractor);
+
+        let parent = summary_entry("Task: anything");
+        system.store(parent.clone(), CancellationToken::new()).await.unwrap();
+
+        let records = stored_records(&vector_store, &ProjectId("test".into())).await;
+        assert_eq!(records.len(), 1, "the parent summary survives a failed extraction");
+        assert_eq!(system.l1_counters().extracted.load(Ordering::Relaxed), 0);
+        assert_eq!(system.l1_counters().failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn only_conversation_summaries_trigger_extraction() {
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        let extractor = L1Extractor::new(Arc::new(FakeSummarizer::new(
+            r#"{"memories":[{"type":"persona","content":"user likes rust"}]}"#,
+        )));
+        let system =
+            dedup_system(vector_store.clone(), fts_store, None).with_l1_extractor(extractor);
+
+        system.store(dedup_entry("plain fact"), CancellationToken::new()).await.unwrap();
+
+        let records = stored_records(&vector_store, &ProjectId("test".into())).await;
+        assert_eq!(records.len(), 1, "a non-summary store must not extract");
+        assert_eq!(system.l1_counters().extracted.load(Ordering::Relaxed), 0);
+        assert_eq!(system.l1_counters().failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn derived_entry_carries_l1_provenance_and_parent_scope() {
+        use crate::entities::L1MemoryType;
+
+        let parent = summary_entry("Task: ship it");
+        let memory = L1ExtractedMemory {
+            id: ulid::Ulid::new().to_string(),
+            kind: L1MemoryType::Instruction,
+            scene: Some("review".into()),
+            content: "always run fmt before pushing".into(),
+            owner: None,
+            deadline: None,
+            status: Some("active".into()),
+        };
+
+        let derived = derived_l1_entry(&parent, &memory);
+
+        assert_eq!(derived.chunk_type, ChunkType::Fact);
+        assert_eq!(derived.namespace, parent.namespace);
+        assert_eq!(derived.project_id, parent.project_id);
+        assert_eq!(derived.content, memory.content);
+        assert_eq!(derived.metadata["l1_kind"], "instruction");
+        assert_eq!(derived.metadata["scene"], "review");
+        assert_eq!(derived.metadata["status"], "active");
+        assert_eq!(derived.metadata["session_id"], "session-1");
+        assert_eq!(derived.metadata["derived_from"], parent.id.0.to_string());
+        assert!(derived.metadata.get("owner").is_none(), "unset attributes stay unset");
     }
 }
