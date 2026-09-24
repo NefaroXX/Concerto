@@ -79,9 +79,10 @@ pub enum TranscriptEntry {
 /// ADR-58 P2+P3 (F8): the orchestrator resolves these from the resolved
 /// blueprint's `StageDef.label` per run and threads them through the recorder,
 /// so a renamed gate renders its configured label in live and restored
-/// transcripts. The defaults reproduce the pre-blueprint strings exactly
-/// ("Reviewer"/"Validator"), keeping every transcript on the default
-/// `standard` blueprint byte-identical.
+/// transcripts. The defaults are the generic gate strings ("Review" /
+/// "Validate") — never role ids — and match the default `standard` blueprint's
+/// stage labels, so the resolved-facade path and the facade-less fallback
+/// agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateLabels {
     /// Label for review-cycle activity entries.
@@ -92,7 +93,7 @@ pub struct GateLabels {
 
 impl Default for GateLabels {
     fn default() -> Self {
-        Self { review: "Reviewer".to_string(), validate: "Validator".to_string() }
+        Self { review: "Review".to_string(), validate: "Validate".to_string() }
     }
 }
 
@@ -782,7 +783,7 @@ mod tests {
         assert_eq!(
             review,
             Some(TranscriptEntry::Activity {
-                agent: "Reviewer".into(),
+                agent: "Review".into(),
                 content: format!("Started review cycle 2 for subtask {tid}."),
             })
         );

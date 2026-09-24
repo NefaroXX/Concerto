@@ -139,6 +139,14 @@ pub enum HandoffDeliverable {
 /// gate allows 6 review cycles (the Review gate cap) and the Validator→Coder
 /// gate allows 5 validation cycles (the Acceptance gate cap); parity.rs §5
 /// pins these to the stage-kind defaults.
+///
+/// FOLLOW-UP (deliberate, this round): these defaults stay **id-based seed
+/// data** — they mirror the pre-ADR-58 engine tables and the standard
+/// blueprint's relationship rows verbatim. They are NOT rewritten to
+/// stage-kind pairs here; that migration would change the seed semantics and
+/// belongs in a dedicated ADR-58/ADR-35 follow-up. The cross-site consistency
+/// test (`seed_sites_agree_on_builtin_specialist_ids`) pins the id set so the
+/// seeds cannot drift in the meantime.
 pub fn default_collaboration_rules() -> Vec<CollaborationRule> {
     vec![
         CollaborationRule {

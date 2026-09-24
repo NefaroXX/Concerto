@@ -939,27 +939,21 @@ impl Drop for TranscriptRecorderGuard {
 /// ADR-58 P2+P3 (F8): resolve the review/validate gate labels for transcript
 /// activity entries from the resolved blueprint's stage definitions.
 ///
-/// The canonical stage labels ("Review"/"Validate") on the default `standard`
-/// blueprint produce the pre-blueprint transcript strings ("Reviewer" /
-/// "Validator") via [`GateLabels::default`], keeping transcripts byte-
-/// identical. A custom blueprint that renames a gate stage surfaces its
-/// configured label in live and restored transcripts instead. Without a
-/// resolved blueprint (tests, `[orchestration]`-less configs) the canonical
-/// labels are used. Gates are resolved by kind, so renamed review/validate
-/// tags still surface their labels (issue #150).
+/// The gate stage's configured `StageDef.label` is used directly (resolved by
+/// KIND, so a renamed review/validate tag still surfaces its label — issue
+/// #150); on the default `standard` blueprint those labels are the generic
+/// "Review" / "Validate" strings. Without a resolved blueprint (tests,
+/// `[orchestration]`-less configs) [`GateLabels::default`] supplies the same
+/// generic fallback — never a role id.
 fn gate_labels_for_resolved(resolved: Option<&ResolvedBlueprint>) -> GateLabels {
     let Some(resolved) = resolved else { return GateLabels::default() };
     let facade = BlueprintFacade::new(resolved);
     let mut labels = GateLabels::default();
     if let Some(stage) = facade.first_stage_of_kind(StageKind::Review) {
-        if stage.def.label != "Review" {
-            labels.review = stage.def.label.clone();
-        }
+        labels.review = stage.def.label.clone();
     }
     if let Some(stage) = facade.first_stage_of_kind(StageKind::Acceptance) {
-        if stage.def.label != "Validate" {
-            labels.validate = stage.def.label.clone();
-        }
+        labels.validate = stage.def.label.clone();
     }
     labels
 }
@@ -2065,8 +2059,8 @@ async fn create_session_and_recorder(
     let event_recorder = start_event_recorder(bus, session_manager.store(), resolved_session_id);
     // ADR-58 P2+P3 (F8): the review/validate gate labels for transcript
     // activity entries come from the resolved blueprint's stage definitions.
-    // The default `standard` blueprint produces the canonical
-    // "Reviewer"/"Validator" strings, keeping transcripts byte-identical.
+    // The default `standard` blueprint produces the generic
+    // "Review"/"Validate" gate labels (never role ids).
     let gate_labels = gate_labels_for_resolved(services.config.resolved_blueprint.as_deref());
     let transcript_recorder =
         start_transcript_recorder(bus, session_manager.store(), resolved_session_id, gate_labels);
@@ -4185,7 +4179,8 @@ async fn run_multi_agent(
     let run_facade = facade.clone();
     // Policy checks, routing, coordination, and actual-cost recording all
     // share one tracker so estimates are not charged as spend.
-    let runner = AgentRunner::new(registry.clone(), services.bus.clone(), spend_tracker.clone());
+    let runner = AgentRunner::new(registry.clone(), services.bus.clone(), spend_tracker.clone())
+        .with_blueprint_facade(facade.clone());
     let routing = Arc::new(
         RoutingEngine::new(
             profiles.clone(),
@@ -4212,7 +4207,8 @@ async fn run_multi_agent(
             services.bus.clone(),
         )
         .with_provider_pins(provider_pins)
-        .with_tool_calling_roles(tool_calling_roles),
+        .with_tool_calling_roles(tool_calling_roles)
+        .with_blueprint_facade(facade.clone()),
     );
     let selector =
         Arc::new(ModelSelector::new(Arc::new(ModelRegistry::from_profiles(profiles)), routing));
@@ -4695,15 +4691,15 @@ async fn run_multi_agent(
 // for the child, never process termination. There is no direct executor write
 // anywhere on this path.
 //
-// ADR-60 Deferred 3 (implemented): review-cycle resumability lives in
-// `plan_approval.rs` (shared `ReviewState` whiteboard kind + payload, one
-// serialization for every path) and `coordinator.rs::run_review_cycle`
-// (WAL-before-invoke snapshots at every cycle transition + validated
-// rehydration on entry). The coordinator path attaches the store in this
-// file behind the D7 opt-in. Supervised CHILDREN are single-agent loops and
-// run no multi-agent review cycles today; when they gain review
-// participation (Phase 4), they must reuse the same plan_approval helpers —
-// not a second serialization.
+// ADR-60 Deferred 3: review-state resumability lives in `plan_approval.rs`
+// (shared `ReviewState` whiteboard kind + payload, one serialization for
+// every path). ADR-35 amendment (2026-09-16 §1) removed the automatic
+// `run_review_cycle` / `run_validation_loop` gates, so review/validation are
+// now Coordinator `call_specialist` decisions with no compiled cycle driver.
+// The coordinator path still attaches the store in this file behind the D7
+// opt-in. Supervised CHILDREN are single-agent loops and run no multi-agent
+// review cycles today; when they gain review participation (Phase 4), they
+// must reuse the same plan_approval helpers — not a second serialization.
 // ===========================================================================
 
 /// Wall-clock budget for one supervised multi-agent run before it is torn
@@ -8869,22 +8865,22 @@ mod runtime_runner_tests {
         use concerto_config::blueprint::OrchestrationConfig;
 
         // No resolved blueprint (tests, `[orchestration]`-less configs):
-        // the canonical labels are used.
+        // the generic gate labels are used (never role ids).
         assert_eq!(
             gate_labels_for_resolved(None),
-            GateLabels { review: "Reviewer".into(), validate: "Validator".into() },
+            GateLabels { review: "Review".into(), validate: "Validate".into() },
         );
 
-        // The default `standard` blueprint carries the canonical stage labels
-        // ("Review"/"Validate"), so the canonical transcript strings survive
-        // untouched — transcripts stay byte-identical on the default.
+        // The default `standard` blueprint carries the generic stage labels
+        // ("Review"/"Validate"), so the resolved path and the facade-less
+        // fallback agree.
         let resolved = OrchestrationConfig::default()
             .resolve(&[], None)
             .expect("the standard blueprint must validate and resolve");
         assert_eq!(
             gate_labels_for_resolved(Some(&resolved)),
-            GateLabels { review: "Reviewer".into(), validate: "Validator".into() },
-            "standard blueprint keeps the canonical gate labels"
+            GateLabels { review: "Review".into(), validate: "Validate".into() },
+            "standard blueprint uses the generic gate labels"
         );
     }
 

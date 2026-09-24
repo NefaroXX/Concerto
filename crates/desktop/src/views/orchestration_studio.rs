@@ -4601,6 +4601,82 @@ mod tests {
         assert_eq!(state.agents.len(), 4);
     }
 
+    /// Cross-site seed consistency (ADR-35/58): every seed/roster site must
+    /// agree on the same built-in specialist id set, so a rename or addition
+    /// in one site cannot silently drift the others. Sites checked: config
+    /// `builtin_agent_seeds`, the standard blueprint's staffed agents, the
+    /// saving materialization (`seed_orchestration_roster` round-trip), the
+    /// Studio's default agents, and the relationship defaults (orchestrator
+    /// `default_collaboration_rules` + the blueprint's relationship rows).
+    /// The coordinator is the one hardcoded actor and is excluded from the
+    /// specialist set.
+    #[test]
+    fn seed_sites_agree_on_builtin_specialist_ids() {
+        use std::collections::BTreeSet;
+
+        let canonical: BTreeSet<String> = concerto_config::builtin_agent_seeds()
+            .into_iter()
+            .map(|agent| agent.id)
+            .filter(|id| !id.eq_ignore_ascii_case("coordinator"))
+            .collect();
+        assert_eq!(
+            canonical,
+            BTreeSet::from([
+                "architect".to_string(),
+                "coder".to_string(),
+                "researcher".to_string(),
+                "reviewer".to_string(),
+                "validator".to_string(),
+            ]),
+            "the canonical built-in specialist set changed; update every seed site"
+        );
+
+        // Standard blueprint staffing.
+        let blueprint_ids: BTreeSet<String> = concerto_config::blueprint::standard_blueprint()
+            .pipeline
+            .stages
+            .iter()
+            .flat_map(|stage| stage.agents.iter().cloned())
+            .collect();
+        assert_eq!(blueprint_ids, canonical, "standard blueprint staffing drifted");
+
+        // Studio default agents (drop the coordinator row).
+        let studio_ids: BTreeSet<String> = default_builtin_agents()
+            .into_iter()
+            .map(|agent| agent.id)
+            .filter(|id| !id.eq_ignore_ascii_case("coordinator"))
+            .collect();
+        assert_eq!(studio_ids, canonical, "Studio default roster drifted");
+
+        // Saving materialization round-trip.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        concerto_config::seed_orchestration_roster(&path).expect("seed orchestration roster");
+        let loaded = concerto_config::load_global_config(Some(&path)).expect("load seeded config");
+        let saved_ids: BTreeSet<String> = loaded
+            .multi_agent
+            .map(|multi| multi.custom_agents)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|agent| agent.id)
+            .filter(|id| !id.eq_ignore_ascii_case("coordinator"))
+            .collect();
+        assert_eq!(saved_ids, canonical, "saving materialization drifted");
+
+        // Relationship defaults: orchestrator rules + blueprint rows.
+        let mut relationship_ids: BTreeSet<String> = BTreeSet::new();
+        for rule in concerto_orchestrator::relationship::default_collaboration_rules() {
+            relationship_ids.insert(rule.from.to_string());
+            relationship_ids.insert(rule.to.to_string());
+        }
+        for rel in concerto_config::blueprint::standard_blueprint().relationships {
+            relationship_ids.insert(rel.from);
+            relationship_ids.insert(rel.to);
+        }
+        relationship_ids.retain(|id| !id.eq_ignore_ascii_case("coordinator"));
+        assert_eq!(relationship_ids, canonical, "relationship defaults drifted");
+    }
+
     #[test]
     fn select_relationship_out_of_range_is_treated_as_none() {
         let mut state = State::new();

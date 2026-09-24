@@ -25,7 +25,6 @@ pub mod context_engine;
 pub mod coordinator;
 pub mod cost;
 pub mod cycle;
-pub mod cycle_manager;
 pub mod decisions;
 pub mod delta;
 pub mod design_doc_verifier;

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use futures::future::join_all;
 
 use concerto_config::{
-    coordinator_fallback, coordinator_self_implement_fallback, AgentCapabilities, BlueprintFacade,
-    CustomAgentConfig, FallbackPersonaDef, PromptSections, StageKind,
+    coordinator_self_implement_fallback, AgentCapabilities, BlueprintFacade, CustomAgentConfig,
+    FallbackPersonaDef, PromptSections, StageKind,
 };
 use concerto_core::error::ProviderError;
 use concerto_core::event::{EventBus, EventKind, ThinkingKind};
@@ -34,7 +34,6 @@ use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
 use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
-use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
 use concerto_sessions::whiteboard::append_whiteboard_event;
 use concerto_sessions::whiteboard::{latest_gate_seq, load_whiteboard_events, WhiteboardLoadOpts};
@@ -47,17 +46,13 @@ use crate::agent_runner::AgentRunner;
 use crate::agents::GenericSpecialistAgent;
 use crate::checkpoint;
 use crate::consultation::{consult_tool_definition, CONSULT_SPECIALIST_TOOL};
-use crate::cycle_manager::{ReviewCycleManager, ValidationCycleManager};
+use crate::cost::AgentCostEstimator;
 use crate::delta::FileDeltaTracker;
 use crate::design_doc_verifier::{
     collect_design_doc_evidence, degraded_verdict, verify_design_doc, DesignDocState,
     DesignDocVerdict,
 };
 use crate::graph::{Dependency, TaskGraph, TaskGraphValidator};
-use crate::plan_approval::{
-    append_review_state_event, load_review_resume, review_target_identity, ReviewCycleStatus,
-    ReviewFeedbackEntry, ReviewResume, ReviewStatePayload,
-};
 use crate::planner::{PlanArtifact, PlannerAgentInfo, TaskPlanner};
 use crate::registry::AgentRegistry;
 use crate::relationship::{
@@ -168,14 +163,15 @@ const MAX_PROSE_STOP_REPROMPTS: u32 = 5;
 
 /// ADR-35 same-role dispatch cap: the number of CONSECUTIVE dispatches to one
 /// role on the same objective, with no implement/code artifact produced, at
-/// which the loop guard fires. It is a pure loop invariant — a guard, never a
-/// compiled dispatch policy (the guard only stops the circle or guides a
-/// different role; it never selects or auto-dispatches a role).
+/// which the loop guard fires. It is a pure loop invariant — an ADVISORY guard,
+/// never a compiled dispatch policy or state forcing (the guard only records
+/// the loop evidence and nudges toward a different role; it never selects,
+/// auto-dispatches, or escalates the run itself).
 const MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES: u32 = 3;
 
-/// The bounded guidance turns the same-role guard may emit before escalating.
-/// At the ceiling the guard stops forcing prose guidance and escalates to
-/// `AwaitingUser` with the loop evidence instead of letting the circle stand.
+/// The bounded advisory nudges the same-role guard may emit. Past the ceiling
+/// the guard stays silent on the tool result (the ledger note already carries
+/// the loop evidence); it never escalates on the operator's behalf.
 const MAX_SAME_ROLE_GUARD_NUDGES: u32 = 1;
 
 /// Whether a produced path is an implement/code artifact (as opposed to a
@@ -855,10 +851,14 @@ fn run_is_stalled(
 }
 
 /// Build a `Failed` run result that records an acceptance rejection (C-06).
+///
+/// Stamped with the coordinator's own sentinel id: the rejection is a
+/// Coordinator decision (ADR-35 amendment 2026-09-16 §2), not a validator
+/// verdict, so it is never attributed to a specialist role.
 fn acceptance_failure_result(task: &AgentTask, summary: String) -> AgentRunResult {
     AgentRunResult {
         task_id: task.id,
-        role: AgentId::new("validator"),
+        role: AgentId::new("coordinator"),
         outcome: AgentOutcome::Failed { error: summary.clone() },
         summary,
         files_modified: Vec::new(),
@@ -870,14 +870,6 @@ fn acceptance_failure_result(task: &AgentTask, summary: String) -> AgentRunResul
         tokens_in: 0,
         tokens_out: 0,
     }
-}
-
-/// True when a validator agent's error means declared verification commands
-/// did not run (the generic eval-runner fails fast with this message when
-/// the agent has no eval engine / the `eval` capability is off).
-fn is_validation_disabled(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    lower.contains("validation disabled") || lower.contains("no eval engine")
 }
 
 fn metrics_from_result(result: &AgentRunResult) -> ProviderMetrics {
@@ -977,22 +969,7 @@ fn refresh_working_memory(
             // the default `standard` blueprint the two agree. Roles not
             // staffed in the resolved blueprint fall back to the legacy
             // tag-based classification (freeform/custom stages).
-            category: match facade.and_then(|facade| facade.stage_for_agent(&result.role)) {
-                Some(stage) => match stage.def.known_kind() {
-                    Some(StageKind::Planning) => DecisionCategory::Architecture,
-                    Some(StageKind::Acceptance) => DecisionCategory::Test,
-                    Some(StageKind::Execution) | Some(StageKind::Review) => {
-                        DecisionCategory::Implementation
-                    }
-                    _ => DecisionCategory::Other,
-                },
-                None => match stage_of(&result.role).as_ref().map(|stage| stage.as_str()) {
-                    Some("design") => DecisionCategory::Architecture,
-                    Some("validate") => DecisionCategory::Test,
-                    Some("implement" | "review") => DecisionCategory::Implementation,
-                    _ => DecisionCategory::Other,
-                },
-            },
+            category: decision_category_for_role(&result.role, facade, stage_of),
             confidence: if matches!(&result.outcome, AgentOutcome::Success) { 1.0 } else { 0.5 },
             superseded_by: None,
             created_at: time::OffsetDateTime::now_utc(),
@@ -1409,8 +1386,6 @@ pub struct CoordinatorAgent {
     model_selector: Arc<ModelSelector>,
     spend_tracker: Arc<SpendTracker>,
     bus: EventBus,
-    review_cycles: ReviewCycleManager,
-    validation_cycles: ValidationCycleManager,
     cycle_state: OrchestratorState,
     /// Tracks file-level progress per task so the cycle detector can
     /// distinguish repeated writes of the same content from real edits.
@@ -1940,20 +1915,33 @@ fn own_write_paths(
 }
 
 /// Phase 6 M3b: classify a settled subtask outcome into a decision category
-/// by its role name. Token-based so the mapping stays stable as rosters are
-/// configured or renamed; an unrecognized role is recorded as `Other`.
-fn decision_category_for_role(role: &AgentId) -> DecisionCategory {
-    let name = role.as_str().to_ascii_lowercase();
-    if name.contains("plan") || name.contains("design") || name.contains("architect") {
-        DecisionCategory::Architecture
-    } else if name.contains("test") || name.contains("valid") || name.contains("review") {
-        DecisionCategory::Test
-    } else if name.contains("tool") {
-        DecisionCategory::Tooling
-    } else if name.contains("implement") || name.contains("coder") || name.contains("worker") {
-        DecisionCategory::Implementation
-    } else {
-        DecisionCategory::Other
+/// from the role's **stage kind** in the resolved blueprint (never a role-name
+/// substring). A renamed or custom stage-staffed specialist is categorized by
+/// the semantics of its stage (issue #150): Planning → Architecture,
+/// Acceptance → Test, Execution/Review → Implementation. When no facade is
+/// attached or the role is not staffed, the registry's declared stage tag is
+/// consulted (`design`/`validate`/`implement`/`review`); anything unknown —
+/// an unstaffed, freeform, or custom-kind role — is recorded as `Other`.
+fn decision_category_for_role(
+    role: &AgentId,
+    facade: Option<&BlueprintFacade>,
+    stage_of: &dyn Fn(&AgentId) -> Option<AgentStage>,
+) -> DecisionCategory {
+    match facade.and_then(|facade| facade.stage_for_agent(role)) {
+        Some(stage) => match stage.def.known_kind() {
+            Some(StageKind::Planning) => DecisionCategory::Architecture,
+            Some(StageKind::Acceptance) => DecisionCategory::Test,
+            Some(StageKind::Execution) | Some(StageKind::Review) => {
+                DecisionCategory::Implementation
+            }
+            _ => DecisionCategory::Other,
+        },
+        None => match stage_of(role).as_ref().map(|stage| stage.as_str()) {
+            Some("design") => DecisionCategory::Architecture,
+            Some("validate") => DecisionCategory::Test,
+            Some("implement" | "review") => DecisionCategory::Implementation,
+            _ => DecisionCategory::Other,
+        },
     }
 }
 
@@ -2010,39 +1998,6 @@ fn sentinel_capabilities(persona: &FallbackPersonaDef, kind: StageKind) -> Agent
         git: Some(true),
         lsp: Some(true),
         eval: Some(false),
-    }
-}
-
-/// ADR-60 Deferred 3: build one full-state [`ReviewStatePayload`] snapshot
-/// for the review cycle identified by `(plan_id, target_hash)`. Every
-/// snapshot carries the complete feedback ledger and counters so a resumed
-/// run needs exactly the newest row (oracle: full state, not minimal).
-#[allow(clippy::too_many_arguments)]
-fn review_snapshot(
-    plan_id: &str,
-    session_id: Ulid,
-    implement_role: &str,
-    review_target: &str,
-    target_hash: &str,
-    status: ReviewCycleStatus,
-    max_cycles: u32,
-    retry_count: u32,
-    ledger: &[ReviewFeedbackEntry],
-    gate_seq_cursor: u64,
-) -> ReviewStatePayload {
-    let now = time::OffsetDateTime::now_utc();
-    ReviewStatePayload {
-        plan_id: plan_id.to_owned(),
-        session_id: session_id.to_string(),
-        implement_role: implement_role.to_owned(),
-        review_target: review_target.to_owned(),
-        review_target_hash: target_hash.to_owned(),
-        status,
-        max_cycles,
-        retry_count,
-        feedback_ledger: ledger.to_vec(),
-        gate_seq_cursor,
-        created_at_ms: now.unix_timestamp() * 1000 + i64::from(now.millisecond()),
     }
 }
 
@@ -2487,8 +2442,6 @@ impl CoordinatorAgent {
             spend_tracker,
             bus,
             planning_provider,
-            review_cycles: ReviewCycleManager::default(),
-            validation_cycles: ValidationCycleManager::default(),
             cycle_state,
             file_delta: FileDeltaTracker::new(),
             relationships: RelationshipManager::defaults(),
@@ -3103,75 +3056,6 @@ impl CoordinatorAgent {
         )
     }
 
-    /// ADR-35 §5, Phase 5 C-06 amendment: whether the coordinator can carry
-    /// the verification stage itself when no validation-stage agent is
-    /// registered. Requires the eval engine (attached via
-    /// [`Self::with_eval_engine`]); the planning provider is always present.
-    fn self_verify_available(&self) -> bool {
-        self.eval_engine.is_some()
-    }
-
-    /// Build the coordinator's self-verify persona (ADR-35 §5, Phase 5 C-06
-    /// amendment): a standalone, never-registered generic specialist carrying
-    /// the reserved `coordinator` id, a validate-stage tag, the planning
-    /// provider (unused in eval mode but required by the constructor), no
-    /// tool executor (eval mode never invokes tools or the LLM), and the
-    /// shared eval engine. `PromptSections::default()` suffices: `run_eval`
-    /// only reads the (empty) constraint/output-format sections for
-    /// post-processing and never builds a prompt.
-    ///
-    /// ADR-58 P2+P3 (§3): the render is driven by the unstaffed-`Acceptance`
-    /// fallback persona (see `acceptance_fallback_persona`), which on the
-    /// default blueprint is [`coordinator_fallback`] — the pre-blueprint
-    /// hardcoded identity (label "Coordinator", empty instructions,
-    /// eval-only capabilities; the Acceptance-kind mask narrows the write
-    /// flags to `false`).
-    fn self_verify_agent(&self, persona: &FallbackPersonaDef) -> GenericSpecialistAgent {
-        let mask = persona.effective_capabilities(StageKind::Acceptance);
-        let mut sections = PromptSections::default();
-        if let Some(instructions) = &persona.system_instructions {
-            sections.system_instructions = instructions.clone();
-        }
-        GenericSpecialistAgent::new(
-            AgentId::new("coordinator"),
-            persona.label.clone(),
-            Some(AgentStage::new(kind_stage_tag(
-                self.blueprint_facade.as_ref(),
-                StageKind::Acceptance,
-                AgentStage::VALIDATE,
-            ))),
-            self.planning_provider.clone(),
-            None,
-            self.bus.clone(),
-            self.retry_policy.clone(),
-            sections,
-            AgentCapabilities {
-                fs_write: Some(mask.fs_write),
-                shell: Some(mask.shell),
-                eval: Some(true),
-                ..Default::default()
-            },
-        )
-        .with_eval(self.eval_engine.clone())
-    }
-
-    /// ADR-58 P2+P3 (§3): the unstaffed-`Acceptance` (validate) fallback
-    /// persona — the stage's configured `fallback`, or the reserved
-    /// [`coordinator_fallback`] gate persona when unconfigured. The stage is
-    /// resolved by kind, so a renamed acceptance tag keeps its configured
-    /// fallback (issue #150).
-    fn acceptance_fallback_persona(&self) -> FallbackPersonaDef {
-        stage_fallback_persona(
-            self.blueprint_facade.as_ref(),
-            &kind_stage_tag(
-                self.blueprint_facade.as_ref(),
-                StageKind::Acceptance,
-                AgentStage::VALIDATE,
-            ),
-            coordinator_fallback(),
-        )
-    }
-
     /// ADR-35 §8, trigger 1: execute a subtask assigned to the reserved
     /// `coordinator` role (an implement subtask in a pipeline with no
     /// implement-stage agent) directly on the planning provider through the
@@ -3222,7 +3106,11 @@ impl CoordinatorAgent {
 
         // Reserve the budget before starting, exactly like AgentRunner, so a
         // hard cap stops the self-run the same way it stops a delegated run.
-        let reserved_cost = CostEstimator::estimate(&subtask.role, &profile.profile);
+        let reserved_cost = AgentCostEstimator::estimate(
+            &subtask.role,
+            &profile.profile,
+            self.blueprint_facade.as_ref(),
+        );
         self.spend_tracker
             .check_and_add(reserved_cost)
             .map_err(|_| OrchestratorError::NoBudgetForDelegation)?;
@@ -3324,42 +3212,6 @@ impl CoordinatorAgent {
                 Err(error)
             }
         }
-    }
-
-    /// ADR-35 §5, Phase 5 C-06 amendment: run the coordinator's self-verify
-    /// persona — the attached eval engine runs the project's detected test
-    /// runner (no LLM, no tools, zero cost). The instrumentation footprint
-    /// mirrors the validator path: a `ValidationCycleStarted` event (cycle 1,
-    /// so the stage feed advances and replay sees the cycle) followed by the
-    /// direct agent run; on error the loop's terminal `ValidationEscalated`
-    /// event is published before the error propagates. Unlike a runner
-    /// dispatch, no `SubTaskStarted`/`SubTaskCompleted` lifecycle or spend
-    /// accounting happens — the validator path does neither, and eval runs
-    /// are zero-cost. Metrics are settled by the caller via
-    /// `metrics_from_result`, exactly like the validator path.
-    async fn run_coordinator_self_verify(
-        &self,
-        task: &SubTask,
-        context: AgentContext,
-        cancel: CancellationToken,
-    ) -> Result<AgentRunResult, OrchestratorError> {
-        let _ = self.bus.publish_for_session(
-            task.session_id,
-            task.id.0,
-            EventKind::ValidationCycleStarted { task_id: task.id, cycle_num: 1 },
-        );
-        let result = self
-            .self_verify_agent(&self.acceptance_fallback_persona())
-            .run(task, context, "", cancel)
-            .await;
-        if result.is_err() {
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                task.id.0,
-                EventKind::ValidationEscalated { task_id: task.id, max_cycles: 1 },
-            );
-        }
-        result
     }
 
     /// The run's default provider config id, used to derive a role's effective
@@ -3554,7 +3406,9 @@ impl CoordinatorAgent {
                 result.files_modified.len(),
             ),
             outcome: Some(result.summary.clone()),
-            category: decision_category_for_role(role),
+            category: decision_category_for_role(role, self.blueprint_facade.as_ref(), &|agent| {
+                self.stage_of(agent)
+            }),
             confidence: 1.0,
             superseded_by: None,
             created_at: now,
@@ -7597,11 +7451,11 @@ impl CoordinatorAgent {
                         .await;
                         // Smoke fix (clap-derive 101): identical failures
                         // repeated consecutively are deterministic — another
-                        // same-agent retry cannot make progress. Once the
-                        // threshold is reached, force escalation by skipping
-                        // the normal retry arm and falling through to the
-                        // EXISTING escalation/replan/ladder flow (order
-                        // unchanged).
+                        // same-agent retry is unlikely to make progress. The
+                        // repeat diagnosis is injected as tool-result context
+                        // (an advisory recommendation) so the Coordinator can
+                        // weigh retry vs escalation; the retry/escalate choice
+                        // is never forced here.
                         let identical_repeat =
                             self.identical_failures.record_failure(task_id, &error);
                         if identical_repeat {
@@ -7622,16 +7476,17 @@ impl CoordinatorAgent {
                                 EventKind::AgentThought {
                                     agent_id: "coordinator".into(),
                                     content: format!(
-                                        "Forcing escalation for {role} subtask {task_id}: identical \
+                                        "Recommendation for {role} subtask {task_id}: identical \
                                          failure repeated {repeated}× consecutively (threshold {}); \
-                                         skipping the remaining same-agent retries.",
+                                         escalating (rather than retrying the same agent) is \
+                                         recommended — the Coordinator decides.",
                                         crate::failure_diagnosis::IDENTICAL_FAILURE_ESCALATION_THRESHOLD,
                                     ),
                                     kind: ThinkingKind::Detail,
                                 },
                             );
                         }
-                        if attempt < self.max_subtask_attempts && !identical_repeat {
+                        if attempt < self.max_subtask_attempts {
                             retry_feedback.entry(task_id).or_default().push(result.clone());
                             graph.mark_pending(&task_id);
                             let _ = self.bus.publish_for_session(task.session_id, task_id.0, EventKind::AgentThought {
@@ -8613,600 +8468,7 @@ impl CoordinatorAgent {
         &self.settled_metrics
     }
 
-    /// ADR-60 Deferred 3: persist one review-cycle snapshot (fail-soft).
-    ///
-    /// Returns the stored row's `gate_seq` for cursor chaining, or `None`
-    /// when persistence degraded (no pool attached / append error). The
-    /// review continues either way — continuity bookkeeping must never fail
-    /// a run — and every degradation is logged, never silent.
-    async fn persist_review_state(&self, payload: &ReviewStatePayload) -> Option<u64> {
-        let pool = self.review_store.as_ref()?;
-        match append_review_state_event(pool, payload).await {
-            Ok(stored) => Some(stored.gate_seq),
-            Err(error) => {
-                warn!(
-                    %error,
-                    plan_id = %payload.plan_id,
-                    "failed to persist review state; the review continues without \
-                     resumability (ADR-60 Deferred 3 degradation)"
-                );
-                None
-            }
-        }
-    }
-
-    /// Run the review loop: a review-stage agent checks implement output,
-    /// re-runs the implement-stage agent if revision is needed, up to
-    /// `max_cycles`. The cycle limit is governed by the `CollaborationRule`
-    /// for `Reviewer -> Coder` (defaults to 3 if not configured).
-    ///
-    /// ADR-35 §5: review participants are resolved by stage tag from the
-    /// registry. Pipelines without a review-stage agent skip review.
-    ///
-    /// ADR-60 Deferred 3: with a review store AND an approved-plan binding
-    /// attached, every cycle transition is a full-state whiteboard snapshot
-    /// committed BEFORE the work it describes (WAL-before-invoke), and an
-    /// entry after a restart resumes the interrupted cycle group — ledger,
-    /// retry counters, and cursor rehydrated and validated — instead of
-    /// running a duplicate second review. Costs spent by the crashed attempt
-    /// are gone with it (only verdicts are durable) and are honestly absent
-    /// from the resumed run's totals.
-    ///
-    /// ADR-35 amendment (2026-09-16 §2): review is now a Coordinator
-    /// DECISION (`call_specialist` to the review-stage agent), not an
-    /// automatic post-implement pipeline gate, so no call site remains in
-    /// `execute_graph`. The method is retained (unused) for the Coordinator
-    /// self-review/resumption paths that follow; removing it would delete a
-    /// deliberate, resumable capability.
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    async fn run_review_cycle(
-        &mut self,
-        graph: &mut TaskGraph,
-        task_id: TaskId,
-        description: String,
-        session_id: Ulid,
-        source_result: &AgentRunResult,
-        context: &AgentContext,
-        task: AgentTask,
-        cancel: &CancellationToken,
-    ) -> Result<AgentRunResult, OrchestratorError> {
-        // The review stage is resolved by kind: a renamed review tag keeps
-        // the gate cycle and its skip message (issue #150).
-        let review_tag =
-            kind_stage_tag(self.blueprint_facade.as_ref(), StageKind::Review, AgentStage::REVIEW);
-        let Some(reviewer_role) = self.first_agent_for_stage(&AgentStage::new(&review_tag)) else {
-            // ADR-58 P2+P3 (F8): the skip message routes the review stage's
-            // configured label when it differs from the standard "Review"; on
-            // the default blueprint the emitted string stays byte-identical.
-            let summary = match self
-                .blueprint_facade
-                .as_ref()
-                .and_then(|facade| facade.stage_by_tag(&review_tag))
-                .map(|stage| stage.def.label.as_str())
-            {
-                Some("Review") | None => {
-                    "No review-stage agent registered; review skipped".to_string()
-                }
-                Some(label) => {
-                    format!("No review-stage agent registered ({label}); review skipped")
-                }
-            };
-            return Ok(AgentRunResult {
-                task_id: TaskId::new(),
-                role: source_result.role.clone(),
-                outcome: AgentOutcome::Success,
-                summary,
-                files_modified: Vec::new(),
-                tool_call_count: 0,
-                cost_usd: 0.0,
-                latency_ms: 0,
-                provider: String::new(),
-                model: String::new(),
-                tokens_in: 0,
-                tokens_out: 0,
-            });
-        };
-        let implement_role = source_result.role.clone();
-        // ADR-58 P2+P3 (R2): the fallback cap is the closed gate kind's engine
-        // default (Review → 3), resolved through the blueprint facade when one
-        // is attached; a legacy `CollaborationRule` cap still wins when one is
-        // configured.
-        let kind_default = match &self.blueprint_facade {
-            Some(facade) => facade.max_cycles(
-                &reviewer_role,
-                &implement_role,
-                StageKind::Review.default_max_cycles(),
-            ),
-            None => StageKind::Review.default_max_cycles(),
-        };
-        let max_cycles =
-            self.relationships.max_cycles(&reviewer_role, &implement_role, kind_default);
-        self.review_cycles.set_max_cycles(max_cycles);
-        // ── ADR-60 Deferred 3: durable review-cycle state ───────────────────
-        // Identity of THIS cycle group: the approved plan id (the only
-        // identity that survives a process restart) plus a restart-stable
-        // hash of `(implement role, target description)` — approved-plan runs
-        // decompose from the seeded DesignDoc, so the description repeats
-        // byte-identically after a restart. Everything here is fail-soft:
-        // any rehydration or persistence problem degrades to pre-Phase 3
-        // behavior with an observable log, never a run failure.
-        let review_key = match (&self.review_store, self.approved_plan_seed.as_ref()) {
-            (Some(pool), Some(seed)) => Some((
-                pool.clone(),
-                seed.plan_id.clone(),
-                review_target_identity(implement_role.as_str(), &description),
-            )),
-            _ => None,
-        };
-        if review_key.is_none() {
-            tracing::debug!(
-                task_id = %task_id.0,
-                "review cycle not resumable (ADR-60 Deferred 3): no whiteboard store \
-                 attached or no approved-plan binding for this run"
-            );
-        }
-        let mut ledger: Vec<ReviewFeedbackEntry> = Vec::new();
-        let mut retry_count = 0_u32;
-        let mut last_review_event_seq = 0_u64;
-        let mut start_cycle = 1_u32;
-        if let Some((pool, plan_id, target_hash)) = &review_key {
-            match load_review_resume(pool, plan_id, target_hash, &session_id.to_string()).await {
-                Ok(ReviewResume::Resolved { status, feedback_ledger }) => {
-                    // Oracle comment 3 (idempotency): a previous attempt
-                    // already settled this cycle group — its recorded outcome
-                    // stands and NO second reviewer call may run for the same
-                    // target, even though this attempt's implement subtask
-                    // re-entered the review gate.
-                    tracing::info!(
-                        %plan_id,
-                        cycles = feedback_ledger.len(),
-                        ?status,
-                        "review cycle already settled per the whiteboard; suppressing \
-                         duplicate review (ADR-60 Deferred 3)"
-                    );
-                    if status == ReviewCycleStatus::Escalated {
-                        let _ = self.bus.publish_for_session(
-                            session_id,
-                            task_id.0,
-                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
-                        );
-                    } else {
-                        let _ = self.bus.publish_for_session(
-                            session_id,
-                            task_id.0,
-                            EventKind::ReviewCycleCompleted {
-                                task_id,
-                                cycle_num: u32::try_from(feedback_ledger.len() + 1).unwrap_or(1),
-                                verdict: "pass".into(),
-                            },
-                        );
-                    }
-                    let last_reason = feedback_ledger.last().and_then(|entry| entry.reason.clone());
-                    let summary = match status {
-                        ReviewCycleStatus::Escalated => format!(
-                            "Review remains unresolved: {} (settled before the restart; \
-                             resumed from whiteboard)",
-                            last_reason.unwrap_or_else(|| "max cycles reached".to_owned())
-                        ),
-                        _ => "Review previously completed for this deliverable \
-                              (resumed from whiteboard); no new review run"
-                            .to_owned(),
-                    };
-                    return Ok(AgentRunResult {
-                        task_id: TaskId::new(),
-                        role: source_result.role.clone(),
-                        outcome: AgentOutcome::Success,
-                        summary,
-                        files_modified: Vec::new(),
-                        tool_call_count: 0,
-                        cost_usd: 0.0,
-                        latency_ms: 0,
-                        provider: String::new(),
-                        model: String::new(),
-                        tokens_in: 0,
-                        tokens_out: 0,
-                    });
-                }
-                Ok(ReviewResume::Resume {
-                    resume_cycle,
-                    retry_count: persisted_retries,
-                    feedback_ledger: persisted_ledger,
-                    from_gate_seq,
-                }) => {
-                    if resume_cycle > max_cycles {
-                        // The cap shrank between attempts (config change):
-                        // every slot is spent; settle unresolved without
-                        // another reviewer call rather than exceeding the cap.
-                        warn!(
-                            %plan_id,
-                            %resume_cycle,
-                            %max_cycles,
-                            "persisted review cycle is beyond the current cycle cap; \
-                             settling unresolved without another reviewer call"
-                        );
-                        let _ = self.bus.publish_for_session(
-                            session_id,
-                            task_id.0,
-                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
-                        );
-                        return Ok(AgentRunResult {
-                            task_id: TaskId::new(),
-                            role: source_result.role.clone(),
-                            outcome: AgentOutcome::Success,
-                            summary: format!(
-                                "Review remains unresolved after {max_cycles} cycles \
-                                 (resumed beyond the configured cap from whiteboard)"
-                            ),
-                            files_modified: Vec::new(),
-                            tool_call_count: 0,
-                            cost_usd: 0.0,
-                            latency_ms: 0,
-                            provider: String::new(),
-                            model: String::new(),
-                            tokens_in: 0,
-                            tokens_out: 0,
-                        });
-                    }
-                    // Fast-forward the in-memory gate counter so `next_cycle`
-                    // inside the loop stays consistent with the persisted
-                    // position (a restart rebuilt this manager empty).
-                    for _ in 1..resume_cycle {
-                        let _ = self.review_cycles.next_cycle(task_id);
-                    }
-                    start_cycle = resume_cycle;
-                    retry_count = persisted_retries;
-                    ledger = persisted_ledger;
-                    last_review_event_seq = from_gate_seq;
-                    tracing::info!(
-                        %plan_id,
-                        %resume_cycle,
-                        retries = retry_count,
-                        "resuming interrupted review cycle from whiteboard state \
-                         (ADR-60 Deferred 3)"
-                    );
-                }
-                // Nothing trustworthy persisted — start fresh (pre-Phase 3).
-                Ok(ReviewResume::Fresh) => {}
-                Err(error) => warn!(
-                    %error,
-                    "review-state lookup failed; proceeding without resumability \
-                     (ADR-60 Deferred 3 degradation)"
-                ),
-            }
-        }
-        let mut review_input = source_result.clone();
-        let mut revision_cost = 0.0;
-        let mut revision_tool_calls = 0_u32;
-        let mut revision_files = Vec::new();
-        let mut revision_tokens_in = 0_u64;
-        let mut revision_tokens_out = 0_u64;
-
-        for cycle in start_cycle..=max_cycles {
-            if cancel.is_cancelled() {
-                return Err(OrchestratorError::Cancelled);
-            }
-
-            let _ = self.bus.publish_for_session(
-                session_id,
-                task_id.0,
-                EventKind::ReviewCycleStarted { task_id, cycle_num: cycle },
-            );
-
-            // ADR-60 Deferred 3 (WAL-before-invoke): commit the FULL snapshot
-            // — ledger, counters, cursor — BEFORE spawning the reviewer, so a
-            // crash can only ever land between durable snapshots. A verdict
-            // lost in that gap leaves the snapshot open and the resumed run
-            // replays exactly one reviewer call with the ledger carried over.
-            if let Some((_pool, plan_id, target_hash)) = &review_key {
-                let snapshot = review_snapshot(
-                    plan_id,
-                    session_id,
-                    implement_role.as_str(),
-                    &description,
-                    target_hash,
-                    ReviewCycleStatus::Started,
-                    max_cycles,
-                    retry_count,
-                    &ledger,
-                    last_review_event_seq,
-                );
-                if let Some(stored_seq) = self.persist_review_state(&snapshot).await {
-                    last_review_event_seq = stored_seq;
-                }
-            }
-
-            // On a resumed cycle the reviewer must see the feedback the
-            // previous attempt already collected — otherwise it would redo
-            // settled work (the redundant cost Phase 3 exists to avoid).
-            let mut review_description = format!("Review cycle {cycle} for: {description}");
-            if !ledger.is_empty() {
-                review_description.push_str(
-                    "\n\nPrior review feedback carried over from before the restart \
-                     (ADR-60 Deferred 3); verify these were addressed instead of \
-                     redoing settled work:",
-                );
-                for entry in &ledger {
-                    let reason = entry.reason.as_deref().unwrap_or("unspecified");
-                    review_description.push_str(&format!(
-                        "\n- cycle {}: needs revision: {reason}",
-                        entry.cycle_num
-                    ));
-                }
-            }
-            let review_task = SubTask {
-                id: TaskId::new(),
-                parent_id: Some(task_id),
-                session_id,
-                role: reviewer_role.clone(),
-                description: review_description,
-                status: concerto_core::types::SubTaskStatus::Pending,
-                dependencies: vec![task_id],
-                deliverable: None,
-                created_at: time::OffsetDateTime::now_utc(),
-                completed_at: None,
-            };
-
-            // Add review task to graph
-            let review_task_id = review_task.id;
-            graph.add_child(review_task.clone(), task_id, Dependency::MustFinishBefore);
-            graph.mark_running(&review_task_id);
-
-            let profile = self.model_selector.select_for_session(
-                &reviewer_role,
-                None,
-                review_task_id,
-                Some(session_id),
-            )?;
-
-            let review_ctx = AgentContext {
-                session: context.session.clone(),
-                parent_task: Some(task.clone()),
-                working_memory: context.working_memory.clone(),
-                retrieved_chunks: context.retrieved_chunks.clone(),
-                previous_results: vec![review_input.clone()],
-                budget_remaining_usd: None,
-                expected_artifacts: Vec::new(),
-                workspace_capsule: None,
-                workspace_snapshot_digest: self.snapshot_digest(cancel).await,
-                run_id: self.run_id.clone(),
-                workspace_generation: self.snapshot_generation(),
-            };
-
-            let result = self
-                .runner
-                .run(reviewer_role.clone(), &review_task, review_ctx, &profile, cancel.clone())
-                .await?;
-            if let Some(review_subtask) = graph.get_mut(&review_task_id) {
-                review_subtask.deliverable = Some(result.summary.clone());
-            }
-            graph.mark_done(&review_task_id);
-
-            // ADR-35 amendment (2026-09-16 §2): an exceeded review-cycle
-            // count is informational evidence, never a terminal stop. Publish
-            // the escalation event and return the reviewer's verdict as a
-            // recoverable result so the Coordinator decides the next move
-            // (re-dispatch, re-plan, or request_user_input).
-            if self.review_cycles.next_cycle(task_id).is_err() {
-                let _ = self.bus.publish_for_session(
-                    session_id,
-                    task_id.0,
-                    EventKind::ReviewCycleEscalated { task_id, max_cycles },
-                );
-                let mut escalated = result;
-                escalated.cost_usd += revision_cost;
-                escalated.tool_call_count =
-                    escalated.tool_call_count.saturating_add(revision_tool_calls);
-                escalated.files_modified.extend(revision_files);
-                escalated.tokens_in = escalated.tokens_in.saturating_add(revision_tokens_in);
-                escalated.tokens_out = escalated.tokens_out.saturating_add(revision_tokens_out);
-                return Ok(escalated);
-            }
-
-            match &result.outcome {
-                AgentOutcome::Success => {
-                    let _ = self.bus.publish_for_session(
-                        session_id,
-                        task_id.0,
-                        EventKind::ReviewCycleCompleted {
-                            task_id,
-                            cycle_num: cycle,
-                            verdict: "pass".into(),
-                        },
-                    );
-                    // ADR-60 Deferred 3: settle the cycle group durably so a
-                    // restart reports it resolved instead of re-reviewing
-                    // (oracle comment 3). No cursor update needed — this arm
-                    // returns immediately.
-                    if let Some((_pool, plan_id, target_hash)) = &review_key {
-                        let snapshot = review_snapshot(
-                            plan_id,
-                            session_id,
-                            implement_role.as_str(),
-                            &description,
-                            target_hash,
-                            ReviewCycleStatus::Completed,
-                            max_cycles,
-                            retry_count,
-                            &ledger,
-                            last_review_event_seq,
-                        );
-                        let _ = self.persist_review_state(&snapshot).await;
-                    }
-                    let mut completed = result.clone();
-                    completed.cost_usd += revision_cost;
-                    completed.tool_call_count =
-                        completed.tool_call_count.saturating_add(revision_tool_calls);
-                    completed.files_modified.extend(revision_files);
-                    completed.tokens_in = completed.tokens_in.saturating_add(revision_tokens_in);
-                    completed.tokens_out = completed.tokens_out.saturating_add(revision_tokens_out);
-                    return Ok(completed);
-                }
-                AgentOutcome::NeedsRevision { reason } => {
-                    // ADR-60 Deferred 3: the verdict is durable BEFORE any
-                    // follow-up work, so a resumed run never replays a cycle
-                    // that already produced one.
-                    ledger.push(ReviewFeedbackEntry {
-                        cycle_num: cycle,
-                        verdict: "needs-revision".to_owned(),
-                        reason: Some(reason.clone()),
-                    });
-                    retry_count = retry_count.saturating_add(1);
-                    if cycle >= max_cycles {
-                        let _ = self.bus.publish_for_session(
-                            session_id,
-                            task_id.0,
-                            EventKind::ReviewCycleEscalated { task_id, max_cycles },
-                        );
-                        if let Some((_pool, plan_id, target_hash)) = &review_key {
-                            let snapshot = review_snapshot(
-                                plan_id,
-                                session_id,
-                                implement_role.as_str(),
-                                &description,
-                                target_hash,
-                                ReviewCycleStatus::Escalated,
-                                max_cycles,
-                                retry_count,
-                                &ledger,
-                                last_review_event_seq,
-                            );
-                            // Terminal arm — returns below, no cursor update.
-                            let _ = self.persist_review_state(&snapshot).await;
-                        }
-                        let mut unresolved = result.clone();
-                        unresolved.cost_usd += revision_cost;
-                        unresolved.tool_call_count =
-                            unresolved.tool_call_count.saturating_add(revision_tool_calls);
-                        unresolved.files_modified.extend(revision_files);
-                        unresolved.tokens_in =
-                            unresolved.tokens_in.saturating_add(revision_tokens_in);
-                        unresolved.tokens_out =
-                            unresolved.tokens_out.saturating_add(revision_tokens_out);
-                        return Ok(unresolved);
-                    }
-                    // Publish agent handoff event for the audit log
-                    let handoff = AgentHandoff::new(
-                        reviewer_role.clone(),
-                        implement_role.clone(),
-                        task_id,
-                        reason.clone(),
-                        HandoffDeliverable::CodeReview(reason.clone()),
-                    );
-                    let _ = self.bus.publish_for_session(
-                        session_id,
-                        task_id.0,
-                        EventKind::AgentHandoff {
-                            from: handoff.from,
-                            to: handoff.to,
-                            task_id: handoff.task_id,
-                            rationale: handoff.rationale.clone(),
-                        },
-                    );
-                    // ADR-60 Deferred 3: durably record the queued revision
-                    // before dispatching it — a crash here resumes AFTER this
-                    // verdict (one fresh implement pass + next review), never
-                    // re-asking the same reviewer question.
-                    if let Some((_pool, plan_id, target_hash)) = &review_key {
-                        let snapshot = review_snapshot(
-                            plan_id,
-                            session_id,
-                            implement_role.as_str(),
-                            &description,
-                            target_hash,
-                            ReviewCycleStatus::RevisionQueued,
-                            max_cycles,
-                            retry_count,
-                            &ledger,
-                            last_review_event_seq,
-                        );
-                        if let Some(stored_seq) = self.persist_review_state(&snapshot).await {
-                            last_review_event_seq = stored_seq;
-                        }
-                    }
-                    let coder_task = SubTask {
-                        id: TaskId::new(),
-                        parent_id: Some(task_id),
-                        session_id,
-                        role: implement_role.clone(),
-                        description: format!("Revise (review {cycle}): {reason}"),
-                        status: concerto_core::types::SubTaskStatus::Pending,
-                        dependencies: vec![task_id],
-                        deliverable: None,
-                        created_at: time::OffsetDateTime::now_utc(),
-                        completed_at: None,
-                    };
-                    let coder_artifacts = self
-                        .expected_artifacts
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .get(&task_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let coder_ctx = AgentContext {
-                        session: context.session.clone(),
-                        parent_task: Some(task.clone()),
-                        working_memory: context.working_memory.clone(),
-                        retrieved_chunks: context.retrieved_chunks.clone(),
-                        previous_results: vec![result],
-                        budget_remaining_usd: None,
-                        expected_artifacts: coder_artifacts,
-                        workspace_capsule: None,
-                        workspace_snapshot_digest: self.snapshot_digest(cancel).await,
-                        run_id: self.run_id.clone(),
-                        workspace_generation: self.snapshot_generation(),
-                    };
-                    // Select routing profile for coder revision
-                    let coder_profile = self.model_selector.select_for_session(
-                        &implement_role,
-                        None,
-                        coder_task.id,
-                        Some(session_id),
-                    )?;
-                    let coder_result = self
-                        .runner
-                        .run(
-                            implement_role.clone(),
-                            &coder_task,
-                            coder_ctx,
-                            &coder_profile,
-                            cancel.clone(),
-                        )
-                        .await?;
-                    revision_cost += coder_result.cost_usd;
-                    revision_tokens_in = revision_tokens_in.saturating_add(coder_result.tokens_in);
-                    revision_tokens_out =
-                        revision_tokens_out.saturating_add(coder_result.tokens_out);
-                    revision_tool_calls =
-                        revision_tool_calls.saturating_add(coder_result.tool_call_count);
-                    revision_files.extend(coder_result.files_modified.clone());
-                    review_input = coder_result;
-                }
-                _ => {
-                    return Err(OrchestratorError::AgentLoopError(
-                        "reviewer agent failed unexpectedly".into(),
-                    ));
-                }
-            }
-        }
-
-        Ok(AgentRunResult {
-            task_id: TaskId::new(),
-            role: reviewer_role,
-            outcome: AgentOutcome::Success,
-            summary: "Review completed".into(),
-            files_modified: vec![],
-            tool_call_count: 0,
-            cost_usd: 0.0,
-            latency_ms: 0,
-            provider: String::new(),
-            model: String::new(),
-            tokens_in: 0,
-            tokens_out: 0,
-        })
-    }
-
-    // ── validation loop (§3.8) ──────────────────────────────────────────
+    // ── acceptance gate (C-06) ──────────────────────────────────────────
 
     /// Record an acceptance decision in the checkpoint action ledger
     /// (audit C-06). `accepted` selects the kind (`"accepted"`/`"rejected"`);
@@ -9282,367 +8544,6 @@ impl CoordinatorAgent {
                 Some(acceptance_failure_result(task, summary))
             }
         }
-    }
-
-    /// Run the validation loop: run test suite after all code is written.
-    /// Max cycles is governed by the `CollaborationRule` for
-    /// `Validator -> Coder` (defaults to 2 if not configured).
-    ///
-    /// ADR-35 §5: validation participants are resolved by stage tag from
-    /// the registry. Pipelines without a validation-stage agent skip
-    /// validation.
-    ///
-    /// `build_task` marks a run that contained implement-stage work: for
-    /// those runs acceptance is coordinator-owned (audit C-06) and requires
-    /// artifact + verification evidence (see [`Self::acceptance_rejection`]).
-    /// `action_ledger` records the acceptance decision for the checkpoint.
-    ///
-    /// ADR-35 amendment (2026-09-16 §2): validation is now a Coordinator
-    /// DECISION (`call_specialist` to the acceptance-stage agent), not an
-    /// automatic post-graph pipeline gate, so no call site remains in
-    /// `execute_graph`. The method is retained (unused) for the Coordinator
-    /// self-validation/resumption paths that follow; removing it would delete
-    /// a deliberate, resumable capability.
-    #[allow(dead_code)]
-    async fn run_validation_loop(
-        &mut self,
-        task: &AgentTask,
-        context: &AgentContext,
-        cancel: &CancellationToken,
-        build_task: bool,
-        action_ledger: &mut Vec<checkpoint::CheckpointAction>,
-    ) -> Result<AgentRunResult, OrchestratorError> {
-        // The acceptance stage is resolved by kind, so a renamed validate
-        // tag keeps its validation gate and self-verify fallback (issue
-        // #150).
-        let validate_tag = kind_stage_tag(
-            self.blueprint_facade.as_ref(),
-            StageKind::Acceptance,
-            AgentStage::VALIDATE,
-        );
-        let Some(validator_role) = self.first_agent_for_stage(&AgentStage::new(&validate_tag))
-        else {
-            if build_task && self.self_verify_available() {
-                // ADR-35 §5, Phase 5 C-06 amendment: no validation-stage
-                // agent is registered, but the coordinator holds an eval
-                // engine — the coordinator carries verification itself. This
-                // is a single cycle (there is no validator + implement pair
-                // to fix failures), so the cycle counter stays at 1.
-                let project_root =
-                    camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
-                        .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
-                let val_task = SubTask {
-                    id: TaskId::new(),
-                    parent_id: Some(task.id),
-                    session_id: task.session_id,
-                    role: AgentId::new("coordinator"),
-                    description: "Coordinator self-verification".into(),
-                    status: concerto_core::types::SubTaskStatus::Pending,
-                    dependencies: vec![],
-                    deliverable: None,
-                    created_at: time::OffsetDateTime::now_utc(),
-                    completed_at: None,
-                };
-                let mut val_ctx = context.clone();
-                val_ctx.parent_task = Some(task.clone());
-                let result = match self
-                    .run_coordinator_self_verify(&val_task, val_ctx, cancel.clone())
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        // The single self-verify cycle is exhausted (the
-                        // escalation event was already published by
-                        // `run_coordinator_self_verify`). Record the
-                        // failed acceptance before propagating, mirroring
-                        // the rejection path's ledger discipline.
-                        self.record_acceptance(action_ledger, task.id, false, &[], false);
-                        return Err(error);
-                    }
-                };
-                // Route exactly like the validator path: the coordinator's
-                // self-verification Success is necessary but not sufficient
-                // for a build task — acceptance also requires the artifact
-                // evidence (C-06).
-                if matches!(result.outcome, AgentOutcome::Success) {
-                    match self.acceptance_rejection(task, build_task, &project_root, action_ledger)
-                    {
-                        None => {
-                            // Coordinator self-verification passed and the
-                            // acceptance evidence is complete.
-                            let mut accepted = result;
-                            accepted.summary = format!(
-                                "Coordinator self-verification passed: {}",
-                                accepted.summary
-                            );
-                            return Ok(accepted);
-                        }
-                        Some(rejected) => return Ok(rejected),
-                    }
-                }
-                // Failed — the detected test runner failed, or no runner was
-                // detected. Verification ran but did not pass; a build task
-                // is not accepted without verification evidence.
-                let summary = format!(
-                    "Acceptance rejected: coordinator self-verification failed — {}",
-                    result.summary
-                );
-                self.record_acceptance(action_ledger, task.id, false, &[], false);
-                return Ok(acceptance_failure_result(task, summary));
-            }
-            if build_task {
-                // C-06: a build task whose pipeline has no validation-stage
-                // agent never produced verification evidence. Do not accept
-                // silently — the absence of declared verification commands
-                // is an acceptance failure.
-                let summary = "Acceptance rejected: no validation-stage agent registered; verification did not run for a build task"
-                    .to_string();
-                self.record_acceptance(action_ledger, task.id, false, &[], false);
-                return Ok(acceptance_failure_result(task, summary));
-            }
-            return Ok(AgentRunResult {
-                task_id: TaskId::new(),
-                role: AgentId::new("validator"),
-                outcome: AgentOutcome::Success,
-                summary: "No validation-stage agent registered; validation skipped".into(),
-                files_modified: Vec::new(),
-                tool_call_count: 0,
-                cost_usd: 0.0,
-                latency_ms: 0,
-                provider: String::new(),
-                model: String::new(),
-                tokens_in: 0,
-                tokens_out: 0,
-            });
-        };
-        // The implement role keys the primary `Execution` stage's resolved
-        // tag, so a renamed implement stage keeps the self-verify fix-pair
-        // loop (issue #150).
-        let implement_tag = execution_stage_tag(self.blueprint_facade.as_ref());
-        let implement_role = self.first_agent_for_stage(&AgentStage::new(&implement_tag));
-        let max_cycles = match &implement_role {
-            Some(role) => {
-                // ADR-58 P2+P3 (R3): the fallback cap is the closed gate
-                // kind's engine default (Acceptance → 2), resolved through
-                // the blueprint facade when one is attached; a legacy
-                // `CollaborationRule` cap still wins when configured.
-                let kind_default = match &self.blueprint_facade {
-                    Some(facade) => facade.max_cycles(
-                        &validator_role,
-                        role,
-                        StageKind::Acceptance.default_max_cycles(),
-                    ),
-                    None => StageKind::Acceptance.default_max_cycles(),
-                };
-                self.relationships.max_cycles(&validator_role, role, kind_default)
-            }
-            // No implement agent to fix failures: the first failed cycle is
-            // treated as exhausted.
-            None => 1,
-        };
-        self.validation_cycles.set_max_cycles(max_cycles);
-        let mut fix_cost = 0.0;
-        let mut fix_tool_calls = 0_u32;
-        let mut fixed_files = Vec::new();
-        let mut fix_tokens_in = 0_u64;
-        let mut fix_tokens_out = 0_u64;
-        let mut previous_results = Vec::new();
-        // Workspace root used to resolve expected artifacts for the C-06
-        // acceptance gate.
-        let project_root = camino::Utf8PathBuf::from_path_buf(context.session.project_dir.clone())
-            .unwrap_or_else(|_| camino::Utf8PathBuf::from("."));
-
-        for cycle in 1..=max_cycles {
-            if cancel.is_cancelled() {
-                return Err(OrchestratorError::Cancelled);
-            }
-
-            let _ = self.bus.publish_for_session(
-                task.session_id,
-                task.id.0,
-                EventKind::ValidationCycleStarted { task_id: task.id, cycle_num: cycle },
-            );
-            // ADR-35 amendment (2026-09-16 §2): an exceeded validation-cycle
-            // count is informational evidence, never a terminal stop. Publish
-            // the escalation event and return a recoverable Failed verdict so
-            // the Coordinator decides the next move.
-            if self.validation_cycles.next_cycle(task.id).is_err() {
-                let _ = self.bus.publish_for_session(
-                    task.session_id,
-                    task.id.0,
-                    EventKind::ValidationEscalated { task_id: task.id, max_cycles },
-                );
-                return Ok(acceptance_failure_result(
-                    task,
-                    format!(
-                        "Validation cycle ceiling ({max_cycles}) reached; escalation is \
-                         informational per ADR-35 amendment (2026-09-16 §2)."
-                    ),
-                ));
-            }
-
-            // Use the validation-stage agent to run the test suite
-            let agent = self.registry.get(&validator_role).ok_or_else(|| {
-                OrchestratorError::AgentLoopError(format!(
-                    "no agent registered for validation role {validator_role}"
-                ))
-            })?;
-
-            let val_task = SubTask {
-                id: TaskId::new(),
-                parent_id: Some(task.id),
-                session_id: task.session_id,
-                role: validator_role.clone(),
-                description: format!("Validation cycle {cycle}"),
-                status: concerto_core::types::SubTaskStatus::Pending,
-                dependencies: vec![],
-                deliverable: None,
-                created_at: time::OffsetDateTime::now_utc(),
-                completed_at: None,
-            };
-
-            let mut val_ctx = context.clone();
-            val_ctx.parent_task = Some(task.clone());
-            val_ctx.previous_results = previous_results.clone();
-
-            let mut result = match agent.run(&val_task, val_ctx, "", cancel.clone()).await {
-                Ok(result) => result,
-                // C-06: an eval-disabled validator errors instead of running
-                // verification. A build task must not be silently accepted
-                // without verification evidence — fail acceptance immediately
-                // (implement retries cannot enable a missing engine).
-                Err(OrchestratorError::AgentLoopError(message))
-                    if is_validation_disabled(&message) =>
-                {
-                    let summary =
-                        format!("Acceptance rejected: verification did not run — {message}");
-                    self.record_acceptance(action_ledger, task.id, false, &[], false);
-                    return Ok(acceptance_failure_result(task, summary));
-                }
-                Err(error) => return Err(error),
-            };
-
-            // C-06: coordinator-owned acceptance for build tasks. The
-            // validator's Success is necessary but not sufficient — the run
-            // is accepted only when the artifact evidence also passes. A
-            // rejection converts the validator pass into a Failed outcome so
-            // it flows through the retry logic below (distinguishable from a
-            // genuine test failure by the "Acceptance rejected" summary and
-            // the ledger entry).
-            if matches!(result.outcome, AgentOutcome::Success) {
-                match self.acceptance_rejection(task, build_task, &project_root, action_ledger) {
-                    None => {
-                        // Validation passed and acceptance evidence is
-                        // complete.
-                        result.cost_usd += fix_cost;
-                        result.tool_call_count =
-                            result.tool_call_count.saturating_add(fix_tool_calls);
-                        result.files_modified.extend(fixed_files);
-                        result.tokens_in = result.tokens_in.saturating_add(fix_tokens_in);
-                        result.tokens_out = result.tokens_out.saturating_add(fix_tokens_out);
-                        return Ok(result);
-                    }
-                    Some(rejected) => result = rejected,
-                }
-            }
-
-            match result.outcome.clone() {
-                AgentOutcome::Success => {
-                    // Defensive: an accepted run returned above; a rejected
-                    // run carries a Failed outcome instead.
-                    return Ok(result);
-                }
-                AgentOutcome::Failed { error } => {
-                    if cycle >= max_cycles {
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task.id.0,
-                            EventKind::ValidationEscalated { task_id: task.id, max_cycles },
-                        );
-                        result.cost_usd += fix_cost;
-                        result.tool_call_count =
-                            result.tool_call_count.saturating_add(fix_tool_calls);
-                        result.files_modified.extend(fixed_files);
-                        result.tokens_in = result.tokens_in.saturating_add(fix_tokens_in);
-                        result.tokens_out = result.tokens_out.saturating_add(fix_tokens_out);
-                        result.summary = format!(
-                            "Validation still fails after {max_cycles} automatic recovery cycles. Latest result: {}",
-                            result.summary
-                        );
-                        return Ok(result);
-                    }
-                    // Re-run the implement-stage agent to fix validation
-                    // failures. Unreachable when no implement agent exists:
-                    // max_cycles is 1 in that case, so the escalated return
-                    // above already fired.
-                    let Some(implement_role) = &implement_role else {
-                        return Err(OrchestratorError::AgentLoopError(
-                            "no implementation-stage agent registered to fix validation failures"
-                                .into(),
-                        ));
-                    };
-                    let fix_task = SubTask {
-                        id: TaskId::new(),
-                        parent_id: Some(task.id),
-                        session_id: task.session_id,
-                        role: implement_role.clone(),
-                        description: format!("Fix validation (cycle {cycle}): {error}"),
-                        status: concerto_core::types::SubTaskStatus::Pending,
-                        dependencies: vec![],
-                        deliverable: None,
-                        created_at: time::OffsetDateTime::now_utc(),
-                        completed_at: None,
-                    };
-                    let mut fix_ctx = context.clone();
-                    fix_ctx.parent_task = Some(task.clone());
-                    fix_ctx.previous_results = vec![result.clone()];
-
-                    // Select routing profile for coder fix
-                    let fix_profile = self.model_selector.select_for_session(
-                        implement_role,
-                        None,
-                        task.id,
-                        Some(task.session_id),
-                    )?;
-                    let fix_result = self
-                        .runner
-                        .run(
-                            implement_role.clone(),
-                            &fix_task,
-                            fix_ctx,
-                            &fix_profile,
-                            cancel.clone(),
-                        )
-                        .await?;
-                    fix_cost += fix_result.cost_usd;
-                    fix_tokens_in = fix_tokens_in.saturating_add(fix_result.tokens_in);
-                    fix_tokens_out = fix_tokens_out.saturating_add(fix_result.tokens_out);
-                    fix_tool_calls = fix_tool_calls.saturating_add(fix_result.tool_call_count);
-                    fixed_files.extend(fix_result.files_modified.clone());
-                    previous_results = vec![result, fix_result];
-                }
-                _ => {
-                    return Err(OrchestratorError::AgentLoopError(
-                        "validator agent returned unexpected outcome".into(),
-                    ));
-                }
-            }
-        }
-
-        Ok(AgentRunResult {
-            task_id: TaskId::new(),
-            role: validator_role,
-            outcome: AgentOutcome::Success,
-            summary: "Validation completed".into(),
-            files_modified: vec![],
-            tool_call_count: 0,
-            cost_usd: 0.0,
-            latency_ms: 0,
-            provider: String::new(),
-            model: String::new(),
-            tokens_in: 0,
-            tokens_out: 0,
-        })
     }
 
     // ── relationship summary ────────────────────────────────────────────
@@ -10934,25 +9835,23 @@ impl CoordinatorAgent {
         Ok((summary, advisory_plan))
     }
 
-    /// ADR-35 same-role dispatch cap — a pure loop-invariant GUARD beside the
+    /// ADR-35 same-role dispatch cap — an ADVISORY guard beside the
     /// vacuous-completion and zero-work guards.
     ///
     /// The decision loop tracks, in memory for one objective, how many
     /// consecutive dispatches have settled against the same role without any
     /// implement/code artifact landing. At
-    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it fires:
+    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it fires and pushes a ledger
+    /// note (which downgrades the run exit to `Partial` and keeps the resume
+    /// checkpoint — never a silent `Completed`), plus, while nudge budget
+    /// remains, an advisory nudge in the tool result.
     ///
-    /// - with a binding (Verified) DesignDoc and nudge budget left, it returns
-    ///   a bounded `directive` in the tool result forcing the model to target a
-    ///   DIFFERENT role next — guidance only, it never selects or dispatches a
-    ///   role itself (ADR-35: no compiled dispatch policy);
-    /// - otherwise it escalates to `AwaitingUser` with the loop evidence
-    ///   instead of letting the circle stand and silently completing.
-    ///
-    /// Either way it pushes a ledger note, which downgrades the run exit to
-    /// `Partial` and keeps the resume checkpoint (never a silent `Completed`).
-    /// A code artifact on the ledger resets the streak: a run making real
-    /// implement progress is never flagged by the cap.
+    /// It NEVER forces a target role and NEVER escalates the run itself: the
+    /// nudge only recommends considering a different role, and re-dispatching
+    /// the same role stays the Coordinator's decision (ADR-35: no compiled
+    /// dispatch policy, no state forcing). A code artifact on the ledger
+    /// resets the streak: a run making real implement progress is never
+    /// flagged by the cap.
     ///
     /// It also YIELDS to the #53 progress guard: once that guard is engaged
     /// (`progress_guard_engaged` — equivalent cycles accumulating or any
@@ -10997,15 +9896,14 @@ impl CoordinatorAgent {
             state.doc_verdict.as_ref().is_some_and(|verdict| verdict.state.is_active());
         let can_nudge = design_binds && state.role_guard_nudges < MAX_SAME_ROLE_GUARD_NUDGES;
         let note = format!(
-            "Same-role dispatch guard: specialist {agent_id} settled {count} consecutive \
-             dispatches on this objective with no implement/code artifact produced; the \
-             coordinator cannot keep re-dispatching the same role in circles. {}",
-            if can_nudge {
-                "A verified DesignDoc binds, so the next dispatch must target a DIFFERENT \
-                 (implement-stage) role — the guard guides, it never selects."
+            "Same-role dispatch guard (advisory): specialist {agent_id} settled {count} \
+             consecutive dispatches on this objective with no implement/code artifact produced. \
+             {}. The Coordinator decides the next step — re-dispatching {agent_id} is permitted, \
+             but a different implement-stage role (or requesting user input) is recommended.",
+            if design_binds {
+                "A verified DesignDoc binds, so implement work is the recommended next step"
             } else {
-                "The guard escalates to AwaitingUser with this loop evidence rather than \
-                 reporting completion."
+                "No binding DesignDoc is attached, so the objective may be design-only"
             }
         );
         let _ = self.bus.publish_for_session(
@@ -11021,38 +9919,30 @@ impl CoordinatorAgent {
 
         if can_nudge {
             state.role_guard_nudges += 1;
-            let directive = format!(
-                "Same-role dispatch guard: you have dispatched {agent_id} {count} times \
-                 consecutively without any implement/code artifact. The verified DesignDoc \
-                 binds, so dispatch a DIFFERENT implement-stage specialist now. Do not call \
-                 {agent_id} again for this objective."
+            let nudge = format!(
+                "Same-role dispatch guard (advisory): you have dispatched {agent_id} {count} \
+                 times consecutively without any implement/code artifact. Consider dispatching \
+                 a different implement-stage specialist next; re-dispatching {agent_id} remains \
+                 your decision."
             );
             let _ = self.bus.publish_for_session(
                 session_id,
                 subtask_id.0,
                 EventKind::AgentThought {
                     agent_id: "coordinator".into(),
-                    content: directive.clone(),
+                    content: nudge.clone(),
                     kind: ThinkingKind::Detail,
                 },
             );
             return Some(serde_json::json!({
-                "same_role_guard": "redirect",
-                "directive": directive,
+                "same_role_guard": "advisory",
+                "nudge": nudge,
             }));
         }
 
-        // Nudge budget exhausted (or no binding design): escalate to the
-        // operator with the loop evidence. The run ends `AwaitingUser` on the
-        // preserved checkpoint — never a silent completion.
-        self.requested_user_input = Some(format!(
-            "Same-role dispatch guard: the coordinator dispatched {agent_id} {count} \
-             consecutive times on this objective with no implement/code artifact produced \
-             and did not progress to a different role; the decision loop was circling the \
-             same role instead of implementing. Give direction (or confirm the objective is \
-             design-only) and resume."
-        ));
-        Some(serde_json::json!({ "same_role_guard": "awaiting_user" }))
+        // Nudge budget exhausted (or no binding design): the ledger note above
+        // already carries the loop evidence; no state is forced.
+        Some(serde_json::json!({ "same_role_guard": "advisory" }))
     }
 
     /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
@@ -11697,9 +10587,10 @@ impl CoordinatorAgent {
         // ── ADR-35 same-role dispatch cap ───────────────────────────────
         // The settled dispatch updates the in-memory same-role streak before
         // checkpointing. Firing the guard records the loop evidence (a ledger
-        // note → Partial) and either guides the model toward a different role
-        // or escalates the run to AwaitingUser — never an auto-dispatch. The
-        // cap yields to the #53 progress guard once that guard is engaged.
+        // note → Partial) and returns ADVISORY guidance only — it never forces
+        // a target role, never escalates, and never auto-dispatches; the
+        // Coordinator decides whether to re-dispatch. The cap yields to the
+        // #53 progress guard once that guard is engaged.
         let progress_state = self.progress_tracker.state();
         let progress_guard_engaged =
             progress_state.repeated_rounds > 0 || progress_state.stall_recoveries > 0;
@@ -13580,10 +12471,14 @@ impl CoordinatorAgent {
         ledger.model_assignments.remove(&parent);
         for child in &children {
             *ledger.subtask_attempts.entry(*child).or_insert(0) = baseline;
+            // The child carries the task's actual role; the graph lookup is
+            // the authority because the transform just materialized it. A
+            // genuinely-unknown child is stamped with an explicit placeholder
+            // — never a fabricated `coder` id.
             let role = graph
                 .get(child)
                 .map(|child_task| child_task.role.clone())
-                .unwrap_or_else(|| AgentId::new("coder"));
+                .unwrap_or_else(|| AgentId::new("unknown"));
             let description = graph
                 .get(child)
                 .map(|child_task| child_task.description.clone())
@@ -13803,10 +12698,12 @@ impl CoordinatorAgent {
             }
             expected.insert(survivor, union);
         }
+        // The survivor carries its actual role; a genuinely-unknown survivor
+        // is stamped with an explicit placeholder — never a fabricated `coder`.
         let role = graph
             .get(&survivor)
-            .map(|task| task.role.clone())
-            .unwrap_or_else(|| AgentId::new("coder"));
+            .map(|survivor_task| survivor_task.role.clone())
+            .unwrap_or_else(|| AgentId::new("unknown"));
         let _ = self.bus.publish_for_session(
             task.session_id,
             survivor.0,
@@ -14555,6 +13452,43 @@ impl CoordinatorAgent {
         format!("[Run phase (advisory): {} — {}]\n\n", phase.as_str(), phase.meaning())
     }
 
+    /// ADR-35 amendment (2026-09-16 §2): the configured review/validation
+    /// cycle ceilings are ADVISORY context injected into the dispatch prompt —
+    /// a "typical ceiling" the Coordinator may weigh, never a hardcoded loop
+    /// bound or terminal stop. Gate roles are resolved by stage KIND (never by
+    /// role id) and the ceiling comes from the collaboration rule, falling
+    /// back to the stage's configured/kind default. Absent gate roles render
+    /// nothing.
+    fn render_cycle_ceiling_advisory(&self) -> String {
+        let implements = AgentId::new(execution_stage_tag(self.blueprint_facade.as_ref()));
+        let ceiling = |kind: StageKind, fallback_tag: &'static str| -> Option<u32> {
+            let tag = kind_stage_tag(self.blueprint_facade.as_ref(), kind, fallback_tag);
+            let from = self.first_agent_for_stage(&AgentStage::new(&tag))?;
+            let kind_default = self
+                .blueprint_facade
+                .as_ref()
+                .and_then(|facade| facade.stage_by_tag(&tag))
+                .and_then(|stage| stage.def.max_cycles)
+                .unwrap_or_else(|| kind.default_max_cycles());
+            Some(self.relationships.max_cycles(&from, &implements, kind_default))
+        };
+        let mut parts = Vec::new();
+        if let Some(n) = ceiling(StageKind::Review, AgentStage::REVIEW) {
+            parts.push(format!("review {n}"));
+        }
+        if let Some(n) = ceiling(StageKind::Acceptance, AgentStage::VALIDATE) {
+            parts.push(format!("validation {n}"));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!(
+            "[Cycle ceilings (advisory): {} — typical limits you may weigh; they never \
+             terminate the run or force a dispatch.]\n\n",
+            parts.join(", ")
+        )
+    }
+
     /// Issue #60: the suitability ranking as ADVISORY context under the
     /// roster — the deterministic, decayed dispatch-outcome evidence for
     /// the run's task class, ranked with bounded reasons (no cost/spend/
@@ -14606,6 +13540,7 @@ impl CoordinatorAgent {
             // The stage-phase marker sits directly above the roster — one
             // advisory line derived from present artifacts.
             prompt.push_str(&self.render_phase_marker(state, ledger));
+            prompt.push_str(&self.render_cycle_ceiling_advisory());
             prompt.push_str(&self.render_specialist_roster(task, ledger));
         } else {
             prompt.push_str(
@@ -14918,6 +13853,7 @@ mod tests {
     use super::*;
     use crate::progress::{MAX_STALL_RECOVERIES, MAX_STALL_ROUNDS};
     use crate::testing::{AgentFlowTestHarness, BudgetScenarioBuilder, MockExpertAgent};
+    use concerto_config::coordinator_fallback;
     use concerto_core::error::PolicyError;
     use concerto_core::executor::ToolExecutor;
     use concerto_core::policy::SimplePolicyEngine;
@@ -30541,11 +29477,11 @@ mod tests {
     }
 
     /// Three consecutive `architect` dispatches on one objective with no
-    /// implement/code artifact: the guard fires and the run stops in
-    /// `AwaitingUser` with the loop evidence and a preserved checkpoint —
-    /// never a silent `Completed`.
+    /// implement/code artifact: the guard fires as ADVICE and the run does NOT
+    /// force `AwaitingUser` — the Coordinator's next turn runs normally, while
+    /// the loop evidence surfaces via the ledger note (a `Partial` exit).
     #[tokio::test]
-    async fn same_role_dispatch_cap_escalates_after_three_repeats() {
+    async fn same_role_dispatch_cap_is_advisory_and_does_not_escalate() {
         let bus = EventBus::new(256);
         let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("architect"), "designed")];
         let registry = AgentRegistry::from_mocks(mocks);
@@ -30560,17 +29496,18 @@ mod tests {
                         "architect",
                         "design it once more",
                     )]),
-                    CoordinatorTurn::Text("should not be reached".into()),
+                    // The advisory cap never forces a stop, so this turn runs.
+                    CoordinatorTurn::Text("the coordinator decides to stop here".into()),
                 ],
             ),
             bus.clone(),
         )
         .await;
 
-        assert_eq!(
+        assert_ne!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::AwaitingUser,
-            "the same-role cap must escalate, not complete: {:?}",
+            "the same-role cap is advisory and must not escalate: {:?}",
             output.completion_status
         );
         assert!(
@@ -30578,10 +29515,7 @@ mod tests {
             "the guard evidence must surface in the final message: {}",
             output.final_message
         );
-        assert!(
-            output.checkpoint_json.is_some(),
-            "the escalated run must keep its checkpoint for resume"
-        );
+        assert!(output.checkpoint_json.is_some(), "the run must keep its checkpoint for resume");
     }
 
     /// Alternating roles never trip the cap: the streak resets on every
@@ -30725,11 +29659,12 @@ mod tests {
         );
     }
 
-    /// With a BINDING (Verified) DesignDoc the guard does not escalate: it
-    /// returns a bounded directive forcing the model toward a DIFFERENT
-    /// implement-stage role — guidance, never an auto-dispatch.
+    /// With a BINDING (Verified) DesignDoc the guard returns a bounded
+    /// ADVISORY nudge recommending a different implement-stage role — it never
+    /// forces a role and never escalates; re-dispatching stays the
+    /// Coordinator's decision.
     #[tokio::test]
-    async fn same_role_dispatch_cap_redirects_when_design_doc_binds() {
+    async fn same_role_dispatch_cap_is_advisory_when_design_doc_binds() {
         let bus = EventBus::new(256);
         let mocks =
             vec![MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON)];
@@ -30753,24 +29688,26 @@ mod tests {
         assert_ne!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::AwaitingUser,
-            "a binding DesignDoc means the guard redirects instead of escalating"
+            "the advisory guard never escalates"
         );
-        let redirect = provider
+        let nudge = provider
             .tool_result_contents()
             .into_iter()
             .find_map(|result| {
                 let guard = result.get("guard")?;
                 (guard.get("same_role_guard").and_then(serde_json::Value::as_str)
-                    == Some("redirect"))
-                .then(|| {
-                    guard.get("directive").and_then(serde_json::Value::as_str).map(str::to_owned)
-                })
+                    == Some("advisory"))
+                .then(|| guard.get("nudge").and_then(serde_json::Value::as_str).map(str::to_owned))
                 .flatten()
             })
-            .expect("the guard redirect must ride the tool result");
+            .expect("the advisory guard nudge must ride the tool result");
         assert!(
-            redirect.contains("DIFFERENT implement-stage"),
-            "the redirect must require a different role without picking it: {redirect}"
+            nudge.contains("different implement-stage"),
+            "the nudge must recommend a different role: {nudge}"
+        );
+        assert!(
+            nudge.contains("remains") && nudge.contains("your decision"),
+            "the nudge must not force a role: {nudge}"
         );
     }
 
