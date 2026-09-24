@@ -2,8 +2,10 @@
 //! window is under pressure.
 //!
 //! Retained as an independent, tested selection utility. The overflow
-//! strategy it served (`SummarizeOldest`) was removed under ADR-67 M-01;
-//! the selector remains public API with its own tests.
+//! strategy it served (`SummarizeOldest`) was removed from production under
+//! ADR-67 M-01 and re-introduced as an **opt-in, unwired** library strategy
+//! in [`crate::short_term`] — the ADR gate on in-run production wiring still
+//! applies, so no production path selects it today.
 //!
 //! **Naming trap:** the constants below (`target_recovery_pct`,
 //! `trigger_pct`, `target_pct`) are *compaction* selection, not retrieval
