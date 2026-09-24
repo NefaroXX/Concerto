@@ -22926,6 +22926,206 @@ mod tests {
         );
     }
 
+    /// DEFERRED #18 / TODO.md "Coordinator restart/resume": the end-to-end
+    /// claim the row still owes. Phase A stalls and persists, then its
+    /// coordinator is dropped — the in-memory `checkpoint_json` it returns is
+    /// deliberately thrown away. Phase B is a FRESH coordinator + bus over the
+    /// same session store that reloads `state_json` from the durable row
+    /// itself (the production post-restart flow in `runtime_runner`), and it
+    /// must
+    ///
+    /// 1. never re-dispatch a subtask phase A already completed — the canary
+    ///    registry is derived from the persisted `Completed` set, so any
+    ///    re-dispatch fails the run — and
+    /// 2. reconcile the subtask that was still `Running` when the process
+    ///    died to `Pending` and dispatch it exactly once (once, not zero:
+    ///    a dropped step would hang the run).
+    ///
+    /// (2) is the hard-kill case only: the cooperative cancel path normalizes
+    /// `Running` → `Pending` *before* persisting, so an orphaned `Running`
+    /// row can only exist when a process died mid-dispatch. The test writes
+    /// that durable row explicitly and resumes through the production
+    /// `checkpoint::restore_graph` path.
+    ///
+    /// Boundary under test: the durable ROW, not the OS process — a second
+    /// process would need a second DB connection, and
+    /// `SqliteSessionStore::connect_path` is crate-private.
+    #[tokio::test]
+    async fn continue_after_restart_loads_durable_checkpoint_and_reconciles_running() {
+        let dir = tempfile::tempdir().expect("tempdir for restart test");
+
+        // ── Phase A: "process one" dispatches, stalls, persists ─────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("phase A run should succeed");
+        // Process one dies: nothing it held in memory reaches phase B.
+        drop(coordinator);
+
+        // ── The durable row, rewritten as a hard kill would leave it ─
+        let mut record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stalled run persisted a resumable checkpoint");
+        assert!(!record.completed, "phase A left the run resumable");
+        let mut graph =
+            checkpoint::GraphCheckpoint::from_json(&record.state_json).expect("state_json loads");
+        let statuses = graph
+            .subtasks
+            .iter()
+            .map(|st| format!("{}:{}:{:?}", st.id, st.role, st.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            graph.subtasks.iter().any(|st| st.status == SubTaskStatus::Completed),
+            "phase A completed at least one subtask (persisted: {statuses})"
+        );
+        // The hard-kill row: process one died while this step was in flight,
+        // so the durable record carries `Running` and NO completion record
+        // for it — the same "an interrupted call has no durable completion
+        // record" rule the cooperative cancel path applies before persisting.
+        let in_flight_index = graph
+            .subtasks
+            .iter()
+            .position(|st| st.status == SubTaskStatus::Completed && st.role.as_str() != "architect")
+            .or_else(|| graph.subtasks.iter().position(|st| st.status == SubTaskStatus::Completed))
+            .unwrap_or_else(|| panic!("phase A completed at least one subtask ({statuses})"));
+        let in_flight_id = graph.subtasks[in_flight_index].id;
+        let in_flight_role = graph.subtasks[in_flight_index].role.clone();
+        graph.subtasks[in_flight_index].status = SubTaskStatus::Running;
+        graph.completed_results.remove(&in_flight_id);
+        record.state_json = serde_json::to_string(&graph).expect("checkpoint reserializes");
+        store.save_orchestration_checkpoint(&record).await.expect("rewrite the durable row");
+
+        // ── Phase B: "process two" continues off the STORE only ─────
+        let bus2 = EventBus::new(256);
+        let mut rx = bus2.subscribe();
+        // Canary registry derived from the persisted graph: a role whose
+        // subtasks are ALL completed is poisoned (a re-dispatch fails the
+        // run); every other role must be able to run.
+        let mut phase2_mocks = Vec::new();
+        let mut role_statuses: Vec<(AgentId, Vec<SubTaskStatus>)> = Vec::new();
+        for subtask in &graph.subtasks {
+            match role_statuses.iter_mut().find(|(role, _)| role == &subtask.role) {
+                Some((_, statuses)) => statuses.push(subtask.status),
+                None => role_statuses.push((subtask.role.clone(), vec![subtask.status])),
+            }
+        }
+        for (role, statuses) in role_statuses {
+            let only_completed = statuses.iter().all(|status| *status == SubTaskStatus::Completed);
+            phase2_mocks.push(if only_completed {
+                MockExpertAgent::always_fail(role, "completed step must not re-dispatch")
+            } else {
+                MockExpertAgent::always_succeed(role, "resumed work").with_artifact_writer()
+            });
+        }
+        let resumed = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("phase B reloads the durable row");
+        assert_eq!(
+            resumed.sequence_num, record.sequence_num,
+            "phase B reads back the row phase A wrote"
+        );
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(phase2_mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+            store.clone(),
+        );
+        let second = coordinator2
+            .run(
+                AgentTask::new(session_id, "continue"),
+                AgentContext::new(concerto_core::types::SessionContext::new(
+                    session_id,
+                    dir.path().to_path_buf(),
+                )),
+                CancellationToken::new(),
+                Some(resumed.state_json),
+            )
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the restarted run completes off the restored graph: {}",
+            second.final_message
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let started = |wanted: TaskId| {
+            events
+                .iter()
+                .filter(|kind| matches!(kind, EventKind::SubTaskStarted { task_id, .. } if *task_id == wanted))
+                .count()
+        };
+        for subtask in &graph.subtasks {
+            if subtask.status == SubTaskStatus::Completed {
+                assert_eq!(
+                    started(subtask.id),
+                    0,
+                    "completed subtask {} ({}) must not be re-dispatched after restart",
+                    subtask.id,
+                    subtask.role
+                );
+            }
+        }
+        assert_eq!(
+            started(in_flight_id),
+            1,
+            "the orphaned Running step {} ({}) is reconciled to Pending and dispatched once",
+            in_flight_id,
+            in_flight_role
+        );
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "the successful restarted run clears the checkpoint"
+        );
+    }
+
     /// Fail-soft fallback: a resume-shaped run with NO stored checkpoint
     /// decomposes fresh — the Coordinator's decision loop runs and its
     /// architect dispatch happens exactly once; the run completes like a
