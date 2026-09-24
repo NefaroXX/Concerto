@@ -168,7 +168,6 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 - Not full OS-level isolation
 - `SandboxProfile::Containerized` not implemented
 - Runtime vulnerabilities can cross boundary
-- `completion` host function not connected to LLM
 
 ### 5. Prompt Injection
 
@@ -268,6 +267,7 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 - Resource limits (memory, instances)
 - Manifest capabilities (declarative permissions)
 - Host-function mediation (controlled API surface)
+- SHA-256 binary hash pinning for persisted capability grants (ADR-37)
 
 **Limitations**:
 - Not full OS-level isolation
@@ -359,12 +359,16 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
    - **Priority**: Low
    - **Effort**: 8 hours
 
-8. **No Integrity Verification for Plugin Binaries**
-   - **Risk**: Tampered plugin files on disk
-   - **Impact**: Code execution, sandbox escape
-   - **Mitigation**: Add checksum verification on load
-   - **Priority**: Low
-   - **Effort**: 4 hours
+8. **No Integrity Verification for Plugin Binaries** — ✅ DONE (2026-09-24)
+   - ADR-37 SHA-256 hash pinning: the WASM binary hash is recorded with each
+     persisted capability grant (`CapabilityManager`, `capability.rs:299`), and a
+     prune-on-load pass revokes any grant whose pinned hash no longer matches the
+     on-disk binary (`manager.rs` load path; audited as `CapabilityDenied` /
+     `grant_pruned_hash`, `manager.rs:1326`).
+   - **Residual risk**: only plugin **capability grants** are pinned; there is no
+     independent boot-time check that the binary itself was not swapped without a
+     matching grant edit (a local adversary can still replace a plugin with one
+     that is not covered by pinned grants).
 
 9. **No Memory Encryption for Sensitive Data**
    - **Risk**: Memory dumps contain secrets
@@ -476,6 +480,7 @@ See [Incident Response](#incident-response) section below.
 |------|---------|--------|---------|
 | 2026-07-28 | 1.0 | Concerto Team | Initial threat model |
 | 2026-09-19 | 1.1 | Concerto Team | Close gap #2 (SecretSanitizer DONE), label review checklist |
+| 2026-09-24 | 1.2 | Concerto Team | Close gap #8 (ADR-37 hash pinning DONE), drop stale `completion` host-function residual risk, add hash pinning to plugin sandbox strengths |
 
 ## Review Schedule
 

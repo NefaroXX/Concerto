@@ -391,7 +391,7 @@ half (what bytes must survive). Findings of the audit:
 | Stream heartbeats & idle re-set | SSE keepalive chunks (`openai.rs:231`), `Retry::stream_idle_timeout_seconds` |
 | Timeouts cap, attempt cap, elapsed fuse | `RetryConfig{ max_attempts, max_elapsed_seconds, ttfb, idle }` |
 | Fallback chain | `providers/routing.rs:258` + coordinator tiers (2.4/2.5 in this doc) |
-| Loop guards & step caps | `orchestrator/agent_loop.rs:459 max_iterations`; `cycle.rs`; `cycle_manager` |
+| Loop guards & step caps | `orchestrator/agent_loop.rs:459 max_iterations`; `cycle.rs` |
 | Tool errors as structured context | `tools/*` return values; `orchestrator/agents/generic.rs:462` |
 | Context-overflow → degrade/retry | `context_guard.rs`, `ContextOverflow` error |
 | Idempotency keys on requests | `providers/retry.rs` & OpenAI SDK headers where applicable |

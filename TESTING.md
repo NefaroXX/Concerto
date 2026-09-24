@@ -91,6 +91,25 @@ following scenarios no longer require fully manual execution:
 Scenarios not listed above are covered by tests from earlier phases or remain
 manual per the sheets below.
 
+### Key automated suites (2026-09-24 reconciliation)
+
+Additional automated coverage added since the acceptance-bar audit; these run
+under `nextest` in CI and are good references when a manual scenario fails:
+
+- **Memory recall (persona)** — `eval-runner` persona-memory replay harness:
+  `persona_mem_multi_hop_recall_passes` and `persona_mem_cold_ask_recall_passes`
+  (`crates/eval-runner/tests/persona_mem_recall.rs`).
+- **Symbolic cascade (links, ADR-69)** — link-store cascade unit tests plus
+  `LinkCascadeConfig` defaults (`crates/memory/src/rag.rs`).
+- **Run-shape decision (ADR-71)** — Coordinator decides and records the run
+  shape: `decide_run_shape` / `record_run_shape_decision`, and
+  `coordinator_shape_row_carries_the_final_shape_and_reason`
+  (`crates/core/src/executor.rs`).
+- **Dispatch failover / recovery** — throttle-exhaustion and provider 404
+  recovery paths: `attempt_dispatch_failover` (`crates/orchestrator/src/coordinator.rs`).
+- **Multi-agent settlement bounds** — `await_run_settlement_bounds_the_wait`
+  (`crates/cli/src/app.rs`).
+
 ## Default desktop checks
 
 | Check | Expected result | Result/notes |

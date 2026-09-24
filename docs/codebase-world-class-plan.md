@@ -142,7 +142,7 @@ Target: Eliminate all cognitive complexity > 50 hotspots (16 functions).
 Target: 1,500+ total tests, property tests in 5 crates, fuzz targets in 2 crates.
 
 - **Orchestrator tests** (11 → 80+):
-  - Cycle detection (`cycle.rs`, `cycle_manager.rs`)
+  - Cycle detection (`cycle.rs`)
   - State machine transitions (`state.rs`)
   - Agent runner lifecycle
   - Checkpoint serialization round-trips

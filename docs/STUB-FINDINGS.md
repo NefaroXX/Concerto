@@ -11,7 +11,7 @@ carries its current resolved/open status, and open items are tracked in
 | # | Stub | Effort | Impact | Priority |
 |---|------|--------|--------|----------|
 | 6 | FTS sync score hardcoded to 1.0 (not 0.0) | ~20 lines | Hybrid search quality | Open — TODO entry |
-| 8 | Eval runner integration test ignored | 1 line | CI coverage gap | Open — TODO entry |
+| 8 | Eval runner integration test ignored | 1 line | CI coverage gap | Resolved 2026-09-24 |
 | 7 | Tool log overlay detail fields | ~5 lines | Desktop UX | Resolved 2026-08-03 |
 | 5 | Global memory namespace | Design + ~50 lines | Feature missing | Resolved 2026-08-03 |
 | 3 | WASM plugin completion host fn | Major plumbing | Plugin ecosystem | Resolved 2026-08-03 |
@@ -100,6 +100,15 @@ Still open. The test remains `#[ignore]`d at `crates/eval/src/runner.rs:414` in
 `concerto-eval` (the runner pipeline is in `concerto-eval`, not
 `concerto-eval-runner`). Tracked as the TODO entry "Un-ignore eval end-to-end
 test" (`docs/TODO.md`).
+
+### Resolution (2026-09-24, supersedes)
+
+Resolved (routing-carcass cleanup). The `#[ignore]` was removed;
+`fallback_mode_runs_tests` is now a plain `#[tokio::test]` at
+`crates/eval/src/runner.rs:471-484` with the early-return guard intact when
+`benchmark_tasks/standard` is absent. `docs/STATUS.md` ("Eval runner coverage is
+now fast") describes the fast unit-test coverage; the TODO entry "Un-ignore eval
+end-to-end test" is marked resolved.
 
 ---
 
@@ -431,10 +440,17 @@ Seven of the eight stubs are resolved (1, 2, 3, 4, 5, 7) or moot (2). The two
 remaining open items (#6 FTS BM25, #8 eval test un-ignore) are tracked in
 [TODO.md](TODO.md); #7 was fixed as originally proposed.
 
+### Status as of 2026-09-24 (supersedes)
+
+#8 is resolved: the `#[ignore]` was removed in the routing-carcass cleanup
+(`fallback_mode_runs_tests` is a plain `#[tokio::test]` at
+`crates/eval/src/runner.rs:471-484`). Only #6 (FTS BM25 ranking) remains open;
+summary rows below reflect this.
+
 | Stub | Change | Status |
 |------|--------|--------|
 | #6 | Add BM25 score to FTS query results | Open — tracked in `docs/TODO.md` ("FTS BM25 ranking not wired") |
-| #8 | Remove `#[ignore]` from eval test | Open — tracked in `docs/TODO.md` ("Un-ignore eval end-to-end test") |
+| #8 | Remove `#[ignore]` from eval test | Resolved 2026-09-24 — `#[ignore]` removed in routing-carcass cleanup |
 | #7 | Show `input_summary` instead of `full_input` in tool log | Resolved 2026-08-03 |
 
 ### Defer

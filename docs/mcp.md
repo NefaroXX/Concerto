@@ -139,6 +139,16 @@ tokens are deferred).
 - MCP tools are opaque to policy internals: gating is by tool name plus
   explicit enablement, and `DenyNetworkEgress` cannot see inside a server's
   traffic.
+- **Failure observability:** server failures are recorded as append-only
+  infra audit rows (`InfraVerdict::McpServerFailed`, `InfraAuditEntry::mcp`,
+  written by `McpManager` via its audit sink — e.g. duplicate-tool rollback,
+  spawn/initialize/list failures, crash) alongside the
+  `EventKind::McpServerStateChanged` event. The WASM plugin manager follows the
+  same pattern: plugin lifecycle transitions publish
+  `EventKind::PluginStateChanged { plugin_id, state, error }` and infra
+  failures (init failure, hash-mismatch grant prune, disable) write
+  `InfraVerdict::PluginLoadFailed`/`PluginDisabled` rows. Both event streams
+  surface in the typed transcript and audit trail (see `crates/sessions/src/audit.rs`).
 
 ## Desktop and CLI
 

@@ -15,6 +15,21 @@ effect. Supersedes: none in full.
 
 **Deciders:** Concerto architecture + maintainer direction
 
+> **Reconciliation note (2026-09-24, commit `cbb09b0`):** §5 ("Intent routing —
+> `route()` retained as a deprecated pure advisor with inert keyword lists"),
+> the matching consequence ("Deprecated-but-retained `route()` ... carry a
+> small maintenance tax; removing them is a follow-up"), T4 ("`route()` and its
+> keyword lists remain inert"), and the verification note ("`route()` — pure;
+> zero non-test production callers") were superseded the same day: `route()`
+> and its keyword corpora were **deleted** from `crates/core/src/intent.rs`.
+> The module now retains only the intent **vocabulary** (`RequestedOutcome`,
+> `TaskScope`, `RouterOutput`, `RouterRoute`, `RunStage`, `PlanDecision`,
+> `LOW_CONFIDENCE_THRESHOLD`) — the decision to make it advisory evolved into
+> removing it entirely. T4 is satisfied trivially (no `route()` exists to
+> consult), and the "remove them as follow-up" tax no longer exists. The core
+> ADR-71 decision (no intent topology branching; Coordinator owns run shape)
+> is unaffected and remains in force.
+
 ## Context
 
 Concerto's orchestration has accumulated multiple sources of authority that

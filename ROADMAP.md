@@ -34,6 +34,27 @@ lifecycle decisions. What is true on `dev` today:
   spend tracking + budget caps remain enforced at dispatch (ADR-31/61
   amendments).
 
+- **Coordinator supremacy (ADR-71, 2026-09-24):** the Coordinator is the sole
+  master of a run — all dispatch, ordering, agent selection, and termination
+  are Coordinator decisions; planners, registries, and evidence are advisory
+  inputs; run endings are classified into exactly four terminal classes.
+  Hardcoded cycle terminals and "compiled schedulers" are coordinator-owned
+  guards; the ADR-64 resolver survives only as the pure reuse oracle. The
+  routing carcass is removed (`route()` + keyword corpora deleted; no intent
+  topology branching; run shape decided and recorded by the Coordinator via
+  `decide_run_shape` / `record_run_shape_decision`).
+- **Provider reach (2026-09-24):** the config-first provider factory covers
+  22 provider ids — the original seven (OpenAI, Anthropic, Google, OpenRouter,
+  Ollama, NIM, OpenCode) plus OpenAI-compatible DeepSeek, Groq, Together,
+  Mistral, xAI, Fireworks, Cerebras, Cohere, DeepInfra, Perplexity,
+  SambaNova, DashScope, Moonshot, Zhipu, and Novita (`docs/missing-providers.md`
+  is fully implemented; `docs/proxy-tool-call-fix.md` documents the
+  flat/content-embedded tool-call parsing those wrappers use).
+- **Global memory live (2026-09-24):** `GlobalMemoryStore`
+  (`crates/memory/src/global.rs`) replaces the stub-backed global tier — a
+  separate SQLite DB scoped by `user_id_hash` with fail-soft, plain-string
+  (`LIKE`) retrieval (no embeddings/FTS).
+
 - **Durable orchestration runtime (ADR-34):** one provider retry boundary
   (time-to-first-byte and idle timeouts, never replaying a specialist run),
   orchestration checkpoints persisted to the session database with fallible
@@ -58,8 +79,8 @@ lifecycle decisions. What is true on `dev` today:
 - **LSP tools registered by default:** `GetHover`, `FindReferences`,
   `RenameSymbol`, `GetDiagnostics`, `GetSemanticTokens`, `GetCodeActions`,
   `ExecuteCodeAction`, and `GetInlayHints` are registered unconditionally in
-  `runtime_runner.rs` (lines 1226–1233); the LSP server starts lazily on first
-  use. `GitTool` is registered at line 1221.
+  `runtime_runner.rs` (lines 1805–1812); the LSP server starts lazily on first
+  use. `GitTool` is registered at line 1800.
 - **Skills and MCP extensions (ADR-43):** new `concerto-skills` and
   `concerto-mcp` crates. Skills are local instruction packs (`skill.toml` /
   `SKILL.md`) discovered by `SkillManager` and injected into every prompt path
@@ -141,14 +162,10 @@ shape the roadmap.
 - **Real FTS BM25 ranking:** propagate SQLite FTS5 `rank()` into hybrid
   retrieval instead of the neutral `score: 1.0` written by the sync layer
   (`crates/memory/src/sync.rs:59,90`) — quick win from STUB-FINDINGS #6.
-- **Un-ignore the eval end-to-end test** (`crates/eval/src/runner.rs:414`); the
-  fixture guard already makes it a safe no-op when benchmark data is absent
-  (STUB-FINDINGS #8).
-- **Provider reach:** flat/content-embedded tool-call parsing for
-  OpenAI-compatible proxies (`docs/proxy-tool-call-fix.md`), then named
-  wrappers for high-demand OpenAI-compatible providers (DeepSeek, Groq,
-  Together, Mistral, xAI, Fireworks, Cerebras, Cohere —
-  `docs/missing-providers.md`).
+- **Provider reach follow-ups:** the named OpenAI-compatible wrappers are
+  implemented (22 provider ids); remaining work is the *flat*/content-embedded
+  tool-call parsing for proxies documented in `docs/proxy-tool-call-fix.md`
+  (Fixes 1–3 landed; any residual gaps live in `docs/TODO.md`).
 - **Fault-injection tests** for the multi-agent containment boundaries in
   ADR-26 (rate limits, malformed tool calls, missing executables, cancellation
   races, provider disconnects).
@@ -218,9 +235,11 @@ these are promised near-term features.
 - **Sandbox / execution isolation.** `SandboxProfile::Containerized` is
   declared but not implemented; plugins run under the WASM capability sandbox,
   which is not complete OS-level isolation (ADR-21, `docs/STATUS.md`).
-- **Evaluator end-to-end runner.** The sole end-to-end eval test is
-  `#[ignore]`d; full pipeline coverage is deferred until multi-agent quality
-  and recovery are reliable.
+- **Evaluator end-to-end runner depth.** The former `#[ignore]`d eval
+  end-to-end test was removed in favor of fast runner unit tests
+  (`crates/eval/src/runner.rs`); a full live end-to-end eval harness over a
+  real benchmark task remains deferred until multi-agent quality and recovery
+  are reliable.
 - **Replacing SQLite memory storage** without a measured need.
 - **Claiming global optimality** for an unbounded real-world software problem.
 - Audit-log retention, provider reach, and the AI-shell phases are parked in
@@ -228,8 +247,8 @@ these are promised near-term features.
 
 ## Architecture decision index
 
-ADR numbers are never reused; gaps (09, 13, 15, 17, 18) are reserved historical
-numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
+ADR numbers are never reused; gaps (09, 13, 15, 17, 18, 51) are reserved
+historical numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 
 | ADR | Topic | Status |
 |---|---|---|
@@ -271,7 +290,33 @@ numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [41](docs/adrs/ADR-41.md) | Spend surfaces in status bar; no Dashboard page | Accepted |
 | [42](docs/adrs/ADR-42.md) | Coordinator resilience: failure-class fallback ladder | Accepted |
 | [43](docs/adrs/ADR-43.md) | Skills, MCP client, and extension manager | Accepted |
+| [44](docs/adrs/ADR-44.md) | Project-root confinement and consent gating | Accepted |
+| [45](docs/adrs/ADR-45.md) | Ladder provider switch, retry configurability, coordinator takeover | Accepted — amends ADR-42 |
+| [46](docs/adrs/ADR-46-reasoning-as-data.md) | Reasoning content as first-class data | Accepted |
+| [47](docs/adrs/ADR-47-message-parts.md) | Canonical message parts | Deferred |
+| [48](docs/adrs/ADR-48-context-engine.md) | ContextEngine v2 — deterministic context assembly | Accepted |
+| [49](docs/adrs/ADR-49-config-first-catalog.md) | Config-first model catalog — providers as data | Accepted |
+| [50](docs/adrs/ADR-50-tool-coercion-and-binary-read-contract.md) | Tool coercion + binary read contract | Accepted — implemented |
+| [52](docs/adrs/ADR-52-orchestration-safety-gates.md) | Orchestration safety gates — global run cap, plan artifacts, exit gate | Accepted — implemented |
+| [53](docs/adrs/ADR-53-dialect-plugins-and-plugin-heartbeat.md) | Dialect plugins and plugin heartbeat | Accepted — implemented |
+| [54](docs/adrs/ADR-54-memory-stub-store-hardening.md) | Stub Global Memory, Self-Heal Stores, Identify All Failures | Accepted |
+| [55](docs/adrs/ADR-55-intent-routing-and-authorization.md) | Intent routing and intent-gated authorization (three-generation gate) | Accepted — outcome→topology and planner-contract points partially superseded by ADR-71 |
+| [56](docs/adrs/ADR-56-model-first-intent-classification.md) | Model-first intent classification | Accepted |
+| [57](docs/adrs/ADR-57-config-change-propagation.md) | Config change propagation without restart | Accepted |
+| [58](docs/adrs/ADR-58-configurable-orchestration.md) | Configurable orchestration — config owns the pipeline | Accepted (revised in place) — registry-is-roster point partially superseded by ADR-71 |
+| [59](docs/adrs/ADR-59-studio-blueprint-editor.md) | Studio orchestration editor — one surface, config-owned, full CRUD | Accepted (revised in place) |
+| [60](docs/adrs/ADR-60-concurrent-agent-runtime.md) | Concurrent Agent Runtime — Process-per-Agent Supervisor | Accepted |
+| [61](docs/adrs/ADR-61-provider-layer-and-factory.md) | Provider Layer — `LlmProvider` Trait, Factory, Transport Hardening | Accepted |
+| [62](docs/adrs/ADR-62-tool-executor-and-virtual-fs.md) | Tool Execution Pipeline — `ToolExecutor`, Policy Gates, `VirtualFs` | Accepted |
+| [63](docs/adrs/ADR-63-memory-subsystem.md) | Memory Subsystem — SQLite Hybrid Vector/FTS Retrieval | Accepted — supersedes ADR-10 |
+| [64](docs/adrs/ADR-64-timeline-zero-waste-orchestration.md) | Timeline-driven zero-waste orchestration | Proposed — compiled-scheduler authority partially superseded by ADR-71; §3 reuse oracle codified as compatible |
 | [65](docs/adrs/ADR-65-evidence-spine.md) | Evidence spine — facts, claims, decisions on one append-only chain | Accepted |
+| [66](docs/adrs/ADR-66-harness-tool-call-guarantee.md) | Harness-level tool-call guarantee — every model drives tools or fails loud | Accepted |
+| [67](docs/adrs/ADR-67-m01-context-pool-consolidation.md) | M-01 — Consolidate context-overflow pools under a single owner per pool | Accepted |
+| [68](docs/adrs/ADR-68-h04-session-ack-breaking-param.md) | H-04 — Breaking parameter change for `request_ack` | Accepted |
+| [69](docs/adrs/ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | Accepted |
+| [70](docs/adrs/ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | Accepted |
+| [71](docs/adrs/ADR-71-coordinator-supremacy.md) | Coordinator Supremacy — the coordinator is the sole master of a run | Accepted |
 
 When current behavior supersedes an ADR decision, update that ADR's status or
 add a superseding ADR; do not silently rewrite its historical context.

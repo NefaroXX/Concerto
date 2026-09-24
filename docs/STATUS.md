@@ -1,6 +1,6 @@
 # Concerto current status
 
-**Last reconciled with the source tree: 2026-09-05**
+**Last reconciled with the source tree: 2026-09-24**
 
 This is the public status source of truth. “Implemented” means the code path
 exists and has automated coverage; it does not mean every provider, model,
@@ -16,9 +16,6 @@ installer packages.
 > **Explicitly deferred** (see `ROADMAP.md`):
 > - **Sandbox / execution isolation** — `SandboxProfile::Containerized` is not
 >   implemented; WASM capability enforcement is not complete OS-level isolation.
-> - **Evaluator end-to-end runner** — the sole end-to-end test in
->   `concerto-eval` (`crates/eval/src/runner.rs:414`) is `#[ignore]`d; the full
->   runner pipeline lacks fast unit coverage.
 
 ## Implemented and testable
 
@@ -49,21 +46,27 @@ installer packages.
   failures retried with context; exhausted bounded subtask/tool work reported as blocked
   or partially complete instead of a generic internal error.
 - **Providers:** OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama, NVIDIA NIM,
-  and OpenCode-compatible endpoints through a shared streaming interface.
+  OpenCode-compatible endpoints, and a config-first catalog of OpenAI-compatible
+  providers (22 provider ids) through a shared streaming interface.
 - **Routing:** explicit role assignments and model overrides; otherwise
   compatible budget-aware selection. Researcher, Coder, and Validator require
-  tool-call support. Capability tiers have been removed.
+  tool-call support. Capability tiers have been removed; the Coordinator owns
+  run shape and dispatch (ADR-71), and there is no routing control flow.
 - **Tools and policy:** filesystem and shell tools through `ToolExecutor`,
   first-match policy rules, an independent shell denylist, virtual filesystem
   changes, diff review, and audit events.
 - **Intent gate and intent-gated authorization (ADR-55; ADR-56 model-first
-  classifier):** deterministic intent router + user confirmation (load-bearing)
-  authorizes mutations; an optional LLM intent classifier classifies — never
-  grants. ADR-56 makes the classifier the model-first primary decider (default
-  flips to enabled; two deterministic fast paths — negation read-only override
-  and ≤48-char smalltalk — run before it; the full deterministic chain stays
-  the offline/fail-soft fallback), superseding the ADR-55 Phase 2c
-  off-by-default, AskUser-only placement. Phase 2 complete as of 2026-08-11 —
+  classifier):** the intent gate stays the only authorization path — task-level
+  prohibitions (`negation_override`), unresolved `AskUser` ambiguity, and gate
+  denials yield a ReadOnly envelope (no grants); confirmed grants yield Acting.
+  An optional LLM intent classifier classifies — never grants. ADR-56 makes the
+  classifier the model-first primary decider (default flips to enabled; two
+  deterministic fast paths — negation read-only override and ≤48-char smalltalk —
+  run before it; the full deterministic chain stays the offline/fail-soft
+  fallback), superseding the ADR-55 Phase 2c off-by-default, AskUser-only
+  placement. The keyword-based `route()` function was deleted in the 2026-09-24
+  cleanup — the gate no longer selects a routed outcome; it only derives the
+  permission envelope under full local agency. Phase 2 complete as of 2026-08-11 —
   2a status chip (`df5c2e7`) and 2b orchestration depth (`5818642`) landed
   earlier; the remaining v2 items landed via `3cb251d` (audit columns),
   `21d4d3e` (shell containment), `44f2deb` (dialog verification), `9ec27f3`
@@ -131,6 +134,20 @@ installer packages.
 The expected manual release checks are maintained in [Testing](../TESTING.md).
 
 ## What's new (unreleased)
+
+- 2026-09-24: **Coordinator supremacy (ADR-71) + routing carcass removal** —
+  the Coordinator is the sole master of a run (all dispatch, ordering, agent
+  selection, termination). The deterministic `route()` function and its keyword
+  corpora were deleted: intent is no longer consulted as routing control flow,
+  `core/src/intent.rs` keeps only the vocabulary types, and run shape
+  (Plan/Execute) is decided and recorded by the Coordinator
+  (`coordinator.rs::decide_run_shape` / `record_run_shape_decision`). Under
+  full local agency the run envelope is always `RunEnvelope::Acting`
+  (`auth.set_read_only(false)`), with deny-class policy rules and the approval
+  sink enforcing boundaries. Provider factory now covers 22 provider ids, and
+  the eval-runner and AgentRunExit wildcard stubs were resolved (see the stubs
+  section). This status file was reconciled with the source tree on 2026-09-24.
+  Verification: fmt/clippy clean, workspace build green.
 
 - 2026-09-05: **ADR-65 evidence spine — Phases 1–8 + security remediation
   (branch `feat/evidence-spine`):** the whiteboard log is now the append-only
@@ -275,19 +292,19 @@ actually work, in order of impact:
   layer writes a neutral `1.0` instead of a zero that could make stored chunks
   look irrelevant. RRF fusion in `rag.rs` uses rank position, not the stored
   score. Tracked as a TODO entry ("FTS BM25 ranking not wired").
-- **Eval runner integration test is `#[ignore]`d**
-  (`crates/eval/src/runner.rs:414`, `concerto-eval`). The sole end-to-end test
-  for task discovery → execution → reporting is skipped by default because it
-  compiles a Rust project. No fast unit test covers the runner pipeline.
-  Tracked as a TODO entry ("Un-ignore eval end-to-end test").
-- **Forward-compat panic footgun in the agent loop** (`agent_loop.rs:393`).
-  `AgentRunExit` is `#[non_exhaustive]` (4 variants today), which forces a
-  `_ => unreachable!()` wildcard arm in the continuation match. All four
-  variants are explicitly covered today, so the arm is genuinely unreachable —
-  but if a 5th variant is ever added to `concerto-core`, this arm silently
-  becomes a runtime panic instead of a compile error. Fix would be to return
-  an explicit error (e.g. `AgentLoopError`) in the wildcard arm when the enum
-  gains variants.
+- **Eval runner coverage is now fast.** The former `#[ignore]`d end-to-end
+  runner test was removed in the routing-carcass cleanup; the runner now has
+  fast unit tests (`crates/eval/src/runner.rs`: `load_tasks_skips_non_directories`,
+  `empty_suite_returns_zero_tasks_report`, `copy_dir_creates_destination`, and
+  `copy_dir_with_nested_directories`), so the pipeline is covered without
+  compiling a benchmark project in the suite. (Resolved — see the 2026-09-24
+  reconciliation.)
+- **Forward-compat panic footgun in the agent loop is fixed**
+  (`agent_loop.rs:707-711`). The `_ => unreachable!()` wildcard arm in the
+  `AgentRunExit` continuation match now returns a typed error
+  (`AgentLoopError("unhandled AgentRunExit variant in continuation loop")`)
+  instead of panicking if a 5th variant is ever added to `concerto-core`.
+  (Resolved — see the 2026-09-24 reconciliation.)
 
 ## In-flight branches
 

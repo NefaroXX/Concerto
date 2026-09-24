@@ -26,8 +26,7 @@ orchestrator/
 ├── graph.rs            # execution graph construction
 ├── state.rs            # orchestrator state model
 ├── conflict.rs         # conflict resolution
-├── cycle.rs            # cycle detection
-├── cycle_manager.rs    # cycle handling
+├── cycle.rs            # cycle detection (CycleBudgetTracker — repeated identical tool calls)
 ├── planner.rs          # task planning
 ├── project_context.rs  # run-scoped AGENTS.md context injection (ADR-70)
 ├── memory_serial.rs    # memory serialization
@@ -52,7 +51,7 @@ orchestrator/
 | Execution graph | `graph.rs` |
 | State model | `state.rs` |
 | Conflict resolution | `conflict.rs` |
-| Cycle detection | `cycle.rs`, `cycle_manager.rs` |
+| Cycle detection | `cycle.rs` (`CycleBudgetTracker` — repeated identical tool calls; wired as `cycle_budget` in `agent_loop.rs`) |
 | Write gates | `gate.rs` (`WriteGate` — single write chokepoint, ADR-60 D4; optimistic `base_version` conflict checks, ADR-60 D5); legacy capability gating via `AgentCapabilities::fs_write` (executor policy) |
 | Supervisor | `supervisor.rs` (`Supervisor`, `SupervisorConfig`, `SupervisorServices`) + `ipc.rs` protocol |
 | Supervised agent-process (ADR-60 S5) | `src/bin/agent_process.rs` + `gate_proxy.rs` + `exec_backend.rs` |
@@ -84,4 +83,10 @@ orchestrator/
 - Skip global mutable state; keep all mutable data in `OrchestratorState`
 - Refrain from deep nesting in `conflict.rs`; use early returns
 - Do not import entire `agents` module; import only needed agents
-- Do not bypass cycle detection; all agent runs go through `cycle_manager`
+- Do not bypass cycle detection: `CycleBudgetTracker` in `cycle.rs` aborts
+  repeated identical tool calls (wired as `cycle_budget` in `agent_loop.rs`);
+  `state.rs` (OrchestratorCycleDetected) and `graph.rs` (DFS task-graph
+  validation) cover the orchestration and graph-level cycle cases.
+  Reconciliation 2026-09-24: `cycle_manager.rs` was deleted — cycle handling
+  lives in `cycle.rs` (see `docs/adrs/ADR-55-intent-routing-and-authorization.md`
+  §5 and `docs/STATUS.md`).
