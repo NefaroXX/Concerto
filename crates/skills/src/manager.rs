@@ -86,8 +86,9 @@ impl SkillManager {
     ///   (deterministic: lowest `(id, path)` wins) and are warned about.
     ///
     /// This is a convenience over [`SkillManager::discover_with_report`] that
-    /// logs every warning at `warn` level and informational notes at `info`
-    /// level and discards them. Callers that need the diagnostics as data
+    /// logs every warning at `warn` level, informational notes and one
+    /// per-pack summary (id, version, path, instruction chars) at `info`
+    /// level, and discards them. Callers that need the diagnostics as data
     /// (e.g. a settings UI) should call [`SkillManager::discover_with_report`]
     /// directly.
     pub fn discover(&self) -> Result<Vec<SkillDescriptor>, SkillsError> {
@@ -97,6 +98,18 @@ impl SkillManager {
         }
         for note in &report.notes {
             info!(note = %note, "using directory name as id");
+        }
+        // One `info` line per loaded pack proves which packs were discovered
+        // and how large each one's instruction text is. Ids, version, path,
+        // and size only — never the instruction content.
+        for descriptor in &report.descriptors {
+            info!(
+                id = %descriptor.id,
+                version = %descriptor.manifest.version,
+                path = %descriptor.pack_dir.display(),
+                chars = descriptor.instructions.chars().count(),
+                "skill pack loaded"
+            );
         }
         Ok(report.descriptors)
     }
@@ -1284,9 +1297,14 @@ Always use conventional commits:
     #[test]
     fn expand_env_refs_replaces_percent_vars_and_leaves_unset_alone() {
         // A distinctive variable name so concurrent tests never observe it.
-        std::env::set_var("CONCERTO_SKILLS_TEST_PROFILE", "/home/alice");
-        assert_eq!(expand_env_refs("%CONCERTO_SKILLS_TEST_PROFILE%/skills"), "/home/alice/skills");
-        std::env::remove_var("CONCERTO_SKILLS_TEST_PROFILE");
+        // Must differ from the var used in expanded_search_path_is_public_expansion:
+        // env vars are process-global and tests run on threads in parallel.
+        std::env::set_var("CONCERTO_SKILLS_TEST_EXPAND_REFS", "/home/alice");
+        assert_eq!(
+            expand_env_refs("%CONCERTO_SKILLS_TEST_EXPAND_REFS%/skills"),
+            "/home/alice/skills"
+        );
+        std::env::remove_var("CONCERTO_SKILLS_TEST_EXPAND_REFS");
 
         // Unset variables are left verbatim (callers still warn on the path).
         assert_eq!(

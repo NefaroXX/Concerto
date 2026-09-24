@@ -1921,6 +1921,7 @@ fn strict_policy() -> PolicyConfig {
             condition: ConditionDef::Always { always: true },
         }],
         time_window: None,
+        approval_timeout_secs: None,
     }
 }
 
@@ -1936,7 +1937,7 @@ fn permissive_policy() -> PolicyConfig {
         action: "auto_approve".into(),
         condition: ConditionDef::Always { always: true },
     });
-    PolicyConfig { rules, time_window: None }
+    PolicyConfig { rules, time_window: None, approval_timeout_secs: None }
 }
 
 /// The first `shown` characters of `full`. Clamps naturally (a count past the

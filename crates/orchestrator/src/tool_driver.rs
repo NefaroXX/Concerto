@@ -33,7 +33,7 @@ use concerto_core::types::{Message, Role, ToolCall, ToolDefinition};
 
 /// Maximum repair-by-reprompt attempts per driver turn before the run
 /// fails loudly (ADR-66 §2(c): bounded repair, then run-level failure).
-pub const MAX_REPAIR_ATTEMPTS: u32 = 2;
+pub const MAX_REPAIR_ATTEMPTS: u32 = 5;
 
 /// Block markers the model is instructed to use for tool calls.
 pub const BLOCK_OPEN: &str = "<tool_calls>";

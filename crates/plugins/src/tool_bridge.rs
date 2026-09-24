@@ -468,6 +468,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         assert_eq!(
             concerto_core::classify_tier(&action),
@@ -527,6 +528,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         assert_eq!(
             concerto_core::classify_tier(&action),

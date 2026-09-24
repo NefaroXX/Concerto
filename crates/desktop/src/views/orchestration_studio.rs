@@ -4601,6 +4601,84 @@ mod tests {
         assert_eq!(state.agents.len(), 4);
     }
 
+    /// Cross-site seed consistency (ADR-35/58): every seed/roster site must
+    /// agree on the same built-in specialist id set, so a rename or addition
+    /// in one site cannot silently drift the others. Sites checked: config
+    /// `builtin_agent_seeds`, the standard blueprint's staffed agents, the
+    /// saving materialization (`seed_orchestration_roster` round-trip), the
+    /// Studio's default agents, and the relationship defaults (whose endpoints
+    /// are pipeline stage tags, checked separately). The coordinator is the one
+    /// hardcoded actor and is excluded from the specialist set.
+    #[test]
+    fn seed_sites_agree_on_builtin_specialist_ids() {
+        use std::collections::BTreeSet;
+
+        let canonical: BTreeSet<String> = concerto_config::builtin_agent_seeds()
+            .into_iter()
+            .map(|agent| agent.id)
+            .filter(|id| !id.eq_ignore_ascii_case("coordinator"))
+            .collect();
+        assert_eq!(
+            canonical,
+            BTreeSet::from([
+                "architect".to_string(),
+                "coder".to_string(),
+                "researcher".to_string(),
+                "reviewer".to_string(),
+                "validator".to_string(),
+            ]),
+            "the canonical built-in specialist set changed; update every seed site"
+        );
+
+        // Standard blueprint staffing.
+        let blueprint_ids: BTreeSet<String> = concerto_config::blueprint::standard_blueprint()
+            .pipeline
+            .stages
+            .iter()
+            .flat_map(|stage| stage.agents.iter().cloned())
+            .collect();
+        assert_eq!(blueprint_ids, canonical, "standard blueprint staffing drifted");
+
+        // Studio default agents (drop the coordinator row).
+        let studio_ids: BTreeSet<String> = default_builtin_agents()
+            .into_iter()
+            .map(|agent| agent.id)
+            .filter(|id| !id.eq_ignore_ascii_case("coordinator"))
+            .collect();
+        assert_eq!(studio_ids, canonical, "Studio default roster drifted");
+
+        // Saving materialization round-trip.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        concerto_config::seed_orchestration_roster(&path).expect("seed orchestration roster");
+        let loaded = concerto_config::load_global_config(Some(&path)).expect("load seeded config");
+        let saved_ids: BTreeSet<String> = loaded
+            .multi_agent
+            .map(|multi| multi.custom_agents)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|agent| agent.id)
+            .filter(|id| !id.eq_ignore_ascii_case("coordinator"))
+            .collect();
+        assert_eq!(saved_ids, canonical, "saving materialization drifted");
+
+        // Relationship defaults are stage-kind/tag keyed (never role ids), so
+        // they are checked against the pipeline's stage tags rather than the
+        // specialist id set.
+        let stage_tags: BTreeSet<String> = concerto_config::blueprint::standard_blueprint()
+            .pipeline
+            .stages
+            .iter()
+            .map(|stage| stage.tag.clone())
+            .collect();
+        for rel in concerto_config::blueprint::standard_blueprint().relationships {
+            assert!(
+                stage_tags.contains(&rel.from) && stage_tags.contains(&rel.to),
+                "relationship endpoints must be pipeline stage tags: {rel:?}"
+            );
+        }
+    }
+
     #[test]
     fn select_relationship_out_of_range_is_treated_as_none() {
         let mut state = State::new();
@@ -5625,11 +5703,14 @@ mod tests {
         // Slice 3 (spec §2): deleting a stage also drops the relationships
         // whose `from`/`to` the stage owned — their row endpoints would
         // otherwise dangle past the stage-tag picker's catalog. The standard
-        // blueprint ties its five relationships to AGENT ids, not stage tags,
-        // so the test adds a stage-tag relationship first ("design" → "design")
-        // and asserts exactly that row is pruned while the others survive.
+        // blueprint's five relationships are stage-tag based (`design` owns two
+        // of them), so deleting `design` prunes every row touching that tag,
+        // exactly. The test also adds a stage-tag relationship first
+        // ("design" → "design") and asserts the prune count matches the
+        // design-touching rows and no others.
         let mut state = standard_blueprint_state();
         let relationships_before_len = state.blueprint.as_ref().unwrap().relationships.len();
+        assert_eq!(relationships_before_len, 5, "standard blueprint ships five stage-tag rows");
         // `RelationshipAdded` seeds a default row from/to the FIRST stage tag.
         let _ = state.update(StudioMessage::RelationshipAdded);
         let blueprint = state.blueprint.as_ref().unwrap();
@@ -5640,7 +5721,16 @@ mod tests {
             "added row targets the first stage tag"
         );
 
-        // Deleting the "design" stage prunes the design-targeting row only.
+        // Two standard rows touch `design` (`design → implement`,
+        // `design → research`) plus the added `design → design` row.
+        let design_rows = blueprint
+            .relationships
+            .iter()
+            .filter(|relationship| relationship.from == "design" || relationship.to == "design")
+            .count();
+        assert_eq!(design_rows, 3, "two standard design rows + the added row");
+
+        // Deleting the "design" stage prunes exactly those design-touching rows.
         let _ = state.update(StudioMessage::StageDeleted(0));
         let blueprint = state.blueprint.as_ref().unwrap();
         assert!(
@@ -5649,8 +5739,8 @@ mod tests {
         );
         assert_eq!(
             blueprint.relationships.len(),
-            relationships_before_len,
-            "only the dangling design row is pruned"
+            relationships_before_len + 1 - design_rows,
+            "exactly the relationships touching the deleted stage are pruned"
         );
         assert!(
             blueprint.relationships.iter().all(|r| r.from != "design" && r.to != "design"),
@@ -5821,9 +5911,11 @@ mod tests {
     #[test]
     fn relationship_field_edits_mutate_and_revalidate_immediately() {
         let mut state = standard_blueprint_state();
+        // The standard blueprint's rows are stage-tag based (spec §3): row 0 is
+        // `review → implement`, not the legacy agent-role id.
         assert_eq!(
             state.blueprint.as_ref().expect("blueprint loaded").relationships[0].from,
-            "reviewer"
+            "review"
         );
 
         let _ = state.update(StudioMessage::RelationshipFromChanged(0, "design".into()));

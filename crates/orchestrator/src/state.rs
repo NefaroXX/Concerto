@@ -152,7 +152,7 @@ impl OrchestratorState {
             if prev.0 == role && prev.1 == hash {
                 emit(&self.bus, task_id);
                 return Err(OrchestratorError::CycleDetected {
-                    tool_name: "reviewer".into(),
+                    tool_name: role.as_str().into(),
                     count: 2,
                 });
             }
@@ -392,8 +392,11 @@ mod tests {
         );
         let err =
             err.expect_err("a custom review-stage role repeating the same issue must trip Rule B");
+        // The detected `tool_name` is the CYCLING ROLE's id (never the
+        // hardcoded "reviewer" literal), so a renamed review-stage role is
+        // reported accurately.
         assert!(
-            matches!(err, OrchestratorError::CycleDetected { tool_name, count: 2 } if tool_name == "reviewer")
+            matches!(err, OrchestratorError::CycleDetected { tool_name, count: 2 } if tool_name == "code-reviewer")
         );
     }
 

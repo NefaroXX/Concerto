@@ -779,6 +779,7 @@ mod tests {
             plan_id: None,
             causation: None,
             base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
         }
     }
 

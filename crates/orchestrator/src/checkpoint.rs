@@ -431,6 +431,13 @@ pub struct GraphCheckpoint {
     /// channel (#23); this field tracks/persists the pending request only.
     #[serde(default)]
     pub pending_user_input: Option<String>,
+    /// Pending approval the run is paused on (timeout → AwaitingUser, not a
+    /// denial). Additive only: absent on older records (serde default = no
+    /// pending approval); old readers ignore the key. A resume restores it and
+    /// re-attaches to the preserved request (same tool/input) instead of
+    /// re-asking the model or burning an identical retry.
+    #[serde(default)]
+    pub pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
 }
 
 const fn current_schema_version() -> u32 {
@@ -677,6 +684,9 @@ pub fn build_checkpoint(
         // interactive answer-request unless `execute_graph` stamps one on an
         // AwaitingUser pause.
         pending_user_input: None,
+        // Approval-timeout pause (pending approval): additive — stamped only
+        // when a run ends AwaitingUser on a preserved approval request.
+        pending_approval: None,
     }
 }
 

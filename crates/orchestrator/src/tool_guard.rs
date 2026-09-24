@@ -35,10 +35,10 @@
 use serde_json::{Map, Value};
 
 /// Maximum corrective-retry injections per tool name within one run before
-/// the guard stops coaching and tells the model to move on. Two corrective
-/// retries are allowed; the third consecutive rejection flips the message to
-/// the exhausted form, bounding the retry loop at 2-3 attempts.
-pub(crate) const MAX_TOOL_GUARD_REJECTS: u32 = 2;
+/// the guard stops coaching and tells the model to move on. Five corrective
+/// retries are allowed; the sixth consecutive rejection flips the message to
+/// the exhausted form, bounding the retry loop at 5-6 attempts.
+pub(crate) const MAX_TOOL_GUARD_REJECTS: u32 = 5;
 
 /// Keys consumed by the execution-backend protocol rather than the tool
 /// schema; the guard must never strip them as "unknown".

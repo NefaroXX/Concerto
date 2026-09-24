@@ -33,7 +33,7 @@ use concerto_core::ToolError;
 /// surfaces unchanged (recoverable result, evidence preserved in the tool
 /// result already in the transcript), and the run-level iteration cap and
 /// continuation-round bound remain the global backstops.
-pub const MAX_SHELL_REPAIR_ATTEMPTS: u32 = 2;
+pub const MAX_SHELL_REPAIR_ATTEMPTS: u32 = 5;
 
 /// Character caps for the corrective message. Chosen so a repair turn stays
 /// small even when a command dumps megabytes of output.
@@ -558,7 +558,7 @@ mod tests {
         };
         let message = corrective_message_text(1, &long_command, &failure);
 
-        assert!(message.starts_with("[shell-repair attempt 1/2]"), "marker missing: {message}");
+        assert!(message.starts_with("[shell-repair attempt 1/5]"), "marker missing: {message}");
         assert!(message.contains(DIAG_NON_ZERO_EXIT), "diagnostic missing: {message}");
         assert!(message.contains("Exit code: 2"), "exit code missing: {message}");
         // Command head-capped.
@@ -578,7 +578,7 @@ mod tests {
             stderr: String::new(),
         };
         let message = corrective_message_text(2, "cargo test", &failure);
-        assert!(message.starts_with("[shell-repair attempt 2/2]"), "marker: {message}");
+        assert!(message.starts_with("[shell-repair attempt 2/5]"), "marker: {message}");
         assert!(
             message.contains("Stderr was empty. Stdout (last 500 chars):"),
             "stdout fallback missing: {message}"

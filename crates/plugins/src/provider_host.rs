@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use concerto_core::error::ProviderError;
+use concerto_core::traits::policy::{AuditLog, InfraAuditEntry, InfraVerdict};
 use concerto_core::traits::provider::{CompletionStream, LlmProvider};
 use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget};
 use concerto_core::CancellationToken;
@@ -22,6 +23,9 @@ pub struct PluginBackedProvider {
     plugin: Arc<Mutex<ActivePlugin>>,
     /// Provider name reported by `provider_name()`.
     provider_name: &'static str,
+    /// Plugin id, for infra-failure audit attribution
+    /// (`plugin:<plugin_id>` subject).
+    plugin_id: String,
     /// Model name advertised by this plugin.
     model: String,
     /// Default context window (may be overridden by plugin).
@@ -36,6 +40,9 @@ pub struct PluginBackedProvider {
     /// Reasoning-echo policy forwarded to the dialect (`"always"` |
     /// `"if-present"`, ADR-46). Defaults to `"if-present"`.
     reasoning_echo: &'static str,
+    /// Optional infra-failure audit sink. `None` disables emission; every
+    /// write is fail-soft.
+    audit: Option<Arc<dyn AuditLog>>,
 }
 
 impl PluginBackedProvider {
@@ -50,11 +57,13 @@ impl PluginBackedProvider {
         Self {
             plugin,
             provider_name: leak_provider_name(plugin_id),
+            plugin_id: plugin_id.to_string(),
             model,
             context_window: 8192,
             dialect: None,
             heartbeat_interval: None,
             reasoning_echo: "if-present",
+            audit: None,
         }
     }
 
@@ -73,11 +82,13 @@ impl PluginBackedProvider {
         Self {
             plugin,
             provider_name: leak_provider_name(plugin_id),
+            plugin_id: plugin_id.to_string(),
             model,
             context_window: 8192,
             dialect: Some(dialect),
             heartbeat_interval,
             reasoning_echo: "if-present",
+            audit: None,
         }
     }
 
@@ -93,11 +104,13 @@ impl PluginBackedProvider {
         Self {
             plugin,
             provider_name: leak_provider_name(plugin_id),
+            plugin_id: plugin_id.to_string(),
             model,
             context_window: 8192,
             dialect: None,
             heartbeat_interval,
             reasoning_echo: "if-present",
+            audit: None,
         }
     }
 
@@ -237,6 +250,30 @@ impl PluginBackedProvider {
     fn lock_plugin(&self) -> Result<MutexGuard<'_, ActivePlugin>, ProviderError> {
         self.plugin.try_lock().map_err(|_| ProviderError::Cancelled)
     }
+
+    /// Attach an infra-failure audit sink. Additive builder so existing
+    /// constructors keep their signatures.
+    pub fn with_audit_log(mut self, audit: Arc<dyn AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Audit a provider-side infra failure (capability refusal, `list_models`
+    /// failure). Fail-soft: a write error only logs.
+    async fn audit_infra(
+        &self,
+        verdict: InfraVerdict,
+        error_kind: &str,
+        detail: impl Into<String>,
+    ) {
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        let entry = InfraAuditEntry::plugin(self.plugin_id.clone(), verdict, error_kind, detail);
+        if let Err(error) = audit.record_infra(entry, CancellationToken::new()).await {
+            tracing::warn!(%error, "plugin provider infra audit write failed; continuing");
+        }
+    }
 }
 
 /// Leak the plugin id string to satisfy `&'static str`.
@@ -266,7 +303,7 @@ impl LlmProvider for PluginBackedProvider {
         // gated to AnswerOnly tasks: a tool-carrying request is refused
         // here, naming provider, model, and the missing capability.
         if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-            return Err(ProviderError::CapabilityRefused {
+            let refused = ProviderError::CapabilityRefused {
                 provider: self.provider_name().to_string(),
                 model: if request.model.is_empty() {
                     self.model.clone()
@@ -274,7 +311,14 @@ impl LlmProvider for PluginBackedProvider {
                     request.model.clone()
                 },
                 capability: "tool_calling".to_string(),
-            });
+            };
+            self.audit_infra(
+                InfraVerdict::CapabilityDenied,
+                "provider_capability_refused",
+                refused.to_string(),
+            )
+            .await;
+            return Err(refused);
         }
 
         // Request body handed to the plugin: the canonical OpenAI shape by
@@ -340,10 +384,19 @@ impl LlmProvider for PluginBackedProvider {
         // in-flight async host calls observe agent cancellation (ADR-38).
         plugin.set_cancel(Some(cancel.clone()));
 
-        let result = plugin
-            .call_provider("list_models", &req_json)
-            .await
-            .map_err(|e| ProviderError::Other(format!("plugin list_models failed: {e}")))?;
+        let result = match plugin.call_provider("list_models", &req_json).await {
+            Ok(result) => result,
+            Err(e) => {
+                let detail = format!("plugin list_models failed: {e}");
+                self.audit_infra(
+                    InfraVerdict::PluginLoadFailed,
+                    "list_models_failed",
+                    detail.clone(),
+                )
+                .await;
+                return Err(ProviderError::Other(detail));
+            }
+        };
 
         let models: Vec<ModelInfo> = serde_json::from_value(result).unwrap_or_default();
         Ok(models)

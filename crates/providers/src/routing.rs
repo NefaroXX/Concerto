@@ -7,7 +7,8 @@
 //! by cost — model choice is never automatic (2026-09-09: cost-based
 //! selection, budget-driven downgrade, and `retry_or_downgrade` were deleted).
 
-use concerto_config::ModelPinConfig;
+use concerto_config::blueprint::StageKind;
+use concerto_config::{BlueprintFacade, ModelPinConfig};
 use concerto_core::error::OrchestratorError;
 use concerto_core::event::{EventBus, EventKind};
 use concerto_core::ids::Ulid;
@@ -24,22 +25,38 @@ use std::sync::Arc;
 pub struct CostEstimator;
 
 impl CostEstimator {
-    /// Estimated typical token usage per agent (input + output).
-    fn typical_tokens(role: &AgentId) -> u64 {
-        match role.as_str() {
-            "architect" => 4_000,
-            "researcher" => 6_000,
-            "coder" => 8_000,
-            "reviewer" => 3_000,
-            "validator" => 500,
-            "coordinator" => 2_000,
+    /// Estimated typical token usage per agent run (input + output), keyed by
+    /// the **stage kind** the role is staffed in via the resolved blueprint
+    /// facade (ADR-58 R13; ADR-35: never the role's name): Planning → 4_000,
+    /// Research → 6_000, Execution → 8_000, Review → 3_000, Acceptance → 500.
+    ///
+    /// An unknown/unstaffed role, an unknown stage kind, or a facade-less
+    /// estimate falls back to a flat 2_000 default, so estimation stays
+    /// data-driven and no role-name special case is compiled in.
+    fn typical_tokens(role: &AgentId, facade: Option<&BlueprintFacade>) -> u64 {
+        match facade
+            .and_then(|facade| facade.stage_for_agent(role))
+            .and_then(|stage| StageKind::parse(stage.def.kind.as_str()))
+        {
+            Some(StageKind::Planning) => 4_000,
+            Some(StageKind::Research) => 6_000,
+            Some(StageKind::Execution) => 8_000,
+            Some(StageKind::Review) => 3_000,
+            Some(StageKind::Acceptance) => 500, // no LLM call
             _ => 2_000,
         }
     }
 
     /// Estimate cost for running a given agent on the given profile.
-    pub fn estimate(role: &AgentId, profile: &RoutingProfile) -> f64 {
-        let tokens = Self::typical_tokens(role) as f64;
+    ///
+    /// `facade` supplies the role's blueprint stage kind; pass `None` for a
+    /// facade-less estimate (flat 2_000-token default).
+    pub fn estimate(
+        role: &AgentId,
+        profile: &RoutingProfile,
+        facade: Option<&BlueprintFacade>,
+    ) -> f64 {
+        let tokens = Self::typical_tokens(role, facade) as f64;
         normalize_cost((tokens / 1000.0) * profile.cost_per_1k_tokens)
     }
 }
@@ -68,10 +85,14 @@ pub struct RoutingEngine {
     spend_tracker: Arc<SpendTracker>,
     pin_config: ModelPinConfig,
     provider_pins: std::collections::HashMap<AgentId, String>,
-    /// Roles that require a tool-calling-capable model. `None` keeps the
-    /// legacy seed-specialist defaults (researcher, coder, validator);
-    /// `Some(set)` is the exact config-derived topology (ADR-35 phase 4).
+    /// Roles that require a tool-calling-capable model. `None` means the
+    /// topology was not supplied and every role is treated as tool-calling
+    /// (data-driven default; never a name match). `Some(set)` is the exact
+    /// config-derived topology (ADR-35 phase 4).
     tool_calling_roles: Option<std::collections::HashSet<AgentId>>,
+    /// Resolved blueprint facade backing the stage-kind cost estimation
+    /// (ADR-58 R13). `None` prices every role with the flat default.
+    blueprint_facade: Option<BlueprintFacade>,
     event_bus: EventBus,
 }
 
@@ -89,6 +110,7 @@ impl RoutingEngine {
             pin_config,
             provider_pins: std::collections::HashMap::new(),
             tool_calling_roles: None,
+            blueprint_facade: None,
             event_bus,
         }
     }
@@ -103,9 +125,16 @@ impl RoutingEngine {
     }
 
     /// Bind the exact set of roles that require tool-calling-capable models.
-    /// When unset, the legacy defaults (researcher, coder, validator) apply.
+    /// When unset, every role is treated as tool-calling (data-driven default,
+    /// never a role-name match).
     pub fn with_tool_calling_roles(mut self, roles: std::collections::HashSet<AgentId>) -> Self {
         self.tool_calling_roles = Some(roles);
+        self
+    }
+
+    /// Bind the resolved blueprint facade backing stage-kind cost estimation.
+    pub fn with_blueprint_facade(mut self, facade: Option<BlueprintFacade>) -> Self {
+        self.blueprint_facade = facade;
         self
     }
 
@@ -153,7 +182,8 @@ impl RoutingEngine {
                 }
                 // Validate pinned model fits budget
                 if let Some(budget) = effective_budget {
-                    let estimated = CostEstimator::estimate(role, profile);
+                    let estimated =
+                        CostEstimator::estimate(role, profile, self.blueprint_facade.as_ref());
                     if estimated > budget {
                         return Err(OrchestratorError::PinnedModelBudgetExceeded {
                             model: profile.model.clone(),
@@ -291,11 +321,13 @@ impl RoutingEngine {
     }
 
     fn required_capability(&self, role: &AgentId) -> Option<&'static str> {
+        // The topology is config data: when no explicit set is supplied every
+        // role is treated as tool-calling and the actual capability of the
+        // selected profile is verified downstream via `supports_tool_calling`
+        // (plus the §4 fallback carve-out). Never keyed on the role's name.
         let needs_tool_calling = match &self.tool_calling_roles {
             Some(roles) => roles.contains(role),
-            // Legacy seed-specialist defaults, preserved when no explicit
-            // topology set is configured.
-            None => matches!(role.as_str(), "researcher" | "coder" | "validator"),
+            None => true,
         };
         needs_tool_calling.then_some("tool_calling")
     }
@@ -537,7 +569,7 @@ mod tests {
     fn custom_tool_calling_roles_are_enforced() {
         // A single plugin-backed non-tool-calling profile (excluded from
         // the §4 fallback, decision (a)) exercises both the pinned and
-        // unassigned rejection paths, plus the legacy-set exemption.
+        // unassigned rejection paths, plus the explicit-set exemption.
         let mut text_only = mock_profile("text-only", 0.001);
         text_only.supports_tool_calling = false;
         text_only.provider = "plugin:tools-less".into();
@@ -572,18 +604,19 @@ mod tests {
         let result = engine.select(&AgentId::new("copilot"), None, TaskId::new());
         assert!(matches!(result, Err(OrchestratorError::NoCapableModel { .. })));
 
-        // "researcher" is a legacy seed specialist absent from the explicit
-        // set, so it does NOT require tool calling: the non-tool-calling
-        // profile is a valid unassigned candidate.
+        // Any role absent from the explicit config-supplied set does NOT
+        // require tool calling: the non-tool-calling profile is a valid
+        // unassigned candidate.
         let result = engine.select(&researcher(), None, TaskId::new()).unwrap();
         assert_eq!(result.model, "text-only");
     }
 
     #[test]
-    fn legacy_tool_calling_roles_still_enforced_when_unset() {
-        // Plain `new()` keeps the legacy defaults: "coder" requires
-        // tool_calling (pinned path), "architect" does not. The profile is
-        // plugin-backed, so the §4 fallback cannot cover its gap.
+    fn unset_tool_calling_roles_default_to_all_roles() {
+        // A plain `new()` has no config-supplied topology, so every role is
+        // treated as tool-calling (data-driven default, never a name match).
+        // The profile is plugin-backed, so the §4 fallback cannot cover its
+        // gap: both the coder (pinned) and the architect (unassigned) refuse.
         let mut text_only = mock_profile("text-only", 0.001);
         text_only.supports_tool_calling = false;
         text_only.provider = "plugin:tools-less".into();
@@ -605,8 +638,8 @@ mod tests {
             ModelPinConfig { pins: HashMap::new(), ..Default::default() },
             EventBus::default(),
         );
-        let result = engine.select(&architect(), None, TaskId::new()).unwrap();
-        assert_eq!(result.model, "text-only");
+        let result = engine.select(&architect(), None, TaskId::new());
+        assert!(matches!(result, Err(OrchestratorError::NoCapableModel { .. })));
     }
 
     #[test]
@@ -622,14 +655,14 @@ mod tests {
         let engine = RoutingEngine::new(profiles, spend_tracker, pin_config, event_bus);
         let task_id = TaskId::new();
 
-        // Coder estimate for expensive: (8k × 0.01/1k) = 0.08, budget = 0.01
+        // Facade-less estimate: (2k × 0.01/1k) = 0.02, budget = 0.01
         let result = engine.select(&coder(), Some(0.01), task_id);
         assert!(matches!(result, Err(OrchestratorError::PinnedModelBudgetExceeded { .. })));
     }
 
     #[test]
     fn pinned_model_within_budget_ok() {
-        // Coder estimate: 8k × 0.005/1k = 0.04.
+        // Facade-less estimate: 2k × 0.005/1k = 0.01.
         let profiles = mock_profiles();
         let spend_tracker = Arc::new(SpendTracker::default());
         let mut pins = HashMap::new();

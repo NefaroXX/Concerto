@@ -12,9 +12,9 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{AgentContext, AgentId, AgentOutcome, AgentRunResult, SubTask};
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
-use concerto_providers::routing::CostEstimator;
 use concerto_sessions::spend::SpendTracker;
 
+use crate::cost::AgentCostEstimator;
 use crate::registry::AgentRegistry;
 
 /// True when an error represents a cancelled run rather than a genuine
@@ -82,6 +82,9 @@ pub struct AgentRunner {
     global_concurrency: Arc<tokio::sync::Semaphore>,
     provider_concurrency: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>>,
     per_provider_limit: usize,
+    /// Resolved blueprint facade backing stage-kind cost estimation for the
+    /// pre-dispatch budget reservation (`None` prices the flat default).
+    blueprint_facade: Option<concerto_config::BlueprintFacade>,
 }
 
 impl AgentRunner {
@@ -98,7 +101,17 @@ impl AgentRunner {
             global_concurrency: Arc::new(tokio::sync::Semaphore::new(3)),
             provider_concurrency: Arc::new(std::sync::Mutex::new(HashMap::new())),
             per_provider_limit: 2,
+            blueprint_facade: None,
         }
+    }
+
+    /// Attach the resolved blueprint facade backing stage-kind cost estimation.
+    pub fn with_blueprint_facade(
+        mut self,
+        facade: Option<concerto_config::BlueprintFacade>,
+    ) -> Self {
+        self.blueprint_facade = facade;
+        self
     }
 
     pub fn with_concurrency_limits(mut self, global: usize, per_provider: usize) -> Self {
@@ -201,7 +214,8 @@ impl AgentRunner {
             })?,
             _ = cancel.cancelled() => return Err(OrchestratorError::Cancelled),
         };
-        let reserved_cost = CostEstimator::estimate(&role, &profile.profile);
+        let reserved_cost =
+            AgentCostEstimator::estimate(&role, &profile.profile, self.blueprint_facade.as_ref());
         self.spend_tracker
             .check_and_add(reserved_cost)
             .map_err(|_| OrchestratorError::NoBudgetForDelegation)?;

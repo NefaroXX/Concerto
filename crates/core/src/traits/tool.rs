@@ -33,6 +33,21 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Canonical `(tool_name, input)` the policy engine evaluates for this
+    /// call.
+    ///
+    /// The default is the tool's own registered name and the caller's input,
+    /// so every existing tool keeps its current rule coverage. Thin alias
+    /// tools (e.g. a `write` tool delegating to `filesystem`) override this to
+    /// present the CANONICAL tool's name and operation-bearing input, so the
+    /// alias inherits the canonical tool's `Condition::ToolName` /
+    /// `Condition::Operation` rule coverage exactly instead of falling through
+    /// to the catch-all. Execution and audit still use the registered name and
+    /// the caller's original input.
+    fn policy_view(&self, input: &serde_json::Value) -> (String, serde_json::Value) {
+        (self.name().to_string(), input.clone())
+    }
+
     fn rollback_support(&self) -> bool {
         false
     }

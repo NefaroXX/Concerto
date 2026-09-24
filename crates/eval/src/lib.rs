@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use concerto_config::ShellProfileConfig;
-use concerto_core::types::{EvalResult, TestRunner};
+use concerto_core::types::{EvalProvenance, EvalResult, TestRunner};
 use concerto_core::CancellationToken;
 use concerto_tools::shell_backend::ShellProfileFactory;
 use thiserror::Error;
@@ -240,6 +240,7 @@ impl EvalEngine {
                     duration_ms,
                     output_tail,
                     coverage: None,
+                    provenance: EvalProvenance::Harness,
                 })
             }
             Ok(Err(e)) => Err(EvalError::Io(e)),
@@ -250,6 +251,7 @@ impl EvalEngine {
                 duration_ms,
                 output_tail: "timed out".into(),
                 coverage: None,
+                provenance: EvalProvenance::Harness,
             }),
         }
     }
@@ -277,18 +279,60 @@ impl EvalEngine {
         project_dir: &Path,
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
+        // No harness config: fall back to a plain `cargo test` IF a Cargo
+        // project is actually reachable (a `Cargo.toml` in this directory or an
+        // ancestor), instead of hard-failing. A hard failure here surfaced as
+        // `None` to the coordinator, which then treated the build as
+        // unvalidated; running cargo test captures an honest pass/fail and is
+        // marked `Fallback` so the report distinguishes it from a real harness
+        // run. With no Cargo project anywhere there is nothing to validate, so
+        // the honest Unknown failure is preserved (callers treat it as "no eval
+        // result") rather than marking every non-Rust project as a failed run.
+        if let TestRunner::Unknown(reason) = &runner {
+            if Self::cargo_project_in_ancestors(project_dir) {
+                return self.run_fallback_cargo_test(project_dir, reason, cancel).await;
+            }
+            return Err(EvalError::HarnessSetupFailed(format!("cannot run tests: {reason}")));
+        }
         // Default args per runner
         let default_args: &[&str] = match &runner {
             TestRunner::Cargo => &["test"],
             TestRunner::Npm => &["test"],
             TestRunner::Pytest => &[],
             TestRunner::Make => &["test"],
-            TestRunner::Unknown(s) => {
-                return Err(EvalError::HarnessSetupFailed(format!("cannot run tests: {s}")));
-            }
+            // Handled above; unreachable, but keep the match total.
+            TestRunner::Unknown(_) => &[],
             _ => &[],
         };
         self.run_with_args(runner, default_args, project_dir, cancel).await
+    }
+
+    /// No-config fallback: run a plain `cargo test` in `project_dir` and mark
+    /// the result [`EvalProvenance::Fallback`] with a note naming the missing
+    /// harness config. Pass/fail is whatever cargo reported.
+    async fn run_fallback_cargo_test(
+        &self,
+        project_dir: &Path,
+        reason: &str,
+        cancel: CancellationToken,
+    ) -> Result<EvalResult, EvalError> {
+        let mut result =
+            self.run_with_args(TestRunner::Cargo, &["test"], project_dir, cancel).await?;
+        result.provenance = EvalProvenance::Fallback;
+        result.output_tail = format!(
+            "eval fallback: no harness config found ({reason}); ran plain `cargo test`.\n{}",
+            result.output_tail
+        );
+        Ok(result)
+    }
+
+    /// True when `dir` or any ancestor carries a `Cargo.toml`, i.e. a plain
+    /// `cargo test` run from `dir` can resolve a package to validate. Cargo
+    /// itself searches ancestors for the manifest, so a manifest-free run root
+    /// inside a Cargo project is still validatable; a directory with no Cargo
+    /// project anywhere is not.
+    fn cargo_project_in_ancestors(dir: &Path) -> bool {
+        dir.ancestors().any(|ancestor| ancestor.join("Cargo.toml").exists())
     }
 
     /// Run tests scoped to changed paths; falls back to full suite if mapping unavailable.
@@ -676,6 +720,7 @@ impl EvalEngine {
             duration_ms,
             output_tail,
             coverage,
+            provenance: EvalProvenance::Harness,
         })
     }
 
@@ -702,6 +747,7 @@ impl EvalEngine {
             duration_ms: eval.duration_ms,
             output_tail: eval.output_tail,
             coverage: cov,
+            provenance: eval.provenance,
         })
     }
 }
@@ -886,6 +932,106 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // No-config fallback tests
+    // -----------------------------------------------------------------------
+
+    /// Missing config no longer hard-fails: with a Cargo project reachable, a
+    /// plain `cargo test` runs and the result is marked with fallback
+    /// provenance. `dir` has no manifest itself but survives with a trivial
+    /// Cargo.toml as evidence of a Rust project to validate.
+    #[tokio::test]
+    async fn missing_config_runs_plain_cargo_test_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        // A Cargo manifest in an ancestor but not in `dir` itself: detection
+        // fails at `dir`, the fallback resolves the project upward.
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(project_root.join("src")).unwrap();
+        std::fs::write(project_root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(project_root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let build_dir = project_root.join("no-config-here");
+        std::fs::create_dir_all(&build_dir).unwrap();
+
+        assert!(matches!(EvalEngine::detect_runner(&build_dir), TestRunner::Unknown(_)));
+        let engine = EvalEngine::new(&build_dir);
+
+        let result = engine
+            .run(CancellationToken::new())
+            .await
+            .expect("the no-config fallback must return a result, not hard-fail");
+
+        assert_eq!(result.runner, TestRunner::Cargo);
+        assert_eq!(result.provenance, EvalProvenance::Fallback);
+        assert!(
+            result.output_tail.contains("eval fallback"),
+            "the fallback must be reported: {}",
+            result.output_tail
+        );
+        assert!(!result.passed, "the empty workspace has no tests to pass");
+    }
+
+    /// The scoped entry point (the coordinator's validation path) falls back
+    /// identically.
+    #[tokio::test]
+    async fn missing_config_scoped_runs_plain_cargo_test_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").unwrap();
+        // `detect_runner` finds the Makefile, so this is a harness run; use a
+        // nested manifest-free dir to exercise the fallback via scoped args.
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        let engine = EvalEngine::new(&nested);
+        let changed = vec![camino::Utf8PathBuf::from("src/lib.rs")];
+
+        let result = engine
+            .run_scoped(&changed, CancellationToken::new())
+            .await
+            .expect("scoped validation must fall back, not hard-fail");
+
+        assert_eq!(result.provenance, EvalProvenance::Fallback);
+        assert!(result.output_tail.contains("eval fallback"));
+    }
+
+    /// With no Cargo project reachable there is nothing to validate, so the
+    /// honest Unknown failure is preserved (not a false fallback failure that
+    /// would mark every non-Rust run Partial).
+    #[tokio::test]
+    async fn no_config_and_no_cargo_project_keeps_honest_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EvalEngine::new(dir.path());
+        let error = engine
+            .run(CancellationToken::new())
+            .await
+            .expect_err("no Cargo project and no harness must stay a clean error");
+        assert!(error.to_string().contains("no config file found"), "{error}");
+    }
+
+    /// A detected harness keeps `Harness` provenance (no false fallback mark).
+    #[tokio::test]
+    async fn detected_harness_keeps_harness_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").unwrap();
+        let engine = EvalEngine::new(dir.path());
+        let result = engine.run(CancellationToken::new()).await.expect("make test runs");
+        assert_eq!(result.provenance, EvalProvenance::Harness);
+        assert!(!result.output_tail.contains("eval fallback"));
+    }
+
+    /// Legacy serialized results (no provenance field) default to `Harness`.
+    #[test]
+    fn legacy_eval_result_defaults_to_harness_provenance() {
+        let json = r#"{
+            "runner": "Cargo",
+            "exit_code": 0,
+            "passed": true,
+            "duration_ms": 100,
+            "output_tail": "ok"
+        }"#;
+        let result: EvalResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.provenance, EvalProvenance::Harness);
+    }
+
+    // -----------------------------------------------------------------------
     // Coverage tests
     // -----------------------------------------------------------------------
 
@@ -984,6 +1130,7 @@ mod tests {
             duration_ms: 100,
             output_tail: "all tests passed".into(),
             coverage: Some(inner),
+            provenance: EvalProvenance::Harness,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deser: EvalResult = serde_json::from_str(&json).unwrap();

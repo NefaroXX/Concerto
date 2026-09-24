@@ -581,6 +581,7 @@ mod tests {
                 attempts: 4,
                 elapsed: std::time::Duration::from_secs(10),
                 last_error: "timeout".into(),
+                throttled: false,
             },
         ];
         for error in errors {

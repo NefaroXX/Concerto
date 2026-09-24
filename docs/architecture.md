@@ -1,6 +1,6 @@
 # Concerto architecture
 
-**Last source reconciliation: 2026-08-03.** The Cargo manifests and executable
+**Last source reconciliation: 2026-09-24.** The Cargo manifests and executable
 code are authoritative when this overview and the implementation differ.
 
 ## System shape
@@ -27,21 +27,29 @@ The detailed internal dependency edges are maintained in
 
 ## Interaction modes
 
-Intent routing decides only the run's permission envelope (ADR-55 Phase 2e):
+There is no routing control flow (ADR-71). Deterministic `route()` and the
+keyword corpora were removed from `concerto-core`; `core/src/intent.rs` keeps
+only the vocabulary types the workspace still speaks. Every non-empty run
+enters the unified agent loop, and the run's permission envelope is derived at
+runtime, not from a routed outcome:
 
 - **ReadOnly** — task-level prohibitions (`negation_override`), unresolved
   `AskUser` ambiguity, and gate denials. No grants; the policy engine denies
-  writes.
-- **Acting** — everything else. Grants hold exactly as confirmed; writes stay
-  governed by the policy engine, never by a branch.
+  writes. This is an outcome of the intent gate, not a route class.
+- **Acting** — everything else under full local agency
+  (`auth.set_read_only(false)` in `runtime_runner.rs`). Grants hold exactly as
+  confirmed; writes stay governed by the policy engine and the approval sink,
+  never by a branch.
 
-Every non-empty run enters the unified agent loop. Chat is what the loop does
-when the model uses no tools (≈ one text-only call in cost, zero forks); the
-routed outcome is a non-binding flavor hint appended to the system prompt and
-logged, never a code-path branch. With multi-agent disabled, `AgentLoop` owns
-the run. With it enabled, only action-required (Execute) and Plan runs use
-`CoordinatorAgent` and the specialist registry — Plan capped at planning-only
-depth; every other run shape enters the loop.
+Chat is what the loop does when the model uses no tools (≈ one text-only call
+in cost, zero forks); the requested outcome is a non-binding flavor hint that
+selects the system prompt (`system_prompt_for(RequestedOutcome)`) and is
+logged, never a code-path branch. The Coordinator owns the run shape:
+`coordinator.rs::decide_run_shape` treats the outcome hint as "an input, not a
+verdict," and the chosen shape (Plan/Execute) is recorded per run
+(`record_run_shape_decision`; `RunShapeContext` is session context, not a
+dispatch gate). With multi-agent disabled, `AgentLoop` owns the run. With it
+enabled, the Coordinator decides — including which runs stay planning-only.
 
 ## Single-agent execution
 
@@ -125,8 +133,11 @@ See [Multi-agent Collaboration](agent-collaboration.md).
 ## Provider layer
 
 `LlmProvider` defines provider identity, streaming completion, connection
-testing, and model metadata. `concerto-providers` implements OpenAI, Anthropic,
-Google, OpenRouter, Ollama, NVIDIA NIM, and OpenCode-compatible behavior. It also
+testing, and model metadata. `concerto-providers` implements a config-first
+factory (`factory.rs`) covering OpenAI, Anthropic, Google, OpenRouter, Ollama,
+NVIDIA NIM, OpenCode-compatible endpoints, and a catalog of OpenAI-compatible
+providers (DeepSeek, Groq, Together, Mistral, xAI, Fireworks, Cerebras, Cohere,
+DeepInfra, Perplexity, SambaNova, DashScope, Moonshot, Zhipu, Novita). It also
 owns OpenAI-compatible protocol normalization, token metering, retry wrapping,
 provider construction, model profiles, and routing.
 
@@ -181,16 +192,27 @@ from those events. Delivery is in-process; it is not a durable message broker.
 
 ## Memory
 
-The active long-term memory path is:
+Memory is layered:
 
-1. walk the selected project and filter supported files;
-2. create line-based chunks for recognized code/text and sliding-window chunks
-   for other text;
-3. produce local BGE small embeddings through `fastembed` (first use may
-   download model data);
-4. store chunks, embeddings, and FTS data in SQLite;
-5. combine vector and FTS5 results with reciprocal-rank fusion;
-6. isolate queries by project and refresh changed files via `notify`.
+- **Short-term (session) memory** — per-session context assembled by
+  `ContextEngine` within the token budget, with overflow handled by
+  `NoOpOverflowStrategy` (ADR-67: one ContextEngine owns all budget pools; the
+  old `SummarizeOldest` strategy was deleted).
+- **Long-term (project) memory** — the active retrieval path:
+
+  1. walk the selected project and filter supported files;
+  2. create line-based chunks for recognized code/text and sliding-window chunks
+     for other text;
+  3. produce local BGE small embeddings through `fastembed` (first use may
+     download model data);
+  4. store chunks, embeddings, and FTS data in SQLite;
+  5. combine vector and FTS5 results with reciprocal-rank fusion;
+  6. isolate queries by project and refresh changed files via `notify`.
+
+- **Global memory** — `GlobalMemoryStore` (`crates/memory/src/global.rs`) is a
+  separate SQLite database scoped by `user_id_hash`, storing cross-project notes
+  and preferences with plain-string (`LIKE`) retrieval. It is fail-soft and does
+  not use embeddings or FTS.
 
 Tree-sitter is used for AST-aware chunking in supported languages (Rust,
 Python, Go, TypeScript), with line-based and sliding-window fallbacks for other
@@ -256,8 +278,8 @@ config-driven v1) and via the CLI's `concerto extensions list`.
 configuration such as rust-analyzer. LSP tools (`GetHover`, `FindReferences`,
 `RenameSymbol`, `GetDiagnostics`, `GetSemanticTokens`, `GetCodeActions`,
 `ExecuteCodeAction`, `GetInlayHints`) are registered unconditionally in the
-agent tool registry (`crates/orchestrator/src/runtime_runner.rs:1715-1722`),
-and the LSP server starts lazily on first use.
+agent tool registry (`crates/orchestrator/src/runtime_runner.rs:1805-1812`, with
+`GitTool` at line 1800), and the LSP server starts lazily on first use.
 
 `concerto-eval` detects common project test runners and owns standard,
 categorized, and multi-agent scenarios. `concerto-eval-runner` constructs the

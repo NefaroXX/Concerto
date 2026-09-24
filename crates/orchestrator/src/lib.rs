@@ -14,6 +14,7 @@
 pub mod agent_loop;
 pub mod agent_runner;
 pub mod agents;
+mod bypass_decision;
 pub mod capsule;
 pub mod checkpoint;
 pub mod conflict;
@@ -24,7 +25,6 @@ pub mod context_engine;
 pub mod coordinator;
 pub mod cost;
 pub mod cycle;
-pub mod cycle_manager;
 pub mod decisions;
 pub mod delta;
 pub mod design_doc_verifier;
@@ -38,7 +38,6 @@ pub mod graph;
 pub mod hash;
 pub mod hunk;
 pub mod in_process_gate;
-pub mod intent_classifier;
 pub mod intent_grants;
 pub mod ipc;
 mod memory_prompt;
@@ -49,6 +48,7 @@ pub mod relationship;
 pub mod speculation;
 pub use relationship::{
     AgentHandoff, AgentRelationship, CollaborationRule, HandoffDeliverable, RelationshipManager,
+    StageRelationship,
 };
 pub mod planner;
 pub mod progress;

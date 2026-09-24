@@ -228,11 +228,10 @@ impl RetryConfig {
 fn default_classifier_enabled() -> bool {
     // ADR-56 (model-first): when `[intent] classifier_enabled` is true the LLM
     // classifier is the PRIMARY intent decider for every non-fast-path
-    // message. The deterministic router (concerto_core::intent::route) remains
-    // the offline / fail-soft fallback and supplies the two fast-path
-    // detections (negation-override, smalltalk). Default is ON — one bounded
-    // model call per non-fast-path message is the intended primary path, not
-    // an opt-in extra (ADR-56 §1/§2).
+    // message. The deterministic rule corpora remain the offline / fail-soft
+    // fallback and supply the two fast-path detections (negation-override,
+    // smalltalk). Default is ON — one bounded model call per non-fast-path
+    // message is the intended primary path, not an opt-in extra (ADR-56 §1/§2).
     true
 }
 
@@ -1245,6 +1244,12 @@ pub struct PolicyConfig {
     pub rules: Vec<PolicyRuleDef>,
     /// Optional time window configuration for auto-approval.
     pub time_window: Option<PolicyTimeWindowConfig>,
+    /// Approval deadline (seconds) for approval-producing rules that do not
+    /// carry an explicit timeout. Additive/optional: absent configs default to
+    /// 30s, preserving pre-existing behavior. A timeout now PAUSES the run
+    /// awaiting the user instead of denying it.
+    #[serde(default)]
+    pub approval_timeout_secs: Option<u64>,
 }
 
 /// Time window configuration for auto-approval of low-cost operations
@@ -1838,7 +1843,7 @@ pub struct MultiAgentConfig {
     #[serde(default = "default_true")]
     pub default_model_fallback: bool,
     /// Maximum dispatch attempts per subtask before the fallback ladder
-    /// walks in. `None` uses the runtime default (3).
+    /// walks in. `None` uses the runtime default (6).
     #[serde(default)]
     pub max_subtask_attempts: Option<u32>,
     /// Global ceiling on total model-dispatch cycles for one multi-agent

@@ -209,6 +209,12 @@ agent. Scheduled after the live-test phase (2026-08-06 decision).
   STUB-FINDINGS.md #8: the test already returns early when
   `benchmark_tasks/standard` is absent, so removing `#[ignore]` is safe on CI
   and exercises the full runner locally.
+
+  **(Resolved 2026-09-24, routing-carcass cleanup)** The `#[ignore]` was
+  removed; `fallback_mode_runs_tests` is now a plain `#[tokio::test]`
+  (`crates/eval/src/runner.rs:471-484`) that keeps its early-return guard when
+  `benchmark_tasks/standard` is absent. See `docs/STATUS.md` ("Eval runner
+  coverage is now fast") and STUB-FINDINGS.md #8.
 - **Fault-injection tests for multi-agent containment.** Not started —
   `docs/adrs/ADR-26.md` defines the provider/tool/subtask recovery boundaries;
   the prior ROADMAP "Automation continuity" item asked for injection tests
@@ -222,6 +228,12 @@ agent. Scheduled after the live-test phase (2026-08-06 decision).
   in `concerto-core` would silently panic instead of failing to compile
   (`docs/STATUS.md:153-160`). Fix: return an explicit `AgentLoopError` in the
   wildcard arm.
+
+  **(Resolved 2026-09-24)** The wildcard arm now returns
+  `OrchestratorError::AgentLoopError("unhandled AgentRunExit variant in
+  continuation loop")` (`crates/orchestrator/src/agent_loop.rs:707-711`); no
+  `unreachable!()` remains in the `AgentRunExit` match. See `docs/STATUS.md`
+  ("Forward-compat panic footgun in the agent loop is fixed").
 - **Acceptance-cycle manual verification (audit C-06 follow-up).** Not
   started — acceptance is validator-owned with artifact/verification evidence,
   but the audit records a manual end-to-end build-then-accept/reject cycle on

@@ -58,11 +58,12 @@ pub struct ToolCall {
     /// Provider-specific opaque state that must be echoed back verbatim when
     /// this tool call is replayed on a later request.
     ///
-    /// Gemini 3.x models (and sometimes 2.5 under thinking) attach a
-    /// `thought_signature` to each `functionCall` part; Google's API requires
-    /// the client to replay that part exactly on the next request that re-sends
-    /// the call, or it fails with `400 INVALID_ARGUMENT` (`Function call is
-    /// missing a thought_signature`). `None` for every provider that does not
+    /// Gemini 3.x models attach an opaque `thoughtSignature` to (usually the
+    /// first) `functionCall` part; Google's API requires the client to replay
+    /// it verbatim as a part-level sibling of `functionCall` on the next
+    /// request that re-sends the call, or it fails with `400
+    /// INVALID_ARGUMENT`. Presence is per-part: later parallel parts carry
+    /// none and must replay bare. `None` for every provider that does not
     /// emit one. `#[serde(default)]` keeps old persisted JSON (without this
     /// field) deserializable; `skip_serializing_if` keeps the serialized wire
     /// shape of a `None`-carrying call byte-identical to today.
@@ -338,6 +339,25 @@ pub struct PolicyAction<'a> {
     /// the producing tool has not populated them. Kept optional so existing
     /// call sites and non-shell tools are unaffected.
     pub command_facts: Option<CommandPolicyFacts>,
+    /// Orchestrator-authority marker (additive; default `false`).
+    ///
+    /// Set `true` ONLY at the orchestrator's own top-level call sites — the
+    /// Coordinator's decision loop (`call_specialist` dispatch,
+    /// self-executor tool calls) and the single-agent `AgentLoop` executor
+    /// calls. It tells the intent gate that this action is the orchestrator
+    /// acting under its own, already-confirmed intent rather than a
+    /// specialist's independently-gated tool call.
+    ///
+    /// When `true`, the engine skips ONLY intent-derived restrictions (the
+    /// `Condition::IntentAuthorized` gate upgrade, the read-only-intent
+    /// pre-sink `Deny`, and `un_granted` / `shell_requires_approval`). It
+    /// KEEPS every hard invariant: deny-class rules (`AutoDeny`,
+    /// `DenyNetworkEgress`) still run first, Consequential actions still
+    /// prompt through the approval sink, plan binding/guard still applies,
+    /// and the audit row records `rule_matched = "coordinator_authority"`.
+    /// Specialists, gate-proxy/supervisor children, and MCP/plugin bridges
+    /// never set this flag, so their gating is unchanged.
+    pub orchestrator_authority: bool,
 }
 
 // ---- ADR-28 §6: structured command-policy facts ----------------------------
@@ -635,6 +655,29 @@ pub enum McpServerState {
     Failed,
     /// Gracefully stopped (or stopped after a crash).
     Stopped,
+}
+
+/// Lifecycle state of one WASM plugin, mirroring [`McpServerState`].
+///
+/// Surfaced to the desktop/CLI via [`crate::event::EventKind::PluginStateChanged`]
+/// so plugin load/initialise/disable transitions are visible in the UI and the
+/// session transcript, not only in logs. A plugin is `Loading` while its module
+/// is loaded and its `init` export runs, `Active` once initialisation
+/// succeeded, `Failed` when load/initialise failed, `Disabled` when an
+/// administrative disable or violation threshold applied, and `Unloaded` after
+/// it is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginState {
+    /// Module load + `init` export in progress.
+    Loading,
+    /// Initialised and ready for tool/provider calls.
+    Active,
+    /// Load or initialisation failed (trap/fuel exhaustion, bad manifest, ...).
+    Failed,
+    /// Administratively disabled (violation threshold or explicit disable).
+    Disabled,
+    /// Removed from the manager.
+    Unloaded,
 }
 
 // ---- TaskId newtype -------------------------------------------------------
@@ -962,6 +1005,27 @@ pub enum AgentCompletionStatus {
     AwaitingUser,
 }
 
+/// Pending-approval payload carried on a checkpoint (and surfaced on a paused
+/// run) so a resume can re-attach to the SAME approval request instead of
+/// re-asking the model or burning a retry. Identifies the action by tool name
+/// and input hash; `correlation_id` pairs it with the executor's preserved
+/// request and the `RequireApproval` audit row. Additive/optional on the
+/// checkpoint (serde default) so older records still load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PendingApprovalInfo {
+    /// Canonical tool name awaiting approval.
+    pub tool_name: String,
+    /// Human-readable action detail (summarized input).
+    pub detail: String,
+    /// Hash of the action input.
+    pub input_hash: String,
+    /// Correlation id of the paused action.
+    pub correlation_id: String,
+    /// Configured approval deadline in seconds (0 when unknown).
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
 /// One structured record of a single tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExecutionSummary {
@@ -997,6 +1061,11 @@ pub enum AgentRunExit {
     Done(AgentOutput),
     /// The model indicated it needs user input before it can proceed.
     NeedsUser { reason: String, partial: AgentOutput },
+    /// An approval request timed out. The run is PAUSED awaiting the user
+    /// (never a denial, never a model retry): `pending` carries the preserved
+    /// request so a resume re-attaches to it, and `partial` carries the
+    /// progress made so far. The run surfaces as `AwaitingUser`.
+    AwaitingApproval { reason: String, pending: PendingApprovalInfo, partial: AgentOutput },
     /// A real blocker stopped progress (e.g. minimum tool calls unmet, or no
     /// file-changing action succeeded).
     Blocked { reason: String, partial: AgentOutput },
@@ -1101,6 +1170,36 @@ pub struct EvalResult {
     /// Optional coverage measurement collected alongside the test run.
     #[serde(default)]
     pub coverage: Option<CoverageInfo>,
+    /// Where this result came from: the project's detected harness, or the
+    /// plain `cargo test` fallback used when no eval config was found.
+    #[serde(default)]
+    pub provenance: EvalProvenance,
+}
+
+/// Provenance of an [`EvalResult`].
+///
+/// Declared so an unvalidated project is never confused with a properly
+/// harnessed one: the coordinator's validation report records whether the
+/// result came from the project's own detected runner or from the no-config
+/// `cargo test` fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum EvalProvenance {
+    /// Ran through the project's detected harness (`cargo`/`npm`/`pytest`/`make`).
+    #[default]
+    Harness,
+    /// No eval config was found; ran a plain `cargo test` fallback.
+    Fallback,
+}
+
+impl fmt::Display for EvalProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvalProvenance::Harness => write!(f, "harness"),
+            EvalProvenance::Fallback => write!(f, "fallback"),
+        }
+    }
 }
 
 /// Detected test runner for a project.

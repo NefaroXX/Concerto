@@ -168,13 +168,18 @@ Each entry lists only internal workspace dependencies (external crates omitted f
 
 - `core` is the sole foundational crate: everything depends on it, it depends on nothing.
 - `tools` and `orchestrator` are the highest-fan-in crates after `core` (most dependents).
+- There is **no `agents` crate**: agents are configuration, not code. The five
+  specialists (Architect, Researcher, Coder, Reviewer, Validator) are config
+  seeds materialized by the orchestrator (`GenericSpecialistAgent`), and custom
+  agents are owned by the config roster (ADR-58/59 revised; the orchestrator
+  derives them from config at startup).
 - `api-types` exists as a separate crate so `desktop` and `cli` can share request/response types without pulling in the Axum HTTP server framework.
 - `plugin-sdk` is `#![no_std]` and has no internal workspace dependencies.
 - `skills` and `mcp` are the ADR-43 extension crates. `skills` depends only on
   `api-types` for the shared manifest types (no `config` dependency), and `mcp`
   depends on `api-types`, `config`, and `core`; both stay below the
   orchestrator, which consumes them at runtime.
-- `test-plugin-wasm` and `test-dialect-plugin-wasm` require the
-  `wasm32-wasip2` Rust target to build.
+- `test-plugin-wasm`, `test-adapter-plugin-wasm`, and
+  `test-provider-plugin-wasm` require the `wasm32-wasip2` Rust target to build.
 - `lsp` tools are registered unconditionally in the agent tool registry
   (`runtime_runner.rs:1715-1722`); the LSP server starts lazily on first use.

@@ -47,15 +47,22 @@ review, provider setup, and single/multi-agent execution.
 
 **Single- and multi-agent execution.** A streaming plan/act/observe loop with
 bounded continuation, cancellation, cycle detection, and recoverable-error
-handling. Multi-agent mode (a desktop toggle, or `--multi-agent` in the CLI)
-runs a Coordinator plus five specialists — Architect, Researcher, Coder,
-Reviewer, and Validator — with dependency-aware task scheduling, per-role
-provider/model assignments, and policy-gated write access. Chat and Plan modes
-never grant project tools; only Build does.
+handling. Every non-empty run enters the same unified loop; the Coordinator
+(ADR-71) is the sole master of a run — it decides all dispatch, ordering, agent
+selection, and termination, and the run shape is recorded for every run. The
+five specialists (Architect, Researcher, Coder, Reviewer, Validator) are
+config-driven seeds with dependency-aware task scheduling and per-role
+provider/model assignments. Tools are granted per confirmed policy decision,
+never by a chat/plan/build keyword: boundaries are enforced by deny-class
+policy rules and the approval sink.
 
 **Provider support.** OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama,
-NVIDIA NIM, and OpenCode-compatible endpoints, through a shared streaming
-interface with retry/backoff and token metering.
+NVIDIA NIM, OpenCode-compatible endpoints, and a config-first catalog of
+OpenAI-compatible providers — Anthropic, OpenAI, OpenCode, Google, OpenRouter,
+NIM, Ollama, DeepSeek, Groq, Together, Mistral, xAI, Fireworks, Cerebras,
+Cohere, DeepInfra, Perplexity, SambaNova, DashScope, Moonshot, Zhipu, and
+Novita — through a shared streaming interface with retry/backoff and token
+metering.
 
 **Policy governance.** Every file write, shell command, and git operation
 passes through `SimplePolicyEngine` and the `VirtualFs` overlay — there is no

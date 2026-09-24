@@ -39,6 +39,7 @@ fn build_action<'a>(
     input: &'a serde_json::Value,
     tool: &dyn Tool,
     session: &SessionContext,
+    orchestrator_authority: bool,
 ) -> PolicyAction<'a> {
     PolicyAction {
         tool_name,
@@ -58,6 +59,9 @@ fn build_action<'a>(
         // shell tool resolves executable/argv/cwd), so the policy engine
         // and audit log reason about what actually runs, not just a string.
         command_facts: tool.command_facts(input, session),
+        // Orchestrator-authority marker: only the authority execute path sets
+        // this; every ordinary (specialist / gate / bridge) path passes false.
+        orchestrator_authority,
     }
 }
 
@@ -194,24 +198,47 @@ impl ToolExecutor {
         decision: ApprovalDecision,
         cancel: CancellationToken,
     ) {
+        let (verdict, user_response) = match decision {
+            ApprovalDecision::Approve => ("Approved", "user approved"),
+            ApprovalDecision::ApproveAllForSession => {
+                ("ApprovedAllForSession", "user approved all for session")
+            }
+            ApprovalDecision::Deny => ("Denied", "user denied"),
+        };
+        self.record_approval_outcome(action, verdict, user_response, cancel).await;
+    }
+
+    /// Persist a timeout as its own approval-decision row (verdict `TimedOut`)
+    /// so the trail shows the request expired and the run paused — the
+    /// pre-fix path wrote no row at all on timeout.
+    async fn record_approval_timeout(
+        &self,
+        action: &PolicyAction<'_>,
+        timeout_secs: u64,
+        cancel: CancellationToken,
+    ) {
+        let response = format!("approval timed out after {timeout_secs}s; awaiting user");
+        self.record_approval_outcome(action, "TimedOut", &response, cancel).await;
+    }
+
+    /// Shared builder for an approval-decision audit row. `verdict` is the
+    /// decision outcome (`Approved` / `ApprovedAllForSession` / `Denied` /
+    /// `TimedOut`); `user_response` is the human-readable detail.
+    async fn record_approval_outcome(
+        &self,
+        action: &PolicyAction<'_>,
+        verdict: &str,
+        user_response: &str,
+        cancel: CancellationToken,
+    ) {
         let entry = AuditEntry {
             tool_name: action.tool_name.to_string(),
-            verdict: match decision {
-                ApprovalDecision::Approve => "Approved".to_owned(),
-                ApprovalDecision::ApproveAllForSession => "ApprovedAllForSession".to_owned(),
-                ApprovalDecision::Deny => "Denied".to_owned(),
-            },
+            verdict: verdict.to_owned(),
             input_hash: crate::policy::compute_input_hash(action.input),
             session_id: action.session_id,
             correlation_id: action.correlation_id,
             timestamp: OffsetDateTime::now_utc(),
-            user_response: Some(match decision {
-                ApprovalDecision::Approve => "user approved".to_owned(),
-                ApprovalDecision::ApproveAllForSession => {
-                    "user approved all for session".to_owned()
-                }
-                ApprovalDecision::Deny => "user denied".to_owned(),
-            }),
+            user_response: Some(user_response.to_owned()),
             rule_matched: Some("user_approval".to_owned()),
             // ---- ADR-28 §6/§7: carry structured facts forward to the log ----
             profile_id: action.command_facts.as_ref().and_then(|f| f.shell_profile_id.clone()),
@@ -300,50 +327,43 @@ impl ToolExecutor {
         }
     }
 
-    /// Persist a deterministic routing decision (ADR-55 §6) as a distinct
-    /// audit entry through the same channel as
-    /// [`Self::record_ack_decision`].
+    /// Persist the coordinator's FINAL run-shape decision (advisor-mode intent
+    /// routing) as a distinct audit entry.
     ///
-    /// A routing decision is not tied to any tool call, so `tool_name` is the
-    /// synthetic `"intent_router"` and `input_hash` is the empty string (no
-    /// input exists). The winning rule name — one of the rule constants from
-    /// `crate::intent` (`execute_keyword`, `verify_keyword`, ...), or the
-    /// `"llm_classifier"` / `"ask_user"` path names — becomes `rule_matched`;
-    /// `user_response` carries the outcome label (`Execute`, `Verify`, ...);
-    /// and `verdict` records the user's confirmation for the decision
-    /// (`granted` | `declined` | `timed_out` | `canceled` | `n/a` — `n/a` when
-    /// no confirmation was solicited, e.g. an unanswered `AskUser`). The
-    /// ADR-28 §6 execution fields stay `None`: there is no command behind a
-    /// routing decision.
-    ///
-    /// Phase 0 ships the channel only: the fixed [`AuditEntry`] schema has no
-    /// dedicated columns for the originating `utterance` or the router's
-    /// `confidence`, so those are surfaced at `debug` level here and durable
-    /// coverage lands with ADR-55 Phase 2 ("durable audit coverage for the new
-    /// records"). Wiring the run loop call site is a later, explicitly
-    /// additive batch; until then nothing calls this method in production, so
-    /// this is zero-behavioral.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn record_routing_decision(
+    /// This row records the shape the coordinator actually chose AFTER
+    /// consulting session context, plus the reason, so an override of the
+    /// routing hint is observable and diagnosable rather than a silent
+    /// divergence. `tool_name` is the synthetic
+    /// `"coordinator_shape"`, `verdict` carries the final shape (`Plan` |
+    /// `Execute`), `rule_matched` the reason code, and `user_response` a
+    /// compact JSON envelope `{hint, final_shape, reason}`. The ADR-28 §6
+    /// execution fields stay `None`: there is no command behind a shape
+    /// decision.
+    pub async fn record_coordinator_shape_decision(
         &self,
         session_id: crate::ids::Ulid,
         correlation_id: crate::ids::Ulid,
-        utterance: &str,
-        route: &str,
-        outcome: &str,
-        confidence: f32,
-        confirmation: &str,
+        hint: &str,
+        final_shape: &str,
+        reason: &str,
         cancel: CancellationToken,
     ) {
         let entry = AuditEntry {
-            tool_name: "intent_router".to_owned(),
-            verdict: confirmation.to_owned(),
+            tool_name: "coordinator_shape".to_owned(),
+            verdict: final_shape.to_owned(),
             input_hash: String::new(),
             session_id,
             correlation_id,
             timestamp: OffsetDateTime::now_utc(),
-            user_response: Some(outcome.to_owned()),
-            rule_matched: Some(route.to_owned()),
+            user_response: Some(
+                serde_json::json!({
+                    "hint": hint,
+                    "final_shape": final_shape,
+                    "reason": reason,
+                })
+                .to_string(),
+            ),
+            rule_matched: Some(reason.to_owned()),
             profile_id: None,
             resolved_executable: None,
             argv: None,
@@ -354,57 +374,52 @@ impl ToolExecutor {
             exit_code: None,
             duration_ms: None,
             toolchain_version: None,
-            // Routing decisions stay JSON-only (ADR-55 §6): no plan is bound.
+            // A shape decision binds no plan and names no source revision.
             plan_id: None,
             source_revision: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
-            tracing::error!(%error, "routing-decision audit write failed");
+            tracing::error!(%error, "coordinator-shape audit write failed");
         } else {
-            tracing::debug!(
-                route,
-                outcome,
-                confirmation,
-                %confidence,
-                utterance,
-                "routing decision recorded"
-            );
+            tracing::debug!(hint, final_shape, reason, "coordinator shape recorded");
         }
     }
 
-    /// Persist an automatic intent-routing decision (ADR-55 Phase 2d §5) as a
-    /// distinct audit entry through the same channel as
-    /// [`Self::record_routing_decision`].
+    /// Persist a generic bypass/abort *decision* row as a distinct audit entry.
     ///
-    /// Routing is the decision (2d §1): when the run loop auto-grants from a
-    /// high-confidence route, the row is labeled `intent_router:
-    /// auto_granted` — `tool_name = "intent_router"`, `verdict =
-    /// "auto_granted"` — and `user_response` carries the
-    /// `{rule, confidence, route, outcome}` envelope so the grant is
-    /// observable (never blocking; §5). `rule_matched` keeps the caller's
-    /// pre-replacement deterministic route name, preserving the ADR-55 Phase
-    /// 2c §5 row-chain invariant (the classifier's own row stays
-    /// distinguishable by `rule_matched`/`verdict`). Non-auto decisions
-    /// (denial, negation, AskUser) keep their existing
-    /// [`Self::record_routing_decision`] rows unchanged.
-    pub async fn record_auto_intent_decision(
+    /// The supremacy invariant ([`crate::executor`] is the run's single
+    /// executor) is that a path which would otherwise abort silently — a
+    /// cleared checkpoint, a loop cap, an operator-visible drop, a
+    /// pre-coordinator setup failure — records WHY it happened as a
+    /// Coordinator Decision row. This is the shared sink those sites use so
+    /// the row shape stays identical everywhere.
+    ///
+    /// `decision` is the stable machine code (e.g. `checkpoint-cleared-scope`)
+    /// carried in both `verdict` and `rule_matched`; `reason` is the
+    /// human-readable detail. `tool_name` is the synthetic
+    /// `"coordinator_decision"`, `input_hash` is empty (no tool input exists),
+    /// and `user_response` is a compact JSON envelope `{decision, reason}`.
+    /// The ADR-28 §6 execution fields stay `None`: there is no command behind a
+    /// decision. Fail-soft: an audit failure is logged, never propagated.
+    pub async fn record_coordinator_decision(
         &self,
         session_id: crate::ids::Ulid,
         correlation_id: crate::ids::Ulid,
-        utterance: &str,
-        route: &str,
-        detail: &str,
+        decision: &str,
+        reason: &str,
         cancel: CancellationToken,
     ) {
         let entry = AuditEntry {
-            tool_name: "intent_router".to_owned(),
-            verdict: "auto_granted".to_owned(),
+            tool_name: "coordinator_decision".to_owned(),
+            verdict: decision.to_owned(),
             input_hash: String::new(),
             session_id,
             correlation_id,
             timestamp: OffsetDateTime::now_utc(),
-            user_response: Some(detail.to_owned()),
-            rule_matched: Some(route.to_owned()),
+            user_response: Some(
+                serde_json::json!({ "decision": decision, "reason": reason }).to_string(),
+            ),
+            rule_matched: Some(decision.to_owned()),
             profile_id: None,
             resolved_executable: None,
             argv: None,
@@ -415,19 +430,18 @@ impl ToolExecutor {
             exit_code: None,
             duration_ms: None,
             toolchain_version: None,
-            // Routing decisions stay JSON-only (ADR-55 §6): no plan is bound.
             plan_id: None,
             source_revision: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
-            tracing::error!(%error, "auto-intent-decision audit write failed");
+            tracing::warn!(%error, decision, "coordinator-decision audit write failed (fail-soft)");
         } else {
-            tracing::debug!(route, detail, utterance, "auto intent decision recorded");
+            tracing::debug!(decision, reason, "coordinator decision recorded");
         }
     }
 
     /// Persist a plan-approval decision (ADR-55 Phase 1d) as a distinct audit
-    /// entry through the same channel as [`Self::record_routing_decision`].
+    /// entry.
     ///
     /// A plan decision is not tied to any tool call, so `tool_name` is the
     /// synthetic `"intent:plan"`. `rule_matched` and `verdict` both carry the
@@ -620,11 +634,48 @@ impl ToolExecutor {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(tool_name, input, session, cancel, false).await
+    }
+
+    /// Orchestrator-authority execute: identical to [`Self::execute`], but the
+    /// policy action carries [`PolicyAction::orchestrator_authority`] = `true`.
+    ///
+    /// Called ONLY by the orchestrator's own top-level call sites (the
+    /// Coordinator's self-executor tool calls and the single-agent `AgentLoop`
+    /// executor calls). The engine then skips intent-derived restrictions
+    /// (the grant-upgrade requirement, the read-only-intent pre-sink deny, and
+    /// `un_granted` / `shell_requires_approval`) while keeping deny-class
+    /// first, Consequential approval sinks, plan guards, and audit rows.
+    /// Specialists, gate-proxy/supervisor children, and MCP/plugin bridges use
+    /// [`Self::execute`] and stay fully intent-gated.
+    pub async fn execute_with_authority(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(tool_name, input, session, cancel, true).await
+    }
+
+    async fn execute_inner(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+        orchestrator_authority: bool,
+    ) -> Result<ToolOutput, ToolError> {
         let tool = self.registry.get(tool_name).ok_or_else(|| ToolError::ExecutionFailed {
             message: format!("tool not found: {tool_name}"),
         })?;
 
-        let action = build_action(tool_name, &input, tool, session);
+        // Policy evaluates the tool's canonical view (alias tools present the
+        // canonical tool name and operation-bearing input); execution and
+        // audit below still use the registered name and the caller's input.
+        let (policy_name, policy_input) = tool.policy_view(&input);
+        let action =
+            build_action(&policy_name, &policy_input, tool, session, orchestrator_authority);
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
@@ -703,6 +754,44 @@ impl ToolExecutor {
         }
     }
 
+    /// Execute a tool **without** a policy decision, for gate-routed
+    /// read-only operations.
+    ///
+    /// The write gate classifies `read`/`list`/`exists` filesystem operations
+    /// as read-only and routes them here instead of through [`Self::execute`]'s
+    /// policy gate: a read must never be denied by a write-oriented policy
+    /// (nor persisted as a `write-rejected` whiteboard decision). Policy is
+    /// still consulted *advisorily* by the gate — this method performs no
+    /// evaluation and writes no decision row; it does keep the
+    /// post-execution audit completion row, exactly like [`Self::execute`]'s
+    /// allowed path.
+    ///
+    /// The caller is responsible for routing only genuinely read-only
+    /// operations here; this method performs no read/write classification of
+    /// its own.
+    pub async fn execute_read_only(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let tool = self.registry.get(tool_name).ok_or_else(|| ToolError::ExecutionFailed {
+            message: format!("tool not found: {tool_name}"),
+        })?;
+        // Build the audit context the same way `execute`'s allowed path does,
+        // but without evaluating the action: the canonical policy view still
+        // names the completion row's tool, and `command_facts` still enrich it.
+        let (policy_name, policy_input) = tool.policy_view(&input);
+        let action = build_action(&policy_name, &policy_input, tool, session, false);
+        let audit = ExecutionAuditContext {
+            correlation_id: action.correlation_id,
+            input_hash: crate::policy::compute_input_hash(&input),
+            facts: action.command_facts.clone(),
+        };
+        self.execute_allowed(tool, tool_name, input, session, cancel, audit).await
+    }
+
     /// ADR-65 F1a: side-effect-free policy gate for the read-dedupe serve path.
     ///
     /// Re-evaluates the action through [`PolicyEngine::evaluate_advisory`] (no
@@ -725,7 +814,8 @@ impl ToolExecutor {
         let Some(tool) = self.registry.get(tool_name) else {
             return false;
         };
-        let action = build_action(tool_name, input, tool, session);
+        let (policy_name, policy_input) = tool.policy_view(input);
+        let action = build_action(&policy_name, &policy_input, tool, session, false);
         matches!(self.policy.evaluate_advisory(&action, cancel).await, Ok(PolicyVerdict::Allow))
     }
 
@@ -780,11 +870,15 @@ impl ToolExecutor {
     /// at the requester.
     ///
     /// H-02 remediation: the timeout is enforced here, not by wrapping the
-    /// sink — a silent sink must not hang the caller, and an approval granted
-    /// after the deadline must never let the action execute. A timeout is an
-    /// explicit deny-by-default state: it fails the action deterministically
-    /// and publishes an [`EventKind::ApprovalTimeout`] so subscribers see the
-    /// same outcome.
+    /// sink — a silent sink must not hang the caller. On timeout the action is
+    /// **paused**, not denied: the request is left with the sink (which owns
+    /// its pending entry, so dropping this future does not lose it), an
+    /// [`EventKind::ApprovalTimeout`] is published, the timeout is recorded as
+    /// an approval-decision audit row (`TimedOut`), and a
+    /// [`ToolError::PausedAwaitingApproval`] is returned. A late user decision
+    /// still fulfils the preserved request and a resume re-attaches to it — the
+    /// run stops `AwaitingUser` instead of burning identical retries. Only an
+    /// explicit `Deny` or a dropped/dismissed pending request denies.
     async fn request_approval_decision(
         &self,
         sink: &dyn ApprovalSink,
@@ -810,11 +904,52 @@ impl ToolExecutor {
                 tracing::warn!(
                     tool_name = %action.tool_name,
                     timeout_secs = timeout.as_secs(),
-                    "approval timed out; action denied by default"
+                    "approval timed out; run paused awaiting the user"
                 );
-                Err(ToolError::PolicyDenied { rule: "approval_timeout".into() })
+                // Record the timeout on the same audit trail as the other
+                // approval outcomes (pre-fix, a timeout wrote no row at all).
+                self.record_approval_timeout(action, timeout.as_secs(), cancel.clone()).await;
+                Err(ToolError::PausedAwaitingApproval {
+                    tool_name: action.tool_name.to_string(),
+                    detail: action_detail(action.input),
+                    input_hash: crate::policy::compute_input_hash(action.input),
+                    correlation_id: action.correlation_id,
+                    timeout_secs: timeout.as_secs(),
+                })
             }
         }
+    }
+}
+
+/// Compact human-readable detail for a paused approval action, used to carry
+/// the action identity onto the checkpoint without shipping the whole input.
+fn action_detail(input: &serde_json::Value) -> String {
+    if let Some(command) = input.get("command").and_then(serde_json::Value::as_str) {
+        let args = input
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            return format!("command: {command}");
+        }
+        return format!("command: {command} {}", args.join(" "));
+    }
+    let key = match input.get("path").and_then(serde_json::Value::as_str) {
+        Some(path) => return format!("path: {path}"),
+        None => input.get("operation").and_then(serde_json::Value::as_str),
+    };
+    if let Some(operation) = key {
+        return format!("operation: {operation}");
+    }
+    let json = serde_json::to_string(input).unwrap_or_default();
+    if json.chars().count() > 120 {
+        let truncated: String = json.chars().take(119).collect();
+        format!("{truncated}…")
+    } else {
+        json
     }
 }
 
@@ -1053,6 +1188,77 @@ mod tests {
         assert!(matches!(err, ToolError::PolicyDenied { .. }));
     }
 
+    /// Records the `orchestrator_authority` flag of the last action it saw, so
+    /// the two executor entry points can be told apart.
+    #[derive(Default)]
+    struct FlagRecordingPolicy {
+        saw_authority: std::sync::Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl PolicyEngine for FlagRecordingPolicy {
+        async fn evaluate(
+            &self,
+            action: &PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> Result<PolicyVerdict, PolicyError> {
+            *self.saw_authority.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(action.orchestrator_authority);
+            // Deny is sufficient: the test only observes the action shape.
+            Ok(PolicyVerdict::Deny)
+        }
+
+        fn audit_log(&self) -> &dyn crate::traits::policy::AuditLog {
+            &NullTestAuditLog
+        }
+    }
+
+    struct NullTestAuditLog;
+
+    #[async_trait]
+    impl crate::traits::policy::AuditLog for NullTestAuditLog {
+        async fn record(
+            &self,
+            _entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_marks_action_non_authority() {
+        let policy = Arc::new(FlagRecordingPolicy::default());
+        let executor = ToolExecutor::new(test_registry(), policy.clone());
+        let _ = executor
+            .execute("echo", serde_json::json!({}), &test_session(), CancellationToken::new())
+            .await;
+        assert_eq!(
+            *policy.saw_authority.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(false),
+            "the ordinary execute path never sets the authority marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_authority_marks_action_authority() {
+        let policy = Arc::new(FlagRecordingPolicy::default());
+        let executor = ToolExecutor::new(test_registry(), policy.clone());
+        let _ = executor
+            .execute_with_authority(
+                "echo",
+                serde_json::json!({}),
+                &test_session(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            *policy.saw_authority.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(true),
+            "the authority path sets the marker"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_tool_returns_not_found() {
         let executor = ToolExecutor::new(test_registry(), Arc::new(AllowPolicy));
@@ -1125,6 +1331,79 @@ mod tests {
         assert_eq!(executor.tool_definitions_for(&shell_caps).len(), 1);
     }
 
+    /// The coordinator's final run-shape decision records its own
+    /// `coordinator_shape` row carrying the final shape + reason.
+    #[tokio::test]
+    async fn coordinator_shape_row_carries_the_final_shape_and_reason() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = Ulid::new();
+
+        executor
+            .record_coordinator_shape_decision(
+                session,
+                Ulid::new(),
+                "Plan",
+                "Execute",
+                "approved_plan_overrides_plan_hint",
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap();
+        let shape = entries
+            .iter()
+            .find(|entry| entry.tool_name == "coordinator_shape")
+            .expect("the coordinator shape row is recorded");
+        assert_eq!(shape.verdict, "Execute", "verdict carries the final shape");
+        assert_eq!(
+            shape.rule_matched.as_deref(),
+            Some("approved_plan_overrides_plan_hint"),
+            "rule_matched carries the override reason"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(shape.user_response.as_deref().unwrap_or("{}"))
+                .expect("the response is a JSON envelope");
+        assert_eq!(envelope["hint"], "Plan");
+        assert_eq!(envelope["final_shape"], "Execute");
+    }
+
+    /// A bypass/abort decision row is a distinct, machine-queryable audit
+    /// entry: `tool_name = "coordinator_decision"`, `verdict`/`rule_matched`
+    /// carry the decision code, and `user_response` is a `{decision, reason}`
+    /// envelope.
+    #[tokio::test]
+    async fn coordinator_decision_row_carries_the_decision_shape() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = Ulid::new();
+
+        executor
+            .record_coordinator_decision(
+                session,
+                Ulid::new(),
+                "checkpoint-cleared-malformed",
+                "the checkpoint could not be parsed",
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "exactly one row");
+        let row = &entries[0];
+        assert_eq!(row.tool_name, "coordinator_decision");
+        assert_eq!(row.verdict, "checkpoint-cleared-malformed");
+        assert_eq!(row.rule_matched.as_deref(), Some("checkpoint-cleared-malformed"));
+        assert_eq!(row.session_id, session);
+        let envelope: serde_json::Value =
+            serde_json::from_str(row.user_response.as_deref().unwrap_or("{}"))
+                .expect("the response is a JSON envelope");
+        assert_eq!(envelope["decision"], "checkpoint-cleared-malformed");
+        assert_eq!(envelope["reason"], "the checkpoint could not be parsed");
+    }
+
     #[tokio::test]
     async fn command_execution_appends_correlated_completion_facts() {
         let audit = Arc::new(RecordingAudit::default());
@@ -1132,7 +1411,6 @@ mod tests {
         let mut registry = ToolRegistry::default();
         registry.register(Box::new(FactTool));
         let executor = ToolExecutor::new(Arc::new(registry), policy);
-
         let output = executor
             .execute("fact", serde_json::json!({}), &test_session(), CancellationToken::new())
             .await
@@ -1251,22 +1529,56 @@ mod tests {
         }
     }
 
-    /// Approval sink whose decision is delivered through a oneshot channel,
-    /// so tests control exactly when — and whether — the "user" responds.
+    /// Await a decision on a watch receiver (see the CLI/desktop sinks): return
+    /// the value immediately when already resolved, else wait for the change.
+    async fn watch_decision(
+        mut receiver: tokio::sync::watch::Receiver<Option<ApprovalDecision>>,
+    ) -> ApprovalDecision {
+        loop {
+            let current = *receiver.borrow();
+            if let Some(decision) = current {
+                return decision;
+            }
+            if receiver.changed().await.is_err() {
+                return ApprovalDecision::Deny;
+            }
+        }
+    }
+
+    /// Approval sink whose decision is delivered through a `watch` channel, so
+    /// tests control exactly when — and whether — the "user" responds. The
+    /// sink keeps its own receiver so a decision resolved AFTER the requester
+    /// dropped its awaiting future (a timeout) is still delivered — the
+    /// "no orphaned oneshot loss" property.
     struct ControlledApprovalSink {
-        pending: Mutex<Option<tokio::sync::oneshot::Sender<ApprovalDecision>>>,
+        pending: Mutex<Option<tokio::sync::watch::Sender<Option<ApprovalDecision>>>>,
+        preserved: Mutex<Option<tokio::sync::watch::Receiver<Option<ApprovalDecision>>>>,
         requests: AtomicUsize,
     }
 
     impl ControlledApprovalSink {
         fn new() -> Self {
-            Self { pending: Mutex::new(None), requests: AtomicUsize::new(0) }
+            Self {
+                pending: Mutex::new(None),
+                preserved: Mutex::new(None),
+                requests: AtomicUsize::new(0),
+            }
         }
 
         fn resolve(&self, decision: ApprovalDecision) {
-            if let Some(sender) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                let _ = sender.send(decision);
+            if let Some(sender) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                let _ = sender.send(Some(decision));
             }
+        }
+
+        /// The decision currently preserved on the sink (delivered even when
+        /// no requester is attached).
+        fn preserved_decision(&self) -> Option<ApprovalDecision> {
+            self.preserved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|receiver| *receiver.borrow())
         }
     }
 
@@ -1278,9 +1590,10 @@ mod tests {
             _cancel: CancellationToken,
         ) -> ApprovalDecision {
             self.requests.fetch_add(1, Ordering::SeqCst);
-            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let (sender, receiver) = tokio::sync::watch::channel(None);
             *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
-            receiver.await.unwrap_or(ApprovalDecision::Deny)
+            *self.preserved.lock().unwrap_or_else(|e| e.into_inner()) = Some(receiver.clone());
+            watch_decision(receiver).await
         }
 
         async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
@@ -1348,7 +1661,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn approval_timeout_denies_without_executing_and_emits_event() {
+    async fn approval_timeout_pauses_without_executing_and_emits_event() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1377,10 +1690,20 @@ mod tests {
         let error = handle
             .await
             .expect("executor task must not panic")
-            .expect_err("approval timeout must fail the action");
+            .expect_err("approval timeout must pause the action");
+        // The timeout PAUSES (resumable), it does NOT deny: the run must never
+        // burn a retry on a timed-out approval.
+        match &error {
+            ToolError::PausedAwaitingApproval { tool_name, input_hash, timeout_secs, .. } => {
+                assert_eq!(tool_name, "echo");
+                assert_eq!(*timeout_secs, 10);
+                assert!(!input_hash.is_empty(), "the paused action carries its input hash");
+            }
+            other => panic!("expected PausedAwaitingApproval, got {other:?}"),
+        }
         assert!(
-            matches!(&error, ToolError::PolicyDenied { rule } if rule == "approval_timeout"),
-            "expected approval_timeout denial, got {error:?}"
+            !matches!(&error, ToolError::PolicyDenied { .. }),
+            "a timeout must never be a policy denial"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "tool must never execute after timeout");
 
@@ -1393,6 +1716,16 @@ mod tests {
             }
             other => panic!("expected ApprovalTimeout event, got {other:?}"),
         }
+
+        // Late resolve after the timeout STILL lands on the preserved request
+        // (the executor dropped its awaiting future, but the sink kept the
+        // channel open) — no orphaned oneshot loss.
+        sink.resolve(ApprovalDecision::Approve);
+        assert_eq!(
+            sink.preserved_decision(),
+            Some(ApprovalDecision::Approve),
+            "a late resolve must fulfil the preserved request"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1736,133 +2069,6 @@ mod tests {
         assert_eq!(entries[0].session_id, caller_session_id);
         assert_eq!(entries[0].correlation_id, correlation_id);
         assert_eq!(entries[0].verdict, "RequestContinue");
-    }
-
-    /// A deterministic routing decision records a single row under the
-    /// synthetic `intent_router` tool identity with the route rule in
-    /// `rule_matched`, the outcome label in `user_response`, and the
-    /// confirmation in `verdict` (`n/a` when no confirmation was solicited).
-    #[tokio::test]
-    async fn routing_decision_records_rule_row() {
-        let audit = Arc::new(RecordingAudit::default());
-        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
-        let executor = ToolExecutor::new(test_registry(), policy);
-        let session = test_session();
-        let correlation_id = Ulid::new();
-
-        executor
-            .record_routing_decision(
-                session.session_id,
-                correlation_id,
-                "add a retry to the uploader",
-                "execute_keyword",
-                "Execute",
-                0.8,
-                "n/a",
-                CancellationToken::new(),
-            )
-            .await;
-
-        let entries = audit.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1, "exactly one routing row is recorded");
-        assert_eq!(entries[0].tool_name, "intent_router");
-        assert_eq!(entries[0].verdict, "n/a");
-        assert_eq!(entries[0].rule_matched.as_deref(), Some("execute_keyword"));
-        assert_eq!(entries[0].user_response.as_deref(), Some("Execute"));
-        assert_eq!(entries[0].session_id, session.session_id);
-        assert_eq!(entries[0].correlation_id, correlation_id);
-        // A routing decision has no input, no command facts, no execution.
-        assert_eq!(entries[0].input_hash, "");
-        assert_eq!(entries[0].profile_id, None);
-        assert_eq!(entries[0].argv, None);
-        assert_eq!(entries[0].network_requested, None);
-        assert_eq!(entries[0].exit_code, None);
-        assert_eq!(entries[0].duration_ms, None);
-    }
-
-    /// A classifier route that solicited a confirmation carries the user's
-    /// answer in `verdict`, so a declined execution leaves a deny-side trace.
-    #[tokio::test]
-    async fn routing_decision_records_declined_confirmation() {
-        let audit = Arc::new(RecordingAudit::default());
-        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
-        let executor = ToolExecutor::new(test_registry(), policy);
-        let session = test_session();
-        let correlation_id = Ulid::new();
-
-        executor
-            .record_routing_decision(
-                session.session_id,
-                correlation_id,
-                "move the repo to a mono crate layout",
-                "ask_user",
-                "Execute",
-                0.6,
-                "declined",
-                CancellationToken::new(),
-            )
-            .await;
-
-        let entries = audit.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool_name, "intent_router");
-        assert_eq!(entries[0].verdict, "declined");
-        assert_eq!(entries[0].rule_matched.as_deref(), Some("ask_user"));
-        assert_eq!(entries[0].user_response.as_deref(), Some("Execute"));
-        assert_eq!(entries[0].session_id, session.session_id);
-        assert_eq!(entries[0].correlation_id, correlation_id);
-    }
-
-    /// A2 (ADR-55 Phase 2d §5/A2): an automatic intent-routing decision
-    /// records a row labeled `intent_router: auto_granted` carrying the
-    /// `{rule, confidence, route, outcome}` envelope in `user_response`, so
-    /// the audit shows `auto_granted` + `RuleHit|LlmClassifier` + the
-    /// decision-time confidence. `rule_matched` keeps the caller's
-    /// pre-replacement deterministic route name (2c §5 row-chain invariant).
-    #[tokio::test]
-    async fn auto_intent_decision_records_auto_granted_row_with_envelope() {
-        let audit = Arc::new(RecordingAudit::default());
-        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
-        let executor = ToolExecutor::new(test_registry(), policy);
-        let session = test_session();
-        let correlation_id = Ulid::new();
-
-        executor
-            .record_auto_intent_decision(
-                session.session_id,
-                correlation_id,
-                "build accord",
-                "execute_keyword",
-                r#"{"rule":"execute_keyword","route":"RuleHit","outcome":"Execute","confidence":0.8}"#,
-                CancellationToken::new(),
-            )
-            .await;
-
-        let entries = audit.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1, "exactly one auto-decision row is recorded");
-        assert_eq!(entries[0].tool_name, "intent_router");
-        assert_eq!(entries[0].verdict, "auto_granted", "the row is labeled auto_granted");
-        assert_eq!(
-            entries[0].rule_matched.as_deref(),
-            Some("execute_keyword"),
-            "rule_matched keeps the caller's pre-replacement route name"
-        );
-        assert_eq!(entries[0].input_hash, "");
-        let envelope: serde_json::Value =
-            serde_json::from_str(entries[0].user_response.as_deref().unwrap_or_default())
-                .expect("valid envelope JSON");
-        assert_eq!(envelope["route"], "RuleHit", "the envelope names the routing path kind");
-        assert_eq!(envelope["rule"], "execute_keyword");
-        assert_eq!(envelope["outcome"], "Execute");
-        assert!(
-            envelope["confidence"].as_f64().unwrap_or_default() >= 0.7,
-            "the envelope carries the decision-time confidence (A2: >= 0.7)"
-        );
-        assert_eq!(entries[0].session_id, session.session_id);
-        assert_eq!(entries[0].correlation_id, correlation_id);
-        // No plan is bound by a routing decision; no command ran.
-        assert_eq!(entries[0].plan_id, None);
-        assert_eq!(entries[0].argv, None);
     }
 
     /// A plan-approval decision records a single row under the synthetic

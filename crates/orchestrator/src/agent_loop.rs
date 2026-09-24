@@ -3,7 +3,8 @@
 //! Phase 3: basic sequential loop with memory, undo, and eval hooks.
 //! Multi-agent coordination is Phase 5.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -63,6 +64,14 @@ pub struct AgentLoop {
     /// repairs argument SHAPE before execution, this one coaches the model
     /// after an execution failure.
     shell_repair_attempts: HashMap<String, u32>,
+    /// Occurrences of each provider tool-call id within the current run
+    /// (cleared at run start). Used to scope the gate's idempotency key: the
+    /// FIRST occurrence of a `ToolCall.id` keeps that id (so a supervisor
+    /// restart replaying the same script re-submits the same key and the gate
+    /// replays its stored decision), while a genuine retry — the same id
+    /// emitted again in a later turn — gets a fresh suffixed key so it
+    /// re-evaluates instead of replaying a stale `write-rejected`.
+    tool_attempts: HashMap<String, u32>,
     max_iterations: u32,
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
@@ -98,6 +107,19 @@ pub struct AgentLoop {
     usage_tokens_out: u64,
     usage_cost_usd: f64,
     usage_latency_ms: u64,
+
+    /// A tool call whose approval request timed out. Set by
+    /// `execute_single_tool_call`; `run_once` turns it into
+    /// `AgentRunExit::AwaitingApproval` (stop the loop, never retry the same
+    /// call). `None` in the common case; cleared at run start.
+    pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
+
+    /// One summary flag for the loop's warn-only degradations (item: warn-only
+    /// drops). A best-effort session/checkpoint persistence write that failed
+    /// (logged at `warn`, never fatal) sets this, so the run summary carries
+    /// ONE degraded note instead of a Decision row per drop. The individual
+    /// `warn` logs are unchanged.
+    degraded: AtomicBool,
 }
 
 /// Maximum number of auto-continuation rounds before escalating a run to a
@@ -106,7 +128,66 @@ pub struct AgentLoop {
 const MAX_CONTINUATION_ROUNDS: u32 = 8;
 /// Number of consecutive rounds with identical progress before declaring
 /// non-convergence and escalating to the user.
-const MAX_STALE_ROUNDS: u32 = 3;
+const MAX_STALE_ROUNDS: u32 = 6;
+
+/// Acknowledgement condition marker for "the undo stash could not be created
+/// (project is not a git repository, or git is unavailable)". Part of the
+/// [`ACK_REMEMBERED`] key `(session_id, project_root, condition)`.
+const UNDO_NOT_A_REPO_CONDITION: &str = "undo-commit-failed";
+
+/// Key identifying one acknowledgement condition:
+/// `(session_id, project_root, condition)`. The session id is stored in its
+/// string form so the key is `Hash + Send` without depending on `Ulid`.
+type AckKey = (String, std::path::PathBuf, &'static str);
+
+/// Process-lifetime record of acknowledgement conditions a continuing run has
+/// already answered, keyed by [`AckKey`].
+///
+/// Why process-lifetime rather than an [`AgentLoop`] field: the runtime builds
+/// a fresh loop for every user message (`runtime_runner.rs`,
+/// `bin/agent_process.rs`), so a continue turn runs on a different instance
+/// than the turn that prompted. Only the desktop process lives across messages
+/// (its continues are covered); a CLI invocation is a fresh process and
+/// correctly re-asks once per invocation. Deliberately not persisted to any
+/// store — a fresh process re-asks once, which is the safe direction. Only
+/// continuing acknowledgements are recorded: an abort ends the run and must
+/// never be replayed as consent (see `setup_undo_stash`).
+static ACK_REMEMBERED: std::sync::LazyLock<std::sync::Mutex<HashSet<AckKey>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Returns `true` when `(session_id, project_root, condition)` was already
+/// acknowledged by a continuing run in this process. A poisoned lock is treated
+/// as "not remembered" so the caller re-asks rather than panicking.
+fn ack_is_remembered(
+    session_id: Ulid,
+    project_root: &std::path::Path,
+    condition: &'static str,
+) -> bool {
+    let guard = match ACK_REMEMBERED.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                "ack-remembered lock poisoned ({e}); treating '{condition}' as not remembered"
+            );
+            return false;
+        }
+    };
+    guard.contains(&(session_id.to_string(), project_root.to_path_buf(), condition))
+}
+
+/// Records a continuing acknowledgement for `(session_id, project_root,
+/// condition)`. Best-effort: a poisoned lock logs and drops the record (a later
+/// round then re-asks), never panics.
+fn remember_ack(session_id: Ulid, project_root: &std::path::Path, condition: &'static str) {
+    let mut guard = match ACK_REMEMBERED.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("ack-remembered lock poisoned ({e}); not recording '{condition}'");
+            return;
+        }
+    };
+    guard.insert((session_id.to_string(), project_root.to_path_buf(), condition));
+}
 
 /// Character cap for the loop's persisted end-reason note (completion fix:
 /// the terminal reason/surfaces bounded into the session event log).
@@ -203,7 +284,7 @@ fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
     }
     if matches!(
         event.tool_name.as_str(),
-        "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
+        "write" | "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
     ) {
         return true;
     }
@@ -333,6 +414,7 @@ impl AgentLoop {
             cycle_budget: CycleBudgetTracker::default(),
             tool_guard_rejects: HashMap::new(),
             shell_repair_attempts: HashMap::new(),
+            tool_attempts: HashMap::new(),
             max_iterations,
             fast,
             state: AgentState::Idle,
@@ -347,6 +429,8 @@ impl AgentLoop {
             usage_tokens_out: 0,
             usage_cost_usd: 0.0,
             usage_latency_ms: 0,
+            pending_approval: None,
+            degraded: AtomicBool::new(false),
         }
     }
 
@@ -415,6 +499,9 @@ impl AgentLoop {
         // previous run on this loop instance.
         self.tool_guard_rejects.clear();
         self.shell_repair_attempts.clear();
+        self.tool_attempts.clear();
+        self.pending_approval = None;
+        self.degraded.store(false, Ordering::Relaxed);
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -461,12 +548,27 @@ impl AgentLoop {
                     // own landing state (an eval failure stays `Partial`);
                     // no transport-level success ever overrides it here.
                     self.persist_run_success(session_id, &output, cancel.clone()).await;
+                    self.note_degraded(&mut output);
                     return Ok(output);
                 }
                 AgentRunExit::NeedsUser { reason, partial } => {
                     let mut output = partial;
                     output.final_message = format!("User input required: {reason}");
                     output.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    // Supremacy invariant: the exit is a Coordinator Decision
+                    // row, not a silent return. Control flow is unchanged —
+                    // the loop keeps its own exits; this only makes the
+                    // decision observable and the preserved checkpoint
+                    // resumable.
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-needs-user",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
@@ -480,17 +582,63 @@ impl AgentLoop {
                         cancel.clone(),
                     );
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
+                    self.note_degraded(&mut output);
                     return Ok(output);
+                }
+                AgentRunExit::AwaitingApproval { reason, pending, mut partial } => {
+                    // Approval timeout: PAUSE, never deny or retry. The run
+                    // stops AwaitingUser with a checkpoint carrying the
+                    // preserved request so a resume re-attaches to it (same
+                    // tool/input) instead of re-asking the model or issuing a
+                    // second identical call.
+                    // Supremacy invariant: the pause is a Coordinator Decision
+                    // row (visibility), while the `AwaitingUser` terminal class
+                    // and the preserved checkpoint are unchanged.
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-awaiting-approval",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
+                    partial.final_message = reason;
+                    partial.completion_status =
+                        concerto_core::types::AgentCompletionStatus::AwaitingUser;
+                    partial.checkpoint_json = serde_json::to_string(&pending).ok();
+                    if let Some(accumulated) = &mut cumulative_progress {
+                        merge_run_progress(accumulated, &partial);
+                    }
+                    self.publish_end_reason(
+                        session_id,
+                        "awaiting approval",
+                        &partial.final_message,
+                        cancel.clone(),
+                    );
+                    self.persist_run_partial(session_id, &partial, cancel.clone()).await;
+                    self.note_degraded(&mut partial);
+                    return Ok(partial);
                 }
                 AgentRunExit::Blocked { reason, partial } => {
                     let mut output = partial;
                     output.final_message = format!("Blocked: {reason}");
                     output.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-blocked",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
                     self.publish_end_reason(session_id, "blocked", &reason, cancel.clone());
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
+                    self.note_degraded(&mut output);
                     return Ok(output);
                 }
                 AgentRunExit::IterationCapHit { reason, partial } => {
@@ -517,6 +665,15 @@ impl AgentLoop {
                         );
                         partial_out.completion_status =
                             concerto_core::types::AgentCompletionStatus::Partial;
+                        self.tool_executor
+                            .record_coordinator_decision(
+                                session_id,
+                                concerto_core::ids::new_id(),
+                                "agent-loop-no-convergence",
+                                &reason,
+                                CancellationToken::new(),
+                            )
+                            .await;
                         self.publish_end_reason(
                             session_id,
                             "no convergence",
@@ -524,6 +681,7 @@ impl AgentLoop {
                             cancel.clone(),
                         );
                         self.persist_run_partial(session_id, &partial_out, cancel.clone()).await;
+                        self.note_degraded(&mut partial_out);
                         return Ok(partial_out);
                     }
 
@@ -573,6 +731,15 @@ impl AgentLoop {
         partial.final_message =
             format!("Blocked: reached maximum continuation rounds ({MAX_CONTINUATION_ROUNDS}).");
         partial.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+        self.tool_executor
+            .record_coordinator_decision(
+                session_id,
+                concerto_core::ids::new_id(),
+                "agent-loop-continuation-cap",
+                &partial.final_message,
+                CancellationToken::new(),
+            )
+            .await;
         self.publish_end_reason(
             session_id,
             "maximum continuation rounds reached",
@@ -580,7 +747,23 @@ impl AgentLoop {
             cancel.clone(),
         );
         self.persist_run_partial(session_id, &partial, cancel.clone()).await;
+        self.note_degraded(&mut partial);
         Ok(partial)
+    }
+
+    /// Append ONE degraded summary note when any best-effort session
+    /// persistence write failed during the run (item: warn-only drops).
+    /// Per-drop Decision rows would be too noisy for these best-effort writes;
+    /// the individual `warn` logs remain, and this single flag makes the
+    /// degradation visible in the run's final message.
+    fn note_degraded(&self, output: &mut AgentOutput) {
+        if self.degraded.load(Ordering::Relaxed) {
+            output.final_message.push_str(
+                " Degraded: one or more session persistence writes failed; the run \
+                 result is unaffected but the durable session record may be \
+                 incomplete (see the logs).",
+            );
+        }
     }
 
     /// End-reason persistence (completion-fix): the loop's terminal reason
@@ -753,8 +936,13 @@ impl AgentLoop {
                     attempts,
                     elapsed,
                     last_error,
+                    ..
                 })) => {
                     self.state = AgentState::Failed;
+                    let reason = format!(
+                        "provider retries exhausted after {attempts} attempts \
+                         ({elapsed:?}): {last_error}"
+                    );
                     let partial = self.build_agent_output(
                         &task,
                         &final_message,
@@ -764,16 +952,31 @@ impl AgentLoop {
                         &tool_events,
                         &verification,
                     );
-                    return Ok(AgentRunExit::Blocked {
-                        reason: format!(
-                            "provider retries exhausted after {attempts} attempts \
-                             ({elapsed:?}): {last_error}"
-                        ),
-                        partial,
-                    });
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            task.session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-provider-retries-exhausted",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
+                    return Ok(AgentRunExit::Blocked { reason, partial });
                 }
                 Err(e) => {
                     self.state = AgentState::Failed;
+                    // Supremacy invariant: a hard provider error that ends the
+                    // loop is a Coordinator Decision row before the error
+                    // propagates (control flow still returns the error).
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            task.session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-error",
+                            &e.to_string(),
+                            CancellationToken::new(),
+                        )
+                        .await;
                     return Err(e);
                 }
             };
@@ -857,19 +1060,69 @@ impl AgentLoop {
             }
 
             // Phase 6: Execute tool calls
-            self.execute_tool_calls(
-                &tool_calls,
-                &task,
-                correlation_id,
-                &session,
-                cancel.clone(),
-                &mut tool_call_count,
-                &mut file_changing_tool_count,
-                &mut files_modified,
-                &mut tool_events,
-                &mut messages,
-            )
-            .await?;
+            if let Err(error) = self
+                .execute_tool_calls(
+                    &tool_calls,
+                    &task,
+                    correlation_id,
+                    &session,
+                    cancel.clone(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+            {
+                // Supremacy invariant: a tool-execution error that would abort
+                // the loop records a Coordinator Decision row first; control
+                // flow is unchanged (the error still propagates).
+                self.tool_executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        "agent-loop-tool-error",
+                        &error.to_string(),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                return Err(error);
+            }
+
+            // An approval timeout pauses the loop HERE: the model is NOT
+            // re-consulted and the identical tool call is NOT re-issued. The
+            // run surfaces `AwaitingApproval` with the preserved request.
+            if let Some(pending) = self.pending_approval.take() {
+                self.state = AgentState::AwaitingApproval;
+                let reason = format!(
+                    "Awaiting approval for tool '{}': {} (timed out after {}s). \
+                     Approve the pending request to resume.",
+                    pending.tool_name, pending.detail, pending.timeout_secs
+                );
+                let partial = self.build_agent_output(
+                    &task,
+                    &final_message,
+                    &files_modified,
+                    tool_call_count,
+                    &None,
+                    &tool_events,
+                    &verification,
+                );
+                // Supremacy invariant: the in-loop approval-timeout pause is a
+                // Coordinator Decision row, not a silent `AwaitingApproval`
+                // return (the terminal class and preserved request unchanged).
+                self.tool_executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        "agent-loop-awaiting-approval",
+                        &reason,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                return Ok(AgentRunExit::AwaitingApproval { reason, pending, partial });
+            }
         }
 
         // Phase 8: Run evaluation
@@ -945,11 +1198,29 @@ impl AgentLoop {
             let warning = "This project is not a git repository (or git is unavailable), so \
                             changes made during this task cannot be automatically undone. \
                             Continue anyway?";
-            let ack = self.approval.request_ack(session_id, warning, cancel.clone()).await;
+            // Ask once per `(session_id, project_root, condition)` across the
+            // whole process: a non-git project cannot become a git repo
+            // mid-run, and the runtime rebuilds the loop for every user
+            // message, so this must outlive any single loop instance. Only a
+            // continuing run is ever remembered, so a skipped prompt is
+            // truthfully acknowledged.
+            let ack =
+                if ack_is_remembered(session_id, &self.project_root, UNDO_NOT_A_REPO_CONDITION) {
+                    true
+                } else {
+                    let ack = self.approval.request_ack(session_id, warning, cancel.clone()).await;
+                    // Only a continuing acknowledgement is remembered: an abort
+                    // ends the run and must never be silently replayed as consent.
+                    if ack {
+                        remember_ack(session_id, &self.project_root, UNDO_NOT_A_REPO_CONDITION);
+                    }
+                    ack
+                };
             // Audit seam (ADR-55 §5 / audit H-04): persist the ack outcome
             // through the same channel as approval decisions, sharing the run's
             // correlation_id chain. Pure observability — the ack bool still
-            // drives the same abort branch below.
+            // drives the same abort branch below. A remembered (skipped) prompt
+            // records a row too, so the audit trail shows every decision point.
             self.tool_executor
                 .record_ack_decision(session_id, correlation_id, warning, ack, cancel)
                 .await;
@@ -1389,6 +1660,12 @@ impl AgentLoop {
                 messages,
             )
             .await?;
+            // An approval timeout pauses the run: stop the remaining calls in
+            // this batch so no further tool call is issued while awaiting the
+            // user. `run_once` turns it into `AgentRunExit::AwaitingApproval`.
+            if self.pending_approval.is_some() {
+                break;
+            }
         }
         Ok(())
     }
@@ -1490,7 +1767,6 @@ impl AgentLoop {
                     partial: output.clone(),
                 }));
             }
-
             if require_verification && eval_result.is_none() {
                 tracing::warn!(
                     task_id = %task.id,
@@ -1541,6 +1817,23 @@ impl AgentLoop {
         } else {
             concerto_core::types::AgentCompletionStatus::Completed
         };
+        // Supremacy invariant: an eval-driven downgrade to `Partial` is a
+        // Coordinator Decision row (visibility), not a silent status flip.
+        if output.completion_status == concerto_core::types::AgentCompletionStatus::Partial {
+            let reason = eval_result
+                .as_ref()
+                .map(|result| format!("evaluation did not pass: {result:?}"))
+                .unwrap_or_else(|| "completion downgraded to Partial".to_owned());
+            self.tool_executor
+                .record_coordinator_decision(
+                    task.session_id,
+                    concerto_core::ids::new_id(),
+                    "agent-loop-eval-downgrade",
+                    &reason,
+                    CancellationToken::new(),
+                )
+                .await;
+        }
         let success =
             output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
         let _ = self.bus.publish_for_session(
@@ -1614,6 +1907,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.create_task(task, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist task row");
         }
 
@@ -1626,6 +1920,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskStarted event");
         }
 
@@ -1642,6 +1937,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.append_messages(session_id, &[user_msg], cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist user message");
         }
     }
@@ -1674,6 +1970,7 @@ impl AgentLoop {
             )
             .await
         {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to update task status");
         }
 
@@ -1686,6 +1983,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
@@ -1702,6 +2000,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist assistant message");
         }
     }
@@ -1720,6 +2019,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.update_task_status(output.task_id, "partial", cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to update task status");
         }
 
@@ -1732,6 +2032,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
@@ -1748,6 +2049,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist assistant message");
         }
     }
@@ -1880,6 +2182,27 @@ impl AgentLoop {
         }
     }
 
+    /// The per-attempt gate idempotency key for a provider tool-call id.
+    ///
+    /// The FIRST occurrence of `tc_id` keeps that id, so a supervisor restart
+    /// replaying the same script re-submits the same durable key and the gate
+    /// replays its stored `write-applied` decision instead of re-executing
+    /// (WAL-before-execute crash replay). Any later occurrence of the same id
+    /// within the run — the model retrying a denied call — gets a fresh
+    /// suffixed key so it re-evaluates instead of replaying a stale
+    /// `write-rejected` ("write decisions are set-once per call_id").
+    ///
+    /// State lives in [`Self::tool_attempts`], cleared at run start.
+    fn gate_attempt_id(&mut self, tc_id: &str) -> String {
+        let occurrence = self.tool_attempts.entry(tc_id.to_owned()).or_insert(0);
+        *occurrence += 1;
+        if *occurrence == 1 {
+            tc_id.to_owned()
+        } else {
+            format!("{tc_id}#attempt-{}", *occurrence)
+        }
+    }
+
     /// Execute a single tool call: tool-guard validation, cycle-budget check,
     /// approval, execution, and structured result persistence.
     #[allow(clippy::too_many_arguments)]
@@ -1978,6 +2301,7 @@ impl AgentLoop {
                 sandbox_profile: None,
                 estimated_cost_usd: None,
                 command_facts: None,
+                orchestrator_authority: false,
             };
 
             match self.approval.request_approval(&action, cancel.clone()).await {
@@ -2134,9 +2458,20 @@ impl AgentLoop {
             return Ok(());
         }
 
+        // Gate dedup scoping: the idempotency key must be fresh per execution
+        // ATTEMPT, not the provider's `ToolCall.id` reused across retries (see
+        // [`Self::gate_attempt_id`]). `tc.id` stays the provider-visible
+        // `ToolResult.id` in the messages below.
+        let attempt_id = self.gate_attempt_id(&tc.id);
         match self
             .tool_executor
-            .execute(&tc.name, arguments.clone(), &tc.id, session, cancel.clone())
+            .execute_with_authority(
+                &tc.name,
+                arguments.clone(),
+                &attempt_id,
+                session,
+                cancel.clone(),
+            )
             .await
         {
             Ok(output) => {
@@ -2266,8 +2601,61 @@ impl AgentLoop {
                     }
                 }
             }
+            Err(ToolError::PausedAwaitingApproval {
+                tool_name,
+                detail,
+                input_hash,
+                correlation_id,
+                timeout_secs,
+            }) => {
+                // A timeout is a PAUSE, not a denial: the executor already
+                // emitted the `ApprovalTimeout` event and recorded the
+                // `TimedOut` audit row. Record the preserved request and let
+                // `run_once` stop the loop AwaitingApproval — no model retry,
+                // no second identical call, no burned subtask retry.
+                tool_events.push(ToolExecutionSummary {
+                    tool_name: tc.name.clone(),
+                    operation: filesystem_operation.map(|s| s.to_string()),
+                    path: detail_path.clone().map(camino::Utf8PathBuf::from),
+                    success: false,
+                    summary: format!(
+                        "awaiting approval (timed out after {timeout_secs}s): {detail}"
+                    ),
+                });
+                let _ = self.bus.publish_for_session(
+                    task.session_id,
+                    correlation_id,
+                    EventKind::ToolExecutionFinished {
+                        tool_name: tc.name.clone(),
+                        duration_ms: 0,
+                        success: false,
+                        detail: Some(format!("awaiting approval: {detail}")),
+                    },
+                );
+                self.state = AgentState::AwaitingApproval;
+                self.pending_approval = Some(concerto_core::types::PendingApprovalInfo {
+                    tool_name,
+                    detail,
+                    input_hash,
+                    correlation_id: correlation_id.to_string(),
+                    timeout_secs,
+                });
+            }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
+                // Supremacy invariant (item: gate-direct-abort): a gate denial
+                // is a Coordinator Decision row too. Deny semantics are
+                // unchanged — the call stays denied, the model still receives
+                // the denial result — only the decision is now observable.
+                self.tool_executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        "gate-policy-denied",
+                        &format!("tool '{}' denied by policy rule '{rule}'", tc.name),
+                        CancellationToken::new(),
+                    )
+                    .await;
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -2319,6 +2707,22 @@ impl AgentLoop {
                 .await;
             }
             Err(e) => {
+                // Supremacy invariant (item: gate-direct-abort): a gate-proxy
+                // cancellation (in_process/gate_proxy `Cancelled`) is a
+                // documented terminal class — the control flow below is
+                // unchanged — but it records a Coordinator Decision row so the
+                // abort is never silent.
+                if matches!(e, ToolError::Cancelled) {
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            task.session_id,
+                            concerto_core::ids::new_id(),
+                            "gate-cancelled",
+                            &format!("tool '{}' cancelled at the write gate", tc.name),
+                            CancellationToken::new(),
+                        )
+                        .await;
+                }
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -3073,6 +3477,12 @@ mod tests {
         fn entries(&self) -> Vec<AuditEntry> {
             self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
         }
+
+        /// Number of `request_ack` audit rows (one per ack decision point,
+        /// prompted or remembered).
+        fn ack_rows(&self) -> usize {
+            self.entries().into_iter().filter(|entry| entry.tool_name == "request_ack").count()
+        }
     }
 
     /// A simple tool that echoes input back as output.
@@ -3394,6 +3804,47 @@ mod tests {
         }))
     }
 
+    /// Like `make_loop_with_dir` but with a [`CapturingAudit`] policy log,
+    /// returned so tests can assert the audit rows an ack decision writes.
+    fn make_loop_with_dir_capturing(
+        provider: Arc<dyn LlmProvider>,
+        approval: Arc<dyn ApprovalSink>,
+        max_iterations: u32,
+        project_dir: &str,
+    ) -> (AgentLoop, CapturingAudit) {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let audit = CapturingAudit::new();
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(audit.clone())));
+        let executor = Arc::new(
+            ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(approval.clone()),
+        );
+        let loop_ = AgentLoop::with_project_root(
+            EventBus::new(256),
+            approval.clone(),
+            provider,
+            executor,
+            Arc::new(NoopMemory),
+            Arc::new(std::sync::Mutex::new(UndoManager::new(project_dir))),
+            EvalEngine::new(project_dir),
+            PromptBuilder::new("test system prompt"),
+            max_iterations,
+            true, // fast mode
+            std::path::PathBuf::from(project_dir),
+            None, // no budget allocator
+        )
+        .with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
+            // Fast, deterministic retries for tests.
+            initial_delay_ms: 5,
+            max_delay_ms: 50,
+            jitter: false,
+            multiplier: 2.0,
+            ..concerto_config::RetryConfig::default()
+        }));
+        (loop_, audit)
+    }
+
     /// Build a loop with extra tools alongside the default EchoTool.
     fn make_loop_with_extra_tools(
         provider: Arc<dyn LlmProvider>,
@@ -3553,6 +4004,73 @@ mod tests {
         }
     }
 
+    /// An approval sink that counts `request_ack` prompts and always
+    /// acknowledges (for asserting the prompt is asked once per condition).
+    #[derive(Clone)]
+    struct CountingAckApproval {
+        prompts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ApprovalSink for CountingAckApproval {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: concerto_core::CancellationToken,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+        async fn approve_all_for_session(
+            &self,
+            _session_id: Ulid,
+            _cancel: concerto_core::CancellationToken,
+        ) {
+        }
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: concerto_core::CancellationToken,
+        ) -> bool {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// An approval sink that aborts the first `request_ack` and acknowledges
+    /// every later one, counting prompts (for proving an abort is never
+    /// remembered and must therefore be re-asked).
+    #[derive(Clone)]
+    struct FirstDenyThenAckApproval {
+        prompts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ApprovalSink for FirstDenyThenAckApproval {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: concerto_core::CancellationToken,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+        async fn approve_all_for_session(
+            &self,
+            _session_id: Ulid,
+            _cancel: concerto_core::CancellationToken,
+        ) {
+        }
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: concerto_core::CancellationToken,
+        ) -> bool {
+            let call = self.prompts.fetch_add(1, Ordering::SeqCst);
+            call > 0
+        }
+    }
+
     /// An approval sink that returns `false` for request_ack.
     struct DenyAckApproval;
     #[async_trait]
@@ -3608,13 +4126,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_attempt_id_keeps_first_occurrence_and_freshens_retries() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 10);
+
+        // First occurrence keeps the provider id (supervisor restart replay).
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1");
+        // A retry of the same id gets a fresh key (re-evaluates, no sticky
+        // `write-rejected` replay).
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1#attempt-2");
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1#attempt-3");
+        // A different provider id is independent and keeps its own first key.
+        assert_eq!(loop_.gate_attempt_id("call-2"), "call-2");
+
+        // A fresh run clears the attempt ledger: the next run's first
+        // occurrence of `call-1` is durable-key stable again.
+        loop_.tool_attempts.clear();
+        assert_eq!(loop_.gate_attempt_id("call-1"), "call-1");
+    }
+
+    #[tokio::test]
     async fn cycle_detection_with_deny_fails_loop() {
-        // Provider returns the same tool call 3 times.
+        // Provider returns the same tool call 6 times (the cycle budget limit).
         let tc = make_tool_call("echo", "hello");
         let calls = vec![
             vec![tc.clone()], // iteration 1 — count=1
             vec![tc.clone()], // iteration 2 — count=2
-            vec![tc.clone()], // iteration 3 — count=3 → cycle detected → denied
+            vec![tc.clone()], // iteration 3 — count=3
+            vec![tc.clone()], // iteration 4 — count=4
+            vec![tc.clone()], // iteration 5 — count=5
+            vec![tc.clone()], // iteration 6 — count=6 → cycle detected → denied
         ];
         let provider = Arc::new(ScriptedProvider::new(calls));
         let approval = Arc::new(ApprovalTestHarness::always_deny());
@@ -3655,6 +4197,105 @@ mod tests {
 
         assert!(result.is_err(), "expected Err, got Ok");
         assert!(matches!(result.unwrap_err(), OrchestratorError::Cancelled));
+    }
+
+    /// The runtime builds a fresh `AgentLoop` for every user message, so the
+    /// remembered acknowledgement must live at process scope: a second loop
+    /// instance on the same `(session, project)` must not re-prompt, yet must
+    /// still audit its decision point (1 prompt + 2 audit rows total).
+    #[tokio::test]
+    async fn undo_ack_prompt_remembered_across_loop_instances() {
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let approval: Arc<dyn ApprovalSink> =
+            Arc::new(CountingAckApproval { prompts: prompts.clone() });
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "test task");
+        let cancel = CancellationToken::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_str().expect("utf8 tempdir");
+
+        // Instance 1: prompts (ack true) and records the continuation.
+        let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop1, audit1) =
+            make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
+        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 1");
+
+        // Instance 2 (a later user message): same session + project, no re-prompt.
+        let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop2, audit2) =
+            make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 2");
+
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            1,
+            "the non-git warning must be asked once per (session, project) across loop instances"
+        );
+        assert_eq!(
+            audit1.ack_rows() + audit2.ack_rows(),
+            2,
+            "both decision points are audited (1 prompt + 1 remembered skip)"
+        );
+    }
+
+    /// A different project root is a different condition triple: it must be
+    /// asked again rather than silently inheriting another project's ack.
+    #[tokio::test]
+    async fn undo_ack_prompt_asked_again_for_a_different_project() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![], vec![]]));
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let approval = Arc::new(CountingAckApproval { prompts: prompts.clone() });
+
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        let (mut loop_, audit) =
+            make_loop_with_dir_capturing(provider, approval, 10, first.path().to_str().unwrap());
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let cancel = CancellationToken::new();
+
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 1");
+        loop_.project_root = std::path::PathBuf::from(second.path());
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 2");
+
+        assert_eq!(prompts.load(Ordering::SeqCst), 2, "a different project must be asked again");
+        assert_eq!(audit.ack_rows(), 2, "both prompts are audited");
+    }
+
+    /// An aborted acknowledgement ends the run and is never remembered: a later
+    /// loop on the same `(session, project)` must prompt again rather than
+    /// replay the abort's non-consent as consent.
+    #[tokio::test]
+    async fn undo_ack_not_remembered_after_abort() {
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let approval: Arc<dyn ApprovalSink> =
+            Arc::new(FirstDenyThenAckApproval { prompts: prompts.clone() });
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "test task");
+        let cancel = CancellationToken::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_str().expect("utf8 tempdir");
+
+        // Instance 1: request_ack returns false → the run is cancelled.
+        let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop1, _audit1) =
+            make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
+        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await;
+        assert!(matches!(aborted.unwrap_err(), OrchestratorError::Cancelled));
+
+        // Instance 2: same triple; request_ack now returns true. Because the
+        // abort was not remembered, the condition must be asked again.
+        let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let (mut loop2, _audit2) =
+            make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("second run");
+
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            2,
+            "an aborted acknowledgement must be asked again, never replayed as consent"
+        );
     }
 
     #[tokio::test]
@@ -4152,6 +4793,62 @@ mod tests {
                 || output.final_message.contains("maximum continuation"),
             "final_message should explain the stall/cap, got: {}",
             output.final_message
+        );
+    }
+
+    /// Item (loop supremacy): a run that exhausts its iteration budget records
+    /// a Coordinator Decision row, so the cap is observable in the audit trail
+    /// rather than only in the final message.
+    #[tokio::test]
+    async fn iteration_cap_records_a_coordinator_decision_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = dir.path().to_str().expect("utf8 tempdir").to_owned();
+        let provider = Arc::new(AlwaysToolProvider { name: "echo" });
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (mut loop_, audit) = make_loop_with_dir_capturing(provider, approval, 3, &project_dir);
+        let task = AgentTask::new(Ulid::new(), "do something that never finishes");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "iteration cap returns Ok partial");
+        let decisions: Vec<_> = audit
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.tool_name == "coordinator_decision")
+            .collect();
+        assert!(
+            !decisions.is_empty(),
+            "the loop cap must record at least one coordinator decision row"
+        );
+        assert!(
+            decisions.iter().any(|entry| entry.verdict.contains("cap")
+                || entry.verdict.contains("convergence")),
+            "the decision names the cap/convergence, got: {:?}",
+            decisions.iter().map(|entry| entry.verdict.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Item (warn-only drops): when a best-effort persistence write failed, the
+    /// run summary carries exactly ONE degraded note (no per-drop Decision row).
+    #[tokio::test]
+    async fn degraded_flag_appends_one_summary_note() {
+        let provider = Arc::new(AlwaysToolProvider { name: "echo" });
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 3);
+
+        let mut clean = agent_output_base();
+        loop_.note_degraded(&mut clean);
+        assert!(
+            !clean.final_message.contains("Degraded:"),
+            "a clean run gets no degraded note: {}",
+            clean.final_message
+        );
+
+        let mut degraded = agent_output_base();
+        loop_.degraded.store(true, std::sync::atomic::Ordering::Relaxed);
+        loop_.note_degraded(&mut degraded);
+        assert!(
+            degraded.final_message.contains("Degraded:"),
+            "a degraded run gets the summary note: {}",
+            degraded.final_message
         );
     }
 
@@ -5800,7 +6497,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_guard_bounds_corrective_retries_then_exhausts() {
-        // Partial args get two corrective retries per tool per run; the third
+        // Partial args get five corrective retries per tool per run; the sixth
         // consecutive rejection flips to the exhausted form so the model
         // stops ping-ponging malformed calls.
         let dir = tempfile::tempdir().unwrap();
@@ -5819,7 +6516,7 @@ mod tests {
 
             ..Default::default()
         };
-        for _ in 0..3 {
+        for _ in 0..6 {
             loop_
                 .execute_single_tool_call(
                     &tc,
@@ -5837,15 +6534,16 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(messages.len(), 3);
-        assert!(messages[0].content.contains("Please retry with corrected arguments"));
-        assert!(messages[1].content.contains("Please retry with corrected arguments"));
+        assert_eq!(messages.len(), 6);
+        for retry in &messages[..5] {
+            assert!(retry.content.contains("Please retry with corrected arguments"));
+        }
         assert!(
-            messages[2].content.contains("Stop calling 'filesystem'"),
-            "third rejection must stop coaching: {}",
-            messages[2].content
+            messages[5].content.contains("Stop calling 'filesystem'"),
+            "sixth rejection must stop coaching: {}",
+            messages[5].content
         );
-        let exhausted_payload = messages[2].tool_results.as_ref().unwrap()[0].content.clone();
+        let exhausted_payload = messages[5].tool_results.as_ref().unwrap()[0].content.clone();
         assert_eq!(exhausted_payload["error"], "tool_guard_exhausted");
     }
 
@@ -6135,6 +6833,8 @@ mod tests {
         Deny(String),
         /// Timeout error.
         Timeout(u64),
+        /// Approval-timeout pause returned straight from the executor.
+        Paused,
         /// Process-start / execution failure.
         SpawnFailed(String),
     }
@@ -6210,6 +6910,13 @@ mod tests {
                 ScriptedShellOutcome::Timeout(timeout_secs) => {
                     Err(ToolError::Timeout { timeout_secs })
                 }
+                ScriptedShellOutcome::Paused => Err(ToolError::PausedAwaitingApproval {
+                    tool_name: "shell".into(),
+                    detail: "command: rm -rf build".into(),
+                    input_hash: "scripted-input-hash".into(),
+                    correlation_id: concerto_core::ids::Ulid::new(),
+                    timeout_secs: 30,
+                }),
                 ScriptedShellOutcome::SpawnFailed(message) => {
                     Err(ToolError::ExecutionFailed { message })
                 }
@@ -6236,6 +6943,51 @@ mod tests {
         messages.iter().filter(|m| m.role == Role::User).collect()
     }
 
+    /// An approval timeout stops the loop AwaitingUser: the model is NOT
+    /// re-consulted and the identical tool call is NOT re-issued (the
+    /// production deny-and-burn-retries failure mode). The checkpoint carries
+    /// the preserved request for the resume.
+    #[tokio::test]
+    async fn approval_timeout_pauses_the_loop_without_a_second_identical_call() {
+        let tc = ToolCall {
+            id: "call_pause".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "rm", "args": ["-rf", "build"] }),
+            ..Default::default()
+        };
+        // Turn 1 emits the call; turn 2 is the identical call a broken retry
+        // would emit; turn 3 would complete. Only turn 1 may ever run.
+        let provider =
+            Arc::new(ScriptedProvider::new(vec![vec![tc.clone()], vec![tc.clone()], vec![]]));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (tool, calls) = ScriptedShellTool::new(ScriptedShellOutcome::Paused);
+        let mut loop_ =
+            make_loop_with_extra_tools(provider_dyn, approval, 10, vec![Box::new(tool)]);
+        let task = AgentTask::new_action_required(Ulid::new(), "approval pause");
+        let output = loop_.run(task, CancellationToken::new()).await.expect("run");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an approval timeout must pause the run AwaitingUser, not fail it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the identical call must not be retried");
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            1,
+            "the model must not be re-consulted after the pause"
+        );
+
+        let pending: concerto_core::types::PendingApprovalInfo = serde_json::from_str(
+            output.checkpoint_json.as_deref().expect("a pause must carry a checkpoint"),
+        )
+        .expect("checkpoint carries the pending-approval payload");
+        assert_eq!(pending.tool_name, "shell");
+        assert_eq!(pending.timeout_secs, 30);
+        assert!(!pending.input_hash.is_empty());
+    }
+
     #[tokio::test]
     async fn shell_execution_failure_queues_bounded_repair_turns() {
         let (mut loop_, task, session, calls) = shell_repair_harness(ScriptedShellOutcome::Exit(
@@ -6256,9 +7008,9 @@ mod tests {
             ..Default::default()
         };
 
-        // Three rounds against the SAME tool-call id: two repairs, then the
-        // budget is exhausted and the third failure surfaces unchanged.
-        for _ in 0..3 {
+        // Six rounds against the SAME tool-call id: five repairs, then the
+        // budget is exhausted and the sixth failure surfaces unchanged.
+        for _ in 0..6 {
             loop_
                 .execute_single_tool_call(
                     &tc,
@@ -6276,18 +7028,33 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "every round must execute");
+        assert_eq!(calls.load(Ordering::SeqCst), 6, "every round must execute");
         let repairs = repair_turns(&messages);
-        assert_eq!(repairs.len(), 2, "bounded at exactly MAX: {messages:?}");
+        assert_eq!(repairs.len(), 5, "bounded at exactly MAX: {messages:?}");
         assert!(
-            repairs[0].content.contains("[shell-repair attempt 1/2]"),
+            repairs[0].content.contains("[shell-repair attempt 1/5]"),
             "marker missing: {}",
             repairs[0].content
         );
         assert!(
-            repairs[1].content.contains("[shell-repair attempt 2/2]"),
+            repairs[1].content.contains("[shell-repair attempt 2/5]"),
             "marker missing: {}",
             repairs[1].content
+        );
+        assert!(
+            repairs[2].content.contains("[shell-repair attempt 3/5]"),
+            "marker missing: {}",
+            repairs[2].content
+        );
+        assert!(
+            repairs[3].content.contains("[shell-repair attempt 4/5]"),
+            "marker missing: {}",
+            repairs[3].content
+        );
+        assert!(
+            repairs[4].content.contains("[shell-repair attempt 5/5]"),
+            "marker missing: {}",
+            repairs[4].content
         );
         for repair in &repairs {
             assert!(repair.content.contains("diagnostic: shell.process.non-zero-exit"));
@@ -6296,10 +7063,10 @@ mod tests {
             assert!(repair.content.contains("inspect the captured output above and fix"));
             assert!(repair.content.contains("exactly ONE corrected `shell` tool call"));
         }
-        // Three tool results (one per round), each followed by at most one
+        // Six tool results (one per round), each followed by at most one
         // repair turn; the last round has no trailing repair.
         let tool_results = messages.iter().filter(|m| m.role == Role::Tool).collect::<Vec<_>>();
-        assert_eq!(tool_results.len(), 3);
+        assert_eq!(tool_results.len(), 6);
         let last = messages.last().expect("non-empty history");
         assert_eq!(last.role, Role::Tool, "exhaustion leaves only the tool result: {messages:?}");
         assert!(!last.content.contains("shell-repair"));

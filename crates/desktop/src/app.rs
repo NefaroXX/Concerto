@@ -4655,40 +4655,54 @@ impl ApprovalSink for DesktopApprovalSink {
 
         let name = format!("{} request", action.tool_name);
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<GrantDecision>>();
-
-        {
+        // Coalesce identical pending requests (same tool + input) onto one
+        // dialog instead of stacking duplicates: a retry/resume re-attaches to
+        // the EXISTING decision slot. The `watch` receiver is cloneable.
+        let key = format!("{}::{}", action.tool_name, action.input);
+        let (rx, queued_new) = {
             let mut guard = self.cap_pending.lock().unwrap_or_else(|e| e.into_inner());
-            guard.push_back(crate::widgets::capability_dialog::PendingApproval {
-                plugin: PluginManifest {
-                    name: name.clone(),
-                    description: "Policy action".into(),
-                    version: "1.0".into(),
-                    id: name,
-                    abi_version: 1,
-                    capabilities_required: caps.clone(),
-                    provides: Vec::new(),
+            match guard.iter().find(|pending| pending.key == key) {
+                Some(existing) => (existing.receiver.clone(), false),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    guard.push_back(crate::widgets::capability_dialog::PendingApproval {
+                        plugin: PluginManifest {
+                            name: name.clone(),
+                            description: "Policy action".into(),
+                            version: "1.0".into(),
+                            id: name,
+                            abi_version: 1,
+                            capabilities_required: caps.clone(),
+                            provides: Vec::new(),
+                        },
+                        capabilities: caps,
+                        key,
+                        sender: tx,
+                        receiver: rx.clone(),
+                    });
+                    (rx, true)
+                }
+            }
+        };
+
+        // Surface a NEWLY-queued request to the UI. `cap_pending` is mutated
+        // from this async task, so without an explicit event the Iced view
+        // would not re-render and the dialog would stay invisible while the
+        // agent blocks waiting on it. Publishing guarantees a redraw that shows
+        // the dialog; a coalesced request reuses the already-visible dialog.
+        if queued_new {
+            let _ = self.bus.publish_for_session(
+                action.session_id,
+                action.correlation_id,
+                concerto_core::event::EventKind::ApprovalRequested {
+                    tool_name: action.tool_name.to_string(),
+                    timeout_secs: 0,
                 },
-                capabilities: caps,
-                sender: tx,
-            });
+            );
         }
 
-        // Surface the pending request to the UI. `cap_pending` is mutated from
-        // this async task, so without an explicit event the Iced view would not
-        // re-render and the dialog would stay invisible while the agent blocks
-        // waiting on it. Publishing guarantees a redraw that shows the dialog.
-        let _ = self.bus.publish_for_session(
-            action.session_id,
-            action.correlation_id,
-            concerto_core::event::EventKind::ApprovalRequested {
-                tool_name: action.tool_name.to_string(),
-                timeout_secs: 0,
-            },
-        );
-
-        match rx.await {
-            Ok(decisions) => {
+        match crate::widgets::capability_dialog::await_decision(rx).await {
+            Some(decisions) => {
                 // Every requested capability must be granted for the action to
                 // proceed (a single Denied button denies the whole request).
                 let all_granted = decisions.iter().all(|d| {
@@ -4712,7 +4726,7 @@ impl ApprovalSink for DesktopApprovalSink {
                     ApprovalDecision::Approve
                 }
             }
-            Err(_) => ApprovalDecision::Deny,
+            None => ApprovalDecision::Deny,
         }
     }
 
@@ -7191,6 +7205,7 @@ custom_agents = []
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         }
     }
 
@@ -7274,6 +7289,66 @@ custom_agents = []
         let cancel = CancellationToken::new();
         let ack = sink.request_ack(Ulid::new(), "some warning", cancel).await;
         assert!(ack, "request_ack must return true when auto-approve is on");
+    }
+
+    /// Identical pending approval requests (same tool + input) coalesce onto
+    /// ONE dialog instead of stacking duplicates; both waiters receive the
+    /// same decision. The production failure mode (identical retries after a
+    /// timeout) no longer queues a duplicate dialog.
+    #[tokio::test]
+    async fn approval_sink_identical_requests_coalesce_onto_one_dialog() {
+        let cap_pending = crate::widgets::capability_dialog::shared_pending();
+        let pending_ack = crate::widgets::capability_dialog::shared_pending_ack();
+        let sink = DesktopApprovalSink {
+            cap_pending: cap_pending.clone(),
+            pending_ack: pending_ack.clone(),
+            pending_intent: crate::widgets::capability_dialog::shared_pending_intent(),
+            pending_plan: crate::widgets::capability_dialog::shared_pending_plan(),
+            auto_approve: Arc::new(AtomicBool::new(false)),
+            bus: EventBus::default(),
+        };
+        let cancel = CancellationToken::new();
+        let input = serde_json::json!({ "path": "/tmp/example.rs" });
+
+        let first = tokio::spawn({
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            let input = input.clone();
+            async move {
+                let action = make_action("write_file", &input);
+                sink.request_approval(&action, cancel).await
+            }
+        });
+        wait_for_pending_dialog(&cap_pending).await;
+
+        // A second identical request coalesces: it must NOT queue a second
+        // dialog and must await the SAME decision.
+        let second = tokio::spawn({
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            let input = input.clone();
+            async move {
+                let action = make_action("write_file", &input);
+                sink.request_approval(&action, cancel).await
+            }
+        });
+        // Give the second task a chance to run and (wrongly) push a duplicate.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            cap_pending.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "identical requests must coalesce onto ONE pending dialog"
+        );
+
+        // Resolving the single dialog delivers the same decision to both.
+        assert!(crate::widgets::capability_dialog::resolve(
+            &cap_pending,
+            &crate::widgets::capability_dialog::Message::GrantSession
+        ));
+        assert_eq!(first.await.expect("first task panicked"), ApprovalDecision::Approve);
+        assert_eq!(second.await.expect("second task panicked"), ApprovalDecision::Approve);
     }
 
     /// Wait until the spawn sink future has installed the pending ack so the

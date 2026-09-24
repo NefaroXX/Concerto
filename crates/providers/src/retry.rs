@@ -64,6 +64,26 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+/// Whether a retry class marks an exhaustion as throttling / transient-5xx —
+/// the cause for which an alternate pipe is the textbook recovery.
+///
+/// Deliberately excludes `Network`, `ConnectionReset`, `StreamTransport`,
+/// `RequestTimeout`, and `StreamIdleTimeout`: a transport-unknown or
+/// timeout cause is not evidence that another provider would succeed, so the
+/// coordinator keeps its conservative skip for those. Mirrors the rate-limit /
+/// overload / 5xx family the task's recovery allowlist names.
+fn is_throttle_class(class: Option<RetryClass>) -> bool {
+    matches!(
+        class,
+        Some(
+            RetryClass::RateLimited
+                | RetryClass::Overloaded
+                | RetryClass::ServiceUnavailable
+                | RetryClass::GatewayFailure
+        )
+    )
+}
+
 /// Decide whether a provider error warrants a retry and (if so) what delay the
 /// provider itself asked for.
 ///
@@ -495,6 +515,7 @@ where
                             attempts: attempt,
                             elapsed,
                             last_error: reason,
+                            throttled: is_throttle_class(decision.class),
                         });
                     }
                 }
@@ -907,5 +928,100 @@ mod tests {
         });
         assert!(d.retryable, "429 should be retryable");
         assert_eq!(d.class, Some(RetryClass::RateLimited));
+    }
+
+    /// The throttle allowlist is exactly the rate-limit / overload / 5xx
+    /// family — transport-unknown and timeout classes are excluded so the
+    /// coordinator keeps its conservative skip for them.
+    #[test]
+    fn throttle_class_allowlist_excludes_transport_and_timeouts() {
+        assert!(is_throttle_class(Some(RetryClass::RateLimited)));
+        assert!(is_throttle_class(Some(RetryClass::Overloaded)));
+        assert!(is_throttle_class(Some(RetryClass::ServiceUnavailable)));
+        assert!(is_throttle_class(Some(RetryClass::GatewayFailure)));
+        assert!(!is_throttle_class(Some(RetryClass::Network)));
+        assert!(!is_throttle_class(Some(RetryClass::ConnectionReset)));
+        assert!(!is_throttle_class(Some(RetryClass::StreamTransport)));
+        assert!(!is_throttle_class(Some(RetryClass::RequestTimeout)));
+        assert!(!is_throttle_class(Some(RetryClass::StreamIdleTimeout)));
+        assert!(!is_throttle_class(None));
+    }
+
+    /// A 429-ceiling exhaustion retains the throttle cause on the surfaced
+    /// `RetryExhausted`, so the coordinator can recover onto an alternate pipe
+    /// (production: planning died after 8x429 with a healthy alternate idle).
+    #[tokio::test]
+    async fn exhausted_rate_limit_carries_throttled_cause() {
+        let error = exhaust(ProviderError::RateLimit { retry_after: Duration::from_secs(1) }).await;
+        assert!(
+            matches!(&error, ProviderError::RetryExhausted { throttled: true, .. }),
+            "a 429 exhaustion must retain the throttle cause: {error:?}"
+        );
+        assert!(error.is_throttle_exhaustion());
+    }
+
+    /// A 5xx-ceiling exhaustion is also throttle/transient-5xx — recoverable.
+    #[tokio::test]
+    async fn exhausted_5xx_carries_throttled_cause() {
+        let error = exhaust(ProviderError::HttpStatus {
+            status: 503,
+            retry_after: None,
+            message: "service unavailable".into(),
+        })
+        .await;
+        assert!(
+            matches!(&error, ProviderError::RetryExhausted { throttled: true, .. }),
+            "a 503 exhaustion must retain the throttle cause: {error:?}"
+        );
+        assert!(error.is_throttle_exhaustion());
+    }
+
+    /// A transport-unknown ceiling (mid-stream transport fault) is NOT
+    /// throttle — the conservative skip is preserved.
+    #[tokio::test]
+    async fn exhausted_stream_transport_is_not_throttled() {
+        let error = exhaust(ProviderError::StreamTransport("connection reset".into())).await;
+        assert!(
+            matches!(&error, ProviderError::RetryExhausted { throttled: false, .. }),
+            "a transport-unknown exhaustion must not claim a throttle cause: {error:?}"
+        );
+        assert!(!error.is_throttle_exhaustion());
+    }
+
+    /// A network-unknown ceiling is NOT throttle either.
+    #[tokio::test]
+    async fn exhausted_network_is_not_throttled() {
+        let error = exhaust(ProviderError::Network("dns lookup failed".into())).await;
+        assert!(
+            !error.is_throttle_exhaustion(),
+            "a network exhaustion must not recover: {error:?}"
+        );
+    }
+
+    /// Drive a single transient failure through the retry loop with a
+    /// one-attempt budget so it surfaces as `RetryExhausted` immediately (no
+    /// sleeps, no real clock dependence).
+    async fn exhaust(error: ProviderError) -> ProviderError {
+        let policy = RetryPolicy::new(RetryConfig {
+            max_attempts: 1,
+            jitter: false,
+            initial_delay_ms: 0,
+            ..RetryConfig::default()
+        });
+        let bus = EventBus::new(16);
+        with_provider_retry(
+            &policy,
+            &bus,
+            Ulid::new(),
+            TaskId::new(),
+            "test",
+            &CancellationToken::new(),
+            || {
+                let error = error.clone();
+                async move { Err::<(), ProviderError>(error) }
+            },
+        )
+        .await
+        .expect_err("the operation must exhaust")
     }
 }

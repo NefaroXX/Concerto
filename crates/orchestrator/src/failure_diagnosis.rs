@@ -60,6 +60,7 @@
 //! [`diagnose_outcome_failure`] / [`diagnose_blocked`].
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Upper bound on the evidence excerpt carried by one diagnosis. Errors are
 /// untrusted model/tool output; the diagnosis stays bounded so checkpoints
@@ -662,6 +663,119 @@ pub fn diagnose_blocked(blockers: &[concerto_core::types::TaskId]) -> FailureDia
     )
 }
 
+// ---------------------------------------------------------------------------
+// Identical-failure repetition guard (smoke: clap-derive 101 repeated 3×+)
+// ---------------------------------------------------------------------------
+
+/// How many times the SAME failure signature must repeat consecutively before
+/// the coordinator stops burning same-agent attempts and forces escalation.
+pub const IDENTICAL_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
+
+/// Upper bound on a normalized failure signature (chars). Failure text is
+/// untrusted model/tool output; the signature stays small and comparable.
+pub const MAX_FAILURE_SIGNATURE_CHARS: usize = 256;
+
+/// One subtask's consecutive-identical-failure run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureRun {
+    signature: String,
+    count: u32,
+}
+
+/// Tracks consecutive identical failure signatures per subtask.
+///
+/// A retry loop that keeps re-dispatching the same agent against the same
+/// deterministic failure (e.g. a `cargo build` error that repeats unchanged)
+/// makes no progress and only spends the remaining attempt budget. After
+/// [`IDENTICAL_FAILURE_ESCALATION_THRESHOLD`] consecutive identical
+/// signatures the coordinator forces escalation (alternate fail-over /
+/// replan) instead. A DIFFERENT signature restarts the run at one, and a
+/// success clears it — so only a genuine repetition triggers.
+#[derive(Debug)]
+pub struct IdenticalFailureTracker {
+    threshold: u32,
+    runs: HashMap<concerto_core::types::TaskId, FailureRun>,
+}
+
+impl Default for IdenticalFailureTracker {
+    fn default() -> Self {
+        Self::new(IDENTICAL_FAILURE_ESCALATION_THRESHOLD)
+    }
+}
+
+impl IdenticalFailureTracker {
+    /// Creates a tracker that triggers at `threshold` (clamped to at least 1,
+    /// so a zero threshold cannot force escalation on the very first failure).
+    pub fn new(threshold: u32) -> Self {
+        Self { threshold: threshold.max(1), runs: HashMap::new() }
+    }
+
+    /// Records a failure for `task` and returns `true` when the SAME
+    /// normalized signature has now occurred consecutively at least
+    /// `threshold` times. A different signature resets the count to one.
+    pub fn record_failure(&mut self, task: concerto_core::types::TaskId, error: &str) -> bool {
+        let signature = failure_signature(error);
+        let entry = self
+            .runs
+            .entry(task)
+            .or_insert_with(|| FailureRun { signature: signature.clone(), count: 0 });
+        if entry.signature == signature {
+            entry.count = entry.count.saturating_add(1);
+        } else {
+            entry.signature = signature;
+            entry.count = 1;
+        }
+        entry.count >= self.threshold
+    }
+
+    /// Clears the run for `task` (a success resets the streak).
+    pub fn record_success(&mut self, task: concerto_core::types::TaskId) {
+        self.runs.remove(&task);
+    }
+
+    /// The current consecutive count for `task` (0 when no live run).
+    pub fn consecutive(&self, task: concerto_core::types::TaskId) -> u32 {
+        self.runs.get(&task).map_or(0, |run| run.count)
+    }
+
+    /// The trigger threshold.
+    pub fn threshold(&self) -> u32 {
+        self.threshold
+    }
+}
+
+/// Normalize failure text into a comparable signature: collapse whitespace and
+/// lowercase, then bound the length. Formatting-only differences (indentation,
+/// line breaks, casing) do not hide an otherwise identical failure.
+pub fn failure_signature(error: &str) -> String {
+    let normalized: String = error.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    normalized.chars().take(MAX_FAILURE_SIGNATURE_CHARS).collect()
+}
+
+/// Diagnosis for a subtask whose identical failure signature has repeated
+/// consecutively past [`IDENTICAL_FAILURE_ESCALATION_THRESHOLD`].
+///
+/// Another identical same-agent retry is futile, so the diagnosis is not
+/// retryable and not same-agent viable: it is alternate-viable (fail over) and
+/// replan-required, which routes the existing recovery machinery to the
+/// alternate/replan paths instead of the retry loop.
+pub fn diagnose_identical_repeat(evidence: &str, count: u32) -> FailureDiagnosis {
+    let detail = format!(
+        "identical failure repeated {count}× consecutively (threshold \
+         {IDENTICAL_FAILURE_ESCALATION_THRESHOLD}); forcing escalation: {evidence}"
+    );
+    FailureDiagnosis::new(
+        FailureKind::Agent,
+        "identical-failure-repeat",
+        false,
+        false,
+        false,
+        true,
+        true,
+        &detail,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +965,7 @@ mod tests {
             attempts: 4,
             elapsed: Duration::from_secs(30),
             last_error: "all retries failed".into(),
+            throttled: false,
         }));
         assert_eq!(exhausted.code, "provider-retries-exhausted");
         assert!(!exhausted.transient && !exhausted.retryable && !exhausted.same_agent_viable);
@@ -1063,5 +1178,107 @@ mod tests {
         let brief = diagnosis.brief();
         assert!(brief.contains("provider [rate-limit]"), "{brief}");
         assert!(brief.contains("transient"), "{brief}");
+    }
+
+    // ── Identical-failure repetition guard (smoke: clap-derive 101) ─────
+
+    #[test]
+    fn three_identical_failures_trigger_escalation() {
+        let task = concerto_core::types::TaskId::new();
+        let mut tracker = IdenticalFailureTracker::default();
+        assert_eq!(tracker.threshold(), IDENTICAL_FAILURE_ESCALATION_THRESHOLD);
+
+        let error = "cargo build failed: error[E0599]: no method named `derive`";
+        assert!(!tracker.record_failure(task, error), "1st is not a repeat");
+        assert_eq!(tracker.consecutive(task), 1);
+        assert!(!tracker.record_failure(task, error), "2nd is not a repeat");
+        assert_eq!(tracker.consecutive(task), 2);
+        assert!(tracker.record_failure(task, error), "3rd identical must force escalation");
+        assert_eq!(tracker.consecutive(task), 3);
+        // Still true while the same signature keeps repeating.
+        assert!(tracker.record_failure(task, error));
+    }
+
+    #[test]
+    fn differing_errors_do_not_trigger_escalation() {
+        let task = concerto_core::types::TaskId::new();
+        let mut tracker = IdenticalFailureTracker::default();
+
+        assert!(!tracker.record_failure(task, "error: missing dependency `serde`"));
+        assert!(!tracker.record_failure(task, "error: unused import `std::fmt`"));
+        assert!(!tracker.record_failure(task, "error: cannot find value `x`"));
+        assert_eq!(tracker.consecutive(task), 1, "each different error restarts the run");
+
+        // Only when the SAME error repeats after the change does it climb.
+        assert!(!tracker.record_failure(task, "error: cannot find value `x`"));
+        assert!(tracker.record_failure(task, "error: cannot find value `x`"));
+    }
+
+    #[test]
+    fn success_resets_the_identical_failure_run() {
+        let task = concerto_core::types::TaskId::new();
+        let mut tracker = IdenticalFailureTracker::default();
+        let error = "cargo test exited 101";
+
+        assert!(!tracker.record_failure(task, error));
+        assert!(!tracker.record_failure(task, error));
+        assert_eq!(tracker.consecutive(task), 2);
+
+        tracker.record_success(task);
+        assert_eq!(tracker.consecutive(task), 0);
+
+        // The count restarts from one after the reset.
+        assert!(!tracker.record_failure(task, error));
+        assert_eq!(tracker.consecutive(task), 1);
+    }
+
+    #[test]
+    fn identical_runs_are_tracked_per_subtask() {
+        let first = concerto_core::types::TaskId::new();
+        let second = concerto_core::types::TaskId::new();
+        let mut tracker = IdenticalFailureTracker::default();
+        let error = "error[E0433]: failed to resolve";
+
+        assert!(!tracker.record_failure(first, error));
+        assert!(!tracker.record_failure(second, error));
+        assert_eq!(tracker.consecutive(first), 1, "each subtask has its own run");
+        assert_eq!(tracker.consecutive(second), 1);
+
+        assert!(!tracker.record_failure(first, error));
+        assert!(tracker.record_failure(first, error));
+        assert_eq!(tracker.consecutive(second), 1, "the other subtask is unaffected");
+    }
+
+    #[test]
+    fn signature_normalization_ignores_formatting_only_differences() {
+        let task = concerto_core::types::TaskId::new();
+        let mut tracker = IdenticalFailureTracker::default();
+        assert!(!tracker.record_failure(task, "Error:   cannot   find `x`\n"));
+        assert!(!tracker.record_failure(task, "error: cannot find `x`"));
+        assert!(tracker.record_failure(task, "ERROR: cannot find `x` "), "case/space-insensitive");
+    }
+
+    #[test]
+    fn signature_is_bounded() {
+        let huge = "x".repeat(MAX_FAILURE_SIGNATURE_CHARS * 4);
+        let signature = failure_signature(&huge);
+        assert_eq!(signature.chars().count(), MAX_FAILURE_SIGNATURE_CHARS);
+    }
+
+    #[test]
+    fn identical_repeat_diagnosis_fails_over_and_replans_not_retries() {
+        let diagnosis = diagnose_identical_repeat("error[E0599]: clap derive failure", 3);
+        assert_eq!(diagnosis.kind, FailureKind::Agent);
+        assert_eq!(diagnosis.code, "identical-failure-repeat");
+        assert!(!diagnosis.transient && !diagnosis.retryable);
+        assert!(!diagnosis.same_agent_viable, "another identical retry is futile");
+        assert!(diagnosis.alternate_agent_viable, "fail over to another agent");
+        assert!(diagnosis.replan_required);
+        // Precedence: alternate fail-over before replan.
+        assert_eq!(
+            recovery_action(&diagnosis, 0, 6),
+            RecoveryAction::RetryAlternate,
+            "the forced escalation must not consume the remaining attempts"
+        );
     }
 }

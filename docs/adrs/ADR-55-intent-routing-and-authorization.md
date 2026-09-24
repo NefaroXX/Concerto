@@ -1071,6 +1071,10 @@ empty-completion honesty rule (Phase 2d Fix B — a loop run ending with
 empty final text still synthesizes the explanatory completion).
 Identical-tool-call repetition coverage is verified in `cycle_manager`,
 with a minimal same-call guard added only if absent.
+> Reconciliation note (2026-09-24): `cycle_manager` was removed in the
+> routing-carcass cleanup; cycle detection lives in `cycle.rs` (`CycleTracker`,
+> "detects repeated identical tool calls"), and its coverage (e.g.
+> `sixth_call_with_same_input_fires_cycle_detected`) is verified there.
 
 ### 6. Narrow normalization (glue-strip)
 

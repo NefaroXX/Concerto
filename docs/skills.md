@@ -169,6 +169,14 @@ once per `refresh`; the prompt hot path only clones the cached string.
 - **Tool hints only:** the `tools` list in a manifest is a prompt-level
   suggestion. It does not grant or strip tools; policy gating of actual tool
   execution is unchanged.
+- **Observability:** `SkillsContext::report_injection` publishes a single
+  `EventKind::SkillsInjected { skill_ids, total_chars, budget_chars }` per run
+  (plus an `info` log line). It is deliberately **content-free** — only sorted,
+  deduplicated pack ids and character counts, never pack instruction text (a
+  secrets-adjacent caution in ADR-43). The event is persisted by the session
+  event recorder and surfaced as a transcript activity entry; a disabled
+  configuration stays silent, and publishing is fail-soft (a publish error is
+  warned about and the run proceeds).
 
 ## Using skills
 

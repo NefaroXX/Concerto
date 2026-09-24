@@ -21,10 +21,22 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default timeout for shell commands when not specified by the caller.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
+///
+/// Generous enough for a cold `cargo build`/`cargo test` on a fresh workspace:
+/// the smoke-proven failure mode was a model never passing `timeout_secs` and
+/// a build being killed at the old 30s default. Short commands are unaffected
+/// (the timeout is an upper bound, not a wait); the hard [`MAX_TIMEOUT_SECS`]
+/// ceiling still bounds a hung command.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 /// Hard upper bound for user-specified timeouts (5 minutes).
 const MAX_TIMEOUT_SECS: u64 = 300;
+
+/// Resolve the effective timeout: the caller's value when present, otherwise
+/// the default, always clamped to the hard ceiling.
+fn resolve_timeout_secs(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(DEFAULT_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS)
+}
 
 /// Maximum allowed command string length (characters).
 const MAX_COMMAND_LENGTH: usize = 4096;
@@ -81,7 +93,11 @@ pub struct ShellInput {
     #[schemars(description = "Optional working directory for the command.")]
     pub cwd: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional execution timeout in seconds.")]
+    #[schemars(
+        description = "Optional execution timeout in seconds. Defaults to 120. Pass a higher \
+                       value (up to 300) for long builds/tests; pass a small value for \
+                       interactive or short commands."
+    )]
     pub timeout_secs: Option<u64>,
 }
 
@@ -462,7 +478,8 @@ impl concerto_core::traits::tool::Tool for ShellTool {
                     "command": { "type": "string" },
                     "args": { "type": "array", "items": { "type": "string" } },
                     "cwd": { "type": ["string", "null"] },
-                    "timeout_secs": { "type": ["integer", "null"], "minimum": 0 }
+                    "timeout_secs": { "type": ["integer", "null"], "minimum": 0,
+                        "description": "Optional execution timeout in seconds. Defaults to 120. Pass a higher value (up to 300) for long builds/tests." }
                 },
                 "required": ["command"]
             })
@@ -594,8 +611,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         };
 
         // Resolve timeout with a hard upper cap.
-        let timeout_secs =
-            shell_input.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS);
+        let timeout_secs = resolve_timeout_secs(shell_input.timeout_secs);
         let timeout = Duration::from_secs(timeout_secs);
 
         // Profile-driven execution (ADR-28): if a shell profile is configured,
@@ -1029,7 +1045,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_tool_default_timeout_is_30_seconds() {
+    async fn shell_tool_default_timeout_is_120_seconds() {
+        // The default must clear a cold build; the old 30s default killed
+        // `cargo build` in smoke.
+        assert_eq!(DEFAULT_TIMEOUT_SECS, 120);
+        assert_eq!(MAX_TIMEOUT_SECS, 300);
+
         let tool = test_tool();
         let session = test_session();
         let policy = test_policy();
@@ -1043,6 +1064,39 @@ mod tests {
 
         let result = tool.execute(input, &policy, &session, cancel).await;
         assert!(result.is_ok(), "expected success with default timeout");
+    }
+
+    #[test]
+    fn shell_timeout_resolution_applies_default_and_ceiling() {
+        // Absent → default.
+        assert_eq!(resolve_timeout_secs(None), DEFAULT_TIMEOUT_SECS);
+        // Explicit value under the cap is honoured.
+        assert_eq!(resolve_timeout_secs(Some(5)), 5);
+        assert_eq!(resolve_timeout_secs(Some(120)), 120);
+        // Over the cap is clamped to the hard ceiling (no unbounded hang).
+        assert_eq!(resolve_timeout_secs(Some(MAX_TIMEOUT_SECS)), MAX_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout_secs(Some(u64::MAX)), MAX_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout_secs(Some(9_999_999)), MAX_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn shell_timeout_schema_documents_build_guidance() {
+        let schema = ShellTool::new().input_schema();
+        let description = schema["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .expect("timeout_secs must carry a description");
+        assert!(
+            description.contains("120"),
+            "the description must name the default so models can pass it: {description}"
+        );
+        assert!(
+            description.to_lowercase().contains("build"),
+            "the description must steer models to pass a timeout for builds: {description}"
+        );
+        assert!(
+            description.contains("300"),
+            "the description must name the hard ceiling: {description}"
+        );
     }
 
     #[tokio::test]

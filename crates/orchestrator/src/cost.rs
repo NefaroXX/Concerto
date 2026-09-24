@@ -1,9 +1,12 @@
 //! `AgentCostEstimator` — rough cost estimation per agent stage kind.
 //!
-//! Uses tunable constants per stage kind (ADR-58 D2). These are conservative
-//! estimates of typical token usage for a single agent run of that stage.
+//! Delegates to the single config-derived estimator
+//! ([`concerto_providers::routing::CostEstimator`]), which keys typical token
+//! usage on the **stage kind** the role is staffed in (Planning → 4_000,
+//! Research → 6_000, Execution → 8_000, Review → 3_000, Acceptance → 500) and
+//! falls back to a flat 2_000-token default for an unknown/unstaffed role or a
+//! facade-less estimate. Never keyed on the role's name.
 
-use concerto_config::blueprint::StageKind;
 use concerto_config::BlueprintFacade;
 use concerto_core::types::{AgentId, RoutingProfile};
 
@@ -11,53 +14,16 @@ use concerto_core::types::{AgentId, RoutingProfile};
 pub struct AgentCostEstimator;
 
 impl AgentCostEstimator {
-    /// Estimated typical token usage per agent (input + output).
-    ///
-    /// ADR-58 R13: keyed by the **stage kind** the role is staffed in (from
-    /// the resolved blueprint facade) rather than the role's name, so a
-    /// renamed or custom stage-staffed specialist prices like its stage does
-    /// (Planning → 4_000, Research → 6_000, Execution → 8_000, Review →
-    /// 3_000, Acceptance → 500). The stage's open kind string is parsed into
-    /// the closed [`StageKind`] vocabulary; an unknown kind string (and an
-    /// absent kind) falls back to the legacy role-name table, so the default
-    /// `standard` blueprint prices byte-identically to pre-ADR-58.
-    fn typical_tokens(role: &AgentId, kind: Option<String>) -> u64 {
-        match kind.as_deref().and_then(StageKind::parse) {
-            Some(StageKind::Planning) => 4_000,
-            Some(StageKind::Research) => 6_000,
-            Some(StageKind::Execution) => 8_000,
-            Some(StageKind::Review) => 3_000,
-            Some(StageKind::Acceptance) => 500, // no LLM call
-            // Role fallthrough (unknown kind strings, custom/freeform,
-            // `coordinator`, facade-less estimates): the pre-ADR-58 role-name
-            // table, byte-identical on the default blueprint. `RunOnce`
-            // stages and genuinely unknown roles also land here.
-            _ => match role.as_str() {
-                "architect" => 4_000,
-                "researcher" => 6_000,
-                "coder" => 8_000,
-                "reviewer" => 3_000,
-                "validator" => 500, // no LLM call
-                "coordinator" => 2_000,
-                _ => 2_000,
-            },
-        }
-    }
-
     /// Estimate cost for running a given agent on the given profile.
     ///
     /// `facade` supplies the role's blueprint stage kind for the heuristic
-    /// (R13); pass `None` for a facade-less estimate to keep the legacy
-    /// role-name table.
+    /// (ADR-58 R13); pass `None` for a facade-less flat-default estimate.
     pub fn estimate(
         role: &AgentId,
         profile: &RoutingProfile,
         facade: Option<&BlueprintFacade>,
     ) -> f64 {
-        let kind =
-            facade.and_then(|facade| facade.stage_for_agent(role)).map(|s| s.def.kind.clone());
-        let tokens = Self::typical_tokens(role, kind) as f64;
-        (tokens / 1000.0) * profile.cost_per_1k_tokens
+        concerto_providers::routing::CostEstimator::estimate(role, profile, facade)
     }
 
     /// Returns true if `budget` is sufficient for a single run of `role`
@@ -132,20 +98,29 @@ mod tests {
     }
 
     #[test]
-    fn estimation_matches_role() {
+    fn estimation_is_keyed_on_stage_kind_not_role_name() {
+        // ADR-58 R13: the token estimate comes from the role's STAFFED STAGE
+        // KIND, so architect (Planning) prices below coder (Execution) on the
+        // default blueprint facade.
+        let resolved = concerto_config::OrchestrationConfig::default()
+            .resolve(&[], None)
+            .expect("the standard blueprint must validate and resolve");
+        let facade = BlueprintFacade::new(&resolved);
         let profile = expensive_profile();
         let architect_cost =
-            AgentCostEstimator::estimate(&AgentId::new("architect"), &profile, None);
-        let coder_cost = AgentCostEstimator::estimate(&AgentId::new("coder"), &profile, None);
+            AgentCostEstimator::estimate(&AgentId::new("architect"), &profile, Some(&facade));
+        let coder_cost =
+            AgentCostEstimator::estimate(&AgentId::new("coder"), &profile, Some(&facade));
         assert!(coder_cost > architect_cost);
     }
 
     #[test]
-    fn default_blueprint_estimates_match_legacy_role_table() {
-        // ADR-58 R13 parity pin: with the default standard blueprint's
-        // facade, the five builtin specialists (and the coordinator persona)
-        // price byte-identically to the pre-ADR-58 role-name table — both
-        // through the stage-kind key and through the facade-less fallthrough.
+    fn estimates_follow_the_resolved_blueprint_stage_kinds() {
+        // ADR-58 R13 parity pin: with the default standard blueprint's facade
+        // the five builtin specialists price by their staffed stage kind
+        // (architect→Planning, researcher→Research, coder→Execution,
+        // reviewer→Review, validator→Acceptance). The coordinator persona is
+        // not staffed in a stage, so it takes the flat 2_000 default.
         let resolved = concerto_config::OrchestrationConfig::default()
             .resolve(&[], None)
             .expect("the standard blueprint must validate and resolve");
@@ -166,14 +141,20 @@ mod tests {
             assert_eq!(
                 estimated,
                 expected(tokens),
-                "standard blueprint must price {role} byte-identically to the legacy table"
+                "standard blueprint must price {role} by stage kind"
             );
-            let fallback = AgentCostEstimator::estimate(&AgentId::new(role), &profile, None);
-            assert_eq!(
-                fallback,
-                expected(tokens),
-                "facade-less fallthrough must keep the legacy price for {role}"
-            );
+        }
+    }
+
+    #[test]
+    fn facade_less_estimates_use_the_flat_default() {
+        // No facade → no stage kind → flat 2_000-token default for every role
+        // (never a role-name special case).
+        let profile = cheap_profile();
+        let expected = (2_000.0 / 1000.0) * profile.cost_per_1k_tokens;
+        for role in ["architect", "researcher", "coder", "reviewer", "validator", "coordinator"] {
+            let estimated = AgentCostEstimator::estimate(&AgentId::new(role), &profile, None);
+            assert_eq!(estimated, expected, "facade-less {role} must use the flat default");
         }
     }
 }

@@ -721,6 +721,14 @@ pub struct RunSummary {
     /// must fall back to a full log replay. `None` on success or when no
     /// checkpoint was due (no write-path services / empty log).
     pub checkpoint_error: Option<String>,
+    /// One summary flag for the run's warn-only degradations (item: warn-only
+    /// drops). A checkpoint that could not be persisted, a lease release that
+    /// failed, or a write-path handler that logged-and-continued all set this
+    /// to `true` — so the run summary carries ONE degraded note rather than a
+    /// Decision row per drop (per-drop decision rows would be too noisy for
+    /// best-effort continuity writes). The individual `warn` logs are
+    /// unchanged.
+    pub degraded: bool,
 }
 
 /// Shared write-path services the steady-state loop dispatches into
@@ -1453,8 +1461,12 @@ impl Supervisor {
             }
         }
         failed.extend(shutdown_failed);
-        let mut summary =
-            RunSummary { failed: failed.clone(), agents: self.agents(), checkpoint_error: None };
+        let mut summary = RunSummary {
+            failed: failed.clone(),
+            agents: self.agents(),
+            checkpoint_error: None,
+            degraded: false,
+        };
         for agent_id in self.agents.keys().map(Clone::clone).collect::<Vec<_>>() {
             if failed.contains(&agent_id) {
                 continue;
@@ -1487,6 +1499,7 @@ impl Supervisor {
                      restart restore must fall back to a full log replay"
                 );
                 summary.checkpoint_error = Some(error.to_string());
+                summary.degraded = true;
             }
         }
         summary
@@ -1783,6 +1796,12 @@ async fn handle_execute_tool(
     cancel: &CancellationToken,
 ) -> Box<IpcResponse> {
     request.agent_id = agent_id.to_owned();
+    // TRUST BOUNDARY: the supervised child is untrusted by design, so any
+    // `orchestrator_authority = true` smuggled over the wire is discarded here
+    // — a child process can never acquire orchestrator authority. The
+    // in-process orchestrator path (`InProcessGateBackend`) does not pass
+    // through this handler and may legitimately carry authority.
+    request.orchestrator_authority = false;
     // ADR-60 D5 always-on: the supervisor attests each mutated target's
     // current state at request arrival so every versioned write carries
     // per-target `base_versions` claims (see [`crate::gate::stamp_base_versions`]);
@@ -2390,13 +2409,23 @@ mod write_path_tests {
     /// A gate whose executor is the REAL `FilesystemTool` rooted at `root` —
     /// the shape the supervisor builds in production.
     fn fs_gate(pool: sqlx::SqlitePool, root: PathBuf) -> Arc<WriteGate> {
+        fs_gate_with_policy(pool, root, allow_engine())
+    }
+
+    /// Same as [`fs_gate`] but under a caller-supplied policy, so a test can
+    /// exercise the supervisor's real policy path (e.g. read-only intent).
+    fn fs_gate_with_policy(
+        pool: sqlx::SqlitePool,
+        root: PathBuf,
+        policy: Arc<SimplePolicyEngine>,
+    ) -> Arc<WriteGate> {
         let mut registry = ToolRegistry::default();
         let utf8_root =
             camino::Utf8PathBuf::from_path_buf(root.clone()).expect("tempdir root is utf-8");
         registry.register(Box::new(FilesystemTool::new(utf8_root)));
-        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), allow_engine()));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy.clone()));
         Arc::new(WriteGate::new(
-            allow_engine(),
+            policy,
             executor,
             pool,
             Arc::new(FilePreImageReader::new(root.clone())),
@@ -2448,6 +2477,7 @@ mod write_path_tests {
             plan_id: None,
             causation: None,
             base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
         }
     }
 
@@ -2742,6 +2772,7 @@ mod write_path_tests {
             pool.clone(),
             store,
             ProjectId("proj-d6-supervisor".to_owned()),
+            None,
         )));
 
         // Fewer than the threshold: no pass may run.
@@ -3185,6 +3216,67 @@ mod write_path_tests {
         assert!(
             summary.checkpoint_error.is_some(),
             "a failed shutdown checkpoint is surfaced loudly"
+        );
+        assert!(
+            summary.degraded,
+            "a failed continuity write sets the single degraded summary flag"
+        );
+    }
+
+    /// TRUST BOUNDARY: a supervised child is untrusted, so a `GateRequest` it
+    /// sends with `orchestrator_authority = true` must NOT acquire authority.
+    /// `handle_execute_tool` forces the flag `false` before evaluation; here a
+    /// read-only-intent run still hard-denies the smuggled write (whereas
+    /// genuine in-process authority would allow it), nothing executes, and the
+    /// rejection is durably recorded.
+    #[tokio::test]
+    async fn handle_execute_tool_discards_smuggled_orchestrator_authority() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("smuggle.txt"), "base").expect("seed file");
+        let (_pool_dir, pool) = test_pool().await;
+
+        let store = Arc::new(crate::intent_grants::IntentGrantStore::new());
+        let auth = Arc::new(crate::intent_grants::SessionIntentAuth::new(store));
+        auth.set_read_only(true);
+        let policy = Arc::new(
+            SimplePolicyEngine::new(
+                vec![PolicyRule::RequireApproval(Condition::IntentAuthorized)],
+                Arc::new(TestAudit),
+            )
+            .with_intent_auth(auth),
+        );
+        let services = SupervisorServices {
+            gate: fs_gate_with_policy(pool.clone(), root.clone(), policy),
+            whiteboard_pool: pool.clone(),
+            memory: Arc::new(CountingMemoryStore),
+            project_id: ProjectId("proj-smuggle".to_owned()),
+            subscriptions: SubscriptionManager::new(pool.clone()),
+            consolidation: None,
+        };
+        let cancel = CancellationToken::new();
+
+        let mut request = fs_write("smuggle-1", "smuggle.txt", "owned");
+        // The child's forged claim: without the boundary guard this would be
+        // an Allow (`coordinator_authority`); with it the read-only deny holds.
+        request.orchestrator_authority = true;
+
+        let response = handle_execute_tool(&services, "agent-evil", request, 1, &cancel).await;
+        assert!(
+            response.error.is_some(),
+            "a smuggled authority flag must not upgrade the verdict: {:?}",
+            response.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("smuggle.txt")).expect("file on disk"),
+            "base",
+            "the denied write did not execute"
+        );
+        let events = all_events(&pool).await;
+        assert!(
+            events.iter().any(|event| event.event_id == "smuggle-1"
+                && event.kind == WhiteboardKind::WriteRejected),
+            "the smuggled request was durably rejected, never applied"
         );
     }
 }

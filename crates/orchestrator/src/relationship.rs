@@ -5,7 +5,8 @@
 //! Used by `CoordinatorAgent` to govern review/validation cycles and to
 //! produce structured handoff events for the audit log.
 
-use concerto_core::types::{AgentId, TaskId};
+use concerto_config::blueprint::StageKind;
+use concerto_core::types::{AgentId, AgentStage, TaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -52,11 +53,13 @@ impl RelationshipManager {
         Ok(manager)
     }
 
-    pub fn defaults() -> Self {
-        // The built-in rules below are validated constants; a failure here
-        // would only indicate a programming error in this module. Degrade to
-        // an empty rule set rather than panicking in library code.
-        match Self::new(default_collaboration_rules()) {
+    pub fn defaults_for_agents(agents: &[(AgentId, StageKind)]) -> Self {
+        // The default stage-kind pairs always validate (no self pairs, caps
+        // >= 1); a failure here would only indicate a programming error in this
+        // module. Degrade to an empty rule set rather than panicking in library
+        // code.
+        let rules = resolve_stage_relationships(&default_stage_relationships(), agents);
+        match Self::new(rules) {
             Ok(manager) => manager,
             Err(error) => {
                 tracing::warn!(error = %error, "built-in collaboration rules are invalid; using empty rule set");
@@ -132,43 +135,121 @@ pub enum HandoffDeliverable {
     Implementation(String),
 }
 
-/// Return the default collaboration rules for the known agent roles.
+/// A default collaboration rule expressed over **stage kinds** (ADR-58 D2),
+/// never agent role ids. Resolved to concrete agent ids at runtime by
+/// [`resolve_stage_relationships`] against the agents actually staffing each
+/// kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageRelationship {
+    /// The stage kind the supervising/context-providing agent staffs.
+    pub from: StageKind,
+    /// The stage kind whose agents are the target of the relationship.
+    pub to: StageKind,
+    /// The relationship the pair expresses.
+    pub relationship: AgentRelationship,
+    /// Maximum review/revision cycles before escalation (`None` = no limit).
+    pub max_cycles: Option<u32>,
+}
+
+/// The engine-default collaboration topology as stage-kind pairs.
 ///
-/// These are the rules that govern the standard Architect → Researcher →
-/// Coder pipeline with Reviewer and Validator oversight.
-pub fn default_collaboration_rules() -> Vec<CollaborationRule> {
+/// These reproduce the historical id-based seed exactly on the standard
+/// five-agent roster (one agent per kind): Review→Execution supervises (cap 6),
+/// Research→Execution provides context, Planning→Execution and
+/// Planning→Research own the design, and Acceptance→Execution supervises
+/// (cap 5). A roster that omits a kind simply yields no edge for pairs that
+/// reference it — never an error.
+pub fn default_stage_relationships() -> Vec<StageRelationship> {
     vec![
-        CollaborationRule {
-            from: AgentId::new("reviewer"),
-            to: AgentId::new("coder"),
+        StageRelationship {
+            from: StageKind::Review,
+            to: StageKind::Execution,
             relationship: AgentRelationship::Supervises,
-            max_cycles: Some(3),
+            max_cycles: Some(6),
         },
-        CollaborationRule {
-            from: AgentId::new("researcher"),
-            to: AgentId::new("coder"),
+        StageRelationship {
+            from: StageKind::Research,
+            to: StageKind::Execution,
             relationship: AgentRelationship::ProvidesContextTo,
             max_cycles: None,
         },
-        CollaborationRule {
-            from: AgentId::new("architect"),
-            to: AgentId::new("coder"),
+        StageRelationship {
+            from: StageKind::Planning,
+            to: StageKind::Execution,
             relationship: AgentRelationship::OwnsDesign,
             max_cycles: None,
         },
-        CollaborationRule {
-            from: AgentId::new("architect"),
-            to: AgentId::new("researcher"),
+        StageRelationship {
+            from: StageKind::Planning,
+            to: StageKind::Research,
             relationship: AgentRelationship::OwnsDesign,
             max_cycles: None,
         },
-        CollaborationRule {
-            from: AgentId::new("validator"),
-            to: AgentId::new("coder"),
+        StageRelationship {
+            from: StageKind::Acceptance,
+            to: StageKind::Execution,
             relationship: AgentRelationship::Supervises,
-            max_cycles: Some(2),
+            max_cycles: Some(5),
         },
     ]
+}
+
+/// Resolve stage-kind pairs against the agents staffing those kinds.
+///
+/// `agents` carries each registered agent together with the stage kind it
+/// staffs (resolved by the caller from the blueprint facade, or from the
+/// agent's stage tag via [`stage_kind_for_tag`] when no blueprint is attached).
+/// Multiple agents of one kind produce the cross-product of from/to agents, so
+/// a one-agent-per-kind roster yields exactly one rule per pair. Self pairs are
+/// skipped; a pair whose kind is unstaffed contributes nothing (no error).
+pub fn resolve_stage_relationships(
+    pairs: &[StageRelationship],
+    agents: &[(AgentId, StageKind)],
+) -> Vec<CollaborationRule> {
+    let mut rules = Vec::new();
+    for pair in pairs {
+        for (from, from_kind) in agents {
+            if *from_kind != pair.from {
+                continue;
+            }
+            for (to, to_kind) in agents {
+                if *to_kind != pair.to || from == to {
+                    continue;
+                }
+                rules.push(CollaborationRule {
+                    from: from.clone(),
+                    to: to.clone(),
+                    relationship: pair.relationship,
+                    max_cycles: pair.max_cycles,
+                });
+            }
+        }
+    }
+    rules
+}
+
+/// Map a canonical stage tag to its known stage kind.
+///
+/// The standard tags are authoritative only as a **fallback** for callers with
+/// no resolved blueprint: `design`→Planning, `research`→Research,
+/// `implement`→Execution, `review`→Review, `validate`→Acceptance. A custom tag
+/// has no known kind here (`None`) — with a blueprint attached the caller
+/// resolves the kind from the facade instead, which honors renamed and custom
+/// stage tags.
+pub fn stage_kind_for_tag(tag: &AgentStage) -> Option<StageKind> {
+    if tag.is_design() {
+        Some(StageKind::Planning)
+    } else if tag.is_research() {
+        Some(StageKind::Research)
+    } else if tag.is_implement() {
+        Some(StageKind::Execution)
+    } else if tag.is_review() {
+        Some(StageKind::Review)
+    } else if tag.is_validate() {
+        Some(StageKind::Acceptance)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -196,15 +277,57 @@ mod tests {
 
     #[test]
     fn upsert_replaces_the_existing_directed_relationship() {
-        let mut manager = RelationshipManager::defaults();
+        // A roster with one Review-kind agent and one Execution-kind agent
+        // resolves the Review→Execution pair; upsert replaces its cap.
+        let reviewer = AgentId::new("gatekeeper");
+        let executor = AgentId::new("builder");
+        let mut manager = RelationshipManager::defaults_for_agents(&[
+            (reviewer.clone(), StageKind::Review),
+            (executor.clone(), StageKind::Execution),
+        ]);
         manager
             .upsert(CollaborationRule {
-                from: AgentId::new("reviewer"),
-                to: AgentId::new("coder"),
+                from: reviewer.clone(),
+                to: executor.clone(),
                 relationship: AgentRelationship::Supervises,
                 max_cycles: Some(7),
             })
             .unwrap();
-        assert_eq!(manager.max_cycles(&AgentId::new("reviewer"), &AgentId::new("coder"), 3), 7);
+        assert_eq!(manager.max_cycles(&reviewer, &executor, 3), 7);
+    }
+
+    #[test]
+    fn defaults_resolve_only_against_staffed_kinds() {
+        // The standard five-agent roster resolves exactly the five historical
+        // edges; a roster missing the Review kind yields no Review→Execution
+        // edge and no error.
+        let standard = [
+            (AgentId::new("architect"), StageKind::Planning),
+            (AgentId::new("researcher"), StageKind::Research),
+            (AgentId::new("coder"), StageKind::Execution),
+            (AgentId::new("reviewer"), StageKind::Review),
+            (AgentId::new("validator"), StageKind::Acceptance),
+        ];
+        let manager = RelationshipManager::defaults_for_agents(&standard);
+        assert_eq!(manager.rules().len(), 5, "one rule per stage-kind pair on the standard roster");
+
+        let without_review: Vec<_> =
+            standard.iter().filter(|(id, _)| id.as_str() != "reviewer").cloned().collect();
+        let reduced = RelationshipManager::defaults_for_agents(&without_review);
+        assert!(
+            !reduced.rules().iter().any(|rule| rule.from.as_str() == "reviewer"),
+            "an unstaffed Review kind yields no edge"
+        );
+        assert_eq!(reduced.rules().len(), 4);
+    }
+
+    #[test]
+    fn stage_kind_for_tag_maps_the_canonical_tags() {
+        assert_eq!(stage_kind_for_tag(&AgentStage::new("design")), Some(StageKind::Planning));
+        assert_eq!(stage_kind_for_tag(&AgentStage::new("research")), Some(StageKind::Research));
+        assert_eq!(stage_kind_for_tag(&AgentStage::new("implement")), Some(StageKind::Execution));
+        assert_eq!(stage_kind_for_tag(&AgentStage::new("review")), Some(StageKind::Review));
+        assert_eq!(stage_kind_for_tag(&AgentStage::new("validate")), Some(StageKind::Acceptance));
+        assert_eq!(stage_kind_for_tag(&AgentStage::new("custom")), None);
     }
 }

@@ -43,9 +43,9 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
-    CompletionRequest, CompletionUsage, DesignDoc, EvalResult, Message, OutputMode, ResearchReport,
-    ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall, ToolChoice,
-    ToolDefinition, ToolOutput, ToolResult,
+    CompletionRequest, CompletionUsage, DesignDoc, EvalProvenance, EvalResult, Message, OutputMode,
+    ResearchReport, ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall,
+    ToolChoice, ToolDefinition, ToolOutput, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -66,7 +66,15 @@ const SUBMIT_REVIEW_REPORT_TOOL: &str = "submit_review_report";
 /// Maximum `submit_*` submission attempts before the agent fails cleanly.
 /// The loop never restarts the agent or the orchestration run; it returns a
 /// structured `AgentOutcome::Failed` after the bound is reached.
-const MAX_SUBMISSION_ATTEMPTS: u32 = 3;
+const MAX_SUBMISSION_ATTEMPTS: u32 = 6;
+
+/// Number of trailing submission attempts that form the *closing phase* of the
+/// bounded investigate-then-close loop. The leading
+/// `MAX_SUBMISSION_ATTEMPTS - CLOSING_SUBMISSION_ATTEMPTS` attempts may
+/// investigate freely (Auto choice, executor tools offered); the closing turns
+/// force the contract tool so a weak model cannot burn the whole budget
+/// writing prose and never calling `submit_*`.
+const CLOSING_SUBMISSION_ATTEMPTS: u32 = 2;
 
 /// Per-file and cumulative budget for the changed-file excerpts injected into
 /// the review prompt (ported from the dedicated `ReviewerAgent`).
@@ -1027,15 +1035,32 @@ impl GenericSpecialistAgent {
             })
             .unwrap_or_default();
 
+        // Fallback results are NOT a harness run: say so, so an acceptance
+        // decision never mistakes "plain cargo test in a project with no eval
+        // config" for a properly harnessed validation.
+        let provenance_note = match result.provenance {
+            EvalProvenance::Harness => String::new(),
+            EvalProvenance::Fallback => {
+                " [provenance=fallback: no eval config found; ran plain `cargo test`]".to_string()
+            }
+            // `EvalProvenance` is non-exhaustive: an unknown future variant is
+            // reported without a fallback marker (fail-open, never mislabels).
+            _ => String::new(),
+        };
+
         let default_summary = if passed {
             format!(
-                "Tests passed (exit_code={}, duration={}ms).{}",
-                result.exit_code, result.duration_ms, coverage_note
+                "Tests passed (exit_code={}, duration={}ms).{}{}",
+                result.exit_code, result.duration_ms, coverage_note, provenance_note
             )
         } else {
             format!(
-                "Tests failed (exit_code={}, duration={}ms).{}\nLatest output:\n{}",
-                result.exit_code, result.duration_ms, coverage_note, result.output_tail
+                "Tests failed (exit_code={}, duration={}ms).{}{}\nLatest output:\n{}",
+                result.exit_code,
+                result.duration_ms,
+                coverage_note,
+                provenance_note,
+                result.output_tail
             )
         };
 
@@ -1049,12 +1074,12 @@ impl GenericSpecialistAgent {
         if fmt_lower.contains("pass") && fmt_lower.contains("fail") {
             if passed {
                 format!(
-                    "Pass: {coverage_note} (exit_code={}, duration={}ms, runner={})",
+                    "Pass: {coverage_note}{provenance_note} (exit_code={}, duration={}ms, runner={})",
                     result.exit_code, result.duration_ms, result.runner
                 )
             } else {
                 format!(
-                    "Fail: {coverage_note} (exit_code={}, duration={}ms, runner={})\nLatest output:\n{}",
+                    "Fail: {coverage_note}{provenance_note} (exit_code={}, duration={}ms, runner={})\nLatest output:\n{}",
                     result.exit_code, result.duration_ms, result.runner, result.output_tail
                 )
             }
@@ -1839,20 +1864,17 @@ impl GenericSpecialistAgent {
         // Dedupe by name: if the executor somehow exposes the same tool as the
         // contract, the contract's definition wins. Capability-free agents
         // are offered the contract tool only — no non-selectable noise.
-        let mut tools = Vec::new();
+        // `investigate_tools` is the Auto-phase set; the closing phase narrows
+        // the wire tool list to the contract tool alone.
+        let mut investigate_tools = Vec::new();
         if has_executor_tools {
-            tools.extend(
+            investigate_tools.extend(
                 executor_tools
                     .into_iter()
                     .filter(|definition| definition.name != contract.tool_name),
             );
         }
-        tools.push(tool_def.clone());
-        let tool_choice = if has_executor_tools {
-            ToolChoice::Auto
-        } else {
-            ToolChoice::Forced(contract.tool_name.into())
-        };
+        investigate_tools.push(tool_def.clone());
         let start = std::time::Instant::now();
         let mut messages = vec![Message {
             role: Role::User,
@@ -1869,6 +1891,11 @@ impl GenericSpecialistAgent {
         let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
         let mut submission_attempts = 0_u32;
+        // Closing-phase latch: set once a text-only (prose) turn ignored the
+        // contract tool, so the next turn forces submission.
+        let mut prose_without_submission = false;
+        // Whether the one-time "submit now" closing instruction was injected.
+        let mut closing_notice_sent = false;
         let mut validation_errors: Vec<String> = Vec::new();
         let mut files_modified: Vec<camino::Utf8PathBuf> = Vec::new();
         let mut iteration = 0_u32;
@@ -1881,11 +1908,43 @@ impl GenericSpecialistAgent {
                 return Err(OrchestratorError::Cancelled);
             }
 
+            // Bounded investigate-then-close. Only agents that actually have a
+            // free investigation phase (capability-gated executor tools) can
+            // enter the closing phase; capability-free agents are already
+            // forced every turn. Closing is triggered when the trailing
+            // attempt budget is reached, or once the model has answered in
+            // prose without submitting.
+            let closing = has_executor_tools
+                && (prose_without_submission
+                    || submission_attempts
+                        >= MAX_SUBMISSION_ATTEMPTS.saturating_sub(CLOSING_SUBMISSION_ATTEMPTS));
+            let (request_tools, request_choice) = if !has_executor_tools || closing {
+                (vec![tool_def.clone()], ToolChoice::Forced(contract.tool_name.into()))
+            } else {
+                (investigate_tools.clone(), ToolChoice::Auto)
+            };
+            if closing && !closing_notice_sent {
+                closing_notice_sent = true;
+                messages.push(Message {
+                    role: Role::User,
+                    content: format!(
+                        "Investigation is over. Do not begin new investigation. Submit your {} \
+                         now by calling {} with the fields you have already gathered.",
+                        contract.label, contract.tool_name
+                    ),
+                    tool_calls: None,
+                    tool_results: None,
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                });
+            }
+
             let request = CompletionRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: Some(tools.clone()),
-                tool_choice: Some(tool_choice.clone()),
+                tools: Some(request_tools),
+                tool_choice: Some(request_choice),
                 temperature: Some(0.7),
                 max_tokens: Some(8192),
                 stream: false,
@@ -1951,6 +2010,11 @@ impl GenericSpecialistAgent {
                     }
                     Err(reasons) => {
                         submission_attempts = submission_attempts.saturating_add(1);
+                        // A non-empty text-only turn is a prose answer that
+                        // ignored the contract tool: close on the next turn.
+                        if !text.trim().is_empty() {
+                            prose_without_submission = true;
+                        }
                         validation_errors.extend(reasons.clone());
                         // No tool call exists to answer, so carry the same
                         // structured feedback in a user turn. A tool-role
@@ -3836,6 +3900,214 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Bounded investigate-then-close submission loop
+    // ------------------------------------------------------------------
+
+    /// Wire tool names offered to the model in a recorded request.
+    fn request_tool_names(request: &CompletionRequest) -> Vec<&str> {
+        request
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|definition| definition.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A capability-gated (fs_read) specialist for the investigate/close tests,
+    /// so the contract tool would otherwise be optional (Auto choice).
+    fn executor_capable_agent(
+        provider: Arc<dyn LlmProvider>,
+        executor: Arc<ToolExecutor>,
+        output_mode: OutputMode,
+        id: &str,
+        stage: &str,
+    ) -> GenericSpecialistAgent {
+        GenericSpecialistAgent::new(
+            AgentId::new(id),
+            id.to_string(),
+            Some(AgentStage::new(stage)),
+            provider,
+            Some(executor),
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections::default(),
+            AgentCapabilities { fs_read: Some(true), ..Default::default() },
+        )
+        .with_output_mode(output_mode)
+    }
+
+    #[tokio::test]
+    async fn review_report_prose_only_investigation_submits_on_forced_close() {
+        // Production defect: a reviewer with executor tools got Auto choice and
+        // answered in prose every turn, never calling submit_review_report.
+        // The closing phase must force the contract tool so submission happens
+        // well within the six-attempt budget.
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            text_chunk("Verdict: Fail. Here is my review as prose, no tool call."),
+            text_chunk("Still describing findings in prose."),
+            text_chunk("More prose, still no submission."),
+            text_chunk("One more prose paragraph."),
+            review_chunk("call_submit", valid_pass_review_args()),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::ReviewReport,
+            "reviewer",
+            "review",
+        );
+
+        let result = agent
+            .run(&review_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1, "only the closing submission is a tool call");
+        let report: ReviewReport = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(report.verdict, ReviewVerdict::Pass);
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5, "four investigate turns then the closing submission");
+        assert!(
+            matches!(calls[0].tool_choice, Some(ToolChoice::Auto)),
+            "the first turn must investigate freely"
+        );
+        let closing = calls
+            .iter()
+            .find(|request| matches!(request.tool_choice, Some(ToolChoice::Forced(_))))
+            .expect("a forced closing turn must be sent");
+        assert_eq!(
+            request_tool_names(closing),
+            vec![SUBMIT_REVIEW_REPORT_TOOL],
+            "the closing turn offers only the contract tool"
+        );
+        assert!(
+            closing.messages.iter().any(|message| message.role == Role::User
+                && message.content.contains("Investigation is over")),
+            "the forced turn must instruct the model to submit now"
+        );
+    }
+
+    #[tokio::test]
+    async fn design_doc_prose_only_investigation_submits_on_forced_close() {
+        // Same behavior in design mode, not just review.
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            text_chunk("Here is the design, written as prose without any tool call."),
+            text_chunk("More design prose."),
+            submission_chunk("call_submit", valid_doc_args()),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::DesignDoc,
+            "designer",
+            "design",
+        );
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 1, "only the closing submission is a tool call");
+        let doc: DesignDoc = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(doc.proposed_files[0].as_str(), "src/auth.rs");
+
+        let calls = provider.calls.lock().unwrap();
+        assert!(matches!(calls[0].tool_choice, Some(ToolChoice::Auto)));
+        assert!(
+            matches!(calls[1].tool_choice, Some(ToolChoice::Forced(_))),
+            "a prose-only turn must close the next turn"
+        );
+        assert_eq!(request_tool_names(&calls[1]), vec![SUBMIT_DESIGN_DOC_TOOL]);
+    }
+
+    #[tokio::test]
+    async fn submission_budget_split_forces_contract_on_trailing_attempts() {
+        // Even a model that keeps choosing the contract tool freely still gets
+        // the trailing attempts forced (the explicit 6-attempt budget split).
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let invalid = || submission_chunk("call_invalid", serde_json::json!({ "goals": ["ship"] }));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            invalid(),
+            invalid(),
+            invalid(),
+            invalid(),
+            submission_chunk("call_submit", valid_doc_args()),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::DesignDoc,
+            "designer",
+            "design",
+        );
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert_eq!(result.tool_call_count, 5);
+
+        let calls = provider.calls.lock().unwrap();
+        for (index, call) in calls.iter().take(4).enumerate() {
+            assert!(
+                matches!(call.tool_choice, Some(ToolChoice::Auto)),
+                "attempt {index} (investment phase) must stay Auto"
+            );
+        }
+        assert!(
+            matches!(calls[4].tool_choice, Some(ToolChoice::Forced(_))),
+            "the trailing attempt must be forced"
+        );
+        assert_eq!(request_tool_names(&calls[4]), vec![SUBMIT_DESIGN_DOC_TOOL]);
+    }
+
+    #[tokio::test]
+    async fn closing_phase_invalid_payload_feedback_is_bounded() {
+        // An invalid payload on a forced closing turn still yields the
+        // structured corrective feedback, and the loop stays bounded at
+        // MAX_SUBMISSION_ATTEMPTS — a prose turn plus five invalid closes.
+        let executor = allow_all_executor(Box::new(ReadOnlyFilesystemTool));
+        let invalid = || submission_chunk("call_invalid", serde_json::json!({ "goals": ["ship"] }));
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            text_chunk("Prose that ignores the contract tool."),
+            invalid(),
+            invalid(),
+            invalid(),
+            invalid(),
+            invalid(),
+        ]));
+        let agent = executor_capable_agent(
+            provider.clone(),
+            executor,
+            OutputMode::DesignDoc,
+            "designer",
+            "design",
+        );
+
+        let result = agent
+            .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+            .await
+            .expect("a bounded failure is a clean AgentOutcome, not an Err");
+        assert!(matches!(result.outcome, AgentOutcome::Failed { .. }));
+        assert!(
+            result.summary.contains("bounded submission attempts"),
+            "failure must cite the attempt bound: {}",
+            result.summary
+        );
+        // One prose attempt + five invalid submits = six counted submission
+        // attempts; only the five tool calls register in `tool_call_count`.
+        assert_eq!(result.tool_call_count, MAX_SUBMISSION_ATTEMPTS - 1);
+        assert!(
+            provider.request_contained_validation_result("interface_sketch"),
+            "the forced closing turns must still carry corrective feedback"
+        );
+    }
+
     #[tokio::test]
     async fn design_doc_without_capabilities_gets_only_contract_tool() {
         // A capability-free agent (empty caps) must not see executor tools
@@ -4413,6 +4685,7 @@ mod tests {
             duration_ms: 1234,
             output_tail: "ok".into(),
             coverage: None,
+            provenance: EvalProvenance::Harness,
         };
         let s = GenericSpecialistAgent::format_summary(true, &result, "");
         assert!(s.contains("Tests passed"));
@@ -4429,6 +4702,7 @@ mod tests {
             duration_ms: 500,
             output_tail: "ok".into(),
             coverage: None,
+            provenance: EvalProvenance::Harness,
         };
         let s = GenericSpecialistAgent::format_summary(true, &result, "Pass/Fail report");
         assert!(s.starts_with("Pass:"));
@@ -4441,11 +4715,72 @@ mod tests {
             duration_ms: 300,
             output_tail: "FAILED test_foo".into(),
             coverage: None,
+            provenance: EvalProvenance::Harness,
         };
         let s2 = GenericSpecialistAgent::format_summary(false, &result_fail, "Pass/Fail report");
         assert!(s2.starts_with("Fail:"));
         assert!(s2.contains("runner=pytest"));
         assert!(s2.contains("FAILED test_foo"));
+    }
+
+    #[test]
+    fn eval_format_summary_marks_fallback_provenance() {
+        let result = EvalResult {
+            runner: TestRunner::Cargo,
+            exit_code: 101,
+            passed: false,
+            duration_ms: 10,
+            output_tail: "error: could not find `Cargo.toml`".into(),
+            coverage: None,
+            provenance: EvalProvenance::Fallback,
+        };
+        let s = GenericSpecialistAgent::format_summary(false, &result, "");
+        assert!(s.contains("provenance=fallback"), "fallback must be visible: {s}");
+        assert!(
+            s.contains("Tests failed"),
+            "acceptance still reflects the fallback pass/fail: {s}"
+        );
+
+        // A harness result carries no fallback marker.
+        let harness = EvalResult { provenance: EvalProvenance::Harness, ..result };
+        let s = GenericSpecialistAgent::format_summary(false, &harness, "");
+        assert!(!s.contains("provenance=fallback"), "harness runs must not be marked: {s}");
+    }
+
+    /// Issue: a project with no eval config used to hard-fail validation,
+    /// leaving the run unvalidated. When a Cargo project is reachable the
+    /// engine now runs a plain `cargo test` fallback; acceptance reflects its
+    /// pass/fail and the report is marked.
+    #[tokio::test]
+    async fn eval_missing_config_falls_back_and_acceptance_reflects_it() {
+        // The session root has no manifest, but a Cargo workspace lives above
+        // it — the fallback resolves and runs `cargo test` there.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let build_dir = root.path().join("build");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        assert!(matches!(EvalEngine::detect_runner(&build_dir), TestRunner::Unknown(_)));
+
+        let agent =
+            eval_agent(Some(Arc::new(EvalEngine::new(&build_dir))), PromptSections::default());
+
+        let result = agent
+            .run(&eval_task(), ctx_at(build_dir.clone()), "test-model", CancellationToken::new())
+            .await
+            .expect("validation must report a result, not hard-fail");
+
+        // The fallback cargo test fails (empty workspace has no tests to
+        // pass), so acceptance is Failed and the summary is marked fallback.
+        assert!(
+            matches!(result.outcome, AgentOutcome::Failed { .. }),
+            "a failed fallback must fail acceptance: {:?}",
+            result.outcome
+        );
+        assert!(
+            result.summary.contains("provenance=fallback"),
+            "the report must mark fallback provenance: {}",
+            result.summary
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4635,12 +4970,21 @@ mod tests {
 
     #[tokio::test]
     async fn eval_engine_error_maps_to_failed_outcome() {
-        // An empty project dir has no detectable test runner; the engine
-        // fails and the agent maps that to a clean Failed outcome carrying
-        // the engine error (never an Err / never a Success).
+        // An engine error that is NOT a missing config (an unavailable build
+        // shell profile) maps to a clean Failed outcome carrying the engine
+        // error — never an Err, never a Success. A missing config no longer
+        // errors: it falls back to plain `cargo test` (see
+        // `eval_missing_config_falls_back_and_acceptance_reflects_it`).
         let dir = tempfile::tempdir().unwrap();
-        let agent =
-            eval_agent(Some(Arc::new(EvalEngine::new(dir.path()))), PromptSections::default());
+        let profile = concerto_config::ShellProfileConfig {
+            id: "missing".to_owned(),
+            name: "Missing build shell".to_owned(),
+            backend: concerto_config::ShellBackendType::System,
+            executable: "definitely-not-a-real-build-shell".to_owned(),
+            ..Default::default()
+        };
+        let engine = EvalEngine::new(dir.path()).with_shell_profile(profile);
+        let agent = eval_agent(Some(Arc::new(engine)), PromptSections::default());
 
         let result = agent
             .run(&eval_task(), ctx(), "test-model", CancellationToken::new())

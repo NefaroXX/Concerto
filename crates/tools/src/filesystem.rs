@@ -564,6 +564,116 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `write` alias tool (Claude-habit compatibility)
+// ---------------------------------------------------------------------------
+
+/// Input schema for the thin [`WriteTool`] alias.
+///
+/// `path` and `content` are both required: the alias has exactly one job, so
+/// there is no optional `operation`/`destination` surface to guess at. The
+/// orchestrator's tool-call guard validates against this schema and coaches a
+/// model that omits either field.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WriteInput {
+    /// Path relative to project root.
+    #[schemars(description = "Path of the file to write, relative to project root.")]
+    pub path: String,
+    /// Full content to write to the file.
+    #[schemars(description = "Content to write to the file.")]
+    pub content: String,
+}
+
+/// Thin `write` alias forwarding to the filesystem tool's `write` operation.
+///
+/// Models trained on Claude-style tool names habitually call a bare `write`
+/// tool. Rather than making them recover through
+/// `filesystem(operation=write)` on every call, this alias presents their
+/// expected shape (`{path, content}`) and delegates to the canonical
+/// filesystem write path.
+///
+/// Policy parity is structural, not duplicated: [`Tool::policy_view`] reports
+/// the canonical `filesystem` tool name together with an input carrying
+/// `operation: "write"`, so every `Condition::ToolName("filesystem")` and
+/// `Condition::Operation("write")` rule (and the catch-all) matches exactly as
+/// it would for a direct `filesystem` write. Execution still runs through the
+/// shared `VirtualFs` and returns the filesystem tool's own output.
+pub struct WriteTool {
+    inner: FilesystemTool,
+}
+
+impl WriteTool {
+    /// Creates a `write` alias rooted at `root` with its own `VirtualFs`.
+    pub fn new(root: camino::Utf8PathBuf) -> Self {
+        Self { inner: FilesystemTool::new(root) }
+    }
+
+    /// Creates a `write` alias sharing an existing `VirtualFs` with the
+    /// canonical filesystem tool, so both observe the same overlay.
+    pub fn new_shared(root: camino::Utf8PathBuf, vfs: Arc<Mutex<VirtualFs>>) -> Self {
+        Self { inner: FilesystemTool::new_shared(root, vfs) }
+    }
+
+    /// The canonical filesystem-write input for a raw alias input: the raw
+    /// object with `operation` forced to `write`.
+    fn canonical_input(input: &serde_json::Value) -> serde_json::Value {
+        let mut object = input.as_object().cloned().unwrap_or_default();
+        object.insert("operation".to_string(), serde_json::Value::String("write".to_string()));
+        serde_json::Value::Object(object)
+    }
+}
+
+#[async_trait]
+impl concerto_core::traits::tool::Tool for WriteTool {
+    fn name(&self) -> &str {
+        "write"
+    }
+
+    fn description(&self) -> &str {
+        "Write content to a file within the project workspace. Alias for the filesystem write operation."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        // The alias always writes, so the advertised contract is just the
+        // write shape: `path` and `content` required.
+        let root = schemars::schema_for!(WriteInput);
+        serde_json::to_value(&root).unwrap_or_else(|error| {
+            tracing::error!(%error, "failed to serialize WriteInput schema");
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path of the file to write, relative to project root." },
+                    "content": { "type": "string", "description": "Content to write to the file." }
+                },
+                "required": ["path", "content"]
+            })
+        })
+    }
+
+    fn capability_requirements(&self) -> CapabilitySet {
+        // Same coarse flag as the canonical filesystem tool: the write itself
+        // is enforced by policy, never by this filter.
+        self.inner.capability_requirements()
+    }
+
+    fn policy_view(&self, input: &serde_json::Value) -> (String, serde_json::Value) {
+        // Canonical identity + operation-bearing input: full parity with a
+        // direct filesystem write under every rule shape.
+        ("filesystem".to_string(), Self::canonical_input(input))
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        policy: &dyn PolicyEngine,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.inner.execute(Self::canonical_input(&input), policy, session, cancel).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1273,5 +1383,215 @@ mod tests {
         assert!(is_directory_like(" src/ "));
         assert!(!is_directory_like("src/main.rs"));
         assert!(!is_directory_like("src"));
+    }
+
+    // -- `write` alias tool ----------------------------------------------------
+
+    use concerto_core::error::PolicyError;
+    use concerto_core::policy::SimplePolicyEngine;
+    use concerto_core::traits::policy::{AuditEntry, AuditLog};
+    use concerto_core::types::{CapabilitySet, Condition, PolicyAction, PolicyRule, PolicyVerdict};
+
+    /// Audit sink for policy-parity tests (no persistence).
+    struct ParityAudit;
+
+    #[async_trait]
+    impl AuditLog for ParityAudit {
+        async fn record(
+            &self,
+            _entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    fn action_for<'a>(tool_name: &'a str, input: &'a serde_json::Value) -> PolicyAction<'a> {
+        PolicyAction {
+            tool_name,
+            input,
+            session_id: concerto_core::ids::Ulid::new(),
+            correlation_id: concerto_core::ids::Ulid::new(),
+            capability_requirements: CapabilitySet::default().with_requirement("filesystem"),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+            orchestrator_authority: false,
+        }
+    }
+
+    async fn verdict_for(
+        rules: Vec<PolicyRule>,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> PolicyVerdict {
+        let engine = SimplePolicyEngine::new(rules, Arc::new(ParityAudit));
+        engine.evaluate(&action_for(tool_name, input), CancellationToken::new()).await.unwrap()
+    }
+
+    /// `write` alias canonicalizes to the filesystem write identity.
+    #[tokio::test]
+    async fn write_alias_policy_view_is_canonical_filesystem_write() {
+        let (write_tool, _dir) = {
+            let dir = TempDir::new().unwrap();
+            let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+            (WriteTool::new(root), dir)
+        };
+        let input = serde_json::json!({ "path": "src/main.rs", "content": "fn main() {}" });
+        let (tool_name, canonical) = write_tool.policy_view(&input);
+        assert_eq!(tool_name, "filesystem");
+        assert_eq!(canonical["operation"], "write");
+        assert_eq!(canonical["path"], "src/main.rs");
+        assert_eq!(canonical["content"], "fn main() {}");
+    }
+
+    /// The alias and a direct filesystem write produce identical verdicts under
+    /// every representative rule shape (allow, deny, approval, read-only).
+    #[tokio::test]
+    async fn write_alias_has_policy_parity_with_filesystem_write() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write_tool = WriteTool::new(root);
+        let alias_input = serde_json::json!({ "path": "src/main.rs", "content": "x" });
+        let (alias_name, alias_canonical) = write_tool.policy_view(&alias_input);
+        // The canonical alias view must equal a direct filesystem write's input.
+        let fs_input = serde_json::json!({
+            "operation": "write",
+            "path": "src/main.rs",
+            "content": "x"
+        });
+        assert_eq!(alias_name, "filesystem");
+        assert_eq!(alias_canonical, fs_input);
+
+        let rule_sets: Vec<Vec<PolicyRule>> = vec![
+            // Default install rules: writes require approval.
+            concerto_core::PolicyPresets::default_rules(),
+            // Permissive preset: everything filesystem is auto-approved.
+            concerto_core::PolicyPresets::permissive(),
+            // Explicit deny of the filesystem write operation.
+            vec![PolicyRule::AutoDeny(Condition::All(vec![
+                Condition::ToolName("filesystem".into()),
+                Condition::Operation("write".into()),
+            ]))],
+            // Read-only auto-approve only: a write falls through to default deny.
+            vec![PolicyRule::AutoApprove(Condition::All(vec![
+                Condition::ToolName("filesystem".into()),
+                Condition::Any(vec![
+                    Condition::Operation("read".into()),
+                    Condition::Operation("list".into()),
+                    Condition::Operation("exists".into()),
+                ]),
+            ]))],
+        ];
+
+        for rules in rule_sets {
+            let alias_verdict = verdict_for(rules.clone(), &alias_name, &alias_canonical).await;
+            let direct_verdict = verdict_for(rules, "filesystem", &fs_input).await;
+            assert_eq!(
+                alias_verdict, direct_verdict,
+                "the write alias must inherit the exact filesystem-write verdict"
+            );
+        }
+    }
+
+    /// The alias and a direct filesystem write are denied by the same rule.
+    #[tokio::test]
+    async fn write_alias_denied_where_filesystem_write_is_denied() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write_tool = WriteTool::new(root);
+        let alias_input = serde_json::json!({ "path": "src/main.rs", "content": "x" });
+        let (alias_name, alias_canonical) = write_tool.policy_view(&alias_input);
+
+        let deny_write = vec![PolicyRule::AutoDeny(Condition::All(vec![
+            Condition::ToolName("filesystem".into()),
+            Condition::Operation("write".into()),
+        ]))];
+
+        let alias_verdict = verdict_for(deny_write.clone(), &alias_name, &alias_canonical).await;
+        let direct_verdict = verdict_for(
+            deny_write,
+            "filesystem",
+            &serde_json::json!({"operation": "write", "path": "x", "content": "y"}),
+        )
+        .await;
+        assert_eq!(alias_verdict, PolicyVerdict::Deny);
+        assert_eq!(alias_verdict, direct_verdict);
+    }
+
+    /// The alias actually materializes a file through the shared VirtualFs.
+    #[tokio::test]
+    async fn write_alias_writes_file() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write_tool = WriteTool::new(root);
+        let output = write_tool
+            .execute(
+                serde_json::json!({ "path": "src/hello.rs", "content": "fn main() {}\n" }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(output.summary.contains("Wrote"), "summary: {}", output.summary);
+        assert_eq!(output.data["materialized"], true);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/hello.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    /// The alias shares the canonical tool's VirtualFs when constructed shared.
+    #[tokio::test]
+    async fn write_alias_shares_vfs_with_filesystem_tool() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let vfs = Arc::new(Mutex::new(VirtualFs::new()));
+        let write_tool = WriteTool::new_shared(root.clone(), vfs.clone());
+        let fs_tool = FilesystemTool::new_shared(root, vfs.clone());
+        let session = session_for(dir.path());
+
+        write_tool
+            .execute(
+                serde_json::json!({ "path": "shared.txt", "content": "shared" }),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let read = fs_tool
+            .execute(
+                serde_json::json!({ "operation": "read", "path": "shared.txt" }),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.data["content"], "shared");
+    }
+
+    /// A missing `content` is rejected with the canonical write diagnostic.
+    #[tokio::test]
+    async fn write_alias_missing_content_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write_tool = WriteTool::new(root);
+        let error = write_tool
+            .execute(
+                serde_json::json!({ "path": "src/main.rs" }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("missing 'content' field for write operation"),
+            "unexpected error: {error}"
+        );
     }
 }

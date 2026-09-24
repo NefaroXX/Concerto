@@ -11,8 +11,10 @@ use crate::memory_adapter_host::PluginBackedVectorStore;
 use crate::provider_host::PluginBackedProvider;
 use crate::tool_bridge::{register_plugin_tools, unregister_plugin_tools};
 use concerto_api_types::plugin::{PluginManifest, PluginProvides};
+use concerto_core::event::{EventBus, EventKind};
+use concerto_core::traits::policy::{AuditLog, InfraAuditEntry, InfraVerdict};
 use concerto_core::traits::provider::LlmProvider;
-use concerto_core::VectorStore;
+use concerto_core::{PluginState, VectorStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +73,14 @@ pub struct PluginManager {
     /// every required capability (ADR-37 prompt-skip). Consumed by
     /// `initialise_plugin` and cleaned up on unload.
     resolved_grants: HashMap<String, GrantedCapabilities>,
+    /// Optional event bus for `PluginStateChanged` lifecycle events (loading /
+    /// active / failed / disabled / unloaded). `None` disables lifecycle
+    /// events; every publish is fail-soft.
+    event_bus: Option<EventBus>,
+    /// Optional append-only audit sink for infra failures (load/init failures,
+    /// capability denials, disable/violation, grant prunes). `None` disables
+    /// infra audit; every emission is fail-soft.
+    audit: Option<Arc<dyn AuditLog>>,
 }
 
 impl PluginManager {
@@ -95,6 +105,44 @@ impl PluginManager {
             plugin_tools: HashMap::new(),
             violations: HashMap::new(),
             resolved_grants: HashMap::new(),
+            event_bus: None,
+            audit: None,
+        }
+    }
+
+    /// Attach an event bus for `PluginStateChanged` lifecycle events.
+    /// Additive (no constructor churn); publish failures are logged and
+    /// ignored.
+    pub fn set_event_bus(&mut self, bus: EventBus) {
+        self.event_bus = Some(bus);
+    }
+
+    /// Attach an audit sink for infra failures. Additive; call before loading
+    /// plugins so load/init failures are captured.
+    pub fn set_audit_log(&mut self, audit: Arc<dyn AuditLog>) {
+        self.audit = Some(audit);
+    }
+
+    /// Publish a `PluginStateChanged` lifecycle event (fail-soft).
+    fn emit_state(&self, plugin_id: &str, state: PluginState, error: Option<String>) {
+        let Some(bus) = self.event_bus.as_ref() else {
+            return;
+        };
+        let kind = EventKind::PluginStateChanged { plugin_id: plugin_id.to_string(), state, error };
+        if let Err(e) = bus.publish_raw(kind) {
+            tracing::warn!(plugin_id, error = %e, "failed to publish plugin state event");
+        }
+    }
+
+    /// Record one infra-failure audit row (fail-soft — never fails the plugin
+    /// operation).
+    async fn record_infra(&self, entry: InfraAuditEntry) {
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        if let Err(error) = audit.record_infra(entry, concerto_core::CancellationToken::new()).await
+        {
+            tracing::warn!(%error, "plugin infra audit write failed; continuing");
         }
     }
 
@@ -116,7 +164,29 @@ impl PluginManager {
         source: &std::path::Path,
         approval_ui: &dyn CapabilityApprovalUI,
     ) -> Result<LoadedPlugin, PluginError> {
-        let loaded = self.loader.load_from_bytes(wasm_bytes, source).await?;
+        let loaded = match self.loader.load_from_bytes(wasm_bytes, source).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                // A load failure has no manifest id, so attribute by source
+                // path. Wasmtime fuel/epoch/trap failures map to `WasmTrap`.
+                let error_kind = plugin_error_kind(&error);
+                let verdict = if error_kind == "wasm_trap" {
+                    InfraVerdict::WasmTrap
+                } else {
+                    InfraVerdict::PluginLoadFailed
+                };
+                self.record_infra(InfraAuditEntry::plugin_subject(
+                    format!("plugin:{}", source.display()),
+                    None,
+                    verdict,
+                    error_kind,
+                    error.to_string(),
+                ))
+                .await;
+                return Err(error);
+            }
+        };
+        self.emit_state(&loaded.manifest.id, PluginState::Loading, None);
         // A fresh load always starts from a clean resolved-grant slate; the
         // prompt-skip path below re-populates it when applicable.
         self.resolved_grants.remove(&loaded.manifest.id);
@@ -132,8 +202,31 @@ impl PluginManager {
             // cover every required capability mean the user already approved
             // this exact binary — load without re-prompting and resolve the
             // live grant set from the store for `initialise_plugin`.
-            let persisted =
-                self.capability_manager.load_grants(&loaded.manifest.id, manifest_hash.as_deref());
+            let (persisted, prune_report) = self
+                .capability_manager
+                .load_grants_with_report(&loaded.manifest.id, manifest_hash.as_deref());
+            // ADR-37 prune-on-load: a hash mismatch (binary changed since
+            // approval) or TTL/format expiry silently drops persisted grants
+            // and forces a fresh prompt — audit it so grant loss is visible.
+            if !prune_report.is_empty() {
+                let error_kind = if prune_report.hash_mismatch > 0 {
+                    "grant_pruned_hash"
+                } else {
+                    "grant_pruned_expired"
+                };
+                self.record_infra(InfraAuditEntry::plugin(
+                    loaded.manifest.id.clone(),
+                    InfraVerdict::CapabilityDenied,
+                    error_kind,
+                    format!(
+                        "{} persisted grant(s) pruned (hash mismatch: {}, expired: {})",
+                        prune_report.total(),
+                        prune_report.hash_mismatch,
+                        prune_report.expired,
+                    ),
+                ))
+                .await;
+            }
             let all_covered = loaded.manifest.capabilities_required.iter().all(|req| {
                 let disc: CapabilityDiscriminant = req.into();
                 persisted.iter().any(|(d, _, _)| *d == disc)
@@ -169,6 +262,18 @@ impl PluginManager {
                 )
             });
             if !all_granted {
+                self.emit_state(
+                    &loaded.manifest.id,
+                    PluginState::Failed,
+                    Some("required capabilities were denied".to_string()),
+                );
+                self.record_infra(InfraAuditEntry::plugin(
+                    loaded.manifest.id.clone(),
+                    InfraVerdict::CapabilityDenied,
+                    "capability_denied",
+                    "one or more required capabilities were denied",
+                ))
+                .await;
                 return Err(PluginError::CapabilityDenied(
                     "one or more required capabilities were denied".into(),
                 ));
@@ -193,13 +298,41 @@ impl PluginManager {
         // un-initialised plugin never lingers in the map.
         let effective_caps =
             self.resolved_grants.remove(&loaded.manifest.id).unwrap_or(granted_caps);
-        let active = self.loader.initialise(loaded, effective_caps).await?;
+        let active = match self.loader.initialise(loaded, effective_caps).await {
+            Ok(active) => active,
+            Err(error) => {
+                // Init failures (including fuel/epoch exhaustion traps, which
+                // the loader reports as `InitFailed(-2)`) are plugin-load
+                // failures; a raw wasmtime trap maps to `WasmTrap`.
+                let error_kind = plugin_error_kind(&error);
+                let verdict = if error_kind == "wasm_trap" {
+                    InfraVerdict::WasmTrap
+                } else {
+                    InfraVerdict::PluginLoadFailed
+                };
+                self.emit_state(&loaded.manifest.id, PluginState::Failed, Some(error.to_string()));
+                self.record_infra(InfraAuditEntry::plugin(
+                    loaded.manifest.id.clone(),
+                    verdict,
+                    error_kind,
+                    error.to_string(),
+                ))
+                .await;
+                return Err(error);
+            }
+        };
         let plugin_id = active.manifest.id.clone();
 
         // Track active plugin wrapped in Arc<Mutex> for tool registration.
         let active = Arc::new(Mutex::new(active));
+        // Thread the infra audit sink into the store so host-function
+        // violations/disables are audited from inside the WASM host call.
+        if let Some(audit) = self.audit.as_ref() {
+            active.blocking_lock().store.data_mut().audit_log = Some(audit.clone());
+        }
         self.active.insert(plugin_id.clone(), active);
-        self.status.insert(plugin_id, PluginStatus::Active);
+        self.status.insert(plugin_id.clone(), PluginStatus::Active);
+        self.emit_state(&plugin_id, PluginState::Active, None);
 
         Ok(())
     }
@@ -248,9 +381,35 @@ impl PluginManager {
     }
 
     /// Disable a plugin (e.g., after unauthorized host call).
+    ///
+    /// Emits a `PluginStateChanged` event and audits a `PluginDisabled` infra
+    /// row; both are fail-soft. The `reason` is preserved verbatim.
     pub fn disable_plugin(&mut self, plugin_id: &str, reason: &str) {
         self.status
             .insert(plugin_id.to_string(), PluginStatus::Disabled { reason: reason.to_string() });
+        self.emit_state(plugin_id, PluginState::Disabled, Some(reason.to_string()));
+        // Audit synchronously through a detached task: `disable_plugin` is a
+        // sync method, and the audit sink is async. Dropping the join handle
+        // detaches the write; failure only logs inside `record_infra`.
+        if let Some(audit) = self.audit.clone() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let entry = InfraAuditEntry::plugin(
+                    plugin_id.to_string(),
+                    InfraVerdict::PluginDisabled,
+                    "plugin_disabled",
+                    reason.to_string(),
+                );
+                handle.spawn(async move {
+                    if let Err(error) =
+                        audit.record_infra(entry, concerto_core::CancellationToken::new()).await
+                    {
+                        tracing::warn!(%error, "plugin disable audit write failed; continuing");
+                    }
+                });
+            } else {
+                tracing::debug!(plugin_id, "no tokio runtime; plugin disable audit write skipped");
+            }
+        }
     }
 
     /// Check if a plugin is active.
@@ -331,6 +490,16 @@ impl PluginManager {
         let caps = &mut active.store.data_mut().granted_caps;
         caps.session_grants.clear();
         caps.persistent_grants.clear();
+        drop(active);
+        // Audit the live revocation: a plugin loses all capabilities, so a
+        // subsequent operation fails closed. Fail-soft.
+        self.record_infra(InfraAuditEntry::plugin(
+            plugin_id.to_string(),
+            InfraVerdict::CapabilityDenied,
+            "grants_revoked",
+            "live capability grants revoked",
+        ))
+        .await;
         Ok(())
     }
 
@@ -556,6 +725,10 @@ impl PluginManager {
                 heartbeat,
             )
         };
+        let provider = match self.audit.clone() {
+            Some(audit) => provider.with_audit_log(audit),
+            None => provider,
+        };
         Ok(Arc::new(provider))
     }
 
@@ -613,6 +786,35 @@ impl PluginManager {
 
         let store = PluginBackedVectorStore::new(plugin_arc.clone());
         Ok(Arc::new(store))
+    }
+}
+
+/// Machine-readable failure category for a [`PluginError`], stored in the audit
+/// row's `error_kind` column. Fuel/epoch exhaustion is reported by the loader
+/// as `InitFailed(-2)`; a raw wasmtime trap (e.g. an out-of-bounds access) is
+/// reported as `wasm_trap`.
+fn plugin_error_kind(error: &PluginError) -> &'static str {
+    match error {
+        PluginError::InitFailed(-2) => "fuel_exhausted",
+        PluginError::InitFailed(_) => "init_failed",
+        PluginError::Runtime(_) => "wasm_trap",
+        PluginError::InvalidManifest(_) => "invalid_manifest",
+        PluginError::AbiTooNew { .. } => "abi_too_new",
+        PluginError::ManifestMismatch => "manifest_mismatch",
+        PluginError::MemoryViolation { .. } => "memory_violation",
+        PluginError::MemoryLimitExceeded { .. } => "memory_limit_exceeded",
+        PluginError::MemoryGrow => "memory_grow",
+        PluginError::MemoryWrite(_) => "memory_write",
+        PluginError::NoMemory => "no_memory",
+        PluginError::MissingScratchBuffer => "missing_scratch_buffer",
+        PluginError::ScratchTooSmall { .. } => "scratch_too_small",
+        PluginError::InvalidUtf8 => "invalid_utf8",
+        PluginError::CapabilityDenied(_) => "capability_denied",
+        PluginError::UnauthorizedHostCall { .. } => "unauthorized_host_call",
+        PluginError::NotActive { .. } => "not_active",
+        PluginError::PluginNotFound(_) => "plugin_not_found",
+        PluginError::Io(_) => "io",
+        _ => "plugin_error",
     }
 }
 
@@ -996,5 +1198,234 @@ mod tests {
             .expect("second refresh should succeed");
         assert_eq!(count, 0, "already-active plugins must be skipped");
         assert!(mgr.is_active("refresh-test"));
+    }
+
+    // ---- Infra-failure audit emission tests ----
+
+    use concerto_core::error::PolicyError;
+    use concerto_core::traits::policy::{AuditEntry, InfraAuditEntry, InfraVerdict};
+    use concerto_core::CancellationToken;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturingAudit {
+        entries: Mutex<Vec<InfraAuditEntry>>,
+    }
+
+    impl CapturingAudit {
+        fn take(&self) -> Vec<InfraAuditEntry> {
+            std::mem::take(&mut *self.entries.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLog for CapturingAudit {
+        async fn record(
+            &self,
+            _entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+        async fn record_infra(
+            &self,
+            entry: InfraAuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            self.entries.lock().unwrap().push(entry);
+            Ok(())
+        }
+    }
+
+    fn load_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A plugin whose `init` traps with fuel exhaustion is audited as a
+    /// `PluginLoadFailed` infra row with `error_kind = fuel_exhausted`.
+    #[tokio::test]
+    async fn test_manager_audits_init_fuel_exhaustion() {
+        use concerto_api_types::plugin::PluginManifest;
+
+        let dir = load_dir("plugin_test_audit_init_fuel");
+        let host = Arc::new(PluginHost::new().expect("host"));
+        let cap_mgr = CapabilityManager::open(&dir).expect("cap store");
+        let mut mgr = PluginManager::new(host, cap_mgr, None, None);
+        let audit = Arc::new(CapturingAudit::default());
+        mgr.set_audit_log(audit.clone());
+
+        // `init` spins forever → fuel exhausted → InitFailed(-2).
+        let manifest = r#"{"id":"spin-init","name":"Spin","version":"0.1.0","description":"spin","abi_version":1,"capabilities_required":[],"provides":[]}"#;
+        let escaped = manifest.replace('"', "\\\"");
+        let wat = format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (global (export "scratch_buffer") (mut i32) (i32.const 0))
+              (global (export "scratch_buffer_size") i32 (i32.const 65536))
+              (data (i32.const 256) "{escaped}")
+              (func (export "manifest") (result i64)
+                (i64.or (i64.shl (i64.const 256) (i64.const 32)) (i64.const {})))
+              (func (export "init") (result i32) (loop (br 0)) (i32.const 0))
+            )"#,
+            manifest.len()
+        );
+        let wasm = wat::parse_str(&wat).expect("wat");
+
+        struct AutoApprove;
+        #[async_trait::async_trait]
+        impl CapabilityApprovalUI for AutoApprove {
+            async fn request(
+                &self,
+                _plugin: &PluginManifest,
+                capabilities: &[concerto_api_types::plugin::CapabilityRequest],
+            ) -> Result<Vec<GrantDecision>, PluginError> {
+                Ok(vec![GrantDecision::Granted; capabilities.len()])
+            }
+        }
+
+        let loaded = mgr
+            .load_plugin(&wasm, std::path::Path::new("spin-init.wasm"), &AutoApprove)
+            .await
+            .expect("load should succeed");
+        let err = mgr
+            .initialise_plugin(&loaded, GrantedCapabilities::new())
+            .await
+            .expect_err("spinning init must fail");
+        assert!(matches!(err, PluginError::InitFailed(_)), "unexpected error: {err}");
+
+        let entries = audit.take();
+        let row = entries
+            .iter()
+            .find(|e| e.verdict == InfraVerdict::PluginLoadFailed)
+            .expect("init failure must be audited");
+        assert_eq!(row.plugin_id.as_deref(), Some("spin-init"));
+        assert!(row.error_kind.is_some(), "init failure must carry an error kind");
+        assert_eq!(row.tool_name, "plugin:spin-init");
+    }
+
+    /// `plugin_error_kind` maps resource-exhaustion and trap failures to their
+    /// audit categories (including the loader's `InitFailed(-2)` sentinel).
+    #[test]
+    fn test_plugin_error_kind_mapping() {
+        assert_eq!(plugin_error_kind(&PluginError::InitFailed(-2)), "fuel_exhausted");
+        assert_eq!(plugin_error_kind(&PluginError::InitFailed(-1)), "init_failed");
+        assert_eq!(plugin_error_kind(&PluginError::InitFailed(7)), "init_failed");
+        assert_eq!(
+            plugin_error_kind(&PluginError::CapabilityDenied("x".into())),
+            "capability_denied"
+        );
+        assert_eq!(
+            plugin_error_kind(&PluginError::InvalidManifest("x".into())),
+            "invalid_manifest"
+        );
+    }
+
+    /// A hash-mismatch grant prune during load is audited as a
+    /// `CapabilityDenied` row with `error_kind = grant_pruned_hash`.
+    #[tokio::test]
+    async fn test_manager_audits_hash_mismatch_prune() {
+        use concerto_api_types::plugin::PluginManifest;
+
+        let dir = load_dir("plugin_test_audit_prune");
+        let host = Arc::new(PluginHost::new().expect("host"));
+        let cap_mgr = CapabilityManager::open(&dir).expect("cap store");
+        let mut mgr = PluginManager::new(host, cap_mgr, None, None);
+        let audit = Arc::new(CapturingAudit::default());
+        mgr.set_audit_log(audit.clone());
+
+        // Manifest requires a capability so `load_plugin` takes the pinned-hash
+        // path; the persisted grant below carries a deliberately wrong hash.
+        let manifest = concerto_api_types::plugin::PluginManifest {
+            id: "prune-me".to_string(),
+            version: "0.1.0".to_string(),
+            name: "prune-me".to_string(),
+            description: "prune".to_string(),
+            abi_version: 1,
+            capabilities_required: vec![
+                concerto_api_types::plugin::CapabilityRequest::FilesystemRead { globs: vec![] },
+            ],
+            provides: vec![],
+        };
+        let manifest_json = serde_json::to_string(&manifest).expect("json");
+        let escaped = manifest_json.replace('"', "\\\"").replace('\n', " ");
+        let wat = format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (global (export "scratch_buffer") (mut i32) (i32.const 0))
+              (global (export "scratch_buffer_size") i32 (i32.const 65536))
+              (data (i32.const 256) "{escaped}")
+              (func (export "manifest") (result i64)
+                (i64.or (i64.shl (i64.const 256) (i64.const 32)) (i64.const {})))
+              (func (export "init") (result i32) i32.const 0)
+            )"#,
+            manifest_json.len()
+        );
+        let wasm = wat::parse_str(&wat).expect("wat");
+
+        // Persist a grant pinned to a bogus hash so it is pruned on load.
+        mgr.capability_manager
+            .save_grant_for_test(
+                "prune-me",
+                &CapabilityDiscriminant::FilesystemRead,
+                &CapabilityScope::default(),
+                Some("deadbeef".to_string()),
+            )
+            .expect("persist grant");
+
+        struct AutoApprove;
+        #[async_trait::async_trait]
+        impl CapabilityApprovalUI for AutoApprove {
+            async fn request(
+                &self,
+                _plugin: &PluginManifest,
+                capabilities: &[concerto_api_types::plugin::CapabilityRequest],
+            ) -> Result<Vec<GrantDecision>, PluginError> {
+                Ok(vec![GrantDecision::Granted; capabilities.len()])
+            }
+        }
+
+        mgr.load_plugin(&wasm, std::path::Path::new("prune-me.wasm"), &AutoApprove)
+            .await
+            .expect("load should succeed");
+
+        let entries = audit.take();
+        let row = entries
+            .iter()
+            .find(|e| e.error_kind.as_deref() == Some("grant_pruned_hash"))
+            .expect("hash-mismatch prune must be audited");
+        assert_eq!(row.verdict, InfraVerdict::CapabilityDenied);
+        assert_eq!(row.plugin_id.as_deref(), Some("prune-me"));
+    }
+
+    /// `disable_plugin` audits a `PluginDisabled` infra row.
+    #[tokio::test]
+    async fn test_manager_audits_disable() {
+        let dir = load_dir("plugin_test_audit_disable");
+        let host = Arc::new(PluginHost::new().expect("host"));
+        let cap_mgr = CapabilityManager::open(&dir).expect("cap store");
+        let mut mgr = PluginManager::new(host, cap_mgr, None, None);
+        let audit = Arc::new(CapturingAudit::default());
+        mgr.set_audit_log(audit.clone());
+
+        mgr.disable_plugin("bad-plugin", "unauthorized host call");
+
+        // `disable_plugin` detaches the audit write; yield until it lands.
+        for _ in 0..100 {
+            if !audit.entries.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let entries = audit.take();
+        let row = entries
+            .iter()
+            .find(|e| e.verdict == InfraVerdict::PluginDisabled)
+            .expect("disable must be audited");
+        assert_eq!(row.plugin_id.as_deref(), Some("bad-plugin"));
+        assert_eq!(row.error_kind.as_deref(), Some("plugin_disabled"));
+        assert_eq!(row.detail.as_deref(), Some("unauthorized host call"));
     }
 }

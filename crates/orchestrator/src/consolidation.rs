@@ -45,11 +45,11 @@
 //!
 //! ## Deliberately deferred (documented, not built)
 //!
-//! Real embedding-model vectors (the slice uses deterministic feature-hash
-//! vectors so projections are retrievable without a downloaded model — swap
-//! the embedder later without changing the contract, per the Phase 4 oracle
-//! answer), bi-temporal *query* support, relevance/recency filtering, and
-//! multi-level disclosure all remain behind ADR-60 Deferred item 4.
+//! Bi-temporal *query* support, relevance/recency filtering, and multi-level
+//! disclosure all remain behind ADR-60 Deferred item 4. The projection vector
+//! uses the same embedder the project indexer uses; when that embedder is
+//! unavailable the pass falls back to a deterministic feature-hash vector so
+//! consolidation never fails on a missing model.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,6 +59,7 @@ use concerto_core::error::MemoryError;
 use concerto_core::ids::Ulid;
 use concerto_core::memory::{ChunkType, EmbeddingRecord, ProjectId};
 use concerto_core::CancellationToken;
+use concerto_memory::embedder::EmbeddingGenerator;
 use concerto_memory::vector_store::{SqliteVectorStore, VectorStore};
 use concerto_sessions::whiteboard::{
     append_whiteboard_event, load_whiteboard_events, NewWhiteboardEvent, WhiteboardEvent,
@@ -89,8 +90,8 @@ const SCOPE_CONSOLIDATION: &str = "consolidation";
 /// Group key for foldable events that carry no `plan_id`.
 const UNPLANNED_GROUP: &str = "run";
 
-/// Feature-hash embedding dimension. Deterministic placeholder until a real
-/// embedder is wired into the supervised spine (see module docs).
+/// Feature-hash embedding dimension: the fallback vector used only when no
+/// real embedder is configured or the configured one is unavailable.
 const EMBEDDING_DIM: usize = 256;
 
 /// Errors from a consolidation pass.
@@ -117,6 +118,11 @@ pub struct Consolidator {
     pool: SqlitePool,
     store: Arc<SqliteVectorStore>,
     project_id: ProjectId,
+    /// Real embedding generator (the same interface the project indexer
+    /// uses). When set, projection vectors come from it; when an embed fails
+    /// the pass fails soft to a feature-hash vector. `None` (test-only paths)
+    /// always uses the feature-hash fallback.
+    embedder: Option<Arc<dyn EmbeddingGenerator>>,
     /// Appends observed since the last trigger evaluation. A failed pass does
     /// not reset progress accounting — nothing is lost because the watermark
     /// did not advance; the next trigger simply retries over the same span.
@@ -128,12 +134,19 @@ pub struct Consolidator {
 
 impl Consolidator {
     /// Bind a consolidator to the whiteboard log pool, the projection target,
-    /// and the project namespace.
-    pub fn new(pool: SqlitePool, store: Arc<SqliteVectorStore>, project_id: ProjectId) -> Self {
+    /// the project namespace, and the embedding generator used for projection
+    /// vectors (`None` uses the deterministic feature-hash fallback).
+    pub fn new(
+        pool: SqlitePool,
+        store: Arc<SqliteVectorStore>,
+        project_id: ProjectId,
+        embedder: Option<Arc<dyn EmbeddingGenerator>>,
+    ) -> Self {
         Self {
             pool,
             store,
             project_id,
+            embedder,
             pending_appends: AtomicU64::new(0),
             pass_in_flight: AtomicBool::new(false),
         }
@@ -300,7 +313,7 @@ impl Consolidator {
                 "ingestion_time_ms": ingestion_time_ms,
                 "session_id": session_id,
             });
-            let vector = feature_hash_embedding(&summary);
+            let (vector, model_id, model_version) = self.embed_projection(&summary).await;
             self.store
                 .store_projection(
                     &EmbeddingRecord {
@@ -313,8 +326,8 @@ impl Consolidator {
                         end_line: None,
                         chunk_type: ChunkType::Fact,
                         vector,
-                        model_id: "feature-hash".to_owned(),
-                        model_version: "1".to_owned(),
+                        model_id,
+                        model_version,
                         stale: false,
                         created_at: OffsetDateTime::now_utc(),
                     },
@@ -362,6 +375,34 @@ impl Consolidator {
         )
         .await?;
         Ok(projected)
+    }
+
+    /// Build the projection vector and its model attribution for `summary`.
+    ///
+    /// Uses the configured real embedder when present. Fail-soft in production
+    /// (module docs): an embedder error logs and falls back to the deterministic
+    /// feature-hash vector so a pass never fails on a missing/unavailable
+    /// model. With no embedder configured the feature-hash vector is used
+    /// directly.
+    async fn embed_projection(&self, summary: &str) -> (Vec<f32>, String, String) {
+        if let Some(embedder) = self.embedder.as_ref() {
+            match embedder.embed(summary).await {
+                Ok(vector) => {
+                    return (
+                        vector,
+                        embedder.model_id().to_owned(),
+                        embedder.model_version().to_owned(),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "D6 consolidation embedder unavailable; falling back to feature-hash vector"
+                    );
+                }
+            }
+        }
+        (feature_hash_embedding(summary), "feature-hash".to_owned(), "1".to_owned())
     }
 
     /// The highest `gate_seq` already covered by a recorded projection.
@@ -631,12 +672,60 @@ mod tests {
     }
 
     /// A consolidator plus its projection store, both over `pool` (tests share
-    /// one DB; production opens the memory DB for the store instead).
+    /// one DB; production opens the memory DB for the store instead). Uses a
+    /// deterministic real-interface embedder so tests exercise the wired path.
     async fn consolidator(pool: SqlitePool) -> (Arc<SqliteVectorStore>, Consolidator) {
+        consolidator_with_embedder(pool, Some(Arc::new(FixedEmbedder))).await
+    }
+
+    async fn consolidator_with_embedder(
+        pool: SqlitePool,
+        embedder: Option<Arc<dyn EmbeddingGenerator>>,
+    ) -> (Arc<SqliteVectorStore>, Consolidator) {
         let project_id = ProjectId("proj-d6".to_owned());
         let store =
             Arc::new(SqliteVectorStore::new(pool.clone()).await.expect("vector store opens"));
-        (store.clone(), Consolidator::new(pool, store, project_id))
+        (store.clone(), Consolidator::new(pool, store, project_id, embedder))
+    }
+
+    /// Deterministic real-interface embedder: fixed 384-d vector and a distinct
+    /// model id so tests can prove the wired path (not the feature-hash
+    /// fallback) produced the projection.
+    struct FixedEmbedder;
+
+    #[async_trait::async_trait]
+    impl EmbeddingGenerator for FixedEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, MemoryError> {
+            Ok(vec![0.125; 384])
+        }
+        fn model_id(&self) -> &str {
+            "test-embedder"
+        }
+        fn model_version(&self) -> &str {
+            "7"
+        }
+        fn dims(&self) -> usize {
+            384
+        }
+    }
+
+    /// Embedder that always fails — models a missing/undownloadable model.
+    struct FailingEmbedder;
+
+    #[async_trait::async_trait]
+    impl EmbeddingGenerator for FailingEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, MemoryError> {
+            Err(MemoryError::EmbeddingFailed { reason: "model unavailable".into() })
+        }
+        fn model_id(&self) -> &str {
+            "failing-embedder"
+        }
+        fn model_version(&self) -> &str {
+            "0"
+        }
+        fn dims(&self) -> usize {
+            384
+        }
     }
 
     fn event(
@@ -1053,5 +1142,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         consolidator.note_append(CancellationToken::new());
         assert_eq!(consolidator.pending_appends(), 1, "counting resumes after a fired trigger");
+    }
+
+    /// D6 now embeds with the real embedder interface: the projection row must
+    /// carry that embedder's vector + model attribution, never the 256-d
+    /// feature-hash fallback.
+    #[tokio::test]
+    async fn pass_uses_real_embedder_vectors_and_model_attribution() {
+        let (_dir, pool) = test_pool().await;
+        let (_store, consolidator) =
+            consolidator_with_embedder(pool.clone(), Some(Arc::new(FixedEmbedder))).await;
+        append(&pool, event(None, WhiteboardKind::Decision, json!({"decision": "x"}))).await;
+
+        assert_eq!(consolidator.consolidate_once(CancellationToken::new()).await.expect("pass"), 1);
+
+        let (model_id, model_version, vector_bytes): (String, String, i64) = sqlx::query_as(
+            "SELECT model_id, model_version, length(vector) FROM vector_store LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("projection row");
+        assert_eq!(model_id, "test-embedder");
+        assert_eq!(model_version, "7");
+        assert_eq!(vector_bytes, 384 * 4, "real 384-d embedder vector, not the 256-d fallback");
+    }
+
+    /// Fail-soft in production: an unavailable embedder must not fail the pass;
+    /// it logs and the projection falls back to the deterministic hash vector.
+    #[tokio::test]
+    async fn pass_falls_back_to_feature_hash_when_embedder_fails() {
+        let (_dir, pool) = test_pool().await;
+        let (_store, consolidator) =
+            consolidator_with_embedder(pool.clone(), Some(Arc::new(FailingEmbedder))).await;
+        append(&pool, event(None, WhiteboardKind::Decision, json!({"decision": "x"}))).await;
+
+        assert_eq!(consolidator.consolidate_once(CancellationToken::new()).await.expect("pass"), 1);
+
+        let model_id: String = sqlx::query_scalar("SELECT model_id FROM vector_store LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("projection row");
+        assert_eq!(model_id, "feature-hash", "failed embedder must fail soft to the hash vector");
     }
 }

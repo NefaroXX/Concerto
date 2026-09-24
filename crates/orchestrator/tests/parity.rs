@@ -151,8 +151,11 @@ fn default_blueprint_resolves_to_runtime_tables() {
         CapabilityMask, OrchestrationConfig, ResolvedStage, StageKind,
     };
     use concerto_config::{builtin_agent_seeds, AppConfig, CustomAgentConfig};
+    use concerto_core::types::AgentId;
     use concerto_core::RunStage;
-    use concerto_orchestrator::relationship::{default_collaboration_rules, AgentRelationship};
+    use concerto_orchestrator::relationship::{
+        default_stage_relationships, resolve_stage_relationships, AgentRelationship,
+    };
 
     // The default AppConfig carries no `[orchestration]` section (legacy
     // equivalence, ADR-58): the equivalent default state is the `standard`
@@ -222,27 +225,38 @@ fn default_blueprint_resolves_to_runtime_tables() {
     }
 
     // -- 3. Collaboration rows -----------------------------------------------
-    // The blueprint's open relationship registry (from/to + kind string) is
-    // the runtime default rule table as data rows, in the same order. Kinds
-    // use the string vocabulary the runtime parses (`configured_relationship`,
-    // runtime_runner.rs:86-94): "supervises" → Supervises,
-    // "provides_context_to" → ProvidesContextTo, "owns_design" → OwnsDesign.
-    let expected: Vec<(&str, &str, AgentRelationship, Option<u32>)> = vec![
-        // relationship.rs:142-145 — reviewer→coder Supervises, cap 3.
-        ("reviewer", "coder", AgentRelationship::Supervises, Some(3)),
-        // relationship.rs:148-152 — researcher→coder ProvidesContextTo, no cap.
-        ("researcher", "coder", AgentRelationship::ProvidesContextTo, None),
-        // relationship.rs:153-158 — architect→coder OwnsDesign, no cap.
-        ("architect", "coder", AgentRelationship::OwnsDesign, None),
-        // relationship.rs:159-164 — architect→researcher OwnsDesign, no cap.
-        ("architect", "researcher", AgentRelationship::OwnsDesign, None),
-        // relationship.rs:165-170 — validator→coder Supervises, cap 2.
-        ("validator", "coder", AgentRelationship::Supervises, Some(2)),
+    // The runtime default topology is expressed as STAGE-KIND pairs (ADR-58
+    // D2/ADR-35) and resolved against the staffed roster — never agent role
+    // ids. The blueprint's open relationship registry carries the same default
+    // rows as data, keyed by stage TAG; the tag's kind must match the runtime
+    // pair's kind. Kinds use the string vocabulary the runtime parses
+    // (`configured_relationship`, runtime_runner.rs:86-94): "supervises" →
+    // Supervises, "provides_context_to" → ProvidesContextTo, "owns_design" →
+    // OwnsDesign.
+    let expected_kinds: Vec<(StageKind, StageKind, AgentRelationship, Option<u32>)> = vec![
+        // relationship.rs `default_stage_relationships()` — Review→Execution
+        // Supervises, cap 6.
+        (StageKind::Review, StageKind::Execution, AgentRelationship::Supervises, Some(6)),
+        // Research→Execution ProvidesContextTo, no cap.
+        (StageKind::Research, StageKind::Execution, AgentRelationship::ProvidesContextTo, None),
+        // Planning→Execution OwnsDesign, no cap.
+        (StageKind::Planning, StageKind::Execution, AgentRelationship::OwnsDesign, None),
+        // Planning→Research OwnsDesign, no cap.
+        (StageKind::Planning, StageKind::Research, AgentRelationship::OwnsDesign, None),
+        // Acceptance→Execution Supervises, cap 5.
+        (StageKind::Acceptance, StageKind::Execution, AgentRelationship::Supervises, Some(5)),
     ];
-    let rules = default_collaboration_rules();
-    assert_eq!(rules.len(), expected.len(), "runtime default rules changed shape");
-    assert_eq!(resolved.relationship_defaults.len(), expected.len());
+    let pairs = default_stage_relationships();
+    assert_eq!(pairs.len(), expected_kinds.len(), "runtime default rule shape changed");
+    for (i, (from_kind, to_kind, relationship, cycles)) in expected_kinds.iter().enumerate() {
+        assert_eq!(pairs[i].from, *from_kind, "pair {i} from kind");
+        assert_eq!(pairs[i].to, *to_kind, "pair {i} to kind");
+        assert_eq!(pairs[i].relationship, *relationship, "pair {i} relationship");
+        assert_eq!(pairs[i].max_cycles, *cycles, "pair {i} max_cycles");
+    }
 
+    // The blueprint data rows state the same topology by stage tag.
+    assert_eq!(resolved.relationship_defaults.len(), expected_kinds.len());
     let kind_to_relationship = |kind: &str| -> AgentRelationship {
         match kind {
             "supervises" => AgentRelationship::Supervises,
@@ -251,25 +265,30 @@ fn default_blueprint_resolves_to_runtime_tables() {
             other => panic!("unexpected relationship kind string {other:?}"),
         }
     };
-    for (i, (expect_from, expect_to, expect_relationship, expect_cycles)) in
-        expected.iter().enumerate()
-    {
-        let def = &resolved.relationship_defaults[i];
-        assert_eq!(def.from, *expect_from, "row {i} from");
-        assert_eq!(def.to, *expect_to, "row {i} to");
-        assert_eq!(
-            kind_to_relationship(&def.kind),
-            *expect_relationship,
-            "row {i} kind: {:?}",
-            def.kind
-        );
-        // The blueprint row carries no cycle cap; the cap lives on the runtime
-        // CollaborationRule and must be the documented value.
-        let rule = &rules[i];
-        assert_eq!(rule.from.as_str(), *expect_from, "row {i} runtime from");
-        assert_eq!(rule.to.as_str(), *expect_to, "row {i} runtime to");
-        assert_eq!(rule.relationship, *expect_relationship, "row {i} runtime relationship");
-        assert_eq!(rule.max_cycles, *expect_cycles, "row {i} runtime max_cycles");
+    for (i, def) in resolved.relationship_defaults.iter().enumerate() {
+        let from_kind = stage(&def.from).def.known_kind().expect("known from kind");
+        let to_kind = stage(&def.to).def.known_kind().expect("known to kind");
+        assert_eq!(from_kind, expected_kinds[i].0, "blueprint row {i} from kind");
+        assert_eq!(to_kind, expected_kinds[i].1, "blueprint row {i} to kind");
+        assert_eq!(kind_to_relationship(&def.kind), expected_kinds[i].2, "row {i} kind");
+    }
+
+    // Resolving against the standard five-agent roster reproduces the
+    // historical id-based edges exactly (one agent per kind).
+    let roster: Vec<(AgentId, StageKind)> = seeds
+        .iter()
+        .filter_map(|seed| {
+            let tag = seed.stage.as_ref()?;
+            let kind = stage(tag.as_str()).def.known_kind()?;
+            Some((AgentId::new(seed.id.as_str()), kind))
+        })
+        .collect();
+    assert_eq!(roster.len(), 5, "the standard roster staffs the five known kinds");
+    let rules = resolve_stage_relationships(&pairs, &roster);
+    assert_eq!(rules.len(), expected_kinds.len(), "standard roster resolves one rule per pair");
+    for (i, rule) in rules.iter().enumerate() {
+        assert_eq!(rule.relationship, expected_kinds[i].2, "resolved row {i} relationship");
+        assert_eq!(rule.max_cycles, expected_kinds[i].3, "resolved row {i} max_cycles");
     }
 
     // -- 4. Feed bindings ----------------------------------------------------
@@ -309,21 +328,21 @@ fn default_blueprint_resolves_to_runtime_tables() {
     assert_eq!(run_once.effective_feed(), None);
 
     // -- 5. Cycle caps -------------------------------------------------------
-    // review is Review-kind with no explicit cap → engine default 3
-    // (relationship.rs:142-145 reviewer→coder Some(3); the coordinator uses
-    // the same fallback when running the review gate, coordinator.rs:3513).
+    // review is Review-kind with no explicit cap → engine default 6
+    // (relationship.rs:148 reviewer→coder Some(6); the coordinator uses
+    // the same fallback when running the review gate).
     let review = stage("review");
     assert_eq!(review.def.max_cycles, None, "no explicit cap on the review stage");
-    assert_eq!(review.def.default_max_cycles(), 3);
-    // validate is Acceptance-kind with no explicit cap → engine default 2
-    // (relationship.rs:165-170 validator→coder Some(2); coordinator.rs:3915).
+    assert_eq!(review.def.default_max_cycles(), 6);
+    // validate is Acceptance-kind with no explicit cap → engine default 5
+    // (relationship.rs:172 validator→coder Some(5)).
     let validate = stage("validate");
     assert_eq!(validate.def.max_cycles, None, "no explicit cap on the validate stage");
-    assert_eq!(validate.def.default_max_cycles(), 2);
+    assert_eq!(validate.def.default_max_cycles(), 5);
     // The gate caps sit beneath the single-agent iteration ceiling
-    // `DEFAULT_MAX_ITERATIONS = 25` (runtime_runner.rs:453-454) and the
-    // per-subtask dispatch ceiling `DEFAULT_MAX_SUBTASK_ATTEMPTS = 3`
-    // (coordinator.rs:52) that bound engine loops today.
+    // `DEFAULT_MAX_ITERATIONS = 25` (runtime_runner.rs:449) and the
+    // per-subtask dispatch ceiling `DEFAULT_MAX_SUBTASK_ATTEMPTS = 6`
+    // (coordinator.rs:83) that bound engine loops today.
     assert!(review.def.default_max_cycles() <= 25);
     assert!(validate.def.default_max_cycles() <= 25);
 }

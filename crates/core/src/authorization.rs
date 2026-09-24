@@ -117,6 +117,18 @@ pub const RULE_INTENT_READONLY_DENY: &str = "intent_readonly_deny";
 /// active grant scope.
 pub const RULE_UN_GRANTED: &str = "un_granted";
 
+/// Audit `rule_matched` value for an orchestrator-authority decision: an
+/// action carrying [`crate::types::PolicyAction::orchestrator_authority`]
+/// decided by the engine's authority branch rather than the run's intent
+/// grant or the read-only invariant. Deliberately DISTINCT from the
+/// intent-derived names (`intent_authorized*`, `un_granted`,
+/// `shell_requires_approval`, `intent_readonly_deny`) so the audit can always
+/// reconstruct *why* an orchestrator action bypassed intent-derived
+/// restrictions. Deny-class (`auto_deny`, `deny_network_egress`) and
+/// Consequential (`consequential`) rows keep their own names — authority never
+/// rewrites those.
+pub const RULE_COORDINATOR_AUTHORITY: &str = "coordinator_authority";
+
 /// Session-scoped, non-durable source of intent-authorization state (ADR-55
 /// §1/§4). Owned by the run loop, never persisted, re-confirmed on resume.
 ///
@@ -1121,6 +1133,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         }
     }
 
@@ -1803,6 +1816,7 @@ mod tests {
             sandbox_profile: Some(SandboxProfile::None),
             estimated_cost_usd: None,
             command_facts: Some(facts),
+            orchestrator_authority: false,
         };
         assert_eq!(classify_tier(&action), IntentTier::Consequential);
     }
@@ -1967,6 +1981,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: Some(facts),
+            orchestrator_authority: false,
         }
     }
 
@@ -2108,6 +2123,7 @@ mod tests {
             sandbox_profile: None,
             estimated_cost_usd: None,
             command_facts: None,
+            orchestrator_authority: false,
         };
         assert!(
             !is_project_bounded_shell(&no_facts),

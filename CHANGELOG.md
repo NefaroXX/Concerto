@@ -9,11 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Unified agent loop (ADR-55 Phase 2e):** the router now grants permission
-  envelopes (ReadOnly/Acting) instead of choosing code paths — every
-  non-empty run enters the loop and the model shapes it; outcomes are
-  non-binding flavor hints; the text-only branch is deleted; the classifier
-  left the hot path. No keyword can convert a build into chat anymore.
+- **Unified agent loop (ADR-55 Phase 2e):** every non-empty run enters the
+  loop and the model shapes it; outcomes are non-binding flavor hints; the
+  text-only branch is deleted; the classifier left the hot path. Under full
+  local agency the run envelope is always Acting (`auth.set_read_only(false)`);
+  boundaries are enforced by deny-class policy rules and the approval sink, and
+  the keyword-based `route()` function was deleted (see the ADR-71 entry
+  below).
+- **Coordinator supremacy (ADR-71):** the Coordinator is the sole master of a
+  run — it decides dispatch, ordering, agent selection, and termination; run
+  endings are classified into exactly four terminal classes (coordinator
+  decision / intervention / coordinator error / immutable safety terminal).
+  Routing as control flow is gone: `route()` and its keyword corpora were
+  deleted from `concerto-core`, the run shape (Plan/Execute) is decided and
+  recorded by the Coordinator (`decide_run_shape` /
+  `record_run_shape_decision`), and intent is no longer consulted as a
+  topology or dispatch authority.
+- **Agents derived from configuration (ADR-58/59 revised):** hardcoded
+  per-role logic was removed — the five specialists and custom agents are
+  config data materialized at startup; the roster owns provider/model pins,
+  prompts, and permissions.
+- **Stage-kind relationships + routing carcass deletion:** stage-kind
+  relationship handling replaced the dead review-resume path; the dead
+  `review_resume` module was removed along with the routing carcass.
+- **Fallback pipes on transport 404:** coordinator dispatch iterates fallback
+  pipes when a provider answers 404 and reports the produced files; throttled
+  providers recover onto alternate pipes instead of failing the run.
+- **Honesty guards against vacuous completion:** the coordinator no longer
+  reports a completed objective when nothing was actually produced
+  (investigate-then-close; no fake "done").
+- **Decisions on bypass paths:** every bypass path records a typed
+  Coordinator Decision, including `gate-policy-denied` for policy denials.
+- **Throttle-exhaustion recovery:** exhausted providers are recovered onto
+  alternate fallback pipes with evidence preserved.
+- **Dispatch history + phase marker:** dispatch records carry the phase marker,
+  and dispatch history feeds advisory same-role capping.
+- **Drop dead trio + global/D6/orphan tiers:** dead-code trio removed; memory
+  tiers consolidated (global tier implemented in
+  `crates/memory/src/global.rs`, D6/orphan tiers dropped).
+- **Same-role cap (advisory):** same-role concurrent dispatch limits are now
+  advisory suggestions, never hard stops.
+- **Approval pause/resume:** approval prompts can be paused and resumed from
+  the coordinator decision loop.
+- **Custom-agent provider pins:** custom agents carry explicit provider/model
+  pins like the built-in specialists.
+- **Undo-ack + rejection rescope:** undo acknowledgement semantics tightened;
+  rejection rescoped so a rejected write's follow-up flows through normal
+  decision routing.
+- **MCP/plugin/skill audits:** `McpServerFailed` and `PluginDisabled` infra
+  rows plus `SkillsInjected`/`PluginStateChanged` events make extension and
+  skill lifecycle visible in the audit trail and transcript.
+- **Gate read bypass:** verified read paths bypass the write gate (read-only
+  by construction) while mutations stay gated.
+- **Bounds 5/6:** continuation and provider round bounds tightened; no-hard-stop
+  invariant preserved (exhaustion is reported, not fatal).
+- **thoughtSignature part sibling:** reasoning/thought signatures are handled
+  as first-class message parts alongside the main content.
 - **Cost-routing deletion:** the harness never selects models — automatic
   cheapest-compatible selection, cost sorting, and downgrade-on-failure are
   removed. Assignment is explicit only (Studio pins, coordinator setting,

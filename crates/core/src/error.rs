@@ -247,6 +247,18 @@ pub enum ProviderError {
         elapsed: Duration,
         /// Error message from the final failed attempt.
         last_error: String,
+        /// Whether the final failed attempt was a throttling / transient 5xx
+        /// condition (rate limit / 429, provider overload, service
+        /// unavailable, gateway failure).
+        ///
+        /// This is the *recovery cause* signal: an alternate pipe is the
+        /// textbook answer when one provider throttles a request, so the
+        /// coordinator recovers the planning/dispatch path for a
+        /// throttle-caused exhaustion. It is deliberately `false` at every
+        /// construction site that cannot attest to a throttle cause, which
+        /// preserves the prior "skip" behaviour for auth, permanent 400,
+        /// capability, and network-unknown causes.
+        throttled: bool,
     },
 
     /// A tool-requiring task was resolved onto a provider/model that cannot
@@ -307,6 +319,21 @@ impl ProviderError {
             | ProviderError::ContextOverflow { .. } => false,
         }
     }
+
+    /// Whether this error is a retry exhaustion whose underlying cause was a
+    /// throttling or transient 5xx condition (rate limit / 429, provider
+    /// overload, service unavailable, gateway failure).
+    ///
+    /// Shared recovery predicate for the coordinator: an alternate pipe is the
+    /// textbook answer when one provider throttles us, so both the planning
+    /// recovery and the dispatch failover consult this rather than re-deriving
+    /// the cause from strings. Network, stream-transport, timeout, auth,
+    /// capability, and permanent-400 exhaustions all return `false` — the
+    /// conservative default, since those causes are not evidence that another
+    /// provider would succeed.
+    pub fn is_throttle_exhaustion(&self) -> bool {
+        matches!(self, ProviderError::RetryExhausted { throttled: true, .. })
+    }
 }
 
 /// Tool execution and policy enforcement errors.
@@ -325,6 +352,25 @@ pub enum ToolError {
     PolicyDenied {
         /// Name of the policy rule that denied the operation.
         rule: String,
+    },
+
+    /// The approval request expired before the user responded. The action is
+    /// PAUSED, not denied: the pending request is preserved by the approval
+    /// sink so a late decision can still fulfil it, and the run resumes
+    /// awaiting the user. Distinct from [`Self::PolicyDenied`] so callers
+    /// never burn a retry on a timeout.
+    #[error("awaiting approval for '{tool_name}' (timed out after {timeout_secs}s)")]
+    PausedAwaitingApproval {
+        /// Canonical tool name awaiting approval.
+        tool_name: String,
+        /// Human-readable action detail (e.g. the summarized input).
+        detail: String,
+        /// Hash of the action input (pairs with the policy audit row).
+        input_hash: String,
+        /// Correlation id of the paused action.
+        correlation_id: crate::ids::Ulid,
+        /// Configured approval deadline that elapsed, in seconds.
+        timeout_secs: u64,
     },
 
     /// Tool execution failed.
@@ -1192,6 +1238,7 @@ mod unit_tests {
             attempts: 5,
             elapsed: std::time::Duration::from_secs(30),
             last_error: "timeout".into(),
+            throttled: false,
         };
         let msg = err.to_string();
         assert!(msg.contains("5"), "should include attempt count");
