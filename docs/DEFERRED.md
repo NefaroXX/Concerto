@@ -30,14 +30,13 @@ a note.
 | 2 | Responses `tokens_out` / `tokens_in` written per message from provider-reported usage | ADR-48:27–29,111 — columns exist but are always `0` (inert); per-iteration totals surface resolved provider only | When real provider-reported usage accounting lands (ADR-48 §4/§5; nothing wired today) | S |
 | 3 | `.wasm` plugin-file watcher (hot reload on file change) | `[verify]` no in-repo source found for a `.wasm` watcher; nearest is the memory re-index watcher (ROADMAP, ADR-57) | Verify scope first: if "plugin hot-reload" was meant, row 30 applies | S |
 | 4 | Per-session ack queue (bounded depth + ack policy) | ADR-68 §6 (queue decision pooled at approval, ~78–97; prefer in-flight budget instead per note) | Implementation phase of ADR-68 desktop ack queue; revisit at desktop persistence work (ADR-43) | S |
-| 5 | Recall budget caps + recall timeout (char caps, 5000 ms timeout race, skip-with-warning, capability-envelope payload) | TODO.md memory section (caps/timeout ~81–88) | When a char-budget allocator + timeout guard land in `chunk_selector.rs`/`rag.rs` | M |
+| 5 | Recall budget caps + recall timeout (char caps, 5000 ms timeout race, skip-with-warning, capability-envelope payload; includes the ChunkSelector char-budget allocator across the selected chunks — TODO.md:88 "no char budget across the selected chunks"; naming trap: the `chunk_selector.rs` constants are compaction selection, not recall) | TODO.md memory section (caps/timeout ~81–88) | When a char-budget allocator + timeout guard land in `chunk_selector.rs`/`rag.rs` | M |
 | 6 | Tier-3 SDKs — Copilot / Bedrock / Azure / Vertex / watsonx | docs/missing-providers.md Tier 3 (open) | Per-provider wrapper + pairwise parity test; Tier 1/2 already done | L |
 | 7 | Doubao / StepFun / Replicate providers | `[unplanned]` — no repo register (zero matches for these names) | Add explicit provider rows if planning changes | L |
 | 8 | Vercel Gateway decision | `[verify]` researched in docs/research/multi-provider-resilience.md (Vercel AI SDK among gateways); no in-repo decision record | Confirm whether a dedicated gateway row is wanted | S |
 | 9 | Setup wizard per-variant auth flows | `[verify]` wizard exists (`crates/config/src/setup.rs`); per-variant auth steps unverified | Verify scope; no dedicated row in repo docs | M |
 | 10 | Live-API smoke tests against real provider endpoints | `[verify]` no in-repo source (TESTING.md has manual live-test matrices only) | Verify; CI uses mocks today | M |
 | 11 | M-01: Estimator deduplication + `rag_pct` configurability | ADR-67 follow-ups (~92–98) | When Estimator/rag_pct consolidation is taken up | S |
-| 12 | ChunkSelector char-budget allocator | TODO.md:88 ("no char budget across the selected chunks") | With recall budget caps (row 5) | S |
 | 13 | Codebase cascade S1/S2/S3 (link store, scoring, slicing) | ADR-69 slices; IMPLEMENTED on fix/coordinator-error-invariant 2026-09-24 (S1 link store + write path, S1 activation, S2 scoring/decay/caps, purge fix, S3 observability — commits 60841dd/af98afe/224f0f9/7713b8d/7584d2d; tests green incl multi-hop guard) | CLOSED on merge of that branch + production proof (link verdicts firing, cascade reorder observed in a live run) | L |
 | 14 | ThreadSpawn fallback for non-WASM spawn | `[verify]` no symbol/source found | Re-entry on live fault-injection test demand | M |
 | 15 | Supervisor beyond 6 agents + D3 + D6 real-embedder swap + multi-level disclosure | ADR-60:112 ("acceptable at 3–6 agents; revisited only if profiling demands"); ADR-58:247 (scheduler/subscription generalization, real-embedder swap, multi-level disclosure deferred) | When profiling shows need beyond 6 agents (with D3/D6 generalization) | L |
@@ -92,6 +91,9 @@ a note.
 
 ## Verification notes (2026-09-24)
 
+- Row 12 (ChunkSelector char-budget allocator) merged into row 5 (recall
+  budget caps + timeout) on 2026-09-24; the #12 numbering gap is left
+  intentionally (no renumbering).
 - Every closed claim was verified by grep/read against a repo source before
   listing. Two inventory "closed" claims failed verification and are instead
   carried as open rows flagged `[verify]`: **health echo** (no feature named
