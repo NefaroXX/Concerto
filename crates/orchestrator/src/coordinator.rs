@@ -6154,6 +6154,28 @@ impl CoordinatorAgent {
             }),
         };
         if let Some(reason) = awaiting_reason.as_ref() {
+            // Supremacy invariant: a run that ends by pausing on the operator
+            // (a fresh `request_user_input`, OR a checkpoint replay that
+            // restored a pending answer-request / approval-timeout) records a
+            // Coordinator Decision row, so the pause is an observable decision
+            // rather than a silent terminal. The `AwaitingUser` terminal class
+            // itself is unchanged — only the record is added.
+            let decision_code = if pending_approval.is_some() {
+                "awaiting-approval-replay"
+            } else {
+                "awaiting-user-replay"
+            };
+            if let Some(executor) = self.tool_executor.as_ref() {
+                executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        decision_code,
+                        reason,
+                        CancellationToken::new(),
+                    )
+                    .await;
+            }
             // `AwaitingUser` terminal class (user-denied): the Coordinator
             // itself requested human input via the `request_user_input` tool,
             // which records its decision in the in-memory decision journal

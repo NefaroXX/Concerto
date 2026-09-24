@@ -721,6 +721,14 @@ pub struct RunSummary {
     /// must fall back to a full log replay. `None` on success or when no
     /// checkpoint was due (no write-path services / empty log).
     pub checkpoint_error: Option<String>,
+    /// One summary flag for the run's warn-only degradations (item: warn-only
+    /// drops). A checkpoint that could not be persisted, a lease release that
+    /// failed, or a write-path handler that logged-and-continued all set this
+    /// to `true` — so the run summary carries ONE degraded note rather than a
+    /// Decision row per drop (per-drop decision rows would be too noisy for
+    /// best-effort continuity writes). The individual `warn` logs are
+    /// unchanged.
+    pub degraded: bool,
 }
 
 /// Shared write-path services the steady-state loop dispatches into
@@ -1453,8 +1461,12 @@ impl Supervisor {
             }
         }
         failed.extend(shutdown_failed);
-        let mut summary =
-            RunSummary { failed: failed.clone(), agents: self.agents(), checkpoint_error: None };
+        let mut summary = RunSummary {
+            failed: failed.clone(),
+            agents: self.agents(),
+            checkpoint_error: None,
+            degraded: false,
+        };
         for agent_id in self.agents.keys().map(Clone::clone).collect::<Vec<_>>() {
             if failed.contains(&agent_id) {
                 continue;
@@ -1487,6 +1499,7 @@ impl Supervisor {
                      restart restore must fall back to a full log replay"
                 );
                 summary.checkpoint_error = Some(error.to_string());
+                summary.degraded = true;
             }
         }
         summary
@@ -3203,6 +3216,10 @@ mod write_path_tests {
         assert!(
             summary.checkpoint_error.is_some(),
             "a failed shutdown checkpoint is surfaced loudly"
+        );
+        assert!(
+            summary.degraded,
+            "a failed continuity write sets the single degraded summary flag"
         );
     }
 

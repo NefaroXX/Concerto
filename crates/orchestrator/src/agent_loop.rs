@@ -4,6 +4,7 @@
 //! Multi-agent coordination is Phase 5.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -112,6 +113,13 @@ pub struct AgentLoop {
     /// `AgentRunExit::AwaitingApproval` (stop the loop, never retry the same
     /// call). `None` in the common case; cleared at run start.
     pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
+
+    /// One summary flag for the loop's warn-only degradations (item: warn-only
+    /// drops). A best-effort session/checkpoint persistence write that failed
+    /// (logged at `warn`, never fatal) sets this, so the run summary carries
+    /// ONE degraded note instead of a Decision row per drop. The individual
+    /// `warn` logs are unchanged.
+    degraded: AtomicBool,
 }
 
 /// Maximum number of auto-continuation rounds before escalating a run to a
@@ -422,6 +430,7 @@ impl AgentLoop {
             usage_cost_usd: 0.0,
             usage_latency_ms: 0,
             pending_approval: None,
+            degraded: AtomicBool::new(false),
         }
     }
 
@@ -492,6 +501,7 @@ impl AgentLoop {
         self.shell_repair_attempts.clear();
         self.tool_attempts.clear();
         self.pending_approval = None;
+        self.degraded.store(false, Ordering::Relaxed);
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -538,12 +548,27 @@ impl AgentLoop {
                     // own landing state (an eval failure stays `Partial`);
                     // no transport-level success ever overrides it here.
                     self.persist_run_success(session_id, &output, cancel.clone()).await;
+                    self.note_degraded(&mut output);
                     return Ok(output);
                 }
                 AgentRunExit::NeedsUser { reason, partial } => {
                     let mut output = partial;
                     output.final_message = format!("User input required: {reason}");
                     output.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    // Supremacy invariant: the exit is a Coordinator Decision
+                    // row, not a silent return. Control flow is unchanged —
+                    // the loop keeps its own exits; this only makes the
+                    // decision observable and the preserved checkpoint
+                    // resumable.
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-needs-user",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
@@ -557,6 +582,7 @@ impl AgentLoop {
                         cancel.clone(),
                     );
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
+                    self.note_degraded(&mut output);
                     return Ok(output);
                 }
                 AgentRunExit::AwaitingApproval { reason, pending, mut partial } => {
@@ -565,6 +591,18 @@ impl AgentLoop {
                     // preserved request so a resume re-attaches to it (same
                     // tool/input) instead of re-asking the model or issuing a
                     // second identical call.
+                    // Supremacy invariant: the pause is a Coordinator Decision
+                    // row (visibility), while the `AwaitingUser` terminal class
+                    // and the preserved checkpoint are unchanged.
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-awaiting-approval",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
                     partial.final_message = reason;
                     partial.completion_status =
                         concerto_core::types::AgentCompletionStatus::AwaitingUser;
@@ -579,17 +617,28 @@ impl AgentLoop {
                         cancel.clone(),
                     );
                     self.persist_run_partial(session_id, &partial, cancel.clone()).await;
+                    self.note_degraded(&mut partial);
                     return Ok(partial);
                 }
                 AgentRunExit::Blocked { reason, partial } => {
                     let mut output = partial;
                     output.final_message = format!("Blocked: {reason}");
                     output.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-blocked",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
                     if let Some(accumulated) = &mut cumulative_progress {
                         merge_run_progress(accumulated, &output);
                     }
                     self.publish_end_reason(session_id, "blocked", &reason, cancel.clone());
                     self.persist_run_partial(session_id, &output, cancel.clone()).await;
+                    self.note_degraded(&mut output);
                     return Ok(output);
                 }
                 AgentRunExit::IterationCapHit { reason, partial } => {
@@ -616,6 +665,15 @@ impl AgentLoop {
                         );
                         partial_out.completion_status =
                             concerto_core::types::AgentCompletionStatus::Partial;
+                        self.tool_executor
+                            .record_coordinator_decision(
+                                session_id,
+                                concerto_core::ids::new_id(),
+                                "agent-loop-no-convergence",
+                                &reason,
+                                CancellationToken::new(),
+                            )
+                            .await;
                         self.publish_end_reason(
                             session_id,
                             "no convergence",
@@ -623,6 +681,7 @@ impl AgentLoop {
                             cancel.clone(),
                         );
                         self.persist_run_partial(session_id, &partial_out, cancel.clone()).await;
+                        self.note_degraded(&mut partial_out);
                         return Ok(partial_out);
                     }
 
@@ -672,6 +731,15 @@ impl AgentLoop {
         partial.final_message =
             format!("Blocked: reached maximum continuation rounds ({MAX_CONTINUATION_ROUNDS}).");
         partial.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+        self.tool_executor
+            .record_coordinator_decision(
+                session_id,
+                concerto_core::ids::new_id(),
+                "agent-loop-continuation-cap",
+                &partial.final_message,
+                CancellationToken::new(),
+            )
+            .await;
         self.publish_end_reason(
             session_id,
             "maximum continuation rounds reached",
@@ -679,7 +747,23 @@ impl AgentLoop {
             cancel.clone(),
         );
         self.persist_run_partial(session_id, &partial, cancel.clone()).await;
+        self.note_degraded(&mut partial);
         Ok(partial)
+    }
+
+    /// Append ONE degraded summary note when any best-effort session
+    /// persistence write failed during the run (item: warn-only drops).
+    /// Per-drop Decision rows would be too noisy for these best-effort writes;
+    /// the individual `warn` logs remain, and this single flag makes the
+    /// degradation visible in the run's final message.
+    fn note_degraded(&self, output: &mut AgentOutput) {
+        if self.degraded.load(Ordering::Relaxed) {
+            output.final_message.push_str(
+                " Degraded: one or more session persistence writes failed; the run \
+                 result is unaffected but the durable session record may be \
+                 incomplete (see the logs).",
+            );
+        }
     }
 
     /// End-reason persistence (completion-fix): the loop's terminal reason
@@ -855,6 +939,10 @@ impl AgentLoop {
                     ..
                 })) => {
                     self.state = AgentState::Failed;
+                    let reason = format!(
+                        "provider retries exhausted after {attempts} attempts \
+                         ({elapsed:?}): {last_error}"
+                    );
                     let partial = self.build_agent_output(
                         &task,
                         &final_message,
@@ -864,16 +952,31 @@ impl AgentLoop {
                         &tool_events,
                         &verification,
                     );
-                    return Ok(AgentRunExit::Blocked {
-                        reason: format!(
-                            "provider retries exhausted after {attempts} attempts \
-                             ({elapsed:?}): {last_error}"
-                        ),
-                        partial,
-                    });
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            task.session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-provider-retries-exhausted",
+                            &reason,
+                            CancellationToken::new(),
+                        )
+                        .await;
+                    return Ok(AgentRunExit::Blocked { reason, partial });
                 }
                 Err(e) => {
                     self.state = AgentState::Failed;
+                    // Supremacy invariant: a hard provider error that ends the
+                    // loop is a Coordinator Decision row before the error
+                    // propagates (control flow still returns the error).
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            task.session_id,
+                            concerto_core::ids::new_id(),
+                            "agent-loop-error",
+                            &e.to_string(),
+                            CancellationToken::new(),
+                        )
+                        .await;
                     return Err(e);
                 }
             };
@@ -957,19 +1060,35 @@ impl AgentLoop {
             }
 
             // Phase 6: Execute tool calls
-            self.execute_tool_calls(
-                &tool_calls,
-                &task,
-                correlation_id,
-                &session,
-                cancel.clone(),
-                &mut tool_call_count,
-                &mut file_changing_tool_count,
-                &mut files_modified,
-                &mut tool_events,
-                &mut messages,
-            )
-            .await?;
+            if let Err(error) = self
+                .execute_tool_calls(
+                    &tool_calls,
+                    &task,
+                    correlation_id,
+                    &session,
+                    cancel.clone(),
+                    &mut tool_call_count,
+                    &mut file_changing_tool_count,
+                    &mut files_modified,
+                    &mut tool_events,
+                    &mut messages,
+                )
+                .await
+            {
+                // Supremacy invariant: a tool-execution error that would abort
+                // the loop records a Coordinator Decision row first; control
+                // flow is unchanged (the error still propagates).
+                self.tool_executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        "agent-loop-tool-error",
+                        &error.to_string(),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                return Err(error);
+            }
 
             // An approval timeout pauses the loop HERE: the model is NOT
             // re-consulted and the identical tool call is NOT re-issued. The
@@ -990,6 +1109,18 @@ impl AgentLoop {
                     &tool_events,
                     &verification,
                 );
+                // Supremacy invariant: the in-loop approval-timeout pause is a
+                // Coordinator Decision row, not a silent `AwaitingApproval`
+                // return (the terminal class and preserved request unchanged).
+                self.tool_executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        "agent-loop-awaiting-approval",
+                        &reason,
+                        CancellationToken::new(),
+                    )
+                    .await;
                 return Ok(AgentRunExit::AwaitingApproval { reason, pending, partial });
             }
         }
@@ -1636,7 +1767,6 @@ impl AgentLoop {
                     partial: output.clone(),
                 }));
             }
-
             if require_verification && eval_result.is_none() {
                 tracing::warn!(
                     task_id = %task.id,
@@ -1687,6 +1817,23 @@ impl AgentLoop {
         } else {
             concerto_core::types::AgentCompletionStatus::Completed
         };
+        // Supremacy invariant: an eval-driven downgrade to `Partial` is a
+        // Coordinator Decision row (visibility), not a silent status flip.
+        if output.completion_status == concerto_core::types::AgentCompletionStatus::Partial {
+            let reason = eval_result
+                .as_ref()
+                .map(|result| format!("evaluation did not pass: {result:?}"))
+                .unwrap_or_else(|| "completion downgraded to Partial".to_owned());
+            self.tool_executor
+                .record_coordinator_decision(
+                    task.session_id,
+                    concerto_core::ids::new_id(),
+                    "agent-loop-eval-downgrade",
+                    &reason,
+                    CancellationToken::new(),
+                )
+                .await;
+        }
         let success =
             output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
         let _ = self.bus.publish_for_session(
@@ -1760,6 +1907,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.create_task(task, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist task row");
         }
 
@@ -1772,6 +1920,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskStarted event");
         }
 
@@ -1788,6 +1937,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.append_messages(session_id, &[user_msg], cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist user message");
         }
     }
@@ -1820,6 +1970,7 @@ impl AgentLoop {
             )
             .await
         {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to update task status");
         }
 
@@ -1832,6 +1983,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
@@ -1848,6 +2000,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist assistant message");
         }
     }
@@ -1866,6 +2019,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.update_task_status(output.task_id, "partial", cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to update task status");
         }
 
@@ -1878,6 +2032,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
@@ -1894,6 +2049,7 @@ impl AgentLoop {
             return;
         }
         if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
+            self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist assistant message");
         }
     }
@@ -2487,6 +2643,19 @@ impl AgentLoop {
             }
             Err(ToolError::PolicyDenied { rule }) => {
                 *tool_call_count += 1;
+                // Supremacy invariant (item: gate-direct-abort): a gate denial
+                // is a Coordinator Decision row too. Deny semantics are
+                // unchanged — the call stays denied, the model still receives
+                // the denial result — only the decision is now observable.
+                self.tool_executor
+                    .record_coordinator_decision(
+                        task.session_id,
+                        concerto_core::ids::new_id(),
+                        "gate-policy-denied",
+                        &format!("tool '{}' denied by policy rule '{rule}'", tc.name),
+                        CancellationToken::new(),
+                    )
+                    .await;
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -2538,6 +2707,22 @@ impl AgentLoop {
                 .await;
             }
             Err(e) => {
+                // Supremacy invariant (item: gate-direct-abort): a gate-proxy
+                // cancellation (in_process/gate_proxy `Cancelled`) is a
+                // documented terminal class — the control flow below is
+                // unchanged — but it records a Coordinator Decision row so the
+                // abort is never silent.
+                if matches!(e, ToolError::Cancelled) {
+                    self.tool_executor
+                        .record_coordinator_decision(
+                            task.session_id,
+                            concerto_core::ids::new_id(),
+                            "gate-cancelled",
+                            &format!("tool '{}' cancelled at the write gate", tc.name),
+                            CancellationToken::new(),
+                        )
+                        .await;
+                }
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -4608,6 +4793,62 @@ mod tests {
                 || output.final_message.contains("maximum continuation"),
             "final_message should explain the stall/cap, got: {}",
             output.final_message
+        );
+    }
+
+    /// Item (loop supremacy): a run that exhausts its iteration budget records
+    /// a Coordinator Decision row, so the cap is observable in the audit trail
+    /// rather than only in the final message.
+    #[tokio::test]
+    async fn iteration_cap_records_a_coordinator_decision_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = dir.path().to_str().expect("utf8 tempdir").to_owned();
+        let provider = Arc::new(AlwaysToolProvider { name: "echo" });
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (mut loop_, audit) = make_loop_with_dir_capturing(provider, approval, 3, &project_dir);
+        let task = AgentTask::new(Ulid::new(), "do something that never finishes");
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_ok(), "iteration cap returns Ok partial");
+        let decisions: Vec<_> = audit
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.tool_name == "coordinator_decision")
+            .collect();
+        assert!(
+            !decisions.is_empty(),
+            "the loop cap must record at least one coordinator decision row"
+        );
+        assert!(
+            decisions.iter().any(|entry| entry.verdict.contains("cap")
+                || entry.verdict.contains("convergence")),
+            "the decision names the cap/convergence, got: {:?}",
+            decisions.iter().map(|entry| entry.verdict.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Item (warn-only drops): when a best-effort persistence write failed, the
+    /// run summary carries exactly ONE degraded note (no per-drop Decision row).
+    #[tokio::test]
+    async fn degraded_flag_appends_one_summary_note() {
+        let provider = Arc::new(AlwaysToolProvider { name: "echo" });
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 3);
+
+        let mut clean = agent_output_base();
+        loop_.note_degraded(&mut clean);
+        assert!(
+            !clean.final_message.contains("Degraded:"),
+            "a clean run gets no degraded note: {}",
+            clean.final_message
+        );
+
+        let mut degraded = agent_output_base();
+        loop_.degraded.store(true, std::sync::atomic::Ordering::Relaxed);
+        loop_.note_degraded(&mut degraded);
+        assert!(
+            degraded.final_message.contains("Degraded:"),
+            "a degraded run gets the summary note: {}",
+            degraded.final_message
         );
     }
 

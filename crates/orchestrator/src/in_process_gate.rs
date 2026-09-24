@@ -172,6 +172,22 @@ impl ToolExecutionBackend for InProcessGateBackend {
             )
             .await;
     }
+
+    async fn record_coordinator_decision(
+        &self,
+        session_id: Ulid,
+        correlation_id: Ulid,
+        decision: &str,
+        reason: &str,
+        cancel: CancellationToken,
+    ) {
+        // In-process the loop writes through the shared policy engine's audit
+        // log (same channel as `record_ack_decision`); the supervised path
+        // keeps the trait default (supervisor-side rows, ADR-60 D4/D5).
+        self.executor
+            .record_coordinator_decision(session_id, correlation_id, decision, reason, cancel)
+            .await;
+    }
 }
 
 impl InProcessGateBackend {

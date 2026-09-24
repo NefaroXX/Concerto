@@ -14,6 +14,7 @@
 pub mod agent_loop;
 pub mod agent_runner;
 pub mod agents;
+mod bypass_decision;
 pub mod capsule;
 pub mod checkpoint;
 pub mod conflict;

@@ -459,6 +459,61 @@ impl ToolExecutor {
         }
     }
 
+    /// Persist a generic bypass/abort *decision* row as a distinct audit entry.
+    ///
+    /// The supremacy invariant ([`crate::executor`] is the run's single
+    /// executor) is that a path which would otherwise abort silently — a
+    /// cleared checkpoint, a loop cap, an operator-visible drop, a
+    /// pre-coordinator setup failure — records WHY it happened as a
+    /// Coordinator Decision row. This is the shared sink those sites use so
+    /// the row shape stays identical everywhere.
+    ///
+    /// `decision` is the stable machine code (e.g. `checkpoint-cleared-scope`)
+    /// carried in both `verdict` and `rule_matched`; `reason` is the
+    /// human-readable detail. `tool_name` is the synthetic
+    /// `"coordinator_decision"`, `input_hash` is empty (no tool input exists),
+    /// and `user_response` is a compact JSON envelope `{decision, reason}`.
+    /// The ADR-28 §6 execution fields stay `None`: there is no command behind a
+    /// decision. Fail-soft: an audit failure is logged, never propagated.
+    pub async fn record_coordinator_decision(
+        &self,
+        session_id: crate::ids::Ulid,
+        correlation_id: crate::ids::Ulid,
+        decision: &str,
+        reason: &str,
+        cancel: CancellationToken,
+    ) {
+        let entry = AuditEntry {
+            tool_name: "coordinator_decision".to_owned(),
+            verdict: decision.to_owned(),
+            input_hash: String::new(),
+            session_id,
+            correlation_id,
+            timestamp: OffsetDateTime::now_utc(),
+            user_response: Some(
+                serde_json::json!({ "decision": decision, "reason": reason }).to_string(),
+            ),
+            rule_matched: Some(decision.to_owned()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+        };
+        if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
+            tracing::warn!(%error, decision, "coordinator-decision audit write failed (fail-soft)");
+        } else {
+            tracing::debug!(decision, reason, "coordinator decision recorded");
+        }
+    }
+
     /// Persist an automatic intent-routing decision (ADR-55 Phase 2d §5) as a
     /// distinct audit entry through the same channel as
     /// [`Self::record_routing_decision`].
@@ -1460,6 +1515,41 @@ mod tests {
         assert_eq!(envelope["final_shape"], "Execute");
     }
 
+    /// A bypass/abort decision row is a distinct, machine-queryable audit
+    /// entry: `tool_name = "coordinator_decision"`, `verdict`/`rule_matched`
+    /// carry the decision code, and `user_response` is a `{decision, reason}`
+    /// envelope.
+    #[tokio::test]
+    async fn coordinator_decision_row_carries_the_decision_shape() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(test_registry(), policy);
+        let session = Ulid::new();
+
+        executor
+            .record_coordinator_decision(
+                session,
+                Ulid::new(),
+                "checkpoint-cleared-malformed",
+                "the checkpoint could not be parsed",
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "exactly one row");
+        let row = &entries[0];
+        assert_eq!(row.tool_name, "coordinator_decision");
+        assert_eq!(row.verdict, "checkpoint-cleared-malformed");
+        assert_eq!(row.rule_matched.as_deref(), Some("checkpoint-cleared-malformed"));
+        assert_eq!(row.session_id, session);
+        let envelope: serde_json::Value =
+            serde_json::from_str(row.user_response.as_deref().unwrap_or("{}"))
+                .expect("the response is a JSON envelope");
+        assert_eq!(envelope["decision"], "checkpoint-cleared-malformed");
+        assert_eq!(envelope["reason"], "the checkpoint could not be parsed");
+    }
+
     #[tokio::test]
     async fn command_execution_appends_correlated_completion_facts() {
         let audit = Arc::new(RecordingAudit::default());
@@ -1467,7 +1557,6 @@ mod tests {
         let mut registry = ToolRegistry::default();
         registry.register(Box::new(FactTool));
         let executor = ToolExecutor::new(Arc::new(registry), policy);
-
         let output = executor
             .execute("fact", serde_json::json!({}), &test_session(), CancellationToken::new())
             .await

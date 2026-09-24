@@ -3039,6 +3039,11 @@ pub async fn run_shared_agent(
     let registry = Arc::new(registry);
 
     // 3. Resolve provider and final effective model
+    // Sessionless setup abort (item: setup aborts): provider resolution, the
+    // policy/audit executor construction below, and session creation all run
+    // BEFORE a session id exists, so there is no audit sink to record to — the
+    // abort is a coordinator-error/intervention class with nothing to write.
+    // Every post-session abort below records a Decision row.
     let (provider, model, provider_config_id) = resolve_provider_and_model(
         &services.config,
         req.selected_provider_id.clone(),
@@ -3229,6 +3234,22 @@ pub async fn run_shared_agent(
                     let now_revision = current_source_revision(&req.project_dir).await;
                     match (&now_revision, &approval_time_revision) {
                         (Some(now), Some(approved_at)) if now != approved_at => {
+                            // Pre-coordinator abort (item: setup aborts): the
+                            // run cannot proceed, so it is a coordinator-error
+                            // class — but a session exists, so the abort is
+                            // recorded as a Decision row before it returns.
+                            crate::bypass_decision::record_decision_row(
+                                Some(executor.as_ref()),
+                                gate_log_pool.as_ref(),
+                                session_id,
+                                "plan-diverged-after-approval",
+                                &format!(
+                                    "approved plan {} diverged: source revision moved from \
+                                     {approved_at} to {now}",
+                                    binding.plan_id(),
+                                ),
+                            )
+                            .await;
                             return Err(OrchestratorError::Unrecoverable {
                                 message: format!(
                                     "approved plan {} diverged from its approval: source \
@@ -3262,6 +3283,14 @@ pub async fn run_shared_agent(
                      Execute falls back to the legacy prose path"
                 ),
                 Err(divergence) => {
+                    crate::bypass_decision::record_decision_row(
+                        Some(executor.as_ref()),
+                        gate_log_pool.as_ref(),
+                        session_id,
+                        "plan-rehydration-failed",
+                        &divergence,
+                    )
+                    .await;
                     return Err(OrchestratorError::Unrecoverable { message: divergence });
                 }
             },
@@ -3310,7 +3339,13 @@ pub async fn run_shared_agent(
             // the stale checkpoint.
             if apply_plan {
                 req.resume_checkpoint_json = None;
-                suppress_stale_checkpoint_for_apply(session_manager, session_id).await;
+                suppress_stale_checkpoint_for_apply(
+                    session_manager,
+                    session_id,
+                    Some(executor.as_ref()),
+                    gate_log_pool.as_ref(),
+                )
+                .await;
             } else if req.resume_checkpoint_json.is_none() {
                 // Load the stored checkpoint unconditionally (not just for
                 // explicit "continue" requests).  This enables crash recovery:
@@ -3366,6 +3401,18 @@ pub async fn run_shared_agent(
                                 %reason,
                                 "discarding checkpoint that failed scope validation on resume"
                             );
+                            // Supremacy invariant: a cleared checkpoint is a
+                            // Coordinator Decision, not a silent drop. Record
+                            // BEFORE the clear so the trail survives even if
+                            // the clear fails.
+                            crate::bypass_decision::record_decision_row(
+                                Some(executor.as_ref()),
+                                gate_log_pool.as_ref(),
+                                session_id,
+                                "checkpoint-cleared-scope",
+                                &format!("resume checkpoint failed scope validation: {reason}"),
+                            )
+                            .await;
                             req.resume_checkpoint_json = None;
                             if let Err(error) = session_manager
                                 .store()
@@ -3394,6 +3441,14 @@ pub async fn run_shared_agent(
                         if checkpoint.objective_hash == input_hash {
                             tracing::info!("input matches checkpoint objective — implicit resume after restart");
                         } else {
+                            crate::bypass_decision::record_decision_row(
+                                Some(executor.as_ref()),
+                                gate_log_pool.as_ref(),
+                                session_id,
+                                "checkpoint-cleared-new-objective",
+                                "stale checkpoint superseded by a new objective (input hash mismatch)",
+                            )
+                            .await;
                             req.resume_checkpoint_json = None;
                             if let Err(error) = session_manager
                                 .store()
@@ -3406,6 +3461,14 @@ pub async fn run_shared_agent(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "discarding malformed orchestration checkpoint");
+                        crate::bypass_decision::record_decision_row(
+                            Some(executor.as_ref()),
+                            gate_log_pool.as_ref(),
+                            session_id,
+                            "checkpoint-cleared-malformed",
+                            &format!("malformed orchestration checkpoint discarded: {error}"),
+                        )
+                        .await;
                         req.resume_checkpoint_json = None;
                         if let Err(clear_error) =
                             session_manager.store().clear_orchestration_checkpoint(session_id).await
@@ -3471,6 +3534,19 @@ pub async fn run_shared_agent(
                     req.cancel_token.clone(),
                 )
                 .await;
+            // Pre-coordinator abort (item: setup aborts): a session exists, so
+            // the refusal also records a Decision-shaped row (the capability
+            // refusal row above stays as the ADR-66 record).
+            crate::bypass_decision::record_decision_row(
+                Some(executor.as_ref()),
+                gate_log_pool.as_ref(),
+                session_id,
+                "provider-capability-refused",
+                &format!(
+                    "model {refused_model} on {refused_provider} lacks capability {capability}"
+                ),
+            )
+            .await;
             return Err(OrchestratorError::Provider(refusal));
         }
     }
@@ -4869,6 +4945,18 @@ async fn drive_supervised_run(
          (ADR-60 Deferred 3): in-flight review state is lost on restart"
     );
     let mut supervisor = Supervisor::new(run.config);
+    // Keep a pool handle for the Decision rows emitted after `run.services` is
+    // moved into the supervisor (`with_services`).
+    let decision_pool = run.services.whiteboard_pool.clone();
+    // Supremacy invariant (item: supervisor child spawn): a child that cannot
+    // be spawned is routed into the run's failure accounting and a Coordinator
+    // Decision row — it is NOT a terminal error to the caller. The remaining
+    // children still run under the shared write gate, and the run ends Partial
+    // with the failed agent named. (Retry/ladder is the process-supervision
+    // driver's existing `max_restarts` bound, which governs runtime crashes;
+    // a start failure has no in-flight process to restart, so it is decided
+    // directly as a failed subtask.)
+    let mut failed_to_start: Vec<String> = Vec::new();
     for (agent_id, description) in &run.tasks {
         let mut command = std::process::Command::new(&run.binary);
         command
@@ -4886,11 +4974,16 @@ async fn drive_supervised_run(
             command.env("CONCERTO_PLAN_ID", plan_id);
         }
         if let Err(error) = supervisor.spawn_agent(&mut command, agent_id) {
-            event_recorder.stop().await;
-            transcript_recorder.stop().await;
-            return Err(OrchestratorError::AgentLoopError(format!(
-                "supervised agent {agent_id} failed to start: {error}"
-            )));
+            tracing::warn!(%agent_id, %error, "supervised agent failed to start; recording a decision");
+            crate::bypass_decision::record_decision_row(
+                None,
+                Some(&decision_pool),
+                run.session_id,
+                "supervisor-agent-start-failed",
+                &format!("agent-process '{agent_id}' failed to start: {error}"),
+            )
+            .await;
+            failed_to_start.push(agent_id.clone());
         }
     }
 
@@ -4964,9 +5057,31 @@ async fn drive_supervised_run(
         .iter()
         .filter(|meta| meta.state == AgentState::Completed && expected.contains(&meta.agent_id))
         .count();
-    let all_completed = total > 0 && completed == total;
+    let all_completed = total > 0 && completed == total && failed_to_start.is_empty();
     for agent_id in &summary.failed {
         tracing::warn!(%agent_id, "supervised multi-agent run finished with a failed agent");
+        // Supremacy invariant: a runtime child crash / restart-budget
+        // exhaustion is recorded as a Coordinator Decision row (and accounted
+        // as a failed subtask below), never a silent terminal.
+        let reason = summary
+            .agents
+            .iter()
+            .find(|meta| &meta.agent_id == agent_id)
+            .map(|meta| {
+                format!(
+                    "agent-process '{agent_id}' failed (state={:?}, restarts={})",
+                    meta.state, meta.restart_count
+                )
+            })
+            .unwrap_or_else(|| format!("agent-process '{agent_id}' failed"));
+        crate::bypass_decision::record_decision_row(
+            None,
+            Some(&decision_pool),
+            run.session_id,
+            "supervisor-agent-failed",
+            &reason,
+        )
+        .await;
     }
     let final_message = if all_completed {
         format!(
@@ -4974,12 +5089,29 @@ async fn drive_supervised_run(
              write gate."
         )
     } else {
+        let mut failed_all: Vec<String> = summary.failed.clone();
+        for agent_id in &failed_to_start {
+            if !failed_all.contains(agent_id) {
+                failed_all.push(agent_id.clone());
+            }
+        }
         let failed_list =
-            if summary.failed.is_empty() { "none".to_owned() } else { summary.failed.join(", ") };
+            if failed_all.is_empty() { "none".to_owned() } else { failed_all.join(", ") };
         format!(
             "Supervised run partially completed: {completed}/{total} agent process(es) finished; \
              failed agents: {failed_list}."
         )
+    };
+    // Item (warn-only drops): ONE degraded note for the run summary rather than
+    // a Decision row per continuity drop (the supervisor's `degraded` flag).
+    let final_message = if summary.degraded {
+        format!(
+            "{final_message} Degraded: a continuity write (shutdown checkpoint / lease release) \
+             could not be persisted; the individual warnings remain in the logs. Restart restore \
+             may fall back to a full log replay."
+        )
+    } else {
+        final_message
     };
     let project_root =
         camino::Utf8PathBuf::from_path_buf(run.project_root.clone()).unwrap_or_default();
@@ -5132,7 +5264,17 @@ fn resume_scope_project_id(project_dir: &Path) -> String {
 async fn suppress_stale_checkpoint_for_apply(
     session_manager: &ProjectSessionManager,
     session_id: Ulid,
+    executor: Option<&concerto_core::ToolExecutor>,
+    pool: Option<&sqlx::SqlitePool>,
 ) {
+    crate::bypass_decision::record_decision_row(
+        executor,
+        pool,
+        session_id,
+        "checkpoint-cleared-pre-execute",
+        "plan-driven Execute suppresses any stale checkpoint so the approved plan governs",
+    )
+    .await;
     if let Err(error) = session_manager.store().clear_orchestration_checkpoint(session_id).await {
         tracing::warn!(%error, "failed to clear checkpoint before plan-driven Execute");
     }
@@ -8541,7 +8683,7 @@ mod runtime_runner_tests {
 
         // The Apply path clears it (M2) so the run re-plans from the
         // approved plan instead of resuming the old partial graph.
-        suppress_stale_checkpoint_for_apply(&manager, session_id).await;
+        suppress_stale_checkpoint_for_apply(&manager, session_id, None, None).await;
 
         assert!(
             store_dyn
