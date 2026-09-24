@@ -55,6 +55,17 @@ persistence, and session recording; the entries below are the genuine
 gaps. Team-hub/asset-ACL machinery is out of scope for a single-user
 agent. Scheduled after the live-test phase (2026-08-06 decision).
 
+- **FTS BM25 ranking (STUB-FINDINGS #6, DEFERRED #20).**
+  **(Resolved 2026-09-24)** `SqliteFullTextStore::search()` selects SQLite FTS5
+  `rank()` with `ORDER BY rank` and negates it into `FtsResult.score`
+  (`crates/memory/src/fts.rs:148,160-163`), so FTS results are always BM25
+  rank-ordered into RRF fusion (`crates/memory/src/rag.rs:412-459`); the stored
+  `score: 1.0` is inert by construction (`crates/memory/src/sync.rs:61,130`).
+  Proven by `fts.rs:404-450` (BM25 term-frequency ordering) and `fts.rs:458-498`
+  (a deliberately non-neutral stored score never surfaces — score equals
+  `-rank`). This closes the "FTS BM25 ranking not wired" item that STATUS.md
+  and STUB-FINDINGS #6 cross-referenced to this file.
+
 - **Symbolic short-term memory / context offload.** Not started — requires
   an ADR before code (ADR-first rule; next number ADR-46). TencentDB
   compresses tool results into a Mermaid node-graph with `node_id` tracing,

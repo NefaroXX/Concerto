@@ -44,7 +44,6 @@ a note.
 | 17 | Eval end-to-end benchmark task (live runtime over real benchmark) | ROADMAP:238–242 | When multi-agent quality + recovery are reliable (ROADMAP ~241) | L |
 | 18 | Coordinator restart/resume end-to-end (cross-process continue) | TODO.md:18–25 (Partial; e2e remains); ADR-34 D2 | After checkpoint persistence + evidence-spine resume e2e | L |
 | 19 | Audit-log retention policy | ADR-40:47 ("future policy question"); TODO.md:14–17 | When an audit-log retention policy is written | S |
-| 20 | FTS BM25 `rank()` wired into retrieval | ROADMAP:162; `crates/memory/src/sync.rs:59,90` writes neutral score 1.0 | When real BM25 rank replaces the neutral 1.0 scorer | M |
 | 21 | Fault-injection tests for multi-agent containment (rate limits, malformed tool calls, missing executables, cancellation races, provider disconnects) | TODO.md:218–224 | ADR-26 boundaries; part of live-test phase | L |
 | 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | With ADR-46/48 reasoning + parts split (Phase 2) | L |
 | 23 | ADR-53 per-token streaming through WASM (heartbeat landed) | ADR-53:137–139 (streaming through WASM deferred; heartbeat keepalive landed per ADR-53/57) | Verify streaming scope remains deferred | M |
@@ -88,12 +87,16 @@ a note.
 9. Tier-1 + Tier-2 providers — implemented 2026-09-24 (missing-providers.md: 22 provider ids registered, :5–33; "Tier 1 & 2 DONE", :53–57; ROADMAP:46–52 "Provider reach (2026-09-24)" — config-first factory covers all 22).
 10. Eval `#[ignore]` un-ignore — resolved 2026-09-24 (TODO.md:207–217; TESTING.md).
 11. Agent-loop wildcard-panic guard — resolved 2026-09-24 (TODO.md:225–236).
+12. FTS BM25 `rank()` wired into retrieval — stale-verified, closed 2026-09-24 (chunk FTS always BM25 rank-ordered: `fts.rs:148` `ORDER BY rank`, RRF fusion `rag.rs:412-459`; stored 1.0 inert by construction `sync.rs:61,130`; proven by tests `fts.rs:404-450,458-498`).
 
 ## Verification notes (2026-09-24)
 
 - Row 12 (ChunkSelector char-budget allocator) merged into row 5 (recall
   budget caps + timeout) on 2026-09-24; the #12 numbering gap is left
   intentionally (no renumbering).
+- Open row 20 (FTS BM25 `rank()` wired into retrieval) was closed 2026-09-24
+  as **stale-verified** — by the time it was registered, the deferral's
+  re-entry condition was already met in code (see Closed #12 for evidence).
 - Every closed claim was verified by grep/read against a repo source before
   listing. Two inventory "closed" claims failed verification and are instead
   carried as open rows flagged `[verify]`: **health echo** (no feature named
@@ -123,5 +126,6 @@ a note.
 - Source trail: `docs/TODO.md`, `docs/STATUS.md`, `ROADMAP.md`,
   `docs/missing-providers.md`, `docs/security-threat-model.md`,
   `docs/adrs/ADR-{21,35,43,47,48,49,53,55,60,67,69}.md`, `docs/ARCHITECTURE-V2.md`,
-  `crates/config/src/schema.rs:649,683`, `crates/memory/src/sync.rs:59,90`,
+  `crates/config/src/schema.rs:649,683`, `crates/memory/src/sync.rs:61,130`,
+  `crates/memory/src/fts.rs:148,404-450,458-498`, `crates/memory/src/rag.rs:412-459`,
   `crates/core/src/event.rs:386,394`.

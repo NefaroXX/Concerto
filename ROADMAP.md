@@ -159,9 +159,12 @@ shape the roadmap.
   implemented on `feat/evidence-spine`. The remaining gap is cross-process
   restart-resume so a Continue after application restart reconciles running
   tasks to pending without rerunning completed graph nodes (ADR-34 decision 2).
-- **Real FTS BM25 ranking:** propagate SQLite FTS5 `rank()` into hybrid
-  retrieval instead of the neutral `score: 1.0` written by the sync layer
-  (`crates/memory/src/sync.rs:59,90`) — quick win from STUB-FINDINGS #6.
+- **Real FTS BM25 ranking — landed 2026-09-24:** SQLite FTS5 `rank()` is
+  selected and negated into `FtsResult.score`, so FTS results reach RRF already
+  rank-ordered (`crates/memory/src/fts.rs:148,160-163`;
+  `crates/memory/src/rag.rs:412-459`); the stored `score: 1.0` is inert by
+  construction (`crates/memory/src/sync.rs:61,130`), proven by
+  `crates/memory/src/fts.rs:404-450,458-498`. (STUB-FINDINGS #6, DEFERRED #20.)
 - **Provider reach follow-ups:** the named OpenAI-compatible wrappers are
   implemented (22 provider ids); remaining work is the *flat*/content-embedded
   tool-call parsing for proxies documented in `docs/proxy-tool-call-fix.md`

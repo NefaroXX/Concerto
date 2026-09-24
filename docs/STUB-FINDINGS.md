@@ -10,7 +10,7 @@ carries its current resolved/open status, and open items are tracked in
 
 | # | Stub | Effort | Impact | Priority |
 |---|------|--------|--------|----------|
-| 6 | FTS sync score hardcoded to 1.0 (not 0.0) | ~20 lines | Hybrid search quality | Open — TODO entry |
+| 6 | FTS sync score hardcoded to 1.0 (not 0.0) | ~20 lines | Hybrid search quality | Resolved 2026-09-24 |
 | 8 | Eval runner integration test ignored | 1 line | CI coverage gap | Resolved 2026-09-24 |
 | 7 | Tool log overlay detail fields | ~5 lines | Desktop UX | Resolved 2026-08-03 |
 | 5 | Global memory namespace | Design + ~50 lines | Feature missing | Resolved 2026-08-03 |
@@ -66,6 +66,21 @@ Still open. The stored default is `1.0` (`crates/memory/src/sync.rs:59,90`),
 not `0.0`, and the real BM25 value remains unwired — the fix above is
 untouched. Tracked as the TODO entry "FTS BM25 ranking not wired"
 (`docs/TODO.md`).
+
+### Resolution (2026-09-24, supersedes)
+
+Resolved. FTS is always BM25 rank-ordered: `SqliteFullTextStore::search()`
+selects SQLite FTS5 `rank()` with `ORDER BY rank` (`crates/memory/src/fts.rs:148`)
+and negates it into `FtsResult.score` (`fts.rs:160-163`), so FTS results reach
+RRF fusion (`crates/memory/src/rag.rs:412-459`) rank-ordered. The stored
+`score: 1.0` is inert by construction (`crates/memory/src/sync.rs:61,130`,
+the identical `insert()` / `replace_project()` write paths — the FTS store
+never persists the writer's score). Proven by
+`fts_search_returns_ranked_results` (`fts.rs:404-450`) and
+`search_scores_are_rank_authoritative_not_stored_scores` (`fts.rs:458-498`,
+which asserts a deliberately non-neutral stored score never surfaces).
+DEFERRED.md #20 closed stale-verified; ROADMAP quick-win marked landed; the
+TODO entry cross-referenced here is marked resolved.
 
 ---
 
@@ -444,12 +459,14 @@ remaining open items (#6 FTS BM25, #8 eval test un-ignore) are tracked in
 
 #8 is resolved: the `#[ignore]` was removed in the routing-carcass cleanup
 (`fallback_mode_runs_tests` is a plain `#[tokio::test]` at
-`crates/eval/src/runner.rs:471-484`). Only #6 (FTS BM25 ranking) remains open;
-summary rows below reflect this.
+`crates/eval/src/runner.rs:471-484`). #6 (FTS BM25 ranking) is also resolved —
+FTS results are always BM25 rank-ordered by construction, the stored 1.0 is
+inert, and the change is proven by the fts.rs tests (see Stub 6 resolution,
+2026-09-24). All eight stubs are now closed. Summary rows below reflect this.
 
 | Stub | Change | Status |
 |------|--------|--------|
-| #6 | Add BM25 score to FTS query results | Open — tracked in `docs/TODO.md` ("FTS BM25 ranking not wired") |
+| #6 | Add BM25 score to FTS query results | Resolved 2026-09-24 — `fts.rs:148` selects/negates FTS5 `rank()`; stored 1.0 inert (`sync.rs:61,130`); proven by `fts.rs:404-450,458-498` |
 | #8 | Remove `#[ignore]` from eval test | Resolved 2026-09-24 — `#[ignore]` removed in routing-carcass cleanup |
 | #7 | Show `input_summary` instead of `full_input` in tool log | Resolved 2026-08-03 |
 
