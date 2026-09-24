@@ -852,6 +852,7 @@ impl AgentLoop {
                     attempts,
                     elapsed,
                     last_error,
+                    ..
                 })) => {
                     self.state = AgentState::Failed;
                     let partial = self.build_agent_output(

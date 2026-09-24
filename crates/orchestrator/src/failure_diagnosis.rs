@@ -965,6 +965,7 @@ mod tests {
             attempts: 4,
             elapsed: Duration::from_secs(30),
             last_error: "all retries failed".into(),
+            throttled: false,
         }));
         assert_eq!(exhausted.code, "provider-retries-exhausted");
         assert!(!exhausted.transient && !exhausted.retryable && !exhausted.same_agent_viable);

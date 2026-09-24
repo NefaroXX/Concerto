@@ -4229,11 +4229,16 @@ impl CoordinatorAgent {
     /// Dead-pipe failover (smoke audit 01M35YG93): a dispatch failure that is
     /// PERMANENT for the assigned pipe yet ALTERNATE-viable — the assignment's
     /// provider/model is dead (HTTP 404 model-not-found, auth, capability
-    /// refusal, model-unavailable) — would fail again if redecomposed onto the
+    /// refusal, model-unavailable) or its retry budget was exhausted on
+    /// throttling / transient 5xx — would fail again if redecomposed onto the
     /// SAME assignment. Retry the SAME subtask ONCE on the run's default-model
     /// pipe (ADR-45 tier-1b machinery: the same role rebuilt on
     /// `default_model_provider` and run with `default_model_profile`) BEFORE
     /// handing the failure back to the Coordinator model for redecomposition.
+    ///
+    /// `failure_cause` is the diagnosis code of the failed dispatch, recorded
+    /// in the attempt note so a throttle-exhausted failover is distinguishable
+    /// from a permanent-400 / model-not-found one.
     ///
     /// Bounded by the checkpointed per-subtask `default_model_provider_attempted`
     /// guard (at most once per subtask per run), gated on the user's
@@ -4250,6 +4255,7 @@ impl CoordinatorAgent {
         failed_profile: &ModelProfile,
         context: &AgentContext,
         cancel: &CancellationToken,
+        failure_cause: &str,
     ) -> Option<AgentRunResult> {
         if !self.default_model_fallback {
             self.append_dispatch_failover_decision(
@@ -4304,7 +4310,7 @@ impl CoordinatorAgent {
             "dispatch-failover-attempted",
             &format!(
                 "Retrying {agent_id} subtask {} once on the fallback pipe {}/{} \
-                 after the assigned pipe failed",
+                 after the assigned pipe failed ({failure_cause})",
                 subtask.id, fallback_profile.profile.provider, fallback_profile.profile.model
             ),
         )
@@ -9523,13 +9529,14 @@ impl CoordinatorAgent {
     ///
     /// ADR-42/45 ladder semantics, owned by the Coordinator now that the
     /// compiled scheduler is gone: when the planning dispatch session's
-    /// provider fails with a provider-class error (HTTP status, auth, or
-    /// capability refusal — never cancellation or a structural error), the
-    /// Coordinator retries `decompose_task` ONCE on the run's default-model
-    /// provider (ADR-45 tier-1b pipe) and records the attempt as an ADR-65
-    /// `Decision` whiteboard event. The retry counts toward
-    /// `model_dispatch_count` exactly like any ladder-tier dispatch (ADR-52),
-    /// because the retried `run_dispatch_session` increments it per turn.
+    /// provider fails with a provider-class error (HTTP status, auth,
+    /// capability refusal, or a throttle/transient-5xx-caused retry exhaustion
+    /// — never cancellation or a structural error), the Coordinator retries
+    /// `decompose_task` ONCE on the run's default-model provider (ADR-45
+    /// tier-1b pipe) and records the attempt as an ADR-65 `Decision` whiteboard
+    /// event. The retry counts toward `model_dispatch_count` exactly like any
+    /// ladder-tier dispatch (ADR-52), because the retried
+    /// `run_dispatch_session` increments it per turn.
     ///
     /// The retry is skipped — straight to a graceful `Partial` — when
     /// cancellation/structural errors surface, the run already consumed its
@@ -9552,6 +9559,14 @@ impl CoordinatorAgent {
         if is_cancellation_error(original_error) {
             return PlanningRecoveryOutcome::Exhausted;
         }
+        // Recoverable provider failures: any surfaced HTTP status (permanent
+        // 400 included, historically), auth, capability refusal, and — new —
+        // a retry exhaustion whose cause was throttling / transient 5xx. The
+        // production failure this closes: the planning pipe died after its
+        // retry budget was exhausted on repeated 429s while a healthy
+        // alternate pipe sat idle. An auth/permanent/network-unknown-caused
+        // exhaustion keeps the historical skip (no alternate pipe is the
+        // textbook answer for those).
         let recoverable = matches!(
             original_error,
             OrchestratorError::Provider(
@@ -9559,19 +9574,36 @@ impl CoordinatorAgent {
                     | ProviderError::AuthFailure
                     | ProviderError::CapabilityRefused { .. }
             )
+        ) || matches!(
+            original_error,
+            OrchestratorError::Provider(error) if error.is_throttle_exhaustion()
         );
         if !recoverable {
             return PlanningRecoveryOutcome::Exhausted;
         }
-        self.retry_planning_on_default_model(
-            task,
-            context,
-            cancel,
-            "planning-provider-recovery",
-            "Retry the planning dispatch session on the run's default-model provider \
-             (ADR-45 tier-1b fallback) after the planning provider failed",
-        )
-        .await
+        // The Decision reason must distinguish the throttle-exhausted cause
+        // from the ordinary provider-failure path (an operator reading the
+        // whiteboard can tell *why* recovery fired).
+        let throttle_exhausted = matches!(
+            original_error,
+            OrchestratorError::Provider(error) if error.is_throttle_exhaustion()
+        );
+        let (tag_prefix, decision_output) = if throttle_exhausted {
+            (
+                "planning-provider-recovery-throttle-exhausted",
+                "Retry the planning dispatch session on the run's default-model provider \
+                 (ADR-45 tier-1b fallback) after the planning provider exhausted its retries \
+                 on throttling / transient-5xx responses (rate limit, overload, 5xx)",
+            )
+        } else {
+            (
+                "planning-provider-recovery",
+                "Retry the planning dispatch session on the run's default-model provider \
+                 (ADR-45 tier-1b fallback) after the planning provider failed",
+            )
+        };
+        self.retry_planning_on_default_model(task, context, cancel, tag_prefix, decision_output)
+            .await
     }
 
     /// Coordinator-owned recovery for a prose-only, zero-dispatch planning
@@ -11153,13 +11185,30 @@ impl CoordinatorAgent {
                 // BEFORE handing the failure back to the decision loop; a
                 // successful failover flows through the normal post-dispatch
                 // handling above.
-                let failover = if !diagnosis.transient && diagnosis.alternate_agent_viable {
+                //
+                // Throttle-caused retry exhaustion joins the eligible set
+                // explicitly via the shared `is_throttle_exhaustion` predicate:
+                // when the assigned pipe burned its own retry budget on
+                // throttling / transient 5xx, an idle alternate pipe is the
+                // textbook answer, so the failover must not skip it. Non-throttle
+                // paths are unchanged (a non-throttle `RetryExhausted` is already
+                // diagnosed non-transient; every other cause keeps the existing
+                // diagnosis-driven gate).
+                let throttle_exhausted = matches!(
+                    &error,
+                    OrchestratorError::Provider(provider_error)
+                        if provider_error.is_throttle_exhaustion()
+                );
+                let failover = if (!diagnosis.transient || throttle_exhausted)
+                    && diagnosis.alternate_agent_viable
+                {
                     self.attempt_dispatch_failover(
                         &run_subtask,
                         &agent_id,
                         &profile,
                         &failover_ctx,
                         cancel,
+                        &diagnosis.code,
                     )
                     .await
                 } else {
@@ -14800,7 +14849,8 @@ mod tests {
                 concerto_core::error::ProviderError::RetryExhausted {
                     attempts: 3,
                     elapsed: std::time::Duration::from_secs(30),
-                    last_error: "all retries failed".into()
+                    last_error: "all retries failed".into(),
+                    throttled: false,
                 }
             )),
             SubtaskFailureClass::LimitReached
@@ -17930,6 +17980,34 @@ mod tests {
         }))
     }
 
+    /// The production regression: the provider's own retry layer burned its
+    /// budget on repeated 429s, surfacing `RetryExhausted` with the throttle
+    /// cause retained. An idle alternate pipe is the textbook answer, so the
+    /// coordinator must recover rather than skip.
+    fn throttle_exhausted_provider_error() -> ProviderError {
+        ProviderError::RetryExhausted {
+            attempts: 8,
+            elapsed: std::time::Duration::from_secs(120),
+            last_error: "transient HTTP status 429; maximum attempt count (8) reached".into(),
+            throttled: true,
+        }
+    }
+
+    /// A retry exhaustion whose cause was NOT throttling (auth / permanent /
+    /// transport-unknown). The coordinator must keep its conservative skip.
+    fn non_throttle_exhausted_provider_error(last_error: &str) -> ProviderError {
+        ProviderError::RetryExhausted {
+            attempts: 4,
+            elapsed: std::time::Duration::from_secs(30),
+            last_error: last_error.to_owned(),
+            throttled: false,
+        }
+    }
+
+    fn err_throttle_exhausted() -> Result<AgentRunResult, OrchestratorError> {
+        Err(OrchestratorError::Provider(throttle_exhausted_provider_error()))
+    }
+
     /// Decision events EXCLUDING the always-recorded run-shape decision (which
     /// carries a `final_shape` payload key). Planning/dispatch/recovery tests
     /// count only the operational decisions.
@@ -18605,6 +18683,225 @@ mod tests {
         assert!(
             decisions.is_empty(),
             "cancellation records no planning-recovery decision: {decisions:?}"
+        );
+    }
+
+    /// Production regression: the planning pipe died after its retry budget
+    /// was exhausted on repeated 429s (`RetryExhausted` carrying the throttle
+    /// cause) while a healthy alternate pipe sat idle. The throttle-caused
+    /// exhaustion is now in the planning-recovery set, so the fallback is
+    /// attempted exactly once and the run proceeds. The Decision reason is
+    /// distinct from the ordinary provider-failure path.
+    #[tokio::test]
+    async fn planning_recovery_attempts_fallback_on_throttle_exhaustion() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                throttle_exhausted_provider_error(),
+                primary_requests.clone(),
+            ));
+        // The default-model pipe is non-degenerate (`nim` != the failed
+        // `google` planning pipe) and serves the recovered planning turn.
+        let default_pipe = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Recovered plan\nthrottle failover produced it".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("nim", "default-nim"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the throttle-exhaustion recovery must complete the run, got: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("throttle failover produced it"),
+            "the fallback plan is the run's final message: {}",
+            output.final_message,
+        );
+        assert_eq!(
+            default_pipe.turn_count(),
+            1,
+            "the fallback must be attempted exactly once on the recovered planning turn"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the throttle-exhausted planning pipe is consulted once before recovery"
+        );
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        assert_eq!(decisions.len(), 1, "exactly one planning-recovery decision: {decisions:?}");
+        assert_eq!(
+            decisions[0].payload["reason"],
+            "planning-provider-recovery-throttle-exhausted-attempted",
+            "the throttle cause is distinguishable in the Decision reason"
+        );
+    }
+
+    /// A `RetryExhausted` whose underlying cause was NOT throttling (auth)
+    /// keeps the historical conservative skip: no recovery, no fallback
+    /// dispatch, and the run pauses as Partial.
+    #[tokio::test]
+    async fn planning_recovery_skips_auth_caused_exhaustion() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                non_throttle_exhausted_provider_error("provider authentication failed"),
+                primary_requests.clone(),
+            ));
+        let default_pipe = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# should never be produced".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("nim", "default-nim"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an auth-caused exhaustion must still pause as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(
+            default_pipe.turn_count(),
+            0,
+            "an auth-caused exhaustion must not consult the fallback provider"
+        );
+    }
+
+    /// A `RetryExhausted` whose underlying cause is transport-unknown (network)
+    /// also keeps the conservative skip — the cause allowlist does not include
+    /// it, so no fallback is attempted.
+    #[tokio::test]
+    async fn planning_recovery_skips_network_caused_exhaustion() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                non_throttle_exhausted_provider_error(
+                    "temporary network failure: connection reset",
+                ),
+                primary_requests.clone(),
+            ));
+        let default_pipe = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# should never be produced".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("nim", "default-nim"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a network-caused exhaustion must still pause as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(
+            default_pipe.turn_count(),
+            0,
+            "a network-caused exhaustion must not consult the fallback provider"
+        );
+    }
+
+    /// A throttle-caused exhaustion whose only fallback resolves to the SAME
+    /// (provider, model) as the failed planning pipe still skips (degenerate):
+    /// recovering would just repeat the throttle. The throttle-specific
+    /// Decision reason records the skip.
+    #[tokio::test]
+    async fn planning_recovery_skips_degenerate_throttle_exhaustion() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                throttle_exhausted_provider_error(),
+                primary_requests.clone(),
+            ));
+        // Degenerate: the only fallback IS the planning pipe (`test/cheap`).
+        let default_pipe = Arc::new(TurnProvider::new(Vec::new()));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                default_pipe.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("test", "cheap"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a degenerate throttle fallback must pause as Partial, got: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(default_pipe.turn_count(), 0, "the degenerate pipe must never be consulted");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let decisions = operational_decisions(&logged);
+        assert_eq!(decisions.len(), 1, "exactly one planning-recovery decision: {decisions:?}");
+        assert_eq!(
+            decisions[0].payload["reason"],
+            "planning-provider-recovery-throttle-exhausted-skipped-degenerate",
         );
     }
 
@@ -29250,6 +29547,88 @@ mod tests {
         );
     }
 
+    /// Production regression (dispatch leg): the assigned pipe exhausted its
+    /// retry budget on throttling (`RetryExhausted`, throttle cause) — a
+    /// normally non-transient, alternate-viable diagnosis. The throttle cause
+    /// keeps the subtask eligible for the one-shot dispatch failover, the
+    /// rebuilt role succeeds on the default-model pipe, and the attempt note
+    /// names the `provider-retries-exhausted` cause so a throttle failover is
+    /// distinguishable from a permanent-400 / model-not-found one.
+    #[tokio::test]
+    async fn dispatch_failover_attempts_throttle_exhausted_pipe() {
+        use concerto_core::traits::provider::LlmProvider;
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let role = AgentId::new("researcher");
+        // The bound pipe exhausted its retries on repeated 429s.
+        let bound =
+            Arc::new(MockExpertAgent::sequence(role.clone(), vec![err_throttle_exhausted()]));
+        let rescued = Arc::new(MockExpertAgent::always_succeed(
+            role.clone(),
+            "default pipe rescued the throttled assignment",
+        ));
+        let mut registry = AgentRegistry::new();
+        registry.register_with_factory(
+            role.clone(),
+            bound,
+            Arc::new(move |_provider: Arc<dyn LlmProvider>| rescued.clone()),
+        );
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(registry),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the codebase")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        let mut coordinator =
+            coordinator.with_review_store(Some(pool.clone())).with_default_model_provider(
+                Some(Arc::new(MockProvider::default()) as Arc<dyn LlmProvider>),
+                Some(fallback_profile("fallback", "default-model")),
+            );
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let task = AgentTask::new(Ulid::new(), "investigate the codebase");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("a throttled pipe must not crash the run");
+
+        // No redecompose: exactly the scripted dispatch + the final text.
+        assert_eq!(provider.turn_count(), 2, "the failover avoided a redecompose turn");
+        assert_eq!(
+            coordinator.default_model_provider_attempted.len(),
+            1,
+            "the throttle-exhausted subtask spends exactly one failover slot"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the rescued subtask completes: {}",
+            output.final_message
+        );
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 500 },
+        )
+        .await
+        .expect("the log loads");
+        let attempt = logged
+            .iter()
+            .find(|event| event.payload["reason"] == "dispatch-failover-attempted")
+            .expect("the throttle failover attempt is recorded");
+        let note = attempt.payload["required_output"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("provider-retries-exhausted"),
+            "the failover note names the throttle-exhaustion cause: {note}"
+        );
+    }
+
     /// Bounded: when the default-model pipe ALSO fails, the failure is
     /// surfaced unchanged and the decision loop redecomposes — each subtask id
     /// gets at most one failover, and the redecomposed assignment is a NEW
@@ -29464,6 +29843,7 @@ mod tests {
                 &failed,
                 &context,
                 &CancellationToken::new(),
+                "test-failure",
             )
             .await;
         assert!(result.is_none(), "a degenerate failover must not dispatch");
@@ -29556,6 +29936,7 @@ mod tests {
                 &failed,
                 &context,
                 &CancellationToken::new(),
+                "test-failure",
             )
             .await;
 
