@@ -17,6 +17,10 @@ a note.
 > source + date, a re-entry condition, and a size. Rows flagged `[verify]` had
 > no traceable repo source and are marked for confirmation; rows flagged
 > `[unplanned]` have no repo register at all.
+> **Append 2026-09-24:** open rows 36–49 added (isolation, UI, provider-parsing
+> residual, release, memory-grounded resume, security-threat-model gaps #3–#9,
+> Phase 3 benchmarks, ADR-60 S5 agent-process slice); Tier-1/2 provider closure
+> in the Closed appendix dated/sourced; row 32 flagged `[dangling-cite]`.
 
 ## Open register
 
@@ -53,10 +57,24 @@ a note.
 | 29 | ADR-43 server mode / SSE / marketplace / persistent desktop state / TOML secrets | ADR-43 §3 v1 note (MCP server mode, SSE transport, marketplace/registry, keyring-backed tokens, persistent desktop state deferred); docs/skills.md:202 | When the API surface / web UI materializes | L |
 | 30 | Plugin hot-reload / remote / registry / marketplace | TODO.md:108–110 | Requires community/registry story (ADR-21, ADR-43 deferred) | L |
 | 31 | L1/STM/PersonaMem memory items (typed extraction, scene memory, persona eval) | TODO.md:58–99 (L1 70–80, STM 65–70, heuristics 89–95, PersonaMem 96–99) | Post-memory relayout (ADR-63/64) | M |
-| 32 | Certified evolution (profile-guided CI, safety gates) | TODO.md:286–293; ROADMAP | When certified-evolution research plan lands | L |
+| 32 | Certified evolution (profile-guided CI, safety gates) | TODO.md:286–293; ROADMAP:189–193 — `[dangling-cite]` the referenced `docs/research/certified-universal-evolution.md` (cited at TODO.md:287, ROADMAP:190) is missing on disk | When certified-evolution research plan lands (restore/rewrite the research doc or re-scope) | L |
 | 33 | Review/validation escalation (informational evidence; no terminal conversion) | ADR-35 §9/amendment; TODO.md:48–52; core/src/event.rs:386,394 (event-bearing only) | When coordinator decides terminal escalation (ADR-35 amended 2026-09-05) | S |
 | 34 | C-05/C-06/C-03 + M-08/M-05/M-02 audit cleanups | TODO.md:38–41 (C-05), 237 (C-06), 32–33 (C-03), 241 (M-08), 246 (M-05), 251 (M-02); AUDIT_FINDINGS_CURRENT.md | When module refactors + coverage are scheduled | L |
 | 35 | STATUS-tracked follow-ups (ENV_LOCK, glyphs, multiline, P4/ADR-59 deferrals, release checklist) | STATUS.md "Tracked follow-ups" ~328–355 | Per tracked follow-up row; each release | M |
+| 36 | Containerized sandbox bundle — `SandboxProfile::Containerized` OS-level isolation | TODO.md:103; ROADMAP:235; security-threat-model.md §6 gap #1 (:310–315, "No Containerized Plugin Sandbox"); real stub — variant declared but not implemented (architecture.md:250, STATUS.md:272), plugins run only under the WASM capability sandbox | When post-1.0 isolation design lands (namespace/cgroup isolation for the Containerized profile) | L |
+| 37 | Hybrid UI full scope (tabbed Settings, Studio split pane, drag-and-drop agent assignment, focus-trap) | TODO.md:145; ROADMAP:147 (post-1.0); docs/hybrid-ui-plan.md — standalone, not part of the world-class plan | Post-1.0 | L |
+| 38 | Flat/content-embedded tool-call parsing residual (beyond proxy Fixes 1–3) | TODO.md:190–195; ROADMAP:165–168 (residual after Fixes 1–3 landed, see Closed #8); docs/proxy-tool-call-fix.md | When sanitized proxy fixtures + pairwise verification land against real OpenAI-compatible proxies | S |
+| 39 | Binary installers (deb/rpm/tar) | TODO.md:260–263; ROADMAP:194 (Later); STATUS.md:11–14 (no installer packages promised today; only `.tar.gz` via scripts/release.sh) | When a release/distribution decision is made | M |
+| 40 | crates.io publish | TODO.md:264–265; ROADMAP:194 (Later); STATUS.md:12–13 (not published; `publish = false` in workspace Cargo.toml) | Release decision + metadata audit (workspace `publish=false`, licence, repository links) | M |
+| 41 | Memory-grounded resume — Phase 6 M3 (a) run-scoped priming, (b) outcome write-back, (c) plan↔worktree drift gadget | ROADMAP:196–212 (live-test-gated; exit gate = three tests, :208–212; no schema change, no new ADR at this scope) | When live stress/interrupt evidence lands + the three tests pass | M |
+| 42 | Windows shell quoting weakness (threat gap #3) | security-threat-model.md §6 :323–328 (~4 h; cmd.exe quoting weaker than POSIX) | When a security milestone is scheduled (prefer `bypass_shell` on Windows) | S |
+| 43 | API server per-client rate limiting (threat gap #4) | security-threat-model.md §6 :332–337 (~4 h) | When a security milestone is scheduled | S |
+| 44 | Audit-log at-rest encryption (threat gap #5) | security-threat-model.md §6 :339–344 (~8 h; SQLCipher / encrypt SQLite) — related: row 19 (audit-log retention policy) | When a security milestone is scheduled | M |
+| 45 | Shell-command CPU rate limiting (threat gap #6) | security-threat-model.md §6 :346–351 (~12 h; cgroup/ulimit integration) | When a security milestone is scheduled | M |
+| 46 | Plugin network egress filtering (threat gap #7) | security-threat-model.md §6 :355–360 (~8 h; network capability allowlist) | When a security milestone is scheduled | M |
+| 47 | Memory encryption for sensitive data (threat gap #9) | security-threat-model.md §6 :373–378 (~8 h; mlock/madvise secure allocation) | When a security milestone is scheduled | M |
+| 48 | Codebase-world-class Phase 3 criterion benchmarks + CI benchmark gate | world-class-plan.md:186–208 (Phase 3 group); TODO.md:153–154; part of the Phases 1–5 group (TODO.md:148–156) | When the Phase 3 benchmark milestone is scheduled (criterion suite + CI gate) | M |
+| 49 | ADR-60 S5 agent-process slice — mock-only provider + `DenyAllApprovalSink` | crates/orchestrator/src/bin/agent_process.rs (`CONCERTO_PROVIDER` accepts only "mock", :137–152; interactive approvals dropped as `DenyAllApprovalSink`, :155, :292–336 — "ADR-60 deferred" per code comment) | When supervisor wiring completes: real provider injection + approvals/acks surfaced through the supervisor (today always denied, never a real approval channel) | S |
 
 ## Closed appendix (each line verified with a repo source)
 
@@ -68,7 +86,7 @@ a note.
 6. ReviewResume module removal — landed (CHANGELOG:33–34; commit `cbb09b0`).
 7. Threat sanitizer + hash pinning (threat gaps #2, #8) — closed (security-threat-model.md, 2026-09-19 / 2026-09-24).
 8. Proxy tool-call parsing Fixes 1–3 — landed (ROADMAP:168; missing-providers.md:51; flat/content-embedded legacy residual tracked in TODO.md:190–195).
-9. Tier-1 + Tier-2 providers — implemented (missing-providers.md: 22 providers delivered).
+9. Tier-1 + Tier-2 providers — implemented 2026-09-24 (missing-providers.md: 22 provider ids registered, :5–33; "Tier 1 & 2 DONE", :53–57; ROADMAP:46–52 "Provider reach (2026-09-24)" — config-first factory covers all 22).
 10. Eval `#[ignore]` un-ignore — resolved 2026-09-24 (TODO.md:207–217; TESTING.md).
 11. Agent-loop wildcard-panic guard — resolved 2026-09-24 (TODO.md:225–236).
 
@@ -92,6 +110,14 @@ a note.
   decision (research-doc mention only), setup-wizard per-variant auth
   (setup.rs exists; variants unverified), live-API smoke tests (manual matrices
   only).
+- 2026-09-24 append: `docs/research/certified-universal-evolution.md` is cited
+  at TODO.md:287 and ROADMAP:190 but is absent from `docs/research/` on this
+  checkout — carried on open row 32 as `[dangling-cite]` (annotated, not
+  deleted). The `live-test-skills-mcp.md` Nextest expectation was refreshed to
+  the latest documented full-workspace count (3421, ROADMAP evidence-spine
+  verification) after the eval `#[ignore]` was removed (Closed #10); the exact
+  count is re-confirmed on the next live-test run, not by a fresh suite run
+  here.
 - Source trail: `docs/TODO.md`, `docs/STATUS.md`, `ROADMAP.md`,
   `docs/missing-providers.md`, `docs/security-threat-model.md`,
   `docs/adrs/ADR-{21,35,43,47,48,49,53,55,60,67,69}.md`, `docs/ARCHITECTURE-V2.md`,
