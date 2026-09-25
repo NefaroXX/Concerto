@@ -26,7 +26,7 @@ pub mod schema_sanitize;
 pub use anthropic::AnthropicChatDialect;
 pub use google::GeminiChatDialect;
 pub use ollama::OllamaChatDialect;
-pub use openai_compat::OpenAiChatDialect;
+pub use openai_compat::{map_usage, OpenAiChatDialect, UsageRequest};
 
 /// Controls whether collected `reasoning_content` is echoed back to the
 /// provider on assistant messages (ADR-46).

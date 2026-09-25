@@ -20,6 +20,12 @@ use crate::sse::BufferedSseParser;
 /// for code that names it next to [`OpenAiProvider`] (e.g. `crate::opencode`).
 pub use crate::adapters::ReasoningEcho;
 
+/// Re-export of the usage-request policy (ADR-48 §4), mirroring
+/// [`ReasoningEcho`]: the enum names an endpoint contract, so it lives beside
+/// the dialect (`crate::adapters::openai_compat`) and is re-exported here for
+/// callers configuring [`OpenAiProvider`].
+pub use crate::adapters::UsageRequest;
+
 pub struct OpenAiProvider {
     api_key: String,
     api_base: String,
@@ -30,6 +36,10 @@ pub struct OpenAiProvider {
     /// request against the actual model name; `Auto` (default) keeps every
     /// non-weak model on the verbatim strict schema.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// How this connector asks the endpoint to report usage (ADR-48 §4).
+    /// Defaults to [`UsageRequest::Off`] — the wire body stays byte-identical
+    /// to the pre-wiring output until a construction site opts an endpoint in.
+    usage_request: UsageRequest,
     dialect: OpenAiChatDialect,
 }
 
@@ -42,6 +52,7 @@ impl OpenAiProvider {
             timeout_secs,
             reasoning_echo: ReasoningEcho::IfPresent,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            usage_request: UsageRequest::Off,
             dialect: OpenAiChatDialect,
         }
     }
@@ -73,6 +84,36 @@ impl OpenAiProvider {
     pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
         self.tool_schema_mode = mode;
         self
+    }
+
+    /// Set the usage-request policy (ADR-48 §4).
+    ///
+    /// Defaults to [`UsageRequest::Off`]: no usage-request member is written
+    /// and the wire body stays byte-identical to the pre-wiring output. The
+    /// connector still captures a `usage` object whenever the endpoint
+    /// reports one — a missing report keeps `None`, never an error.
+    pub fn with_usage_request(mut self, mode: UsageRequest) -> Self {
+        self.usage_request = mode;
+        self
+    }
+
+    /// The active usage-request policy (ADR-48 §4), exposed for tests and for
+    /// connectors that wrap this one (e.g. `crate::openrouter`).
+    pub fn usage_request(&self) -> UsageRequest {
+        self.usage_request
+    }
+
+    /// Render the exact wire body for `request`: the dialect's payload with
+    /// this connector's usage-request policy applied (ADR-48 §4).
+    ///
+    /// Called by [`LlmProvider::stream_completion`] *after* any adaptive
+    /// tool-schema rewrite, so the streaming flag applied matches the one
+    /// actually sent. Pure — no I/O — which keeps the body testable without a
+    /// transport.
+    fn render_body(&self, request: &CompletionRequest, model: &str) -> serde_json::Value {
+        let mut body = self.dialect.render_chat_body(request, model, self.reasoning_echo);
+        self.usage_request.apply(&mut body, request.stream);
+        body
     }
 }
 
@@ -143,23 +184,19 @@ impl OpenAiStreamState {
     }
 
     /// Capture a provider-reported `usage` object (top-level `usage` member of
-    /// an SSE event, as OpenAI/DeepSeek emit it). The first observation wins;
-    /// usage is only ever attached to the terminal chunk.
+    /// an SSE event, as OpenAI/DeepSeek/OpenRouter emit it). The first
+    /// observation wins; usage is only ever attached to the terminal chunk.
+    ///
+    /// The payload → [`CompletionUsage`] mapping is the family-shared
+    /// [`crate::adapters::openai_compat::map_usage`], so this connector
+    /// applies the same fail-soft rules as every other OpenAI-compatible
+    /// gateway: no `usage`, no counts, or a non-integer count all keep
+    /// `None` — never an error, never a fabricated `0`.
     fn capture_usage(&mut self, parsed: &serde_json::Value) {
         if self.usage.is_some() {
             return;
         }
-        let Some(usage) = parsed.get("usage").and_then(|u| u.as_object()) else {
-            return;
-        };
-        let usage = CompletionUsage {
-            prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()),
-            completion_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()),
-        };
-        // Only record usage that actually carries at least one token count.
-        if usage.prompt_tokens.is_some() || usage.completion_tokens.is_some() {
-            self.usage = Some(usage);
-        }
+        self.usage = crate::adapters::openai_compat::map_usage(parsed);
     }
 
     /// Emit a final chunk carrying the accumulated reasoning (if any) before
@@ -628,7 +665,7 @@ impl LlmProvider for OpenAiProvider {
         }
         let non_streamed = !request.stream;
 
-        let body = self.dialect.render_chat_body(&request, &model, self.reasoning_echo);
+        let body = self.render_body(&request, &model);
 
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
@@ -1188,6 +1225,59 @@ mod tests {
         let chunks: Vec<CompletionChunk> =
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         assert_eq!(chunks.last().unwrap().usage, None);
+    }
+
+    // -- ADR-48 §4: usage-request wiring -----------------------------------
+
+    /// The constructor must not opt any endpoint in: every construction site
+    /// that was not explicitly covered keeps byte-identical wire bodies.
+    #[test]
+    fn usage_request_defaults_to_off() {
+        let provider = OpenAiProvider::new("test-key".into(), "test-model".into(), 15);
+        assert_eq!(provider.usage_request(), UsageRequest::Off, "default policy must be Off");
+    }
+
+    #[test]
+    fn with_usage_request_sets_policy() {
+        let provider = OpenAiProvider::new("test-key".into(), "test-model".into(), 15)
+            .with_usage_request(UsageRequest::IncludeStreamUsage);
+        assert_eq!(provider.usage_request(), UsageRequest::IncludeStreamUsage);
+    }
+
+    /// The rendered wire body carries the policy: a streamed request opts in,
+    /// a non-streamed request stays byte-identical, and the default policy
+    /// writes nothing at all.
+    #[test]
+    fn render_body_applies_usage_request_policy() {
+        use concerto_core::types::{Message, Role};
+
+        let message = || Message {
+            role: Role::User,
+            content: "Hello".into(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        };
+        let streamed =
+            CompletionRequest { messages: vec![message()], stream: true, ..Default::default() };
+        let non_streamed =
+            CompletionRequest { messages: vec![message()], stream: false, ..Default::default() };
+
+        let opted_in = OpenAiProvider::new("test-key".into(), "test-model".into(), 15)
+            .with_usage_request(UsageRequest::IncludeStreamUsage);
+        let body = opted_in.render_body(&streamed, "test-model");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stream"], true, "the stream flag itself is untouched");
+
+        let body = opted_in.render_body(&non_streamed, "test-model");
+        assert!(body.get("stream_options").is_none(), "non-streamed bodies stay untouched");
+        assert_eq!(body["stream"], false);
+
+        let default = OpenAiProvider::new("test-key".into(), "test-model".into(), 15);
+        let body = default.render_body(&streamed, "test-model");
+        assert!(body.get("stream_options").is_none(), "the default policy writes nothing");
     }
 
     /// A non-streamed completion body (`stream: false`, the weak-model

@@ -1133,11 +1133,15 @@ fn resolve_provider(
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         tracing::info!("no provider config; using OPENAI_API_KEY env fallback");
         return Ok((
-            Arc::new(concerto_providers::openai::OpenAiProvider::new(
-                key,
-                "gpt-4o".to_string(),
-                15,
-            )),
+            Arc::new(
+                concerto_providers::openai::OpenAiProvider::new(key, "gpt-4o".to_string(), 15)
+                    // ADR-48 §4: the same usage opt-in as the factory's
+                    // `openai` arm — a key-only fallback must report
+                    // provider usage too, or the columns stay 0 here.
+                    .with_usage_request(
+                        concerto_providers::openai::UsageRequest::IncludeStreamUsage,
+                    ),
+            ),
             None,
         ));
     }
