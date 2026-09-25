@@ -646,9 +646,10 @@ impl Default for AppConfig {
 /// Additive serde-default only: every knob is optional, and a missing
 /// `[context]` section (or missing knob) keeps the engine's embedded defaults
 /// from `context_compaction.rs` (`trigger_tokens` 16000, `retain_user_turns` 4,
-/// `minimum_user_turns` 6). `cache_stable_prefix` is the ADR-048 gap knob:
-/// it is resolved on the engine's budget policy but held as a label while the
-/// dialect cache-op wiring lands (additive, no behavior change when unset).
+/// `minimum_user_turns` 6). `cache_stable_prefix` is the ADR-048
+/// prefix-discipline knob: it is resolved on the engine's budget policy and
+/// consumed by the prompt builder's stable-head seam (additive, no behavior
+/// change when unset or `false`).
 /// No schema migration is required; this section is a first-class v5 field but
 /// defaults to `None` for old configs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -665,20 +666,18 @@ pub struct ContextConfig {
     /// (`6`) applies.
     #[serde(default)]
     pub minimum_user_turns: Option<usize>,
-    /// Request an explicit prefix-stability boundary between the deterministic
-    /// checkpoint head and the recent tail the engine materializes for the
-    /// next request. `true` asks the engine to mark the frontier/tail edge so
-    /// a provider dialect's prompt-cache op can break there — aligning the
-    /// cached prefix with the byte-stable head instead of the first user turn.
-    /// `false` or unset (`None`, the default) keeps today's behavior, where
-    /// the provider-level `[model_settings.providers].cache_breakpoints` dial
-    /// is the only cache-marker path.
+    /// Pin a byte-stable head on every single-agent system prompt and append
+    /// the volatile working memory (active state plus retrieved chunks) after
+    /// it, so per-turn content never lands inside the cached prefix.
+    /// `false` or unset (`None`, the default) keeps today's byte-identical
+    /// assembly. The provider-level
+    /// `[model_settings.providers].cache_breakpoints` dial remains the
+    /// separate, provider-level cache-marker path.
     ///
-    /// TODO(ADR-048): exposed and resolved on the engine's budget policy but
-    /// not yet forwarded to a dialect cache op — the marker needs a
-    /// `Message`-level carrier before `AnthropicChatDialect::apply_cache_breakpoints`
-    /// can consume it. Wiring deliberately deferred; `None` output is
-    /// byte-identical to today.
+    /// Consumed by `PromptBuilder::with_cache_stable_prefix` through the
+    /// engine's budget policy (`ContextBudgetPolicy::from_config`); the
+    /// discipline is applied at assembly time, so no dialect cache op and no
+    /// `Message`-level carrier are involved (ADR-048).
     #[serde(default)]
     pub cache_stable_prefix: Option<bool>,
 }

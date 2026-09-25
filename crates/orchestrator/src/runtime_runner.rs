@@ -2151,7 +2151,18 @@ async fn execute_agent_loop(
         .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
         // Run-scoped project AGENTS.md context (ADR-70): injected between the
         // skills section and the environment card.
-        .with_project_context(Some(project_context));
+        .with_project_context(Some(project_context))
+        // ADR-048: `[context].cache_stable_prefix` pins a byte-stable system
+        // head and appends the volatile working memory after it. Resolved
+        // through the engine's budget policy so the knob's default lives in
+        // exactly one place (`ContextBudgetPolicy::from_config`); unset or
+        // `false` keeps today's byte-identical assembly.
+        .with_cache_stable_prefix(
+            crate::context_engine::ContextBudgetPolicy::from_config(
+                services.config.context.as_ref(),
+            )
+            .cache_stable_prefix,
+        );
 
     // ADR-43: one audit record + `info` log per run proving which enabled
     // skill packs (and how many characters) were injected into this loop's

@@ -39,6 +39,15 @@ pub struct PromptBuilder {
     /// `None` renders the card from OS facts plus the detected OS default
     /// shell instead — the card is never omitted and never errors.
     shell_profile: Option<ShellProfileConfig>,
+    /// ADR-048 prefix discipline (the `[context].cache_stable_prefix` knob).
+    ///
+    /// `false` (default) keeps today's byte-identical assembly. `true` pins a
+    /// byte-stable head — template, resolved summary, skills block, project
+    /// AGENTS.md context and environment card — and appends the volatile
+    /// working-memory/retrieved block *after* it, still inside the single
+    /// system message, so a prompt cache keyed on the head survives a churned
+    /// tail. See [`PromptBuilder::stable_system_head`].
+    cache_stable_prefix: bool,
 }
 
 impl PromptBuilder {
@@ -50,6 +59,7 @@ impl PromptBuilder {
             skills: None,
             project_context: None,
             shell_profile: None,
+            cache_stable_prefix: false,
         }
     }
 
@@ -64,6 +74,7 @@ impl PromptBuilder {
             skills,
             project_context: None,
             shell_profile: None,
+            cache_stable_prefix: false,
         }
     }
 
@@ -83,19 +94,27 @@ impl PromptBuilder {
         self
     }
 
-    /// Build a `CompletionRequest` from the current context.
+    /// Enable ADR-048 prefix discipline (the `[context].cache_stable_prefix`
+    /// knob). Defaults to `false`, which keeps [`PromptBuilder::build`]
+    /// byte-identical to today's assembly.
+    pub fn with_cache_stable_prefix(mut self, enabled: bool) -> Self {
+        self.cache_stable_prefix = enabled;
+        self
+    }
+
+    /// Whether this builder pins a byte-stable system head (ADR-048).
+    pub fn cache_stable_prefix(&self) -> bool {
+        self.cache_stable_prefix
+    }
+
+    /// Assemble the complete system message: the template with `{summary}`
+    /// and `{working_memory}` resolved, then the skills block, the project
+    /// AGENTS.md context and the environment card, in that order.
     ///
-    /// * `working_memory_block` — the XML block from `WorkingMemory::to_system_block()`.
-    /// * `messages` — the conversation history (short-term memory messages).
-    /// * `prev_summary` — optional summary from a previous session.
-    /// * `tools` — optional tool definitions to include.
-    pub fn build(
-        &self,
-        working_memory_block: &str,
-        messages: &[Message],
-        prev_summary: Option<&str>,
-        tools: Option<&[concerto_core::types::ToolDefinition]>,
-    ) -> CompletionRequest {
+    /// `working_memory` is the only volatile member; everything substituted
+    /// into the template from `prev_summary` and everything appended after it
+    /// is session-stable within a run.
+    fn assemble_system(&self, working_memory: &str, prev_summary: Option<&str>) -> String {
         let mut system = self.system_template.clone();
 
         if let Some(summary) = prev_summary {
@@ -104,7 +123,7 @@ impl PromptBuilder {
             system = system.replace("{summary}", "");
         }
 
-        system = system.replace("{working_memory}", working_memory_block);
+        system = system.replace("{working_memory}", working_memory);
 
         // Append the skills section after placeholder substitution so skill
         // instructions can never collide with template placeholders. The
@@ -137,6 +156,63 @@ impl PromptBuilder {
         let card = environment_card(self.shell_profile.as_ref());
         system.push_str("\n\n");
         system.push_str(&card);
+
+        system
+    }
+
+    /// ADR-048: the byte-stable head of the system message — the assembled
+    /// system message with the volatile working memory blanked out.
+    ///
+    /// Every byte this returns is built from facts that do not change within
+    /// a run: the template, the resolved `{summary}`, the skills block (sorted
+    /// and deduplicated by [`SkillsContext`]), the project AGENTS.md context
+    /// and the environment card. Tool schemas never enter this string at all —
+    /// they ride `CompletionRequest::tools`, rendered from the executor
+    /// registry in registration order — so they are stable for the same
+    /// reason.
+    ///
+    /// With [`PromptBuilder::with_cache_stable_prefix`] enabled,
+    /// [`PromptBuilder::build`] emits exactly these bytes first and appends
+    /// the volatile working memory (active state plus retrieved chunks) after
+    /// them, inside the same single system message so last-system-wins
+    /// adapters (Anthropic, Gemini) still see it while the bytes before it
+    /// never move.
+    pub fn stable_system_head(&self, prev_summary: Option<&str>) -> String {
+        self.assemble_system("", prev_summary)
+    }
+
+    /// Build a `CompletionRequest` from the current context.
+    ///
+    /// * `working_memory_block` — the XML block from `WorkingMemory::to_system_block()`.
+    /// * `messages` — the conversation history (short-term memory messages).
+    /// * `prev_summary` — optional summary from a previous session.
+    /// * `tools` — optional tool definitions to include.
+    pub fn build(
+        &self,
+        working_memory_block: &str,
+        messages: &[Message],
+        prev_summary: Option<&str>,
+        tools: Option<&[concerto_core::types::ToolDefinition]>,
+    ) -> CompletionRequest {
+        let system = if self.cache_stable_prefix {
+            // ADR-048: pin the stable head, then append the volatile tail.
+            // The tail lands after the environment card and still inside the
+            // one system message — adapters that keep only the last system
+            // message see the same content, but the bytes above the tail are
+            // identical from build to build.
+            let mut system = self.stable_system_head(prev_summary);
+            if !working_memory_block.is_empty() {
+                system.push_str("\n\n");
+                system.push_str(working_memory_block);
+            }
+            system
+        } else {
+            // Default (byte-identical to today): the working memory is
+            // substituted wherever the template asks for it, and is dropped
+            // entirely when the template carries no `{working_memory}`
+            // placeholder.
+            self.assemble_system(working_memory_block, prev_summary)
+        };
 
         let mut all_messages = Vec::with_capacity(messages.len() + 1);
 
@@ -1005,5 +1081,166 @@ mod tests {
             usage,
             Some(CompletionUsage { prompt_tokens: Some(10), completion_tokens: Some(5) })
         );
+    }
+
+    // -- ADR-048: cache_stable_prefix --------------------------------------
+
+    fn user_message(content: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    #[test]
+    fn cache_stable_prefix_defaults_to_false() {
+        assert!(!PromptBuilder::new("System prompt").cache_stable_prefix());
+        assert!(!PromptBuilder::with_skills("System prompt", None).cache_stable_prefix());
+        assert!(PromptBuilder::new("System prompt")
+            .with_cache_stable_prefix(true)
+            .cache_stable_prefix());
+    }
+
+    /// Prefix stability: two builds over different working memory and a
+    /// different conversation must emit byte-identical head bytes.
+    #[test]
+    fn stable_head_is_byte_identical_across_builds_with_different_tails() {
+        let builder = PromptBuilder::new(
+            "System prompt\nWM: {working_memory}\nSummary: {summary}".to_string(),
+        )
+        .with_cache_stable_prefix(true);
+        let head = builder.stable_system_head(Some("session summary"));
+
+        let first = builder.build(
+            "<working_memory>iteration 1</working_memory>",
+            &[user_message("turn one")],
+            Some("session summary"),
+            None,
+        );
+        let second = builder.build(
+            "<working_memory>iteration 2: more files, different retrieved chunks</working_memory>",
+            &[user_message("turn two")],
+            Some("session summary"),
+            None,
+        );
+
+        let first_system = &first.messages[0].content;
+        let second_system = &second.messages[0].content;
+        assert!(first_system.starts_with(&head), "the head must lead the system message");
+        assert!(second_system.starts_with(&head), "head bytes must be stable across builds");
+        assert_ne!(first_system, second_system, "the volatile tail must still differ");
+        assert_ne!(
+            first.messages[1].content, second.messages[1].content,
+            "the conversation sits outside the head"
+        );
+    }
+
+    /// Volatile-tail exclusion: neither the working memory (active state plus
+    /// retrieved chunks) nor the conversation may appear inside the pinned
+    /// head.
+    #[test]
+    fn cache_stable_prefix_keeps_volatile_content_out_of_the_head() {
+        let builder = PromptBuilder::new("System prompt\nWM: {working_memory}".to_string())
+            .with_cache_stable_prefix(true);
+        let head = builder.stable_system_head(None);
+        let request = builder.build(
+            "<working_memory>RETRIEVED_CHUNK_SECRET</working_memory>",
+            &[user_message("USER_TURN_SECRET")],
+            None,
+            None,
+        );
+
+        let system = &request.messages[0].content;
+        assert!(system.starts_with(&head));
+        assert!(
+            !head.contains("RETRIEVED_CHUNK_SECRET"),
+            "working memory must not sit in the head"
+        );
+
+        let marker = system.find("RETRIEVED_CHUNK_SECRET").expect("the tail is still delivered");
+        assert!(
+            marker >= head.len(),
+            "the tail must start after the head: marker {marker}, head {}",
+            head.len()
+        );
+        assert!(
+            !system.contains("USER_TURN_SECRET"),
+            "the conversation never enters the system message"
+        );
+        assert_eq!(request.messages[1].content, "USER_TURN_SECRET");
+    }
+
+    /// Production-shaped templates carry no `{working_memory}` placeholder, so
+    /// the tail is appended after every stable section (skills, project
+    /// context, environment card) rather than interleaved into them.
+    #[test]
+    fn cache_stable_prefix_appends_the_tail_after_the_stable_sections() {
+        let builder =
+            PromptBuilder::new("System prompt".to_string()).with_cache_stable_prefix(true);
+        let request = builder.build("<working_memory>state</working_memory>", &[], None, None);
+        let system = &request.messages[0].content;
+
+        let card = system.find("## Environment").expect("environment card present");
+        let tail = system.find("<working_memory>state</working_memory>").expect("tail present");
+        assert!(tail > card, "tail at {tail} must follow the environment card at {card}");
+    }
+
+    /// The default path is untouched: the working memory is substituted where
+    /// the template asks for it — once, before the stable sections — so
+    /// `cache_stable_prefix = false` stays byte-identical to today.
+    #[test]
+    fn cache_stable_prefix_off_keeps_todays_assembly() {
+        let template = "System prompt\nWM: {working_memory}\nSummary: {summary}";
+        let builder = PromptBuilder::new(template.to_string());
+        assert!(!builder.cache_stable_prefix(), "the knob must default to off");
+
+        let request = builder.build("<working_memory>state</working_memory>", &[], None, None);
+        let system = &request.messages[0].content;
+        assert!(
+            system.starts_with(
+                "System prompt\nWM: <working_memory>state</working_memory>\nSummary: "
+            ),
+            "in-place substitution must be byte-identical to today: {system}"
+        );
+        assert_eq!(
+            system.matches("<working_memory>state</working_memory>").count(),
+            1,
+            "the working memory must not be duplicated"
+        );
+        let card = system.find("## Environment").expect("environment card present");
+        let wm =
+            system.find("<working_memory>state</working_memory>").expect("working memory present");
+        assert!(wm < card, "today's order keeps the working memory inside the head");
+    }
+
+    /// Tool schemas ride `CompletionRequest::tools`, not the system string:
+    /// two builds over the same registry serialize to identical bytes while
+    /// the message tail churns.
+    #[test]
+    fn tool_schemas_stay_byte_stable_across_builds() {
+        use concerto_core::types::ToolDefinition;
+
+        let tools = [ToolDefinition {
+            name: "filesystem".into(),
+            description: "Filesystem operations".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let builder =
+            PromptBuilder::new("System prompt".to_string()).with_cache_stable_prefix(true);
+
+        let first = builder.build("<wm>one</wm>", &[user_message("one")], None, Some(&tools));
+        let second = builder.build("<wm>two</wm>", &[user_message("two")], None, Some(&tools));
+
+        assert_eq!(
+            serde_json::to_string(&first.tools).expect("tools serialize"),
+            serde_json::to_string(&second.tools).expect("tools serialize"),
+            "tool schemas must not depend on the volatile tail"
+        );
+        assert_ne!(first.messages[0].content, second.messages[0].content);
     }
 }
