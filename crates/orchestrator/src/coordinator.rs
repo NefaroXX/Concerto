@@ -1718,6 +1718,11 @@ pub struct CoordinatorAgent {
     /// Never used to gate behavior in this phase — persistence/write gating is
     /// load-bearing only with the Phase 5/6 evidence checks.
     workspace_snapshot: Option<crate::workspace_snapshot::WorkspaceSnapshotRecord>,
+    /// Phase 6 M3c step 5: the confirmed plan drift a resume re-armed Pending
+    /// (the affected COMPLETED subtasks), held until the completion tail so a
+    /// re-dispatch that never settles can attach the diff to its Partial note.
+    /// Cleared as soon as it is read; `None` on a run without confirmed drift.
+    plan_drift_redispatch: Option<crate::external_change::PlanDriftRedispatch>,
     /// ADR-65 §3: the run id (fresh per `execute_graph`, matching the
     /// checkpoint scope) stamped into every dispatched agent's tool-evidence
     /// facts, so a run's tool commands are attributable across task
@@ -2005,6 +2010,60 @@ fn own_write_paths(
         }
     }
     own
+}
+
+/// One entry of a ready batch: the node id plus the role that will staff it,
+/// the shape the scheduler's picks resolve to. Aliased so the Phase 6 M3c
+/// drift-bypass partition stays readable (clippy type-complexity).
+type ReadyEntry = (TaskId, AgentId);
+
+/// The plan's declared artifacts for the subtasks the checkpoint recorded
+/// COMPLETE, de-duplicated in declaration order.
+///
+/// A Pending subtask's artifacts legitimately do not exist yet, so including
+/// them would report drift on every mid-run resume (issue #: the C-06 scope
+/// rule, shared by the publish path and its tests).
+fn completed_expected_artifacts(
+    expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+    completed_results: &HashMap<TaskId, AgentRunResult>,
+) -> Vec<camino::Utf8PathBuf> {
+    let mut seen = HashSet::new();
+    expected_artifacts
+        .iter()
+        .filter(|(task_id, _)| completed_results.contains_key(task_id))
+        .flat_map(|(_, paths)| paths.iter())
+        .filter(|path| seen.insert((*path).clone()))
+        .cloned()
+        .collect()
+}
+
+/// Phase 6 M3c step 1: the run-start workspace inventory the classified diff
+/// compares against — the `WorkspaceSnapshot` event whose generation the
+/// checkpoint recorded (`cp.snapshot_generation`).
+///
+/// The resume's OWN readiness-barrier snapshot (captured after the tamper)
+/// is the `live` side; this is the `baseline` side, so it must predate the
+/// interruption. Fail-soft by contract: no recorded generation, no pool
+/// events, an unparsable payload, or an event older than the
+/// [`RESUME_LOG_WINDOW`] tail all degrade to an empty baseline — the
+/// classification then falls back to its missing-only reading (absence is
+/// still provable without history; alteration and addition are not).
+fn plan_drift_baseline(
+    log_window: &[WhiteboardEvent],
+    generation: Option<&str>,
+) -> Vec<concerto_sessions::SnapshotEntry> {
+    let Some(generation) = generation else { return Vec::new() };
+    let Some(payload) = log_window.iter().rev().find_map(|event| {
+        if event.kind != WhiteboardKind::WorkspaceSnapshot {
+            return None;
+        }
+        serde_json::from_value::<concerto_sessions::WorkspaceSnapshotPayload>(event.payload.clone())
+            .ok()
+            .filter(|payload| payload.generation == generation)
+    }) else {
+        return Vec::new();
+    };
+    payload.files
 }
 
 /// Phase 6 M3b: classify a settled subtask outcome into a decision category
@@ -2635,6 +2694,7 @@ impl CoordinatorAgent {
             review_store: None,
             write_gate: None,
             workspace_snapshot: None,
+            plan_drift_redispatch: None,
             run_id: None,
             memory_decision_store: None,
             memory_task_tree: None,
@@ -5805,7 +5865,7 @@ impl CoordinatorAgent {
                 },
             );
         }
-        let completed_results = cp.completed_results;
+        let mut completed_results = cp.completed_results;
         let total_cost = cp.total_cost;
         let total_tool_calls = cp.total_tool_calls;
         let all_files = cp.all_files;
@@ -5887,6 +5947,60 @@ impl CoordinatorAgent {
                 _ => false,
             };
 
+        // ── Phase 6 M3c steps 1–2: plan-drift investigation ──────────────
+        // Runs BEFORE the §7 evaluation: confirmed drift is evidence the
+        // resume policy weighs (it can yield Replan or RefreshEvidence), and
+        // its confirmed findings are what step 3 re-arms after the evaluation.
+        // Scope: the artifacts of the subtasks the checkpoint recorded
+        // COMPLETE (a Pending subtask's artifacts legitimately do not exist
+        // yet) and not the run's own recorded writes (a path F3 already
+        // reports as an external change is never double-reported). Fail-soft
+        // at every step: no snapshot ⇒ no findings; a run-start baseline the
+        // log window no longer carries ⇒ missing-only reading; a re-read that
+        // fails for a reason other than absence ⇒ `Unverified`, which step 5
+        // below reports as Partial instead of guessing a verdict.
+        let expected = completed_expected_artifacts(&cp.expected_artifacts, &completed_results);
+        let own_written = own_write_paths(
+            &all_files,
+            &completed_results,
+            post_cursor,
+            &context.session.project_dir,
+        );
+        let investigation = match self.workspace_snapshot.as_ref() {
+            Some(snapshot) => crate::external_change::investigate_plan_drift(
+                &expected,
+                &plan_drift_baseline(&log_window, cp.snapshot_generation.as_deref()),
+                &snapshot.entries,
+                &own_written,
+                &context.session.project_dir,
+            ),
+            None => crate::external_change::PlanDriftInvestigation::default(),
+        };
+        // Phase 6 M3c step 5 (re-verification failure): the finding could not
+        // be re-read, so neither clearing nor re-dispatch is honest. State the
+        // blocker and the diff — the recoverable note downgrades the exit to
+        // Partial without inviting a resume that would hit the same unreadable
+        // file.
+        let mut loop_notes: Vec<String> = Vec::new();
+        if investigation.reverify_failed() {
+            loop_notes.push(format!(
+                "Plan-drift re-verification failed: the live filesystem could not be read for \
+                 {} ({}); the resume could neither confirm nor clear the drift, so no \
+                 re-dispatch was attempted and the run is reported Partial.",
+                investigation.affected_paths().join(", "),
+                investigation
+                    .reverify
+                    .iter()
+                    .filter(|entry| {
+                        entry.status == concerto_core::event::PlanDriftReverifyStatus::Unverified
+                    })
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let confirmed_drift = investigation.confirmed_paths();
+
         // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
         let pending_decision = cp.pending_decision.clone();
         let snapshot_generation_at_checkpoint = cp.snapshot_generation.clone();
@@ -5902,6 +6016,7 @@ impl CoordinatorAgent {
                 snapshot_generation_at_checkpoint.as_deref(),
                 &log_window,
                 post_cursor,
+                &confirmed_drift,
                 cancel,
             )
             .await;
@@ -5932,6 +6047,12 @@ impl CoordinatorAgent {
                 "ADR-65 §7: resume chose REPLAN — the workspace objectively changed \
                  materially to the pending step; delegating to the Phase-6 scheduler"
             );
+            // Phase 6 M3c step 4: the investigation still reports when the
+            // drift itself is what forced the replan — a signal that shaped
+            // the resume must not vanish with the superseded graph. The fresh
+            // plan's id does not exist yet, so it rides as `None` (additive
+            // field); `redispatched` is empty because the fresh plan dispatches.
+            self.publish_plan_drift(task, None, &investigation, &[]);
             return Ok(None);
         };
         let mut action_ledger = action_ledger;
@@ -5943,6 +6064,27 @@ impl CoordinatorAgent {
             // Partial before ever dispatching the decided task.
             subtask_attempts.insert(re_armed, 0);
         }
+        // Phase 6 M3c step 3 (replan): confirmed drift re-arms the affected
+        // COMPLETED subtasks (Completed → Pending) so the normal ready batch
+        // re-dispatches them through the usual policy-gated specialist path —
+        // the restored ledger, expected artifacts, and attempt budget ride
+        // along, exactly as a Continue re-arm does. Never a halt: the raw
+        // signal alone never stops a run.
+        let redispatched = if investigation.reverify_failed() || confirmed_drift.is_empty() {
+            // Step 5: a re-read that failed is reported Partial above instead
+            // of re-armed (the note must stay true: no re-dispatch ran), and
+            // nothing confirmed means there is nothing to re-dispatch.
+            Vec::new()
+        } else {
+            self.redispatch_drift_subtasks(
+                &mut graph,
+                &mut completed_results,
+                &cp.expected_artifacts,
+                &mut subtask_attempts,
+                &mut action_ledger,
+                &investigation,
+            )
+        };
 
         // ADR-52: a resumed run re-persists its durable plan artifact
         // (idempotent overwrite of `plan-<run_id>.json`) so the plans dir
@@ -5954,23 +6096,12 @@ impl CoordinatorAgent {
         // ADR-55 Phase 2b: retain the id so a planning-only run can bind
         // its rendered plan to the durable artifact.
         self.last_plan_id = plan_id.clone();
-        // ── Phase 6 M3c: plan-drift signal ────────────────────────────────
-        // The resume is Applied: this run continues the restored plan, so
-        // compare the plan's declared artifacts against the live inventory.
-        // Scoped to the subtasks the checkpoint already recorded complete — a
-        // Pending subtask's artifacts legitimately do not exist yet — and
-        // excluding the run's own recorded writes, so a path F3 already
-        // reports as an external change is never double-reported. Fail-soft
-        // and advisory: it never gates the resume.
-        self.emit_plan_drift(
-            plan_id.as_deref(),
-            &cp.expected_artifacts,
-            &all_files,
-            &completed_results,
-            post_cursor,
-            &context.session.project_dir,
-            task,
-        );
+        // ── Phase 6 M3c step 4: publish the investigation ─────────────────
+        // One signal carries what drifted, what the live re-read concluded,
+        // and which steps were re-dispatched, so both frontends can render
+        // the same one-line report. Cleared investigations publish nothing
+        // (step 2 is silent by design); a publish error is logged only.
+        self.publish_plan_drift(task, plan_id.as_deref(), &investigation, &redispatched);
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
@@ -6000,7 +6131,7 @@ impl CoordinatorAgent {
             model_assignments,
             action_ledger,
             dispatch_summary: String::new(),
-            loop_notes: Vec::new(),
+            loop_notes,
             // TODO #22 (tracking half): an AwaitingUser pause carries its
             // pending question on the checkpoint; the resume hands it to
             // `execute_graph` so the run stops again with the SAME reason —
@@ -6018,66 +6149,41 @@ impl CoordinatorAgent {
         }))
     }
 
-    /// Phase 6 M3c: detect planned-but-absent artifacts on a resumed run and
-    /// publish a [`EventKind::PlanDrift`] signal.
+    /// Phase 6 M3c step 4: publish the investigation as ONE
+    /// [`EventKind::PlanDrift`] carrying what drifted (the classified diff),
+    /// what the live re-read concluded, and which steps were re-dispatched —
+    /// so both frontends render the same one-line report from the same data.
     ///
-    /// Scope is the artifacts of the subtasks the checkpoint recorded COMPLETE
-    /// (a pending subtask's artifacts are not yet expected to exist —
-    /// including them would report drift on every mid-run resume). The run's
-    /// own recorded writes are excluded, so a path F3 already reports as an
-    /// external change is never double-reported here.
-    ///
-    /// Fail-soft and advisory: no captured snapshot means no signal, a publish
-    /// error is logged only, and the signal never gates the resume.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_plan_drift(
+    /// Silent by contract on a cleared investigation (step 2) and when the
+    /// classification found nothing; the malformed-declaration warning is
+    /// logged either way (declaration quality, never workspace drift).
+    /// Fail-soft: a publish error is logged only — the signal never gates the
+    /// resume.
+    fn publish_plan_drift(
         &self,
-        plan_id: Option<&str>,
-        expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
-        checkpoint_all_files: &[camino::Utf8PathBuf],
-        completed_results: &HashMap<TaskId, AgentRunResult>,
-        post_cursor: &[WhiteboardEvent],
-        project_root: &std::path::Path,
         task: &AgentTask,
+        plan_id: Option<&str>,
+        investigation: &crate::external_change::PlanDriftInvestigation,
+        redispatched: &[String],
     ) {
-        let Some(snapshot) = self.workspace_snapshot.as_ref() else { return };
-        let mut seen = HashSet::new();
-        let expected: Vec<camino::Utf8PathBuf> = expected_artifacts
-            .iter()
-            .filter(|(task_id, _)| completed_results.contains_key(task_id))
-            .flat_map(|(_, paths)| paths.iter())
-            .filter(|path| seen.insert((*path).clone()))
-            .cloned()
-            .collect();
-        if expected.is_empty() {
-            return;
-        }
-        let own_written =
-            own_write_paths(checkpoint_all_files, completed_results, post_cursor, project_root);
-        let drift = crate::external_change::detect_plan_drift(
-            plan_id,
-            &expected,
-            &snapshot.entries,
-            &own_written,
-        );
-        if !drift.unverifiable.is_empty() {
-            // Declaration quality, not workspace drift: prose where a path
-            // was declared. Logged with the entries so the malformed
-            // declaration is actionable; never published as PlanDrift.
+        if !investigation.unverifiable.is_empty() {
             warn!(
                 run_id = plan_id.unwrap_or("<none>"),
-                count = drift.unverifiable.len(),
-                entries = ?drift.unverifiable,
+                count = investigation.unverifiable.len(),
+                entries = ?investigation.unverifiable,
                 "plan declaration is undeclared/unverifiable (no file path) — not workspace drift"
             );
         }
-        if drift.is_empty() {
+        if investigation.is_empty() || investigation.is_cleared() {
             return;
         }
         warn!(
             run_id = plan_id.unwrap_or("<none>"),
-            affected = drift.affected_paths.len(),
-            "Phase 6 M3c: plan drift detected — planned artifact(s) absent from the live workspace"
+            affected = investigation.affected_paths().len(),
+            confirmed = investigation.confirmed_paths().len(),
+            unverified = investigation.reverify_failed(),
+            redispatched = redispatched.len(),
+            "Phase 6 M3c: plan drift confirmed — re-dispatching diverged subtasks"
         );
         let _ = self.bus.publish_for_session(
             task.session_id,
@@ -6085,9 +6191,74 @@ impl CoordinatorAgent {
             EventKind::PlanDrift {
                 task_id: task.id,
                 plan_id: plan_id.map(str::to_owned),
-                affected_paths: drift.affected_paths,
+                affected_paths: investigation.affected_paths(),
+                diff: investigation.diff.clone(),
+                reverify: investigation.reverify.clone(),
+                redispatched: redispatched.to_vec(),
             },
         );
+    }
+
+    /// Phase 6 M3c step 3 (replan): drop the COMPLETED subtasks whose
+    /// artifacts the investigation confirmed diverged back to `Pending` so the
+    /// normal ready batch re-dispatches them through the usual policy-gated
+    /// specialist path — the restored ledger, expected artifacts, and attempt
+    /// budget ride along exactly as a `Continue` re-arm does, and each dispatch
+    /// runs the same policy gate as any other specialist run.
+    ///
+    /// Keeps the re-armed node ids on [`Self::plan_drift_redispatch`] so the
+    /// completion tail can attach the diff if the re-dispatch never settles
+    /// (step 5). Returns the re-armed roles for the drift signal.
+    fn redispatch_drift_subtasks(
+        &mut self,
+        graph: &mut TaskGraph,
+        completed_results: &mut HashMap<TaskId, AgentRunResult>,
+        expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+        subtask_attempts: &mut HashMap<TaskId, u32>,
+        action_ledger: &mut Vec<checkpoint::CheckpointAction>,
+        investigation: &crate::external_change::PlanDriftInvestigation,
+    ) -> Vec<String> {
+        let confirmed_paths = investigation.confirmed_paths();
+        let confirmed: HashSet<&str> = confirmed_paths.iter().map(String::as_str).collect();
+        let timestamp = time::OffsetDateTime::now_utc();
+        let mut nodes: Vec<TaskId> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for (task_id, paths) in expected_artifacts {
+            // Only the subtasks the checkpoint recorded COMPLETE can have
+            // drifted: a Pending subtask's artifacts are not written yet.
+            if !completed_results.contains_key(task_id)
+                || !paths.iter().any(|path| confirmed.contains(path.as_str()))
+            {
+                continue;
+            }
+            let Some(subtask) = graph.get(task_id) else { continue };
+            labels.push(subtask.role.as_str().to_owned());
+            graph.mark_pending(task_id);
+            if let Some(subtask) = graph.get_mut(task_id) {
+                // The evidence it completed is no longer valid: its artifact
+                // diverged, so the deliverable and completion stamp go too.
+                subtask.deliverable = None;
+                subtask.completed_at = None;
+            }
+            completed_results.remove(task_id);
+            subtask_attempts.insert(*task_id, 0);
+            action_ledger.push(checkpoint::CheckpointAction {
+                kind: "plan-drift-redispatch".into(),
+                task_id: Some(*task_id),
+                timestamp,
+                evidence: None,
+            });
+            nodes.push(*task_id);
+        }
+        if !nodes.is_empty() {
+            self.plan_drift_redispatch = Some(crate::external_change::PlanDriftRedispatch {
+                paths: confirmed_paths,
+                nodes,
+                labels: labels.clone(),
+                diff: investigation.diff.clone(),
+            });
+        }
+        labels
     }
 
     /// Read this session's log tail window for the resume evaluation
@@ -6220,6 +6391,7 @@ impl CoordinatorAgent {
         checkpoint_snapshot_generation: Option<&str>,
         log_window: &[WhiteboardEvent],
         post_cursor: &[WhiteboardEvent],
+        plan_drift: &[String],
         cancel: &CancellationToken,
     ) -> ResumeApplication {
         // Steps a previous resume already skipped stay skipped — a recorded
@@ -6371,9 +6543,18 @@ impl CoordinatorAgent {
             post_cursor,
             &context.session.project_dir,
         );
-        let change = self
+        let mut change = self
             .workspace_change_verdict(checkpoint_snapshot_generation, &own_written, cancel)
             .await;
+        // Phase 6 M3c: the step 1–2 investigation's confirmed findings ride
+        // into the §7 policy as workspace-change evidence — a confirmed
+        // divergence is exactly the condition §7 has always been written
+        // against, it simply could never be observed at this depth before.
+        // Advisory: `evaluate` treats it as one input among the others, so a
+        // settled graph still resolves to RefreshEvidence (the caller re-arms
+        // the diverged steps) while material open work forces the Replan the
+        // policy already prescribes.
+        change.plan_drift = plan_drift.to_vec();
         // Issue #65: the F3 external evidence becomes explicit, reconcilable
         // records (ownership-aware, conflict-flagged, checkpoint-persisted)
         // instead of a one-shot verdict the model reads once and loses.
@@ -6909,6 +7090,20 @@ impl CoordinatorAgent {
                     .collect()
             };
 
+            // Phase 6 M3c step 3: a plan-drift re-armed node bypasses the
+            // resolver. Its artifact evidence lives in the whiteboard timeline
+            // (the pre-tamper run's log), not in the live filesystem the
+            // investigation just contradicted — a `Reuse` verdict would
+            // re-inject the pre-tamper cached result and silently swallow the
+            // re-dispatch this resume exists to perform. Every other ready
+            // node keeps its resolver verdict.
+            let (drift_ids, resolver_ids): (Vec<ReadyEntry>, Vec<ReadyEntry>) =
+                ready_ids.clone().into_iter().partition(|(task_id, _)| {
+                    self.plan_drift_redispatch
+                        .as_ref()
+                        .is_some_and(|redispatch| redispatch.nodes.contains(task_id))
+                });
+
             // ADR-64 Phase 5: capsule projection — clone the timeline
             // projection out of the resolver block so it is available
             // for capsule building in the dispatch futures below.
@@ -6963,7 +7158,7 @@ impl CoordinatorAgent {
                         let expected_map = self.expected_artifacts_snapshot();
 
                         let pass = resolver_integration::resolve_batch(
-                            &ready_ids,
+                            &resolver_ids,
                             &graph,
                             &completed_results,
                             &projection,
@@ -7043,8 +7238,11 @@ impl CoordinatorAgent {
                             }
                         }
 
-                        // Return only the non-reused task IDs for normal dispatch.
-                        pass.dispatch_ids
+                        // Return only the non-reused task IDs for normal
+                        // dispatch, with the drift bypass re-attached first.
+                        let mut dispatch_ids = drift_ids;
+                        dispatch_ids.extend(pass.dispatch_ids);
+                        dispatch_ids
                     } else {
                         // Projection build failed — dispatch all.
                         ready_ids
@@ -8778,6 +8976,62 @@ impl CoordinatorAgent {
             )
             .await;
         }
+        // 3. Plan-drift re-dispatch: the subtasks this resume re-armed after
+        // a confirmed artifact divergence must settle before the run may claim
+        // Completed. A re-dispatch that never settles leaves the divergence
+        // unaddressed, so the exit is Partial with the classification attached
+        // and the checkpoint preserved — a later resume retries the
+        // re-dispatch instead of reading an unverified state. Taken rather
+        // than read: a settled drift never re-asserts itself on a later cycle
+        // or a later resume of the same run.
+        if let Some(redispatch) = self.plan_drift_redispatch.take() {
+            let unfinished: Vec<TaskId> = redispatch
+                .nodes
+                .iter()
+                .copied()
+                .filter(|task_id| {
+                    graph
+                        .get(task_id)
+                        .is_some_and(|subtask| subtask.status != SubTaskStatus::Completed)
+                })
+                .collect();
+            if !unfinished.is_empty() {
+                let detail = unfinished
+                    .iter()
+                    .map(|task_id| {
+                        graph
+                            .get(task_id)
+                            .map(|subtask| {
+                                format!("{} [{}]", subtask.role, subtask.status.as_str())
+                            })
+                            .unwrap_or_else(|| task_id.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let note = format!(
+                    "Plan-drift re-dispatch guard: re-dispatched subtask(s) ({detail}) did not \
+                     settle after a confirmed artifact divergence on {}; the drift remains \
+                     unaddressed, so the run is reported Partial and its checkpoint is preserved \
+                     for resume. Diff: {}.",
+                    redispatch.paths.join(", "),
+                    redispatch
+                        .diff
+                        .iter()
+                        .map(|entry| format!("{} ({})", entry.path, entry.class.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                recoverable_notes.push(note.clone());
+                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                self.record_completion_guard_decision(
+                    task.session_id,
+                    "completion-blocked-plan-drift-redispatch",
+                    &note,
+                )
+                .await;
+            }
+        }
+
         // ── Run-continuity Phase 1: stall gate at the final exit ────────
         // A stalled run (declared-Completion false, declared deliverables
         // unproduced, or a Failed/Blocked subtask) KEEPS its resumable
@@ -26423,6 +26677,65 @@ mod tests {
         .to_string()
     }
 
+    /// A v4 checkpoint for a run that SETTLED one subtask which declared an
+    /// artifact — the exact shape Phase 6 M3c's drift investigation scopes to:
+    /// the `completed_results` entry (a settled node) plus the per-task
+    /// `expected_artifacts` declaration (what may drift), and the run-start
+    /// `snapshot_generation` the classified diff is baselined against.
+    fn settled_artifact_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        design_id: TaskId,
+        artifact: &str,
+        snapshot_generation: &str,
+    ) -> String {
+        let stamp = [2026, 254, 0, 0, 0, 0, 0, 0, 0];
+        let result = success_result(design_id, "architect", "designed");
+        let mut completed_results = serde_json::Map::new();
+        completed_results.insert(
+            design_id.to_string(),
+            serde_json::to_value(&result).expect("agent run result serializes"),
+        );
+        let mut expected_artifacts = serde_json::Map::new();
+        expected_artifacts.insert(design_id.to_string(), serde_json::json!([artifact]));
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": design_id.to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [{
+                "id": design_id.to_string(),
+                "parent_id": null,
+                "session_id": session_id.to_string(),
+                "role": "architect",
+                "description": "design the thing",
+                "status": "Completed",
+                "dependencies": [],
+                "deliverable": "designed",
+            }],
+            "edges": [],
+            "completed_results": completed_results,
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": expected_artifacts,
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": [
+                { "kind": "dispatched", "task_id": design_id.to_string(), "timestamp": stamp },
+                { "kind": "completed", "task_id": design_id.to_string(), "timestamp": stamp },
+            ],
+            "snapshot_generation": snapshot_generation,
+        })
+        .to_string()
+    }
+
     /// Run-history audit: a deliberate operator stop mid-planning is recorded
     /// as its own event carrying the stage that was cancelled. The interrupt
     /// here lands AFTER the architect dispatch settled — the exact moment the
@@ -29010,6 +29323,7 @@ mod tests {
                 ("src/held-resume.rs".to_owned(), Some("ev-1".to_owned())),
                 ("src/other.rs".to_owned(), None),
             ],
+            plan_drift: Vec::new(),
         };
         coordinator
             .record_resume_external_changes(
@@ -30146,33 +30460,213 @@ mod tests {
         )
         .with_workspace_snapshot(snapshot);
 
-        let mut expected: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
-        expected.insert(completed_id, vec![camino::Utf8PathBuf::from("src/gone.rs")]);
-        expected.insert(pending_id, vec![camino::Utf8PathBuf::from("src/not_yet.rs")]);
+        let mut expected_map: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        expected_map.insert(completed_id, vec![camino::Utf8PathBuf::from("src/gone.rs")]);
+        expected_map.insert(pending_id, vec![camino::Utf8PathBuf::from("src/not_yet.rs")]);
         let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
         completed_results
             .insert(completed_id, success_result(completed_id, "coder", "wrote the module"));
+        let entries = coordinator
+            .workspace_snapshot
+            .as_ref()
+            .expect("workspace snapshot set")
+            .entries
+            .clone();
 
         let task = AgentTask::new(Ulid::new(), "resume the plan");
         let mut rx = bus.subscribe();
-        coordinator.emit_plan_drift(
-            Some("plan-7"),
-            &expected,
+        // Step 1–2 (no baseline: the log window carried no run-start
+        // inventory), then step 4 — the publish half of the production path.
+        let investigation = crate::external_change::investigate_plan_drift(
+            &completed_expected_artifacts(&expected_map, &completed_results),
             &[],
-            &completed_results,
-            &[],
+            &entries,
+            &own_write_paths(&[], &completed_results, &[], directory.path()),
             directory.path(),
+        );
+        coordinator.publish_plan_drift(
             &task,
+            Some("plan-7"),
+            &investigation,
+            &["coder".to_owned()],
         );
 
         let event = rx.try_recv().expect("PlanDrift published");
-        let EventKind::PlanDrift { task_id, plan_id, affected_paths } = &event.kind else {
+        let EventKind::PlanDrift { task_id, plan_id, affected_paths, diff, reverify, redispatched } =
+            &event.kind
+        else {
             panic!("expected PlanDrift, got a different event kind");
         };
         assert_eq!(*task_id, task.id);
         assert_eq!(plan_id.as_deref(), Some("plan-7"));
         assert_eq!(*affected_paths, vec!["src/gone.rs".to_owned()]);
+        assert_eq!(diff.len(), 1, "one classified finding: {:?}", diff);
+        assert_eq!(
+            reverify[0].status,
+            concerto_core::event::PlanDriftReverifyStatus::Gone,
+            "an absent file re-verifies as gone: {:?}",
+            reverify
+        );
+        assert_eq!(*redispatched, vec!["coder".to_owned()]);
         assert!(rx.try_recv().is_err(), "exactly one drift event per evaluation");
+    }
+
+    /// Phase 6 M3c end to end (tampered worktree → classify → re-verify →
+    /// re-arm → re-dispatch): a settled design step declared
+    /// `docs/design.md`, the file was rewritten behind the run's back, and
+    /// the resumed run must (1) publish ONE drift signal carrying the
+    /// classified divergence, the live re-read verdict, and the re-armed
+    /// role, and (2) actually dispatch that settled step again through the
+    /// normal ready batch — never a silent continued run, never a halt on the
+    /// raw signal.
+    ///
+    /// Both inventories come from the production walk: the run-start one is
+    /// the `WorkspaceSnapshot` event the baseline reader consults, the live
+    /// one is the resume barrier's capture. Without the run-start baseline in
+    /// the log the present-but-altered file is NOT drift, so the assertions
+    /// also pin the baseline plumbing.
+    #[tokio::test]
+    async fn confirmed_plan_drift_rearms_and_redispatches_the_settled_step() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "redesigned"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let workspace = tempfile::tempdir().expect("tempdir for drift workspace");
+        let cancel = CancellationToken::new();
+        let artifact_rel = "docs/design.md";
+        let artifact = workspace.path().join(artifact_rel);
+        std::fs::create_dir_all(artifact.parent().expect("docs dir"))
+            .expect("docs directory created");
+
+        // Run-start state: the artifact exactly as the run recorded it.
+        std::fs::write(&artifact, b"# the design as the run left it\n")
+            .expect("run-start artifact written");
+        let run_start_entries =
+            crate::workspace_snapshot::capture_workspace_snapshot(workspace.path(), &cancel);
+        let run_start = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: crate::workspace_snapshot::generation_for(&run_start_entries),
+            entries: run_start_entries,
+            captured_at_ms: 1,
+            project_root: camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+
+        let session_id = Ulid::new();
+        // The baseline lives in the whiteboard log the resume's log window
+        // reads — session-scoped, exactly as the barrier persists it.
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: Ulid::new().to_string(),
+                agent_id: "workspace-snapshot".to_owned(),
+                kind: WhiteboardKind::WorkspaceSnapshot,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::to_value(run_start.as_payload()).expect("payload serializes"),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("run-start baseline appended");
+
+        // The tamper: an external reviewer rewrites the artifact.
+        std::fs::write(&artifact, b"# rewritten by an external reviewer\n")
+            .expect("tampered artifact written");
+        let live_entries =
+            crate::workspace_snapshot::capture_workspace_snapshot(workspace.path(), &cancel);
+        let live = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: crate::workspace_snapshot::generation_for(&live_entries),
+            entries: live_entries,
+            captured_at_ms: 2,
+            project_root: camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() })
+        .with_workspace_snapshot(live);
+
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let design_id = TaskId::new();
+        let cp_json = settled_artifact_checkpoint_json(
+            &project_id,
+            session_id,
+            design_id,
+            artifact_rel,
+            &run_start.generation,
+        );
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        // 1. ONE drift signal: classified divergence + live re-read + who was
+        //    re-dispatched (the wording both frontends render).
+        let drift = events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::PlanDrift { affected_paths, diff, reverify, redispatched, .. } => Some(
+                    (affected_paths.clone(), diff.clone(), reverify.clone(), redispatched.clone()),
+                ),
+                _ => None,
+            })
+            .expect("a confirmed divergence must publish exactly one PlanDrift");
+        assert_eq!(drift.0, vec![artifact_rel.to_owned()], "names the drifted artifact");
+        assert_eq!(
+            drift.1[0].class,
+            concerto_core::event::PlanDriftDiffClass::AlteredHash,
+            "present-and-changed against the run-start baseline: {:?}",
+            drift.1
+        );
+        assert_eq!(
+            drift.2[0].status,
+            concerto_core::event::PlanDriftReverifyStatus::Diverged,
+            "the live re-read confirms the divergence: {:?}",
+            drift.2
+        );
+        assert_eq!(drift.3, vec!["architect".to_owned()], "the settled step is re-armed");
+        assert!(
+            events.iter().filter(|kind| matches!(kind, EventKind::PlanDrift { .. })).count() == 1,
+            "exactly one drift signal per resume"
+        );
+
+        // 2. The settled step is dispatched AGAIN — the re-dispatch is an
+        //    attempt on the normal policy-gated path, not a claim.
+        let re_dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+        });
+        assert!(
+            re_dispatched,
+            "the drift-rearmed architect must be dispatched again; the run ended {:?} with: {}",
+            output.completion_status, output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Plan-drift re-verification failed"),
+            "a confirmed divergence is not a re-verification failure: {}",
+            output.final_message
+        );
     }
 
     /// M3c: when every completed subtask's declared artifact is present in the
@@ -30203,24 +30697,34 @@ mod tests {
         )
         .with_workspace_snapshot(snapshot);
 
-        let mut expected: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
-        expected.insert(completed_id, vec![camino::Utf8PathBuf::from("src/present.rs")]);
+        let mut expected_map: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        expected_map.insert(completed_id, vec![camino::Utf8PathBuf::from("src/present.rs")]);
         let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
         completed_results
             .insert(completed_id, success_result(completed_id, "coder", "wrote the module"));
+        let entries = coordinator
+            .workspace_snapshot
+            .as_ref()
+            .expect("workspace snapshot set")
+            .entries
+            .clone();
 
         let task = AgentTask::new(Ulid::new(), "resume the plan");
         let mut rx = bus.subscribe();
-        coordinator.emit_plan_drift(
-            Some("plan-8"),
-            &expected,
+        let investigation = crate::external_change::investigate_plan_drift(
+            &completed_expected_artifacts(&expected_map, &completed_results),
             &[],
-            &completed_results,
-            &[],
+            &entries,
+            &own_write_paths(&[], &completed_results, &[], directory.path()),
             directory.path(),
-            &task,
         );
+        coordinator.publish_plan_drift(&task, Some("plan-8"), &investigation, &[]);
 
+        assert!(
+            investigation.is_empty(),
+            "present artifacts are not a finding: {:?}",
+            investigation
+        );
         assert!(rx.try_recv().is_err(), "present artifacts must not report drift");
     }
 
@@ -30265,19 +30769,37 @@ mod tests {
         let task = AgentTask::new(Ulid::new(), "resume the plan");
         let mut rx = bus.subscribe();
 
+        let entries = coordinator
+            .workspace_snapshot
+            .as_ref()
+            .expect("workspace snapshot set")
+            .entries
+            .clone();
+        let own_written = own_write_paths(&[], &completed_results, &[], directory.path());
+        let publish = |map: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>| {
+            let investigation = crate::external_change::investigate_plan_drift(
+                &completed_expected_artifacts(map, &completed_results),
+                &[],
+                &entries,
+                &own_written,
+                directory.path(),
+            );
+            coordinator.publish_plan_drift(&task, Some("plan-9"), &investigation, &[]);
+            investigation
+        };
+
         // Prose-only declarations: nothing is drift, so nothing is published.
         let mut prose_only: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
         prose_only
             .insert(completed_id, descriptions.iter().map(camino::Utf8PathBuf::from).collect());
-        coordinator.emit_plan_drift(
-            Some("plan-9"),
-            &prose_only,
-            &[],
-            &completed_results,
-            &[],
-            directory.path(),
-            &task,
+        let prose_investigation = publish(&prose_only);
+        assert_eq!(
+            prose_investigation.unverifiable.len(),
+            descriptions.len(),
+            "prose lands in the declaration-quality bucket: {:?}",
+            prose_investigation.unverifiable
         );
+        assert!(prose_investigation.is_empty(), "prose is never a drift finding");
         assert!(rx.try_recv().is_err(), "prose-only declarations must publish no event");
 
         // Prose alongside a genuinely absent real path: exactly ONE event,
@@ -30289,15 +30811,7 @@ mod tests {
             paths.push(camino::Utf8PathBuf::from("src/gone.rs"));
             paths
         });
-        coordinator.emit_plan_drift(
-            Some("plan-9"),
-            &mixed,
-            &[],
-            &completed_results,
-            &[],
-            directory.path(),
-            &task,
-        );
+        publish(&mixed);
         let event = rx.try_recv().expect("real missing path publishes PlanDrift");
         let EventKind::PlanDrift { affected_paths, .. } = &event.kind else {
             panic!("expected PlanDrift, got a different event kind");
