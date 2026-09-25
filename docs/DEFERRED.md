@@ -45,11 +45,10 @@ a note.
 | 18 | Coordinator restart/resume end-to-end (cross-process continue) | TODO.md:18–25 (Partial; e2e remains); ADR-34 D2 | After checkpoint persistence + evidence-spine resume e2e | L |
 | 19 | Audit-log retention policy | ADR-40:47 ("future policy question"); TODO.md:14–17 | When an audit-log retention policy is written | S |
 | 21 | Fault-injection tests for multi-agent containment (rate limits, malformed tool calls, missing executables, cancellation races, provider disconnects) | TODO.md:218–224 | ADR-26 boundaries; part of live-test phase | L |
-| 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | With ADR-46/48 reasoning + parts split (Phase 2) | L |
+| 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | **GATED DOCTRINE 2026-09-25** — stays OPEN, but gated on ADR-47's own reopen condition (:78–93): reopen **only** when a consumer proposes/needs richer message content the flat shape cannot express (multi-part tool bodies, image/file `File` parts, structured `Thinking`/`RedactedThinking` on Anthropic/Gemini paths, or structured data smuggled into `content: String`). Migration preconditions recorded 2026-09-25 — all three required before any parts work: **(a)** a named consumer need (ADR-47:80–81); **(b)** a parts-joined-text equivalence test — joining `parts` back to flat text must reproduce today's bytes, and Fix 2 strictness must not loosen (proxy-tool-call-fix.md:5,60 — content-embedded strict path buffers content to turn end); **(c)** a checkpoint/`state_json` migration plan for old rows (`orchestration_checkpoints.state_json` is `TEXT NOT NULL`, migration 019:10; `crates/sessions/src/lib.rs:150`), shipped additively with `serde(default)` + legacy-column fallback in one dedicated window, never as a side effect of an unrelated feature (ADR-47:62–65,109–110; ARCHITECTURE-V2.md §10). Verified migration-safe meanwhile: the Mimo/loose-tier tool mods operate on `ToolDefinition`/`ToolCall` **values**, not message shape — `schema_loose.rs:113` `adapt_tool_definitions(&mut [ToolDefinition])`, `:132` `unflatten_tool_arguments(&mut serde_json::Value)`, `google.rs:55` `adapt_tools_for` mutates `request.tools` — so they neither block nor depend on a parts migration. | L |
 | 23 | ADR-53 per-token streaming through WASM (heartbeat landed) | ADR-53:137–139 (streaming through WASM deferred; heartbeat keepalive landed per ADR-53/57) | Verify streaming scope remains deferred | M |
 | 24 | Shell Phases C–F + slices 1–3 (explain/debug/optimize, workflow AST, tool ABI, measured self-improvement) | TODO.md:114–135; ADR-29; ROADMAP | When Phases C–F are scheduled from the roadmap | L |
 | 25 | Code editor integration (external editor + open-in-editor + diffs) | TODO.md:157; ROADMAP | Post-1.0 | M |
-| 26 | ADR-49 flat→parts canonicalization (do NOT mark complete) | ADR-49:85–98; TODO.md:87–88 | With message-parts work (row 22) | L |
 | 27 | Pricing/metadata freshness feeds the VISUAL SPEND TRACKER ONLY (rescoped 2026-09-25: display-only, spend tracker) | TODO.md:201; STATUS.md tracked follow-ups | When the display-only pricing/metadata freshness flow lands. Stale prices make usage dollars wrong; routing must never see prices. Non-goal: the coordinator must never know or care about cheap vs expensive models; no cost-based routing, no model switching on price, and no coordinator coupling of any kind. | M |
 | 28 | ADR-58 P5/P6 + TOML diff + canvas DAG editor + partitioning | ADR-58:238–247; STATUS.md ~328–355 (deferred P5 Studio, P6 items, TOML diff, run-one-stage, multi-executor partitioning) | Post-P6 roadmap phase (explicit ADR-58 deferral items) | L |
 | 29 | ADR-43 server mode / SSE / marketplace / persistent desktop state / TOML secrets | ADR-43 §3 v1 note (MCP server mode, SSE transport, marketplace/registry, keyring-backed tokens, persistent desktop state deferred); docs/skills.md:202 | When the API surface / web UI materializes | L |
@@ -91,6 +90,24 @@ a note.
 
 ## Verification notes (2026-09-24)
 
+- 2026-09-25 append: **row 26 cut 2026-09-25 as miscited duplicate of #22 (no
+  separate task behind the label)**. Its two citations both resolve to other
+  work: `ADR-49:85–98` is the **config-catalog flattening** deferred item
+  ("merging `ProviderConfig` / `ModelPinConfig` / `MultiAgentConfig` into a
+  single catalog schema"), not message parts — ADR-47 is the sole message-parts
+  authority; and `TODO.md:87–88` now cites the **L1-extraction** source paths
+  (`src/core/prompts/l1-extraction.ts`, `src/core/prompts/l1-dedup.ts`,
+  `src/core/record/l1-dedup.ts`) under the L1 typed-extraction item, carried by
+  row 31. The row's own re-entry condition ("with message-parts work (row 22)")
+  confirmed the duplication. The #26 numbering gap is left intentionally (no
+  renumbering), matching the row 12 precedent. The real ADR-49 flattening
+  deferral remains recorded in its own ADR and is not tracked here.
+- 2026-09-25 append: row 22 annotated **GATED DOCTRINE** and kept OPEN. The
+  gate is ADR-47's own wording ("Reopen when a consumer proposes/needs **richer
+  message content that the flat shape cannot express**", ADR-47:78–93), not a
+  re-scoped trigger. Row size (L) and source cell were left unchanged. The
+  Mimo/loose-tier tool mods were checked to be migration-safe (they act on
+  `ToolDefinition`/`ToolCall` values, not message shape).
 - Row 12 (ChunkSelector char-budget allocator) merged into row 5 (recall
   budget caps + timeout) on 2026-09-24; the #12 numbering gap is left
   intentionally (no renumbering).
