@@ -309,6 +309,14 @@ pub enum EventKind {
     /// fires for the planned-but-absent class. `plan_id` is the plan artifact
     /// id (`plan-<plan_id>.json`), `affected_paths` are project-root-relative
     /// forward-slash paths.
+    ///
+    /// The signal carries the whole Phase 6 M3c investigation so a consumer
+    /// (desktop chat, CLI transcript, SSE) can render one human report:
+    /// `diff` is the classified snapshot-vs-checkpoint finding per path,
+    /// `reverify` is the live-filesystem re-verification of those findings,
+    /// and `redispatched` names the re-armed steps the resume re-dispatched.
+    /// All three are additive — a legacy producer (or a pre-M3c event row)
+    /// deserializes them as empty.
     PlanDrift {
         task_id: TaskId,
         /// Run-scoped id of the plan the drift is scoped to; `None` when the
@@ -317,6 +325,18 @@ pub enum EventKind {
         /// present.
         plan_id: Option<String>,
         affected_paths: Vec<String>,
+        /// Classified findings for every declared artifact that could not be
+        /// confirmed intact at the resume's snapshot. Additive field.
+        #[serde(default)]
+        diff: Vec<PlanDriftDiffEntry>,
+        /// Per-finding live-filesystem re-verification. Additive field.
+        #[serde(default)]
+        reverify: Vec<PlanDriftReverifyEntry>,
+        /// Role labels of the completed subtasks the resume re-armed and
+        /// re-dispatched; empty when the resume delegated to a fresh plan.
+        /// Additive field.
+        #[serde(default)]
+        redispatched: Vec<String>,
     },
     SubTaskCreated {
         task_id: TaskId,
@@ -706,6 +726,124 @@ pub struct IntentRouteDecision {
     pub auto_granted: bool,
 }
 
+/// How a planned artifact diverged from the run-start workspace inventory
+/// (Phase 6 M3c, [`EventKind::PlanDrift::diff`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDriftDiffClass {
+    /// The plan expects it, the resume's live inventory does not hold it,
+    /// and the run's own writes do not explain it.
+    Missing,
+    /// The live inventory holds it but with a different recorded identity
+    /// (content hash, or size when no hash was captured) than the run-start
+    /// baseline.
+    AlteredHash,
+    /// The live inventory holds it but the run-start baseline did not — it
+    /// appeared after the run began, written by something other than the run.
+    New,
+}
+
+impl PlanDriftDiffClass {
+    /// The kebab-free lowercase label used in human reports.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::AlteredHash => "altered",
+            Self::New => "new",
+        }
+    }
+}
+
+/// One classified planned-artifact finding of a [`EventKind::PlanDrift`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDriftDiffEntry {
+    /// Project-root-relative forward-slash path.
+    pub path: String,
+    /// Why it is a finding.
+    pub class: PlanDriftDiffClass,
+}
+
+/// The outcome of re-reading one drift finding from the live filesystem
+/// (Phase 6 M3c, [`EventKind::PlanDrift::reverify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDriftReverifyStatus {
+    /// Present and unchanged against the run-start reference (or present
+    /// with no comparable reference): the finding is cleared silently.
+    Intact,
+    /// Present but diverged from the run-start reference.
+    Diverged,
+    /// Absent from the live filesystem.
+    Gone,
+    /// The file could not be read or stat'ed for a reason other than
+    /// absence — re-verification genuinely failed.
+    Unverified,
+}
+
+impl PlanDriftReverifyStatus {
+    /// The kebab-free lowercase label used in human reports.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Intact => "intact",
+            Self::Diverged => "diverged",
+            Self::Gone => "gone",
+            Self::Unverified => "unverified",
+        }
+    }
+
+    /// Whether the finding survived re-verification as real drift.
+    pub fn is_confirmed_drift(&self) -> bool {
+        matches!(self, Self::Diverged | Self::Gone)
+    }
+}
+
+/// One live-filesystem re-verification result of a [`EventKind::PlanDrift`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDriftReverifyEntry {
+    /// Project-root-relative forward-slash path.
+    pub path: String,
+    /// What re-reading the file showed.
+    pub status: PlanDriftReverifyStatus,
+}
+
+/// The one-line human report both frontends render for an
+/// [`EventKind::PlanDrift`] (Phase 6 M3c step 4 — desktop chat activity and
+/// the CLI transcript must tell the same story).
+///
+/// Reports, in order: what drifted, what re-verification concluded, and what
+/// was re-dispatched. `affected_paths` are the classified findings' paths,
+/// `reverify` their live re-read, and `redispatched` the re-armed steps'
+/// role labels (empty when the resume delegated re-dispatch to a fresh plan).
+pub fn plan_drift_report(
+    affected_paths: &[String],
+    reverify: &[PlanDriftReverifyEntry],
+    redispatched: &[String],
+) -> String {
+    let listed =
+        if affected_paths.is_empty() { "<unlisted>".to_owned() } else { affected_paths.join(", ") };
+    let mut statuses: Vec<&'static str> = Vec::new();
+    for entry in reverify {
+        let label = entry.status.as_str();
+        if !statuses.contains(&label) {
+            statuses.push(label);
+        }
+    }
+    let reverified = if statuses.is_empty() {
+        "no re-verification".to_owned()
+    } else {
+        format!("re-verified: {}", statuses.join(", "))
+    };
+    let redispatch =
+        if reverify.iter().any(|entry| entry.status == PlanDriftReverifyStatus::Unverified) {
+            "no re-dispatch attempted".to_owned()
+        } else if redispatched.is_empty() {
+            "re-dispatch delegated to the resumed plan".to_owned()
+        } else {
+            format!("re-dispatched {}", redispatched.join(", "))
+        };
+    format!("Plan drift: {listed} ({reverified}); {redispatch}")
+}
+
 impl EventKind {
     /// Sanitize all string fields in this event kind to redact secrets.
     ///
@@ -855,12 +993,37 @@ impl EventKind {
                 project_id: sanitizer.sanitize(&project_id),
                 reason: sanitizer.sanitize(&reason),
             },
-            EventKind::PlanDrift { task_id, plan_id, affected_paths } => EventKind::PlanDrift {
+            EventKind::PlanDrift {
+                task_id,
+                plan_id,
+                affected_paths,
+                diff,
+                reverify,
+                redispatched,
+            } => EventKind::PlanDrift {
                 task_id,
                 plan_id: plan_id.map(|id| sanitizer.sanitize(&id)),
                 affected_paths: affected_paths
                     .into_iter()
                     .map(|path| sanitizer.sanitize(&path))
+                    .collect(),
+                diff: diff
+                    .into_iter()
+                    .map(|entry| PlanDriftDiffEntry {
+                        path: sanitizer.sanitize(&entry.path),
+                        class: entry.class,
+                    })
+                    .collect(),
+                reverify: reverify
+                    .into_iter()
+                    .map(|entry| PlanDriftReverifyEntry {
+                        path: sanitizer.sanitize(&entry.path),
+                        status: entry.status,
+                    })
+                    .collect(),
+                redispatched: redispatched
+                    .into_iter()
+                    .map(|label| sanitizer.sanitize(&label))
                     .collect(),
             },
             // Run-history audit: the resume input is verbatim user text and
@@ -1807,5 +1970,80 @@ mod tests {
         let json = serde_json::to_value(&kind).unwrap();
         let back: EventKind = serde_json::from_value(json).unwrap();
         assert!(matches!(back, EventKind::AgentThought { kind: ThinkingKind::Headline, .. }));
+    }
+
+    /// Phase 6 M3c: the investigation payload on `PlanDrift` is additive —
+    /// a legacy row (or an older producer) that carries only the original
+    /// three fields still deserializes, with the payload defaulted empty.
+    #[test]
+    fn plan_drift_payload_is_additive() {
+        let legacy = serde_json::json!({
+            "PlanDrift": {
+                "task_id": "01J00000000000000000000000",
+                "plan_id": "plan-7",
+                "affected_paths": ["src/gone.rs"]
+            }
+        });
+        let back: EventKind = serde_json::from_value(legacy).expect("legacy row deserializes");
+        let EventKind::PlanDrift { plan_id, affected_paths, diff, reverify, redispatched, .. } =
+            &back
+        else {
+            panic!("expected PlanDrift");
+        };
+        assert_eq!(plan_id.as_deref(), Some("plan-7"));
+        assert_eq!(affected_paths, &vec!["src/gone.rs".to_owned()]);
+        assert!(diff.is_empty() && reverify.is_empty() && redispatched.is_empty());
+
+        // The full payload round-trips with its typed classification.
+        let full = EventKind::PlanDrift {
+            task_id: TaskId::new(),
+            plan_id: Some("plan-7".into()),
+            affected_paths: vec!["src/gone.rs".into()],
+            diff: vec![PlanDriftDiffEntry {
+                path: "src/gone.rs".into(),
+                class: PlanDriftDiffClass::Missing,
+            }],
+            reverify: vec![PlanDriftReverifyEntry {
+                path: "src/gone.rs".into(),
+                status: PlanDriftReverifyStatus::Gone,
+            }],
+            redispatched: vec!["coder".into()],
+        };
+        let json = serde_json::to_value(&full).expect("serializes");
+        let back: EventKind = serde_json::from_value(json).expect("deserializes");
+        let EventKind::PlanDrift { diff, reverify, redispatched, .. } = &back else {
+            panic!("expected PlanDrift");
+        };
+        assert_eq!(diff[0].class, PlanDriftDiffClass::Missing);
+        assert_eq!(reverify[0].status, PlanDriftReverifyStatus::Gone);
+        assert_eq!(redispatched, &vec!["coder".to_owned()]);
+    }
+
+    /// Both frontends render this single report line for a drift signal.
+    #[test]
+    fn plan_drift_report_tells_what_drifted_verified_and_redispatched() {
+        let paths = vec!["src/gone.rs".to_owned(), "src/new.rs".to_owned()];
+        let reverify = vec![
+            PlanDriftReverifyEntry {
+                path: "src/gone.rs".into(),
+                status: PlanDriftReverifyStatus::Gone,
+            },
+            PlanDriftReverifyEntry {
+                path: "src/new.rs".into(),
+                status: PlanDriftReverifyStatus::Diverged,
+            },
+        ];
+        let report = plan_drift_report(&paths, &reverify, &["coder".to_owned()]);
+        assert!(report.contains("src/gone.rs, src/new.rs"), "{report}");
+        assert!(report.contains("re-verified: gone, diverged"), "{report}");
+        assert!(report.contains("re-dispatched coder"), "{report}");
+
+        // A re-verification failure never claims a re-dispatch happened.
+        let failed = vec![PlanDriftReverifyEntry {
+            path: "src/gone.rs".into(),
+            status: PlanDriftReverifyStatus::Unverified,
+        }];
+        let report = plan_drift_report(&paths, &failed, &[]);
+        assert!(report.contains("no re-dispatch attempted"), "{report}");
     }
 }
