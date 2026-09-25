@@ -14,7 +14,7 @@ use crate::plan_approval::{
 };
 use crate::registry::AgentRegistry;
 use crate::services::ProviderSummarizer;
-use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
+use crate::session_manager::{message_row_usage, ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
 use async_trait::async_trait;
@@ -3794,6 +3794,8 @@ async fn run_multi_agent(
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
+        // Run-start row: no provider call has happened yet, so there is no
+        // usage to record — tokens stay `None` by design.
         let user_message = Message {
             role: concerto_core::types::Role::User,
             content: req.input.clone(),
@@ -4540,6 +4542,11 @@ async fn run_multi_agent(
         Ok(output) => output,
         Err(error) => {
             stage_feed.abort();
+            // Settle the coordinator's usage first: it feeds both the failure
+            // row below and the metrics/spend tail, so one rate-limit
+            // exhaustion or cancellation records the same tokens everywhere
+            // (ADR-48 §4 — real usage when available, on the message row too).
+            let settled = coordinator.settled_metrics();
             if let Some(store) = &session_store {
                 let content = if matches!(
                     &error,
@@ -4550,14 +4557,15 @@ async fn run_multi_agent(
                 } else {
                     format!("Task failed: {error}")
                 };
+                let (tokens_in, tokens_out) = message_row_usage(settled);
                 let failure_message = Message {
                     role: concerto_core::types::Role::Assistant,
                     content,
                     tool_calls: None,
                     tool_results: None,
                     reasoning_content: None,
-                    tokens_in: None,
-                    tokens_out: None,
+                    tokens_in,
+                    tokens_out,
                 };
                 if let Err(store_error) = store
                     .append_messages(session_id, &[failure_message], req.cancel_token.clone())
@@ -4572,11 +4580,11 @@ async fn run_multi_agent(
             }
             transcript_recorder.stop().await;
             event_recorder.stop().await;
-            // Persist the coordinator's settled metrics before the error
-            // propagates: on a rate-limit exhaustion / cancellation the run
-            // consumed real tokens without any output — the audit trail must
-            // still record them. Best-effort like the success tail.
-            let settled = coordinator.settled_metrics();
+            // Persist the coordinator's settled metrics (bound above, before
+            // the failure row) before the error propagates: on a rate-limit
+            // exhaustion / cancellation the run consumed real tokens without
+            // any output — the audit trail must still record them. Best-effort
+            // like the success tail.
             persist_provider_metrics(
                 session_store.as_ref(),
                 session_id,
@@ -4674,14 +4682,18 @@ async fn run_multi_agent(
     )
     .await;
     if let Some(store) = &session_store {
+        // ADR-48 §4: the assistant row records the same settled usage the
+        // `provider_metrics` and spend writes above record for this run. The
+        // run-start user row predates any provider call and stays `None`.
+        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_message = Message {
             role: concerto_core::types::Role::Assistant,
             content: output.final_message.clone(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
+            tokens_in,
+            tokens_out,
         };
         if let Err(error) =
             store.append_messages(session_id, &[assistant_message], req.cancel_token.clone()).await
@@ -5157,7 +5169,8 @@ async fn drive_supervised_run(
     // Per-child provider metrics/spend are not surfaced through the parent in
     // this slice (the mock-provider children consume none), so there is
     // nothing to persist here yet — the coordinator tail's metric writes are
-    // deliberately omitted rather than called with empty data.
+    // deliberately omitted rather than called with empty data, and the
+    // assistant row's token fields stay `None` for the same reason.
     if let Some(store) = session_store {
         let assistant_message = Message {
             role: Role::Assistant,

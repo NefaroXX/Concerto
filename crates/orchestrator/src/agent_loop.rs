@@ -30,6 +30,7 @@ use concerto_tools::undo::UndoManager;
 use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
+use crate::session_manager::message_row_usage;
 use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
 use crate::tool_driver::{self, DriverTurn, TextToolDriver};
@@ -1924,6 +1925,8 @@ impl AgentLoop {
             tracing::warn!(error = %e, "failed to persist TaskStarted event");
         }
 
+        // Run-start row: no provider call has happened yet, so there is no
+        // usage to record — tokens stay `None` by design.
         let user_msg = Message {
             role: Role::User,
             content: task.description.clone(),
@@ -1987,14 +1990,19 @@ impl AgentLoop {
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
+        // ADR-48 §4: the terminal assistant row carries the run's
+        // provider-reported usage, the same totals the `provider_metrics`
+        // rows record for this run. The run-start user row predates any
+        // provider call and keeps `None`.
+        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_msg = Message {
             role: Role::Assistant,
             content: output.summary(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
+            tokens_in,
+            tokens_out,
         };
         if cancel.is_cancelled() {
             return;
@@ -2036,14 +2044,17 @@ impl AgentLoop {
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
+        // Same accounting as `persist_run_success`: the partial landing still
+        // spent real tokens, so the assistant row records them (ADR-48 §4).
+        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_msg = Message {
             role: Role::Assistant,
             content: output.summary(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
+            tokens_in,
+            tokens_out,
         };
         if cancel.is_cancelled() {
             return;
@@ -6207,6 +6218,63 @@ mod tests {
         for pm in &output.provider_metrics {
             assert!(!pm.provider.is_empty(), "provider name must not be empty");
         }
+    }
+
+    /// A completed run records the run's provider-reported usage on the
+    /// terminal assistant row (ADR-48 §4), while the run-start user row —
+    /// written before any provider call — carries no usage. Runs through the
+    /// real persistence seams against an in-memory store, so the asserted
+    /// values are the ones that actually land in the `messages` table.
+    #[tokio::test]
+    async fn persist_run_success_records_usage_on_the_assistant_row() {
+        let store = concerto_sessions::SqliteSessionStore::connect_in_memory()
+            .await
+            .expect("in-memory sessions store");
+        let session_id = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/persist-usage"),
+                "openai",
+                "gpt-4",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 10).with_session_store(Some(store.clone()));
+        let cancel = CancellationToken::new();
+
+        let task = AgentTask::new(session_id, "test");
+        loop_.persist_run_start(&task, cancel.clone()).await;
+
+        let mut output = agent_output_base();
+        output.task_id = task.id;
+        output.session_id = session_id;
+        output.completion_status = concerto_core::types::AgentCompletionStatus::Completed;
+        output.provider_metrics = vec![ProviderMetrics {
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            tokens_in: 120,
+            tokens_out: 60,
+            cost_usd: 0.0,
+            latency_ms: 1,
+        }];
+        loop_.persist_run_success(session_id, &output, cancel.clone()).await;
+
+        let messages = store.load_messages(session_id, cancel).await.expect("load messages");
+        assert_eq!(messages.len(), 2, "run-start user row + terminal assistant row");
+        assert_eq!(messages[0].role, Role::User, "first row is the run-start user row");
+        assert_eq!(messages[0].tokens_in, None, "no provider call had happened yet");
+        assert_eq!(messages[1].role, Role::Assistant, "second row is the assistant summary");
+        assert_eq!(messages[1].tokens_in, Some(120), "provider-reported prompt tokens recorded");
+        assert_eq!(
+            messages[1].tokens_out,
+            Some(60),
+            "provider-reported completion tokens recorded"
+        );
     }
 
     // -----------------------------------------------------------------------

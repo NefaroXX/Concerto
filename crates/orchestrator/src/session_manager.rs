@@ -201,6 +201,33 @@ impl ProjectSessionManager {
     }
 }
 
+/// Fold a run's provider-reported usage into the `(tokens_in, tokens_out)`
+/// pair stored on a persisted message row (ADR-48 §4: real usage is recorded
+/// per message when available, estimate otherwise).
+///
+/// * Entries whose provider is empty are skipped, mirroring the
+///   `provider_metrics` and spend writers — a message row's totals then line
+///   up with the per-call rows written for the same run, and mock/padding
+///   entries never become a fabricated measurement.
+/// * An empty (or fully-skipped) slice yields `(None, None)`, which
+///   `append_messages` stores as `0`: indistinguishable from "not recorded",
+///   exactly like every row written before this milestone.
+///
+/// The sums saturate — token counts are accounting, not a place to panic on
+/// a pathological accumulation.
+pub(crate) fn message_row_usage(metrics: &[ProviderMetrics]) -> (Option<u64>, Option<u64>) {
+    let mut tokens_in: Option<u64> = None;
+    let mut tokens_out: Option<u64> = None;
+    for metric in metrics {
+        if metric.provider.trim().is_empty() {
+            continue;
+        }
+        tokens_in = Some(tokens_in.unwrap_or(0).saturating_add(metric.tokens_in));
+        tokens_out = Some(tokens_out.unwrap_or(0).saturating_add(metric.tokens_out));
+    }
+    (tokens_in, tokens_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +293,83 @@ mod tests {
 
         let sessions = mgr.list_project_sessions(&dir, 10, CancellationToken::new()).await.unwrap();
         assert!(sessions.iter().any(|s| s.id == created.session_id));
+    }
+
+    // ------------------------------------------------------------------
+    // Per-message token accounting (ADR-48 §4)
+    // ------------------------------------------------------------------
+    fn metric(provider: &str, tokens_in: u64, tokens_out: u64) -> ProviderMetrics {
+        ProviderMetrics {
+            provider: provider.to_string(),
+            model: "model".to_string(),
+            tokens_in,
+            tokens_out,
+            cost_usd: 0.0,
+            latency_ms: 1,
+        }
+    }
+
+    #[test]
+    fn message_row_usage_sums_settled_calls() {
+        let usage = message_row_usage(&[metric("openai", 120, 60), metric("anthropic", 80, 40)]);
+        assert_eq!(usage, (Some(200), Some(100)));
+    }
+
+    #[test]
+    fn message_row_usage_without_a_settled_call_stays_unknown() {
+        assert_eq!(message_row_usage(&[]), (None, None));
+        // Empty-provider entries are the ones the metrics and spend writers
+        // skip; they must not turn into a recorded measurement.
+        assert_eq!(message_row_usage(&[metric("", 999, 999)]), (None, None));
+    }
+
+    #[test]
+    fn message_row_usage_saturates_instead_of_panicking() {
+        let usage =
+            message_row_usage(&[metric("openai", u64::MAX, u64::MAX), metric("openai", 1, 1)]);
+        assert_eq!(usage, (Some(u64::MAX), Some(u64::MAX)));
+    }
+
+    /// The computed usage must survive the real write: `Some(n)` restores as
+    /// `Some(n)` through `append_messages`/`load_messages`, so the row is a
+    /// measurement and not just an in-memory value that stores as `0`.
+    #[tokio::test]
+    async fn message_row_usage_round_trips_through_the_messages_table() {
+        let store = SqliteSessionStore::connect_in_memory().await.expect("in-memory store");
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let session = store
+            .create_session(
+                Utf8Path::new("/tmp/message-row-usage"),
+                "openai",
+                "gpt-4",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("session");
+
+        let (tokens_in, tokens_out) =
+            message_row_usage(&[metric("openai", 120, 60), metric("openai", 80, 40)]);
+        let assistant = Message {
+            role: concerto_core::types::Role::Assistant,
+            content: "done".to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in,
+            tokens_out,
+        };
+        store
+            .append_messages(session.id, &[assistant], CancellationToken::new())
+            .await
+            .expect("append");
+
+        let loaded = store.load_messages(session.id, CancellationToken::new()).await.expect("load");
+        assert_eq!(loaded.len(), 1, "exactly one assistant row");
+        assert_eq!(loaded[0].tokens_in, Some(200), "provider-reported tokens_in must be recorded");
+        assert_eq!(
+            loaded[0].tokens_out,
+            Some(100),
+            "provider-reported tokens_out must be recorded"
+        );
     }
 }
