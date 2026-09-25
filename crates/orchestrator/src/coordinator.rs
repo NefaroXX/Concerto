@@ -230,6 +230,23 @@ fn prose_stop_dispatch_instruction(attempt: u32) -> String {
     )
 }
 
+/// The explicit dispatch instruction appended to a RESUMED run's decision
+/// context by [`CoordinatorAgent::drive_resumed_implement`]: the restored
+/// steps are all settled, the implement stage was never dispatched, and the
+/// session must decide the next dispatch instead of re-reporting the
+/// completion guard's verdict in prose.
+fn resume_drive_instruction() -> String {
+    "<resume_drive>\n\
+     This run was resumed from a checkpoint whose restored steps are ALL settled, yet the \
+     plan's implement stage was never dispatched and no code artifact exists. Decide the \
+     NEXT dispatch now with the `call_specialist` tool.\n\
+     - Do NOT re-dispatch a restored step: they are all Completed.\n\
+     - Do NOT close in prose: an action-required resume that ends with no implement \
+     dispatch is reported as an unattempted-implementation failure and pauses Partial.\n\
+     </resume_drive>\n"
+        .to_owned()
+}
+
 /// ADR-35 amendment (2026-09-05) §1: built-in instructions for the
 /// Coordinator's decision loop. The roster ([`Self::render_specialist_roster`])
 /// is injected after these instructions; the Orchestration Studio's
@@ -843,6 +860,35 @@ fn is_unfinished_subtask_status(status: SubTaskStatus) -> bool {
 /// Whether the graph holds any unfinished (non-terminal) subtask.
 fn graph_has_unfinished_work(graph: &TaskGraph) -> bool {
     graph.all_tasks().iter().any(|subtask| is_unfinished_subtask_status(subtask.status))
+}
+
+/// The restored graph's dispatch-chain tip: the newest leaf (no outgoing
+/// dependents), or the newest node when every node has dependents. This is
+/// the resume-drive's chain parent, so a dispatch decided after restore
+/// attaches exactly where the interrupted session's next dispatch would have
+/// (a child of the frontier, `MustFinishBefore` its parent) instead of
+/// becoming a detached root.
+///
+/// [`TaskGraph::all_tasks`] iterates a `HashMap`, so the order is made
+/// explicit here — `created_at`, then task id — to keep the choice
+/// deterministic across restores of the same row.
+fn restored_chain_tip(graph: &TaskGraph) -> Option<TaskId> {
+    let mut candidates = graph
+        .all_tasks()
+        .into_iter()
+        .filter(|subtask| graph.outgoing_dependents(&subtask.id).is_empty())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = graph.all_tasks();
+    }
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.0.to_string().cmp(&right.id.0.to_string()))
+        })
+        .map(|subtask| subtask.id)
 }
 
 /// Run-continuity Phase 1: the stall predicate evaluated at a run's final
@@ -5136,6 +5182,195 @@ impl CoordinatorAgent {
         );
     }
 
+    /// Whether a restored checkpoint is in the shape the resume-drive exists
+    /// for: an ACTION-REQUIRED, full-depth run that PROMISED implementation
+    /// (the same predicate the completion guard arms on) yet holds no
+    /// implement-stage dispatch, no code artifact, and no unresolved pause —
+    /// with every restored node already `Completed`, so there is no open work
+    /// for the decision loop to wait on.
+    ///
+    /// Returning `true` hands the restored result to
+    /// [`Self::drive_resumed_implement`] instead of returning it verbatim:
+    /// verbatim would fall straight through to `execute_graph`'s
+    /// unattempted-implementation guard, which re-reports the SAME canned
+    /// Partial the run already was — a dead end that re-persists on every
+    /// resume.
+    ///
+    /// Deliberately narrower than the guard: any `Failed`/`Blocked` node, a
+    /// preserved input/approval pause, a parked wait, or an empty graph keeps
+    /// today's restore behaviour untouched.
+    fn resume_needs_implement_drive(&self, task: &AgentTask, result: &DecomposeResult) -> bool {
+        matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && self.orchestration_depth == OrchestrationDepth::Full
+            && self.run_has_promised_plan()
+            && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
+            && !result.all_files.iter().any(|path| is_code_artifact_path(path))
+            && result.requested_user_input.is_none()
+            && result.pending_approval.is_none()
+            && self.active_wait.is_none()
+            && !result.graph.is_empty()
+            && result
+                .graph
+                .all_tasks()
+                .iter()
+                .all(|subtask| subtask.status == SubTaskStatus::Completed)
+    }
+
+    /// Resume-drive: re-enter the Coordinator's decision loop over the
+    /// RESTORED graph so a settled-but-unattempted implement stage gets its
+    /// dispatch, instead of returning the restore verbatim and letting the
+    /// completion guard downgrade the run to the Partial it already was.
+    ///
+    /// ADR-35 §1: dispatch happens ONLY through `call_specialist` inside
+    /// [`Self::run_dispatch_session`] — never a direct graph mutation — so
+    /// every decision stays policy-gated, whiteboard-recorded and settled
+    /// with a checkpoint persist, exactly like a live-loop dispatch (a stop
+    /// mid-drive leaves the same durable shape a mid-run stop does).
+    ///
+    /// `MultiAgentModeStarted` is NOT re-fired: the restore already published
+    /// it for this run. The restored ledger rides through; the drive's own
+    /// dispatches merge on top, deduplicated.
+    async fn drive_resumed_implement(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        cp_json: &str,
+        mut result: DecomposeResult,
+    ) -> Result<DecomposeResult, OrchestratorError> {
+        // The restore already wrote the checkpoint's plan back into the
+        // run-scoped doc store (and its expected artifacts alongside), so an
+        // implement dispatch decided here derives the same contract.
+        let doc = self.design_doc_snapshot();
+        // Output-mode typing and relationship resolution ONLY — the roster
+        // still decides who gets dispatched (ADR-35).
+        let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
+        let mut intro = self.dispatch_context_intro(doc.as_ref(), None, cancel).await;
+        intro.push_str(&resume_drive_instruction());
+        let mut state = DispatchSessionState {
+            doc,
+            doc_verdict: None,
+            last_node: restored_chain_tip(&result.graph),
+            ..Default::default()
+        };
+        // The drive's ledger STARTS from the restored state, so a
+        // settle-persist inside the session writes the MERGED checkpoint —
+        // restored rows plus this session's dispatches — instead of a row
+        // that silently drops the restored bookkeeping (a stop mid-drive
+        // would otherwise lose the design step's results, files, and action
+        // ledger on the next resume). `retry_feedback` has no ledger mirror;
+        // it stays on the result as everywhere else. The fields are moved out
+        // of `result` and moved back on the success arm below, so nothing is
+        // double-counted.
+        let mut ledger = DispatchLedger {
+            completed_results: std::mem::take(&mut result.completed_results),
+            total_cost: result.total_cost,
+            total_tool_calls: result.total_tool_calls,
+            all_files: std::mem::take(&mut result.all_files),
+            provider_metrics: std::mem::take(&mut result.provider_metrics),
+            subtask_attempts: std::mem::take(&mut result.subtask_attempts),
+            model_assignments: std::mem::take(&mut result.model_assignments),
+            action_ledger: std::mem::take(&mut result.action_ledger),
+            notes: Vec::new(),
+        };
+        // Persist under the RESTORED run id + sequence so the drive's
+        // intermediate checkpoints stay part of the same run history. The
+        // restore already deserialized this payload; a repeat failure can
+        // only be corruption, and degrading to a fresh scope is strictly
+        // better than failing the resume over bookkeeping.
+        let restored = checkpoint::GraphCheckpoint::from_json(cp_json).ok();
+        let mut scope = checkpoint::CheckpointScope {
+            run_id: restored.as_ref().map_or_else(Ulid::new, |cp| cp.run_id),
+            session_id: task.session_id,
+            root_task_id: task.id,
+            project_id: context.session.project_id.0.clone(),
+            objective: result.objective.clone(),
+            objective_hash: result.objective_hash.clone(),
+            source_revision: self.source_revision.clone(),
+            sequence_num: restored.as_ref().map_or(0, |cp| cp.sequence_num),
+        };
+        let session = self
+            .run_dispatch_session(
+                &mut result.graph,
+                task,
+                context,
+                cancel,
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                design_role.as_ref(),
+                &intro,
+            )
+            .await;
+        let summary = match session {
+            Ok((summary, _advisory_plan)) => summary,
+            Err(error) => {
+                // The ledger (seeded with the restored state AND carrying the
+                // drive's own dispatches) unwinds with the error: preserve
+                // every file it holds on the run-scoped accumulator, so the
+                // caller's pause report names what the resumed run produced
+                // instead of claiming it produced none.
+                self.planning_produced_files.extend(ledger.all_files.iter().cloned());
+                // Cancellation propagates unchanged — the caller records the
+                // `RunInterruptedByUser` run-history event from it. Every other
+                // class surfaces as an explicit resume failure rather than a
+                // bare planning-pause message.
+                if is_cancellation_error(&error) {
+                    return Err(error);
+                }
+                return Err(OrchestratorError::AgentLoopError(format!(
+                    "resume could not dispatch the pending implement stage: {error}"
+                )));
+            }
+        };
+        // Completion superset: the ledger already holds the restored state
+        // plus this session's dispatches (seeded above), so move it back
+        // verbatim and fold in whatever the run-scoped accumulator held —
+        // the same merge `finish_decompose_result` performs, deduplicated.
+        let mut files = std::mem::take(&mut ledger.all_files);
+        for path in std::mem::take(&mut self.planning_produced_files) {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+        result.all_files = files;
+        result.completed_results = std::mem::take(&mut ledger.completed_results);
+        result.total_cost = ledger.total_cost;
+        result.total_tool_calls = ledger.total_tool_calls;
+        result.provider_metrics = std::mem::take(&mut ledger.provider_metrics);
+        result.subtask_attempts = std::mem::take(&mut ledger.subtask_attempts);
+        result.model_assignments = std::mem::take(&mut ledger.model_assignments);
+        result.action_ledger = std::mem::take(&mut ledger.action_ledger);
+        result.dispatch_summary = summary;
+        result.loop_notes.append(&mut ledger.notes);
+        // A pause raised by THIS drive (model-requested input, a dispatch
+        // pending approval) supersedes whatever the restored row carried;
+        // otherwise the restored pause survives the resume unchanged.
+        if let Some(requested) = self.requested_user_input.take() {
+            result.requested_user_input = Some(requested);
+        }
+        if let Some(pending) = self.pending_approval.take() {
+            result.pending_approval = Some(pending);
+        }
+        // Truthful pause when the session closed without the dispatch the
+        // run promised: the guard would fire at the exit anyway, so name the
+        // real cause instead of leaving only the guard's verdict to explain it.
+        if !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger) {
+            result.loop_notes.push(
+                "Resume-drive: the restored plan's implement stage is still unattempted — the \
+                 resumed decision session closed without an implement dispatch, so the run \
+                 reports Partial and keeps its checkpoint for resume."
+                    .to_owned(),
+            );
+        }
+        // The drive added nodes to an already-restored graph: re-validate the
+        // whole DAG (empty graphs stay legal, as everywhere else).
+        if !result.graph.is_empty() {
+            TaskGraphValidator::validate(&result.graph)?;
+        }
+        Ok(result)
+    }
+
     /// Decompose the task into a TaskGraph, or restore from a previous checkpoint.
     async fn decompose_or_restore(
         &mut self,
@@ -5147,7 +5382,20 @@ impl CoordinatorAgent {
         let checkpoint_present = resume_checkpoint_json.is_some();
         if let Some(cp_json) = resume_checkpoint_json {
             match self.restore_and_evaluate(&cp_json, task, context, cancel).await {
-                Ok(Some(result)) => return Ok(result),
+                Ok(Some(result)) => {
+                    // Resume-drive: a restored graph that is fully settled
+                    // yet never dispatched its implement stage would fall
+                    // through to the completion guard's canned Partial — a
+                    // dead end that re-persists on every resume. Hand it back
+                    // to the decision loop instead, so the Coordinator
+                    // dispatches the promised work.
+                    if self.resume_needs_implement_drive(task, &result) {
+                        return self
+                            .drive_resumed_implement(task, context, cancel, &cp_json, result)
+                            .await;
+                    }
+                    return Ok(result);
+                }
                 // ADR-65 §7 Replan: the workspace objectively changed
                 // materially to the pending step. The resume path itself
                 // dispatches nothing — the fresh decompose below lets the
@@ -25527,6 +25775,370 @@ mod tests {
             !output.final_message.contains("Unattempted-implementation guard"),
             "the guard must not fire without a promised plan: {}",
             output.final_message
+        );
+    }
+
+    /// A v4-shaped checkpoint for the stop-before-coder case: the design step
+    /// settled (design-stage `dispatched`+`completed` rows only — ZERO
+    /// implement dispatches) and the implement step is still `Pending` on its
+    /// completed design dependency. No produced files, so nothing on disk
+    /// answers the promised implementation.
+    fn stop_before_coder_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        design_id: TaskId,
+        coder_id: TaskId,
+    ) -> String {
+        let stamp = [2026, 254, 0, 0, 0, 0, 0, 0, 0];
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": design_id.to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [
+                {
+                    "id": design_id.to_string(),
+                    "parent_id": null,
+                    "session_id": session_id.to_string(),
+                    "role": "architect",
+                    "description": "design the thing",
+                    "status": "Completed",
+                    "dependencies": [],
+                    "deliverable": "designed",
+                },
+                {
+                    "id": coder_id.to_string(),
+                    "parent_id": design_id.to_string(),
+                    "session_id": session_id.to_string(),
+                    "role": "coder",
+                    "description": "implement the thing",
+                    "status": "Pending",
+                    "dependencies": [design_id.to_string()],
+                    "deliverable": null,
+                },
+            ],
+            "edges": [[design_id.to_string(), coder_id.to_string(), "MustFinishBefore"]],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": [
+                {
+                    "kind": "dispatched",
+                    "task_id": design_id.to_string(),
+                    "timestamp": stamp,
+                },
+                {
+                    "kind": "completed",
+                    "task_id": design_id.to_string(),
+                    "timestamp": stamp,
+                },
+            ],
+        })
+        .to_string()
+    }
+
+    /// Resume-drive regression (stop-before-coder): a freshly-restored run
+    /// whose graph still holds a PENDING implement step must ATTEMPT that
+    /// implement dispatch — not fall into the canned unattempted-implementation
+    /// Partial. Asserts on the dispatch attempt itself (`SubTaskStarted` for
+    /// the coder), never merely on the absence of the guard note.
+    #[tokio::test]
+    async fn resume_with_pending_implement_step_dispatches_the_coder() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_review_store(Some(pool.clone()))
+        // The plan was approved: implementation is promised, so the completion
+        // guard is armed exactly as it is on the live run.
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let session_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let cp_json = stop_before_coder_checkpoint_json(
+            &project_id,
+            session_id,
+            TaskId::new(),
+            TaskId::new(),
+        );
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let coder_dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder")
+        });
+        assert!(
+            coder_dispatched,
+            "a restored PENDING implement step must be dispatched on resume; the run ended \
+             {:?} with message: {}",
+            output.completion_status, output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Unattempted-implementation guard"),
+            "the unattempted-implementation guard must not fire when dispatch was attempted: {}",
+            output.final_message
+        );
+    }
+
+    /// Resume-drive regression (stop-before-coder, settled shape): the
+    /// durable row the stop actually leaves behind holds ONLY the settled
+    /// design step — zero implement dispatches, no code artifact, every node
+    /// Completed. The resumed run must dispatch the coder from the restored
+    /// decision loop, not fall into the canned unattempted-implementation
+    /// Partial. Asserts on the dispatch attempt itself (`SubTaskStarted` for
+    /// the coder), never merely on the absence of the guard note.
+    #[tokio::test]
+    async fn resume_with_design_only_checkpoint_dispatches_the_pending_implement_step() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the plan")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let session_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let design_id = TaskId::new();
+        let cp_json = design_only_checkpoint_json(&project_id, session_id, design_id);
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let coder_dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder")
+        });
+        assert!(
+            coder_dispatched,
+            "a fully-settled-but-unattempted implement stage must be dispatched on resume; the \
+             run ended {:?} with message: {}",
+            output.completion_status, output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Unattempted-implementation guard"),
+            "the unattempted-implementation guard must not fire when dispatch was attempted: {}",
+            output.final_message
+        );
+        assert!(
+            !completion_guard_decision(&pool, "completion-blocked-unattempted-implementation")
+                .await,
+            "no unattempted-implementation verdict may be recorded once the dispatch was attempted"
+        );
+    }
+
+    /// Resume-drive end to end over REAL storage (two runs, ONE session row):
+    /// phase 1 is a deliberate operator stop after the architect settles — the
+    /// settle-persist wrote the design-only row and the cancelled turn never
+    /// reaches one, exactly like a live stop mid-decision-loop. Phase 2 is a
+    /// FRESH coordinator resuming from that durable row: it must dispatch the
+    /// pending implement step from the restored decision loop (the drive's
+    /// `<resume_drive>` instruction reaches the provider), not fall into the
+    /// canned unattempted-implementation Partial. The architect is registered
+    /// as a canary that always fails, so a re-dispatch of the settled design
+    /// step cannot pass unnoticed.
+    #[tokio::test]
+    async fn interrupted_run_resumes_into_the_pending_implement_dispatch() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (_log_dir, pool) = resume_log_pool().await;
+        let store = Arc::new(
+            concerto_sessions::SqliteSessionStore::connect_in_memory()
+                .await
+                .expect("in-memory session store"),
+        );
+        let project = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("test project dir is UTF-8");
+        let session_id = store
+            .create_session(&project, "mock", "test-model", CancellationToken::new())
+            .await
+            .expect("create session row")
+            .id;
+        let session_context = |session_id: Ulid| {
+            AgentContext::new(concerto_core::types::SessionContext::new(
+                session_id,
+                dir.path().to_path_buf(),
+            ))
+        };
+
+        // ── Phase 1: the architect settles, then the operator stops the run
+        // mid-decision-loop (the second model turn is a cancellation), leaving
+        // the design-only durable row behind. ───────────────────────────────
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(
+            TurnProvider::new(vec![CoordinatorTurn::Calls(vec![call_specialist(
+                "architect",
+                "design it",
+            )])])
+            .with_terminal_error(ProviderError::Cancelled),
+        );
+        let mut coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("architect"),
+                "designed",
+            )])),
+            provider,
+        )
+        .with_checkpoint_store(
+            Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+            None,
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+        let first = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                session_context(session_id),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("the interrupted run still returns an output");
+        assert_eq!(
+            first.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a deliberate stop surfaces as Partial: {}",
+            first.final_message
+        );
+        let mut first_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            first_events.push(event.kind.clone());
+        }
+        assert!(
+            first_events.iter().any(|kind| matches!(
+                kind,
+                EventKind::RunInterruptedByUser { at_stage, .. } if at_stage == "planning"
+            )),
+            "the stop is recorded with its stage, so the audit can tell it from a failure"
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stop leaves a resumable row behind");
+        let restored: crate::checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("durable row loads");
+        assert_eq!(restored.subtasks.len(), 1, "the cancelled coder was never settled");
+        assert!(
+            restored.subtasks.iter().all(|sub| sub.status == SubTaskStatus::Completed),
+            "only the settled design step is durable"
+        );
+
+        // ── Phase 2: a fresh coordinator over the SAME session row resumes
+        // from that durable checkpoint. ─────────────────────────────────────
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the plan")]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let mut coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![
+                // Canary: the settled design step must never re-dispatch.
+                MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                    .with_artifact_writer(),
+            ])),
+            provider.clone(),
+        )
+        .with_checkpoint_store(
+            Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+            None,
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+        let second = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                session_context(session_id),
+                CancellationToken::new(),
+                Some(record.state_json),
+            )
+            .await
+            .expect("resumed run should return an output");
+
+        let mut second_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            second_events.push(event.kind.clone());
+        }
+        assert!(
+            second_events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the resumed run must dispatch the pending implement step; it ended {:?}: {}",
+            second.completion_status,
+            second.final_message
+        );
+        assert!(
+            provider.message_contents().iter().any(|content| content.contains("<resume_drive>")),
+            "the restored run re-entered the decision loop behind the drive's instruction"
+        );
+        assert!(
+            !second.final_message.contains("Unattempted-implementation guard"),
+            "the unattempted-implementation guard must not fire: {}",
+            second.final_message
+        );
+        assert!(
+            !completion_guard_decision(&pool, "completion-blocked-unattempted-implementation")
+                .await,
+            "no unattempted-implementation verdict may be recorded once the dispatch was attempted"
         );
     }
 
