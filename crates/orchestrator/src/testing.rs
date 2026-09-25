@@ -63,6 +63,7 @@ pub struct MockExpertAgent {
     responses: Mutex<VecDeque<Result<AgentRunResult, OrchestratorError>>>,
     stage: Option<AgentStage>,
     write_expected_artifacts: bool,
+    cancel_on_run: Option<CancellationToken>,
 }
 
 /// The pipeline stage conventionally declared by a built-in id, so mocks
@@ -103,6 +104,7 @@ impl MockExpertAgent {
             responses: Mutex::new(VecDeque::from(responses)),
             stage: default_stage(&id),
             write_expected_artifacts: false,
+            cancel_on_run: None,
         }
     }
 
@@ -159,6 +161,16 @@ impl MockExpertAgent {
         self.write_expected_artifacts = true;
         self
     }
+
+    /// Cancel the given run token as soon as this mock's `run` is invoked —
+    /// the test's stand-in for the operator pressing stop while a specialist
+    /// call is in flight. The scripted response still decides what the call
+    /// returns (queue `Err(OrchestratorError::Cancelled)` to model the
+    /// interrupted call), so a caller can assert the dispatch-outcome audit.
+    pub fn cancel_on_run(mut self, cancel: CancellationToken) -> Self {
+        self.cancel_on_run = Some(cancel);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -182,6 +194,11 @@ impl ExpertAgent for MockExpertAgent {
         _model: &str,
         _cancel: CancellationToken,
     ) -> Result<AgentRunResult, OrchestratorError> {
+        // A configured stop fires the moment the call is in flight, before
+        // any scripted result is read back.
+        if let Some(cancel) = &self.cancel_on_run {
+            cancel.cancel();
+        }
         let mut written_paths = Vec::new();
         if self.write_expected_artifacts {
             for path in &context.expected_artifacts {
