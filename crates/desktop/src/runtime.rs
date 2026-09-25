@@ -398,6 +398,13 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
             "Coordinator",
             format!("Detected an orchestration cycle for {task_id}: {sequence:?}"),
         ),
+        // Phase 6 M3c step 4: one human line — what drifted, what the live
+        // re-read concluded, and what was re-dispatched. The wording comes
+        // from the shared core helper, so the CLI renders the identical line.
+        EventKind::PlanDrift { affected_paths, reverify, redispatched, .. } => activity(
+            "Coordinator",
+            concerto_core::event::plan_drift_report(affected_paths, reverify, redispatched),
+        ),
         _ => None,
     }
 }
@@ -840,6 +847,40 @@ mod tests {
             Some(DesktopEvent::RunStageChanged { stage })
                 if stage == concerto_core::intent::RunStage::Execute
         ));
+    }
+
+    /// Phase 6 M3c step 4: the drift signal renders as ONE chat line naming
+    /// what drifted, what the live re-read concluded, and what was
+    /// re-dispatched — the wording the CLI shares via the core helper.
+    #[test]
+    fn plan_drift_renders_one_readable_activity_line() {
+        let event = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::PlanDrift {
+                task_id: TaskId::new(),
+                plan_id: Some("plan-7".into()),
+                affected_paths: vec!["src/gone.rs".to_owned()],
+                diff: vec![concerto_core::event::PlanDriftDiffEntry {
+                    path: "src/gone.rs".to_owned(),
+                    class: concerto_core::event::PlanDriftDiffClass::Missing,
+                }],
+                reverify: vec![concerto_core::event::PlanDriftReverifyEntry {
+                    path: "src/gone.rs".to_owned(),
+                    status: concerto_core::event::PlanDriftReverifyStatus::Gone,
+                }],
+                redispatched: vec!["coder".to_owned()],
+            },
+        );
+
+        let desktop = translate_event(&event).expect("plan drift must reach chat");
+        let DesktopEvent::AgentThought { agent_id, content, .. } = desktop else {
+            panic!("plan drift renders as chat activity, got {desktop:?}");
+        };
+        assert_eq!(agent_id, "Coordinator");
+        assert!(content.contains("src/gone.rs"), "names the drifted artifact: {content}");
+        assert!(content.contains("re-verified: gone"), "reports the re-read: {content}");
+        assert!(content.contains("re-dispatched coder"), "reports the re-dispatch: {content}");
     }
 
     /// Thinking tiers survive translation, and `LowLevel` thoughts fold

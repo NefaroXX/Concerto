@@ -2279,6 +2279,14 @@ fn event_line(kind: &EventKind) -> Option<String> {
         EventKind::ProviderRetryExhausted { attempts, reason, .. } => {
             Some(format!("· Provider retries exhausted after {attempts}: {reason}"))
         }
+        // -- plan drift (Phase 6 M3c step 4): one line — what drifted, what
+        // the live re-read concluded, and what was re-dispatched. The wording
+        // is shared with the desktop renderer through the core helper, so
+        // both frontends report the drift identically.
+        EventKind::PlanDrift { affected_paths, reverify, redispatched, .. } => Some(format!(
+            "· {}",
+            concerto_core::event::plan_drift_report(affected_paths, reverify, redispatched)
+        )),
         _ => None,
     }
 }
@@ -2584,6 +2592,33 @@ mod tests {
             }),
             Some("· [coder] hi".to_string())
         );
+    }
+
+    /// Phase 6 M3c step 4: the drift signal renders as ONE activity line
+    /// naming what drifted, what the live re-read concluded, and what was
+    /// re-dispatched — the wording the desktop shares via the core helper.
+    #[test]
+    fn plan_drift_renders_one_readable_activity_line() {
+        let line = event_line(&EventKind::PlanDrift {
+            task_id: concerto_core::TaskId::new(),
+            plan_id: Some("plan-7".into()),
+            affected_paths: vec!["src/gone.rs".to_owned()],
+            diff: vec![concerto_core::event::PlanDriftDiffEntry {
+                path: "src/gone.rs".to_owned(),
+                class: concerto_core::event::PlanDriftDiffClass::Missing,
+            }],
+            reverify: vec![concerto_core::event::PlanDriftReverifyEntry {
+                path: "src/gone.rs".to_owned(),
+                status: concerto_core::event::PlanDriftReverifyStatus::Gone,
+            }],
+            redispatched: vec!["coder".to_owned()],
+        })
+        .expect("plan drift must reach the TUI transcript");
+
+        assert!(line.starts_with("· "), "activity-line prefix: {line}");
+        assert!(line.contains("src/gone.rs"), "names the drifted artifact: {line}");
+        assert!(line.contains("re-verified: gone"), "reports the re-read: {line}");
+        assert!(line.contains("re-dispatched coder"), "reports the re-dispatch: {line}");
     }
 
     #[test]
