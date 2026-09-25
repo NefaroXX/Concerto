@@ -5072,9 +5072,68 @@ impl CoordinatorAgent {
     /// JSON without deserializing the whole record — the cheap seed for a
     /// resumed run's Phase-0 retrieval. Fail-soft: a malformed/absent
     /// checkpoint yields `None` (no seed; vector matches only).
-    fn checkpoint_run_id_hint(json: Option<&str>) -> Option<String> {
+    ///
+    /// `pub(crate)` so the runtime runner can tie the `ResumeRequested`
+    /// run-history event to the checkpoint's run without a full parse.
+    pub(crate) fn checkpoint_run_id_hint(json: Option<&str>) -> Option<String> {
         let value: serde_json::Value = serde_json::from_str(json?).ok()?;
         value.get("run_id").and_then(serde_json::Value::as_str).map(str::to_owned)
+    }
+
+    /// Run-history audit: record a deliberate operator interrupt (the
+    /// `Cancelled` terminal class, ADR-42) as its own event.
+    ///
+    /// The run's output alone cannot distinguish a user stop from a provider
+    /// failure — both normalize to `Partial` — so the history carries the
+    /// interrupt explicitly. Fail-soft like every other bus publish: a full
+    /// or lagging subscriber must never turn a stop into a failure.
+    fn publish_run_interrupted(
+        &self,
+        task_id: TaskId,
+        session_id: Ulid,
+        run_id: Option<String>,
+        at_stage: &str,
+    ) {
+        let _ = self.bus.publish_for_session(
+            session_id,
+            task_id.0,
+            EventKind::RunInterruptedByUser { run_id, session_id, at_stage: at_stage.to_owned() },
+        );
+        tracing::info!(%task_id, %session_id, at_stage, "run interrupted by the operator");
+    }
+
+    /// Run-history audit: record the outcome of ONE `call_specialist`
+    /// dispatch attempt at the moment the Coordinator's decision does NOT
+    /// reach a successful specialist run.
+    ///
+    /// `attempted` is the guard's discriminator: `false` means the dispatch
+    /// never reached a specialist (policy denial, model selection), `true`
+    /// means a specialist call was issued and then failed or was cancelled.
+    /// `reason` carries free-form text (sanitized on publish); the
+    /// `outcome` label is a fixed caller-chosen constant. Fail-soft like
+    /// every other bus publish.
+    fn publish_dispatch_outcome(
+        &self,
+        task_id: TaskId,
+        session_id: Ulid,
+        role: &AgentId,
+        attempted: bool,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let _ = self.bus.publish_for_session(
+            session_id,
+            task_id.0,
+            EventKind::SpecialistDispatchOutcome {
+                run_id: self.run_id.clone(),
+                session_id,
+                task_id,
+                role: role.clone(),
+                attempted,
+                outcome: outcome.to_owned(),
+                reason,
+            },
+        );
     }
 
     /// Decompose the task into a TaskGraph, or restore from a previous checkpoint.
@@ -5386,6 +5445,32 @@ impl CoordinatorAgent {
         let mut graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
             OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
         })?;
+        // Run-history audit: record the shape the resume actually received —
+        // before any resume-evaluator outcome (Applied / Replan / recovery
+        // re-arming) mutates it — so a later completion verdict is auditable
+        // against what was restored. `plan_present` reports whether the
+        // checkpoint promised an implementation (a binding design doc or
+        // declared expected artifacts). Fail-soft like every publish.
+        {
+            let restored = graph.all_tasks();
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::CheckpointRestored {
+                    run_id: Some(cp.run_id.to_string()),
+                    session_id: task.session_id,
+                    pending_nodes: restored
+                        .iter()
+                        .filter(|subtask| is_unfinished_subtask_status(subtask.status))
+                        .count(),
+                    completed_nodes: restored
+                        .iter()
+                        .filter(|subtask| subtask.status == SubTaskStatus::Completed)
+                        .count(),
+                    plan_present: cp.design_doc.is_some() || !cp.expected_artifacts.is_empty(),
+                },
+            );
+        }
         let completed_results = cp.completed_results;
         let total_cost = cp.total_cost;
         let total_tool_calls = cp.total_tool_calls;
@@ -8499,6 +8584,13 @@ impl CoordinatorAgent {
         self.retrieve_memory_context(&task, &mut context, plan_seed.as_deref(), cancel.clone())
             .await;
 
+        // Run-history audit: the checkpoint's run id is the only identifier
+        // that ties this run to its prior attempts BEFORE `self.run_id` is
+        // (re)established inside `execute_graph`, so a deliberate interrupt
+        // landing in the planning phase still reports the right run. Fail-soft
+        // by construction: an unreadable checkpoint simply yields `None`.
+        let checkpoint_run_id = Self::checkpoint_run_id_hint(resume_checkpoint_json.as_deref());
+
         // Phase 1: Decompose or restore
         let DecomposeResult {
             graph,
@@ -8538,6 +8630,18 @@ impl CoordinatorAgent {
                 // Partial result rather than crashing the session. When the
                 // ladder was attempted or skipped first, its ladder-exhausted
                 // note makes the pause explicit instead of silent.
+                //
+                // Run-history audit: a user stop mid-planning surfaces here as
+                // `Cancelled`; record it so the run history shows a deliberate
+                // interrupt rather than an anonymous partial plan failure.
+                if is_cancellation_error(&e) {
+                    self.publish_run_interrupted(
+                        task.id,
+                        task.session_id,
+                        checkpoint_run_id,
+                        "planning",
+                    );
+                }
                 let note = self.planning_recovery_note.take();
                 // A planning failure that came AFTER the run already produced
                 // artifacts (a later planning dispatch failed) must not read
@@ -8612,29 +8716,49 @@ impl CoordinatorAgent {
             });
         }
 
-        // Phase 2: Execute graph
-        self.execute_graph(
-            task,
-            context,
-            cancel,
-            graph,
-            completed_results,
-            total_cost,
-            total_tool_calls,
-            all_files,
-            provider_metrics,
-            subtask_attempts,
-            retry_feedback,
-            model_assignments,
-            action_ledger,
-            run_objective,
-            run_objective_hash,
-            loop_notes,
-            requested_user_input,
-            pending_approval,
-        )
-        .await
-        .map(|(output, _notes)| output)
+        // Phase 2: Execute graph. `task` is consumed here, so its ids are
+        // captured first for the run-history interrupt audit below.
+        let (task_id, session_id) = (task.id, task.session_id);
+        let outcome = self
+            .execute_graph(
+                task,
+                context,
+                cancel,
+                graph,
+                completed_results,
+                total_cost,
+                total_tool_calls,
+                all_files,
+                provider_metrics,
+                subtask_attempts,
+                retry_feedback,
+                model_assignments,
+                action_ledger,
+                run_objective,
+                run_objective_hash,
+                loop_notes,
+                requested_user_input,
+                pending_approval,
+            )
+            .await;
+        match outcome {
+            Ok((output, _notes)) => Ok(output),
+            Err(e) => {
+                // Run-history audit: a user stop during graph dispatch is the
+                // same `Cancelled` terminal class as a provider-level stop.
+                // Record the stage so a later audit can tell a deliberate
+                // interrupt (this event present) from a provider failure.
+                if is_cancellation_error(&e) {
+                    self.publish_run_interrupted(
+                        task_id,
+                        session_id,
+                        checkpoint_run_id,
+                        "executing",
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     // ── review cycle (§3.8) ─────────────────────────────────────────────
@@ -10287,6 +10411,10 @@ impl CoordinatorAgent {
             }
         };
         let decision_id = decision.id.clone();
+        // Mint the subtask id BEFORE the policy gate: every dispatch outcome
+        // below — including a denial that never materializes a graph node —
+        // correlates to this decision under one id in the run history.
+        let subtask_id = TaskId::new();
         // Issue #60: the deterministic task class for the suitability
         // record — derived from the task text + expected artifacts (never
         // model-judged), attributed to the REQUESTED specialist.
@@ -10384,6 +10512,15 @@ impl CoordinatorAgent {
                     suitability_now,
                     0,
                 );
+                // Run-history audit: never reached a specialist.
+                self.publish_dispatch_outcome(
+                    subtask_id,
+                    task.session_id,
+                    &agent_id,
+                    false,
+                    "policy-denied",
+                    None,
+                );
                 return serde_json::json!({
                     "error": "policy_denied",
                     "message": "the run's policy denied this specialist dispatch",
@@ -10393,6 +10530,16 @@ impl CoordinatorAgent {
                 if matches!(error, concerto_core::error::PolicyError::Cancelled)
                     || cancel.is_cancelled()
                 {
+                    // Run-history audit: the stop landed before any
+                    // specialist call — an interrupt, not a failure.
+                    self.publish_dispatch_outcome(
+                        subtask_id,
+                        task.session_id,
+                        &agent_id,
+                        false,
+                        "cancelled",
+                        None,
+                    );
                     return serde_json::json!({ "error": "cancelled" });
                 }
                 self.suitability.record(
@@ -10402,6 +10549,16 @@ impl CoordinatorAgent {
                     None,
                     suitability_now,
                     0,
+                );
+                // Run-history audit: never reached a specialist; the reason
+                // carries the policy error text (sanitized on publish).
+                self.publish_dispatch_outcome(
+                    subtask_id,
+                    task.session_id,
+                    &agent_id,
+                    false,
+                    "policy-denied",
+                    Some(error.to_string()),
                 );
                 return serde_json::json!({
                     "error": "policy_denied",
@@ -10413,7 +10570,6 @@ impl CoordinatorAgent {
         // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
         let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
         let description = specialist_task_description(&args.task, args.notes.as_deref());
-        let subtask_id = TaskId::new();
         self.append_dispatch_decision(
             task.session_id,
             &agent_id,
@@ -10534,6 +10690,16 @@ impl CoordinatorAgent {
             Ok(profile) => profile,
             Err(error) => {
                 if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    // Run-history audit: the stop landed before any
+                    // specialist call — an interrupt, not a failure.
+                    self.publish_dispatch_outcome(
+                        subtask_id,
+                        task.session_id,
+                        &agent_id,
+                        false,
+                        "cancelled",
+                        None,
+                    );
                     return serde_json::json!({ "error": "cancelled" });
                 }
                 warn!(
@@ -10561,6 +10727,15 @@ impl CoordinatorAgent {
                     0,
                 );
                 self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                // Run-history audit: never reached a specialist.
+                self.publish_dispatch_outcome(
+                    subtask_id,
+                    task.session_id,
+                    &agent_id,
+                    false,
+                    "model-selection-failed",
+                    Some(error.to_string()),
+                );
                 return serde_json::json!({
                     "error": "model_selection_failed",
                     "message": format!("no model could be selected for {agent_id}: {error}"),
@@ -10584,6 +10759,17 @@ impl CoordinatorAgent {
             Ok(result) => result,
             Err(error) => {
                 if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    // Run-history audit: the specialist call WAS issued, then
+                    // interrupted — `attempted: true` keeps it distinct from
+                    // a pre-dispatch denial.
+                    self.publish_dispatch_outcome(
+                        subtask_id,
+                        task.session_id,
+                        &agent_id,
+                        true,
+                        "cancelled",
+                        None,
+                    );
                     return serde_json::json!({ "error": "cancelled" });
                 }
                 warn!(
@@ -10651,6 +10837,16 @@ impl CoordinatorAgent {
                         0,
                     );
                     self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                    // Run-history audit: the specialist call was issued and
+                    // did not settle (after any default-model failover).
+                    self.publish_dispatch_outcome(
+                        subtask_id,
+                        task.session_id,
+                        &agent_id,
+                        true,
+                        "dispatch-failed",
+                        Some(error.to_string()),
+                    );
                     return serde_json::json!({
                         "error": "dispatch_failed",
                         "message": error.to_string(),
@@ -25331,6 +25527,173 @@ mod tests {
             !output.final_message.contains("Unattempted-implementation guard"),
             "the guard must not fire without a promised plan: {}",
             output.final_message
+        );
+    }
+
+    /// The design-only checkpoint as the decision loop actually persists it:
+    /// the stop landed after the design step settled but BEFORE the pending
+    /// coder was persisted (the settle-persist never ran), so the durable row
+    /// holds only the settled design step, ZERO implement dispatches on the
+    /// ledger, and no binding doc / expected artifacts. The shape behind the
+    /// completion guard's unattempted-implementation verdict.
+    fn design_only_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        design_id: TaskId,
+    ) -> String {
+        let stamp = [2026, 254, 0, 0, 0, 0, 0, 0, 0];
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": design_id.to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [{
+                "id": design_id.to_string(),
+                "parent_id": null,
+                "session_id": session_id.to_string(),
+                "role": "architect",
+                "description": "design the thing",
+                "status": "Completed",
+                "dependencies": [],
+                "deliverable": "designed",
+            }],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": [
+                { "kind": "dispatched", "task_id": design_id.to_string(), "timestamp": stamp },
+                { "kind": "completed", "task_id": design_id.to_string(), "timestamp": stamp },
+            ],
+        })
+        .to_string()
+    }
+
+    /// Run-history audit: a deliberate operator stop mid-planning is recorded
+    /// as its own event carrying the stage that was cancelled. The interrupt
+    /// here lands AFTER the architect dispatch settled — the exact moment the
+    /// design-only durable row is left behind — and the `Partial` output alone
+    /// cannot distinguish it from a provider failure.
+    #[tokio::test]
+    async fn run_interrupt_during_planning_is_recorded_with_its_stage() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let provider = Arc::new(
+            TurnProvider::new(vec![CoordinatorTurn::Calls(vec![call_specialist(
+                "architect",
+                "design it",
+            )])])
+            .with_terminal_error(ProviderError::Cancelled),
+        );
+        let coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("architect"),
+                "designed",
+            )])),
+            provider,
+        )
+        .with_review_store(Some(pool))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert!(
+            events.iter().any(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            }),
+            "the architect must dispatch and settle before the interrupt"
+        );
+        let at_stage = events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::RunInterruptedByUser { at_stage, .. } => Some(at_stage.as_str()),
+                _ => None,
+            })
+            .expect("the interrupt must be recorded in the run history");
+        assert_eq!(at_stage, "planning", "the stop landed in the decision session");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an interrupted run reports a Partial: {}",
+            output.final_message
+        );
+    }
+
+    /// Run-history audit: restoring a checkpoint records the shape the resume
+    /// received — pending/completed counts and whether an implementation was
+    /// promised — BEFORE any resume-evaluator outcome mutates it. These are
+    /// the completion guard's key inputs, so a later unattempted-
+    /// implementation verdict can be audited against what was restored.
+    #[tokio::test]
+    async fn checkpoint_restore_records_the_shape_the_resume_received() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_review_store(Some(pool))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let session_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let cp_json = design_only_checkpoint_json(&project_id, session_id, TaskId::new());
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut restored = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EventKind::CheckpointRestored {
+                run_id,
+                pending_nodes,
+                completed_nodes,
+                plan_present,
+                ..
+            } = &event.kind
+            {
+                restored.push((run_id.clone(), *pending_nodes, *completed_nodes, *plan_present));
+            }
+        }
+        let (run_id, pending, completed, plan_present) =
+            restored.first().expect("the restore must be recorded in the run history");
+        assert_eq!(*pending, 0, "the design-only row holds no unfinished subtask");
+        assert_eq!(*completed, 1, "the settled design step is completed");
+        assert!(
+            !*plan_present,
+            "no binding doc and no expected artifacts: nothing promised an implementation yet"
+        );
+        assert!(
+            run_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "the restore is tied to its checkpoint run: {run_id:?}"
         );
     }
 

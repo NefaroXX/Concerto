@@ -613,6 +613,73 @@ pub enum EventKind {
         task_id: TaskId,
         stage: crate::intent::RunStage,
     },
+
+    // --- run interrupt / resume audit (run-history continuity) ---
+    /// A run was interrupted by the operator (a deliberate stop), recorded at
+    /// the moment the `Cancelled` terminal class surfaces.
+    ///
+    /// The output alone cannot tell a user stop from a provider failure —
+    /// both normalize to `Partial` — so the run history carries this
+    /// explicit marker instead. `at_stage` names the stage that was
+    /// cancelled: `"planning"` (decompose / decision session) or
+    /// `"executing"` (graph dispatch).
+    RunInterruptedByUser {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The stage the interrupt landed in (`"planning"` | `"executing"`).
+        at_stage: String,
+    },
+    /// A resume was requested for this session and an orchestration
+    /// checkpoint row was accepted to govern the run.
+    ///
+    /// Recorded before any restore or dispatch work so the intent survives
+    /// even when the resume later fails, replans, or is cleared.
+    ResumeRequested {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The input that requested the resume (e.g. `continue`).
+        message: String,
+    },
+    /// A checkpoint graph was restored from the durable row: the shape the
+    /// resume received, before any resume-evaluator outcome applied.
+    ///
+    /// These are the completion guard's key inputs — a later
+    /// unattempted-implementation verdict can be audited against whether the
+    /// restored graph ever held implement work.
+    CheckpointRestored {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// Restored subtasks in a non-terminal state.
+        pending_nodes: usize,
+        /// Restored subtasks already `Completed`.
+        completed_nodes: usize,
+        /// Whether the checkpoint carried a binding design doc / declared
+        /// expected artifacts (a promised implementation).
+        plan_present: bool,
+    },
+    /// The outcome of ONE `call_specialist` dispatch attempt.
+    ///
+    /// Emitted at every point where the Coordinator's dispatch decision does
+    /// not reach a successful specialist run, so the run history separates
+    /// "attempted and blocked" (`attempted: true`) from "never attempted"
+    /// (`attempted: false`) — the input a completion guard needs to report
+    /// the real blocker instead of a generic unattempted verdict.
+    SpecialistDispatchOutcome {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The (possibly not-yet-materialized) subtask the decision targeted.
+        task_id: TaskId,
+        role: AgentId,
+        /// `false` when the dispatch never reached a specialist call (policy
+        /// denial, model selection failure); `true` when a specialist call was
+        /// issued and then failed or was cancelled.
+        attempted: bool,
+        /// Machine-readable label: `policy-denied`, `model-selection-failed`,
+        /// `dispatch-failed`, or `cancelled`.
+        outcome: String,
+        /// Human-readable reason; `None` when the outcome needs none.
+        reason: Option<String>,
+    },
 }
 
 /// The intent-routing payload of an intent [`EventKind::RoutingDecided`]
@@ -795,6 +862,34 @@ impl EventKind {
                     .into_iter()
                     .map(|path| sanitizer.sanitize(&path))
                     .collect(),
+            },
+            // Run-history audit: the resume input is verbatim user text and
+            // the dispatch reason can echo provider error strings.
+            EventKind::ResumeRequested { run_id, session_id, message } => {
+                EventKind::ResumeRequested {
+                    run_id,
+                    session_id,
+                    message: sanitizer.sanitize(&message),
+                }
+            }
+            EventKind::SpecialistDispatchOutcome {
+                run_id,
+                session_id,
+                task_id,
+                role,
+                attempted,
+                outcome,
+                reason,
+            } => EventKind::SpecialistDispatchOutcome {
+                run_id,
+                session_id,
+                task_id,
+                role,
+                attempted,
+                // `outcome` is a fixed caller-chosen label, never echoed
+                // provider text; only the reason carries free-form text.
+                outcome,
+                reason: reason.map(|reason| sanitizer.sanitize(&reason)),
             },
             // All other variants have no string fields or only non-sensitive strings
             other => other,
@@ -1525,7 +1620,7 @@ mod tests {
     /// by the desktop/cli bus adapters).
     #[test]
     fn run_stage_changed_serialization_roundtrip() {
-        let task_id = crate::types::TaskId::new();
+        let task_id = TaskId::new();
         let kind = EventKind::RunStageChanged { task_id, stage: crate::intent::RunStage::Execute };
         let json = serde_json::to_value(&kind).unwrap();
         let back: EventKind = serde_json::from_value(json).unwrap();
@@ -1536,6 +1631,82 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// The run-history audit variants (interrupt / resume / restore / dispatch
+    /// outcome) survive a serde round trip with their payload intact — the
+    /// session event recorder persists them verbatim and the run-history
+    /// reader must be able to reconstruct them.
+    #[test]
+    fn run_history_audit_events_roundtrip() {
+        let session_id = new_id();
+        let task_id = TaskId::new();
+        let kinds = vec![
+            EventKind::RunInterruptedByUser {
+                run_id: Some("run-1".into()),
+                session_id,
+                at_stage: "planning".into(),
+            },
+            EventKind::ResumeRequested { run_id: None, session_id, message: "continue".into() },
+            EventKind::CheckpointRestored {
+                run_id: Some("run-1".into()),
+                session_id,
+                pending_nodes: 1,
+                completed_nodes: 2,
+                plan_present: true,
+            },
+            EventKind::SpecialistDispatchOutcome {
+                run_id: None,
+                session_id,
+                task_id,
+                role: AgentId::new("coder"),
+                attempted: true,
+                outcome: "dispatch-failed".into(),
+                reason: Some("rate limited".into()),
+            },
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).expect("event must serialize");
+            let back: EventKind = serde_json::from_str(&json).expect("event must deserialize");
+            assert_eq!(
+                format!("{back:?}"),
+                format!("{kind:?}"),
+                "round trip must preserve the audit payload"
+            );
+        }
+    }
+
+    /// The two free-form string fields on the audit variants are sanitized
+    /// before broadcast, like every other user/provider text field.
+    #[test]
+    fn sanitizer_redacts_run_history_audit_text() {
+        let sanitizer = SecretSanitizer::default();
+        let resumed = EventKind::ResumeRequested {
+            run_id: None,
+            session_id: new_id(),
+            message: "use key sk-1234567890abcdef1234567890abcdef to continue".into(),
+        }
+        .sanitized(&sanitizer);
+        let EventKind::ResumeRequested { message, .. } = resumed else {
+            panic!("expected ResumeRequested");
+        };
+        assert!(message.contains("[REDACTED]"), "message must be redacted: {message}");
+
+        let outcome = EventKind::SpecialistDispatchOutcome {
+            run_id: None,
+            session_id: new_id(),
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            attempted: false,
+            outcome: "policy-denied".into(),
+            reason: Some("denied for token sk-1234567890abcdef1234567890abcdef".into()),
+        }
+        .sanitized(&sanitizer);
+        let EventKind::SpecialistDispatchOutcome { outcome: label, reason, .. } = outcome else {
+            panic!("expected SpecialistDispatchOutcome");
+        };
+        assert_eq!(label, "policy-denied", "the fixed label must not be rewritten");
+        assert!(reason.as_deref().is_some_and(|r| r.contains("[REDACTED]")), "reason: {reason:?}");
     }
 
     #[test]

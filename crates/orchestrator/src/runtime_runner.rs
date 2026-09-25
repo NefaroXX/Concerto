@@ -3566,6 +3566,24 @@ pub async fn run_shared_agent(
         &req.input,
     );
 
+    // Run-history audit: a checkpoint row governs this run, so record the
+    // resume intent BEFORE any restore or dispatch work — the history shows a
+    // deliberate resume (explicit `continue`/`resume` input OR an implicit
+    // objective match after a restart), not a fresh run, even when the resume
+    // later fails, replans, or is cleared. The checkpoint block above has
+    // already finalized the row (cleared/malformed ⇒ `None`), so `is_some()`
+    // is the decision. Fail-soft like every other publish.
+    if req.resume_checkpoint_json.is_some() {
+        let run_id = crate::coordinator::CoordinatorAgent::checkpoint_run_id_hint(
+            req.resume_checkpoint_json.as_deref(),
+        );
+        let _ = services.bus.publish_for_session(
+            session_id,
+            task.id.0,
+            EventKind::ResumeRequested { run_id, session_id, message: req.input.clone() },
+        );
+    }
+
     // ─── ADR-60 D7 run-continuity: a `continue`/resume run with no approved
     // plan binding still rehydrates the session's whiteboard ledger — files
     // touched, failed commands, and the session's last approved artifact —
