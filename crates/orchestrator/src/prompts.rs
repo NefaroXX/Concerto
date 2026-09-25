@@ -21,11 +21,20 @@ use concerto_providers::retry::{with_provider_retry, RetryPolicy};
 use crate::project_context::ProjectContext;
 use crate::skills_context::SkillsContext;
 
+/// The `{working_memory}` placeholder as the shipped templates spell it —
+/// including the blank-line separator that precedes it. Non-empty working
+/// memory is substituted in place; an empty block removes the separator and
+/// the placeholder together (see [`PromptBuilder::assemble_system`]).
+const WORKING_MEMORY_SEPARATOR_PLACEHOLDER: &str = "\n\n{working_memory}";
+
 /// Builds the full `CompletionRequest` for each agent cycle.
 #[derive(Debug, Clone)]
 pub struct PromptBuilder {
     /// The system prompt template. `{working_memory}` and `{summary}`
-    /// placeholders are replaced at build time.
+    /// placeholders are replaced at build time. The shipped
+    /// `SYSTEM_PROMPT_*` templates all carry `{working_memory}`, so the
+    /// active-state + retrieved-chunks block reaches the model on the
+    /// default assembly path — not only under `cache_stable_prefix`.
     system_template: String,
     /// Runtime-owned skills context (ADR-43, Task 4). When set and non-empty,
     /// the current skills section is appended to the system prompt on every
@@ -123,7 +132,18 @@ impl PromptBuilder {
             system = system.replace("{summary}", "");
         }
 
-        system = system.replace("{working_memory}", working_memory);
+        // Working memory (ADR-48 §3/§4): the templates ask for the volatile
+        // active-state + retrieved-chunks block with a trailing
+        // `{working_memory}` placeholder preceded by a blank line. An empty
+        // block removes the separator as well, so an empty state leaves the
+        // template byte-identical — no dangling blank line, no placeholder
+        // leak, no fabricated section header.
+        if working_memory.is_empty() {
+            system = system.replace(WORKING_MEMORY_SEPARATOR_PLACEHOLDER, "");
+            system = system.replace("{working_memory}", "");
+        } else {
+            system = system.replace("{working_memory}", working_memory);
+        }
 
         // Append the skills section after placeholder substitution so skill
         // instructions can never collide with template placeholders. The
@@ -207,10 +227,12 @@ impl PromptBuilder {
             }
             system
         } else {
-            // Default (byte-identical to today): the working memory is
-            // substituted wherever the template asks for it, and is dropped
-            // entirely when the template carries no `{working_memory}`
-            // placeholder.
+            // Default path: the working memory is substituted wherever the
+            // template asks for it — the shipped `SYSTEM_PROMPT_*` templates
+            // all carry `{working_memory}`, so the block is delivered here
+            // too (previously it was only delivered under
+            // `cache_stable_prefix`). A template without the placeholder
+            // still drops it entirely.
             self.assemble_system(working_memory_block, prev_summary)
         };
 
@@ -1242,5 +1264,77 @@ mod tests {
             "tool schemas must not depend on the volatile tail"
         );
         assert_ne!(first.messages[0].content, second.messages[0].content);
+    }
+
+    // -- default-path working-memory delivery (shipped SYSTEM_PROMPT_* -------
+
+    const WORKING_MEMORY_BLOCK: &str =
+        "<working_memory>\n{\"objective\":\"ship the fix\"}\n</working_memory>";
+
+    /// The shipped build template carries `{working_memory}`, so the
+    /// active-state + retrieved-chunks block is delivered on the DEFAULT
+    /// path (`cache_stable_prefix` off) — inside the single system message,
+    /// which is the one last-system-wins adapters (Anthropic, Gemini) read.
+    #[test]
+    fn working_memory_block_reaches_the_model_on_the_default_path() {
+        let builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD.to_string());
+        assert!(!builder.cache_stable_prefix(), "this must exercise the default path");
+
+        let request = builder.build(WORKING_MEMORY_BLOCK, &[user_message("do it")], None, None);
+
+        let system: Vec<_> =
+            request.messages.iter().filter(|message| message.role == Role::System).collect();
+        assert_eq!(system.len(), 1, "exactly one system message, kept intact");
+        assert!(
+            system[0].content.contains(WORKING_MEMORY_BLOCK),
+            "working-memory block missing from the system message"
+        );
+        assert!(system[0].content.contains("## Environment"), "structure intact");
+    }
+
+    /// An empty block degrades to an empty string: no placeholder leak, no
+    /// dangling blank-line separator, no fabricated section header — the
+    /// prompt is the bare template plus the usual appended sections.
+    #[test]
+    fn empty_working_memory_degrades_to_an_empty_string() {
+        let builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD.to_string());
+        let request = builder.build("", &[user_message("do it")], None, None);
+        let system = &request.messages[0].content;
+
+        assert!(!system.contains("{working_memory}"), "placeholder leaked: {system}");
+        assert!(
+            !system.contains("<working_memory>"),
+            "an empty block must not render a section: {system}"
+        );
+        assert!(!system.contains("\n\n\n"), "the separator must go with the empty block: {system}");
+        assert!(system.contains("## Environment"), "environment card intact: {system}");
+        assert_eq!(
+            request.messages.iter().filter(|message| message.role == Role::System).count(),
+            1,
+            "single-system-message structure preserved"
+        );
+    }
+
+    /// The volatile tail still lands after the environment card when the
+    /// ADR-048 knob is on: the placeholder is blanked inside the stable head
+    /// and the block is appended, never injected twice.
+    #[test]
+    fn cache_stable_prefix_delivers_the_block_once_after_the_head() {
+        let builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD.to_string())
+            .with_cache_stable_prefix(true);
+        let request = builder.build(WORKING_MEMORY_BLOCK, &[], None, None);
+        let system = &request.messages[0].content;
+        let head = builder.stable_system_head(None);
+
+        assert!(system.starts_with(&head), "the stable head still leads");
+        assert!(!head.contains(WORKING_MEMORY_BLOCK), "the block stays out of the head");
+        assert_eq!(
+            system.matches(WORKING_MEMORY_BLOCK).count(),
+            1,
+            "delivered exactly once: {system}"
+        );
+        let card = system.find("## Environment").expect("environment card present");
+        let block = system.find(WORKING_MEMORY_BLOCK).expect("working memory present");
+        assert!(block > card, "the volatile tail follows the stable sections");
     }
 }

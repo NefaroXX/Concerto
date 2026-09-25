@@ -729,6 +729,14 @@ pub enum TaskExecutionMode {
 /// Formerly the `AgentMode::Build` prompt text; preserved verbatim when the
 /// mode picker was removed (ADR-55 Phase 1e) so intent-gated Execute runs keep
 /// the same behavior.
+///
+/// Carries the trailing `{working_memory}` placeholder
+/// ([`SYSTEM_PROMPT_CHAT`]/[`SYSTEM_PROMPT_PLAN`] do too): the orchestrator's
+/// `PromptBuilder` substitutes the volatile active-state + retrieved-chunks
+/// block there at build time. Without the placeholder the substitution is a
+/// no-op and that block never reaches the model on the default assembly path.
+/// An empty block removes the placeholder *and* its blank-line separator, so
+/// the rendered prompt is byte-identical to one without the placeholder.
 pub const SYSTEM_PROMPT_BUILD: &str =
     "You are a careful, capable software engineering assistant working \
     directly in the user's codebase. You can read and write files and run \
@@ -750,23 +758,35 @@ pub const SYSTEM_PROMPT_BUILD: &str =
     shell {\"command\": \"cargo test\"}\n\
     filesystem operations: read, write, delete, exists, list, move, copy \
     (write needs content; move/copy need destination). shell takes command \
-    (required) and optional cwd.";
+    (required) and optional cwd.\n\
+    \n\
+    {working_memory}";
 
 /// Chat-mode system prompt: conversational answer only, no tool use. Used for
 /// every non-Execute, non-Plan outcome (Answer, Diagnose, Review, Verify, and
 /// any future outcome).
+///
+/// Ends with the same `{working_memory}` placeholder as [`SYSTEM_PROMPT_BUILD`]
+/// so the working-memory block is delivered on every outcome, not just Execute.
 pub const SYSTEM_PROMPT_CHAT: &str =
     "You are Concerto, a helpful and concise conversational assistant. \
     Answer the user's questions clearly. Do not use tools and do not write \
-    or modify files; respond with text only.";
+    or modify files; respond with text only.\n\
+    \n\
+    {working_memory}";
 
 /// Plan-mode system prompt: produce a plan/design as text, no writes. Used for
 /// [`RequestedOutcome::Plan`] runs.
+///
+/// Ends with the same `{working_memory}` placeholder as [`SYSTEM_PROMPT_BUILD`]
+/// so the working-memory block is delivered on every outcome, not just Execute.
 pub const SYSTEM_PROMPT_PLAN: &str =
     "You are a senior software architect. Given the user's request, produce \
     a clear, concrete plan or design as text. Do not write files or run \
     commands. Outline the approach, the components involved, and the \
-    step-by-step steps you would take to implement it.";
+    step-by-step steps you would take to implement it.\n\
+    \n\
+    {working_memory}";
 
 /// Select the run's system prompt from the intent-gate outcome (ADR-55
 /// Phase 1e): the intent gate is now the ONLY routing path, so the prompt is
@@ -2047,6 +2067,26 @@ mod tests {
     #[test]
     fn system_prompt_for_plan_is_plan() {
         assert_eq!(system_prompt_for(crate::intent::RequestedOutcome::Plan), SYSTEM_PROMPT_PLAN);
+    }
+
+    /// Every run prompt must ask for the working-memory block. `PromptBuilder`
+    /// delivers it by substituting `{working_memory}`; a template without the
+    /// placeholder silently drops the block, so the active-state +
+    /// retrieved-chunks payload never reaches the model on the default
+    /// (non `cache_stable_prefix`) assembly path.
+    #[test]
+    fn system_prompts_carry_the_working_memory_placeholder() {
+        for prompt in [SYSTEM_PROMPT_BUILD, SYSTEM_PROMPT_CHAT, SYSTEM_PROMPT_PLAN] {
+            assert_eq!(
+                prompt.matches("{working_memory}").count(),
+                1,
+                "exactly one placeholder (zero drops the block, many duplicate it): {prompt}"
+            );
+            assert!(
+                prompt.ends_with("{working_memory}"),
+                "placeholder at the tail: an empty block degrades to the bare prompt: {prompt}"
+            );
+        }
     }
 
     #[test]
