@@ -26,6 +26,7 @@ pub mod coordinator;
 pub mod cost;
 pub mod cycle;
 pub mod decisions;
+pub mod declared_artifacts;
 pub mod delta;
 pub mod design_doc_verifier;
 pub mod exec_backend;

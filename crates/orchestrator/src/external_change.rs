@@ -153,6 +153,12 @@ pub struct PlanDrift {
     /// are absent from the live inventory and unexplained by the run's own
     /// writes. Sorted and deduplicated.
     pub affected_paths: Vec<String>,
+    /// Declared entries with no parseable file path (prose a model emitted
+    /// where a path was expected). Logged as a malformed declaration, NEVER
+    /// counted as drift — see [`crate::declared_artifacts`]. Sorted and
+    /// deduplicated. Additive field: older records deserialize as empty.
+    #[serde(default)]
+    pub unverifiable: Vec<String>,
 }
 
 impl PlanDrift {
@@ -173,27 +179,33 @@ impl PlanDrift {
 ///
 /// Non-file expectations (empty, directory — trailing `/` — or glob patterns)
 /// cannot be verified against a file inventory and are skipped rather than
-/// reported as false drift.
+/// reported as false drift. Prose declarations (a description where a path
+/// was expected) are collected into [`PlanDrift::unverifiable`] instead —
+/// they are a malformed declaration, never workspace drift.
 pub fn detect_plan_drift(
     plan_id: Option<&str>,
     expected: &[camino::Utf8PathBuf],
     live: &[SnapshotEntry],
     own_written: &std::collections::HashSet<String>,
 ) -> PlanDrift {
+    use crate::declared_artifacts::{classify, DeclaredArtifact};
+
     let live_paths: std::collections::HashSet<&str> =
         live.iter().map(|entry| entry.path.as_str()).collect();
 
     let mut affected: Vec<String> = Vec::new();
+    let mut unverifiable: Vec<String> = Vec::new();
     for path in expected {
-        let normalized = normalize_relative_path(path.as_str());
-        if normalized.is_empty()
-            || normalized.ends_with('/')
-            || normalized.contains('*')
-            || normalized.contains('?')
-        {
+        let normalized = match classify(path.as_str()) {
             // Not a concrete file path; the inventory cannot speak to it.
-            continue;
-        }
+            DeclaredArtifact::NonFile => continue,
+            // Prose — a declaration problem, reported separately.
+            DeclaredArtifact::Unverifiable => {
+                unverifiable.push(path.as_str().to_owned());
+                continue;
+            }
+            DeclaredArtifact::Path(normalized) => normalized,
+        };
         if live_paths.contains(normalized.as_str()) || own_written.contains(&normalized) {
             continue;
         }
@@ -201,15 +213,9 @@ pub fn detect_plan_drift(
     }
     affected.sort();
     affected.dedup();
-    PlanDrift { plan_id: plan_id.map(str::to_owned), affected_paths: affected }
-}
-
-/// Normalize a workspace-relative path for inventory comparison: forward
-/// slashes only, no leading `./`. The snapshot inventory stores paths in this
-/// canonical form.
-fn normalize_relative_path(path: &str) -> String {
-    let slash_normalized = path.replace('\\', "/");
-    slash_normalized.strip_prefix("./").unwrap_or(&slash_normalized).to_owned()
+    unverifiable.sort();
+    unverifiable.dedup();
+    PlanDrift { plan_id: plan_id.map(str::to_owned), affected_paths: affected, unverifiable }
 }
 
 #[cfg(test)]
@@ -390,5 +396,50 @@ mod tests {
             &own,
         );
         assert_eq!(drift.affected_paths, vec!["src/b.rs".to_owned()]);
+    }
+
+    /// `unverifiable` is additive: a record serialized before the field
+    /// existed still deserializes as an empty list.
+    #[test]
+    fn plan_drift_unverifiable_field_is_additive() {
+        let legacy = serde_json::json!({
+            "plan_id": "plan-1",
+            "affected_paths": ["src/a.rs"],
+        });
+        let drift: PlanDrift = serde_json::from_value(legacy).expect("older records deserialize");
+        assert_eq!(drift.affected_paths, vec!["src/a.rs".to_owned()]);
+        assert!(drift.unverifiable.is_empty());
+    }
+
+    /// The regression this classification exists for: descriptions emitted
+    /// where file paths were declared are NEVER drift — and a genuinely
+    /// absent real path still is (no overcorrection).
+    #[test]
+    fn plan_drift_classifies_description_entries_as_unverifiable_not_missing() {
+        let live: Vec<SnapshotEntry> = vec![entry("src/present.rs", Some(1), Some(1), Some("h"))];
+        let own = std::collections::HashSet::new();
+        let descriptions = [
+            "DESIGN.md: Comprehensive design document as specified in the requirements.",
+            "src/components/StatusIndicator/StatusIcon.tsx: Component for rendering status icons.",
+        ];
+        let mut declared = expected(&["src/present.rs", "src/never_written.rs"]);
+        declared.extend(expected(&descriptions));
+
+        let drift = detect_plan_drift(Some("plan-1"), &declared, &live, &own);
+
+        assert_eq!(
+            drift.affected_paths,
+            vec!["src/never_written.rs".to_owned()],
+            "only the genuinely absent real path drifts"
+        );
+        let mut want_unverifiable = descriptions.map(str::to_owned).to_vec();
+        want_unverifiable.sort();
+        assert_eq!(drift.unverifiable, want_unverifiable, "descriptions are unverifiable");
+        assert!(!drift.is_empty(), "a real missing path still reports");
+
+        // Prose-only declarations emit NO drift at all.
+        let prose_only = detect_plan_drift(Some("plan-1"), &expected(&descriptions), &live, &own);
+        assert!(prose_only.is_empty(), "prose-only declarations are never drift");
+        assert_eq!(prose_only.unverifiable.len(), 2);
     }
 }

@@ -793,16 +793,29 @@ fn check_one_artifact(
 /// root) and holds non-placeholder content (audit C-06). Returns the
 /// verified paths on success, or the offending artifacts with a per-file
 /// reason. An empty `expected` list passes vacuously.
+///
+/// Artifact identity is a FILE PATH: declarations that carry no parseable
+/// path (prose a model emitted where a path was expected) are violations
+/// with [`crate::declared_artifacts::UNVERIFIABLE_REASON`] — never
+/// `missing:`. They still fail the gate (no weakening): the declaration
+/// itself is the defect.
 fn verify_expected_artifacts(
     project_root: &camino::Utf8Path,
     expected: &[camino::Utf8PathBuf],
 ) -> Result<Vec<camino::Utf8PathBuf>, Vec<(camino::Utf8PathBuf, String)>> {
+    use crate::declared_artifacts::{classify, DeclaredArtifact, UNVERIFIABLE_REASON};
+
     let mut verified = Vec::new();
     let mut violations = Vec::new();
     for artifact in expected {
-        match check_one_artifact(project_root, artifact) {
-            Ok(()) => verified.push(artifact.clone()),
-            Err(reason) => violations.push((artifact.clone(), reason)),
+        match classify(artifact.as_str()) {
+            DeclaredArtifact::Path(_) => match check_one_artifact(project_root, artifact) {
+                Ok(()) => verified.push(artifact.clone()),
+                Err(reason) => violations.push((artifact.clone(), reason)),
+            },
+            DeclaredArtifact::NonFile | DeclaredArtifact::Unverifiable => {
+                violations.push((artifact.clone(), UNVERIFIABLE_REASON.to_owned()))
+            }
         }
     }
     if violations.is_empty() {
@@ -2141,7 +2154,16 @@ impl SplitTaskArgs {
             .iter()
             .filter_map(|child| {
                 let description = child.get("description").and_then(serde_json::Value::as_str)?;
-                let expected_artifacts = parse_string_array(child, "expected_artifacts");
+                // Declaration boundary: strip `": <description>"` off a
+                // path-like head so canonicalization, the decision journal,
+                // and the C-06 map all see the same PATH (see
+                // `declared_artifacts`).
+                let expected_artifacts = parse_string_array(child, "expected_artifacts")
+                    .into_iter()
+                    .map(|raw| {
+                        crate::declared_artifacts::path_without_description(&raw).into_owned()
+                    })
+                    .collect::<Vec<_>>();
                 let after = child
                     .get("after")
                     .and_then(serde_json::Value::as_array)
@@ -2188,7 +2210,13 @@ impl MergeTaskArgs {
         Some(Self {
             task_ids,
             merged_description: merged_description.to_owned(),
-            merged_artifacts: parse_string_array(arguments, "merged_artifacts"),
+            // Declaration boundary: strip `": <description>"` off a
+            // path-like head so canonicalization, the transform spec, and
+            // the C-06 map all see the same PATH (see `declared_artifacts`).
+            merged_artifacts: parse_string_array(arguments, "merged_artifacts")
+                .into_iter()
+                .map(|raw| crate::declared_artifacts::path_without_description(&raw).into_owned())
+                .collect(),
             notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
             supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
         })
@@ -5742,6 +5770,15 @@ impl CoordinatorAgent {
         let mut graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
             OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
         })?;
+        // Declaration boundary: a checkpoint (especially one written before
+        // the shared declaration split) can carry `"<path>: <description>"`
+        // entries. Normalize them to paths BEFORE their first use below
+        // (`plan_present`, the C-06 map restore, the plan artifact, plan
+        // drift) so every existence check sees a path — or, for prose that
+        // has none, an `undeclared/unverifiable` classification.
+        for paths in cp.expected_artifacts.values_mut() {
+            *paths = crate::declared_artifacts::declared_paths(paths);
+        }
         // Run-history audit: record the shape the resume actually received —
         // before any resume-evaluator outcome (Applied / Replan / recovery
         // re-arming) mutates it — so a later completion verdict is auditable
@@ -6023,6 +6060,17 @@ impl CoordinatorAgent {
             &snapshot.entries,
             &own_written,
         );
+        if !drift.unverifiable.is_empty() {
+            // Declaration quality, not workspace drift: prose where a path
+            // was declared. Logged with the entries so the malformed
+            // declaration is actionable; never published as PlanDrift.
+            warn!(
+                run_id = plan_id.unwrap_or("<none>"),
+                count = drift.unverifiable.len(),
+                entries = ?drift.unverifiable,
+                "plan declaration is undeclared/unverifiable (no file path) — not workspace drift"
+            );
+        }
         if drift.is_empty() {
             return;
         }
@@ -7736,7 +7784,12 @@ impl CoordinatorAgent {
                                                 .cloned()
                                                 .unwrap_or_default()
                                         } else {
-                                            doc.proposed_files.clone()
+                                            // Declaration boundary (see the
+                                            // DesignDoc dispatch insert): keep
+                                            // the path, drop `": <description>"`.
+                                            crate::declared_artifacts::declared_paths(
+                                                &doc.proposed_files,
+                                            )
                                         };
                                         let orig_desc = graph
                                             .get(&orig_impl_id)
@@ -10941,10 +10994,13 @@ impl CoordinatorAgent {
             agent.stage().as_ref().is_some_and(|stage| stage.as_str() == implement_tag);
         if is_implement_role {
             if let Some(doc) = expected_artifact_doc(state) {
-                self.expected_artifacts
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(subtask_id, doc.proposed_files.clone());
+                // Declaration boundary: `proposed_files` may hold
+                // `"<path>: <description>"` prose; store the PATHS so C-06
+                // verifies the delivered files (see `declared_artifacts`).
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).insert(
+                    subtask_id,
+                    crate::declared_artifacts::declared_paths(&doc.proposed_files),
+                );
             }
         }
 
@@ -21037,6 +21093,61 @@ mod tests {
         assert!(verify_expected_artifacts(&root, &[]).is_ok());
     }
 
+    /// A declaration that is prose (a description where a path was expected)
+    /// fails as `undeclared/unverifiable` — NEVER as `missing:` — while a
+    /// genuinely absent real path still reports `missing` (no
+    /// overcorrection).
+    #[test]
+    fn verify_expected_artifacts_labels_prose_as_unverifiable_not_missing() {
+        let dir = tempfile::tempdir().expect("tempdir for artifact check");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("tempdir path is valid UTF-8");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        // The delivered file EXISTS: an unsplit prose declaration must not
+        // turn delivered work into a missing-file claim.
+        std::fs::write(dir.path().join("DESIGN.md"), "# Design\n")
+            .expect("write declared design doc");
+
+        let prose = camino::Utf8PathBuf::from(
+            "DESIGN.md: Comprehensive design document as specified in the requirements.",
+        );
+        let violations = verify_expected_artifacts(&root, std::slice::from_ref(&prose))
+            .expect_err("prose is a violation");
+        assert_eq!(violations.len(), 1);
+        let (offender, reason) = &violations[0];
+        assert_eq!(offender, &prose);
+        assert!(
+            reason.contains(crate::declared_artifacts::UNVERIFIABLE_REASON),
+            "reason labels the declaration defect: {reason}"
+        );
+        assert!(
+            !reason.contains("missing"),
+            "prose must never be reported as a missing file: {reason}"
+        );
+
+        // A real, genuinely absent path keeps the `missing` reason.
+        let missing = root.join("src/missing.rs");
+        let violations = verify_expected_artifacts(&root, std::slice::from_ref(&missing))
+            .expect_err("missing is a violation");
+        assert_eq!(violations[0].0, missing);
+        assert!(
+            violations[0].1.contains("missing"),
+            "a real absent path still reports missing: {}",
+            violations[0].1
+        );
+
+        // After the declaration split, the same declaration verifies the
+        // delivered file itself.
+        let split = camino::Utf8PathBuf::from(
+            crate::declared_artifacts::path_without_description(prose.as_str()).into_owned(),
+        );
+        assert_eq!(split, camino::Utf8PathBuf::from("DESIGN.md"));
+        assert_eq!(
+            verify_expected_artifacts(&root, std::slice::from_ref(&split)).expect("delivered"),
+            vec![camino::Utf8PathBuf::from("DESIGN.md")]
+        );
+    }
+
     #[test]
     fn record_acceptance_writes_evidence_to_ledger() {
         let bus = EventBus::new(256);
@@ -30111,6 +30222,88 @@ mod tests {
         );
 
         assert!(rx.try_recv().is_err(), "present artifacts must not report drift");
+    }
+
+    /// The PlanDrift/C-06 existence-check fix: `"<path>: <description>"`
+    /// declarations are `undeclared/unverifiable`, not drift. Prose-only
+    /// expectations publish NO `PlanDrift` event (they are logged instead),
+    /// while a genuinely absent real path alongside them still publishes.
+    #[test]
+    fn plan_drift_never_publishes_for_prose_only_declarations() {
+        let bus = EventBus::new(64);
+        let directory = tempfile::tempdir().expect("tempdir for drift workspace");
+        let completed_id = TaskId::new();
+
+        let snapshot = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "gen-3".into(),
+            entries: vec![concerto_sessions::SnapshotEntry {
+                path: "src/untouched.rs".into(),
+                size_bytes: Some(1),
+                mtime_ms: Some(1),
+                content_hash: Some("h".into()),
+            }],
+            captured_at_ms: 3,
+            project_root: camino::Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+        let coordinator = coordinator_for_ladder(
+            bus.clone(),
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_workspace_snapshot(snapshot);
+
+        let descriptions = [
+            "DESIGN.md: Comprehensive design document as specified in the requirements.",
+            "src/components/StatusIndicator/StatusIcon.tsx: Component for rendering status icons.",
+        ];
+        let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
+        completed_results
+            .insert(completed_id, success_result(completed_id, "coder", "wrote the design"));
+
+        let task = AgentTask::new(Ulid::new(), "resume the plan");
+        let mut rx = bus.subscribe();
+
+        // Prose-only declarations: nothing is drift, so nothing is published.
+        let mut prose_only: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        prose_only
+            .insert(completed_id, descriptions.iter().map(camino::Utf8PathBuf::from).collect());
+        coordinator.emit_plan_drift(
+            Some("plan-9"),
+            &prose_only,
+            &[],
+            &completed_results,
+            &[],
+            directory.path(),
+            &task,
+        );
+        assert!(rx.try_recv().is_err(), "prose-only declarations must publish no event");
+
+        // Prose alongside a genuinely absent real path: exactly ONE event,
+        // naming ONLY the real path.
+        let mut mixed = prose_only;
+        mixed.insert(completed_id, {
+            let mut paths: Vec<camino::Utf8PathBuf> =
+                descriptions.iter().map(camino::Utf8PathBuf::from).collect();
+            paths.push(camino::Utf8PathBuf::from("src/gone.rs"));
+            paths
+        });
+        coordinator.emit_plan_drift(
+            Some("plan-9"),
+            &mixed,
+            &[],
+            &completed_results,
+            &[],
+            directory.path(),
+            &task,
+        );
+        let event = rx.try_recv().expect("real missing path publishes PlanDrift");
+        let EventKind::PlanDrift { affected_paths, .. } = &event.kind else {
+            panic!("expected PlanDrift, got a different event kind");
+        };
+        assert_eq!(*affected_paths, vec!["src/gone.rs".to_owned()]);
+        assert!(rx.try_recv().is_err(), "exactly one drift event per evaluation");
     }
 
     /// Phase 6 M3 (#2 + `kill_midrun_resume_produces_grounded_plan`): a run
