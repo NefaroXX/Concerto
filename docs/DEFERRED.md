@@ -37,12 +37,10 @@ a note.
 | 9 | Setup wizard per-variant auth flows | `[verify]` wizard exists (`crates/config/src/setup.rs`); per-variant auth steps unverified | Verify scope; no dedicated row in repo docs | M |
 | 11 | M-01: Estimator deduplication + `rag_pct` configurability | ADR-67 follow-ups (~92–98) | When Estimator/rag_pct consolidation is taken up | S |
 | 13 | Codebase cascade S1/S2/S3 (link store, scoring, slicing) | ADR-69 slices; IMPLEMENTED on fix/coordinator-error-invariant 2026-09-24 (S1 link store + write path, S1 activation, S2 scoring/decay/caps, purge fix, S3 observability — commits 60841dd/af98afe/224f0f9/7713b8d/7584d2d; tests green incl multi-hop guard) | CLOSED on merge of that branch + production proof (link verdicts firing, cascade reorder observed in a live run) | L |
-| 14 | ThreadSpawn fallback for non-WASM spawn | `[verify]` no symbol/source found | Re-entry on live fault-injection test demand | M |
 | 15 | Supervisor beyond 6 agents + D3 + D6 real-embedder swap + multi-level disclosure | ADR-60:112 ("acceptable at 3–6 agents; revisited only if profiling demands"); ADR-58:247 (scheduler/subscription generalization, real-embedder swap, multi-level disclosure deferred) | When profiling shows need beyond 6 agents (with D3/D6 generalization) | L |
 | 16 | Single-project limit (one active project per process) | ROADMAP:216 (explicitly deferred/incomplete); STATUS.md | Multi-project support requires per-project scoping of process-global services | L |
 | 17 | Eval end-to-end benchmark task (live runtime over real benchmark) | ROADMAP:238–242 | When multi-agent quality + recovery are reliable (ROADMAP ~241) | L |
 | 18 | Coordinator restart/resume end-to-end (cross-process continue) | TODO.md:18–25 (Partial; e2e remains); ADR-34 D2 | After checkpoint persistence + evidence-spine resume e2e | L |
-| 19 | Audit-log retention policy | ADR-40:47 ("future policy question"); TODO.md:14–17 | When an audit-log retention policy is written | S |
 | 21 | Fault-injection tests for multi-agent containment (rate limits, malformed tool calls, missing executables, cancellation races, provider disconnects) | TODO.md:218–224 | ADR-26 boundaries; part of live-test phase | L |
 | 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | **GATED DOCTRINE 2026-09-25** — stays OPEN, but gated on ADR-47's own reopen condition (:78–93): reopen **only** when a consumer proposes/needs richer message content the flat shape cannot express (multi-part tool bodies, image/file `File` parts, structured `Thinking`/`RedactedThinking` on Anthropic/Gemini paths, or structured data smuggled into `content: String`). Migration preconditions recorded 2026-09-25 — all three required before any parts work: **(a)** a named consumer need (ADR-47:80–81); **(b)** a parts-joined-text equivalence test — joining `parts` back to flat text must reproduce today's bytes, and Fix 2 strictness must not loosen (proxy-tool-call-fix.md:5,60 — content-embedded strict path buffers content to turn end); **(c)** a checkpoint/`state_json` migration plan for old rows (`orchestration_checkpoints.state_json` is `TEXT NOT NULL`, migration 019:10; `crates/sessions/src/lib.rs:150`), shipped additively with `serde(default)` + legacy-column fallback in one dedicated window, never as a side effect of an unrelated feature (ADR-47:62–65,109–110; ARCHITECTURE-V2.md §10). Verified migration-safe meanwhile: the Mimo/loose-tier tool mods operate on `ToolDefinition`/`ToolCall` **values**, not message shape — `schema_loose.rs:113` `adapt_tool_definitions(&mut [ToolDefinition])`, `:132` `unflatten_tool_arguments(&mut serde_json::Value)`, `google.rs:55` `adapt_tools_for` mutates `request.tools` — so they neither block nor depend on a parts migration. | L |
 | 23 | ADR-53 per-token streaming through WASM (heartbeat landed) | ADR-53:137–139 (streaming through WASM deferred; heartbeat keepalive landed per ADR-53/57) | Verify streaming scope remains deferred | M |
@@ -65,7 +63,7 @@ a note.
 | 41 | Memory-grounded resume — Phase 6 M3 (a) run-scoped priming, (b) outcome write-back, (c) plan↔worktree drift gadget | ROADMAP:196–212 (live-test-gated; exit gate = three tests, :208–212; no schema change, no new ADR at this scope) | When live stress/interrupt evidence lands + the three tests pass | M |
 | 42 | Windows shell quoting weakness (threat gap #3) | security-threat-model.md §6 :323–328 (~4 h; cmd.exe quoting weaker than POSIX) | When a security milestone is scheduled (prefer `bypass_shell` on Windows) | S |
 | 43 | API server per-client rate limiting (threat gap #4) | security-threat-model.md §6 :332–337 (~4 h) | When a security milestone is scheduled | S |
-| 44 | Audit-log at-rest encryption (threat gap #5) | security-threat-model.md §6 :339–344 (~8 h; SQLCipher / encrypt SQLite) — related: row 19 (audit-log retention policy) | When a security milestone is scheduled | M |
+| 44 | Audit-log at-rest encryption (threat gap #5) — **includes the audit-log retention policy** (former row 19, merged 2026-09-25: retention bounds the encrypted vault) | security-threat-model.md §6 :339–344 (~8 h; SQLCipher / encrypt SQLite); retention part: ADR-40:47 ("Audit retention remains a future policy question, not a session one" — no age-/size-based audit-only truncation, any future one belongs in its own ADR) + TODO.md:14–17 (define retention/archival for `audit_log`; the log is grow-only by design) | When a security milestone is scheduled; the retention/archival policy settles in the same window, since the retention bounds are what bound the encrypted store | M |
 | 45 | Shell-command CPU rate limiting (threat gap #6) | security-threat-model.md §6 :346–351 (~12 h; cgroup/ulimit integration) | When a security milestone is scheduled | M |
 | 46 | Plugin network egress filtering (threat gap #7) | security-threat-model.md §6 :355–360 (~8 h; network capability allowlist) | When a security milestone is scheduled | M |
 | 47 | Memory encryption for sensitive data (threat gap #9) | security-threat-model.md §6 :373–378 (~8 h; mlock/madvise secure allocation) | When a security milestone is scheduled | M |
@@ -89,7 +87,30 @@ a note.
 
 ## Verification notes (2026-09-24)
 
-- 2026-09-25 append: **row 10 cut 2026-09-25 per owner decision** — manual
+- 2026-09-25 append: **row 14 cut 2026-09-25 per owner decision** — no symbol
+  and no source exist. A repo-wide case-insensitive search for `ThreadSpawn` /
+  `thread_spawn` matches only this register itself (this row and the
+  remaining-unknowns note below); there is no `ThreadSpawn` type, module, or
+  spawn-fallback path in the tree, and the row's own re-entry condition ("live
+  fault-injection test demand") is hypothetical rather than a cited deferral.
+  Cutting it removes a task that had nothing to resume. The #14 numbering gap is
+  left intentionally (no renumbering), matching the row 10 / row 12 / row 26
+  precedent. Note: `ThreadSpawn` was also removed from the remaining-unknowns
+  list below, since that list enumerates live `[verify]` rows only.
+- 2026-09-25 append: **row 19 merged into row 44** (audit-log retention policy →
+  an included sub-part of audit-log at-rest encryption) and row 19 deleted. Both
+  citations were re-verified first — `docs/adrs/ADR-40.md:47` ("Audit retention
+  remains a future policy question, not a session one"; any future audit-only
+  truncation belongs in its own ADR) and `docs/TODO.md:14–17` (`audit_log` is
+  grow-only by design). They are folded rather than dropped because retention is
+  what bounds the encrypted store: the threat gap (#5) and the policy question
+  are settled in the same window or not at all. Row 44's size stays **M** — the
+  ~8 h encryption work dominates; the S-sized retention policy is a decision plus
+  a prune path, not additional headline effort. Row 44's re-entry condition is
+  unchanged in trigger ("when a security milestone is scheduled") and extended to
+  state that retention settles alongside it. The #19 numbering gap is left
+  intentionally (no renumbering).
+ — manual
   live matrices in TESTING.md remain the practice; no automated canary job
   planned. Cut by owner decision 2026-09-25 ("weed"), not as a miscitation:
   the row was already flagged `[verify]` with no in-repo source (CI uses
@@ -134,7 +155,7 @@ a note.
   git objects. Containing hardening commits (`ff3c768`, `27263cd`, `edfa67c`,
   `40965ac`) are present.
 - Remaining unknowns (flagged `[verify]` in the open table): `.wasm` watcher,
-  ThreadSpawn fallback, Doubao/StepFun/Replicate ([unplanned]), Vercel Gateway
+  Doubao/StepFun/Replicate ([unplanned]), Vercel Gateway
   decision (research-doc mention only), setup-wizard per-variant auth
   (setup.rs exists; variants unverified).
 - 2026-09-24 append: `docs/research/certified-universal-evolution.md` is cited
