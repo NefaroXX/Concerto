@@ -200,102 +200,404 @@ fn build_hardcoded_denylist() -> Vec<Regex> {
     HARDCODED_DENY_PATTERNS.iter().filter_map(|pattern| Regex::new(pattern).ok()).collect()
 }
 
-/// Shell-quote a single argument for the configured shell.
+// ---------------------------------------------------------------------------
+// Shell dialects, argument quoting, and launch planning (threat gap #3:
+// "Windows Shell Quoting Weakness", security-threat-model.md §6)
+// ---------------------------------------------------------------------------
+
+/// Which quoting rule set (and launcher switch) a shell invocation uses.
 ///
-/// On POSIX (sh/bash/zsh/dash), wrap in single quotes and escape any
-/// embedded single quote as `'\''`. On Windows cmd, wrap in double
-/// quotes and escape embedded double quotes/backslashes/`%` per the
-/// CRT rules. The goal is that the resulting token is treated as a
-/// literal by the shell — never parsed as a metacharacter.
-fn shell_quote(arg: &str) -> String {
+/// Deliberately small: on Windows the only shell Concerto launches directly is
+/// `cmd.exe`; every other shell an operator can select through
+/// [`ShellConfig::shell`] (Git-Bash, MSYS2 bash, WSL sh, ...) speaks POSIX
+/// `-c` quoting, and quoting it with cmd rules would be wrong in both
+/// directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellDialect {
+    /// sh/bash/zsh/dash: single-quote quoting, `-c` launcher switch.
+    Posix,
+    /// cmd.exe: cmd/CRT quoting, launched through [`cmd_verbatim_launch`].
+    Cmd,
+}
+
+/// The platform whose rules apply.
+///
+/// Passed explicitly into the pure planning/quoting functions rather than read
+/// from `cfg!` at each call site, so the Windows-only branches are exercised
+/// by unit tests on the Linux-only CI runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Host {
+    Unix,
+    Windows,
+}
+
+/// The host this binary was compiled for.
+fn host() -> Host {
     if cfg!(unix) {
-        // POSIX single-quote escape: 'arg' -> '\''\''arg'\'' '\''
-        let mut out = String::with_capacity(arg.len() + 2);
-        out.push('\'');
-        for c in arg.chars() {
-            if c == '\'' {
-                // POSIX: close the single-quoted string, add an escaped
-                // single quote, then reopen the single-quoted string. This
-                // produces the literal `'` in the arg as a 4-char sequence
-                // `'\''` rather than the 5-char `''\''`, which would leak
-                // an extra `'` into the argument and could break anchoring
-                // on patterns designed for the canonical escape.
-                out.push_str("'\\''");
-            } else {
+        Host::Unix
+    } else {
+        Host::Windows
+    }
+}
+
+/// Shell syntax characters. A *command string* containing one of these is
+/// shell-dependent and must not be spawned argv-direct.
+///
+/// Not all of these are metacharacters to cmd.exe — `'`, `$`, backtick, `*`,
+/// `?`, `~`, `#`, `!` are literal there — but they are shell syntax to the
+/// POSIX shells an operator can select via [`ShellConfig::shell`], so a
+/// command string containing one is treated as shell-dependent rather than
+/// guessed at. Arguments are *quoted* or *rejected*, never scanned with this
+/// table: on the argv-direct path they never reach a shell at all.
+const SHELL_SYNTAX: &[char] = &[
+    '|', '&', ';', '<', '>', '(', ')', '^', '"', '\'', '$', '`', '*', '?', '~', '#', '%', '!',
+    '\n', '\r',
+];
+
+/// cmd.exe builtins: there is no on-disk program to spawn, so the command only
+/// means anything inside cmd.exe.
+///
+/// Deliberately generous — `find`, `findstr`, `more`, and `sort` also exist as
+/// external programs, and misclassifying them merely keeps them on the
+/// hardened shell path, which is where they ran before argv-direct preference
+/// existed. A missed builtin would be a functional regression (spawn of a
+/// non-existent program), so the table errs towards "shell required".
+const CMD_BUILTINS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir",
+    "doskey", "echo", "endlocal", "erase", "exit", "find", "findstr", "for", "ftype", "goto", "if",
+    "md", "mkdir", "mklink", "more", "move", "not", "path", "pause", "popd", "print", "prompt",
+    "pushd", "rd", "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "sort", "start",
+    "time", "title", "type", "ver", "verify", "vol",
+];
+
+/// Characters that must never appear unquoted on a cmd.exe command line;
+/// their presence in an argument forces the argument to be wrapped in `"`.
+///
+/// Matches the pre-hardening trigger set exactly (plus newlines, as defence in
+/// depth for the allowlist string — [`validate_cmd_args`] rejects newline
+/// arguments before anything spawns). Two characters are deliberately *not*
+/// triggers: `!` (literal because every cmd launch passes `/V:OFF`) and `=`
+/// (a cmd token separator that cannot begin a command, and quoting it would
+/// visibly change `echo a=b` output).
+const WINDOWS_QUOTE_TRIGGERS: &[char] =
+    &[' ', '\t', '\n', '\r', '"', '\\', '%', '<', '>', '|', '&', '^', '(', ')', ';', ','];
+
+/// cmd.exe switches that make the `/C` operand be taken verbatim:
+/// `/D` disables AutoRun (a user registry entry cannot rewrite the command
+/// line), `/V:OFF` forces delayed expansion off (so `!` is a literal), and
+/// `/S` selects the "strip the leading quote and the last quote" rule so the
+/// operand is delivered byte-for-byte.
+const CMD_VERBATIM_SWITCHES: [&str; 4] = ["/D", "/V:OFF", "/S", "/C"];
+
+/// Wrap `full_command` as the `/C` operand. With `/S`, cmd.exe strips exactly
+/// the first and last quote of the remainder, so the inner text — whatever it
+/// contains, including quotes and backslashes — is what cmd.exe executes.
+fn cmd_verbatim_operand(full_command: &str) -> String {
+    format!("\"{full_command}\"")
+}
+
+/// Launcher switches plus operand for running `full_command` through cmd.exe.
+/// `prefix` carries profile-specific switches that must precede `/C`.
+fn cmd_verbatim_launch(prefix: &[String], full_command: &str) -> (Vec<String>, String) {
+    let mut switches = prefix.to_vec();
+    switches.extend(CMD_VERBATIM_SWITCHES.iter().map(|s| (*s).to_string()));
+    (switches, cmd_verbatim_operand(full_command))
+}
+
+/// Whether `arg` must be wrapped before it can go on a cmd.exe command line.
+///
+/// An empty argument is forced through quoting too: emitted bare it would
+/// vanish from the command line entirely, silently dropping an argv element.
+fn windows_arg_needs_quoting(arg: &str) -> bool {
+    arg.is_empty() || arg.chars().any(|c| WINDOWS_QUOTE_TRIGGERS.contains(&c))
+}
+
+/// Quote a single argument so cmd.exe hands the child one, byte-for-byte
+/// identical, argv element.
+///
+/// cmd.exe and the C run-time parse the same command line with different
+/// rules, and both must agree, so:
+///
+/// 1. An argument with no shell-significant character stays bare (preserving
+///    e.g. `echo hello`, which would otherwise print literal quotes).
+/// 2. Otherwise it is wrapped in `"`, so every one of its characters sits
+///    inside quotes at every point of cmd.exe's quote toggling.
+/// 3. A `"` inside the argument becomes `""`: cmd.exe sees two toggles (net
+///    zero, quoting unaffected) while the run-time sees one literal quote.
+/// 4. A backslash run touching a quote is doubled first — the run-time halves
+///    any run immediately before a `"`, so doubling keeps the child's copy
+///    identical (including a trailing run, doubled before the closing quote).
+///
+/// `%` is intentionally *not* escaped: cmd.exe expands `%...%` even inside
+/// quotes and provides no escape for it outside batch files. See
+/// [`validate_cmd_args`], which rejects arguments that would expand.
+fn shell_quote_windows(arg: &str) -> String {
+    if !windows_arg_needs_quoting(arg) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes * 2 {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push_str("\"\"");
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
                 out.push(c);
             }
         }
-        out.push('\'');
-        out
-    } else {
-        // Windows cmd quoting. Wrap in double quotes, double any embedded
-        // double quotes, and escape backslashes that precede a quote or
-        // end of string. The `%` is also escaped as `%%` to prevent
-        // %VAR% expansion in cmd.
-        let needs_quoting = arg.chars().any(|c| {
-            matches!(
-                c,
-                ' ' | '\t' | '"' | '\\' | '%' | '<' | '>' | '|' | '&' | '^' | '(' | ')' | ';' | ','
-            )
-        });
-        if !needs_quoting {
-            return arg.to_string();
+    }
+    // A run that reaches the closing quote must be doubled before it.
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// POSIX single-quote a single argument: `'arg'`, with an embedded `'`
+/// written as `'\''`. The 4-character escape is load-bearing — the 5-character
+/// `''\''` spelling leaks an extra `'` into the argument and breaks allowlist
+/// patterns anchored on the canonical escape.
+fn shell_quote_posix(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for c in arg.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
         }
-        let mut out = String::with_capacity(arg.len() + 2);
-        out.push('"');
-        // Count trailing backslashes so we can double them before the closing quote.
-        let trailing_backslashes = arg.chars().rev().take_while(|&c| c == '\\').count();
-        for (i, c) in arg.char_indices() {
-            match c {
-                '"' => {
-                    out.push_str("\\\"");
-                }
-                '\\' => {
-                    // Double backslashes that precede a closing quote (at end-of-string
-                    // or right before the closing quote we'll append). The simplest
-                    // correct rule for our usage: double every backslash that's at a
-                    // position where the remaining string is all-backslashes OR where
-                    // the next char is a quote.
-                    let remaining_after =
-                        arg[i..].chars().skip(1).take_while(|&c| c == '\\').count();
-                    let is_trailing_run = remaining_after
-                        == arg[i..].chars().count().saturating_sub(1)
-                        && (arg.len() - i - remaining_after - 1) == 0;
-                    if is_trailing_run {
-                        out.push('\\');
-                        out.push('\\'); // double it
-                    } else {
-                        out.push('\\');
-                    }
-                }
-                '%' => {
-                    out.push_str("%%");
-                }
-                _ => out.push(c),
-            }
-        }
-        // Double the trailing-backslash run before the closing quote.
-        for _ in 0..trailing_backslashes {
-            out.push('\\');
-        }
-        out.push('"');
-        out
+    }
+    out.push('\'');
+    out
+}
+
+/// Shell-quote one argument for `dialect`. Not `cfg!`-gated: the Windows rules
+/// are pure and are unit-tested on every CI host.
+fn shell_quote(arg: &str, dialect: ShellDialect) -> String {
+    match dialect {
+        ShellDialect::Posix => shell_quote_posix(arg),
+        ShellDialect::Cmd => shell_quote_windows(arg),
     }
 }
 
 /// Builds the full command string from command and args with proper quoting.
-fn build_full_command(command: &str, args: &[String]) -> String {
+fn build_full_command(command: &str, args: &[String], dialect: ShellDialect) -> String {
     if args.is_empty() {
-        command.to_string()
+        return command.to_string();
+    }
+    let mut out = command.to_string();
+    for a in args {
+        out.push(' ');
+        out.push_str(&shell_quote(a, dialect));
+    }
+    out
+}
+
+/// Lower-cased executable stem of a shell path, without a `.exe` suffix, so
+/// `cmd`, `cmd.exe`, and `C:\Windows\System32\cmd.exe` all compare equal.
+fn shell_stem(shell: &str) -> String {
+    let base = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let lower = base.to_ascii_lowercase();
+    lower.strip_suffix(".exe").map(str::to_string).unwrap_or_else(|| lower)
+}
+
+/// Dialect of an explicit shell path, independent of the host (pure, so
+/// cmd.exe detection is covered on Linux CI).
+fn dialect_for_shell(shell: &str) -> ShellDialect {
+    if shell_stem(shell) == "cmd" {
+        ShellDialect::Cmd
     } else {
-        let mut quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
-        let mut out = command.to_string();
-        for q in &quoted {
-            out.push(' ');
-            out.push_str(q);
+        ShellDialect::Posix
+    }
+}
+
+/// Dialect that applies on `host`. Unix hosts are pinned to
+/// [`ShellDialect::Posix`] so a POSIX host can never take the cmd.exe path.
+fn effective_dialect_for(host: Host, shell: &str) -> ShellDialect {
+    match host {
+        Host::Unix => ShellDialect::Posix,
+        Host::Windows => dialect_for_shell(shell),
+    }
+}
+
+/// True when any `%...%` pair inside `arg` names something the environment
+/// resolves.
+///
+/// Every pair of `%` positions is checked, not just adjacent ones, so
+/// `%%PATH%%` is caught by its inner pair (`PATH`); `%%` on its own has an
+/// empty name and passes. `%Y-%m-%d` passes because no pair resolves.
+fn percent_pair_expands(arg: &str) -> bool {
+    let positions: Vec<usize> = arg.match_indices('%').map(|(i, _)| i).collect();
+    // Bounded scan: an argument with hundreds of `%` would otherwise cost
+    // O(n^2) passes. Fail closed — that is not a legitimate literal.
+    if positions.len() > 64 {
+        return true;
+    }
+    for (n, &open) in positions.iter().enumerate() {
+        for &close in positions.iter().skip(n + 1) {
+            // `%VAR:~0,1%` substring syntax: only the name before `:` counts.
+            let name = &arg[open + 1..close];
+            let base = name.split(':').next().unwrap_or(name);
+            // `env::var_os` panics on a key containing '=' or NUL.
+            if base.is_empty() || base.contains('=') || base.contains('\0') {
+                continue;
+            }
+            if std::env::var_os(base).is_some() {
+                return true;
+            }
         }
-        let _ = &mut quoted; // silence unused-mut if any
-        out
+    }
+    false
+}
+
+/// Fail-closed validation of arguments headed for a cmd.exe launch.
+///
+/// cmd.exe expands `%...%` *before* the command runs and has no escape for it
+/// outside batch files, so no amount of quoting can protect an argument whose
+/// `%`-pair names a real variable — reject instead. Newlines are rejected too:
+/// they separate commands in cmd.exe's grammar, and an unquoted argument is
+/// emitted bare by [`shell_quote_windows`].
+fn validate_cmd_args(args: &[String]) -> Result<(), ToolError> {
+    for arg in args {
+        if arg.chars().any(|c| c == '\n' || c == '\r') {
+            return Err(ToolError::ExecutionFailed {
+                message: "argument contains a newline, which cmd.exe cannot quote safely".into(),
+            });
+        }
+        if percent_pair_expands(arg) {
+            return Err(ToolError::ExecutionFailed {
+                message: "argument contains a %...% pair that resolves in the environment; \
+                          cmd.exe would expand it before the program runs"
+                    .into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a cmd.exe builtin name (with or without `.exe`).
+fn cmd_builtin_reason(command: &str) -> Option<&'static str> {
+    let stem = shell_stem(command);
+    CMD_BUILTINS.contains(&stem.as_str()).then_some("the command is a cmd.exe builtin")
+}
+
+/// Whether `command` names a `.bat`/`.cmd` script. `CreateProcess` cannot run
+/// those directly; they are cmd.exe's own format.
+fn is_batch_script(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.ends_with(".bat") || lower.ends_with(".cmd")
+}
+
+/// Whether `command` starts with POSIX-style `NAME=` environment assignment,
+/// which cmd.exe does not implement and only a shell does.
+fn looks_like_env_assignment(command: &str) -> bool {
+    let Some(eq) = command.find('=') else {
+        return false;
+    };
+    let mut chars = command[..eq].chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// Why a Windows command cannot be spawned argv-direct, or `None` when it can.
+///
+/// Only the `command` string is examined. Arguments never require shell
+/// semantics: on the argv-direct path they are handed to the OS untouched, and
+/// on the shell path they are quoted by [`shell_quote_windows`] or rejected by
+/// [`validate_cmd_args`].
+fn windows_shell_requirement(shell_override: Option<&str>, command: &str) -> Option<&'static str> {
+    if shell_override.is_some() {
+        return Some("an explicit shell override is configured");
+    }
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Some("the command string is empty");
+    }
+    // The tool contract is `command` + `args`; a `command` with whitespace is
+    // a shell command line (or a path with spaces, which the shell path has
+    // always received). Spawning it argv-direct would treat the whole string
+    // as one program name.
+    if trimmed.chars().any(char::is_whitespace) {
+        return Some("the command string is a shell command line, not a single program");
+    }
+    if trimmed.chars().any(|c| SHELL_SYNTAX.contains(&c)) {
+        return Some("the command string contains shell syntax");
+    }
+    if let Some(reason) = cmd_builtin_reason(trimmed) {
+        return Some(reason);
+    }
+    if is_batch_script(trimmed) {
+        return Some("the command is a batch script, which only cmd.exe can run");
+    }
+    if looks_like_env_assignment(trimmed) {
+        return Some("the command assigns a variable before running a program");
+    }
+    None
+}
+
+/// How a shell invocation will be launched.
+///
+/// Built once per execution and consumed by both the spawner and
+/// `command_facts`, so the argv that is audited can never drift from the argv
+/// that actually runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellPlan {
+    /// Spawn `program` directly with its own argv — no shell in between.
+    Direct { program: String, args: Vec<String> },
+    /// Spawn `program` (a shell) with `switches` followed by `operand`.
+    /// `verbatim` means the operand must reach the command line without CRT
+    /// escaping (cmd.exe only — see [`cmd_verbatim_launch`]).
+    Wrapped { program: String, switches: Vec<String>, operand: String, verbatim: bool },
+}
+
+/// Launch plan for a legacy (non-profile) shell invocation.
+///
+/// On Unix nothing changes: the shell always wraps the command, exactly as
+/// before. On Windows the command is spawned argv-direct whenever no shell
+/// semantics are needed — the shell is then the injection surface we avoid —
+/// and only shell-dependent commands fall back to a hardened cmd.exe
+/// invocation (or to the override shell, quoted for its own dialect).
+fn legacy_shell_plan(
+    host: Host,
+    bypass_shell: bool,
+    shell: &str,
+    shell_override: Option<&str>,
+    command: &str,
+    args: &[String],
+    full_command: &str,
+) -> ShellPlan {
+    if bypass_shell {
+        return ShellPlan::Direct { program: command.to_string(), args: args.to_vec() };
+    }
+    if host == Host::Windows && windows_shell_requirement(shell_override, command).is_none() {
+        return ShellPlan::Direct { program: command.to_string(), args: args.to_vec() };
+    }
+    if effective_dialect_for(host, shell) == ShellDialect::Cmd {
+        let (switches, operand) = cmd_verbatim_launch(&[], full_command);
+        ShellPlan::Wrapped { program: shell.to_string(), switches, operand, verbatim: true }
+    } else {
+        ShellPlan::Wrapped {
+            program: shell.to_string(),
+            switches: vec!["-c".to_string()],
+            operand: full_command.to_string(),
+            verbatim: false,
+        }
     }
 }
 
@@ -384,6 +686,83 @@ impl ShellTool {
         }
     }
 
+    /// The shell program this tool spawns: the profile-resolved executable
+    /// when a profile is configured, else the explicit override, else the OS
+    /// default. Single source for [`ShellTool::dialect`] and
+    /// [`ShellTool::shell_plan_for`] so quoting and planning cannot disagree.
+    fn resolved_shell_program(&self) -> String {
+        if let Some(profile) = &self.profile {
+            let backend = ShellProfileFactory::backend_for(profile);
+            backend.resolved_program(profile).to_string_lossy().into_owned()
+        } else {
+            self.config.shell.clone().unwrap_or_else(detect_os_default_shell)
+        }
+    }
+
+    /// Quoting dialect for `full_command` on this host.
+    fn dialect(&self) -> ShellDialect {
+        self.dialect_for(host())
+    }
+
+    /// Quoting dialect for `host` (the parameterised form exists so the
+    /// Windows-only profile path is unit-testable on the Linux-only CI).
+    fn dialect_for(&self, host: Host) -> ShellDialect {
+        effective_dialect_for(host, &self.resolved_shell_program())
+    }
+
+    /// Shell-quoted `command` + `args` in this tool's dialect: the string the
+    /// allowlist matches, the policy facts classify, and the shell receives.
+    fn full_command(&self, command: &str, args: &[String]) -> String {
+        build_full_command(command, args, self.dialect())
+    }
+
+    /// Launch plan for `host`, shared by [`execute`](Self::execute) and
+    /// `command_facts` so the audited argv can never drift from the argv that
+    /// actually runs. `full_command` must be [`ShellTool::full_command`] for
+    /// the production host (the test seam passes its own).
+    fn shell_plan_for(
+        &self,
+        host: Host,
+        command: &str,
+        args: &[String],
+        full_command: &str,
+    ) -> ShellPlan {
+        if let Some(profile) = &self.profile {
+            let backend = ShellProfileFactory::backend_for(profile);
+            let program = backend.resolved_program(profile).to_string_lossy().into_owned();
+            if self.dialect_for(host) == ShellDialect::Cmd {
+                // A cmd.exe profile (the primary Windows path, e.g.
+                // `os-comspec`): we own the switch set and the operand must
+                // reach cmd.exe verbatim, so `command_args`'s plain `/C` is
+                // not used here.
+                let (switches, operand) = cmd_verbatim_launch(&profile.args, full_command);
+                ShellPlan::Wrapped { program, switches, operand, verbatim: true }
+            } else {
+                // POSIX-ish profile: `command_args` yields profile args + a
+                // launcher switch + the command; the command is the operand.
+                let mut switches = backend.command_args(profile, full_command);
+                let operand = switches.pop().unwrap_or_default();
+                ShellPlan::Wrapped { program, switches, operand, verbatim: false }
+            }
+        } else {
+            let shell = self.config.shell.clone().unwrap_or_else(detect_os_default_shell);
+            legacy_shell_plan(
+                host,
+                self.config.bypass_shell,
+                &shell,
+                self.config.shell.as_deref(),
+                command,
+                args,
+                full_command,
+            )
+        }
+    }
+
+    /// Production-host shorthand for [`ShellTool::shell_plan_for`].
+    fn shell_plan(&self, shell_input: &ShellInput, full_command: &str) -> ShellPlan {
+        self.shell_plan_for(host(), &shell_input.command, &shell_input.args, full_command)
+    }
+
     /// Validates the full command string against allowlist and denylist.
     fn validate_input(&self, command: &str, args: &[String]) -> Result<(), ToolError> {
         if command.len() > MAX_COMMAND_LENGTH {
@@ -442,7 +821,7 @@ impl ShellTool {
         // Check allowlist against the *quoted* command string (what the shell
         // actually sees). This is important: anchored patterns like `^echo( .*)?$`
         // continue to match when args contain quotes.
-        let full_command = build_full_command(command, args);
+        let full_command = self.full_command(command, args);
         let allowed = self.config.allowlist.iter().any(|pattern| pattern.is_match(&full_command));
         if !allowed {
             return Err(ToolError::PolicyDenied {
@@ -513,33 +892,31 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         session: &SessionContext,
     ) -> Option<CommandPolicyFacts> {
         let shell_input: ShellInput = serde_json::from_value(input.clone()).ok()?;
-        let full_command = build_full_command(&shell_input.command, &shell_input.args);
+        let full_command = self.full_command(&shell_input.command, &shell_input.args);
 
-        // Describe the executable and argv that will actually be spawned. A
-        // profile/legacy shell is the launcher; direct mode launches the
+        // Describe the executable and argv that will actually be spawned, from
+        // the same plan `execute` runs: a profile/legacy shell is the launcher,
+        // direct mode (bypass, or Windows argv-direct preference) launches the
         // requested program itself.
-        let (resolved_executable, argv) = if let Some(profile) = &self.profile {
-            let backend = ShellProfileFactory::backend_for(profile);
-            let program = backend.resolved_program(profile);
-            let arguments = backend.command_args(profile, &full_command);
-            (
-                Some(program.clone()),
-                std::iter::once(program.to_string_lossy().into_owned()).chain(arguments).collect(),
-            )
-        } else if self.config.bypass_shell {
-            (
-                resolve_program_in_path(&shell_input.command),
-                std::iter::once(shell_input.command.clone())
-                    .chain(shell_input.args.iter().cloned())
+        let plan = self.shell_plan(&shell_input, &full_command);
+        let (resolved_executable, argv) = match &plan {
+            ShellPlan::Direct { program, args } => (
+                resolve_program_in_path(program),
+                std::iter::once(program.clone()).chain(args.iter().cloned()).collect(),
+            ),
+            ShellPlan::Wrapped { program, switches, operand, .. } => (
+                // A profile backend resolves its own executable (ADR-28), so
+                // keep its program as-is; a legacy shell goes through PATH.
+                if self.profile.is_some() {
+                    Some(PathBuf::from(program))
+                } else {
+                    resolve_program_in_path(program)
+                },
+                std::iter::once(program.clone())
+                    .chain(switches.iter().cloned())
+                    .chain(std::iter::once(operand.clone()))
                     .collect(),
-            )
-        } else {
-            let shell = self.config.shell.clone().unwrap_or_else(detect_os_default_shell);
-            let shell_arg = if cfg!(unix) { "-c" } else { "/C" };
-            (
-                resolve_program_in_path(&shell),
-                vec![shell, shell_arg.to_owned(), full_command.clone()],
-            )
+            ),
         };
 
         let network_requested = command_looks_networked(&shell_input.command, &shell_input.args);
@@ -592,7 +969,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         self.validate_command(&shell_input.command, &shell_input.args)?;
 
         // Build the shell-quoted command string for actual execution.
-        let full_command = build_full_command(&shell_input.command, &shell_input.args);
+        let full_command = self.full_command(&shell_input.command, &shell_input.args);
 
         // Determine working directory with sandboxing
         let project_dir =
@@ -621,11 +998,6 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         if let Some(profile) = &self.profile {
             let backend = ShellProfileFactory::backend_for(profile);
             backend.check_available(profile)?;
-            // The managed backend resolves to the installed Concerto runtime;
-            // other backends resolve via the profile's own executable.
-            let program = backend.resolved_program(profile);
-            let args: Vec<String> = backend.command_args(profile, &full_command);
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             let base: HashMap<String, String> = std::env::vars().collect();
             let env = backend.effective_env(profile, &base);
             let effective_cwd = if shell_input.cwd.is_some() {
@@ -646,18 +1018,9 @@ impl concerto_core::traits::tool::Tool for ShellTool {
                 &shell_input.command,
                 &shell_input.args,
             )?;
-            let result = ProcessHandle::run_with_env(
-                &program.to_string_lossy(),
-                &arg_refs,
-                &effective_cwd,
-                Some(&env),
-                timeout,
-                cancel,
-            )
-            .await;
-            // A managed `bash -c` wrapper may have materialized a literal
-            // `nul`/`con`/... file via a `> nul` redirect; sweep it up.
-            cleanup_reserved_device_files(&effective_cwd);
+            let plan = self.shell_plan(&shell_input, &full_command);
+            validate_plan_args(&plan, &shell_input.args)?;
+            let result = spawn_plan(&plan, &effective_cwd, Some(&env), timeout, cancel).await;
             return into_tool_output(result, &shell_input.command, timeout_secs);
         }
 
@@ -667,35 +1030,78 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         // the process will be spawned.
         contain_shell_command(&project_dir, &cwd, &shell_input.command, &shell_input.args)?;
 
-        // Determine execution mode: direct or shell-wrapped.
-        //
-        // When `bypass_shell` is true the command binary is spawned
-        // directly (pre-shell-wrapping behaviour).  Otherwise we wrap
-        // in the configured (or auto-detected) OS shell so that shell
-        // features (pipes, redirects, variable expansion) work.
-        let result = if self.config.bypass_shell {
-            // Direct execution — spawn the command binary directly.
-            let args: Vec<&str> = shell_input.args.iter().map(|s| s.as_str()).collect();
-            ProcessHandle::run(&shell_input.command, &args, &cwd, timeout, cancel).await
-        } else {
-            // Shell execution — wrap in `{shell} -c "full command"`.
-            let shell = self.config.shell.clone().unwrap_or_else(detect_os_default_shell);
-
-            // On Unix the flag is `-c`; on Windows cmd it is `/C`.
-            // (PowerShell uses `-Command` which is equivalent.)
-            let shell_arg = if cfg!(unix) { "-c" } else { "/C" };
-
-            let shell_args: Vec<&str> = vec![shell_arg, &full_command];
-            let result = ProcessHandle::run(&shell, &shell_args, &cwd, timeout, cancel).await;
-            // Git-Bash `bash -c` can materialize a literal `nul` file in the
-            // working directory via a `> nul` redirect (the `\\?\` extended
-            // path bypasses Windows' reserved-name check); sweep it up.
-            cleanup_reserved_device_files(&cwd);
-            result
-        };
+        // Decide how to launch: argv-direct (bypass, or Windows when no shell
+        // semantics are needed — the shell is then the injection surface we
+        // avoid) or a shell-wrapped plan quoted for its own dialect. Unix is
+        // always shell-wrapped, exactly as before.
+        let plan = self.shell_plan(&shell_input, &full_command);
+        validate_plan_args(&plan, &shell_input.args)?;
+        let result = spawn_plan(&plan, &cwd, None, timeout, cancel).await;
 
         into_tool_output(result, &shell_input.command, timeout_secs)
     }
+}
+
+/// Reject arguments that the launcher cannot deliver literally.
+///
+/// Only cmd.exe-launched plans (`verbatim`) need this: cmd.exe expands
+/// `%...%` before the program runs and offers no escape for it outside batch
+/// files, and it treats newlines as command separators. Arguments on the
+/// argv-direct path never reach a shell, and POSIX plans are quoted by
+/// [`shell_quote_posix`], so neither is rejected here.
+fn validate_plan_args(plan: &ShellPlan, args: &[String]) -> Result<(), ToolError> {
+    if let ShellPlan::Wrapped { verbatim: true, .. } = plan {
+        return validate_cmd_args(args);
+    }
+    Ok(())
+}
+
+/// Spawn `plan` in `cwd`, with cancel/timeout support and optional profile
+/// environment. This is the single place a shell tool starts a process, so
+/// the audited plan (see `command_facts`) and the executed argv are the same
+/// object.
+async fn spawn_plan(
+    plan: &ShellPlan,
+    cwd: &Utf8Path,
+    env: Option<&HashMap<String, String>>,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<ProcessOutput, ToolError> {
+    match plan {
+        ShellPlan::Direct { program, args } => {
+            let refs = str_refs(args);
+            ProcessHandle::run_with_env(program, &refs, cwd, env, timeout, cancel).await
+        }
+        ShellPlan::Wrapped { program, switches, operand, verbatim } => {
+            let switch_refs = str_refs(switches);
+            let result = if *verbatim {
+                ProcessHandle::run_with_raw_tail(
+                    program,
+                    &switch_refs,
+                    operand,
+                    cwd,
+                    env,
+                    timeout,
+                    cancel,
+                )
+                .await
+            } else {
+                let mut refs = switch_refs;
+                refs.push(operand);
+                ProcessHandle::run_with_env(program, &refs, cwd, env, timeout, cancel).await
+            };
+            // A shell-wrapped command (`bash -c`, `cmd /C`) may have
+            // materialized a literal `nul`/`con`/... file via a `> nul`
+            // redirect; sweep it up. Direct spawns have no shell to do that.
+            cleanup_reserved_device_files(cwd);
+            result
+        }
+    }
+}
+
+/// Borrow a `&[String]` as `&[&str]` for a spawn call.
+fn str_refs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 /// Map a raw process result into the tool's [`ToolOutput`], preserving the
@@ -1385,19 +1791,18 @@ mod tests {
 
     #[test]
     fn shell_quote_posix_wraps_in_single_quotes() {
-        // On Unix we expect POSIX single-quote wrapping. The exact escape
-        // sequence for an embedded single quote is `'\''` (close-quote,
-        // backslash-escaped quote, reopen-quote), NOT `''\''` — that bug
-        // leaks an extra `'` into the arg and breaks allowlist anchoring.
-        if !cfg!(unix) {
-            return;
-        }
-        assert_eq!(shell_quote("hello"), "'hello'");
-        assert_eq!(shell_quote("hello world"), "'hello world'");
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        // POSIX single-quote wrapping. The exact escape sequence for an
+        // embedded single quote is `'\''` (close-quote, backslash-escaped
+        // quote, reopen-quote), NOT `''\''` — that bug leaks an extra `'`
+        // into the arg and breaks allowlist anchoring. Pure rules: the
+        // dialect is passed explicitly, so this runs on every CI host.
+        let quote = |arg: &str| shell_quote(arg, ShellDialect::Posix);
+        assert_eq!(quote("hello"), "'hello'");
+        assert_eq!(quote("hello world"), "'hello world'");
+        assert_eq!(quote("a'b"), "'a'\\''b'");
         // A semicolon stays inside the quotes; the wrapping does not split
         // the arg into two shell tokens.
-        let q = shell_quote("hello; rm -rf ~");
+        let q = quote("hello; rm -rf ~");
         assert_eq!(q, "'hello; rm -rf ~'");
     }
 
@@ -1636,5 +2041,472 @@ mod tests {
     fn no_inference_when_command_is_not_missing() {
         let raw = json!({ "cmd": "ls" }).as_object().unwrap().clone();
         assert!(infer_missing_arguments(&raw, &missing(&["args"])).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Threat model §6 #3 — Windows shell quoting hardening (DEFERRED row 42).
+    // Everything here is pure: the Windows-only rules are exercised on the
+    // Linux-only CI via `Host` and the reference parsers below.
+    // -----------------------------------------------------------------------
+
+    /// Reference implementation of the Windows C run-time argument parser
+    /// (`parse_lp_cmd_line` in `library/std/src/sys/args/windows.rs`, Rust
+    /// 1.96), ported so our cmd.exe quoting can be round-tripped in tests.
+    ///
+    /// The rules it encodes: space/tab outside quotes split arguments; a
+    /// quote toggles quoting; `""` inside quotes is one literal quote; a run
+    /// of `n` backslashes immediately before a quote is halved (an odd run
+    /// escapes the quote instead); a backslash run not followed by a quote is
+    /// literal; the final argument is kept even when empty if the line ended
+    /// inside quotes.
+    fn crt_parse_args(line: &str) -> Vec<String> {
+        let mut chars = line.chars().peekable();
+
+        // argv[0]: quotes toggle unconditionally; whitespace ends it.
+        let mut argv0 = String::new();
+        let mut in_quotes = false;
+        for c in chars.by_ref() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                ' ' | '\t' if !in_quotes => break,
+                other => argv0.push(other),
+            }
+        }
+        while matches!(chars.peek(), Some(' ' | '\t')) {
+            chars.next();
+        }
+        let mut out = vec![argv0];
+
+        let mut cur = String::new();
+        in_quotes = false;
+        while let Some(c) = chars.next() {
+            match c {
+                ' ' | '\t' if !in_quotes => {
+                    out.push(std::mem::take(&mut cur));
+                    while matches!(chars.peek(), Some(' ' | '\t')) {
+                        chars.next();
+                    }
+                }
+                '\\' => {
+                    let mut run = 1usize;
+                    while chars.peek() == Some(&'\\') {
+                        chars.next();
+                        run += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        for _ in 0..run / 2 {
+                            cur.push('\\');
+                        }
+                        if run % 2 == 1 {
+                            chars.next();
+                            cur.push('"');
+                        }
+                    } else {
+                        for _ in 0..run {
+                            cur.push('\\');
+                        }
+                    }
+                }
+                '"' if in_quotes => match chars.peek().copied() {
+                    Some('"') => {
+                        cur.push('"');
+                        chars.next();
+                    }
+                    Some(_) => in_quotes = false,
+                    // End of line: keep `cur` even if empty (in_quotes set).
+                    None => break,
+                },
+                '"' => in_quotes = true,
+                other => cur.push(other),
+            }
+        }
+        if !cur.is_empty() || in_quotes {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Metacharacter matrix for the quoting tests: everything cmd.exe or a
+    /// CRT run-time can reinterpret, plus the argv shapes that must survive.
+    fn quoting_matrix() -> Vec<String> {
+        [
+            "plain",
+            "hello world",
+            "",
+            "a\"b",
+            "\"\"",
+            "C:\\src\\",
+            "a\\b",
+            "\\\\",
+            "trailing\\",
+            "a b|c",
+            "&whoami",
+            "%PATH%",
+            "a&b",
+            "a|b",
+            "a>b",
+            "a<b",
+            "a^b",
+            "(x)",
+            "a;b",
+            "a,b",
+            "100%",
+            "a%b",
+            "\ttab",
+            "line1\nline2",
+            "a=b",
+            "!bang!",
+            "git status",
+            "héllo wörld",
+            "nul",
+            "..\\..\\escape",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+    }
+
+    #[test]
+    fn shell_quote_windows_round_trips_through_crt_arg_parsing() {
+        // The child program parses its own command line with the C run-time
+        // rules, so every argument we emit for cmd.exe must decode back to
+        // the original bytes after CRT parsing — quotes, backslash runs,
+        // empty arguments, and metacharacters alike.
+        for arg in quoting_matrix() {
+            let quoted = shell_quote_windows(&arg);
+            let line = format!("prog {quoted}");
+            let parsed = crt_parse_args(&line);
+            assert_eq!(
+                parsed,
+                vec!["prog".to_string(), arg.clone()],
+                "CRT round-trip failed: quoted `{quoted}`"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_quote_windows_exposes_no_cmd_syntax_outside_quotes() {
+        // cmd.exe parses the operand with its own quote toggling (no
+        // backslash rules) to find command boundaries. No separator or
+        // redirect character may sit outside quotes, or `& whoami`-style
+        // payloads would run; the quotes themselves must balance.
+        const OUTSIDE: &[char] =
+            &[' ', '\t', '\n', '\r', '&', '|', '<', '>', '^', '(', ')', '%', ';', ','];
+        for input in quoting_matrix() {
+            let quoted = shell_quote_windows(&input);
+            let mut in_quotes = false;
+            for (idx, c) in quoted.chars().enumerate() {
+                if c == '"' {
+                    in_quotes = !in_quotes;
+                    continue;
+                }
+                if !in_quotes {
+                    assert!(
+                        !OUTSIDE.contains(&c),
+                        "`{c:?}` at {idx} of `{quoted}` (input `{input}`) is outside quotes"
+                    );
+                }
+            }
+            assert!(!in_quotes, "unbalanced quotes for `{input}`: `{quoted}`");
+        }
+    }
+
+    #[test]
+    fn shell_quote_windows_quoting_matrix_is_exact() {
+        let cases: &[(&str, &str)] = &[
+            // No trigger character: emitted bare so `echo hello` output is
+            // unchanged (and allowlist patterns anchored on the plain form
+            // keep matching).
+            ("plain", "plain"),
+            // Trigger characters force wrapping.
+            ("hello world", "\"hello world\""),
+            ("", "\"\""),
+            ("a\"b", "\"a\"\"b\""),
+            // Two content quotes: open + two `""` pairs + close = six.
+            ("\"\"", "\"\"\"\"\"\""),
+            // A backslash run before the closing quote is doubled so the
+            // run-time halves it back.
+            ("C:\\src\\", "\"C:\\src\\\\\""),
+            ("trailing\\", "\"trailing\\\\\""),
+            // A backslash not touching a quote stays as-is.
+            ("a\\b", "\"a\\b\""),
+            // Shell syntax and %-variables are quoted, never escaped: cmd.exe
+            // has no escape for `%` outside batch files, so `validate_cmd_args`
+            // rejects expanding pairs instead.
+            ("&whoami", "\"&whoami\""),
+            ("%PATH%", "\"%PATH%\""),
+            ("\ttab", "\"\ttab\""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&shell_quote_windows(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_verbatim_operand_matches_slash_s_quote_strip() {
+        // With `/S`, cmd.exe strips exactly the first and last quote of the
+        // remainder after `/C` and executes what is left — so wrapping the
+        // operand in one quote pair must deliver `full_command` byte-for-byte,
+        // including when it itself starts/ends with quotes or backslashes.
+        for full in [
+            "echo hi",
+            "dir \"C:\\a b\"",
+            "cd C:\\",
+            "\"C:\\Program Files\\x.exe\" a",
+            "echo \"a",
+            "echo a\"",
+            "",
+        ] {
+            let operand = cmd_verbatim_operand(full);
+            let mut chars = operand.chars();
+            assert_eq!(chars.next(), Some('"'), "operand must open with a quote: {operand}");
+            let mut inner: String = chars.collect();
+            assert_eq!(inner.pop(), Some('"'), "operand must close with a quote: {operand}");
+            assert_eq!(inner, full, "/S strip must yield the original command");
+        }
+    }
+
+    #[test]
+    fn cmd_verbatim_launch_orders_profile_args_then_switches_then_operand() {
+        let (switches, operand) =
+            cmd_verbatim_launch(&["/K".to_string(), "chcp 65001".to_string()], "dir");
+        assert_eq!(switches, ["/K", "chcp 65001", "/D", "/V:OFF", "/S", "/C"].map(String::from));
+        assert_eq!(operand, "\"dir\"");
+        // Without profile args the standard four switches stand alone.
+        let (switches, _) = cmd_verbatim_launch(&[], "echo hi");
+        assert_eq!(switches, ["/D", "/V:OFF", "/S", "/C"].map(String::from));
+    }
+
+    #[test]
+    fn dialect_for_shell_detects_cmd_and_posix() {
+        assert_eq!(dialect_for_shell("cmd"), ShellDialect::Cmd);
+        assert_eq!(dialect_for_shell("CMD.EXE"), ShellDialect::Cmd);
+        assert_eq!(dialect_for_shell("C:\\Windows\\System32\\cmd.exe"), ShellDialect::Cmd);
+        assert_eq!(dialect_for_shell("/bin/bash"), ShellDialect::Posix);
+        assert_eq!(dialect_for_shell("C:\\Program Files\\Git\\bin\\bash.exe"), ShellDialect::Posix);
+        // PowerShell legacy overrides stay on the POSIX-side plan for now
+        // (row 42 scope is cmd.exe); the launch switch differs only where a
+        // pwsh override is explicitly configured.
+        assert_eq!(dialect_for_shell("pwsh"), ShellDialect::Posix);
+        // A Unix host can never take the cmd.exe path, whatever the string.
+        assert_eq!(effective_dialect_for(Host::Unix, "cmd.exe"), ShellDialect::Posix);
+        assert_eq!(effective_dialect_for(Host::Windows, "cmd.exe"), ShellDialect::Cmd);
+        assert_eq!(effective_dialect_for(Host::Windows, "bash.exe"), ShellDialect::Posix);
+    }
+
+    #[test]
+    fn windows_shell_requirement_classifies_commands() {
+        // Plain external programs need no shell: they spawn argv-direct.
+        assert_eq!(windows_shell_requirement(None, "cargo"), None);
+        assert_eq!(windows_shell_requirement(None, "git"), None);
+        // cmd.exe builtins only mean anything inside cmd.exe.
+        assert!(windows_shell_requirement(None, "echo").is_some());
+        assert!(windows_shell_requirement(None, "DIR.EXE").is_some());
+        assert!(windows_shell_requirement(None, "set").is_some());
+        // Batch scripts are cmd.exe's own format; CreateProcess can't run them.
+        assert!(windows_shell_requirement(None, "build.bat").is_some());
+        assert!(windows_shell_requirement(None, "build.CMD").is_some());
+        // Shell syntax, command lines (whitespace), POSIX env assignments,
+        // empty/blank commands, and any configured shell override.
+        assert!(windows_shell_requirement(None, "ls | wc").is_some());
+        assert!(windows_shell_requirement(None, "foo&bar").is_some());
+        assert!(windows_shell_requirement(None, "my tool").is_some());
+        assert!(windows_shell_requirement(None, "FOO=1").is_some());
+        assert!(windows_shell_requirement(None, "").is_some());
+        assert!(windows_shell_requirement(None, "   ").is_some());
+        assert!(windows_shell_requirement(Some("cmd.exe"), "cargo").is_some());
+    }
+
+    #[test]
+    fn validate_cmd_args_rejects_expanding_pairs_and_newlines() {
+        // `%` pairs that resolve in the environment expand inside quotes too
+        // and have no escape outside batch files: reject before spawning.
+        if std::env::var_os("PATH").is_some() {
+            let args = vec!["--path".to_string(), "%PATH%".to_string()];
+            assert!(validate_cmd_args(&args).is_err(), "%PATH% must be rejected");
+            // `%%PATH%%` is caught by its inner pair, not just adjacent ones.
+            let args = vec!["%%PATH%%".to_string()];
+            assert!(validate_cmd_args(&args).is_err(), "%%PATH%% must be rejected");
+        }
+        // Newlines separate commands in cmd.exe's grammar.
+        let args = vec!["ok".to_string(), "a\nb".to_string()];
+        assert!(validate_cmd_args(&args).is_err(), "newline args must be rejected");
+        let args = vec!["ok".to_string(), "a\rb".to_string()];
+        assert!(validate_cmd_args(&args).is_err(), "CR args must be rejected");
+        // Fail closed on absurdly many `%` (bounded scan).
+        let args = vec!["%x".repeat(65)];
+        assert!(validate_cmd_args(&args).is_err(), "runaway % must be rejected");
+        // Format-looking and non-resolving `%` usage stays usable.
+        let args = vec!["--date=%d/%m/%Y".to_string(), "%".to_string(), "100%".to_string()];
+        assert!(validate_cmd_args(&args).is_ok(), "literal percent args must pass");
+        let args = vec!["C:\\src".to_string(), "a&b".to_string()];
+        assert!(validate_cmd_args(&args).is_ok(), "plain args must pass");
+    }
+
+    #[test]
+    fn legacy_plan_prefers_argv_direct_on_windows_only() {
+        let args: Vec<String> = ["build", "--release"].iter().map(|s| (*s).to_string()).collect();
+        let full = build_full_command("cargo", &args, ShellDialect::Cmd);
+
+        // No shell semantics → spawn argv-direct; the shell is then the
+        // injection surface we avoid.
+        let plan = legacy_shell_plan(Host::Windows, false, "cmd.exe", None, "cargo", &args, &full);
+        assert_eq!(plan, ShellPlan::Direct { program: "cargo".into(), args: args.clone() });
+
+        // Arguments are never scanned for shell syntax: on the direct path
+        // they never reach a shell, so even `|`-bearing args stay direct.
+        let nasty: Vec<String> = ["a|b"].iter().map(|s| (*s).to_string()).collect();
+        let plan =
+            legacy_shell_plan(Host::Windows, false, "cmd.exe", None, "cargo", &nasty, "cargo");
+        assert_eq!(plan, ShellPlan::Direct { program: "cargo".into(), args: nasty.clone() });
+
+        // cmd.exe builtins fall back to the hardened cmd.exe launch.
+        let plan = legacy_shell_plan(Host::Windows, false, "cmd.exe", None, "echo", &[], "echo hi");
+        assert_eq!(
+            plan,
+            ShellPlan::Wrapped {
+                program: "cmd.exe".into(),
+                switches: ["/D", "/V:OFF", "/S", "/C"].map(String::from).to_vec(),
+                operand: "\"echo hi\"".into(),
+                verbatim: true,
+            }
+        );
+
+        // Shell syntax in the command forces the shell path.
+        let plan = legacy_shell_plan(
+            Host::Windows,
+            false,
+            "C:\\Windows\\System32\\cmd.exe",
+            None,
+            "a & b",
+            &[],
+            "a & b",
+        );
+        assert!(matches!(plan, ShellPlan::Wrapped { verbatim: true, .. }));
+
+        // An explicit shell override always wins (the operator asked for it),
+        // quoted for that shell's own dialect.
+        let plan = legacy_shell_plan(
+            Host::Windows,
+            false,
+            "C:\\msys64\\usr\\bin\\bash.exe",
+            Some("C:\\msys64\\usr\\bin\\bash.exe"),
+            "cargo",
+            &args,
+            &full,
+        );
+        assert_eq!(
+            plan,
+            ShellPlan::Wrapped {
+                program: "C:\\msys64\\usr\\bin\\bash.exe".into(),
+                switches: vec!["-c".into()],
+                operand: full.clone(),
+                verbatim: false,
+            }
+        );
+
+        // bypass_shell keeps its meaning on every host: direct, always.
+        let plan = legacy_shell_plan(Host::Windows, true, "cmd.exe", None, "echo", &[], "echo");
+        assert_eq!(plan, ShellPlan::Direct { program: "echo".into(), args: vec![] });
+    }
+
+    #[test]
+    fn legacy_plan_keeps_unix_shell_wrapping_unchanged() {
+        // Row 42 is Windows-only: a Unix host is always shell-wrapped with
+        // `-c`, argv-direct preference never engages, and quoting is POSIX.
+        let args: Vec<String> = ["a|b"].iter().map(|s| (*s).to_string()).collect();
+        let full = build_full_command("cargo", &args, ShellDialect::Posix);
+        let plan = legacy_shell_plan(Host::Unix, false, "/bin/bash", None, "cargo", &args, &full);
+        assert_eq!(
+            plan,
+            ShellPlan::Wrapped {
+                program: "/bin/bash".into(),
+                switches: vec!["-c".into()],
+                operand: full,
+                verbatim: false,
+            }
+        );
+        // Even a command string that looks like `cmd.exe` stays POSIX-wrapped.
+        let plan = legacy_shell_plan(Host::Unix, false, "/bin/sh", None, "echo", &[], "echo hi");
+        assert_eq!(
+            plan,
+            ShellPlan::Wrapped {
+                program: "/bin/sh".into(),
+                switches: vec!["-c".into()],
+                operand: "echo hi".into(),
+                verbatim: false,
+            }
+        );
+        // bypass_shell still spawns directly.
+        let plan = legacy_shell_plan(Host::Unix, true, "/bin/sh", None, "pwd", &[], "pwd");
+        assert_eq!(plan, ShellPlan::Direct { program: "pwd".into(), args: vec![] });
+    }
+
+    #[test]
+    fn shell_plan_profile_cmd_is_verbatim_on_windows() {
+        // The primary Windows production path: `os-comspec`-style profile
+        // selected, cmd.exe detected, operand delivered byte-for-byte.
+        let profile = concerto_config::shell::ShellProfileConfig {
+            id: "os-comspec".into(),
+            executable: "cmd.exe".into(),
+            args: vec!["/K".into(), "chcp 65001".into()],
+            ..Default::default()
+        };
+        let tool = ShellTool::with_profile(profile, true);
+        let args = vec!["C:\\a b".to_string()];
+        let full = build_full_command("dir", &args, ShellDialect::Cmd);
+        let plan = tool.shell_plan_for(Host::Windows, "dir", &args, &full);
+        let (program, switches, operand, verbatim) = match plan {
+            ShellPlan::Wrapped { program, switches, operand, verbatim } => {
+                (program, switches, operand, verbatim)
+            }
+            other => panic!("expected a wrapped cmd.exe plan, got {other:?}"),
+        };
+        assert!(verbatim, "the cmd.exe operand must be launched verbatim");
+        assert_eq!(shell_stem(&program), "cmd");
+        assert_eq!(switches, ["/K", "chcp 65001", "/D", "/V:OFF", "/S", "/C"].map(String::from));
+        assert_eq!(operand, format!("\"{full}\""));
+        // The quoted form is what /S strips back to.
+        let stripped = operand.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+        assert_eq!(stripped, Some(full.as_str()));
+    }
+
+    #[test]
+    fn shell_plan_profile_posix_pops_command_as_operand() {
+        // A POSIX profile (Git Bash, managed bash, any Unix host) keeps the
+        // backend's own launch args, with the command as the final operand.
+        let profile = concerto_config::shell::ShellProfileConfig {
+            id: "system-default".into(),
+            executable: "bash".into(),
+            ..Default::default()
+        };
+        let tool = ShellTool::with_profile(profile, true);
+        let args = vec!["hello".to_string()];
+        let full = build_full_command("echo", &args, ShellDialect::Posix);
+        let plan = tool.shell_plan_for(Host::Unix, "echo", &args, &full);
+        let (program, switches, operand, verbatim) = match plan {
+            ShellPlan::Wrapped { program, switches, operand, verbatim } => {
+                (program, switches, operand, verbatim)
+            }
+            other => panic!("expected a wrapped POSIX plan, got {other:?}"),
+        };
+        assert!(!verbatim);
+        assert_eq!(shell_stem(&program), "bash");
+        assert_eq!(switches, vec!["-c".to_string()]);
+        assert_eq!(operand, full);
+        assert_eq!(operand, "echo 'hello'");
+    }
+
+    #[test]
+    fn command_facts_direct_plan_is_program_plus_args() {
+        // The facts of a direct spawn are the program and its argv, with no
+        // shell in between (bypass mode on any host; Windows direct
+        // preference produces the same `ShellPlan::Direct` shape).
+        let tool = ShellTool::allow_all_direct();
+        let input = json!({ "command": "cargo", "args": ["build", "--release"] });
+        let facts = Tool::command_facts(&tool, &input, &test_session()).expect("facts produced");
+        let argv: Vec<&str> = facts.argv.iter().map(String::as_str).collect();
+        assert_eq!(argv, vec!["cargo", "build", "--release"]);
+        assert!(facts.shell_profile_id.is_none());
     }
 }

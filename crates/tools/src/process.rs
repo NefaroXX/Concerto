@@ -50,6 +50,49 @@ impl ProcessHandle {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ProcessOutput, ToolError> {
+        let command = Self::base_command(cmd, args, cwd, env);
+        Self::spawn_and_collect(command, timeout, cancel).await
+    }
+
+    /// Like [`run_with_env`], but appends `raw_tail` to the child's command
+    /// line *verbatim* — no CRT argument escaping — after `args`.
+    ///
+    /// Windows-only mechanism, and the load-bearing half of threat-model §6
+    /// #3: `cmd.exe` must receive `/D /V:OFF /S /C "<operand>"` with the
+    /// operand byte-for-byte intact, because `/S` strips exactly the first
+    /// and last quote of the remainder. CRT-escaping that operand (what
+    /// `Command::arg` does) corrupts cmd.exe's own quote stripping and
+    /// re-opens the injection gap the escaping was meant to close.
+    ///
+    /// On non-Windows hosts there is no raw tail to preserve, so the operand
+    /// is appended as an ordinary argument; no caller ever produces a
+    /// verbatim plan off Windows (`effective_dialect_for` pins Unix to the
+    /// POSIX dialect).
+    pub async fn run_with_raw_tail(
+        cmd: &str,
+        args: &[&str],
+        raw_tail: &str,
+        cwd: &Utf8Path,
+        env: Option<&HashMap<String, String>>,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ProcessOutput, ToolError> {
+        let mut command = Self::base_command(cmd, args, cwd, env);
+        #[cfg(windows)]
+        command.raw_arg(raw_tail);
+        #[cfg(not(windows))]
+        command.arg(raw_tail);
+        Self::spawn_and_collect(command, timeout, cancel).await
+    }
+
+    /// Common `Command` setup shared by every spawn entrypoint so piped
+    /// stdio, `kill_on_drop`, cwd, and env merging cannot drift apart.
+    fn base_command(
+        cmd: &str,
+        args: &[&str],
+        cwd: &Utf8Path,
+        env: Option<&HashMap<String, String>>,
+    ) -> Command {
         let mut command = Command::new(cmd);
         command.args(args);
         command.current_dir(cwd.as_std_path());
@@ -59,7 +102,7 @@ impl ProcessHandle {
         if let Some(env) = env {
             command.envs(env.iter());
         }
-        Self::spawn_and_collect(command, timeout, cancel).await
+        command
     }
 
     async fn spawn_and_collect(
