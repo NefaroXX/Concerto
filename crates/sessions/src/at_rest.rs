@@ -20,9 +20,13 @@
 //!   healthy encrypted file, and (b) a plaintext → encrypted swap interrupted
 //!   by a crash can be finished or rolled back on the next connect.
 //! * **Migration.** An existing plaintext database is converted with
-//!   `sqlcipher_export` into `<db>.enc-tmp`, verified with the key, marked,
-//!   and swapped in with two renames; the previous file survives briefly as
-//!   `<db>.old` and is swept after the first successful keyed open.
+//!   `sqlcipher_export` into `<db>.enc-tmp`, verified with the key, then swapped
+//!   in with two renames. The swap is marked in two phases: an in-progress
+//!   `<db>.migrating` marker is written before the renames and promoted to the
+//!   final marker only after the installed file is re-verified with the key, so
+//!   a crash never leaves the final marker next to a plaintext database. The
+//!   previous file survives briefly as `<db>.old` and is swept after the first
+//!   successful keyed open.
 //! * **Logging.** Statement logging is disabled for keyed connections: sqlx
 //!   logs statement text at `Debug`, and the key pragma must never reach a
 //!   log sink. [`AtRestKey`]'s `Debug` output is redacted as well.
@@ -254,10 +258,38 @@ fn old_path(db_path: &Path) -> PathBuf {
     with_suffix(db_path, ".old")
 }
 
+/// In-progress marker written *before* the plaintext → encrypted swap begins.
+///
+/// It is promoted to the final [`marker_path`] only after the encrypted file is
+/// installed and re-verified, so a crash can never leave the final marker next
+/// to a plaintext database. Recovery consumes this marker (finishing, rolling
+/// back, or clearing it) rather than quarantining anything.
+fn migrating_marker_path(db_path: &Path) -> PathBuf {
+    with_suffix(db_path, ".migrating")
+}
+
 fn write_marker(db_path: &Path) -> Result<(), SessionError> {
-    let marker = marker_path(db_path);
-    std::fs::write(&marker, MARKER_CONTENT).map_err(|e| {
+    write_marker_at(&marker_path(db_path))
+}
+
+fn write_marker_at(marker: &Path) -> Result<(), SessionError> {
+    std::fs::write(marker, MARKER_CONTENT).map_err(|e| {
         SessionError::Storage(format!("failed to write at-rest marker {}: {e}", marker.display()))
+    })
+}
+
+/// Promote the in-progress marker to the final marker, declaring the database
+/// at-rest encrypted. Only called once the encrypted file is in place.
+fn promote_migrating_marker(db_path: &Path) -> Result<(), SessionError> {
+    let migrating = migrating_marker_path(db_path);
+    if !migrating.exists() {
+        return write_marker(db_path);
+    }
+    std::fs::rename(&migrating, marker_path(db_path)).map_err(|e| {
+        SessionError::Storage(format!(
+            "failed to promote at-rest marker {}: {e}",
+            migrating.display()
+        ))
     })
 }
 
@@ -373,15 +405,25 @@ async fn migrate_plaintext_to_encrypted(
         }
     }
 
-    // Commit the swap. The marker goes first: it is what tells a later
-    // `connect_path` (or a crash recovery) that the plaintext-looking file is
-    // mid-conversion instead of healthy plaintext.
-    write_marker(db_path)?;
+    // Commit the swap in two phases. First the in-progress marker: it tells a
+    // later `connect_path` (or crash recovery) that the plaintext-looking file
+    // is mid-conversion. The final marker — which promises the database is
+    // encrypted — is written only *after* the swap is installed and verified,
+    // so a crash can never leave a marked plaintext database behind.
+    write_marker_at(&migrating_marker_path(db_path))?;
     std::fs::rename(db_path, old_path(db_path)).map_err(|e| {
         SessionError::Storage(format!("failed to move plaintext database aside: {e}"))
     })?;
     std::fs::rename(&tmp, db_path)
         .map_err(|e| SessionError::Storage(format!("failed to install encrypted database: {e}")))?;
+
+    // Re-verify the installed file with the key before promoting the marker:
+    // the final marker must only ever describe a database that really opens
+    // keyed.
+    verify_keyed(db_path, key).await.map_err(|e| {
+        SessionError::Storage(format!("at-rest verification failed after the swap: {e}"))
+    })?;
+    promote_migrating_marker(db_path)?;
     Ok(())
 }
 
@@ -462,18 +504,30 @@ fn remove_file_if_exists(path: &Path) -> Result<(), SessionError> {
 
 /// Finish or roll back a plaintext → encrypted swap interrupted by a crash.
 ///
-/// Crash windows (marker is written before the renames, so its presence
-/// brackets the swap):
+/// The swap is two-phase, so the markers bracket it precisely:
 ///
-/// 1. Marker + plaintext main file — crashed before the renames: drop the
-///    stale marker and let the next connect re-run the migration.
-/// 2. Marker + no main file + `.enc-tmp` — crashed between the renames with
-///    the export already verified: install the encrypted copy.
-/// 3. Marker + no main file + only `.old` — the encrypted copy vanished
-///    before it was installed: restore the plaintext original and drop the
-///    marker so it is treated as plaintext again.
-/// 4. Marker with nothing else — nothing recoverable: drop the marker.
+/// * An in-progress marker (`.migrating`) means the swap was underway. Its own
+///   presence never promises encryption, so recovery can always reach a
+///   recoverable state:
+///   1. `.migrating` + plaintext main file — crashed before the renames: drop
+///      the in-progress marker and let the next connect re-run the migration.
+///   2. `.migrating` + no main file + `.enc-tmp` — crashed between the renames
+///      with the export already verified: install the encrypted copy and
+///      promote the marker.
+///   3. `.migrating` + encrypted main file — crashed after the encrypted copy
+///      was installed but before promotion: promote the marker.
+///   4. `.migrating` + no main file + only `.old` — the encrypted copy vanished
+///      before it was installed: restore the plaintext original and drop the
+///      in-progress marker so it is treated as plaintext again.
+///   5. `.migrating` with nothing else — nothing recoverable: drop the marker.
+/// * A final marker (`.sqlcipher`) means a completed migration is expected; it
+///   is only ever written next to a verified encrypted file, so the cases below
+///   clean up a stale marker, finish a swap, or roll one back.
 pub(crate) fn recover_interrupted_migration(db_path: &Path) -> Result<(), SessionError> {
+    if migrating_marker_path(db_path).exists() {
+        return recover_migrating(db_path);
+    }
+
     let marker = marker_path(db_path);
     if !marker.exists() {
         return Ok(());
@@ -520,6 +574,67 @@ pub(crate) fn recover_interrupted_migration(db_path: &Path) -> Result<(), Sessio
     Ok(())
 }
 
+/// Resolve an in-progress (`.migrating`) marker to a recoverable state.
+///
+/// The in-progress marker is never a promise of encryption, so no branch here
+/// quarantines: it either drops the marker (retry as plaintext) or promotes it
+/// once an encrypted file is known to be installed.
+fn recover_migrating(db_path: &Path) -> Result<(), SessionError> {
+    let migrating = migrating_marker_path(db_path);
+
+    if db_path.is_file() {
+        if concerto_core::helpers::is_sqlite_file(db_path) {
+            // The swap never committed; the plaintext original is intact.
+            remove_file_if_exists(&migrating)?;
+            tracing::info!(
+                path = %db_path.display(),
+                "cleared an in-progress at-rest marker; the plaintext database will be re-encrypted"
+            );
+            return Ok(());
+        }
+        // The encrypted copy is already installed, only promotion is missing.
+        promote_migrating_marker(db_path)?;
+        tracing::warn!(
+            path = %db_path.display(),
+            "promoted an at-rest marker after an interrupted swap"
+        );
+        return Ok(());
+    }
+
+    let tmp = tmp_path(db_path);
+    if tmp.is_file() {
+        std::fs::rename(&tmp, db_path).map_err(|e| {
+            SessionError::Storage(format!("failed to complete interrupted at-rest swap: {e}"))
+        })?;
+        promote_migrating_marker(db_path)?;
+        tracing::warn!(
+            path = %db_path.display(),
+            "completed an interrupted at-rest encryption swap"
+        );
+        return Ok(());
+    }
+
+    let old = old_path(db_path);
+    if old.is_file() {
+        std::fs::rename(&old, db_path).map_err(|e| {
+            SessionError::Storage(format!("failed to restore database from interrupted swap: {e}"))
+        })?;
+        remove_file_if_exists(&migrating)?;
+        tracing::warn!(
+            path = %db_path.display(),
+            "rolled back an interrupted at-rest encryption swap"
+        );
+        return Ok(());
+    }
+
+    remove_file_if_exists(&migrating)?;
+    tracing::warn!(
+        path = %db_path.display(),
+        "in-progress at-rest marker present without any database file; cleared the marker"
+    );
+    Ok(())
+}
+
 /// Best-effort sweep of swap leftovers after a successful keyed open.
 fn sweep_migration_leftovers(db_path: &Path) {
     for suffix in [
@@ -531,6 +646,7 @@ fn sweep_migration_leftovers(db_path: &Path) {
         ".enc-tmp-wal",
         ".enc-tmp-shm",
         ".enc-tmp-journal",
+        ".migrating",
     ] {
         let path = with_suffix(db_path, suffix);
         if !path.exists() {
@@ -820,6 +936,91 @@ mod tests {
 
         recover_interrupted_migration(&db).expect("recover");
         assert!(tmp_path(&db).exists(), "unrelated files are left alone");
+    }
+
+    fn write_migrating(db: &Path) {
+        write_marker_at(&migrating_marker_path(db)).expect("migrating marker");
+    }
+
+    /// Crash window 1: the in-progress marker was written but the swap never
+    /// began. Recovery drops the marker; the plaintext database is untouched
+    /// and re-migratable (never quarantined).
+    #[test]
+    fn recover_migrating_clears_marker_on_plaintext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sessions.db");
+        write_fake_sqlite(&db);
+        write_migrating(&db);
+
+        recover_interrupted_migration(&db).expect("recover");
+        assert!(!migrating_marker_path(&db).exists(), "in-progress marker must be dropped");
+        assert!(!is_at_rest_encrypted(&db), "no final marker may appear");
+        assert!(concerto_core::helpers::is_sqlite_file(&db), "plaintext database untouched");
+    }
+
+    /// Crash window 2: the plaintext was moved aside and the verified export
+    /// exists, but the install rename never ran. Recovery installs the export
+    /// and promotes the final marker.
+    #[test]
+    fn recover_migrating_completes_swap_from_tmp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sessions.db");
+        write_fake_encrypted(&tmp_path(&db));
+        write_fake_sqlite(&old_path(&db));
+        write_migrating(&db);
+
+        recover_interrupted_migration(&db).expect("recover");
+        assert!(db.is_file(), "swap must be completed from .enc-tmp");
+        assert!(!tmp_path(&db).exists(), ".enc-tmp consumed");
+        assert!(old_path(&db).exists(), ".old kept for the sweep");
+        assert!(is_at_rest_encrypted(&db), "final marker promoted");
+        assert!(!migrating_marker_path(&db).exists(), "in-progress marker consumed");
+    }
+
+    /// Crash window 3: the encrypted file was installed but the marker was not
+    /// promoted. Recovery promotes it without touching the file.
+    #[test]
+    fn recover_migrating_promotes_after_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sessions.db");
+        write_fake_encrypted(&db);
+        write_fake_sqlite(&old_path(&db));
+        write_migrating(&db);
+        let before = std::fs::read(&db).expect("read");
+
+        recover_interrupted_migration(&db).expect("recover");
+        assert!(is_at_rest_encrypted(&db), "final marker promoted");
+        assert!(!migrating_marker_path(&db).exists(), "in-progress marker consumed");
+        assert_eq!(std::fs::read(&db).expect("read"), before, "installed file untouched");
+    }
+
+    /// Crash window 4: only the plaintext original survives (the export is
+    /// gone). Recovery rolls back and drops the in-progress marker.
+    #[test]
+    fn recover_migrating_restores_old_without_tmp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sessions.db");
+        write_fake_sqlite(&old_path(&db));
+        write_migrating(&db);
+
+        recover_interrupted_migration(&db).expect("recover");
+        assert!(concerto_core::helpers::is_sqlite_file(&db), "plaintext original restored");
+        assert!(!is_at_rest_encrypted(&db), "no final marker after rollback");
+        assert!(!migrating_marker_path(&db).exists(), "in-progress marker dropped");
+    }
+
+    /// Crash window 5: only the in-progress marker exists. Recovery clears it
+    /// without conjuring a database.
+    #[test]
+    fn recover_migrating_drops_orphan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sessions.db");
+        write_migrating(&db);
+
+        recover_interrupted_migration(&db).expect("recover");
+        assert!(!migrating_marker_path(&db).exists());
+        assert!(!is_at_rest_encrypted(&db));
+        assert!(!db.exists(), "no database was conjured up");
     }
 
     #[test]
