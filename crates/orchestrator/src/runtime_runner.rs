@@ -4123,6 +4123,10 @@ async fn run_multi_agent(
             memory.clone(),
             consolidation,
             supervised_plan_id,
+            // ADR-60 S5 (DEFERRED #49): hand the children the effective config
+            // (real provider rebuild) and the parent-rendered skills section.
+            &services.config,
+            &services.skills,
         ) {
             Some(supervised) => {
                 return drive_supervised_run(
@@ -4769,6 +4773,12 @@ struct SupervisedRun {
     /// `GateRequest.plan_id` and its terminal events — write-applied rows and
     /// subtask completions then key into the plan's ledger (`fold_ledger`).
     plan_id: Option<String>,
+    /// ADR-60 S5 (DEFERRED #49): extra environment the parent stamps on every
+    /// child so it can rebuild the real provider and inject the same skills
+    /// section. Resolved once per run: the effective `AppConfig` as JSON
+    /// ([`crate::agent_process_config::CONFIG_ENV`], no secrets) and the
+    /// parent-rendered skills section (`CONCERTO_AGENT_SKILLS_SECTION`).
+    spawn_env: Vec<(String, String)>,
 }
 
 /// Prepare everything a supervised multi-agent run needs, or `None` (with a
@@ -4789,6 +4799,8 @@ fn prepare_supervised_run(
     memory: Arc<dyn MemoryStore>,
     consolidation: Option<Arc<crate::consolidation::Consolidator>>,
     plan_id: Option<String>,
+    config: &AppConfig,
+    skills: &crate::skills_context::SkillsContext,
 ) -> Option<SupervisedRun> {
     let tasks = supervised_agent_tasks(multi_agent, objective);
     if tasks.is_empty() {
@@ -4830,26 +4842,63 @@ fn prepare_supervised_run(
         subscriptions: SubscriptionManager::new(log_pool),
         consolidation,
     };
+    let spawn_env = supervised_spawn_env(config, skills);
     // ADR-60 D3: every supervised worker subscribes to `Decision` topics so
     // sibling decisions stream to it as `whiteboard-slice` pushes (protocol
     // 0.2.0); the supervisor loop registers these on first sight of the child.
-    let mut config = SupervisorConfig::default();
+    let mut supervisor_config = SupervisorConfig::default();
     for (agent_id, _) in &tasks {
-        config = config.with_whiteboard_subscription(
+        supervisor_config = supervisor_config.with_whiteboard_subscription(
             agent_id.clone(),
             vec![concerto_sessions::whiteboard::WhiteboardKind::Decision],
         );
     }
     Some(SupervisedRun {
         services,
-        config,
+        config: supervisor_config,
         binary,
         project_root: project_dir.to_path_buf(),
         session_id,
         tasks,
         plan_id,
+        spawn_env,
     })
 }
+
+/// Build the per-run child environment carrying the effective config and the
+/// parent-rendered skills section (ADR-60 S5, DEFERRED #49).
+///
+/// Fail-soft on serialization: a config that cannot be serialized is logged
+/// and omitted — the child then fails closed with a named missing-config error
+/// rather than silently falling back to a mock. The values carry no secrets
+/// (provider metadata + skill *instructions*, which are local instruction
+/// packs by design).
+fn supervised_spawn_env(
+    config: &AppConfig,
+    skills: &crate::skills_context::SkillsContext,
+) -> Vec<(String, String)> {
+    use crate::agent_process_config::CONFIG_ENV;
+    let mut env = Vec::new();
+    match serde_json::to_string(config) {
+        Ok(json) => env.push((CONFIG_ENV.to_owned(), json)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "supervised run: could not serialize the effective config for children; \
+                 children will fail closed on a missing provider"
+            );
+        }
+    }
+    let section = skills.section();
+    if !section.is_empty() {
+        env.push((SUPERVISED_SKILLS_ENV.to_owned(), section));
+    }
+    env
+}
+
+/// Environment variable carrying the parent-rendered skills section to each
+/// supervised child (`agent_process.rs` reads the same name).
+const SUPERVISED_SKILLS_ENV: &str = "CONCERTO_AGENT_SKILLS_SECTION";
 
 /// ADR-60 D6 (Phase 4): construct the supervised consolidation projection
 /// task over the project's memory DB (`<app data>/memory/memory.db`), the
@@ -4996,11 +5045,14 @@ async fn drive_supervised_run(
         command
             .env("CONCERTO_AGENT_ID", agent_id)
             .env("CONCERTO_PROJECT_ROOT", &run.project_root)
-            .env("CONCERTO_TASK_DESCRIPTION", description)
-            // Slice limitation (documented on the child entry): the
-            // agent-process binary wires the mock provider only today; real
-            // provider plumbing is a later ADR-60 chunk.
-            .env("CONCERTO_PROVIDER", "mock");
+            .env("CONCERTO_TASK_DESCRIPTION", description);
+        // ADR-60 S5 (DEFERRED #49): the effective config (no secrets) and the
+        // parent-rendered skills section are stamped once per run so each child
+        // rebuilds the real provider and injects the same skills. `mock` is an
+        // explicit opt-in only — the child never falls back to it implicitly.
+        for (name, value) in &run.spawn_env {
+            command.env(name, value);
+        }
         // ADR-60 D7 ledger enrichment: a plan-driven run stamps every child
         // write with the approved plan id (the child mirrors it onto
         // `GateRequest.plan_id` and its terminal whiteboard events).

@@ -12,6 +12,7 @@
 //! runtime used by frontends.
 
 pub mod agent_loop;
+pub mod agent_process_config;
 pub mod agent_runner;
 pub mod agents;
 mod bypass_decision;

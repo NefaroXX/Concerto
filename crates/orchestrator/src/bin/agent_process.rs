@@ -24,9 +24,11 @@
 //! | `CONCERTO_PROJECT_ROOT` | Project directory the loop is scoped to (required). |
 //! | `CONCERTO_TASK_DESCRIPTION` | The task objective (required). |
 //! | `CONCERTO_MAX_ITERATIONS` | Loop iteration cap (default 25). |
-//! | `CONCERTO_PROVIDER` | `mock` (the only wiring in the slice; default). |
-//! | `CONCERTO_MOCK_SCRIPT_JSON` | Optional per-turn [`CompletionChunk`] script for the mock provider. |
+//! | `CONCERTO_AGENT_CONFIG_JSON` | The parent's resolved [`AppConfig`] as JSON; the real provider is rebuilt from it (required unless `CONCERTO_PROVIDER=mock`). |
+//! | `CONCERTO_PROVIDER` | `mock` selects the explicit mock opt-in (tests/fixtures only); unset or any other value uses the real config/credential path. |
+//! | `CONCERTO_MOCK_SCRIPT_JSON` | Optional per-turn `CompletionChunk` script for the mock provider. |
 //! | `CONCERTO_PLAN_ID` | Optional approved plan id (ADR-60 D7 ledger enrichment); stamps every gated write and the terminal event. |
+//! | `CONCERTO_AGENT_SKILLS_SECTION` | Optional pre-rendered skills section injected into the system prompt; the parent renders it once (ADR-43). |
 //!
 //! ## Stdout discipline
 //!
@@ -42,7 +44,6 @@
 //!
 //! ## Deferred to later chunks
 //!
-//! - Real provider wiring (config/credentials) and skills injection.
 //! - Interactive approval surfacing — the child's approval sink denies;
 //!   approvals are a supervisor/UI concern in the new model.
 //! - Memory stores/invalidations are supervisor-side (D6); the child's
@@ -52,20 +53,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use concerto_config::CredentialStore;
 use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
 use concerto_core::memory::ProjectId;
 use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
 use concerto_core::traits::provider::LlmProvider;
-use concerto_core::types::{system_prompt_for, AgentTask, CompletionChunk};
+use concerto_core::types::{system_prompt_for, AgentTask};
 use concerto_core::{CancellationToken, RequestedOutcome};
 use concerto_eval::EvalEngine;
+use concerto_orchestrator::agent_process_config::{
+    self, AgentProcessProviderError, CONFIG_ENV, PROVIDER_ENV,
+};
 use concerto_orchestrator::gate_proxy::{GateProxyBackend, GateProxyClient, GateProxyMemoryStore};
 use concerto_orchestrator::prompts::PromptBuilder;
-use concerto_providers::mock::MockProvider;
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use concerto_tools::undo::UndoManager;
 use serde_json::json;
+
+/// Environment variable carrying the parent-rendered skills section (ADR-43).
+///
+/// The parent renders the budgeted section once from its runtime-owned
+/// `SkillsContext` and hands it over as-is, so the child's system prompt
+/// matches the parent's without the child running discovery itself.
+const SKILLS_SECTION_ENV: &str = "CONCERTO_AGENT_SKILLS_SECTION";
 
 /// The process entry; all failures map onto exit codes (see module docs).
 #[tokio::main]
@@ -115,6 +126,17 @@ async fn run() -> i32 {
     #[cfg(target_os = "linux")]
     install_parent_death_signal();
 
+    // Resolve the provider before touching the supervisor: a missing config or
+    // credential is a startup failure, and failing here (exit 1, no handshake)
+    // keeps the supervisor's spawn accounting simple and the failure loud.
+    let provider = match resolve_provider() {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("agent-process: {error}");
+            return 1;
+        }
+    };
+
     // Bind to the supervisor: handshake (D2) then the tool registry (the
     // gate owns what the loop may present to the model).
     let client = match GateProxyClient::connect(agent_id.clone()).await {
@@ -134,28 +156,18 @@ async fn run() -> i32 {
             }
         };
 
-    let provider: Arc<dyn LlmProvider> = match std::env::var("CONCERTO_PROVIDER").as_deref() {
-        Ok("mock") | Err(_) => match mock_provider() {
-            Ok(provider) => Arc::new(provider),
-            Err(error) => {
-                eprintln!("agent-process: {error}");
-                return 1;
-            }
-        },
-        Ok(other) => {
-            eprintln!(
-                "agent-process: CONCERTO_PROVIDER={other} is not wired in the ADR-60 S5 slice \
-                 (only \"mock\" is available)"
-            );
-            return 1;
-        }
-    };
-
     let bus = EventBus::default();
     let approval: Arc<dyn ApprovalSink> = Arc::new(DenyAllApprovalSink);
     let undo_manager = Arc::new(std::sync::Mutex::new(UndoManager::new(&project_root)));
     let eval = EvalEngine::new(&project_root);
-    let prompt_builder = PromptBuilder::new(system_prompt_for(RequestedOutcome::Execute));
+    // ADR-43: the parent renders the skills section once and stamps it as an
+    // env var; the child appends it verbatim to its system prompt. Absent or
+    // empty means "no skills injected", exactly like a disabled config.
+    let skills_section = std::env::var(SKILLS_SECTION_ENV).ok().filter(|s| !s.is_empty());
+    let prompt_builder = PromptBuilder::with_skills(
+        system_prompt_for(RequestedOutcome::Execute),
+        skills_context_from_section(skills_section),
+    );
     let memory = Arc::new(GateProxyMemoryStore::new(
         client.clone(),
         agent_id.clone(),
@@ -239,16 +251,39 @@ fn install_parent_death_signal() {
     }
 }
 
-/// Build the mock provider, with an optional scripted conversation.
-fn mock_provider() -> Result<MockProvider, String> {
-    match std::env::var("CONCERTO_MOCK_SCRIPT_JSON") {
-        Ok(script_json) => serde_json::from_str::<Vec<Vec<CompletionChunk>>>(&script_json)
-            .map(MockProvider::scripted)
-            .map_err(|error| {
-                format!("CONCERTO_MOCK_SCRIPT_JSON is not a valid chunk script: {error}")
-            }),
-        Err(_) => Ok(MockProvider::default()),
+/// Resolve the loop's provider.
+///
+/// `CONCERTO_PROVIDER=mock` is the explicit, documented opt-in (tests and
+/// fixtures). Every other value — and an unset variable — selects the real
+/// path: the parent's stamped [`AppConfig`] is parsed, the default provider is
+/// resolved from it, and the provider is built through the credential store
+/// (OS keychain, with the `CONCERTO_*_API_KEY` env fallback). There is no
+/// mock fallback anywhere on this path.
+fn resolve_provider() -> Result<Arc<dyn LlmProvider>, AgentProcessProviderError> {
+    let provider_env = std::env::var(PROVIDER_ENV).ok();
+    if agent_process_config::selects_mock(provider_env.as_deref()) {
+        let script = std::env::var("CONCERTO_MOCK_SCRIPT_JSON").ok();
+        return agent_process_config::build_mock_provider(script.as_deref())
+            .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>);
     }
+    let config_json = std::env::var(CONFIG_ENV).ok();
+    let config = agent_process_config::parse_app_config(config_json.as_deref())?;
+    let (provider_config, model_override) = agent_process_config::resolve_provider_config(&config)?;
+    agent_process_config::build_provider(
+        &provider_config,
+        model_override.as_deref(),
+        &CredentialStore::new(),
+    )
+}
+
+/// Build a `SkillsContext` carrying the parent-rendered section verbatim.
+///
+/// Returns `None` when the parent injected nothing, so the prompt assembly is
+/// byte-identical to a run with no skills (the section is never fabricated).
+fn skills_context_from_section(
+    section: Option<String>,
+) -> Option<Arc<concerto_orchestrator::skills_context::SkillsContext>> {
+    concerto_orchestrator::skills_context::SkillsContext::from_rendered_section(section)
 }
 
 /// A terminal whiteboard event describing this process's task outcome.
