@@ -2,7 +2,7 @@
 
 use crate::common::canonicalize_within;
 use crate::containment::contain_shell_command;
-use crate::process::{ProcessHandle, ProcessOutput};
+use crate::process::{CpuBudget, ProcessHandle, ProcessOutput};
 use crate::shell_backend::ShellProfileFactory;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -43,6 +43,29 @@ const MAX_COMMAND_LENGTH: usize = 4096;
 
 /// Maximum allowed number of arguments.
 const MAX_ARGS_COUNT: usize = 100;
+
+/// Environment variable an operator can set to give every shell command a
+/// CPU-time budget (threat-model §6, gap #6) without a code change — the
+/// row-43 `CONCERTO_API_RATE_LIMIT` precedent for a fail-closed-by-default
+/// runtime escape hatch.
+///
+/// Only consulted when [`ShellConfig::cpu_budget_secs`] is `None`; an
+/// explicit config value (including `0`, "off") always wins. An unparsable
+/// or `0` value means off, never "kill immediately".
+const CPU_BUDGET_ENV: &str = "CONCERTO_SHELL_CPU_BUDGET_SECS";
+
+/// Resolve the effective CPU budget: the explicit config value when present,
+/// else the environment fallback, else off.
+///
+/// Pure on purpose — tests exercise the whole matrix without mutating the
+/// process environment (which would race with tests running beside it).
+fn resolve_cpu_budget(configured: Option<u64>, env: Option<&str>) -> Option<CpuBudget> {
+    match configured {
+        // Explicit config wins, including `Some(0)` = "off".
+        Some(seconds) => CpuBudget::from_secs(seconds),
+        None => env.and_then(|raw| raw.trim().parse::<u64>().ok()).and_then(CpuBudget::from_secs),
+    }
+}
 
 /// Hardcoded deny patterns that are always rejected regardless of config.
 const HARDCODED_DENY_PATTERNS: &[&str] = &[
@@ -181,6 +204,17 @@ pub struct ShellConfig {
     /// applies). Opt-in escape hatch for local runs the user has approved;
     /// used by [`ShellTool::allow_all`]. Default is `false`.
     pub allow_all: bool,
+    /// CPU-time ceiling in seconds per command (threat-model §6, gap #6:
+    /// "No CPU rate limiting on shell commands"). `None` (default) consults
+    /// [`CPU_BUDGET_ENV`] and otherwise runs with no budget — the
+    /// pre-existing behaviour; `Some(0)` is an explicit "off" that also
+    /// ignores the environment.
+    ///
+    /// When a budget is set it is enforced in layers: a process-group
+    /// watchdog on hosts that can account for CPU time, plus a `ulimit`
+    /// `RLIMIT_CPU` backstop in front of POSIX-wrapped plans. The wall-clock
+    /// `timeout_secs` remains an independent limit.
+    pub cpu_budget_secs: Option<u64>,
 }
 
 impl Default for ShellConfig {
@@ -191,6 +225,7 @@ impl Default for ShellConfig {
             shell: None,
             bypass_shell: false,
             allow_all: false,
+            cpu_budget_secs: None,
         }
     }
 }
@@ -727,7 +762,7 @@ impl ShellTool {
         args: &[String],
         full_command: &str,
     ) -> ShellPlan {
-        if let Some(profile) = &self.profile {
+        let plan = if let Some(profile) = &self.profile {
             let backend = ShellProfileFactory::backend_for(profile);
             let program = backend.resolved_program(profile).to_string_lossy().into_owned();
             if self.dialect_for(host) == ShellDialect::Cmd {
@@ -755,12 +790,47 @@ impl ShellTool {
                 args,
                 full_command,
             )
-        }
+        };
+        // Built here rather than at spawn time: `command_facts` derives the
+        // audited argv from this same plan, so the `ulimit` backstop that is
+        // enforced is exactly the one that is audited (threat gap #6).
+        self.with_cpu_limit(plan)
     }
 
     /// Production-host shorthand for [`ShellTool::shell_plan_for`].
     fn shell_plan(&self, shell_input: &ShellInput, full_command: &str) -> ShellPlan {
         self.shell_plan_for(host(), &shell_input.command, &shell_input.args, full_command)
+    }
+
+    /// Effective CPU budget for one execution: explicit config, else the
+    /// environment fallback, else none (see [`resolve_cpu_budget`]).
+    fn cpu_budget(&self) -> Option<CpuBudget> {
+        resolve_cpu_budget(
+            self.config.cpu_budget_secs,
+            std::env::var(CPU_BUDGET_ENV).ok().as_deref(),
+        )
+    }
+
+    /// Prefix `plan` with the `ulimit` CPU backstop when a budget applies to
+    /// it. A no-op for every plan the backstop cannot serve (argv-direct
+    /// plans, cmd.exe's verbatim operand) and whenever no budget is
+    /// configured, which is the default.
+    fn with_cpu_limit(&self, plan: ShellPlan) -> ShellPlan {
+        let Some(budget) = self.cpu_budget() else {
+            return plan;
+        };
+        if !plan_takes_cpu_backstop(&plan, Some(budget)) {
+            return plan;
+        }
+        let ShellPlan::Wrapped { program, switches, operand, verbatim } = plan else {
+            return plan;
+        };
+        ShellPlan::Wrapped {
+            program,
+            switches,
+            operand: format!("{}{operand}", cpu_limit_prelude(budget)),
+            verbatim,
+        }
     }
 
     /// Validates the full command string against allowlist and denylist.
@@ -991,6 +1061,10 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         let timeout_secs = resolve_timeout_secs(shell_input.timeout_secs);
         let timeout = Duration::from_secs(timeout_secs);
 
+        // Resolve the effective CPU budget once for this execution; the plan
+        // carries the matching `ulimit` backstop (see `with_cpu_limit`).
+        let cpu_budget = self.cpu_budget();
+
         // Profile-driven execution (ADR-28): if a shell profile is configured,
         // run through its backend so the agent honours the selected executable,
         // args, env, and working-directory behaviour. A missing/broken profile
@@ -1020,7 +1094,8 @@ impl concerto_core::traits::tool::Tool for ShellTool {
             )?;
             let plan = self.shell_plan(&shell_input, &full_command);
             validate_plan_args(&plan, &shell_input.args)?;
-            let result = spawn_plan(&plan, &effective_cwd, Some(&env), timeout, cancel).await;
+            let result =
+                spawn_plan(&plan, &effective_cwd, Some(&env), timeout, cpu_budget, cancel).await;
             return into_tool_output(result, &shell_input.command, timeout_secs);
         }
 
@@ -1036,7 +1111,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         // always shell-wrapped, exactly as before.
         let plan = self.shell_plan(&shell_input, &full_command);
         validate_plan_args(&plan, &shell_input.args)?;
-        let result = spawn_plan(&plan, &cwd, None, timeout, cancel).await;
+        let result = spawn_plan(&plan, &cwd, None, timeout, cpu_budget, cancel).await;
 
         into_tool_output(result, &shell_input.command, timeout_secs)
     }
@@ -1056,39 +1131,90 @@ fn validate_plan_args(plan: &ShellPlan, args: &[String]) -> Result<(), ToolError
     Ok(())
 }
 
-/// Spawn `plan` in `cwd`, with cancel/timeout support and optional profile
-/// environment. This is the single place a shell tool starts a process, so
-/// the audited plan (see `command_facts`) and the executed argv are the same
-/// object.
+/// True when `plan` is one the `ulimit` CPU backstop can serve: a
+/// POSIX-wrapped shell invocation with a budget configured.
+///
+/// `Direct` plans never go through a shell, and a `verbatim` operand is
+/// cmd.exe's, which has no `ulimit` builtin — prefixing either would be
+/// ignored or would corrupt the argv, so the process-group watchdog (where
+/// available) is the only enforcement for them.
+fn plan_takes_cpu_backstop(plan: &ShellPlan, budget: Option<CpuBudget>) -> bool {
+    budget.is_some() && matches!(plan, ShellPlan::Wrapped { verbatim: false, .. })
+}
+
+/// The shell prelude that installs the `RLIMIT_CPU` ceiling.
+///
+/// `ulimit -S -t N` sets only the *soft* CPU limit, leaving the hard limit
+/// where it was. At `N` seconds of CPU the kernel sends `SIGXCPU`, whose
+/// default action terminates the process — a spelling [`super::process`] can
+/// recognise (`128 + SIGXCPU`). Setting the hard limit to `N` instead makes
+/// the kernel deliver `SIGKILL` directly, which is indistinguishable from an
+/// OOM or external kill, so it would be reported as a plain exit code 137.
+fn cpu_limit_prelude(budget: CpuBudget) -> String {
+    format!("ulimit -S -t {}; ", budget.seconds())
+}
+
+/// Spawn `plan` in `cwd`, with cancel/timeout support, an optional CPU budget,
+/// and optional profile environment. This is the single place a shell tool
+/// starts a process, so the audited plan (see `command_facts`) and the
+/// executed argv are the same object.
 async fn spawn_plan(
     plan: &ShellPlan,
     cwd: &Utf8Path,
     env: Option<&HashMap<String, String>>,
     timeout: Duration,
+    cpu_budget: Option<CpuBudget>,
     cancel: CancellationToken,
 ) -> Result<ProcessOutput, ToolError> {
+    // The plan already carries the `ulimit` prelude when one applies, so
+    // `kernel_backstop` and the audited argv derive from the same object.
+    let kernel_backstop = plan_takes_cpu_backstop(plan, cpu_budget);
     match plan {
         ShellPlan::Direct { program, args } => {
             let refs = str_refs(args);
-            ProcessHandle::run_with_env(program, &refs, cwd, env, timeout, cancel).await
+            ProcessHandle::run_limited(
+                program,
+                &refs,
+                None,
+                cwd,
+                env,
+                timeout,
+                cpu_budget,
+                kernel_backstop,
+                cancel,
+            )
+            .await
         }
         ShellPlan::Wrapped { program, switches, operand, verbatim } => {
             let switch_refs = str_refs(switches);
             let result = if *verbatim {
-                ProcessHandle::run_with_raw_tail(
+                ProcessHandle::run_limited(
                     program,
                     &switch_refs,
-                    operand,
+                    Some(operand),
                     cwd,
                     env,
                     timeout,
+                    cpu_budget,
+                    kernel_backstop,
                     cancel,
                 )
                 .await
             } else {
                 let mut refs = switch_refs;
                 refs.push(operand);
-                ProcessHandle::run_with_env(program, &refs, cwd, env, timeout, cancel).await
+                ProcessHandle::run_limited(
+                    program,
+                    &refs,
+                    None,
+                    cwd,
+                    env,
+                    timeout,
+                    cpu_budget,
+                    kernel_backstop,
+                    cancel,
+                )
+                .await
             };
             // A shell-wrapped command (`bash -c`, `cmd /C`) may have
             // materialized a literal `nul`/`con`/... file via a `> nul`
@@ -1263,6 +1389,7 @@ mod tests {
             shell: None,
             bypass_shell: true, // tests bypass the shell for direct process control
             allow_all: false,
+            cpu_budget_secs: None,
         })
     }
 
@@ -1834,6 +1961,7 @@ mod tests {
             shell: None,
             bypass_shell: false,
             allow_all: false,
+            cpu_budget_secs: None,
         });
         let session = test_session();
         let policy = test_policy();
@@ -1885,6 +2013,7 @@ mod tests {
             shell: None,
             bypass_shell: false,
             allow_all: false,
+            cpu_budget_secs: None,
         });
         let session = test_session();
         let policy = test_policy();
@@ -1922,6 +2051,7 @@ mod tests {
             shell: None,
             bypass_shell: false,
             allow_all: false,
+            cpu_budget_secs: None,
         });
         let session = test_session();
         let policy = test_policy();
@@ -2508,5 +2638,140 @@ mod tests {
         let argv: Vec<&str> = facts.argv.iter().map(String::as_str).collect();
         assert_eq!(argv, vec!["cargo", "build", "--release"]);
         assert!(facts.shell_profile_id.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // CPU-time budget (threat gap #6). Pure tests cover the whole budget
+    // matrix without mutating the process environment; the end-to-end test
+    // proves the breach actually kills.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn resolve_cpu_budget_prefers_config_then_env_then_off() {
+        // Explicit config wins, including an explicit zero ("off").
+        assert_eq!(resolve_cpu_budget(Some(7), Some("900")), CpuBudget::from_secs(7));
+        assert_eq!(resolve_cpu_budget(Some(0), Some("900")), None);
+        // No config: the environment fallback is parsed, trimmed, and zero is off.
+        assert_eq!(resolve_cpu_budget(None, Some(" 30 ")), CpuBudget::from_secs(30));
+        assert_eq!(resolve_cpu_budget(None, Some("0")), None);
+        // Unparsable or absent env means off, never "kill immediately".
+        assert_eq!(resolve_cpu_budget(None, Some("banana")), None);
+        assert_eq!(resolve_cpu_budget(None, None), None);
+    }
+
+    #[test]
+    fn only_posix_wrapped_plans_take_the_ulimit_backstop() {
+        let budget = CpuBudget::from_secs(5);
+        let direct = ShellPlan::Direct { program: "cargo".into(), args: vec![] };
+        let posix = ShellPlan::Wrapped {
+            program: "sh".into(),
+            switches: vec!["-c".into()],
+            operand: "echo hi".into(),
+            verbatim: false,
+        };
+        let verbatim = ShellPlan::Wrapped {
+            program: "cmd.exe".into(),
+            switches: vec!["/C".into()],
+            operand: "\"echo hi\"".into(),
+            verbatim: true,
+        };
+        assert!(!plan_takes_cpu_backstop(&direct, budget));
+        assert!(plan_takes_cpu_backstop(&posix, budget));
+        assert!(!plan_takes_cpu_backstop(&verbatim, budget));
+        // No budget, no backstop, whatever the plan shape.
+        assert!(!plan_takes_cpu_backstop(&posix, None));
+    }
+
+    #[test]
+    fn cpu_limit_prelude_sets_rlimit_cpu_in_seconds() {
+        let budget = CpuBudget::from_secs(42).expect("non-zero budget");
+        assert_eq!(cpu_limit_prelude(budget), "ulimit -S -t 42; ");
+    }
+
+    #[test]
+    fn with_cpu_limit_prefixes_eligible_plans_only() {
+        let args = vec!["hi".to_string()];
+        let full = build_full_command("echo", &args, ShellDialect::Posix);
+
+        let wrapped = ShellTool::with_config(ShellConfig {
+            allowlist: vec![Regex::new(r"^echo( .*)?$").unwrap()],
+            denylist: build_hardcoded_denylist(),
+            shell: None,
+            bypass_shell: false,
+            allow_all: false,
+            cpu_budget_secs: Some(3),
+        });
+        match wrapped.shell_plan_for(Host::Unix, "echo", &args, &full) {
+            ShellPlan::Wrapped { operand, verbatim, .. } => {
+                assert!(!verbatim);
+                assert_eq!(operand, format!("ulimit -S -t 3; {full}"));
+            }
+            other => panic!("expected a POSIX wrapped plan, got {other:?}"),
+        }
+
+        // A direct plan never goes through a shell, so it is never prefixed.
+        let direct = ShellTool::with_config(ShellConfig {
+            allowlist: vec![Regex::new(r"^echo( .*)?$").unwrap()],
+            denylist: build_hardcoded_denylist(),
+            shell: None,
+            bypass_shell: true,
+            allow_all: false,
+            cpu_budget_secs: Some(3),
+        });
+        assert!(matches!(
+            direct.shell_plan_for(Host::Unix, "echo", &args, &full),
+            ShellPlan::Direct { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cpu_budget_breach_surfaces_an_explicit_error() {
+        // `allow_all` lifts the tool's own allowlist; the denylist still
+        // applies. A spinning shell burns far past a one-second budget long
+        // before the generous wall-clock timeout.
+        let tool = ShellTool::with_config(ShellConfig {
+            allowlist: vec![],
+            denylist: build_hardcoded_denylist(),
+            shell: None,
+            bypass_shell: false,
+            allow_all: true,
+            cpu_budget_secs: Some(1),
+        });
+        let session = test_session();
+        let policy = test_policy();
+        let cancel = CancellationToken::new();
+        let input =
+            json!({"command": "sh", "args": ["-c", "while :; do :; done"], "timeout_secs": 30u64});
+        let result = tool.execute(input, &policy, &session, cancel).await;
+        let error = result.expect_err("a spinning shell command must breach its cpu budget");
+        let ToolError::ExecutionFailed { message } = error else {
+            panic!("expected ExecutionFailed, got {error:?}");
+        };
+        // The explicit breach message names the budget; the executor records
+        // the tool error as an `ExecutionError(...)` audit row.
+        assert!(message.contains("cpu budget exceeded"), "message was: {message}");
+        assert!(message.contains("1s"), "the budget must be named: {message}");
+    }
+
+    #[test]
+    fn explicit_zero_budget_leaves_the_plan_unprefixed() {
+        // `Some(0)` is an explicit "off": the env fallback is ignored and the
+        // launch plan is byte-for-byte the pre-budget one. The process layer
+        // separately proves an unconfigured budget never arms a watchdog.
+        let args = vec!["hi".to_string()];
+        let full = build_full_command("echo", &args, ShellDialect::Posix);
+        let tool = ShellTool::with_config(ShellConfig {
+            allowlist: vec![Regex::new(r"^echo( .*)?$").unwrap()],
+            denylist: build_hardcoded_denylist(),
+            shell: None,
+            bypass_shell: false,
+            allow_all: false,
+            cpu_budget_secs: Some(0),
+        });
+        match tool.shell_plan_for(Host::Unix, "echo", &args, &full) {
+            ShellPlan::Wrapped { operand, .. } => assert_eq!(operand, full),
+            other => panic!("expected a POSIX wrapped plan, got {other:?}"),
+        }
     }
 }

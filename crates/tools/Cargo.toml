@@ -30,7 +30,10 @@ blake3 = { workspace = true }
 imara-diff = { workspace = true }
 gix = { workspace = true }
 regex = { workspace = true }
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+# `feature` (a pure cfg gate, no extra crate) exposes `unistd::sysconf` /
+# `SysconfVar::CLK_TCK`, which converts `/proc/<pid>/stat` jiffies into a CPU
+# time budget for the shell threat-gap-#6 watchdog (see `cpu_accounting`).
+nix = { version = "0.31", default-features = false, features = ["signal", "feature"] }
 
 [dev-dependencies]
 tempfile = "3"

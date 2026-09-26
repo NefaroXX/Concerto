@@ -9,6 +9,7 @@
 
 pub mod common;
 pub mod containment;
+mod cpu_accounting;
 pub mod diff;
 pub mod error;
 pub mod filesystem;
