@@ -31,6 +31,7 @@ use concerto_core::memory::{
     ChunkType, MemoryChunk, MemoryEntry, MemoryId, MemoryNamespace, MemoryQuery, ProjectId,
 };
 use concerto_core::policy::SimplePolicyEngine;
+use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::traits::policy::AuditLog;
 use concerto_core::types::{Condition, PolicyRule, ToolRegistry};
@@ -136,7 +137,6 @@ fn one_write_script() -> serde_json::Value {
 struct CountingMemoryStore {
     retrievals: AtomicUsize,
 }
-
 impl CountingMemoryStore {
     fn new() -> Self {
         Self { retrievals: AtomicUsize::new(0) }
@@ -284,6 +284,9 @@ async fn real_agent_process_gated_write_completes_end_to_end() {
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: memory.clone(),
         project_id: ProjectId("proj-s5".to_owned()),
     };
@@ -366,6 +369,9 @@ async fn denied_write_fails_the_tool_call_but_the_agent_completes() {
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-s5".to_owned()),
     };
@@ -413,4 +419,163 @@ async fn denied_write_fails_the_tool_call_but_the_agent_completes() {
     assert_eq!(events[1].agent_id, "agent-a");
     assert_eq!(events[1].gate_seq, 2);
     assert_eq!(events[1].agent_seq, 2);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-60 S5 approval bridge (DEFERRED #49): the child's approval sink rides
+// the supervisor's existing approval surface over IPC.
+// ---------------------------------------------------------------------------
+
+/// A supervisor-side approval sink the bridge tests script.
+struct ScriptedApprovalSink {
+    decision: ApprovalDecision,
+    calls: AtomicUsize,
+}
+
+impl ScriptedApprovalSink {
+    fn new(decision: ApprovalDecision) -> Self {
+        Self { decision, calls: AtomicUsize::new(0) }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ApprovalSink for ScriptedApprovalSink {
+    async fn request_approval(
+        &self,
+        _action: &concerto_core::types::PolicyAction<'_>,
+        _cancel: CancellationToken,
+    ) -> ApprovalDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.decision
+    }
+
+    async fn approve_all_for_session(
+        &self,
+        _session_id: concerto_core::ids::Ulid,
+        _cancel: CancellationToken,
+    ) {
+    }
+
+    async fn request_ack(
+        &self,
+        _session_id: concerto_core::ids::Ulid,
+        _message: &str,
+        _cancel: CancellationToken,
+    ) -> bool {
+        true
+    }
+}
+
+/// Six identical `filesystem` reads (past the loop's repeat budget) followed by
+/// a completion turn. The repeat is what forces the loop to consult its
+/// approval sink; the call is identical so the cycle tracker fires on the
+/// sixth read.
+fn repeated_read_script() -> serde_json::Value {
+    let read_turn = json!([
+        {
+            "delta": "",
+            "reasoning": null,
+            "tool_call": {
+                "id": "call-1",
+                "name": "filesystem",
+                "arguments": { "operation": "read", "path": ".gitkeep" }
+            },
+            "is_final": false,
+            "usage": null
+        },
+        { "delta": "", "reasoning": null, "tool_call": null, "is_final": true, "usage": null }
+    ]);
+    let mut turns = Vec::new();
+    for _ in 0..6 {
+        turns.push(read_turn.clone());
+    }
+    turns.push(json!([
+        { "delta": "done", "reasoning": null, "tool_call": null, "is_final": true, "usage": null }
+    ]));
+    json!(turns)
+}
+
+/// An approving supervisor sink lets the repeated call proceed: the child
+/// bridges the request over IPC, the supervisor routes it to the sink, and the
+/// decision comes back as an approval.
+#[tokio::test]
+async fn approval_round_trip_over_ipc_approves_the_repeated_call() {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    git_commit_all(root_dir.path());
+    let (_pool_dir, pool) = whiteboard_pool(2).await;
+
+    let sink = Arc::new(ScriptedApprovalSink::new(ApprovalDecision::Approve));
+    let services = SupervisorServices {
+        gate: fs_gate(
+            engine(vec![PolicyRule::AutoApprove(Condition::Always)]),
+            pool.clone(),
+            root_dir.path().to_path_buf(),
+        ),
+        whiteboard_pool: pool.clone(),
+        subscriptions: SubscriptionManager::new(pool.clone()),
+        consolidation: None,
+        memory: Arc::new(CountingMemoryStore::new()),
+        project_id: ProjectId("proj-s5".to_owned()),
+        approval_sink: Some(sink.clone()),
+        bus: None,
+    };
+
+    let mut supervisor = Supervisor::new(SupervisorConfig::default());
+    supervisor
+        .spawn_agent(&mut agent_process(root_dir.path(), repeated_read_script()), "agent-a")
+        .expect("spawn agent process");
+
+    let summary = run_supervisor(supervisor, services, Duration::from_secs(8)).await;
+    assert!(summary.failed.is_empty(), "no agent may fail: {:?}", summary.failed);
+    let agent =
+        summary.agents.iter().find(|meta| meta.agent_id == "agent-a").expect("agent-a registered");
+    assert_eq!(agent.state, AgentState::Completed, "approval must let the run complete");
+    assert_eq!(
+        sink.call_count(),
+        1,
+        "the child's approval request must reach the supervisor's sink exactly once"
+    );
+}
+
+/// With no supervisor sink configured, the bridge denies: the child's repeated
+/// call is not approved, the task fails closed, and the write/read never runs.
+#[tokio::test]
+async fn approval_without_a_supervisor_sink_denies_fail_closed() {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    git_commit_all(root_dir.path());
+    let (_pool_dir, pool) = whiteboard_pool(2).await;
+
+    let services = SupervisorServices {
+        gate: fs_gate(
+            engine(vec![PolicyRule::AutoApprove(Condition::Always)]),
+            pool.clone(),
+            root_dir.path().to_path_buf(),
+        ),
+        whiteboard_pool: pool.clone(),
+        subscriptions: SubscriptionManager::new(pool.clone()),
+        consolidation: None,
+        memory: Arc::new(CountingMemoryStore::new()),
+        project_id: ProjectId("proj-s5".to_owned()),
+        approval_sink: None,
+        bus: None,
+    };
+
+    let mut supervisor = Supervisor::new(SupervisorConfig::default());
+    supervisor
+        .spawn_agent(&mut agent_process(root_dir.path(), repeated_read_script()), "agent-a")
+        .expect("spawn agent process");
+
+    let summary = run_supervisor(supervisor, services, Duration::from_secs(8)).await;
+    // The child's approval is denied, so its loop fails the task (exit 1). The
+    // supervisor treats a non-zero exit as a crash and retries within budget;
+    // the run must end without the child succeeding.
+    let agent = summary.agents.iter().find(|meta| meta.agent_id == "agent-a");
+    assert!(
+        agent.is_none_or(|meta| meta.state != AgentState::Completed),
+        "a denied approval must never complete the task"
+    );
 }

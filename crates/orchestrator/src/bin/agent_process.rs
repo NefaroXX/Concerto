@@ -44,8 +44,9 @@
 //!
 //! ## Deferred to later chunks
 //!
-//! - Interactive approval surfacing — the child's approval sink denies;
-//!   approvals are a supervisor/UI concern in the new model.
+//! - Interactive approval surfacing — the child's approval sink bridges to the
+//!   supervisor over IPC ([`ApprovalProxySink`]); when the supervisor cannot
+//!   answer, the child denies (fail-closed default, unchanged).
 //! - Memory stores/invalidations are supervisor-side (D6); the child's
 //!   memory store is a retrieval facade.
 
@@ -57,7 +58,7 @@ use concerto_config::CredentialStore;
 use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
 use concerto_core::memory::ProjectId;
-use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
+use concerto_core::traits::approval::ApprovalSink;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{system_prompt_for, AgentTask};
 use concerto_core::{CancellationToken, RequestedOutcome};
@@ -65,7 +66,9 @@ use concerto_eval::EvalEngine;
 use concerto_orchestrator::agent_process_config::{
     self, AgentProcessProviderError, CONFIG_ENV, PROVIDER_ENV,
 };
-use concerto_orchestrator::gate_proxy::{GateProxyBackend, GateProxyClient, GateProxyMemoryStore};
+use concerto_orchestrator::gate_proxy::{
+    ApprovalProxySink, GateProxyBackend, GateProxyClient, GateProxyMemoryStore,
+};
 use concerto_orchestrator::prompts::PromptBuilder;
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use concerto_tools::undo::UndoManager;
@@ -157,7 +160,12 @@ async fn run() -> i32 {
         };
 
     let bus = EventBus::default();
-    let approval: Arc<dyn ApprovalSink> = Arc::new(DenyAllApprovalSink);
+    // ADR-60 S5 approval bridge: the sink forwards each request to the
+    // supervisor, which routes it to the same frontend approval surface the
+    // in-process paths use. No answer (no sink, cancellation, transport
+    // failure) denies — the fail-closed default, now because the channel said
+    // so.
+    let approval: Arc<dyn ApprovalSink> = Arc::new(ApprovalProxySink::new(client.clone()));
     let undo_manager = Arc::new(std::sync::Mutex::new(UndoManager::new(&project_root)));
     let eval = EvalEngine::new(&project_root);
     // ADR-43: the parent renders the skills section once and stamps it as an
@@ -322,50 +330,4 @@ fn unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Child-side approval sink: approvals and user acknowledgments are a
-/// supervisor/UI concern in the ADR-60 model (the gate owns policy, the
-/// supervisor owns the UI surface). The child denies and logs the drop.
-struct DenyAllApprovalSink;
-
-impl DenyAllApprovalSink {
-    fn deny(reason: &str) {
-        eprintln!("agent-process: {reason}");
-    }
-}
-
-#[async_trait::async_trait]
-impl ApprovalSink for DenyAllApprovalSink {
-    async fn request_approval(
-        &self,
-        _action: &concerto_core::types::PolicyAction<'_>,
-        _cancel: CancellationToken,
-    ) -> ApprovalDecision {
-        Self::deny(
-            "approval request dropped: interactive approvals are supervisor-side and not yet \
-             wired (ADR-60 deferred)",
-        );
-        ApprovalDecision::Deny
-    }
-
-    async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {
-        Self::deny(
-            "approve-all request dropped: interactive approvals are supervisor-side (ADR-60 \
-             deferred)",
-        );
-    }
-
-    async fn request_ack(
-        &self,
-        _session_id: Ulid,
-        _message: &str,
-        _cancel: CancellationToken,
-    ) -> bool {
-        Self::deny(
-            "user acknowledgment request dropped: ack surfacing is supervisor-side (ADR-60 \
-             deferred); aborting the current task",
-        );
-        false
-    }
 }

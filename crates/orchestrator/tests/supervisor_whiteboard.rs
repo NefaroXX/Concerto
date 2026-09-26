@@ -188,6 +188,9 @@ async fn supervisor_pushes_one_bounded_slice_and_never_resends_an_unacked_span()
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d3-flush".to_owned()),
     };

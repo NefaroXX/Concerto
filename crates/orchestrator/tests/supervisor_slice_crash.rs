@@ -180,6 +180,9 @@ async fn subscriber_crash_between_slice_and_ack_redelivers_from_the_cursor() {
         memory: Arc::new(NullMemory),
         project_id: ProjectId("proj-d3-crash".to_owned()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
     };
     let config = SupervisorConfig::default()
         .with_whiteboard_subscription("agent-s", vec![WhiteboardKind::Decision]);

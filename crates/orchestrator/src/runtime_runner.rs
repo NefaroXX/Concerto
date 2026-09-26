@@ -4124,9 +4124,13 @@ async fn run_multi_agent(
             consolidation,
             supervised_plan_id,
             // ADR-60 S5 (DEFERRED #49): hand the children the effective config
-            // (real provider rebuild) and the parent-rendered skills section.
+            // (real provider rebuild), the parent-rendered skills section, the
+            // run's bus (approval audit events) and the SAME frontend approval
+            // sink the in-process paths use.
             &services.config,
             &services.skills,
+            &services.bus,
+            &services.approval_sink,
         ) {
             Some(supervised) => {
                 return drive_supervised_run(
@@ -4801,6 +4805,8 @@ fn prepare_supervised_run(
     plan_id: Option<String>,
     config: &AppConfig,
     skills: &crate::skills_context::SkillsContext,
+    bus: &EventBus,
+    approval_sink: &Arc<dyn ApprovalSink>,
 ) -> Option<SupervisedRun> {
     let tasks = supervised_agent_tasks(multi_agent, objective);
     if tasks.is_empty() {
@@ -4841,6 +4847,11 @@ fn prepare_supervised_run(
         project_id: ProjectId(concerto_core::helpers::project_id_hash(project_dir)),
         subscriptions: SubscriptionManager::new(log_pool),
         consolidation,
+        // ADR-60 S5 approval bridge: children route approvals to the SAME
+        // frontend sink the in-process paths use. `None` keeps the fail-closed
+        // deny default.
+        approval_sink: Some(approval_sink.clone()),
+        bus: Some(bus.clone()),
     };
     let spawn_env = supervised_spawn_env(config, skills);
     // ADR-60 D3: every supervised worker subscribes to `Decision` topics so
