@@ -394,6 +394,9 @@ pub enum EventKind {
     },
 
     // --- review + validation loops (Phase 5) ---
+    // Escalation is event-free: the coordinator escalates by verdict
+    // (`progress::CycleVerdict::Escalate`) and surfaces it as an informational
+    // `AgentThought`, so no dedicated escalation event kind is needed.
     ReviewCycleStarted {
         task_id: TaskId,
         cycle_num: u32,
@@ -403,17 +406,9 @@ pub enum EventKind {
         cycle_num: u32,
         verdict: String,
     },
-    ReviewCycleEscalated {
-        task_id: TaskId,
-        max_cycles: u32,
-    },
     ValidationCycleStarted {
         task_id: TaskId,
         cycle_num: u32,
-    },
-    ValidationEscalated {
-        task_id: TaskId,
-        max_cycles: u32,
     },
 
     // --- routing (Phase 5) ---

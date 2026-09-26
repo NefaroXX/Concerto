@@ -279,22 +279,12 @@ pub fn transcript_entry_from_event_with_labels(
                 content: format!("Review cycle {cycle_num} for subtask {task_id}: {verdict}"),
             })
         }
-        EventKind::ReviewCycleEscalated { task_id, max_cycles } => {
-            Some(TranscriptEntry::Activity {
-                agent: labels.review.clone(),
-                content: format!("Escalated subtask {task_id} after {max_cycles} review cycles."),
-            })
-        }
         EventKind::ValidationCycleStarted { task_id, cycle_num } => {
             Some(TranscriptEntry::Activity {
                 agent: labels.validate.clone(),
                 content: format!("Started validation cycle {cycle_num} for subtask {task_id}."),
             })
         }
-        EventKind::ValidationEscalated { task_id, max_cycles } => Some(TranscriptEntry::Activity {
-            agent: labels.validate.clone(),
-            content: format!("Escalated subtask {task_id} after {max_cycles} validation cycles."),
-        }),
         EventKind::BudgetDowngradeTriggered { role, from_model, to_model } => {
             Some(TranscriptEntry::Activity {
                 agent: "Coordinator".to_string(),
@@ -873,18 +863,6 @@ mod tests {
             })
         );
 
-        let escalated = transcript_entry_from_event_with_labels(
-            &EventKind::ReviewCycleEscalated { task_id: tid, max_cycles: 3 },
-            &labels,
-        );
-        assert_eq!(
-            escalated,
-            Some(TranscriptEntry::Activity {
-                agent: "QA Reviewer".into(),
-                content: format!("Escalated subtask {tid} after 3 review cycles."),
-            })
-        );
-
         let validated = transcript_entry_from_event_with_labels(
             &EventKind::ValidationCycleStarted { task_id: tid, cycle_num: 1 },
             &labels,
@@ -894,18 +872,6 @@ mod tests {
             Some(TranscriptEntry::Activity {
                 agent: "QA Verifier".into(),
                 content: format!("Started validation cycle 1 for subtask {tid}."),
-            })
-        );
-
-        let validation_escalated = transcript_entry_from_event_with_labels(
-            &EventKind::ValidationEscalated { task_id: tid, max_cycles: 2 },
-            &labels,
-        );
-        assert_eq!(
-            validation_escalated,
-            Some(TranscriptEntry::Activity {
-                agent: "QA Verifier".into(),
-                content: format!("Escalated subtask {tid} after 2 validation cycles."),
             })
         );
 

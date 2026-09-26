@@ -378,17 +378,9 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
             "Reviewer",
             format!("Review cycle {cycle_num} for subtask {task_id}: {verdict}"),
         ),
-        EventKind::ReviewCycleEscalated { task_id, max_cycles } => activity(
-            "Reviewer",
-            format!("Escalated subtask {task_id} after {max_cycles} review cycles."),
-        ),
         EventKind::ValidationCycleStarted { task_id, cycle_num } => activity(
             "Validator",
             format!("Started validation cycle {cycle_num} for subtask {task_id}."),
-        ),
-        EventKind::ValidationEscalated { task_id, max_cycles } => activity(
-            "Validator",
-            format!("Escalated subtask {task_id} after {max_cycles} validation cycles."),
         ),
         EventKind::BudgetDowngradeTriggered { role, from_model, to_model } => activity(
             "Coordinator",

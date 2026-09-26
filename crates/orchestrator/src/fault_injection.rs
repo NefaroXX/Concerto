@@ -578,9 +578,7 @@ struct RunReport {
     needs_revision: usize,
     blocked_events: usize,
     review_cycles: u32,
-    review_escalated: bool,
     validation_cycles: u32,
-    validation_escalated: bool,
     /// Progress-guard thoughts (#53 stall nudges + escalations).
     guards: Vec<String>,
     tokens_in: u64,
@@ -618,9 +616,7 @@ impl RunReport {
             needs_revision: 0,
             blocked_events: 0,
             review_cycles: 0,
-            review_escalated: false,
             validation_cycles: 0,
-            validation_escalated: false,
             guards: Vec::new(),
             tokens_in: 0,
             tokens_out: 0,
@@ -656,9 +652,7 @@ impl RunReport {
             EventKind::SubTaskNeedsRevision { .. } => self.needs_revision += 1,
             EventKind::SubTaskBlocked { .. } => self.blocked_events += 1,
             EventKind::ReviewCycleStarted { .. } => self.review_cycles += 1,
-            EventKind::ReviewCycleEscalated { .. } => self.review_escalated = true,
             EventKind::ValidationCycleStarted { .. } => self.validation_cycles += 1,
-            EventKind::ValidationEscalated { .. } => self.validation_escalated = true,
             EventKind::AgentThought { content, .. } if content.contains("Progress guard") => {
                 self.guards.push(content.clone());
             }
