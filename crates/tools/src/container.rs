@@ -17,10 +17,15 @@
 //! - The project root is the only default mount, at its own absolute path; the
 //!   working directory must fall under it (fail-closed otherwise).
 //! - Network defaults to none; host environment is never forwarded wholesale.
+//! - Extra mounts and forwarded environment entries are **operator-supplied**
+//!   via [`ContainerConfig`] (programmatic-only today — there is no TOML key).
+//!   They are validated here as defense-in-depth: an escaping mount, a
+//!   conflicting access mode, or a security-sensitive env override is refused
+//!   with a named error rather than passed to the runtime.
 //!
-//! Fail-closed: no runtime, an unsupported platform (Windows), or an
-//! out-of-root working directory all produce an explicit error, never a silent
-//! fallback to unconfined execution.
+//! Fail-closed: no runtime, an unsupported platform (Windows), an
+//! out-of-root working directory, or an invalid mount/env entry all produce an
+//! explicit error, never a silent fallback to unconfined execution.
 
 use crate::error::ToolError;
 use crate::shell::ShellPlan;
@@ -33,6 +38,17 @@ use concerto_core::sandbox::{detect_container_runtime, ContainerRuntime, Runtime
 fn runtime_unavailable() -> ToolError {
     ToolError::PolicyDenied { rule: "sandbox_containerized_runtime_unavailable".into() }
 }
+
+/// Policy refusal with a named rule, for an invalid supplied entry.
+fn invalid_entry(rule: &str) -> ToolError {
+    ToolError::PolicyDenied { rule: rule.to_string() }
+}
+
+/// Environment variable names treated as security-sensitive: an operator-
+/// supplied `-e` that overrides one of these could subvert the container's
+/// loader/path resolution. Refused unless [`ContainerConfig::allow_sensitive_env`]
+/// is explicitly set.
+const SENSITIVE_ENV_VARS: [&str; 3] = ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"];
 
 /// Configuration for routing a shell invocation through a container runtime.
 ///
@@ -52,6 +68,10 @@ pub struct ContainerConfig {
     pub env: Vec<(String, String)>,
     /// Additional bind mounts in `docker`/`podman` `-v` syntax.
     pub extra_mounts: Vec<String>,
+    /// Explicit opt-in for [`ContainerConfig::env`] entries that override a
+    /// security-sensitive name ([`SENSITIVE_ENV_VARS`]). Defaults to `false`,
+    /// so the safe behaviour is fail-closed.
+    pub allow_sensitive_env: bool,
 }
 
 impl ContainerConfig {
@@ -63,8 +83,115 @@ impl ContainerConfig {
             network: false,
             env: Vec::new(),
             extra_mounts: Vec::new(),
+            allow_sensitive_env: false,
         }
     }
+}
+
+/// Validate every operator-supplied mount and env entry.
+///
+/// Called before any argv is built, so an invalid entry is a named refusal
+/// rather than a silently dropped argument. See the module docs for why this
+/// exists (programmatic-only inputs, defense-in-depth).
+fn validate_entries(config: &ContainerConfig, project_root: &Utf8Path) -> Result<(), ToolError> {
+    for mount in &config.extra_mounts {
+        validate_mount(mount, project_root)?;
+    }
+    for (key, value) in &config.env {
+        validate_env(key, value, config.allow_sensitive_env)?;
+    }
+    Ok(())
+}
+
+/// Validate one `-v source:dest[:options]` entry.
+///
+/// - `source` is a host path that must resolve inside `project_root`.
+/// - `dest` is an absolute container path that must not shadow or overlap the
+///   project-root mount.
+/// - Extra mounts are read-only: only the project root is writable, so an
+///   explicit `rw` (or `ro` combined with `rw`) conflicts with that policy.
+fn validate_mount(mount: &str, project_root: &Utf8Path) -> Result<(), ToolError> {
+    if mount.trim().is_empty() {
+        return Err(invalid_entry("sandbox_containerized_mount_empty"));
+    }
+    let parts: Vec<&str> = mount.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(invalid_entry("sandbox_containerized_mount_malformed"));
+    }
+    let source = parts[0];
+    let dest = parts[1];
+    if source.is_empty() || dest.is_empty() || !dest.starts_with('/') {
+        return Err(invalid_entry("sandbox_containerized_mount_malformed"));
+    }
+
+    // Extra mounts must stay read-only; `rw` would add a writable path beyond
+    // the project root. `ro,rw` is contradictory and also refused.
+    if let Some(options) = parts.get(2) {
+        if options.split(',').any(|option| option.trim() == "rw") {
+            return Err(invalid_entry("sandbox_containerized_mount_access_mode_conflict"));
+        }
+    }
+
+    let dest_norm = normalize_lexically(Utf8Path::new(dest));
+    let root_norm = normalize_lexically(project_root);
+    if dest_norm == root_norm || root_norm.starts_with(&dest_norm) {
+        return Err(invalid_entry("sandbox_containerized_mount_shadows_project_root"));
+    }
+
+    let source_path = Utf8Path::new(source);
+    let resolved = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        project_root.join(source_path)
+    };
+    let resolved_norm = normalize_lexically(&resolved);
+    if !resolved_norm.starts_with(&root_norm) {
+        return Err(invalid_entry("sandbox_containerized_mount_escapes_project_root"));
+    }
+    // Defense in depth: when the paths exist, the canonical (symlink-resolved)
+    // source must also stay inside the canonical root.
+    if let (Ok(real_source), Ok(real_root)) =
+        (std::fs::canonicalize(&resolved), std::fs::canonicalize(project_root))
+    {
+        if !real_source.starts_with(&real_root) {
+            return Err(invalid_entry("sandbox_containerized_mount_escapes_project_root"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `-e KEY=VALUE` entry.
+fn validate_env(key: &str, value: &str, allow_sensitive: bool) -> Result<(), ToolError> {
+    if key.is_empty() || value.is_empty() {
+        return Err(invalid_entry("sandbox_containerized_env_empty"));
+    }
+    let is_control =
+        |text: &str| text.bytes().any(|byte| byte == b'\n' || byte == b'\r' || byte == b'\0');
+    // A key carrying `=` would shift the `KEY=VALUE` split inside the runtime.
+    if is_control(key) || is_control(value) || key.contains('=') {
+        return Err(invalid_entry("sandbox_containerized_env_control_char"));
+    }
+    if !allow_sensitive && SENSITIVE_ENV_VARS.contains(&key.to_ascii_uppercase().as_str()) {
+        return Err(invalid_entry("sandbox_containerized_env_sensitive_override"));
+    }
+    Ok(())
+}
+
+/// Resolve `.` and `..` components lexically, without touching the filesystem
+/// (the path may not exist yet). Used for containment checks.
+fn normalize_lexically(path: &Utf8Path) -> camino::Utf8PathBuf {
+    use camino::Utf8Component;
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    components.into_iter().collect()
 }
 
 /// The inner argv a container executes for `plan`, preserving row 42's launch
@@ -97,6 +224,7 @@ pub(crate) fn container_run_plan(
     if !cwd.starts_with(project_root) {
         return Err(ToolError::PolicyDenied { rule: "sandbox_containerized_unenforceable".into() });
     }
+    validate_entries(config, project_root)?;
 
     let mut args = vec!["run".to_string(), "--rm".to_string(), "--init".to_string()];
     args.push("--network".to_string());
@@ -255,18 +383,158 @@ mod tests {
         let mut cfg = ContainerConfig::new("alpine:3");
         cfg.env.push(("FOO".into(), "bar".into()));
         cfg.network = true;
-        cfg.extra_mounts.push("/cache:/cache:ro".into());
+        cfg.extra_mounts.push("/work/project/cache:/cache:ro".into());
         let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
             .expect("plan");
         let ShellPlan::Direct { args, .. } = plan else { panic!("argv-direct") };
         let e = args.iter().position(|a| a == "-e").expect("-e");
         assert_eq!(args[e + 1], "FOO=bar");
-        let extra = args.windows(2).any(|w| w[0] == "-v" && w[1] == "/cache:/cache:ro");
+        let extra =
+            args.windows(2).any(|w| w[0] == "-v" && w[1] == "/work/project/cache:/cache:ro");
         assert!(extra, "extra mount missing");
         let net = args.iter().position(|a| a == "--network").expect("--network");
         assert_eq!(args[net + 1], "bridge");
         // Host PATH etc. must never be forwarded wholesale.
         assert!(!args.iter().any(|a| a.starts_with("PATH=")));
+    }
+
+    #[test]
+    fn container_config_rejects_empty_mount() {
+        let (root, cwd) = paths();
+        for mount in ["", "   "] {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.extra_mounts.push(mount.into());
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("empty mount must be refused");
+            assert!(matches!(
+                err,
+                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_empty"
+            ));
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_malformed_mount() {
+        let (root, cwd) = paths();
+        for mount in ["/only-a-source", "/work/project/cache:relative", ":"] {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.extra_mounts.push(mount.into());
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("malformed mount must be refused");
+            assert!(matches!(
+                err,
+                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_malformed"
+            ));
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_mount_escaping_project_root() {
+        let (root, cwd) = paths();
+        for mount in ["/etc:/etc:ro", "../../etc:/etc:ro", "/work/project/../../etc:/etc:ro"] {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.extra_mounts.push(mount.into());
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("escaping mount must be refused");
+            assert!(
+                matches!(
+                    err,
+                    ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_escapes_project_root"
+                ),
+                "unexpected refusal for {mount:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_writable_extra_mount() {
+        let (root, cwd) = paths();
+        for mount in ["/work/project/cache:/cache:rw", "/work/project/cache:/cache:ro,rw"] {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.extra_mounts.push(mount.into());
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("writable extra mount must be refused");
+            assert!(matches!(
+                err,
+                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_access_mode_conflict"
+            ));
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_mount_shadowing_project_root() {
+        let (root, cwd) = paths();
+        for mount in ["/work/project/cache:/work/project:ro", "/work/project/cache:/work:ro"] {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.extra_mounts.push(mount.into());
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("shadowing mount must be refused");
+            assert!(matches!(
+                err,
+                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_shadows_project_root"
+            ));
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_empty_env() {
+        let (root, cwd) = paths();
+        for entry in [("", "value"), ("KEY", "")] {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.env.push((entry.0.into(), entry.1.into()));
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("empty env entry must be refused");
+            assert!(matches!(
+                err,
+                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_env_empty"
+            ));
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_env_control_characters() {
+        let (root, cwd) = paths();
+        for entry in [("K\nEY", "value"), ("KEY", "va\nlue"), ("KEY", "va\0lue"), ("K=EY", "value")]
+        {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.env.push((entry.0.into(), entry.1.into()));
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("env control characters must be refused");
+            assert!(matches!(
+                err,
+                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_env_control_char"
+            ));
+        }
+    }
+
+    #[test]
+    fn container_config_rejects_sensitive_env_override() {
+        let (root, cwd) = paths();
+        for name in SENSITIVE_ENV_VARS {
+            let mut cfg = ContainerConfig::new("alpine:3");
+            cfg.env.push((name.into(), "/tmp/evil".into()));
+            let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+                .expect_err("sensitive env override must be refused");
+            assert!(
+                matches!(
+                    err,
+                    ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_env_sensitive_override"
+                ),
+                "unexpected refusal for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_config_allows_sensitive_env_when_explicitly_opted_in() {
+        let (root, cwd) = paths();
+        let mut cfg = ContainerConfig::new("alpine:3");
+        cfg.allow_sensitive_env = true;
+        cfg.env.push(("PATH".into(), "/custom/bin".into()));
+        let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+            .expect("explicit opt-in must allow the override");
+        let ShellPlan::Direct { args, .. } = plan else { panic!("argv-direct") };
+        assert!(args.windows(2).any(|w| w[0] == "-e" && w[1] == "PATH=/custom/bin"));
     }
 
     #[test]
