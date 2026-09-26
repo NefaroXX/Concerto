@@ -35,7 +35,6 @@ a note.
 | 7 | Doubao / StepFun / Replicate providers | `[unplanned]` — no repo register (zero matches for these names) | Add explicit provider rows if planning changes | L |
 | 8 | Vercel Gateway decision | `[verify]` researched in docs/research/multi-provider-resilience.md (Vercel AI SDK among gateways); no in-repo decision record | Confirm whether a dedicated gateway row is wanted | S |
 | 9 | Setup wizard per-variant auth flows | `[verify]` wizard exists (`crates/config/src/setup.rs`); per-variant auth steps unverified | Verify scope; no dedicated row in repo docs | M |
-| 10 | Live-API smoke tests against real provider endpoints | `[verify]` no in-repo source (TESTING.md has manual live-test matrices only) | Verify; CI uses mocks today | M |
 | 11 | M-01: Estimator deduplication + `rag_pct` configurability | ADR-67 follow-ups (~92–98) | When Estimator/rag_pct consolidation is taken up | S |
 | 13 | Codebase cascade S1/S2/S3 (link store, scoring, slicing) | ADR-69 slices; IMPLEMENTED on fix/coordinator-error-invariant 2026-09-24 (S1 link store + write path, S1 activation, S2 scoring/decay/caps, purge fix, S3 observability — commits 60841dd/af98afe/224f0f9/7713b8d/7584d2d; tests green incl multi-hop guard) | CLOSED on merge of that branch + production proof (link verdicts firing, cascade reorder observed in a live run) | L |
 | 14 | ThreadSpawn fallback for non-WASM spawn | `[verify]` no symbol/source found | Re-entry on live fault-injection test demand | M |
@@ -90,6 +89,13 @@ a note.
 
 ## Verification notes (2026-09-24)
 
+- 2026-09-25 append: **row 10 cut 2026-09-25 per owner decision** — manual
+  live matrices in TESTING.md remain the practice; no automated canary job
+  planned. Cut by owner decision 2026-09-25 ("weed"), not as a miscitation:
+  the row was already flagged `[verify]` with no in-repo source (CI uses
+  mocks today), and what it proposed to automate is the manual matrix sheet,
+  which is not being replaced. The #10 numbering gap is left intentionally
+  (no renumbering), matching the row 12 / row 26 precedent.
 - 2026-09-25 append: **row 26 cut 2026-09-25 as miscited duplicate of #22 (no
   separate task behind the label)**. Its two citations both resolve to other
   work: `ADR-49:85–98` is the **config-catalog flattening** deferred item
@@ -130,8 +136,7 @@ a note.
 - Remaining unknowns (flagged `[verify]` in the open table): `.wasm` watcher,
   ThreadSpawn fallback, Doubao/StepFun/Replicate ([unplanned]), Vercel Gateway
   decision (research-doc mention only), setup-wizard per-variant auth
-  (setup.rs exists; variants unverified), live-API smoke tests (manual matrices
-  only).
+  (setup.rs exists; variants unverified).
 - 2026-09-24 append: `docs/research/certified-universal-evolution.md` is cited
   at TODO.md:287 and ROADMAP:190 but is absent from `docs/research/` on this
   checkout — carried on open row 32 as `[dangling-cite]` (annotated, not
