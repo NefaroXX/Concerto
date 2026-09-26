@@ -3,6 +3,7 @@ use concerto_core::error::ProviderError;
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{CompletionRequest, ModelInfo, TokenBudget};
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 
 use crate::openai::{OpenAiProvider, ReasoningEcho, UsageRequest};
 
@@ -13,7 +14,7 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self {
             inner: OpenAiProvider::new(api_key, model, timeout_secs)
                 .with_api_base(OPENROUTER_API_BASE.to_string())
@@ -86,7 +87,7 @@ mod tests {
     use concerto_core::types::{CompletionUsage, Message, Role};
 
     fn provider() -> OpenRouterProvider {
-        OpenRouterProvider::new("test-key".into(), "test-model".into(), 15)
+        OpenRouterProvider::new("test-key".to_string(), "test-model".into(), 15)
     }
 
     fn streamed_request() -> CompletionRequest {

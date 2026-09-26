@@ -20,6 +20,7 @@ pub mod memory;
 pub mod policy;
 pub mod policy_presets;
 pub mod sanitizer;
+pub mod secret;
 #[cfg(test)]
 pub mod testing;
 pub mod text;
@@ -40,6 +41,9 @@ pub use executor::ToolExecutor;
 pub use policy::SimplePolicyEngine;
 pub use policy::{RpmLimiter, SpendTracker};
 pub use policy_presets::{inject_intent_gate_rule, PolicyPresets};
+// Zero-on-drop holder for provider keys and credential-store material
+// (threat model §6 gap #9); redacts itself under Debug/Display.
+pub use secret::SecretString;
 
 pub use types::{
     AgentId, AgentOutput, AgentStage, AgentTask, McpServerState, ModelInfo, PluginState, ProjectId,

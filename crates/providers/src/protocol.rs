@@ -1,18 +1,22 @@
 use concerto_core::error::ProviderError;
 use concerto_core::types::{CompletionRequest, ToolCall};
+use concerto_core::SecretString;
 
 /// A normalized request sent to any provider implementation.
+///
+/// `api_key` is a [`SecretString`] so the derived `Debug` — and any struct
+/// that embeds this one — renders `[REDACTED]` instead of the credential.
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
     pub completion: CompletionRequest,
     pub api_base: Option<String>,
-    pub api_key: String,
+    pub api_key: SecretString,
     pub timeout_seconds: u64,
 }
 
 impl ProviderRequest {
     pub fn new(completion: CompletionRequest, api_key: String) -> Self {
-        Self { completion, api_base: None, api_key, timeout_seconds: 30 }
+        Self { completion, api_base: None, api_key: api_key.into(), timeout_seconds: 30 }
     }
 }
 
@@ -76,9 +80,30 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_arguments_object;
+    use super::{ensure_arguments_object, ProviderRequest};
 
     /// A JSON object — the only wire-legal shape — passes through untouched.
+    /// Fixture is synthetic — never a real credential. `ProviderRequest`
+    /// derives `Debug`, so the redaction has to come from the `SecretString`
+    /// field itself, not from a manual impl on this struct.
+    #[test]
+    fn provider_request_debug_redacts_the_api_key() {
+        const SYNTHETIC: &str = "sk-synthetic-provider-request-fixture";
+        let request = ProviderRequest::new(
+            concerto_core::types::CompletionRequest::default(),
+            SYNTHETIC.to_string(),
+        );
+
+        assert_eq!(request.api_key.expose(), SYNTHETIC);
+
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(SYNTHETIC), "api_key leaked into Debug: {rendered}");
+        assert!(!rendered.contains("sk-synthetic"), "api_key prefix leaked: {rendered}");
+        assert!(rendered.contains("[REDACTED]"), "redaction marker missing: {rendered}");
+        // Non-secret fields must remain diagnosable.
+        assert!(rendered.contains("timeout_seconds"), "other fields must still render: {rendered}");
+    }
+
     #[test]
     fn objects_pass_through_unchanged() {
         let args = serde_json::json!({"command": "ls"});

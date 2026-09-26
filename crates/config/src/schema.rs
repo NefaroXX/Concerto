@@ -1,5 +1,6 @@
 use camino::Utf8PathBuf;
 use concerto_core::types::{AgentId, AgentStage, OutputMode};
+use concerto_core::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -1528,8 +1529,13 @@ impl ProviderConfig {
     /// Runtime resolution additionally falls back to the `<PROVIDER>_API_KEY`
     /// env var; use [`Self::effective_api_key`] when the key the runtime would
     /// actually use must be known (e.g. `concerto health`).
-    pub fn api_key(&self, store: &CredentialStore) -> Result<String, ConfigError> {
-        store.get(&self.keyring_key)
+    ///
+    /// The key comes back in a zero-on-drop [`SecretString`]: the buffer is
+    /// wiped when the returned value drops and neither `Debug` nor `Display`
+    /// renders it, so a key held across a `.await` (or embedded in a struct
+    /// that gets logged) cannot leak.
+    pub fn api_key(&self, store: &CredentialStore) -> Result<SecretString, ConfigError> {
+        store.get_secret(&self.keyring_key)
     }
 
     /// Resolve the key the runtime would use: keyring first, then the
@@ -1539,13 +1545,13 @@ impl ProviderConfig {
     /// When both are missing, the original keyring error from
     /// [`Self::api_key`] is returned, preserving the credential-missing
     /// semantics callers rely on.
-    pub fn effective_api_key(&self, store: &CredentialStore) -> Result<String, ConfigError> {
+    pub fn effective_api_key(&self, store: &CredentialStore) -> Result<SecretString, ConfigError> {
         match self.api_key(store) {
             Ok(key) => Ok(key),
             Err(error) => {
                 let env_key = format!("{}_API_KEY", self.provider.to_uppercase());
                 match std::env::var(env_key) {
-                    Ok(key) => Ok(key),
+                    Ok(key) => Ok(SecretString::from(key)),
                     Err(_) => Err(error),
                 }
             }
@@ -3729,7 +3735,7 @@ mod tests {
         std::env::set_var("TESTPROVXYZ_API_KEY", "sk-test-xyz");
         assert!(provider.api_key(&store).is_err(), "keyring-only api_key must not read the env");
         assert_eq!(
-            provider.effective_api_key(&store).unwrap(),
+            provider.effective_api_key(&store).unwrap().expose(),
             "sk-test-xyz",
             "effective_api_key must fall back to the <PROVIDER>_API_KEY env var",
         );

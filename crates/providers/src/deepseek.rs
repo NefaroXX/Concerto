@@ -17,6 +17,7 @@ use concerto_core::error::ProviderError;
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{CompletionRequest, ModelInfo, TokenBudget};
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 
 use crate::openai::{OpenAiProvider, ReasoningEcho};
 
@@ -40,7 +41,7 @@ pub struct DeepSeekProvider {
 
 impl DeepSeekProvider {
     /// Build a provider targeting the DeepSeek endpoint.
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self::with_api_base(api_key, model, timeout_secs, DEEPSEEK_API_BASE.to_string())
     }
 
@@ -49,7 +50,7 @@ impl DeepSeekProvider {
     ///
     /// Useful for self-hosted gateways, proxies, or tests.
     pub fn with_api_base(
-        api_key: String,
+        api_key: impl Into<SecretString>,
         model: String,
         timeout_secs: u64,
         api_base: String,

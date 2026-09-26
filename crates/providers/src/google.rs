@@ -6,13 +6,14 @@ use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
 };
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 use futures::stream::StreamExt;
 
 use crate::adapters::{Dialect, GeminiChatDialect, ReasoningEcho};
 use crate::sse::BufferedSseParser;
 
 pub struct GoogleProvider {
-    api_key: String,
+    api_key: SecretString,
     model: String,
     timeout_secs: u64,
     dialect: GeminiChatDialect,
@@ -27,14 +28,25 @@ pub struct GoogleProvider {
 }
 
 impl GoogleProvider {
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self {
-            api_key,
+            api_key: api_key.into(),
             model,
             timeout_secs,
             dialect: GeminiChatDialect,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
         }
+    }
+
+    /// Scrub this connector's API key out of a diagnostic string.
+    ///
+    /// The Gemini REST URL carries the credential as a `?key=` query
+    /// parameter and `reqwest::Error`'s `Display` renders the full request
+    /// URL (`... for url (<url>)`), so an unscrubbed transport error would
+    /// put the key into logs, the UI, and any persisted failure message.
+    /// Applied to every error string this connector builds.
+    fn scrub(&self, message: &str) -> String {
+        scrub_message(message, &self.api_key)
     }
 
     /// Set the tool-schema presentation mode (adaptive tool schemas).
@@ -326,14 +338,28 @@ impl GoogleStreamState {
     }
 }
 
+/// Remove `key` from `message`, if present. See [`GoogleProvider::scrub`].
+fn scrub_message(message: &str, key: &SecretString) -> String {
+    let key = key.expose();
+    if key.is_empty() {
+        return message.to_string();
+    }
+    message.replace(key, "[REDACTED]")
+}
+
 #[async_trait]
 impl LlmProvider for GoogleProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
-        let url =
-            format!("https://generativelanguage.googleapis.com/v1beta/models?key={}", self.api_key);
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+            self.api_key.expose()
+        );
         let resp = client.get(&url).send().await.map_err(|e| {
-            ProviderError::Other(format!("google connection failed: {}", describe_error_chain(&e)))
+            ProviderError::Other(format!(
+                "google connection failed: {}",
+                self.scrub(&describe_error_chain(&e))
+            ))
         })?;
         if resp.status().is_success() {
             Ok(())
@@ -349,24 +375,30 @@ impl LlmProvider for GoogleProvider {
         _cancel: CancellationToken,
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
-        let url =
-            format!("https://generativelanguage.googleapis.com/v1beta/models?key={}", self.api_key);
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+            self.api_key.expose()
+        );
         let resp = client.get(&url).send().await.map_err(|e| {
-            ProviderError::Other(format!("google list_models failed: {}", describe_error_chain(&e)))
+            ProviderError::Other(format!(
+                "google list_models failed: {}",
+                self.scrub(&describe_error_chain(&e))
+            ))
         })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Other(format!(
-                "google list_models returned {status}: {text}"
+                "google list_models returned {status}: {}",
+                self.scrub(&text)
             )));
         }
 
         let json: serde_json::Value = resp.json().await.map_err(|e| {
             ProviderError::Other(format!(
                 "google list_models parse failed: {}",
-                describe_error_chain(&e)
+                self.scrub(&describe_error_chain(&e))
             ))
         })?;
 
@@ -406,7 +438,7 @@ impl LlmProvider for GoogleProvider {
             if request.model.is_empty() { self.model.clone() } else { request.model.clone() };
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            model, self.api_key
+            model, self.api_key.expose()
         );
 
         // Adaptive tool schemas (weak-model tier, ADR-66 §4 family): when
@@ -423,6 +455,12 @@ impl LlmProvider for GoogleProvider {
 
         // Clone cancel token for use inside the stream later
         let cancel = cancel.clone();
+        // The completion stream is `'static`, so it cannot borrow `self` to
+        // scrub mid-stream transport errors (whose `Display` can carry the
+        // request URL, which embeds the key). It carries its own zero-on-drop
+        // copy instead of a plain `String`, so the extra buffer is wiped with
+        // the stream rather than left behind when it drops.
+        let scrub_key = self.api_key.clone();
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             result = async {
@@ -432,14 +470,14 @@ impl LlmProvider for GoogleProvider {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| ProviderError::Network(format!("request failed: {}", describe_error_chain(&e))))?;
+                    .map_err(|e| ProviderError::Network(format!("request failed: {}", self.scrub(&describe_error_chain(&e)))))?;
 
                 if !r.status().is_success() {
                     let status = r.status();
                     // Extract optional retry-after / retry-after-ms header
                     let retry_after = crate::retry::parse_retry_after(r.headers());
                     let text = r.text().await.unwrap_or_default();
-                    return Err(crate::retry::map_http_error(status, &text, retry_after));
+                    return Err(crate::retry::map_http_error(status, &self.scrub(&text), retry_after));
                 }
                 Ok(r)
             } => {
@@ -482,7 +520,7 @@ impl LlmProvider for GoogleProvider {
                     // inside a healthy stream stay fatal.
                     Err(e) => vec![Err(ProviderError::StreamTransport(format!(
                         "connection dropped mid-stream: {}",
-                        describe_error_chain(&e)
+                        scrub_message(&describe_error_chain(&e), &scrub_key)
                     )))]
                 };
                 for item in items {
@@ -537,28 +575,51 @@ mod tests {
 
     #[test]
     fn google_provider_new_sets_fields() {
-        let p = GoogleProvider::new("test-key".into(), "gemini-2.0-flash".into(), 30);
-        assert_eq!(p.api_key, "test-key");
+        let p = GoogleProvider::new("test-key".to_string(), "gemini-2.0-flash".into(), 30);
+        assert_eq!(p.api_key.expose(), "test-key");
         assert_eq!(p.model, "gemini-2.0-flash");
         assert_eq!(p.timeout_secs, 30);
     }
 
+    /// The Gemini URL carries the key as `?key=` and `reqwest::Error`
+    /// renders the request URL, so every diagnostic this connector builds is
+    /// scrubbed. Fixture is synthetic.
+    #[test]
+    fn scrub_strips_the_api_key_from_diagnostics() {
+        const SYNTHETIC: &str = "sk-synthetic-google-fixture";
+        let p = GoogleProvider::new(SYNTHETIC.to_string(), "gemini-2.0-flash".into(), 30);
+
+        let raw = format!("error sending request for url (https://example.test/?key={SYNTHETIC})");
+        let scrubbed = p.scrub(&raw);
+        assert!(!scrubbed.contains(SYNTHETIC), "api_key leaked into diagnostics: {scrubbed}");
+        assert!(scrubbed.contains("[REDACTED]"), "redaction marker missing: {scrubbed}");
+
+        // A message that never contained the key passes through byte-identical.
+        assert_eq!(p.scrub("plain transport failure"), "plain transport failure");
+    }
+
+    #[test]
+    fn scrub_of_an_empty_key_is_a_noop() {
+        let p = GoogleProvider::new(String::new(), "gemini-2.0-flash".into(), 30);
+        assert_eq!(p.scrub("no key configured"), "no key configured");
+    }
+
     #[test]
     fn google_provider_name() {
-        let p = GoogleProvider::new("k".into(), "m".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "m".into(), 30);
         assert_eq!(p.provider_name(), "google");
     }
 
     #[test]
     fn google_context_capacity_returns_budget() {
-        let p = GoogleProvider::new("k".into(), "gemini-1.5-pro".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-1.5-pro".into(), 30);
         let budget = p.context_capacity("gemini-1.5-pro");
         assert!(budget.capacity > 0);
     }
 
     #[test]
     fn google_approximate_cost_flash() {
-        let p = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30);
         // 1M input, 1M output tokens
         let cost = p.approximate_cost(1_000_000, 1_000_000);
         // 0.10 + 0.40 = 0.50
@@ -567,7 +628,7 @@ mod tests {
 
     #[test]
     fn google_approximate_cost_1_5_pro() {
-        let p = GoogleProvider::new("k".into(), "gemini-1.5-pro".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-1.5-pro".into(), 30);
         let cost = p.approximate_cost(1_000_000, 1_000_000);
         // 3.50 + 10.50 = 14.00
         assert!((cost - 14.00).abs() < 0.001);
@@ -575,7 +636,7 @@ mod tests {
 
     #[test]
     fn google_approximate_cost_1_5_flash() {
-        let p = GoogleProvider::new("k".into(), "gemini-1.5-flash".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-1.5-flash".into(), 30);
         let cost = p.approximate_cost(1_000_000, 1_000_000);
         // 0.35 + 1.05 = 1.40
         assert!((cost - 1.40).abs() < 0.001);
@@ -583,7 +644,7 @@ mod tests {
 
     #[test]
     fn google_approximate_cost_1_0_pro() {
-        let p = GoogleProvider::new("k".into(), "gemini-1.0-pro".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-1.0-pro".into(), 30);
         let cost = p.approximate_cost(1_000_000, 1_000_000);
         // 0.50 + 1.50 = 2.00
         assert!((cost - 2.00).abs() < 0.001);
@@ -591,7 +652,7 @@ mod tests {
 
     #[test]
     fn google_approximate_cost_unknown_model_uses_default() {
-        let p = GoogleProvider::new("k".into(), "gemini-unknown-model".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-unknown-model".into(), 30);
         let cost = p.approximate_cost(1_000_000, 1_000_000);
         // default: 1.00 + 2.00 = 3.00
         assert!((cost - 3.00).abs() < 0.001);
@@ -599,14 +660,14 @@ mod tests {
 
     #[test]
     fn google_approximate_cost_zero_tokens() {
-        let p = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30);
         let cost = p.approximate_cost(0, 0);
         assert!((cost - 0.0).abs() < 0.0001);
     }
 
     #[test]
     fn google_context_capacity_uses_model_name() {
-        let p = GoogleProvider::new("k".into(), "gemini-1.5-pro".into(), 30);
+        let p = GoogleProvider::new("k".to_string(), "gemini-1.5-pro".into(), 30);
         let budget = p.context_capacity("unknown-model");
         // Should fall back to default budget of 4000
         assert!(budget.capacity > 0);
@@ -950,9 +1011,9 @@ mod tests {
     /// models adapt; the explicit dials pin the tier for this test.)
     #[test]
     fn google_loose_schema_tier_resolves_and_round_trips() {
-        let strict_provider = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+        let strict_provider = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Strict);
-        let loose_provider = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+        let loose_provider = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Loose);
 
         let mut request = CompletionRequest {
@@ -1005,9 +1066,9 @@ mod tests {
     /// Explicit `Strict` dials win over the weak-model name heuristic.
     #[test]
     fn google_strict_dial_disables_adaptation() {
-        let strict = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+        let strict = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Strict);
-        let loose = GoogleProvider::new("k".into(), "gemini-2.0-flash".into(), 30)
+        let loose = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Loose);
         let mut request = CompletionRequest {
             tools: Some(vec![ToolDefinition {

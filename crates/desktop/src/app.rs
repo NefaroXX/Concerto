@@ -2695,7 +2695,7 @@ impl App {
             async move {
                 concerto_providers::list_models_for_provider_async(
                     &provider_type,
-                    &api_key,
+                    api_key.expose(),
                     api_base.as_deref(),
                 )
                 .await

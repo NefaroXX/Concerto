@@ -6,6 +6,7 @@ use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
 };
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 use futures::stream::StreamExt;
 use std::collections::{HashMap, VecDeque};
 
@@ -27,7 +28,7 @@ pub use crate::adapters::ReasoningEcho;
 pub use crate::adapters::UsageRequest;
 
 pub struct OpenAiProvider {
-    api_key: String,
+    api_key: SecretString,
     api_base: String,
     model: String,
     timeout_secs: u64,
@@ -44,9 +45,9 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self {
-            api_key,
+            api_key: api_key.into(),
             api_base: "https://api.openai.com/v1".to_string(),
             model,
             timeout_secs,
@@ -60,6 +61,15 @@ impl OpenAiProvider {
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
         self
+    }
+
+    /// The credential this connector authenticates with, borrowed.
+    ///
+    /// Callers that also need the key (e.g. `OpenCodeZenProvider`, which owns
+    /// this provider as its OpenAI-compatible inner path) read it through
+    /// here instead of keeping a second long-lived copy of the secret.
+    pub(crate) fn api_key(&self) -> &SecretString {
+        &self.api_key
     }
 
     /// Set the reasoning-content echo policy (ADR-46).
@@ -664,9 +674,13 @@ impl LlmProvider for OpenAiProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp = client.get(&url).bearer_auth(&self.api_key).send().await.map_err(|e| {
-            ProviderError::Other(format!("openai connection failed: {}", describe_error_chain(&e)))
-        })?;
+        let resp =
+            client.get(&url).bearer_auth(self.api_key.expose()).send().await.map_err(|e| {
+                ProviderError::Other(format!(
+                    "openai connection failed: {}",
+                    describe_error_chain(&e)
+                ))
+            })?;
         if resp.status().is_success() {
             Ok(())
         } else if resp.status().as_u16() == 401 {
@@ -682,9 +696,13 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp = client.get(&url).bearer_auth(&self.api_key).send().await.map_err(|e| {
-            ProviderError::Other(format!("openai list_models failed: {}", describe_error_chain(&e)))
-        })?;
+        let resp =
+            client.get(&url).bearer_auth(self.api_key.expose()).send().await.map_err(|e| {
+                ProviderError::Other(format!(
+                    "openai list_models failed: {}",
+                    describe_error_chain(&e)
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -771,7 +789,7 @@ impl LlmProvider for OpenAiProvider {
             result = async {
                 client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("Authorization", format!("Bearer {}", self.api_key.expose()))
                     .header("Content-Type", "application/json")
                     .json(&body)
                     .send()
@@ -1332,13 +1350,13 @@ mod tests {
     /// that was not explicitly covered keeps byte-identical wire bodies.
     #[test]
     fn usage_request_defaults_to_off() {
-        let provider = OpenAiProvider::new("test-key".into(), "test-model".into(), 15);
+        let provider = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
         assert_eq!(provider.usage_request(), UsageRequest::Off, "default policy must be Off");
     }
 
     #[test]
     fn with_usage_request_sets_policy() {
-        let provider = OpenAiProvider::new("test-key".into(), "test-model".into(), 15)
+        let provider = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15)
             .with_usage_request(UsageRequest::IncludeStreamUsage);
         assert_eq!(provider.usage_request(), UsageRequest::IncludeStreamUsage);
     }
@@ -1364,7 +1382,7 @@ mod tests {
         let non_streamed =
             CompletionRequest { messages: vec![message()], stream: false, ..Default::default() };
 
-        let opted_in = OpenAiProvider::new("test-key".into(), "test-model".into(), 15)
+        let opted_in = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15)
             .with_usage_request(UsageRequest::IncludeStreamUsage);
         let body = opted_in.render_body(&streamed, "test-model");
         assert_eq!(body["stream_options"]["include_usage"], true);
@@ -1374,7 +1392,7 @@ mod tests {
         assert!(body.get("stream_options").is_none(), "non-streamed bodies stay untouched");
         assert_eq!(body["stream"], false);
 
-        let default = OpenAiProvider::new("test-key".into(), "test-model".into(), 15);
+        let default = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
         let body = default.render_body(&streamed, "test-model");
         assert!(body.get("stream_options").is_none(), "the default policy writes nothing");
     }
@@ -2161,7 +2179,7 @@ mod tests {
     /// `CONCERTO_LIVE_PROXY_MODEL` defaults to a cheap tool-calling model.
     struct LiveProxy {
         base: String,
-        key: String,
+        key: SecretString,
         model: String,
     }
 
@@ -2174,7 +2192,7 @@ mod tests {
             }
             let model = std::env::var("CONCERTO_LIVE_PROXY_MODEL")
                 .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-            Some(Self { base: base.trim_end_matches('/').to_string(), key, model })
+            Some(Self { base: base.trim_end_matches('/').to_string(), key: key.into(), model })
         }
 
         /// A forced single-tool request: `tool_choice` pins the outcome so the
@@ -2288,7 +2306,7 @@ mod tests {
             _ = cancel.cancelled() => None,
             result = client
                 .post(format!("{}/chat/completions", proxy.base))
-                .bearer_auth(&proxy.key)
+                .bearer_auth(proxy.key.expose())
                 .json(&proxy.request_body(stream))
                 .send() => {
                 let response = result.expect("live proxy request sent");

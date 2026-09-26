@@ -80,13 +80,29 @@ fn policy_rule(action: &str) -> toml::Value {
 // PendingConfig — wizard results before persisting
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PendingConfig {
     pub provider: String,
     pub api_key: String,
     pub model: String,
     pub working_dir: PathBuf,
     pub policy_mode: String,
+}
+
+impl std::fmt::Debug for PendingConfig {
+    /// Redacts `api_key`: this struct is the wizard's in-memory copy of a
+    /// freshly typed credential, and a derived `Debug` would put it into any
+    /// log line, panic message, or `{:?}` of an enclosing value. Every other
+    /// field still renders normally so diagnostics stay useful.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingConfig")
+            .field("provider", &self.provider)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("working_dir", &self.working_dir)
+            .field("policy_mode", &self.policy_mode)
+            .finish()
+    }
 }
 
 impl PendingConfig {
@@ -385,6 +401,27 @@ mod tests {
         let reader = io::BufReader::new(Cursor::new(input.as_bytes().to_vec()));
         let writer = Vec::new();
         SetupWizard::new(reader, writer)
+    }
+
+    /// The wizard holds a freshly typed credential in `PendingConfig`; a
+    /// derived `Debug` would put it into any `{:?}`. Fixture is synthetic.
+    #[test]
+    fn pending_config_debug_redacts_the_api_key() {
+        const SYNTHETIC: &str = "sk-synthetic-wizard-fixture";
+        let config = PendingConfig {
+            provider: "openai".into(),
+            api_key: SYNTHETIC.into(),
+            model: "gpt-4o".into(),
+            working_dir: PathBuf::from("/tmp"),
+            policy_mode: "strict".into(),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(SYNTHETIC), "api_key leaked into Debug: {rendered}");
+        assert!(rendered.contains("[REDACTED]"), "redaction marker missing: {rendered}");
+        // Non-secret fields must still be diagnosable.
+        assert!(rendered.contains("openai"), "provider must still render: {rendered}");
+        assert!(rendered.contains("gpt-4o"), "model must still render: {rendered}");
     }
 
     #[test]

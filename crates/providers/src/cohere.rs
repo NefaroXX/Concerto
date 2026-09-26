@@ -16,6 +16,7 @@ use concerto_core::error::ProviderError;
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{CompletionRequest, ModelInfo, TokenBudget};
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 
 use crate::openai::{OpenAiProvider, ReasoningEcho};
 
@@ -41,7 +42,7 @@ pub struct CohereProvider {
 
 impl CohereProvider {
     /// Build a provider targeting the Cohere endpoint.
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self {
             inner: OpenAiProvider::new(api_key, model, timeout_secs)
                 .with_api_base(COHERE_API_BASE.to_string()),

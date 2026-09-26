@@ -1,4 +1,5 @@
 use concerto_core::error::ConfigError;
+use concerto_core::SecretString;
 
 use crate::legacy;
 
@@ -27,7 +28,31 @@ impl CredentialStore {
     /// In test mode, tries `CONCERTO_<KEY>` first, then `OPENCODE_RS_<KEY>`.
     /// In production, tries the `concerto` keyring service first, then
     /// `opencode-rs`.
+    ///
+    /// Prefer [`Self::get_secret`] for call sites that go on to hand the
+    /// value to a long-lived holder; this method returns a plain `String`
+    /// for the existing callers that only test presence or forward once.
     pub fn get(&self, account: &str) -> Result<String, ConfigError> {
+        self.fetch(account)
+    }
+
+    /// Like [`Self::get`], but the credential comes back in a zero-on-drop,
+    /// non-rendering [`SecretString`] instead of a plain `String`.
+    ///
+    /// Use this whenever the value survives past the statement that read it
+    /// (a provider instance, a pending config): the holder wipes the buffer
+    /// when it drops and redacts itself under `Debug`/`Display`, so a
+    /// stray `{:?}` in a log line cannot leak it.
+    pub fn get_secret(&self, account: &str) -> Result<SecretString, ConfigError> {
+        self.fetch(account).map(SecretString::from)
+    }
+
+    /// Shared read path for [`Self::get`] and [`Self::get_secret`].
+    ///
+    /// Test mode, try `CONCERTO_<KEY>` first, then `OPENCODE_RS_<KEY>`.
+    /// Production, try the `concerto` keyring service first, then
+    /// `opencode-rs`.
+    fn fetch(&self, account: &str) -> Result<String, ConfigError> {
         if self.test_mode {
             // Try new env prefix first, then legacy prefix
             let env_key = Self::new_env_key(account);
@@ -136,6 +161,31 @@ mod tests {
     fn test_mode_missing_key_errors() {
         let store = CredentialStore::from_env();
         assert!(store.get("nonexistent/key").is_err());
+    }
+
+    /// `get_secret` must hand back the same bytes as `get` while refusing to
+    /// render them. Fixture is synthetic — never a real credential.
+    #[test]
+    fn get_secret_reads_the_same_credential_and_redacts_it() {
+        const SYNTHETIC: &str = "sk-synthetic-credential-fixture";
+        std::env::set_var("CONCERTO_CREDENTIAL_FIXTURE", SYNTHETIC);
+        let store = CredentialStore::from_env();
+
+        let secret = store.get_secret("credential/fixture").expect("fixture must resolve");
+        assert_eq!(secret.expose(), SYNTHETIC);
+        assert_eq!(secret.expose(), store.get("credential/fixture").unwrap());
+
+        let rendered = format!("{secret:?} | {secret}");
+        assert!(!rendered.contains(SYNTHETIC), "secret leaked into formatting: {rendered}");
+        assert!(rendered.contains("[REDACTED]"), "redaction marker missing: {rendered}");
+
+        std::env::remove_var("CONCERTO_CREDENTIAL_FIXTURE");
+    }
+
+    #[test]
+    fn get_secret_missing_key_errors_like_get() {
+        let store = CredentialStore::from_env();
+        assert!(store.get_secret("nonexistent/key").is_err());
     }
 
     #[test]

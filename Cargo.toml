@@ -112,6 +112,13 @@ chrono-tz = "0.10"
 # ---- Input hashing for audit log (Phase 2) ----
 blake3 = "1"
 
+# ---- Secret material held in RAM (threat model §6 gap #9) ----
+# Already a transitive dependency of the credential stack (keyring, rustls,
+# aws-lc-rs) at 1.9.0 in Cargo.lock, so promoting it to a direct dependency
+# adds no new package to the graph. Provides the volatile, cannot-be-elided
+# zeroing `SecretString` relies on for zero-on-drop.
+zeroize = "1.9"
+
 # ---- LSP client (Phase 2) ----
 tower-lsp = "0.20"
 lsp-types = "0.97"
