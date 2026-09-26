@@ -209,6 +209,15 @@ impl From<AgentProcessProviderError> for OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Serialises access to the process-global `CONCERTO_DEEPSEEK_API_KEY`
+    /// env var across the tests in this module. `cargo test` runs tests in
+    /// parallel threads within one process, so the `real_provider_*` tests that
+    /// set the key race `missing_credential_*` which removes it — an
+    /// intermittent false failure. Mirrors the crate-wide
+    /// `CONCERTO_API_KEY_LOCK` convention in `crates/api-server/src/auth.rs`.
+    static DEEPSEEK_API_KEY_LOCK: Mutex<()> = Mutex::new(());
 
     fn provider_config(provider: &str, model: &str) -> ProviderConfig {
         ProviderConfig {
@@ -278,6 +287,7 @@ mod tests {
 
     #[test]
     fn missing_credential_is_a_named_credential_error() {
+        let _lock = DEEPSEEK_API_KEY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         std::env::remove_var("CONCERTO_DEEPSEEK_API_KEY");
         let config = provider_config("deepseek", "deepseek-chat");
         let error = build_provider(&config, None, &CredentialStore::from_env())
@@ -289,6 +299,7 @@ mod tests {
 
     #[test]
     fn real_provider_builds_with_an_env_backed_credential() {
+        let _lock = DEEPSEEK_API_KEY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         std::env::set_var("CONCERTO_DEEPSEEK_API_KEY", "sk-synthetic-fixture");
         let config = provider_config("deepseek", "deepseek-chat");
         let built = build_provider(&config, None, &CredentialStore::from_env());
@@ -310,6 +321,7 @@ mod tests {
 
     #[test]
     fn model_override_applies_to_the_built_provider() {
+        let _lock = DEEPSEEK_API_KEY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         std::env::set_var("CONCERTO_DEEPSEEK_API_KEY", "sk-synthetic-fixture");
         let config = provider_config("deepseek", "deepseek-chat");
         let built =
