@@ -5,6 +5,7 @@ use futures::StreamExt;
 use wasmtime::{Caller, Linker};
 
 use concerto_core::error::ProviderError;
+use concerto_core::traits::policy::AuditLog;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::CompletionRequest;
 
@@ -145,6 +146,49 @@ fn handle_violation(caller: &mut Caller<'_, PluginStoreData>, capability: &str) 
         plugin_id: caller.data().plugin_id.clone(),
         capability: capability.to_string(),
     })
+}
+
+/// Emit a fail-soft `egress_denied` infra audit row for a rejected
+/// plugin-initiated HTTP egress attempt (threat model §6 gap #7).
+///
+/// The row carries the full rejection detail, which names the rule that
+/// refused the target (see `capability::RULE_EGRESS_ALLOWLIST` /
+/// `capability::RULE_NETWORK_CAPABILITY`) plus the offending URL, so an
+/// operator can reconstruct what the plugin tried to reach and why it was
+/// refused. Emission is detached and best-effort: a slow or broken sink can
+/// never affect the host call's outcome.
+///
+/// `rt` is resolved by the caller rather than inside this function so the
+/// redirect callback — which runs on a blocking thread inside
+/// `spawn_blocking` — can still emit a row: the handle is captured before
+/// the offload and moved into the redirect closure.
+fn emit_egress_audit(
+    rt: Option<tokio::runtime::Handle>,
+    audit: Option<Arc<dyn AuditLog>>,
+    plugin_id: String,
+    url: String,
+    detail: String,
+) {
+    let (Some(rt), Some(audit)) = (rt, audit) else {
+        tracing::debug!(
+            target: "plugin",
+            plugin_id,
+            "no runtime or audit sink; plugin egress deny row skipped"
+        );
+        return;
+    };
+    let entry = concerto_core::traits::policy::InfraAuditEntry::plugin(
+        plugin_id,
+        concerto_core::traits::policy::InfraVerdict::CapabilityDenied,
+        "egress_denied",
+        format!("network egress to {url} denied: {detail}"),
+    );
+    rt.spawn(async move {
+        if let Err(error) = audit.record_infra(entry, concerto_core::CancellationToken::new()).await
+        {
+            tracing::warn!(%error, "plugin egress audit write failed; continuing");
+        }
+    });
 }
 
 /// Check whether a plugin may emit events: requires at least one granted
@@ -402,20 +446,47 @@ async fn host_http_get(
 
     check_enabled(&caller).map_err(into_anyhow)?;
     let url = read_string(&mut caller, url_ptr, url_len).map_err(into_anyhow)?;
+    // Capture the runtime handle up front: the redirect callback below runs
+    // on a blocking thread, where `Handle::try_current()` may be unavailable,
+    // yet a refused redirect must still be audited.
+    let rt = tokio::runtime::Handle::try_current().ok();
     match check_url_allowed(&caller.data().granted_caps, &caller.data().plugin_id, &url) {
         Ok(()) => {}
-        Err(PluginError::CapabilityDenied(_)) => {
+        Err(PluginError::CapabilityDenied(detail)) => {
+            // Audit the refusal (naming the rule) before the generic
+            // violation accounting below, so the row records *what* egress
+            // was attempted and *which* rule refused it.
+            emit_egress_audit(
+                rt.clone(),
+                caller.data().audit_log.clone(),
+                caller.data().plugin_id.clone(),
+                url.clone(),
+                detail,
+            );
             return Err(handle_violation(&mut caller, "NetworkOutbound"));
         }
         Err(e) => return Err(into_anyhow(e)),
     }
     let granted_caps = caller.data().granted_caps.clone();
     let plugin_id = caller.data().plugin_id.clone();
+    let redirect_audit = caller.data().audit_log.clone();
     let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if check_url_allowed(&granted_caps, &plugin_id, attempt.url().as_str()).is_ok() {
-            attempt.follow()
-        } else {
-            attempt.error("redirect target is outside the plugin's granted domains")
+        let target = attempt.url().as_str().to_string();
+        match check_url_allowed(&granted_caps, &plugin_id, &target) {
+            Ok(()) => attempt.follow(),
+            Err(PluginError::CapabilityDenied(detail)) => {
+                // A redirect is attacker-influenced egress: audit it the same
+                // way as a refused first-hop request, then fail the fetch.
+                emit_egress_audit(
+                    rt.clone(),
+                    redirect_audit.clone(),
+                    plugin_id.clone(),
+                    target,
+                    detail.clone(),
+                );
+                attempt.error(format!("redirect target refused by network egress filter: {detail}"))
+            }
+            Err(error) => attempt.error(error.to_string()),
         }
     });
 

