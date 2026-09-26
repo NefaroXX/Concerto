@@ -214,6 +214,11 @@ pub(crate) fn inner_argv(plan: &ShellPlan) -> Vec<String> {
 /// The returned plan is always [`ShellPlan::Direct`] with `program` set to the
 /// runtime binary: the runtime is spawned argv-direct, so the sandbox
 /// introduces no host shell.
+///
+/// Both `cwd` and `project_root` are canonicalized before the containment test
+/// so a symlink inside the project root that points outside it cannot pass a
+/// purely lexical `starts_with`. Resolution failure is fail-closed (a named
+/// refusal), never a silent fallback.
 pub(crate) fn container_run_plan(
     plan: &ShellPlan,
     config: &ContainerConfig,
@@ -221,10 +226,18 @@ pub(crate) fn container_run_plan(
     cwd: &Utf8Path,
     project_root: &Utf8Path,
 ) -> Result<ShellPlan, ToolError> {
-    if !cwd.starts_with(project_root) {
+    // Resolve symlinks on both sides; a path that cannot be resolved is
+    // refused (the plan cannot be proven to run inside the mount).
+    let cwd = cwd.canonicalize_utf8().map_err(|_| ToolError::PolicyDenied {
+        rule: "sandbox_containerized_cwd_unresolvable".into(),
+    })?;
+    let project_root = project_root.canonicalize_utf8().map_err(|_| ToolError::PolicyDenied {
+        rule: "sandbox_containerized_cwd_unresolvable".into(),
+    })?;
+    if !cwd.starts_with(&project_root) {
         return Err(ToolError::PolicyDenied { rule: "sandbox_containerized_unenforceable".into() });
     }
-    validate_entries(config, project_root)?;
+    validate_entries(config, &project_root)?;
 
     let mut args = vec!["run".to_string(), "--rm".to_string(), "--init".to_string()];
     args.push("--network".to_string());
@@ -296,8 +309,23 @@ pub(crate) fn containerize_with(
 mod tests {
     use super::*;
 
-    fn paths() -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
-        (camino::Utf8PathBuf::from("/work/project"), camino::Utf8PathBuf::from("/work/project/sub"))
+    /// A real project root (canonicalized) plus a real subdirectory, so the
+    /// symlink-resolving containment check sees paths that exist. The returned
+    /// `TempDir` must be held for the test's lifetime.
+    fn paths() -> (tempfile::TempDir, camino::Utf8PathBuf, camino::Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(dir.path()).expect("canonical tempdir"),
+        )
+        .expect("utf8 root");
+        let cwd = root.join("sub");
+        std::fs::create_dir_all(&cwd).expect("create subdir");
+        (dir, root, cwd)
+    }
+
+    /// A real directory outside any test project root, for containment tests.
+    fn outside_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("outside tempdir")
     }
 
     fn wrapped() -> ShellPlan {
@@ -313,7 +341,7 @@ mod tests {
 
     #[test]
     fn container_run_plan_mounts_project_and_sets_cwd() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let cfg = ContainerConfig::new("debian:bookworm-slim");
         let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
             .expect("container plan");
@@ -335,7 +363,7 @@ mod tests {
 
     #[test]
     fn container_run_plan_composes_with_row_42_and_45() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let cfg = ContainerConfig::new("alpine:3");
         let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Podman, &cwd, &root)
             .expect("plan");
@@ -353,7 +381,7 @@ mod tests {
 
     #[test]
     fn container_run_plan_preserves_argv_direct_plans() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let cfg = ContainerConfig::new("alpine:3");
         let direct = ShellPlan::Direct {
             program: "cargo".into(),
@@ -368,7 +396,7 @@ mod tests {
 
     #[test]
     fn container_run_plan_defaults_to_no_network() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let cfg = ContainerConfig::new("alpine:3");
         let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
             .expect("plan");
@@ -379,18 +407,18 @@ mod tests {
 
     #[test]
     fn container_run_plan_passes_only_configured_env() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let mut cfg = ContainerConfig::new("alpine:3");
         cfg.env.push(("FOO".into(), "bar".into()));
         cfg.network = true;
-        cfg.extra_mounts.push("/work/project/cache:/cache:ro".into());
+        let mount = format!("{root}/cache:/cache:ro");
+        cfg.extra_mounts.push(mount.clone());
         let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
             .expect("plan");
         let ShellPlan::Direct { args, .. } = plan else { panic!("argv-direct") };
         let e = args.iter().position(|a| a == "-e").expect("-e");
         assert_eq!(args[e + 1], "FOO=bar");
-        let extra =
-            args.windows(2).any(|w| w[0] == "-v" && w[1] == "/work/project/cache:/cache:ro");
+        let extra = args.windows(2).any(|w| w[0] == "-v" && w[1] == mount);
         assert!(extra, "extra mount missing");
         let net = args.iter().position(|a| a == "--network").expect("--network");
         assert_eq!(args[net + 1], "bridge");
@@ -400,7 +428,7 @@ mod tests {
 
     #[test]
     fn container_config_rejects_empty_mount() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         for mount in ["", "   "] {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.extra_mounts.push(mount.into());
@@ -415,8 +443,8 @@ mod tests {
 
     #[test]
     fn container_config_rejects_malformed_mount() {
-        let (root, cwd) = paths();
-        for mount in ["/only-a-source", "/work/project/cache:relative", ":"] {
+        let (_dir, root, cwd) = paths();
+        for mount in ["/only-a-source", "relative-dest", ":"] {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.extra_mounts.push(mount.into());
             let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
@@ -426,12 +454,22 @@ mod tests {
                 ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_malformed"
             ));
         }
+        // A relative destination is malformed.
+        let mut cfg = ContainerConfig::new("alpine:3");
+        cfg.extra_mounts.push(format!("{root}/cache:relative"));
+        let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
+            .expect_err("relative destination must be refused");
+        assert!(matches!(
+            err,
+            ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_malformed"
+        ));
     }
 
     #[test]
     fn container_config_rejects_mount_escaping_project_root() {
-        let (root, cwd) = paths();
-        for mount in ["/etc:/etc:ro", "../../etc:/etc:ro", "/work/project/../../etc:/etc:ro"] {
+        let (_dir, root, cwd) = paths();
+        let escaped = format!("{root}/../../etc:/etc:ro");
+        for mount in ["/etc:/etc:ro", "../../etc:/etc:ro", escaped.as_str()] {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.extra_mounts.push(mount.into());
             let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
@@ -448,10 +486,10 @@ mod tests {
 
     #[test]
     fn container_config_rejects_writable_extra_mount() {
-        let (root, cwd) = paths();
-        for mount in ["/work/project/cache:/cache:rw", "/work/project/cache:/cache:ro,rw"] {
+        let (_dir, root, cwd) = paths();
+        for mount in [format!("{root}/cache:/cache:rw"), format!("{root}/cache:/cache:ro,rw")] {
             let mut cfg = ContainerConfig::new("alpine:3");
-            cfg.extra_mounts.push(mount.into());
+            cfg.extra_mounts.push(mount);
             let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
                 .expect_err("writable extra mount must be refused");
             assert!(matches!(
@@ -463,10 +501,11 @@ mod tests {
 
     #[test]
     fn container_config_rejects_mount_shadowing_project_root() {
-        let (root, cwd) = paths();
-        for mount in ["/work/project/cache:/work/project:ro", "/work/project/cache:/work:ro"] {
+        let (_dir, root, cwd) = paths();
+        let parent = root.parent().expect("tempdir has a parent");
+        for mount in [format!("{root}/cache:{root}:ro"), format!("{root}/cache:{parent}:ro")] {
             let mut cfg = ContainerConfig::new("alpine:3");
-            cfg.extra_mounts.push(mount.into());
+            cfg.extra_mounts.push(mount);
             let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
                 .expect_err("shadowing mount must be refused");
             assert!(matches!(
@@ -478,7 +517,7 @@ mod tests {
 
     #[test]
     fn container_config_rejects_empty_env() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         for entry in [("", "value"), ("KEY", "")] {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.env.push((entry.0.into(), entry.1.into()));
@@ -493,7 +532,7 @@ mod tests {
 
     #[test]
     fn container_config_rejects_env_control_characters() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         for entry in [("K\nEY", "value"), ("KEY", "va\nlue"), ("KEY", "va\0lue"), ("K=EY", "value")]
         {
             let mut cfg = ContainerConfig::new("alpine:3");
@@ -509,7 +548,7 @@ mod tests {
 
     #[test]
     fn container_config_rejects_sensitive_env_override() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         for name in SENSITIVE_ENV_VARS {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.env.push((name.into(), "/tmp/evil".into()));
@@ -527,7 +566,7 @@ mod tests {
 
     #[test]
     fn container_config_allows_sensitive_env_when_explicitly_opted_in() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let mut cfg = ContainerConfig::new("alpine:3");
         cfg.allow_sensitive_env = true;
         cfg.env.push(("PATH".into(), "/custom/bin".into()));
@@ -539,13 +578,50 @@ mod tests {
 
     #[test]
     fn container_run_plan_refuses_cwd_outside_project_root() {
-        let (root, _) = paths();
-        let outside = camino::Utf8PathBuf::from("/tmp/elsewhere");
+        let (_dir, root, _) = paths();
+        let outside_tmp = outside_dir();
+        let outside = camino::Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(outside_tmp.path()).expect("canonical outside"),
+        )
+        .expect("utf8 outside");
         let cfg = ContainerConfig::new("alpine:3");
         let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &outside, &root)
             .expect_err("out-of-root cwd must be refused");
         assert!(
             matches!(err, ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_unenforceable")
+        );
+    }
+
+    /// A symlink inside the project root that resolves outside it must not pass
+    /// the containment check: the lexical `starts_with` would accept it, so the
+    /// canonicalized check refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn container_run_plan_refuses_symlink_cwd_escaping_project_root() {
+        let (_dir, root, _) = paths();
+        let outside_tmp = outside_dir();
+        let link = root.join("escape");
+        std::os::unix::fs::symlink(outside_tmp.path(), &link).expect("symlink");
+        let cfg = ContainerConfig::new("alpine:3");
+        let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &link, &root)
+            .expect_err("symlink escape must be refused");
+        assert!(
+            matches!(err, ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_unenforceable"),
+            "symlink-out must be refused as out-of-root: {err:?}"
+        );
+    }
+
+    /// A working directory that cannot be resolved is fail-closed.
+    #[test]
+    fn container_run_plan_refuses_unresolvable_cwd() {
+        let (_dir, root, _) = paths();
+        let missing = root.join("does-not-exist");
+        let cfg = ContainerConfig::new("alpine:3");
+        let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &missing, &root)
+            .expect_err("unresolvable cwd must be refused");
+        assert!(
+            matches!(err, ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_cwd_unresolvable"),
+            "unresolvable cwd must use the named rule: {err:?}"
         );
     }
 
@@ -556,7 +632,7 @@ mod tests {
         // injected so this is deterministic and never requires a runtime.
         #[cfg(not(windows))]
         {
-            let (root, cwd) = paths();
+            let (_dir, root, cwd) = paths();
             let cfg = ContainerConfig::new("alpine:3");
             let err = containerize_with(
                 &wrapped(),
@@ -574,7 +650,7 @@ mod tests {
         // (ADR-72 §5), independent of detection.
         #[cfg(windows)]
         {
-            let (root, cwd) = paths();
+            let (_dir, root, cwd) = paths();
             let cfg = ContainerConfig::new("alpine:3");
             let err = containerize_with(
                 &wrapped(),
@@ -593,7 +669,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn containerize_uses_detected_runtime_when_unset() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let cfg = ContainerConfig::new("alpine:3");
         let plan = containerize_with(
             &wrapped(),
@@ -610,7 +686,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn containerize_explicit_runtime_overrides_absent_detection() {
-        let (root, cwd) = paths();
+        let (_dir, root, cwd) = paths();
         let mut cfg = ContainerConfig::new("alpine:3");
         cfg.runtime = Some(ContainerRuntime::Docker);
         let plan = containerize_with(
@@ -629,7 +705,7 @@ mod tests {
     #[test]
     fn containerize_refuses_out_of_root_cwd_under_available_runtime() {
         // Independent of detection: an out-of-root cwd is always refused.
-        let (root, _) = paths();
+        let (_dir, root, _) = paths();
         let outside = camino::Utf8PathBuf::from("/");
         let cfg = ContainerConfig::new("alpine:3");
         let err = containerize_with(

@@ -1465,6 +1465,20 @@ mod tests {
         SessionContext::new(concerto_core::ids::Ulid::new(), dir)
     }
 
+    /// A real project root plus a real subdirectory for ADR-72 container
+    /// routing: the containment check canonicalizes both sides, so fake paths
+    /// fail closed. The returned `TempDir` must be held for the test lifetime.
+    fn container_paths() -> (tempfile::TempDir, Utf8PathBuf, Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(dir.path()).expect("canonical tempdir"),
+        )
+        .expect("utf8 root");
+        let cwd = root.join("sub");
+        std::fs::create_dir_all(&cwd).expect("create subdir");
+        (dir, root, cwd)
+    }
+
     fn test_tool() -> ShellTool {
         // The allowlist is matched against the full command string
         // (command + " " + shell-quoted args joined), so anchors must account for args.
@@ -1518,7 +1532,7 @@ mod tests {
         };
         let full = tool.full_command(&input.command, &input.args);
         let plan = tool.shell_plan(&input, &full);
-        let root = Utf8PathBuf::from("/proj");
+        let (_dir, root, _cwd) = container_paths();
         let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
         let ShellPlan::Direct { program, args } = routed else {
             panic!("container plan must be argv-direct");
@@ -1526,7 +1540,7 @@ mod tests {
         assert_eq!(program, "docker");
         assert_eq!(args[0], "run");
         assert!(args.contains(&"alpine:3".to_string()));
-        assert!(args.contains(&"/proj:/proj".to_string()));
+        assert!(args.contains(&format!("{root}:{root}")));
     }
 
     /// ADR-72: a working directory outside the mount is refused fail-closed
@@ -1541,8 +1555,12 @@ mod tests {
             ShellInput { command: "echo".into(), args: vec![], cwd: None, timeout_secs: None };
         let full = tool.full_command(&input.command, &input.args);
         let plan = tool.shell_plan(&input, &full);
-        let root = Utf8PathBuf::from("/proj");
-        let cwd = Utf8PathBuf::from("/tmp/elsewhere");
+        let (_dir, root, _cwd) = container_paths();
+        let outside_tmp = tempfile::tempdir().expect("outside tempdir");
+        let cwd = Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(outside_tmp.path()).expect("canonical outside"),
+        )
+        .expect("utf8 outside");
         let err = tool.containerized_plan(plan, &cwd, &root).expect_err("must refuse");
         assert!(matches!(
             err,
@@ -1603,7 +1621,7 @@ mod tests {
             ShellInput { command: "echo".into(), args: vec![], cwd: None, timeout_secs: None };
         let full = tool.full_command(&input.command, &input.args);
         let plan = tool.shell_plan(&input, &full);
-        let root = Utf8PathBuf::from("/proj");
+        let (_dir, root, _cwd) = container_paths();
         let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
         let ShellPlan::Direct { program, args } = routed else { panic!("argv-direct") };
         assert_eq!(program, "podman");
@@ -1645,9 +1663,8 @@ mod tests {
         assert!(!verbatim);
         assert!(operand.starts_with("ulimit -S -t 5; "));
 
-        let routed = tool
-            .containerized_plan(plan, &Utf8PathBuf::from("/proj"), &Utf8PathBuf::from("/proj"))
-            .expect("routed");
+        let (_dir, root, _cwd) = container_paths();
+        let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
         let ShellPlan::Direct { program, args } = &routed else { panic!("argv-direct") };
         assert_eq!(program, "docker");
         let image = args.iter().position(|a| a == "alpine:3").expect("image");
