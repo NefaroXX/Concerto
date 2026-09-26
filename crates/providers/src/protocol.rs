@@ -73,3 +73,38 @@ pub enum StreamEvent {
     Done { tokens_in: u64, tokens_out: u64 },
     Error(ProviderError),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_arguments_object;
+
+    /// A JSON object — the only wire-legal shape — passes through untouched.
+    #[test]
+    fn objects_pass_through_unchanged() {
+        let args = serde_json::json!({"command": "ls"});
+        assert_eq!(ensure_arguments_object(args.clone()), args);
+    }
+
+    /// Every non-object producer shape coerces to `{}` so the outbound wire
+    /// never trips `function.arguments must be a JSON object` — including a
+    /// double-encoded arguments *string*, which is why the OpenAI connector
+    /// unwraps that class upstream (row #38) instead of losing the payload
+    /// here.
+    #[test]
+    fn non_object_shapes_coerce_to_empty_object() {
+        let cases = [
+            serde_json::json!("ls"),
+            serde_json::json!("\"{\\\"command\\\":\\\"ls\\\"}\""),
+            serde_json::json!(["ls"]),
+            serde_json::json!(42),
+            serde_json::json!(null),
+        ];
+        for args in cases {
+            assert_eq!(
+                ensure_arguments_object(args.clone()),
+                serde_json::json!({}),
+                "shape: {args}"
+            );
+        }
+    }
+}
