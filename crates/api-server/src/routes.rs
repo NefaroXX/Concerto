@@ -21,9 +21,10 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth;
+use crate::rate_limit::{self, RateLimitState};
 use crate::state::AppState;
 use axum::extract::DefaultBodyLimit;
-use axum::middleware::from_fn;
+use axum::middleware::{from_fn, from_fn_with_state};
 use std::env;
 
 /// Cancels the contained [`CancellationToken`] when the request future is
@@ -92,7 +93,9 @@ pub fn router(state: AppState) -> Router {
             router.merge(SwaggerUi::new("/v1/docs").url("/v1/openapi.json", ApiDoc::openapi()));
     }
 
-    router
+    // Outermost layer: throttles every route (before auth) by client IP.
+    // Disabled by default — see `rate_limit` for the config contract.
+    router.layer(from_fn_with_state(RateLimitState::from_env(), rate_limit::rate_limit_layer))
 }
 
 /// 301 redirect from a legacy unversioned path to its /v1/ equivalent.
