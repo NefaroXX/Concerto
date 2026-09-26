@@ -1874,10 +1874,11 @@ pub struct ModelInfo {
 
 /// Sandbox isolation level for tool execution.
 ///
-/// **This is currently a stub.** No variant provides OS-level isolation
-/// (no containers, seccomp, namespaces, or Landlock). All non-`None`
-/// profiles are rejected by the policy engine until real sandboxing is
-/// implemented.
+/// [`SandboxProfile::Containerized`] is enforced (ADR-72): it is admitted only
+/// when a container runtime (docker/podman) is detected and the action carries
+/// a container-routable plan, and refused otherwise (fail-closed).
+/// [`SandboxProfile::ReadOnlyFs`] and [`SandboxProfile::NetworkIsolated`] remain
+/// stubs and are rejected by the policy engine until implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SandboxProfile {
@@ -1887,7 +1888,8 @@ pub enum SandboxProfile {
     ReadOnlyFs,
     /// Network operations are denied (shell/http tools blocked). **Not implemented.**
     NetworkIsolated,
-    /// Full containerization. **Not implemented.**
+    /// OS-level container isolation (ADR-72). Admitted only when a runtime is
+    /// detected and the action has a container-routable plan.
     Containerized,
 }
 

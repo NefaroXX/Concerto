@@ -3,6 +3,9 @@ use crate::authorization::{
     RULE_COORDINATOR_AUTHORITY,
 };
 use crate::error::PolicyError;
+use crate::sandbox::{
+    is_container_routable_tool, ContainerRuntimeProbe, SystemContainerRuntime,
+};
 use crate::traits::policy::{AuditEntry, AuditLog, PolicyEngine};
 use crate::types::{
     CodeCategory, Condition, PolicyAction, PolicyRule, PolicyVerdict, SandboxProfile,
@@ -34,6 +37,10 @@ pub struct SimplePolicyEngine {
     /// approval_timeout_secs`. A timeout now PAUSES the run awaiting the user
     /// instead of denying it.
     approval_timeout: std::time::Duration,
+    /// ADR-72: container-runtime availability probe used to admit or refuse the
+    /// `SandboxProfile::Containerized` profile. Defaults to the process-wide
+    /// system probe; injectable so tests never need a container runtime.
+    sandbox_runtime: Arc<dyn ContainerRuntimeProbe>,
 }
 
 impl SimplePolicyEngine {
@@ -47,7 +54,16 @@ impl SimplePolicyEngine {
             rate_limiter: None,
             intent_auth: None,
             approval_timeout: std::time::Duration::from_secs(30),
+            sandbox_runtime: Arc::new(SystemContainerRuntime::new()),
         }
+    }
+
+    /// Override the container-runtime probe used by `check_sandbox` (ADR-72).
+    /// Injecting a stub keeps enforcement tests deterministic and free of any
+    /// container requirement.
+    pub fn with_sandbox_runtime(mut self, probe: Arc<dyn ContainerRuntimeProbe>) -> Self {
+        self.sandbox_runtime = probe;
+        self
     }
 
     /// Override the default approval deadline (30s) used by approval-producing
@@ -386,13 +402,40 @@ impl SimplePolicyEngine {
 
     /// Check the active sandbox profile against the requested tool operation.
     ///
-    /// Sandbox profiles are currently stubs and do not provide real runtime
-    /// isolation. Any non-`None` profile produces a deny verdict so callers
-    /// cannot accidentally rely on unimplemented sandboxing.
+    /// `ReadOnlyFs` and `NetworkIsolated` are still stubs and are denied so
+    /// callers cannot accidentally rely on unimplemented sandboxing.
+    ///
+    /// `Containerized` is admitted only when (ADR-72 §2):
+    /// 1. a container runtime (docker/podman) is available, **and**
+    /// 2. the action carries a container-routable plan (structured command
+    ///    facts for the shell tool).
+    ///
+    /// Otherwise it is denied fail-closed: a missing runtime is an explicit
+    /// refusal, never a silent fallback to ambient authority. Admission here
+    /// means "not blocked by the sandbox gate"; the action still passes through
+    /// normal rule evaluation.
     fn check_sandbox(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
         match action.sandbox_profile {
             None | Some(SandboxProfile::None) => None,
-            Some(_) => Some((PolicyVerdict::Deny, "sandbox_profiles_not_implemented".into())),
+            Some(SandboxProfile::ReadOnlyFs) | Some(SandboxProfile::NetworkIsolated) => {
+                Some((PolicyVerdict::Deny, "sandbox_profiles_not_implemented".into()))
+            }
+            Some(SandboxProfile::Containerized) => self.check_containerized(action),
+        }
+    }
+
+    /// `SandboxProfile::Containerized` admission (ADR-72 §2).
+    fn check_containerized(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
+        match self.sandbox_runtime.probe() {
+            unavailable if !unavailable.is_available() => Some((
+                PolicyVerdict::Deny,
+                "sandbox_containerized_runtime_unavailable".into(),
+            )),
+            _ if !container_plan_is_well_formed(action) => Some((
+                PolicyVerdict::Deny,
+                "sandbox_containerized_unenforceable".into(),
+            )),
+            _ => None,
         }
     }
 
@@ -784,6 +827,16 @@ fn cmd_is_network_op(cmd: &str) -> bool {
                 | "socat"
         )
     })
+}
+
+/// ADR-72 §2: whether `action` carries the plan needed to route execution
+/// through a container. Only the shell tool has such a route; it must carry
+/// structured command facts naming a working directory (the mount anchor).
+/// Any other tool under `Containerized` is refused as unenforceable rather
+/// than run unconfined.
+fn container_plan_is_well_formed(action: &PolicyAction<'_>) -> bool {
+    is_container_routable_tool(action.tool_name)
+        && action.command_facts.as_ref().is_some_and(|facts| facts.working_directory.is_some())
 }
 
 #[async_trait]
@@ -1219,6 +1272,7 @@ mod tests {
     };
     use crate::ids::Ulid;
     use crate::policy_presets::inject_intent_gate_rule;
+    use crate::sandbox::{ContainerRuntime, ContainerRuntimeProbe, RuntimeAvailability};
     use crate::types::{
         CapabilitySet, CommandPolicyFacts, DestructiveClass, FilesystemScope, SandboxProfile,
     };
@@ -1939,10 +1993,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_containerized_denies_as_stub() {
+    async fn sandbox_containerized_refuses_without_runtime() {
+        // ADR-72 §2: fail-closed. No runtime => explicit refusal, never a
+        // silent passthrough to ambient authority — even for a shell action
+        // that carries a well-formed container plan.
         let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
-        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))];
-        let engine = SimplePolicyEngine::new(rules, audit);
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit.clone(),
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Unavailable {
+            reason: "test: no runtime".into(),
+        })));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = shell_container_action(&input);
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_containerized_runtime_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_containerized_refuses_non_shell_tool_as_unenforceable() {
+        // A runtime exists, but the filesystem tool has no container route, so
+        // Containerized must refuse rather than run it unconfined.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))],
+            audit.clone(),
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Available(
+            ContainerRuntime::Docker,
+        ))));
         let action = PolicyAction {
             tool_name: "filesystem",
             input: &serde_json::json!({}),
@@ -1956,6 +2040,88 @@ mod tests {
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_containerized_unenforceable")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_containerized_allows_with_runtime_and_shell_plan() {
+        // Both admission preconditions met: the sandbox gate passes the action
+        // through to normal rule evaluation, where the AutoApprove rule allows.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit,
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Available(
+            ContainerRuntime::Podman,
+        ))));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = shell_container_action(&input);
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn sandbox_none_path_is_unchanged() {
+        // Selecting the default profile never consults the runtime probe and
+        // preserves the pre-ADR-72 behavior exactly.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit,
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Unavailable {
+            reason: "test".into(),
+        })));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = PolicyAction {
+            tool_name: "shell",
+            input: &input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+            orchestrator_authority: false,
+        };
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+    }
+
+    /// ADR-72 test double: a probe with a fixed verdict.
+    struct StubRuntimeProbe(RuntimeAvailability);
+
+    impl ContainerRuntimeProbe for StubRuntimeProbe {
+        fn probe(&self) -> RuntimeAvailability {
+            self.0.clone()
+        }
+    }
+
+    /// A shell action under `Containerized` carrying a well-formed plan.
+    fn shell_container_action<'a>(input: &'a serde_json::Value) -> PolicyAction<'a> {
+        PolicyAction {
+            tool_name: "shell",
+            input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: Some(SandboxProfile::Containerized),
+            estimated_cost_usd: None,
+            command_facts: Some(CommandPolicyFacts {
+                shell_profile_id: None,
+                resolved_executable: None,
+                argv: vec!["/bin/sh".into(), "-c".into(), "echo hello".into()],
+                working_directory: Some(PathBuf::from("/proj")),
+                network_requested: false,
+                filesystem_scope: FilesystemScope::ProjectOnly,
+                destructive_classification: DestructiveClass::NonDestructive,
+            }),
+            orchestrator_authority: false,
+        }
     }
 
     // ---- validate(): rule-shape validation ----------------------------------
