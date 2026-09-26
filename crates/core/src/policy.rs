@@ -406,15 +406,30 @@ impl SimplePolicyEngine {
     /// `Containerized` is admitted only when (ADR-72 §2):
     /// 1. a container runtime (docker/podman) is available, **and**
     /// 2. the action carries a container-routable plan (structured command
-    ///    facts for the shell tool).
+    ///    facts for the shell tool with a working directory), **and**
+    /// 3. those facts assert [`crate::types::CommandRouting::Containerized`] —
+    ///    the explicit marker that the invocation was genuinely routed through
+    ///    a container.
     ///
-    /// Otherwise it is denied fail-closed: a missing runtime is an explicit
+    /// Otherwise it is denied fail-closed: a missing runtime, a plan that is
+    /// not container-routable, or a missing routing marker is an explicit
     /// refusal, never a silent fallback to ambient authority. Admission here
     /// means "not blocked by the sandbox gate"; the action still passes through
     /// normal rule evaluation.
+    ///
+    /// The reverse direction is enforced too: command facts that assert
+    /// container routing while the active profile is *not* `Containerized` are
+    /// refused rather than silently ignored — the producer's routing claim and
+    /// the session's declared profile must agree.
     fn check_sandbox(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
         match action.sandbox_profile {
-            None | Some(SandboxProfile::None) => None,
+            None | Some(SandboxProfile::None) => {
+                if container_routing_is_asserted(action) {
+                    Some((PolicyVerdict::Deny, "sandbox_container_routing_profile_mismatch".into()))
+                } else {
+                    None
+                }
+            }
             Some(SandboxProfile::ReadOnlyFs) | Some(SandboxProfile::NetworkIsolated) => {
                 Some((PolicyVerdict::Deny, "sandbox_profiles_not_implemented".into()))
             }
@@ -423,6 +438,13 @@ impl SimplePolicyEngine {
     }
 
     /// `SandboxProfile::Containerized` admission (ADR-72 §2).
+    ///
+    /// Ordering matters for diagnostics only; every arm is a denial, so no
+    /// ordering admits an unrouted invocation. Runtime detection comes first so
+    /// an absent runtime is reported as such, then plan shape (which also
+    /// refuses non-routable tools as unenforceable), then the routing marker,
+    /// which names the exact residual this check closes: a caller that selected
+    /// `Containerized` but forgot to route the invocation through a container.
     fn check_containerized(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
         match self.sandbox_runtime.probe() {
             unavailable if !unavailable.is_available() => {
@@ -430,6 +452,9 @@ impl SimplePolicyEngine {
             }
             _ if !container_plan_is_well_formed(action) => {
                 Some((PolicyVerdict::Deny, "sandbox_containerized_unenforceable".into()))
+            }
+            _ if !container_routing_is_asserted(action) => {
+                Some((PolicyVerdict::Deny, "sandbox_containerized_routing_missing".into()))
             }
             _ => None,
         }
@@ -833,6 +858,15 @@ fn cmd_is_network_op(cmd: &str) -> bool {
 fn container_plan_is_well_formed(action: &PolicyAction<'_>) -> bool {
     is_container_routable_tool(action.tool_name)
         && action.command_facts.as_ref().is_some_and(|facts| facts.working_directory.is_some())
+}
+
+/// ADR-72 §2: whether `action` explicitly asserts that it was genuinely routed
+/// through a container (see [`crate::types::CommandRouting`]). Absence is never
+/// an admit: the `Containerized` gate requires this marker, and a marker
+/// without a matching profile is likewise refused, so the routing claim and the
+/// declared sandbox profile must agree exactly.
+fn container_routing_is_asserted(action: &PolicyAction<'_>) -> bool {
+    action.command_facts.as_ref().is_some_and(|facts| facts.container_routing.is_containerized())
 }
 
 #[async_trait]
@@ -1270,7 +1304,8 @@ mod tests {
     use crate::policy_presets::inject_intent_gate_rule;
     use crate::sandbox::{ContainerRuntime, ContainerRuntimeProbe, RuntimeAvailability};
     use crate::types::{
-        CapabilitySet, CommandPolicyFacts, DestructiveClass, FilesystemScope, SandboxProfile,
+        CapabilitySet, CommandPolicyFacts, CommandRouting, DestructiveClass, FilesystemScope,
+        SandboxProfile,
     };
     use std::path::PathBuf;
 
@@ -1834,6 +1869,7 @@ mod tests {
             network_requested: false,
             filesystem_scope: FilesystemScope::ProjectOnly,
             destructive_classification: DestructiveClass::NonDestructive,
+            container_routing: CommandRouting::Direct,
         }
     }
 
@@ -2088,6 +2124,53 @@ mod tests {
         assert_eq!(verdict, PolicyVerdict::Allow);
     }
 
+    #[tokio::test]
+    async fn sandbox_containerized_refuses_without_routing_marker() {
+        // Row-36 fail-open residual: a caller that selects `Containerized` but
+        // forgets to route the invocation through a container produces shell
+        // facts with a working directory yet no container routing. A well-formed
+        // plan plus an available runtime is NOT enough; the gate must refuse
+        // with a named error, never admit.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit.clone(),
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Available(
+            ContainerRuntime::Docker,
+        ))));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = shell_container_action_with_routing(&input, CommandRouting::Direct);
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_containerized_routing_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_container_routing_without_containerized_profile_is_refused() {
+        // Reverse direction: command facts assert container routing while the
+        // declared profile is `None`. The routing claim and the profile must
+        // agree; a mismatch is refused rather than silently ignored. No runtime
+        // probe is configured because the mismatch is decided before detection.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit.clone(),
+        );
+        let input = serde_json::json!({"command": "echo hello"});
+        let mut action = shell_container_action_with_routing(&input, CommandRouting::Containerized);
+        action.sandbox_profile = None;
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_container_routing_profile_mismatch")
+        );
+    }
+
     /// ADR-72 test double: a probe with a fixed verdict.
     struct StubRuntimeProbe(RuntimeAvailability);
 
@@ -2097,8 +2180,18 @@ mod tests {
         }
     }
 
-    /// A shell action under `Containerized` carrying a well-formed plan.
+    /// A shell action under `Containerized` carrying a well-formed plan and a
+    /// genuine container routing marker.
     fn shell_container_action<'a>(input: &'a serde_json::Value) -> PolicyAction<'a> {
+        shell_container_action_with_routing(input, CommandRouting::Containerized)
+    }
+
+    /// A shell action under `Containerized` with an explicit routing marker, so
+    /// tests can exercise the missing-marker residual deterministically.
+    fn shell_container_action_with_routing<'a>(
+        input: &'a serde_json::Value,
+        container_routing: CommandRouting,
+    ) -> PolicyAction<'a> {
         PolicyAction {
             tool_name: "shell",
             input,
@@ -2115,6 +2208,7 @@ mod tests {
                 network_requested: false,
                 filesystem_scope: FilesystemScope::ProjectOnly,
                 destructive_classification: DestructiveClass::NonDestructive,
+                container_routing,
             }),
             orchestrator_authority: false,
         }

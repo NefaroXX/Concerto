@@ -469,6 +469,7 @@ mod tests {
             network_requested: false,
             filesystem_scope: FilesystemScope::ProjectOnly,
             destructive_classification: DestructiveClass::NonDestructive,
+            ..Default::default()
         }
     }
 

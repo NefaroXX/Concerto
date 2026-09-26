@@ -1806,6 +1806,7 @@ mod tests {
             network_requested: true,
             filesystem_scope: FilesystemScope::ProjectOnly,
             destructive_classification: DestructiveClass::NonDestructive,
+            ..Default::default()
         };
         let action = PolicyAction {
             tool_name: "shell",
@@ -1963,6 +1964,7 @@ mod tests {
                 FilesystemScope::Anywhere
             },
             destructive_classification: DestructiveClass::NonDestructive,
+            ..Default::default()
         }
     }
 

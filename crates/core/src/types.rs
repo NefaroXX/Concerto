@@ -422,6 +422,46 @@ impl DestructiveClass {
     }
 }
 
+/// ADR-72 §2: explicit execution-routing assertion carried on
+/// [`CommandPolicyFacts`].
+///
+/// This is the honest signal the policy engine requires before it will admit a
+/// `SandboxProfile::Containerized` action. A working directory alone proves
+/// nothing about routing — a shell invocation can carry a `cwd` and still be
+/// launched unconfined on the host — so `Containerized` admission requires this
+/// marker *in addition to* a well-formed plan and an available runtime.
+///
+/// Producer contract (every command-fact author must follow it):
+/// - Set [`CommandRouting::Direct`] (the default) when the argv launches
+///   directly on the host. This is always safe.
+/// - Set [`CommandRouting::Containerized`] **only** when the argv was produced
+///   by wrapping the inner invocation in `<runtime> run …` and will be spawned
+///   argv-direct through that runtime (see the shell tool's `with_container`
+///   route). Never set it from a bare working directory, or for an invocation
+///   that was planned but not actually routed.
+///
+/// The policy engine enforces both directions of the contract: a
+/// `Containerized` profile without this marker is denied
+/// (`sandbox_containerized_routing_missing`), and this marker without a
+/// `Containerized` profile is denied
+/// (`sandbox_container_routing_profile_mismatch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CommandRouting {
+    /// The invocation launches directly on the host (default, safe).
+    #[default]
+    Direct,
+    /// The invocation was wrapped in a container runtime and runs confined.
+    Containerized,
+}
+
+impl CommandRouting {
+    /// Whether this routing asserts genuine container confinement.
+    pub fn is_containerized(self) -> bool {
+        matches!(self, Self::Containerized)
+    }
+}
+
 /// Structured, pre-resolved facts about a command execution, presented to the
 /// policy engine and audit log (ADR-28 §6/§7).
 ///
@@ -449,6 +489,12 @@ pub struct CommandPolicyFacts {
     pub filesystem_scope: FilesystemScope,
     /// Destructive-operation classification.
     pub destructive_classification: DestructiveClass,
+    /// ADR-72 §2: explicit routing assertion. Defaults to
+    /// [`CommandRouting::Direct`]; a producer sets
+    /// [`CommandRouting::Containerized`] only when the `argv` above was
+    /// genuinely wrapped in a container runtime. See [`CommandRouting`] for the
+    /// full producer contract the policy engine enforces.
+    pub container_routing: CommandRouting,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1875,8 +1921,9 @@ pub struct ModelInfo {
 /// Sandbox isolation level for tool execution.
 ///
 /// [`SandboxProfile::Containerized`] is enforced (ADR-72): it is admitted only
-/// when a container runtime (docker/podman) is detected and the action carries
-/// a container-routable plan, and refused otherwise (fail-closed).
+/// when a container runtime (docker/podman) is detected, the action carries a
+/// container-routable plan, **and** its command facts assert
+/// [`CommandRouting::Containerized`]; it is refused otherwise (fail-closed).
 /// [`SandboxProfile::ReadOnlyFs`] and [`SandboxProfile::NetworkIsolated`] remain
 /// stubs and are rejected by the policy engine until implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

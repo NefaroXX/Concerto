@@ -11,8 +11,8 @@ use concerto_config::shell::ShellProfileConfig;
 use concerto_core::sandbox::ContainerRuntimeProbe;
 use concerto_core::traits::PolicyEngine;
 use concerto_core::types::{
-    CapabilitySet, CommandPolicyFacts, DestructiveClass, FilesystemScope, SessionContext,
-    ToolOutput,
+    CapabilitySet, CommandPolicyFacts, CommandRouting, DestructiveClass, FilesystemScope,
+    SessionContext, ToolOutput,
 };
 use concerto_core::{CancellationToken, ToolError};
 use regex::Regex;
@@ -1056,17 +1056,23 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         // requested program itself. Under ADR-72 the plan is first routed
         // through the container so the audited argv is the container argv that
         // runs (a failure to containerize yields no facts; `execute` refuses).
+        //
+        // The `container_routing` marker is set ONLY on the branch that actually
+        // wrapped the invocation: if containerization fails, `.ok()?` returns no
+        // facts at all, so the policy gate can never see a `Containerized`
+        // routing claim for an unrouted plan.
         let plan = self.shell_plan(&shell_input, &full_command);
-        let plan = match &self.container {
+        let (plan, container_routing) = match &self.container {
             Some(_) => {
                 let cwd_utf8 = Utf8PathBuf::from_path_buf(
                     working_directory.clone().unwrap_or_else(|| project_dir.clone()),
                 )
                 .ok()?;
                 let root_utf8 = Utf8PathBuf::from_path_buf(project_dir.clone()).ok()?;
-                self.containerized_plan(plan, &cwd_utf8, &root_utf8).ok()?
+                let routed = self.containerized_plan(plan, &cwd_utf8, &root_utf8).ok()?;
+                (routed, CommandRouting::Containerized)
             }
-            None => plan,
+            None => (plan, CommandRouting::Direct),
         };
         let (resolved_executable, argv) = match &plan {
             ShellPlan::Direct { program, args } => (
@@ -1096,6 +1102,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
             network_requested,
             filesystem_scope,
             destructive_classification,
+            container_routing,
         })
     }
 
@@ -1655,7 +1662,7 @@ mod tests {
     }
 
     /// ADR-72: the audited command facts describe the container argv that
-    /// actually runs, so the policy gate's "well-formed plan" sees the routing.
+    /// actually runs, and assert the routing marker the policy gate requires.
     #[test]
     fn container_command_facts_describe_the_runtime_argv() {
         let tool = ShellTool::new().with_container(ContainerConfig {
@@ -1669,6 +1676,20 @@ mod tests {
         assert_eq!(facts.argv.get(1).map(String::as_str), Some("run"));
         assert!(facts.argv.contains(&"alpine:3".to_string()));
         assert!(facts.working_directory.is_some());
+        // The marker is set only on the branch that actually routed, so the gate
+        // cannot be satisfied by a bare working directory.
+        assert_eq!(facts.container_routing, CommandRouting::Containerized);
+    }
+
+    /// ADR-72 §2: a tool with no container config produces `Direct` routing, so
+    /// an unrelated shell invocation can never satisfy the Containerized gate.
+    #[test]
+    fn non_container_command_facts_assert_direct_routing() {
+        let tool = ShellTool::new();
+        let session = test_session();
+        let input = json!({"command": "echo", "args": ["hi"]});
+        let facts = tool.command_facts(&input, &session).expect("facts");
+        assert_eq!(facts.container_routing, CommandRouting::Direct);
     }
 
     #[tokio::test]
