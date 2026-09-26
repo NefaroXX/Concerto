@@ -538,6 +538,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub tool_settings: Option<ToolSettings>,
 
+    /// `[audit]` — SQLCipher at-rest encryption and audit-log retention
+    /// (security threat model gap #5 / DEFERRED row 44 incl. row 19).
+    ///
+    /// `None` (no `[audit]` section) keeps the status quo: plaintext database,
+    /// grow-only audit log. Additive serde-default only — every pre-existing
+    /// config loads unchanged and needs no schema-version bump.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+
     /// ADR-58 `[orchestration]` — the Orchestration Blueprint pipeline.
     ///
     /// `None` (no `[orchestration]` table) keeps the engine's embedded
@@ -604,6 +613,7 @@ impl PartialEq for AppConfig {
             && self.project_roots == other.project_roots
             && self.context == other.context
             && self.tool_settings == other.tool_settings
+            && self.audit == other.audit
             && self.orchestration == other.orchestration
     }
 }
@@ -634,6 +644,7 @@ impl Default for AppConfig {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            audit: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
@@ -823,6 +834,47 @@ impl Default for ToolSettings {
     fn default() -> Self {
         Self { git_auto_init: true }
     }
+}
+
+// ---- [audit] : at-rest encryption + audit-log retention -----------------------
+
+/// `[audit]` — at-rest protection and lifetime of the audit log
+/// (security threat model gap #5, DEFERRED row 44 incl. row 19).
+///
+/// Additive serde-default only: a config without an `[audit]` section keeps
+/// today's behavior exactly (plaintext database, grow-only audit log), so no
+/// schema-version bump is needed (the `[skills]`/`[mcp]`/ADR-70 trajectory).
+/// Every knob below is explicit opt-in — nothing is ever deleted or encrypted
+/// behind the user's back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AuditConfig {
+    /// Encrypt the sessions/audit SQLite database at rest with SQLCipher.
+    ///
+    /// Default: false (opt-in). When enabled the at-rest key is generated on
+    /// first use and stored in the OS keychain under the
+    /// `audit/db_encryption_key` account (`CONCERTO_AUDIT_DB_ENCRYPTION_KEY`
+    /// overrides it, which is also the supported way to provision a key on a
+    /// headless host without a keychain). The store refuses to start when the
+    /// build cannot provide SQLCipher or the key is unavailable — encryption
+    /// is never silently downgraded to plaintext.
+    #[serde(default)]
+    pub encrypt_at_rest: bool,
+
+    /// Days an `audit_log` row is retained before it is archived out of the
+    /// hot database and deleted. `None` (the default) or `0` keeps every row
+    /// forever, preserving ADR-40's "no age-based audit-only truncation"
+    /// until a user opts in. Rows strictly older than the cutoff are moved to
+    /// the archive first; a failed archive write aborts the prune, so rows are
+    /// never deleted un-archived.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
+
+    /// Directory holding the encrypted `audit-archive.db` that pruned rows are
+    /// moved into. `None` = the Concerto data directory. The archive is
+    /// written with the same at-rest key as the hot database, so it is only
+    /// readable while `encrypt_at_rest` stays enabled with the same key.
+    #[serde(default)]
+    pub archive_dir: Option<Utf8PathBuf>,
 }
 
 // ---- Phase 8: observability export configuration ------------------------------
@@ -2284,6 +2336,78 @@ mod tests {
             crate::schema::ToolSettings::deserialize(toml::Value::Table(toml::map::Map::new()))
                 .expect("omitted keys fall back to their serde defaults");
         assert!(from_toml.git_auto_init, "serde default must also be true");
+    }
+
+    // ------------------------------------------------------------------
+    // [audit] — at-rest encryption + audit-log retention (row 44 / row 19)
+    // ------------------------------------------------------------------
+
+    /// Every `[audit]` knob is opt-in: an empty section must behave exactly
+    /// like a config that never mentions `[audit]` (plaintext, grow-only).
+    #[test]
+    fn audit_config_defaults_keep_status_quo() {
+        let defaults = AuditConfig::default();
+        assert!(!defaults.encrypt_at_rest, "encryption must be opt-in");
+        assert_eq!(defaults.retention_days, None, "no retention until explicitly configured");
+        assert_eq!(defaults.archive_dir, None);
+
+        let empty: AuditConfig =
+            toml::from_str("").expect("an empty [audit] table must deserialize");
+        assert_eq!(empty, defaults, "serde defaults must match Default");
+    }
+
+    /// A config without `[audit]` keeps `audit == None` — the load seam never
+    /// invents a section, so no schema-version bump and no serialized churn.
+    #[test]
+    fn audit_section_absent_stays_none() {
+        let parsed: AppConfig = toml::from_str("schema_version = 8\n").expect("must parse");
+        assert_eq!(parsed.audit, None, "absent [audit] must stay None");
+    }
+
+    /// Partial sections fill the remaining knobs from their serde defaults, so
+    /// `[audit] encrypt_at_rest = true` alone is a valid, complete opt-in.
+    #[test]
+    fn audit_section_partial_parses() {
+        let parsed: AppConfig = toml::from_str(
+            "schema_version = 8\n\
+             [audit]\n\
+             encrypt_at_rest = true\n\
+             retention_days = 90\n",
+        )
+        .expect("must parse");
+        let audit = parsed.audit.expect("[audit] section present");
+        assert!(audit.encrypt_at_rest);
+        assert_eq!(audit.retention_days, Some(90));
+        assert_eq!(audit.archive_dir, None, "unset archive_dir falls back to the data dir");
+
+        // A bare `[audit]` table is also valid: nothing is enabled by it.
+        let bare: AppConfig = toml::from_str("schema_version = 8\n[audit]\n").expect("must parse");
+        assert_eq!(bare.audit, Some(AuditConfig::default()));
+    }
+
+    /// `retention_days = 0` means "keep forever" (same as omitting it) and
+    /// must round-trip, so a user can re-disarm retention explicitly.
+    #[test]
+    fn audit_retention_zero_disables() {
+        let parsed: AppConfig =
+            toml::from_str("schema_version = 8\n[audit]\nretention_days = 0\n").expect("parse");
+        let audit = parsed.audit.as_ref().expect("[audit] present");
+        assert_eq!(audit.retention_days, Some(0));
+        // Round-trips through TOML: `0` is a real value, not a skip-everything None.
+        let encoded = toml::to_string(&parsed).expect("serialize");
+        let back: AppConfig = toml::from_str(&encoded).expect("reparse");
+        assert_eq!(back, parsed, "[audit] must survive a settings round-trip");
+    }
+
+    /// Equality covers the new section: two configs that differ only in
+    /// `[audit]` must not compare equal (settings save relies on `PartialEq`).
+    #[test]
+    fn appconfig_equality_covers_audit() {
+        let base: AppConfig = toml::from_str("schema_version = 8\n").expect("must parse");
+        let mut encrypted = base.clone();
+        encrypted.audit = Some(AuditConfig { encrypt_at_rest: true, ..AuditConfig::default() });
+        assert_ne!(base, encrypted, "audit settings must participate in AppConfig equality");
+        assert_eq!(base, base.clone());
     }
 
     #[test]

@@ -104,6 +104,8 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         context: None,
         // [tools] is additive and default-on; old configs keep it None.
         tool_settings: None,
+        // [audit] is additive; old configs keep it None (plaintext, no retention).
+        audit: None,
         // ADR-70 adds [project_context]; additive Option defaults to None.
         project_context: None,
         orchestration: None,
@@ -149,6 +151,8 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         context: config.context,
         // [tools] is additive and default-on; old configs keep it None.
         tool_settings: None,
+        // [audit] is additive; old configs keep it None (plaintext, no retention).
+        audit: None,
         // ADR-70 adds [project_context]; additive Option defaults to None.
         project_context: None,
         orchestration: None,
@@ -245,6 +249,8 @@ mod tests {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            // [audit] is additive; old configs keep it None (plaintext, no retention).
+            audit: None,
             // ADR-70 adds [project_context]; additive Option defaults to None.
             project_context: None,
             orchestration: None,
@@ -277,6 +283,8 @@ mod tests {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            // [audit] is additive; old configs keep it None (plaintext, no retention).
+            audit: None,
             // ADR-70 adds [project_context]; additive Option defaults to None.
             project_context: None,
             orchestration: None,
@@ -331,6 +339,8 @@ mod tests {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            // [audit] is additive; old configs keep it None (plaintext, no retention).
+            audit: None,
             // ADR-70 adds [project_context]; additive Option defaults to None.
             project_context: None,
             orchestration: None,

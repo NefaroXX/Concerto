@@ -2003,6 +2003,15 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         std::fs::create_dir_all(&xdg_data).unwrap();
         let old_data = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        // `SqliteSessionStore::connect()` resolves the `[audit]` at-rest
+        // policy from the *global* config (row 44). Point XDG_CONFIG_HOME at
+        // an empty directory so these tests see pure defaults (encryption
+        // off) instead of a developer's real config, which could otherwise
+        // fail closed on keychain access.
+        let xdg_config = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        let old_config = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
 
         let proj = temp.path().join("prune-project");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2047,6 +2056,10 @@ api_key = "sk-test-key-for-provider-list-1234567890"
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
+        match &old_config {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
 
         assert!(result.is_ok(), "dry run should succeed: {:?}", result.err());
         assert!(still_exists, "dry run must not delete sessions");
@@ -2060,6 +2073,15 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         std::fs::create_dir_all(&xdg_data).unwrap();
         let old_data = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        // `SqliteSessionStore::connect()` resolves the `[audit]` at-rest
+        // policy from the *global* config (row 44). Point XDG_CONFIG_HOME at
+        // an empty directory so these tests see pure defaults (encryption
+        // off) instead of a developer's real config, which could otherwise
+        // fail closed on keychain access.
+        let xdg_config = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        let old_config = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
 
         let proj = temp.path().join("prune-project");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2116,6 +2138,10 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         match &old_data {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match &old_config {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
         assert!(result.is_ok(), "prune should succeed: {:?}", result.err());

@@ -5,7 +5,9 @@
 //! `concerto-sessions` — SQLite-backed session persistence with WAL mode,
 //! advisory locking, schema migrations, and conversation history.
 
+pub mod at_rest;
 pub mod audit;
+pub mod audit_retention;
 pub mod plan_bindings;
 pub mod plans;
 pub mod replay;
@@ -13,6 +15,8 @@ pub mod resource_facts;
 pub mod spend;
 pub mod whiteboard;
 
+pub use at_rest::{is_at_rest_encrypted, marker_path, AtRestKey};
+pub use audit_retention::AuditRetentionReport;
 pub use plan_bindings::PlanBindingRecord;
 pub use resource_facts::{
     CachedRead, ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
@@ -32,7 +36,7 @@ use concerto_core::types::{Message, ProviderMetrics, TokenBudget};
 use concerto_core::CancellationToken;
 use concerto_core::TaskId;
 use sqlx::pool::PoolOptions;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteSynchronous};
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
 use std::sync::Arc;
 use thiserror::Error;
@@ -438,6 +442,11 @@ pub struct SqliteSessionStore {
     /// `connect_path` / `connect_in_memory` (tests, explicit paths) never set
     /// it, so those paths stay free of data-root side effects.
     _data_dir_lock: Option<Arc<DataDirLock>>,
+    /// `Some` when the database was opened with `[audit] encrypt_at_rest`:
+    /// `prune_audit` needs the key to attach the archive database with the
+    /// *same* protection as the hot log. Held in memory like the pool's own
+    /// connect options; `AtRestKey`'s `Debug` is redacted.
+    at_rest_key: Option<AtRestKey>,
 }
 
 impl SqliteSessionStore {
@@ -450,7 +459,40 @@ impl SqliteSessionStore {
         let data_dir = app_data_dir()?;
         let data_dir_lock = acquire_data_dir_lock(&data_dir, Some(SESSION_LOCK_TIMEOUT), None)?;
         let db_path = data_dir.join("sessions.db");
-        let mut store = Self::connect_path(&db_path).await?;
+
+        // `[audit]` policy is read before the database is touched: at-rest
+        // encryption and retention are machine-wide settings from the global
+        // config file only (no env/project layer — see `AuditSettings`).
+        let settings = at_rest::AuditSettings::from_global_config()?;
+
+        let mut store = if settings.encrypt_at_rest {
+            let key = at_rest::resolve_at_rest_key()?;
+            Self::connect_with_at_rest(&db_path, &key).await?
+        } else {
+            Self::connect_path(&db_path).await?
+        };
+
+        // Best-effort retention while the data-dir lock is held, so two
+        // instances cannot prune concurrently. A failing prune never blocks
+        // startup: rows are only removed *after* they were archived, so the
+        // worst case is an unpruned log (and a warning). `connect()` has no
+        // caller-supplied token (its signature is fixed), hence a fresh one
+        // here; cancellation is exercised through `prune_audit` directly.
+        if let Some(days) = settings.retention_days {
+            let archive_dir = settings.archive_dir.unwrap_or_else(|| data_dir.clone());
+            match store.prune_audit(days, &archive_dir, &CancellationToken::new()).await {
+                Ok(report) => tracing::info!(
+                    archived = report.archived,
+                    deleted = report.deleted,
+                    cutoff_unix = report.cutoff_unix,
+                    "audit retention prune completed"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "audit retention prune failed; the audit log was left untouched")
+                }
+            }
+        }
+
         store._data_dir_lock = Some(data_dir_lock);
         Ok(store)
     }
@@ -464,6 +506,10 @@ impl SqliteSessionStore {
     /// open is retried once against a fresh database. If that retry also
     /// fails, the original error is returned (it is never masked).
     async fn connect_path(db_path: &std::path::Path) -> Result<Self, SessionError> {
+        // A marker-carrying database is encrypted: never open it with the
+        // plaintext path (and therefore never let the ADR-54 header heuristic
+        // below quarantine a healthy encrypted file).
+        at_rest::ensure_not_at_rest_encrypted(db_path)?;
         match Self::try_connect(db_path).await {
             Ok(store) => Ok(store),
             Err(original) => {
@@ -494,50 +540,9 @@ impl SqliteSessionStore {
 
     /// Open the database without quarantine recovery.
     async fn try_connect(db_path: &std::path::Path) -> Result<Self, SessionError> {
-        let options = SqliteConnectOptions::new()
-            .filename(db_path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .foreign_keys(true)
-            .synchronous(SqliteSynchronous::Normal);
-
-        let pool = PoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-
-        // Read the SQLite header so a garbage/truncated file fails the open
-        // deterministically instead of surfacing later on the first query.
-        let _schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version;")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-
-        sqlx::query("PRAGMA journal_mode=WAL;")
-            .execute(&pool)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-        sqlx::query("PRAGMA busy_timeout = 5000;")
-            .execute(&pool)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-        sqlx::query("PRAGMA foreign_keys = ON;")
-            .execute(&pool)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-        sqlx::query("PRAGMA synchronous = NORMAL;")
-            .execute(&pool)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| SessionError::Database(e.to_string()))?;
-
-        Ok(Self { pool, _data_dir_lock: None })
+        let options = at_rest::plain_options(db_path).create_if_missing(true);
+        let pool = at_rest::build_pool(options).await?;
+        Ok(Self { pool, _data_dir_lock: None, at_rest_key: None })
     }
 
     // In‑memory connection for tests – avoids filesystem side‑effects and uses the same PRAGMAs.
@@ -579,8 +584,18 @@ impl SqliteSessionStore {
             .await
             .map_err(|e| SessionError::Database(e.to_string()))?;
 
-        Ok(Self { pool, _data_dir_lock: None })
+        Ok(Self { pool, _data_dir_lock: None, at_rest_key: None })
     }
+}
+
+/// Run the embedded schema migrations (`./migrations`) against `pool`.
+/// Shared by the plaintext and at-rest open paths so both see one schema
+/// lifecycle.
+pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<(), SessionError> {
+    sqlx::migrate!("./migrations")
+        .run(pool)
+        .await
+        .map_err(|e| SessionError::Database(e.to_string()))
 }
 
 /// Normalise a project directory path for consistent storage and lookup.
@@ -3400,5 +3415,408 @@ mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().starts_with("valid.db.corrupt"));
         assert!(!touched, "valid-header file must never be quarantined");
+    }
+
+    // -----------------------------------------------------------------------
+    // At-rest encryption (row 44) + audit retention (row 19)
+    // -----------------------------------------------------------------------
+
+    use concerto_core::traits::policy::AuditEntry as PolicyAuditEntry;
+    use sqlx::{Connection as _, SqliteConnection};
+
+    /// Fixed test key (64 hex chars). Every at-rest test uses the same value
+    /// so a stray env override cannot make them race each other.
+    fn test_key() -> AtRestKey {
+        AtRestKey::parse_hex(&"11".repeat(32)).expect("valid test key")
+    }
+
+    /// Audit row aged `age_secs` seconds, attached to `session_id`.
+    fn aged_audit_entry(session_id: Ulid, age_secs: i64) -> PolicyAuditEntry {
+        PolicyAuditEntry {
+            tool_name: "test_tool".into(),
+            verdict: "Allow".into(),
+            input_hash: "hash".into(),
+            session_id,
+            correlation_id: Ulid::new(),
+            timestamp: time::OffsetDateTime::now_utc() - time::Duration::seconds(age_secs),
+            user_response: None,
+            rule_matched: Some("auto_approve".into()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+        }
+    }
+
+    fn quarantine_backups(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().contains(".corrupt-"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    async fn audit_row_count(store: &SqliteSessionStore) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&store.pool)
+            .await
+            .expect("audit_log count")
+    }
+
+    #[tokio::test]
+    /// A fresh database opened with a key is encrypted at rest, carries the
+    /// marker, refuses the plaintext path (without ever quarantining), and
+    /// fails closed on a wrong key — while the right key still reads the
+    /// data written earlier.
+    async fn at_rest_encrypts_a_fresh_database_and_fails_closed_on_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let key = test_key();
+
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+        let project = camino::Utf8PathBuf::from("/tmp/at-rest-fresh");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        store.pool.close().await;
+
+        assert!(!concerto_core::helpers::is_sqlite_file(&db_path), "file must be encrypted");
+        assert!(is_at_rest_encrypted(&db_path), "marker must exist");
+
+        // Plaintext path refuses instead of quarantining a healthy encrypted file.
+        let error = match SqliteSessionStore::connect_path(&db_path).await {
+            Ok(_) => panic!("plaintext path must refuse a marked database"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SessionError::Storage(_)),
+            "expected marker refusal, got {error:?}"
+        );
+
+        // Wrong key: fail closed, no quarantine, file and marker untouched.
+        let wrong = AtRestKey::parse_hex(&"22".repeat(32)).unwrap();
+        let error = match SqliteSessionStore::connect_with_at_rest(&db_path, &wrong).await {
+            Ok(_) => panic!("wrong key must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SessionError::Storage(_)), "expected key failure, got {error:?}");
+        assert!(db_path.is_file(), "wrong key must never move the database");
+        assert!(is_at_rest_encrypted(&db_path), "wrong key must keep the marker");
+        assert!(quarantine_backups(dir.path()).is_empty(), "wrong key must never quarantine");
+
+        // Right key: the earlier session is still there.
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+        let loaded = store.load_session(session.id, CancellationToken::new()).await.unwrap();
+        assert!(loaded.is_some(), "session must survive the wrong-key attempt");
+        store.pool.close().await;
+    }
+
+    #[tokio::test]
+    /// An existing plaintext database (sessions + audit rows) is converted to
+    /// SQLCipher in place: the data survives, the header becomes non-plaintext,
+    /// the marker appears and the swap leftovers are swept.
+    async fn at_rest_migrates_an_existing_plaintext_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+
+        // Plaintext origin with one session and one audit row.
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+        let project = camino::Utf8PathBuf::from("/tmp/at-rest-migrate");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        crate::audit::SqliteAuditLog::new(store.pool.clone())
+            .record(aged_audit_entry(session.id, 60), CancellationToken::new())
+            .await
+            .expect("audit row");
+        store.pool.close().await;
+        assert!(concerto_core::helpers::is_sqlite_file(&db_path), "origin is plaintext");
+
+        let key = test_key();
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+
+        assert!(!concerto_core::helpers::is_sqlite_file(&db_path), "file must be encrypted now");
+        assert!(is_at_rest_encrypted(&db_path), "marker must exist");
+        assert!(!db_path.with_extension("db.old").exists(), "swap leftover must be swept");
+        assert!(!std::path::Path::new(&format!("{}.enc-tmp", db_path.display())).exists());
+
+        let loaded = store.load_session(session.id, CancellationToken::new()).await.unwrap();
+        assert!(loaded.is_some(), "session must survive the conversion");
+        assert_eq!(audit_row_count(&store).await, 1, "audit row must survive the conversion");
+        store.pool.close().await;
+    }
+
+    #[tokio::test]
+    /// Losing the marker on an otherwise healthy encrypted database is
+    /// recovered: the keyed open succeeds and the marker is rewritten.
+    async fn at_rest_restores_a_lost_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let key = test_key();
+
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+        store.pool.close().await;
+        std::fs::remove_file(marker_path(&db_path)).unwrap();
+        assert!(!is_at_rest_encrypted(&db_path));
+
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+        assert!(is_at_rest_encrypted(&db_path), "marker must be rewritten");
+        assert!(!concerto_core::helpers::is_sqlite_file(&db_path));
+        store.pool.close().await;
+    }
+
+    #[tokio::test]
+    /// Stale marker next to healthy plaintext (crash before the swap):
+    /// recovery clears it and the conversion then proceeds normally.
+    async fn at_rest_recovers_a_stale_marker_and_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+        let project = camino::Utf8PathBuf::from("/tmp/at-rest-stale");
+        store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        store.pool.close().await;
+        // Simulate the interrupted swap: marker written, renames never ran.
+        std::fs::write(marker_path(&db_path), "concerto-sqlcipher-v1\n").unwrap();
+
+        let key = test_key();
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+        assert!(is_at_rest_encrypted(&db_path), "conversion must have completed");
+        assert!(!concerto_core::helpers::is_sqlite_file(&db_path));
+        assert_eq!(
+            store.list_recent_sessions(10, CancellationToken::new()).await.unwrap().len(),
+            1,
+            "the pre-existing session must survive"
+        );
+        store.pool.close().await;
+    }
+
+    #[tokio::test]
+    /// Retention core path: rows older than the window are copied into the
+    /// archive first and only then deleted; recent rows stay in place.
+    async fn prune_audit_archives_and_deletes_only_old_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+
+        let project = camino::Utf8PathBuf::from("/tmp/prune-audit");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        let audit = crate::audit::SqliteAuditLog::new(store.pool.clone());
+        audit
+            .record(aged_audit_entry(session.id, 100 * 86_400), CancellationToken::new())
+            .await
+            .expect("old audit row");
+        audit
+            .record(aged_audit_entry(session.id, 86_400), CancellationToken::new())
+            .await
+            .expect("recent audit row");
+        assert_eq!(audit_row_count(&store).await, 2);
+
+        let archive_dir = dir.path().join("archive");
+        let report =
+            store.prune_audit(30, &archive_dir, &CancellationToken::new()).await.expect("prune");
+        assert_eq!(report.deleted, 1, "exactly the row older than 30 days");
+        assert_eq!(report.archived, 1, "the deleted row must be archived first");
+        assert!(report.cutoff_unix > 0);
+
+        assert_eq!(audit_row_count(&store).await, 1, "the recent row stays hot");
+
+        // The archive holds the old row, in full.
+        let archive_path = archive_dir.join("audit-archive.db");
+        assert!(archive_path.is_file(), "archive file must exist");
+        let options = SqliteConnectOptions::new().filename(&archive_path);
+        let mut conn = SqliteConnection::connect_with(&options).await.expect("open archive");
+        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log_archive")
+            .fetch_one(&mut conn)
+            .await
+            .expect("archive count");
+        assert_eq!(archived, 1);
+        let tool: String = sqlx::query_scalar("SELECT tool_name FROM audit_log_archive")
+            .fetch_one(&mut conn)
+            .await
+            .expect("archive tool_name");
+        assert_eq!(tool, "test_tool");
+        conn.close().await.expect("close archive");
+    }
+
+    #[tokio::test]
+    /// The cutoff is strict: a row just older than the window is archived, a
+    /// row just younger survives.
+    async fn prune_audit_cutoff_is_strictly_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+
+        let project = camino::Utf8PathBuf::from("/tmp/prune-boundary");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        let audit = crate::audit::SqliteAuditLog::new(store.pool.clone());
+        // ~30 days + 5s (older than the window) vs ~30 days - 5s (inside it).
+        audit
+            .record(aged_audit_entry(session.id, 30 * 86_400 + 5), CancellationToken::new())
+            .await
+            .expect("older row");
+        audit
+            .record(aged_audit_entry(session.id, 30 * 86_400 - 5), CancellationToken::new())
+            .await
+            .expect("younger row");
+
+        let archive_dir = dir.path().join("archive");
+        let report =
+            store.prune_audit(30, &archive_dir, &CancellationToken::new()).await.expect("prune");
+        assert_eq!(report.deleted, 1, "only the row past the cutoff is deleted");
+        assert_eq!(audit_row_count(&store).await, 1, "the in-window row stays");
+    }
+
+    #[tokio::test]
+    /// Guard rails: `0` days is rejected (never delete everything) and a
+    /// cancelled token stops the prune before any statement runs.
+    async fn prune_audit_rejects_zero_days_and_honours_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+        let project = camino::Utf8PathBuf::from("/tmp/prune-guards");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        crate::audit::SqliteAuditLog::new(store.pool.clone())
+            .record(aged_audit_entry(session.id, 10 * 86_400), CancellationToken::new())
+            .await
+            .expect("audit row");
+
+        let archive_dir = dir.path().join("archive");
+        let error =
+            store.prune_audit(0, &archive_dir, &CancellationToken::new()).await.unwrap_err();
+        assert!(
+            matches!(error, SessionError::Validation(_)),
+            "zero days must be rejected: {error:?}"
+        );
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = store.prune_audit(1, &archive_dir, &cancel).await.unwrap_err();
+        assert!(
+            matches!(error, SessionError::Database(_)),
+            "cancelled prune must error: {error:?}"
+        );
+        assert_eq!(audit_row_count(&store).await, 1, "nothing may be deleted after a cancel");
+        assert!(!archive_dir.join("audit-archive.db").exists(), "no archive may be written");
+    }
+
+    #[tokio::test]
+    /// Fail closed: when the archive directory cannot be created, the prune
+    /// errors and every eligible row stays in the hot log.
+    async fn prune_audit_never_deletes_when_the_archive_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+        let project = camino::Utf8PathBuf::from("/tmp/prune-fail-closed");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        let audit = crate::audit::SqliteAuditLog::new(store.pool.clone());
+        for age in [100 * 86_400, 200 * 86_400] {
+            audit
+                .record(aged_audit_entry(session.id, age), CancellationToken::new())
+                .await
+                .expect("audit row");
+        }
+
+        // A *file* where the archive directory should go: create_dir_all fails.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let error = store.prune_audit(30, &blocked, &CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(error, SessionError::Storage(_)), "expected storage failure: {error:?}");
+        assert_eq!(audit_row_count(&store).await, 2, "rows must survive an archive failure");
+    }
+
+    #[tokio::test]
+    /// On an at-rest-encrypted store the archive is attached with the *same*
+    /// key, so pruned rows never end up in a plaintext file.
+    async fn prune_audit_writes_an_encrypted_archive_when_the_store_is_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let key = test_key();
+        let store = SqliteSessionStore::connect_with_at_rest(&db_path, &key).await.unwrap();
+
+        let project = camino::Utf8PathBuf::from("/tmp/prune-encrypted");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        crate::audit::SqliteAuditLog::new(store.pool.clone())
+            .record(aged_audit_entry(session.id, 100 * 86_400), CancellationToken::new())
+            .await
+            .expect("old audit row");
+
+        let archive_dir = dir.path().join("archive");
+        let report =
+            store.prune_audit(30, &archive_dir, &CancellationToken::new()).await.expect("prune");
+        assert_eq!((report.archived, report.deleted), (1, 1));
+
+        let archive_path = archive_dir.join("audit-archive.db");
+        assert!(archive_path.is_file());
+        assert!(
+            !concerto_core::helpers::is_sqlite_file(&archive_path),
+            "archive must be encrypted at rest, not plaintext"
+        );
+
+        // Reading it requires the key (connect itself is lazy; the first
+        // statement is where SQLCipher rejects a missing/wrong key).
+        let wrong_options = SqliteConnectOptions::new().filename(&archive_path);
+        let unreadable: Result<i64, ()> = async {
+            let mut conn = SqliteConnection::connect_with(&wrong_options).await.map_err(|_| ())?;
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log_archive")
+                .fetch_one(&mut conn)
+                .await
+                .map_err(|_| ())
+        }
+        .await;
+        assert!(unreadable.is_err(), "without the key the archive must not read");
+
+        let right_options = SqliteConnectOptions::new()
+            .filename(&archive_path)
+            .pragma("key", format!("'{}'", key.to_hex()));
+        let mut conn = SqliteConnection::connect_with(&right_options).await.expect("keyed open");
+        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log_archive")
+            .fetch_one(&mut conn)
+            .await
+            .expect("keyed archive read");
+        assert_eq!(archived, 1, "the archived row must be readable with the key");
+        conn.close().await.expect("close archive");
+        store.pool.close().await;
+    }
+
+    #[tokio::test]
+    /// A retention window wider than any possible timestamp keeps every row
+    /// (u64::MAX days must not wrap into "delete everything").
+    async fn prune_audit_keeps_everything_on_an_absurd_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+        let project = camino::Utf8PathBuf::from("/tmp/prune-huge");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        crate::audit::SqliteAuditLog::new(store.pool.clone())
+            .record(aged_audit_entry(session.id, 100 * 86_400), CancellationToken::new())
+            .await
+            .expect("old audit row");
+
+        let archive_dir = dir.path().join("archive");
+        let report = store
+            .prune_audit(u64::MAX, &archive_dir, &CancellationToken::new())
+            .await
+            .expect("prune");
+        assert_eq!((report.archived, report.deleted), (0, 0));
+        assert_eq!(audit_row_count(&store).await, 1, "the old row must survive");
     }
 }

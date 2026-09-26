@@ -50,19 +50,22 @@ pub struct HealthReport {
     pub stores: StoreSummary,
 }
 
-/// Offline status of one local SQLite store (ADR-54).
+/// Offline status of one local SQLite store (ADR-54, row 44).
 ///
-/// Derived from read-only file inspection: the SQLite magic header and any
-/// `.corrupt-<ts>.bak` quarantines beside the store. No database is opened
-/// and nothing is written — `concerto health` stays deterministic and safe.
+/// Derived from read-only file inspection: the SQLite magic header, the
+/// at-rest encryption marker (when present), and any `.corrupt-<ts>.bak`
+/// quarantines beside the store. No database is opened and nothing is
+/// written — `concerto health` stays deterministic and safe.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StoreStatus {
     /// Absolute path of the store file.
     pub path: String,
-    /// One of `ok`, `absent (created on first open)`, or
-    /// `corrupt (rebuilt on next open)`.
+    /// One of `ok`, `ok (encrypted at rest)`, `absent (created on first
+    /// open)`, or `corrupt (rebuilt on next open)`.
     pub state: String,
-    /// `true` when the file starts with the SQLite magic header.
+    /// `true` when the file starts with the SQLite magic header. Stays
+    /// `false` for at-rest-encrypted files, which have no plaintext header —
+    /// `state` is what reports them as healthy.
     pub sqlite_header_valid: bool,
     /// Names of `.corrupt-<ts>.bak` backups found next to the store.
     pub quarantined_backups: Vec<String>,
@@ -251,10 +254,16 @@ fn probe_store(path: std::path::PathBuf) -> StoreStatus {
     }
     let exists = path.is_file();
     let sqlite_header_valid = exists && concerto_core::helpers::is_sqlite_file(&path);
-    let state = match (exists, sqlite_header_valid) {
-        (false, _) => "absent (created on first open)".into(),
-        (true, true) => "ok".into(),
-        (true, false) => "corrupt (rebuilt on next open)".into(),
+    let encrypted_at_rest = exists && concerto_sessions::is_at_rest_encrypted(&path);
+    let state = match (exists, encrypted_at_rest, sqlite_header_valid) {
+        (false, _, _) => "absent (created on first open)".into(),
+        // An encrypted file has no plaintext SQLite header; the marker is
+        // written only after a verified keyed open, so it is the offline
+        // proof of health — reporting it as corrupt would be a false alarm
+        // on every healthy encrypted store (row 44).
+        (true, true, _) => "ok (encrypted at rest)".into(),
+        (true, false, true) => "ok".into(),
+        (true, false, false) => "corrupt (rebuilt on next open)".into(),
     };
     StoreStatus {
         path: path.display().to_string(),
@@ -892,6 +901,14 @@ mod tests {
         let status = probe_store(db.clone());
         assert_eq!(status.state, "ok");
         assert!(status.sqlite_header_valid);
+
+        // At-rest marker + non-SQLite header -> healthy encrypted, not corrupt.
+        std::fs::write(concerto_sessions::marker_path(&db), b"concerto-sqlcipher-v1\n").unwrap();
+        std::fs::write(&db, b"not-a-plaintext-sqlite-header").unwrap();
+        let status = probe_store(db.clone());
+        assert_eq!(status.state, "ok (encrypted at rest)");
+        assert!(!status.sqlite_header_valid, "encrypted files have no plaintext header");
+        std::fs::remove_file(concerto_sessions::marker_path(&db)).unwrap();
 
         // Quarantine backups are listed (ADR-54 self-heal evidence).
         let backup = "memory.db.corrupt-1723000000.bak";

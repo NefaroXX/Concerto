@@ -1011,7 +1011,9 @@ impl AuditLog for NoopAuditLog {
 
 /// Open (or create) the SQLite pool for the append-only audit log.
 /// Uses a separate connection from the session store so audit writes
-/// never block session operations.
+/// never block session operations — via `SqliteSessionStore::open_pool`
+/// so the same at-rest policy as the store applies: an encrypted
+/// `sessions.db` must not silently disable auditing (row 44).
 async fn create_audit_pool(
     data_dir: &std::path::Path,
 ) -> Result<sqlx::SqlitePool, OrchestratorError> {
@@ -1020,26 +1022,9 @@ async fn create_audit_pool(
     })?;
 
     let db_path = data_dir.join("sessions.db");
-    let options =
-        sqlx::sqlite::SqliteConnectOptions::new().filename(&db_path).create_if_missing(true);
-    let pool = sqlx::SqlitePool::connect_with(options).await.map_err(|e| {
+    concerto_sessions::SqliteSessionStore::open_pool(&db_path).await.map_err(|e| {
         OrchestratorError::AgentLoopError(format!("failed to connect to audit DB: {e}"))
-    })?;
-
-    sqlx::query("PRAGMA journal_mode=WAL;")
-        .execute(&pool)
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("audit PRAGMA error: {e}")))?;
-    sqlx::query("PRAGMA foreign_keys=ON;")
-        .execute(&pool)
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("audit PRAGMA error: {e}")))?;
-    sqlx::migrate!("../sessions/migrations")
-        .run(&pool)
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("audit migration error: {e}")))?;
-
-    Ok(pool)
+    })
 }
 
 /// Resolve the provider based on the selected ID and configuration.
