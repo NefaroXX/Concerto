@@ -338,13 +338,92 @@ impl GoogleStreamState {
     }
 }
 
-/// Remove `key` from `message`, if present. See [`GoogleProvider::scrub`].
+/// Substitution written in place of every representation of the API key.
+const REDACTED: &str = "[REDACTED]";
+
+/// Remove every representation of `key` from `message`. See
+/// [`GoogleProvider::scrub`].
+///
+/// A key containing query-special characters (`=`, `/`, `+`, `%`, `&`, …) is
+/// percent-encoded in the URL that `reqwest::Error` renders, so scrubbing only
+/// the raw key would leak the encoded form. Every candidate rendering is
+/// removed **case-insensitively**, which also covers upper- and lower-case
+/// percent-escape hex digits.
 fn scrub_message(message: &str, key: &SecretString) -> String {
     let key = key.expose();
     if key.is_empty() {
         return message.to_string();
     }
-    message.replace(key, "[REDACTED]")
+    let mut out = message.to_string();
+    for candidate in key_representations(key) {
+        out = replace_all_case_insensitive(&out, &candidate, REDACTED);
+    }
+    out
+}
+
+/// Every rendering of `key` that a transport error could carry.
+///
+/// Includes the raw key, the exact percent-encoding the `url` crate applies to
+/// a query component (reqwest serialises request URLs through that crate, so
+/// this is byte-for-byte what its `Error` would print), and a conservative
+/// RFC-3986 unreserved-only encoding for any layer that encodes more
+/// aggressively than `url` does. Duplicates are harmless: the first pass
+/// removes the span, later passes find nothing.
+fn key_representations(key: &str) -> Vec<String> {
+    let mut forms = vec![key.to_string()];
+    // Round-trip the key through the same URL parser reqwest uses. A parse
+    // failure (control characters, an over-long key) simply leaves this
+    // candidate out; the strict form below still covers it.
+    const PREFIX: &str = "https://example.invalid/?key=";
+    if let Ok(url) = reqwest::Url::parse(&format!("{PREFIX}{key}")) {
+        if let Some(encoded) = url.as_str().strip_prefix(PREFIX) {
+            forms.push(encoded.to_string());
+        }
+    }
+    forms.push(percent_encode_strict(key));
+    forms
+}
+
+/// Percent-encode every byte outside the RFC-3986 unreserved set
+/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`). Uppercase hex; case-insensitive
+/// matching covers lowercase escapes.
+fn percent_encode_strict(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Replace every ASCII-case-insensitive occurrence of `needle` in `haystack`
+/// with `replacement`.
+///
+/// `to_ascii_lowercase` never changes byte length, so indices found in the
+/// lowered copy align with the original bytes. An empty `needle` is a no-op.
+fn replace_all_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut copied_to = 0;
+    let mut search_from = 0;
+    while let Some(offset) = lower_haystack[search_from..].find(&lower_needle) {
+        let start = search_from + offset;
+        let end = start + needle.len();
+        out.push_str(&haystack[copied_to..start]);
+        out.push_str(replacement);
+        copied_to = end;
+        search_from = end;
+    }
+    out.push_str(&haystack[copied_to..]);
+    out
 }
 
 #[async_trait]
@@ -602,6 +681,61 @@ mod tests {
     fn scrub_of_an_empty_key_is_a_noop() {
         let p = GoogleProvider::new(String::new(), "gemini-2.0-flash".into(), 30);
         assert_eq!(p.scrub("no key configured"), "no key configured");
+    }
+
+    /// A key containing query-special characters is percent-encoded in the
+    /// URL reqwest renders; every encoded form must be scrubbed, not just the
+    /// raw key. Fixture is synthetic.
+    #[test]
+    fn scrub_strips_percent_encoded_api_key_forms() {
+        // Contains every character class named by the finding: `=`, `/`, `+`,
+        // `%`, `&`.
+        const KEY: &str = "sk-A=1/B+2%3&C";
+        let p = GoogleProvider::new(KEY.to_string(), "gemini-2.0-flash".into(), 30);
+
+        let raw = format!("error for url (https://example.test/?key={KEY})");
+        // Full percent-encoding, the form a URL/form encoder produces when it
+        // escapes every non-unreserved byte (`=` `/` `+` `%` `&`).
+        let strict = "error for url (https://example.test/?key=sk-A%3D1%2FB%2B2%253%26C)";
+        // Same, with lowercase hex escapes (case-insensitive matching).
+        let lower_hex = "error for url (https://example.test/?key=sk-a%3d1%2fb%2b2%253%26c)";
+
+        for message in [raw.as_str(), strict, lower_hex] {
+            let scrubbed = p.scrub(message);
+            assert!(!scrubbed.contains(KEY), "raw api_key leaked from {message:?}: {scrubbed}");
+            assert!(
+                !scrubbed.contains("sk-A%3D1%2FB%2B2%253%26C"),
+                "uppercase strict encoding leaked from {message:?}: {scrubbed}"
+            );
+            assert!(
+                !scrubbed.contains("sk-a%3d1%2fb%2b2%253%26c"),
+                "lowercase encoding leaked from {message:?}: {scrubbed}"
+            );
+            assert!(
+                scrubbed.contains(REDACTED),
+                "redaction marker missing for {message:?}: {scrubbed}"
+            );
+        }
+    }
+
+    /// A fully percent-encoded key is generated as a candidate and scrubbed;
+    /// guards the strict encoder used for the encoded forms the finding named.
+    #[test]
+    fn scrub_covers_strict_percent_encoding() {
+        const KEY: &str = "sk-A=1/B+2%3&C";
+        let p = GoogleProvider::new(KEY.to_string(), "gemini-2.0-flash".into(), 30);
+        let encoded = key_representations(KEY)
+            .into_iter()
+            .find(|form| form != KEY && form.contains('%'))
+            .expect("a percent-encoded representation is generated");
+        assert!(
+            encoded.contains("%3D") && encoded.contains("%2F") && encoded.contains("%2B"),
+            "the strict encoder must escape the named characters: {encoded}"
+        );
+        let message = format!("error for url (https://example.test/?key={encoded})");
+        let scrubbed = p.scrub(&message);
+        assert!(!scrubbed.contains(&encoded), "strict encoding {encoded:?} leaked: {scrubbed}");
+        assert!(scrubbed.contains(REDACTED));
     }
 
     #[test]
