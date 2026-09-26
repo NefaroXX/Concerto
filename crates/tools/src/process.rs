@@ -345,10 +345,18 @@ async fn cpu_watchdog(budget: Option<CpuBudget>, group_leader: Option<u32>) -> D
     let (Some(budget), Some(pgid)) = (budget, group_leader) else {
         return std::future::pending::<Duration>().await;
     };
+    // Capture the group's lineage before the first sample: the leader's start
+    // time lets later samples detect a recycled pgid and refuse to attribute a
+    // foreign group's CPU. A leader whose stat line cannot be read means the
+    // watchdog cannot verify reuse, so it stays disarmed (fail-open, matching
+    // the unsupported-platform behaviour above).
+    let Some(lineage) = cpu_accounting::capture_lineage(pgid) else {
+        return std::future::pending::<Duration>().await;
+    };
     let limit = budget.duration();
     loop {
         tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
-        match cpu_accounting::group_cpu_time(pgid) {
+        match cpu_accounting::group_cpu_time(&lineage) {
             Some(used) if used >= limit => return used,
             Some(_) => {}
             None => return std::future::pending::<Duration>().await,
