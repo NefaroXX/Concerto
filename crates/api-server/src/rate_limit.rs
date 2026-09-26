@@ -23,7 +23,7 @@ use axum::{
 };
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -40,8 +40,13 @@ pub const RATE_LIMIT_WINDOW_ENV: &str = "CONCERTO_API_RATE_LIMIT_WINDOW_SECS";
 const DEFAULT_WINDOW_SECS: u64 = 60;
 
 /// Once this many clients are tracked, expired windows are pruned. Bounds
-/// memory under a many-source-address flood: the map retains at most the
-/// clients active in the current window plus this threshold.
+/// memory under a many-source-address flood.
+///
+/// This is a *threshold*, not a strict cap: the map is pruned when it reaches
+/// this size, so it can hold the clients active in the current window plus up
+/// to this many more (a sustained flood of distinct keys can exceed it before
+/// the next prune). It is a memory-safety backstop, not a hard ceiling on
+/// distinct clients.
 const PRUNE_THRESHOLD: usize = 4096;
 
 /// Path that never consumes budget — mirrors the health bypass in
@@ -273,10 +278,29 @@ pub async fn rate_limit_layer(
 /// client-controlled, so honouring them would let an attacker rotate keys and
 /// sidestep the limiter. The port is excluded so a client that reconnects
 /// (new ephemeral port) shares one bucket.
+///
+/// IPv6 peers are keyed on their /64 network prefix, not the full address: a
+/// single client is routinely delegated a /64 (or larger) and can rotate the
+/// low 64 bits for free, which would otherwise let it sidestep the limit. The
+/// trade-off is that distinct clients inside the same /64 share one bucket —
+/// which matches how IPv6 allocations are actually made. IPv4 keeps its full
+/// address (its allocations are not made in large free-to-rotate blocks).
 fn client_key(req: &Request) -> Option<String> {
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|connect_info| connect_info.0.ip().to_string())
+    let ip = req.extensions().get::<ConnectInfo<SocketAddr>>()?.0.ip();
+    Some(rate_limit_key(ip))
+}
+
+/// Canonical bucket key for `ip`: unchanged for IPv4, /64-aggregated for IPv6.
+fn rate_limit_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            // Zero the interface identifier, keeping the /64 network prefix.
+            let mut prefix = [0u8; 16];
+            prefix[..8].copy_from_slice(&v6.octets()[..8]);
+            format!("{}/64", Ipv6Addr::from(prefix))
+        }
+    }
 }
 
 /// 429 with `Retry-After`.
@@ -324,6 +348,18 @@ mod tests {
 
     async fn send(app: &Router, uri: &str, a: u8, b: u8, c: u8, d: u8) -> Response {
         app.clone().oneshot(client_request(uri, a, b, c, d)).await.expect("request")
+    }
+
+    /// Request to `uri` as if it came from `addr` (`:54321`).
+    fn client_request_v6(uri: &str, addr: Ipv6Addr) -> Request<Body> {
+        let mut req = Request::builder().uri(uri).body(Body::empty()).expect("static body");
+        let addr = SocketAddr::new(IpAddr::V6(addr), 54321);
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    async fn send_v6(app: &Router, uri: &str, addr: Ipv6Addr) -> Response {
+        app.clone().oneshot(client_request_v6(uri, addr)).await.expect("request")
     }
 
     /// Requests at or below the limit pass through to the handler.
@@ -405,6 +441,56 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS
             );
         });
+    }
+
+    /// Two IPv6 addresses in the same /64 share one bucket, so a client cannot
+    /// rotate the low 64 bits to sidestep the limit.
+    #[test]
+    fn ipv6_addresses_in_same_64_share_a_bucket() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let app = test_router(RateLimitState::enabled(RateLimitConfig {
+            max_requests: 1,
+            window_secs: 60,
+        }));
+        let a: Ipv6Addr = "2001:db8:1:2::1".parse().expect("v6 addr");
+        let b: Ipv6Addr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().expect("v6 addr");
+        rt.block_on(async {
+            assert_eq!(send_v6(&app, "/test", a).await.status(), StatusCode::OK);
+            assert_eq!(
+                send_v6(&app, "/test", b).await.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "a rotation within the same /64 must share the bucket"
+            );
+        });
+    }
+
+    /// Distinct /64 prefixes stay isolated: one client's flood must not throttle
+    /// another network.
+    #[test]
+    fn distinct_ipv6_64_prefixes_are_isolated() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let app = test_router(RateLimitState::enabled(RateLimitConfig {
+            max_requests: 1,
+            window_secs: 60,
+        }));
+        let a: Ipv6Addr = "2001:db8:1:2::1".parse().expect("v6 addr");
+        let b: Ipv6Addr = "2001:db8:1:3::1".parse().expect("v6 addr");
+        rt.block_on(async {
+            assert_eq!(send_v6(&app, "/test", a).await.status(), StatusCode::OK);
+            assert_eq!(send_v6(&app, "/test", a).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            // A different /64 gets its full budget.
+            assert_eq!(send_v6(&app, "/test", b).await.status(), StatusCode::OK);
+            assert_eq!(send_v6(&app, "/test", b).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        });
+    }
+
+    /// IPv4 keying is unchanged: the full address, not an aggregate.
+    #[test]
+    fn ipv4_client_key_is_the_full_address() {
+        let key = rate_limit_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(key, "192.0.2.1");
+        // Distinct IPv4 addresses in the same /24 remain distinct buckets.
+        assert_ne!(key, rate_limit_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))));
     }
 
     /// With the config disabled (env unset — the default), every request
