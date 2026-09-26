@@ -1,12 +1,14 @@
 //! Shell tool implementation — async, cancellable, sandboxed process execution.
 
 use crate::common::canonicalize_within;
+use crate::container::{containerize, containerize_with, ContainerConfig};
 use crate::containment::contain_shell_command;
 use crate::process::{CpuBudget, ProcessHandle, ProcessOutput};
 use crate::shell_backend::ShellProfileFactory;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use concerto_config::shell::ShellProfileConfig;
+use concerto_core::sandbox::ContainerRuntimeProbe;
 use concerto_core::traits::PolicyEngine;
 use concerto_core::types::{
     CapabilitySet, CommandPolicyFacts, DestructiveClass, FilesystemScope, SessionContext,
@@ -18,6 +20,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Default timeout for shell commands when not specified by the caller.
@@ -592,7 +595,7 @@ fn windows_shell_requirement(shell_override: Option<&str>, command: &str) -> Opt
 /// `command_facts`, so the argv that is audited can never drift from the argv
 /// that actually runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ShellPlan {
+pub(crate) enum ShellPlan {
     /// Spawn `program` directly with its own argv — no shell in between.
     Direct { program: String, args: Vec<String> },
     /// Spawn `program` (a shell) with `switches` followed by `operand`.
@@ -673,6 +676,14 @@ pub struct ShellTool {
     /// the selected profile's executable/args/env instead of the hardcoded OS
     /// default. `None` preserves the legacy `ShellConfig` behaviour.
     profile: Option<ShellProfileConfig>,
+    /// ADR-72: opt-in container routing. When set, the planned invocation is
+    /// wrapped in a `docker`/`podman run` argv (fail-closed if no runtime is
+    /// available). `None` (default) is byte-identical to pre-ADR-72 behavior.
+    container: Option<ContainerConfig>,
+    /// ADR-72 §3: injectable container-runtime detection seam. `None` (the
+    /// default) uses the process-wide system probe; tests inject a fixed
+    /// found/absent result so no container runtime is ever required.
+    container_probe: Option<Arc<dyn ContainerRuntimeProbe>>,
 }
 
 impl Default for ShellTool {
@@ -684,12 +695,17 @@ impl Default for ShellTool {
 impl ShellTool {
     /// Creates a new `ShellTool` with the default hardcoded denylist.
     pub fn new() -> Self {
-        Self { config: ShellConfig::default(), profile: None }
+        Self {
+            config: ShellConfig::default(),
+            profile: None,
+            container: None,
+            container_probe: None,
+        }
     }
 
     /// Creates a `ShellTool` with a custom configuration.
     pub fn with_config(config: ShellConfig) -> Self {
-        Self { config, profile: None }
+        Self { config, profile: None, container: None, container_probe: None }
     }
 
     /// Creates a `ShellTool` driven by a configured shell profile (ADR-28).
@@ -698,7 +714,12 @@ impl ShellTool {
     /// engine remains the real gate) — used for agent execution the user has
     /// already approved, matching the legacy `ShellTool::allow_all` behaviour.
     pub fn with_profile(profile: ShellProfileConfig, allow_all: bool) -> Self {
-        Self { config: ShellConfig { allow_all, ..Default::default() }, profile: Some(profile) }
+        Self {
+            config: ShellConfig { allow_all, ..Default::default() },
+            profile: Some(profile),
+            container: None,
+            container_probe: None,
+        }
     }
 
     /// Creates a `ShellTool` that permits all commands. The policy engine and
@@ -707,7 +728,12 @@ impl ShellTool {
     /// commands that the user has approved. The hardcoded denylist (e.g.
     /// `rm -rf /`, `dd`, `mkfs`) still always applies.
     pub fn allow_all() -> Self {
-        Self { config: ShellConfig { allow_all: true, ..Default::default() }, profile: None }
+        Self {
+            config: ShellConfig { allow_all: true, ..Default::default() },
+            profile: None,
+            container: None,
+            container_probe: None,
+        }
     }
 
     /// Creates an allow-all tool that spawns the requested executable
@@ -718,7 +744,26 @@ impl ShellTool {
         Self {
             config: ShellConfig { bypass_shell: true, allow_all: true, ..Default::default() },
             profile: None,
+            container: None,
+            container_probe: None,
         }
+    }
+
+    /// Route this tool's invocations through an OS-level container runtime
+    /// (ADR-72). The invocation is refused fail-closed when no runtime is
+    /// available or the platform is unsupported.
+    pub fn with_container(mut self, container: ContainerConfig) -> Self {
+        self.container = Some(container);
+        self
+    }
+
+    /// Inject the container-runtime detection probe (ADR-72 §3). Defaults to
+    /// the process-wide system probe when unset. Tests use this to make
+    /// found/absent/malformed detection deterministic without a container
+    /// runtime; operators may use it to supply a differently cached probe.
+    pub fn with_container_runtime_probe(mut self, probe: Arc<dyn ContainerRuntimeProbe>) -> Self {
+        self.container_probe = Some(probe);
+        self
     }
 
     /// The shell program this tool spawns: the profile-resolved executable
@@ -800,6 +845,29 @@ impl ShellTool {
     /// Production-host shorthand for [`ShellTool::shell_plan_for`].
     fn shell_plan(&self, shell_input: &ShellInput, full_command: &str) -> ShellPlan {
         self.shell_plan_for(host(), &shell_input.command, &shell_input.args, full_command)
+    }
+
+    /// ADR-72: apply container routing when configured. A no-op (byte-identical
+    /// to pre-ADR-72) when no container config is attached. Refuses fail-closed
+    /// when the profile cannot be enforced.
+    ///
+    /// Detection is the injected probe when present, else the process-wide
+    /// system probe. A missing runtime yields an explicit refusal here, so a
+    /// container-configured tool can never silently execute its inner command
+    /// unconfined.
+    fn containerized_plan(
+        &self,
+        plan: ShellPlan,
+        cwd: &Utf8Path,
+        project_root: &Utf8Path,
+    ) -> Result<ShellPlan, ToolError> {
+        let Some(config) = &self.container else {
+            return Ok(plan);
+        };
+        match &self.container_probe {
+            Some(probe) => containerize_with(&plan, config, probe.probe(), cwd, project_root),
+            None => containerize(&plan, config, cwd, project_root),
+        }
     }
 
     /// Effective CPU budget for one execution: explicit config, else the
@@ -964,11 +1032,42 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         let shell_input: ShellInput = serde_json::from_value(input.clone()).ok()?;
         let full_command = self.full_command(&shell_input.command, &shell_input.args);
 
+        let network_requested = command_looks_networked(&shell_input.command, &shell_input.args);
+        let destructive_classification = DestructiveClass::classify_command(&full_command);
+
+        let project_dir = &session.project_dir;
+        let working_directory = match shell_input.cwd.as_ref() {
+            Some(cwd) => {
+                let cwd = PathBuf::from(normalize_msys_cwd(cwd).as_ref());
+                Some(if cwd.is_absolute() { cwd } else { project_dir.join(cwd) })
+            }
+            None => self
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.resolve_working_dir(project_dir, home_dir().as_deref()))
+                .or(Some(project_dir.clone())),
+        };
+        let filesystem_scope =
+            FilesystemScope::classify_for(working_directory.as_deref(), project_dir);
+
         // Describe the executable and argv that will actually be spawned, from
         // the same plan `execute` runs: a profile/legacy shell is the launcher,
         // direct mode (bypass, or Windows argv-direct preference) launches the
-        // requested program itself.
+        // requested program itself. Under ADR-72 the plan is first routed
+        // through the container so the audited argv is the container argv that
+        // runs (a failure to containerize yields no facts; `execute` refuses).
         let plan = self.shell_plan(&shell_input, &full_command);
+        let plan = match &self.container {
+            Some(_) => {
+                let cwd_utf8 = Utf8PathBuf::from_path_buf(
+                    working_directory.clone().unwrap_or_else(|| project_dir.clone()),
+                )
+                .ok()?;
+                let root_utf8 = Utf8PathBuf::from_path_buf(project_dir.clone()).ok()?;
+                self.containerized_plan(plan, &cwd_utf8, &root_utf8).ok()?
+            }
+            None => plan,
+        };
         let (resolved_executable, argv) = match &plan {
             ShellPlan::Direct { program, args } => (
                 resolve_program_in_path(program),
@@ -988,24 +1087,6 @@ impl concerto_core::traits::tool::Tool for ShellTool {
                     .collect(),
             ),
         };
-
-        let network_requested = command_looks_networked(&shell_input.command, &shell_input.args);
-        let destructive_classification = DestructiveClass::classify_command(&full_command);
-
-        let project_dir = &session.project_dir;
-        let working_directory = match shell_input.cwd.as_ref() {
-            Some(cwd) => {
-                let cwd = PathBuf::from(normalize_msys_cwd(cwd).as_ref());
-                Some(if cwd.is_absolute() { cwd } else { project_dir.join(cwd) })
-            }
-            None => self
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.resolve_working_dir(project_dir, home_dir().as_deref()))
-                .or(Some(project_dir.clone())),
-        };
-        let filesystem_scope =
-            FilesystemScope::classify_for(working_directory.as_deref(), project_dir);
 
         Some(CommandPolicyFacts {
             shell_profile_id: self.profile.as_ref().map(|p| p.id.clone()),
@@ -1094,6 +1175,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
             )?;
             let plan = self.shell_plan(&shell_input, &full_command);
             validate_plan_args(&plan, &shell_input.args)?;
+            let plan = self.containerized_plan(plan, &effective_cwd, &project_dir)?;
             let result =
                 spawn_plan(&plan, &effective_cwd, Some(&env), timeout, cpu_budget, cancel).await;
             return into_tool_output(result, &shell_input.command, timeout_secs);
@@ -1111,6 +1193,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
         // always shell-wrapped, exactly as before.
         let plan = self.shell_plan(&shell_input, &full_command);
         validate_plan_args(&plan, &shell_input.args)?;
+        let plan = self.containerized_plan(plan, &cwd, &project_dir)?;
         let result = spawn_plan(&plan, &cwd, None, timeout, cpu_budget, cancel).await;
 
         into_tool_output(result, &shell_input.command, timeout_secs)
@@ -1391,6 +1474,201 @@ mod tests {
             allow_all: false,
             cpu_budget_secs: None,
         })
+    }
+
+    /// ADR-72: with no container config the plan is untouched (byte-identical
+    /// to pre-ADR-72).
+    #[test]
+    fn containerized_plan_is_identity_without_container_config() {
+        let tool = test_tool();
+        let input = ShellInput {
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            cwd: None,
+            timeout_secs: None,
+        };
+        let full = tool.full_command(&input.command, &input.args);
+        let plan = tool.shell_plan(&input, &full);
+        let root = Utf8PathBuf::from("/proj");
+        let routed = tool.containerized_plan(plan.clone(), &root, &root).expect("identity");
+        assert_eq!(routed, plan);
+    }
+
+    /// ADR-72: an attached container config routes the planned invocation
+    /// through the runtime, preserving the row-42 launch shape as the inner
+    /// command (asserted at the seam; no runtime is invoked).
+    #[test]
+    fn containerized_plan_routes_wrapped_shell_through_runtime() {
+        let tool = ShellTool::new().with_container(ContainerConfig {
+            runtime: Some(concerto_core::sandbox::ContainerRuntime::Docker),
+            ..ContainerConfig::new("alpine:3")
+        });
+        let input = ShellInput {
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            cwd: None,
+            timeout_secs: None,
+        };
+        let full = tool.full_command(&input.command, &input.args);
+        let plan = tool.shell_plan(&input, &full);
+        let root = Utf8PathBuf::from("/proj");
+        let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
+        let ShellPlan::Direct { program, args } = routed else {
+            panic!("container plan must be argv-direct");
+        };
+        assert_eq!(program, "docker");
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"alpine:3".to_string()));
+        assert!(args.contains(&"/proj:/proj".to_string()));
+    }
+
+    /// ADR-72: a working directory outside the mount is refused fail-closed
+    /// with the named unenforceable rule.
+    #[test]
+    fn containerized_plan_refuses_out_of_root_cwd() {
+        let tool = ShellTool::new().with_container(ContainerConfig {
+            runtime: Some(concerto_core::sandbox::ContainerRuntime::Docker),
+            ..ContainerConfig::new("alpine:3")
+        });
+        let input =
+            ShellInput { command: "echo".into(), args: vec![], cwd: None, timeout_secs: None };
+        let full = tool.full_command(&input.command, &input.args);
+        let plan = tool.shell_plan(&input, &full);
+        let root = Utf8PathBuf::from("/proj");
+        let cwd = Utf8PathBuf::from("/tmp/elsewhere");
+        let err = tool.containerized_plan(plan, &cwd, &root).expect_err("must refuse");
+        assert!(matches!(
+            err,
+            ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_unenforceable"
+        ));
+    }
+
+    /// ADR-72 test double: a container-runtime probe with a fixed verdict, so
+    /// detection is deterministic without a container runtime installed.
+    struct FixedRuntimeProbe(concerto_core::sandbox::RuntimeAvailability);
+
+    impl ContainerRuntimeProbe for FixedRuntimeProbe {
+        fn probe(&self) -> concerto_core::sandbox::RuntimeAvailability {
+            self.0.clone()
+        }
+    }
+
+    /// ADR-72 §2: with a container config attached but detection reporting no
+    /// runtime, the invocation is refused fail-closed — the unconfined inner
+    /// plan is never returned. Deterministic (injected probe), no runtime
+    /// required.
+    #[cfg(not(windows))]
+    #[test]
+    fn containerized_plan_refuses_when_probe_reports_absent() {
+        let tool = ShellTool::new()
+            .with_container(ContainerConfig::new("alpine:3"))
+            .with_container_runtime_probe(Arc::new(FixedRuntimeProbe(
+                concerto_core::sandbox::RuntimeAvailability::Unavailable {
+                    reason: "test: no runtime".into(),
+                },
+            )));
+        let input =
+            ShellInput { command: "echo".into(), args: vec![], cwd: None, timeout_secs: None };
+        let full = tool.full_command(&input.command, &input.args);
+        let plan = tool.shell_plan(&input, &full);
+        let root = Utf8PathBuf::from("/proj");
+        let err = tool
+            .containerized_plan(plan, &root, &root)
+            .expect_err("absent runtime must refuse, never pass through");
+        assert!(matches!(
+            err,
+            ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_runtime_unavailable"
+        ));
+    }
+
+    /// ADR-72 §3: an injected probe reporting an available runtime routes the
+    /// plan through it, without consulting the host `PATH`.
+    #[test]
+    fn containerized_plan_routes_with_injected_available_probe() {
+        let tool = ShellTool::new()
+            .with_container(ContainerConfig::new("alpine:3"))
+            .with_container_runtime_probe(Arc::new(FixedRuntimeProbe(
+                concerto_core::sandbox::RuntimeAvailability::Available(
+                    concerto_core::sandbox::ContainerRuntime::Podman,
+                ),
+            )));
+        let input =
+            ShellInput { command: "echo".into(), args: vec![], cwd: None, timeout_secs: None };
+        let full = tool.full_command(&input.command, &input.args);
+        let plan = tool.shell_plan(&input, &full);
+        let root = Utf8PathBuf::from("/proj");
+        let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
+        let ShellPlan::Direct { program, args } = routed else { panic!("argv-direct") };
+        assert_eq!(program, "podman");
+        assert_eq!(args[0], "run");
+    }
+
+    /// ADR-72 §4 / row 45: the CPU `ulimit` prelude built by `with_cpu_limit`
+    /// rides inside the container command unchanged, is not duplicated as a
+    /// runtime ceiling, and the resulting argv-direct container plan takes no
+    /// kernel backstop, so the in-container `ulimit` is the single CPU guard.
+    #[test]
+    fn containerized_plan_carries_row45_cpu_budget_inside_container() {
+        let tool = ShellTool::with_config(ShellConfig {
+            allowlist: vec![Regex::new(r"^echo( .*)?$").unwrap()],
+            denylist: build_hardcoded_denylist(),
+            shell: Some("/bin/sh".to_string()),
+            bypass_shell: false,
+            allow_all: false,
+            cpu_budget_secs: Some(5),
+        })
+        .with_container(ContainerConfig::new("alpine:3"))
+        .with_container_runtime_probe(Arc::new(FixedRuntimeProbe(
+            concerto_core::sandbox::RuntimeAvailability::Available(
+                concerto_core::sandbox::ContainerRuntime::Docker,
+            ),
+        )));
+
+        let input = ShellInput {
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            cwd: None,
+            timeout_secs: None,
+        };
+        let full = tool.full_command(&input.command, &input.args);
+        let plan = tool.shell_plan(&input, &full);
+        let ShellPlan::Wrapped { operand, verbatim, .. } = &plan else {
+            panic!("expected a POSIX wrapped plan, got {plan:?}");
+        };
+        assert!(!verbatim);
+        assert!(operand.starts_with("ulimit -S -t 5; "));
+
+        let routed = tool
+            .containerized_plan(plan, &Utf8PathBuf::from("/proj"), &Utf8PathBuf::from("/proj"))
+            .expect("routed");
+        let ShellPlan::Direct { program, args } = &routed else { panic!("argv-direct") };
+        assert_eq!(program, "docker");
+        let image = args.iter().position(|a| a == "alpine:3").expect("image");
+        let expected: Vec<String> =
+            vec!["/bin/sh".into(), "-c".into(), format!("ulimit -S -t 5; {full}")];
+        assert_eq!(&args[image + 1..], expected.as_slice());
+        // The runtime itself is never asked to impose a CPU ceiling.
+        assert!(!args.iter().any(|a| a == "--ulimit" || a == "--cpus"));
+        // The outer container argv takes no kernel backstop; the prelude inside
+        // is the enforcement, exactly as ADR-72 §4 requires.
+        assert!(!plan_takes_cpu_backstop(&routed, tool.cpu_budget()));
+    }
+
+    /// ADR-72: the audited command facts describe the container argv that
+    /// actually runs, so the policy gate's "well-formed plan" sees the routing.
+    #[test]
+    fn container_command_facts_describe_the_runtime_argv() {
+        let tool = ShellTool::new().with_container(ContainerConfig {
+            runtime: Some(concerto_core::sandbox::ContainerRuntime::Docker),
+            ..ContainerConfig::new("alpine:3")
+        });
+        let session = test_session();
+        let input = json!({"command": "echo", "args": ["hi"]});
+        let facts = tool.command_facts(&input, &session).expect("container facts");
+        assert_eq!(facts.argv.first().map(String::as_str), Some("docker"));
+        assert_eq!(facts.argv.get(1).map(String::as_str), Some("run"));
+        assert!(facts.argv.contains(&"alpine:3".to_string()));
+        assert!(facts.working_directory.is_some());
     }
 
     #[tokio::test]

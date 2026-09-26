@@ -3,9 +3,7 @@ use crate::authorization::{
     RULE_COORDINATOR_AUTHORITY,
 };
 use crate::error::PolicyError;
-use crate::sandbox::{
-    is_container_routable_tool, ContainerRuntimeProbe, SystemContainerRuntime,
-};
+use crate::sandbox::{is_container_routable_tool, ContainerRuntimeProbe, SystemContainerRuntime};
 use crate::traits::policy::{AuditEntry, AuditLog, PolicyEngine};
 use crate::types::{
     CodeCategory, Condition, PolicyAction, PolicyRule, PolicyVerdict, SandboxProfile,
@@ -427,14 +425,12 @@ impl SimplePolicyEngine {
     /// `SandboxProfile::Containerized` admission (ADR-72 §2).
     fn check_containerized(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
         match self.sandbox_runtime.probe() {
-            unavailable if !unavailable.is_available() => Some((
-                PolicyVerdict::Deny,
-                "sandbox_containerized_runtime_unavailable".into(),
-            )),
-            _ if !container_plan_is_well_formed(action) => Some((
-                PolicyVerdict::Deny,
-                "sandbox_containerized_unenforceable".into(),
-            )),
+            unavailable if !unavailable.is_available() => {
+                Some((PolicyVerdict::Deny, "sandbox_containerized_runtime_unavailable".into()))
+            }
+            _ if !container_plan_is_well_formed(action) => {
+                Some((PolicyVerdict::Deny, "sandbox_containerized_unenforceable".into()))
+            }
             _ => None,
         }
     }
@@ -2002,9 +1998,9 @@ mod tests {
             vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
             audit.clone(),
         )
-        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Unavailable {
-            reason: "test: no runtime".into(),
-        })));
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(
+            RuntimeAvailability::Unavailable { reason: "test: no runtime".into() },
+        )));
         let input = serde_json::json!({"command": "echo hello"});
         let action = shell_container_action(&input);
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
@@ -2073,9 +2069,9 @@ mod tests {
             vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
             audit,
         )
-        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Unavailable {
-            reason: "test".into(),
-        })));
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(
+            RuntimeAvailability::Unavailable { reason: "test".into() },
+        )));
         let input = serde_json::json!({"command": "echo hello"});
         let action = PolicyAction {
             tool_name: "shell",

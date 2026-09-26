@@ -86,7 +86,8 @@ pub trait ContainerRuntimeProbe: Send + Sync {
 }
 
 /// The runtimes probed, in preference order (ADR-72 §3).
-const SUPPORTED_RUNTIMES: [ContainerRuntime; 2] = [ContainerRuntime::Docker, ContainerRuntime::Podman];
+const SUPPORTED_RUNTIMES: [ContainerRuntime; 2] =
+    [ContainerRuntime::Docker, ContainerRuntime::Podman];
 
 /// Probe `path_var` for the supported runtimes without touching the process
 /// environment. Pure and unit-testable.

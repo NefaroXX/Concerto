@@ -8,6 +8,7 @@
 //! choke-point that enforces policy before every tool call.
 
 pub mod common;
+pub mod container;
 pub mod containment;
 mod cpu_accounting;
 pub mod diff;
