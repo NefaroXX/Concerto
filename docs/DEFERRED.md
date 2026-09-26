@@ -21,6 +21,13 @@ a note.
 > residual, release, memory-grounded resume, security-threat-model gaps #3–#9,
 > Phase 3 benchmarks, ADR-60 S5 agent-process slice); Tier-1/2 provider closure
 > in the Closed appendix dated/sourced; row 32 flagged `[dangling-cite]`.
+> **Append 2026-09-26 (owner decisions 2026-09-25/26):** row 47 **closed** (the
+> safe-reachable scope of threat gap #9 landed in `1c38c9f`; the RAM-pinning
+> residual is recorded in the Closed appendix, not quietly dropped). Rows 36 and
+> 45 annotated with the shipped state (`d00582b`/`3ae6ea5`/`fdf4800` and
+> `13cba1c`) and **kept OPEN** — what remains is the Windows path (row 36's
+> superseding-ADR decision also governs row 45) plus a CPU-budget config key.
+> No other rows touched; no renumbering; numbering gaps left intentional.
 
 ## Open register
 
@@ -55,7 +62,7 @@ a note.
 | 33 | Review/validation escalation (informational evidence; no terminal conversion) | ADR-35 §9/amendment; TODO.md:48–52; core/src/event.rs:386,394 (event-bearing only) | When coordinator decides terminal escalation (ADR-35 amended 2026-09-05) | S |
 | 34 | C-05/C-06/C-03 + M-08/M-05/M-02 audit cleanups | TODO.md:38–41 (C-05), 237 (C-06), 32–33 (C-03), 241 (M-08), 246 (M-05), 251 (M-02); AUDIT_FINDINGS_CURRENT.md | When module refactors + coverage are scheduled | L |
 | 35 | STATUS-tracked follow-ups (ENV_LOCK, glyphs, multiline, P4/ADR-59 deferrals, release checklist) | STATUS.md "Tracked follow-ups" ~328–355 | Per tracked follow-up row; each release | M |
-| 36 | Containerized sandbox bundle — `SandboxProfile::Containerized` OS-level isolation | TODO.md:103; ROADMAP:235; security-threat-model.md §6 gap #1 (:310–315, "No Containerized Plugin Sandbox"); real stub — variant declared but not implemented (architecture.md:250, STATUS.md:272), plugins run only under the WASM capability sandbox | When post-1.0 isolation design lands (namespace/cgroup isolation for the Containerized profile) | L |
+| 36 | Containerized sandbox bundle — `SandboxProfile::Containerized` OS-level isolation — **shipped 2026-09-26 for the container path (row STAYS OPEN: only the Windows path is outstanding)** | TODO.md:103; ROADMAP:235; security-threat-model.md §6 gap #1 (:310–315, "No Containerized Plugin Sandbox"); was a real stub — variant declared but not implemented (architecture.md:250, STATUS.md:272), plugins ran only under the WASM capability sandbox. **Landed 2026-09-26 in three slices:** `d00582b` (ADR-72 + enforceable core half — `core::sandbox` docker/podman runtime detection, `SimplePolicyEngine::check_sandbox` fail-closed admission gate, rules `sandbox_containerized_runtime_unavailable` / `_unenforceable`), `3ae6ea5` (shell invocations actually routed through the container — `tools::container` builds the `docker`/`podman run` argv from a planned `ShellPlan` as `ShellPlan::Direct`, opt-in `ShellTool::with_container`, `command_facts` audits the container argv), `fdf4800` (`CommandRouting` marker — closes the fail-open where `Containerized` was selected without routing) | **Windows path only.** Windows Job Objects need `unsafe` FFI (`windows-sys` `CreateJobObjectW` / `AssignProcessToJobObject`), which the workspace hard-denies (`[workspace.lints] unsafe_code`). ADR-72 §5 records v1 as **unsupported on Windows** (probe returns `Unavailable` → `Containerized` refused, fail-closed and honest), not shipped. Recorded options for a future Windows story: **(a)** a narrow, audited `unsafe` exception; **(b)** the safe high-level `windows` crate — safe Job Object bindings, no `unsafe` in our code, but a new dependency requiring its own ADR; **(c)** accept Linux/macOS-only with loud documentation. **Re-entry: a superseding ADR that chooses among (a)/(b)/(c).** | L |
 | 37 | Hybrid UI full scope (tabbed Settings, Studio split pane, drag-and-drop agent assignment, focus-trap) | TODO.md:145; ROADMAP:147 (post-1.0); docs/hybrid-ui-plan.md — standalone, not part of the world-class plan | Post-1.0 | L |
 | 38 | Flat/content-embedded tool-call parsing residual (beyond proxy Fixes 1–3) | TODO.md:190–195; ROADMAP:165–168 (residual after Fixes 1–3 landed, see Closed #8); docs/proxy-tool-call-fix.md | When sanitized proxy fixtures + pairwise verification land against real OpenAI-compatible proxies | S |
 | 39 | Binary installers (deb/rpm/tar) | TODO.md:260–263; ROADMAP:194 (Later); STATUS.md:11–14 (no installer packages promised today; only `.tar.gz` via scripts/release.sh) | When a release/distribution decision is made | M |
@@ -64,9 +71,8 @@ a note.
 | 42 | Windows shell quoting weakness (threat gap #3) | security-threat-model.md §6 :323–328 (~4 h; cmd.exe quoting weaker than POSIX) | When a security milestone is scheduled (prefer `bypass_shell` on Windows) | S |
 | 43 | API server per-client rate limiting (threat gap #4) | security-threat-model.md §6 :332–337 (~4 h) | When a security milestone is scheduled | S |
 | 44 | Audit-log at-rest encryption (threat gap #5) — **includes the audit-log retention policy** (former row 19, merged 2026-09-25: retention bounds the encrypted vault) | security-threat-model.md §6 :339–344 (~8 h; SQLCipher / encrypt SQLite); retention part: ADR-40:47 ("Audit retention remains a future policy question, not a session one" — no age-/size-based audit-only truncation, any future one belongs in its own ADR) + TODO.md:14–17 (define retention/archival for `audit_log`; the log is grow-only by design) | When a security milestone is scheduled; the retention/archival policy settles in the same window, since the retention bounds are what bound the encrypted store | M |
-| 45 | Shell-command CPU rate limiting (threat gap #6) | security-threat-model.md §6 :346–351 (~12 h; cgroup/ulimit integration) | When a security milestone is scheduled | M |
+| 45 | Shell-command CPU rate limiting (threat gap #6) — **portable layer shipped 2026-09-26 (row STAYS OPEN: Windows + cgroup v2 residual)** | security-threat-model.md §6 :346–351 (~12 h; cgroup/ulimit integration). **Landed 2026-09-26 in `13cba1c`:** Linux `/proc` watchdog sampling aggregate process-group user+sys CPU (`tools::cpu_accounting`, `CpuBudget` + `ProcessHandle::run_limited`) that SIGKILLs the group and returns an explicit budget error; POSIX `ulimit -S -t N` soft backstop prelude on wrapped plans (soft-only: `SIGXCPU` is recognisable, a hard `SIGKILL` is not); budgets **default off** and the existing wall-clock timeout is unchanged; `CONCERTO_SHELL_CPU_BUDGET_SECS` escape hatch (config wins, unparsable/0 = off). Composes with row 36 — inside a container the `ulimit` prelude rides along and the runtime is not asked to re-impose a CPU ceiling. **Residual: no CPU enforcement on Windows** (no safe Job Object path; row 36's Windows decision governs this too) and **cgroup v2 is not implemented** (needs privileged cgroupfs writes / `unsafe`) | A superseding ADR for the Windows Job Object path (row 36's options (a)/(b)/(c)) and/or an explicit cgroup-v2 decision. **Tracked sub-item:** the CPU budget has **no TOML config field yet** — `ShellConfig::cpu_budget_secs` (`crates/tools/src/shell.rs:220`) is `None` in every production call site (`with_profile` / `allow_all` / `new`), so the env var is the only operator knob; add a config key when the budget is wired for operators. | M |
 | 46 | Plugin network egress filtering (threat gap #7) | security-threat-model.md §6 :355–360 (~8 h; network capability allowlist) | When a security milestone is scheduled | M |
-| 47 | Memory encryption for sensitive data (threat gap #9) | security-threat-model.md §6 :373–378 (~8 h; mlock/madvise secure allocation) | When a security milestone is scheduled | M |
 | 48 | Codebase-world-class Phase 3 criterion benchmarks + CI benchmark gate | world-class-plan.md:186–208 (Phase 3 group); TODO.md:153–154; part of the Phases 1–5 group (TODO.md:148–156) | When the Phase 3 benchmark milestone is scheduled (criterion suite + CI gate) | M |
 | 49 | ADR-60 S5 agent-process slice — mock-only provider + `DenyAllApprovalSink` | crates/orchestrator/src/bin/agent_process.rs (`CONCERTO_PROVIDER` accepts only "mock", :137–152; interactive approvals dropped as `DenyAllApprovalSink`, :155, :292–336 — "ADR-60 deferred" per code comment) | When supervisor wiring completes: real provider injection + approvals/acks surfaced through the supervisor (today always denied, never a real approval channel) | S |
 
@@ -84,6 +90,7 @@ a note.
 10. Eval `#[ignore]` un-ignore — resolved 2026-09-24 (TODO.md:207–217; TESTING.md).
 11. Agent-loop wildcard-panic guard — resolved 2026-09-24 (TODO.md:225–236).
 12. FTS BM25 `rank()` wired into retrieval — stale-verified, closed 2026-09-24 (chunk FTS always BM25 rank-ordered: `fts.rs:148` `ORDER BY rank`, RRF fusion `rag.rs:412-459`; stored 1.0 inert by construction `sync.rs:61,130`; proven by tests `fts.rs:404-450,458-498`).
+13. Memory encryption for sensitive data (threat gap #9) — **closed 2026-09-26 per owner decision**, with the residual recorded rather than dropped. The safe-reachable scope shipped in `1c38c9f`: `concerto_core::SecretString` (zero-on-drop `zeroize` wipe of the backing buffer, `Debug`/`Display` render a redaction marker, `expose()` returns a borrow so call sites stop cloning keys, credential store and `ProviderConfig` resolve through `get_secret`, `PendingConfig`/`ProviderRequest` no longer derive `Debug` over a raw key, and the Google connector scrubs its `?key=` URL out of transport errors) — module docs at `crates/core/src/secret.rs`, tests cover the drop wipe, redaction (direct / embedded / collection / credential-store / provider-request / wizard-config) and the Google diagnostic scrub. **Residual, unimplemented by design rather than by oversight: `mlock`/`madvise` RAM pinning.** No safe abstraction for it exists in the dependency graph — `nix` (present only as a `signal` + `feature` cfg gate in `crates/tools`/`crates/plugins`) exposes it as a raw-pointer `unsafe fn`, and the workspace hard-denies `unsafe_code`, so the RAM-pinning half of threat gap #9 stays open work. Closure is therefore scoped: the *safe-reachable* mitigation is closed, the pinning half is not.
 
 ## Verification notes (2026-09-24)
 
@@ -172,3 +179,74 @@ a note.
   `crates/config/src/schema.rs:649,683`, `crates/memory/src/sync.rs:61,130`,
   `crates/memory/src/fts.rs:148,404-450,458-498`, `crates/memory/src/rag.rs:412-459`,
   `crates/core/src/event.rs:386,394`.
+
+## Verification notes (2026-09-26)
+
+Owner decisions of 2026-09-25/26, executed 2026-09-26 against HEAD `fdf4800`.
+All three commits cited below are reachable from this checkout; every claim was
+checked against code or an ADR, not against commit messages alone.
+
+- **Row 47 closed** (see Closed #13). Verified in the tree, not just in the
+  commit body: `crates/core/src/secret.rs` documents the three closures
+  (zero-on-drop, no-rendering `Debug`/`Display`, explicit `&str` reads via
+  `expose()`) and states at lines 19–21 that `mlock`/`madvise` page pinning is
+  deliberately **not** covered. The *reason* recorded in the appendix was
+  re-checked against the dependency graph: `nix` is a direct dependency of
+  `crates/tools` and `crates/plugins` only, with `default-features = false` and
+  `features = ["signal"]` / `["signal", "feature"]`, and it is used solely for
+  signal handling plus the `sysconf` cfg gate; `mlock`/`madvise` would arrive as
+  raw-pointer `unsafe fn`, which `[workspace.lints]` denies via `unsafe_code`.
+  No safe `mlock` wrapper is present anywhere in `Cargo.lock`. Closure is scoped
+  to the safe-reachable mitigation and the residual is stated in the appendix —
+  it is not recorded as done. The `#47` numbering gap is left intentionally (no
+  renumbering), matching the row 10 / 12 / 14 / 19 / 26 precedent.
+- **Row 36 annotated, kept OPEN** (size unchanged at **L**). All three slices
+  verified present: ADR-72 exists at
+  `docs/adrs/ADR-72-containerized-sandbox-profile.md` (with the design landed in
+  `d00582b`), routing in `3ae6ea5`, and the `CommandRouting` marker in
+  `fdf4800`. The row is **not** closed because the remaining work is the Windows
+  path, and ADR-72 §5 explicitly declines to ship it: "Decision (v1): the
+  `Containerized` profile is **not supported on Windows**", with the probe
+  returning `Unavailable` and the engine refusing
+  `sandbox_containerized_runtime_unavailable` — fail-closed, but a decline, not a
+  delivery. §5 also names the blocker independently of the ADR prose: the
+  repository hard-denies `unsafe_code`, which blocks the `windows-sys` FFI
+  (`CreateJobObjectW` / `AssignProcessToJobObject`). Verified in the graph: no
+  `windows` or `windows-sys` entry in any workspace `Cargo.toml` — both appear
+  in `Cargo.lock` only as transitive packages of other crates, so option (b) is
+  genuinely a **new direct dependency** and option (a) a lint-denial change,
+  neither of which can ride along with a doc update. The row's re-entry was
+  rewritten from the stale "when post-1.0 isolation design lands" to the actual
+  gate: a **superseding ADR choosing among (a) audited `unsafe` exception /
+  (b) safe `windows` crate / (c) documented Linux-macOS-only**.
+- **Row 45 annotated, kept OPEN** (size unchanged at **M**). The portable layer
+  is verified in the tree: `crates/tools/src/cpu_accounting.rs` (process-group
+  CPU sampling), `ProcessHandle::run_limited` in `crates/tools/src/process.rs`,
+  and `ShellConfig::cpu_budget_secs` defaulting to `None` with the
+  `CONCERTO_SHELL_CPU_BUDGET_SECS` fallback in `crates/tools/src/shell.rs:58`
+  (config wins, including `Some(0)` = off). Two residuals are recorded. First,
+  **Windows**: `cpu_accounting::supported()` is a pure `cfg` gate that is
+  Linux-only, argv-direct and cmd.exe-verbatim plans skip the `ulimit` prelude
+  and rely on that watchdog, so on Windows neither backstop applies and there is
+  no CPU enforcement at all — governed by row 36's Windows decision, cross-
+  referenced rather than duplicated. Second, **cgroup v2**: not implemented;
+  it needs privileged cgroupfs writes, which is not available under the current
+  no-`unsafe` posture. The "no TOML config field yet" sub-item is tracked in the
+  row's re-entry cell: `cpu_budget_secs` appears **only** in
+  `crates/tools/src/shell.rs` and in that crate's tests — no config-crate schema
+  field and no production call site sets it (`ShellTool::with_profile`,
+  `allow_all`, and `new` all take the `Default`), so today the env var is the
+  only operator knob. Noted as a small tracked sub-item rather than folded into
+  the headline row, since it is a config-wiring task, not new enforcement work.
+- **Scope of this pass:** rows 36, 45, and 47 only. All other open rows, the
+  earlier verification notes, and the existing Closed #1–#12 lines are unchanged.
+  No renumbering; gaps left intentional. Not verified here (out of scope, and
+  flagged as follow-up rather than asserted): `docs/security-threat-model.md` §6
+  gaps #1, #6 and #9 still carry their original open text — unlike gap #8, none
+  of them is marked `✅ DONE`, so the threat model and this register currently
+  disagree for row 36 (partially shipped), row 45 (partially shipped) and row 47
+  (closed with residual). That file should be reconciled in a separate docs pass.
+- Pre-existing formatting defect noted, **not** fixed in this pass: the 2026-09-24
+  notes above contain a bare `— manual` fragment on its own line, left behind by the
+  2026-09-25 row-10 cut, which orphans the tail of that bullet. Left alone to
+  keep this diff to the owner decisions above; worth a one-line repair.

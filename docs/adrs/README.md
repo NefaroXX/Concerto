@@ -68,7 +68,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [37](./ADR-37.md) | Plugin Capability Grant Lifecycle — TTL, Hash Pinning, Revocation | 2026-07-26 | Accepted (renumbered 2026-08-02) | Time-bounded, pinned, revocable capability grants instead of indefinite approvals. |
 | [38](./ADR-38.md) | Async WASM Host Functions | 2026-08-02 | Accepted — implemented | wasmtime `async_support` for plugin host calls. |
 | [39](./ADR-39.md) | Embedder Degradation Handling | 2026-08-02 | Accepted | Stale-marking, backoff pause, explicit degradation events, FTS-only fallback with notice. |
-| [40](./ADR-40.md) | Audit Log is Append-Only and Outlives Session Pruning | 2026-08-02 | Accepted | The audit trail survives session deletion by design. |
+| [40](./ADR-40.md) | Audit Log is Append-Only and Outlives Session Pruning | 2026-08-02 | Accepted — §Decision item 3 superseded by [ADR-73](./ADR-73-audit-encryption-and-retention.md); items 1/2/4 in force | The audit trail survives session deletion by design. |
 | [41](./ADR-41.md) | Spend surfaces in the status bar; no Dashboard page | 2026-08-03 | Accepted | Cost/spend visibility inline; no separate dashboard surface. |
 | [42](./ADR-42.md) | Coordinator resilience: failure-class fallback ladder | 2026-08-04 | Accepted — amended by [ADR-45](./ADR-45.md), extended by [ADR-35](./ADR-35.md) | Failure classes map to an escalation ladder (retry → provider switch → takeover). |
 | [43](./ADR-43-skills-mcp-and-extension-manager.md) | Skills, MCP client, and extension manager | 2026-08-04 | Accepted | Local instruction packs (never execute code) + stdio MCP tools, all policy-gated. |
@@ -99,6 +99,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [69](./ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | 2026-09-18 | Accepted | Three slices: link store (M 3-5d), scoring+decay (M 5-8d), Mermaid+UI+eval (S-M 3-5d); fail-open, degree/TTL caps, cost-gated progression. |
 | [70](./ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | 2026-09-20 | Accepted | Global + per-project AGENTS.md injected into every prompt path (skills → AGENTS → environment card); project-over-global, bounded/truncated, fail-soft, opt-in, coordinator maintenance nudge (text only). |
 | [71](./ADR-71-coordinator-supremacy.md) | Coordinator Supremacy — the coordinator is the sole master of a run | 2026-09-24 | Accepted | Coordinator sole master: instructions run until done / intervention / coordinator error; all agent errors to coordinator; four-class terminal taxonomy (Coordinator decision / intervention / Coordinator error / immutable safety terminals); hardcoded cycle terminals → coordinator-owned guards; planner + registry advisory-only; no intent topology branching; compiled schedulers revoked except the resolver-as-reuse-oracle; scoped partial supersession of ADR-19/55/58/64/65. |
+| [73](./ADR-73-audit-encryption-and-retention.md) | Audit-Log Encryption at Rest and Bounded Retention | 2026-09-26 | Accepted — implemented (`7351128`) | `sessions.db` (including the append-only `audit_log`) encrypted with SQLCipher, opted in and fail-closed; aged rows archived into a keyed archive and then deleted, verified before delete, configured via `[audit]`; answers ADR-40 §Decision item 3. |
 
 > **Partial supersession note (2026-09-24):**
 > [ADR-71](./ADR-71-coordinator-supremacy.md) makes **scoped partial
@@ -107,6 +108,14 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 > summarized in those rows' Status cells above). These are partial, not full,
 > supersessions — none of the five files is moved to `archive/`; nothing is
 > deleted. Read ADR-71 before relying on the revoked points.
+
+> **Scoped partial supersession note (2026-09-26):**
+> [ADR-73](./ADR-73-audit-encryption-and-retention.md) supersedes **only**
+> ADR-40's §Decision item 3 ("audit retention remains a future policy
+> question"), which is the clause that asked for that ADR. ADR-40's other
+> clauses — append-only, detach-don't-delete, migration rebuild — remain in
+> force and ADR-40 is **not** archived. The distinction item 3 drew is kept:
+> retention is a time-based policy, not a session-lifecycle one.
 
 ## Archived ADRs ([`archive/`](./archive/))
 

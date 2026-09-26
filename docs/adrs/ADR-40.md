@@ -1,6 +1,9 @@
 # ADR-40: Audit Log is Append-Only and Outlives Session Pruning
 
-**Status:** Accepted (2026-08-02)
+**Status:** Accepted (2026-08-02) — §Decision item 3 superseded by
+[ADR-73](./ADR-73-audit-encryption-and-retention.md) (2026-09-26); items 1, 2
+and 4 remain in force unchanged. Not archived: the amendment is scoped to one
+clause.
 **Date:** 2026-08-02
 **Deciders:** Concerto architecture
 
@@ -47,6 +50,12 @@ correct one.
 3. **Audit retention remains a future policy question, not a session one.**
    No age- or size-based *audit-only* truncation is introduced; if one is ever
    wanted it belongs in its own ADR, separate from session pruning.
+   **[Superseded by ADR-73 (2026-09-26)]** — that ADR now exists: the audit
+   database is encrypted at rest (SQLCipher) and aged rows are archived into a
+   keyed archive and then deleted, configured via `[audit]` in the global
+   config, defaulting to off. The distinction this clause drew is preserved —
+   retention is a time-based policy, **not** a session-lifecycle one, and
+   session pruning still never deletes audit rows.
 4. The table rebuild copies all current columns (002 + 016 additions) and
    recreates `idx_audit_session`; this is executed in the standard sqlx
    migration transaction.

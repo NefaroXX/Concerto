@@ -175,3 +175,73 @@ Objects implementation. Therefore:
 - Windows kernel-level isolation is out of scope (§5).
 - Plugin execution under `Containerized` (rather than the WASM capability
   sandbox) is out of scope; this ADR governs the shell/process path.
+
+## Implementation status (2026-09-26)
+
+**Status note only.** The Status (`Proposed`) and every decision clause above
+are unchanged; this section records what actually landed and what the landed
+slice does *not* yet guarantee. Read it alongside the Residuals.
+
+### Landed, in three stacked commits
+
+| Commit | Landed |
+|---|---|
+| `d00582b` | Design record (this ADR) + the enforceable core half: `core::sandbox` runtime detection (`ContainerRuntime` docker/podman, injectable `ContainerRuntimeProbe`, cached/refreshable `SystemContainerRuntime`, pure `PATH` probe) and the policy admission gate in `SimplePolicyEngine::check_sandbox`. |
+| `3ae6ea5` | The execution half: `tools::container` builds the `docker`/`podman run` argv from an already-planned `ShellPlan` and returns it as `ShellPlan::Direct` (runtime spawned argv-direct, no host shell introduced); `ShellTool::with_container` + an injectable `with_container_runtime_probe` seam. Detection is fail-closed: no runtime or an unsupported platform yields an explicit `PolicyDenied` (`sandbox_containerized_runtime_unavailable` / `sandbox_containerized_unsupported_platform`), never a silent unconfined passthrough. Row-45's `ulimit` prelude rides inside the container unchanged and is not duplicated as a runtime CPU ceiling. `command_facts` routes through the same container plan, so the audited argv is the argv that runs. |
+| `fdf4800` | The `CommandRouting` marker — see below. |
+
+`None` remains byte-identical to pre-ADR-72 behavior in all three commits, and
+no existing call site selects `Containerized`, so every current run is
+unchanged. No test or CI job requires a container runtime.
+
+### `CommandRouting`: the marker the policy engine requires (`fdf4800`)
+
+`Containerized` admission needs a third condition beyond "runtime found" and
+"plan is container-routable": the action's `CommandPolicyFacts` must assert
+`CommandRouting::Containerized` (`crates/core/src/types.rs`). A working
+directory proves nothing about routing — a shell invocation can carry a `cwd`
+and still be launched unconfined on the host — so the marker is what makes the
+claim checkable at the policy seam.
+
+The engine enforces **both** directions, and both denials are named rules
+recorded in the audit trail:
+
+| Condition | Verdict | Rule |
+|---|---|---|
+| `Containerized` profile, runtime found, well-formed plan, **no** routing marker | `Deny` | `sandbox_containerized_routing_missing` |
+| Routing marker asserted, profile is **not** `Containerized` (including `None`) | `Deny` | `sandbox_container_routing_profile_mismatch` |
+
+The producer contract is: set `CommandRouting::Direct` (the default) when the
+argv launches directly on the host; set `CommandRouting::Containerized` only
+when the argv was genuinely wrapped in `<runtime> run …` and will be spawned
+argv-direct through that runtime (the shell tool's container route). Never from
+a bare `cwd`, and never for an invocation that was planned but not routed.
+
+### Known limits of the landed slice (recorded honestly)
+
+- **The marker is a producer contract assertion, not an unforgeable
+  capability.** It is a field on facts that the producing tool fills in; a
+  buggy or malicious producer that sets `Containerized` on an unwrapped argv
+  would be admitted, and the only trace is the audited argv. There is no
+  independent proof (e.g. re-inspecting the spawned process) that the command
+  actually ran inside a container. Treat the marker as a *required assertion
+  that catches the realistic mistake* — a caller that selected `Containerized`
+  and forgot to route — not as a sandbox guarantee on its own. The kernel
+  boundary is the runtime, not the marker.
+- **Windows is unsupported and fails closed**, unchanged from §5: no runtime
+  probe success ⇒ `sandbox_containerized_runtime_unavailable` (the tools seam
+  can also surface `sandbox_containerized_unsupported_platform`). A first-class
+  Windows story requires a superseding ADR.
+- **Selection is programmatic only.** There is no config key; a caller must set
+  `PolicyAction::sandbox_profile` and configure `ContainerConfig` on the shell
+  tool. The path is unreachable from config/UI/CLI today, so the feature is
+  inert in normal operation.
+- **Mount, image, and pull behavior:** the project root is bind-mounted
+  read-write at its own absolute path (`-v <root>:<root>`, the only default
+  mount; further `-v` entries come only from the operator's `extra_mounts`), a
+  `cwd` outside the root is refused, the image is operator-supplied, and **no
+  image is pulled implicitly** — a missing image fails at the runtime,
+  fail-closed. The plan also passes `--rm --init`. Network defaults to
+  `--network none`; only explicitly listed `KEY=VALUE` entries are forwarded
+  with `-e`, so provider keys (row 47) do not leak into model-driven processes.
+- **`ReadOnlyFs` and `NetworkIsolated` remain stubs** (`sandbox_profiles_not_implemented`) and plugin execution under `Containerized` remains out of scope — the WASM capability sandbox still governs plugins.
