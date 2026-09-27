@@ -255,15 +255,20 @@ const COORDINATOR_DISPATCH_PROMPT: &str = r#"You are the Coordinator: the sole d
 
 How to work:
 1. Read the objective, the recorded evidence (workspace facts, the design document if one binds), and the specialist roster below.
-2. Call a specialist with the call_specialist tool when one is the right tool for the work: name the agent_id exactly as listed, give the specialist a complete self-contained task, and put your guidance in notes.
+2. Delegation is the DEFAULT action for implementation, review, and validation work. Use the call_specialist tool: name the agent_id exactly as listed, give the specialist a complete self-contained task, and put your guidance in notes. Do not keep the work in-house because a call feels costly — the registered specialists are the run's capacity.
 3. The tool returns the specialist's outcome (success / failed / blocked / needs_revision, its summary, and the files it changed). Decide the next step from that outcome: re-call the specialist with corrective notes, call a different specialist, or finish.
-4. When a specialist failed or returned needs_revision, you may retry with corrective notes. Every call you make is recorded as a Decision on the whiteboard, so call deliberately.
-5. If no registered specialist fits (or none is registered for the work at all), do the work yourself with your own tools — you are a full agent.
+4. When a specialist failed or returned needs_revision, retry with corrective notes or re-target the SAME work to another registered specialist before treating the work as impossible. Every call is recorded as a Decision on the whiteboard; the record exists for auditability, never to discourage a needed dispatch — do not avoid a call merely to keep the ledger short.
+5. Self-execution is permitted ONLY when you have exhausted the roster: (a) no agents are registered (an empty roster), (b) the roster is disabled or unavailable, or (c) you attempted delegation and it genuinely failed. While ANY specialist remains that could do the work, you must delegate. Doing the work yourself is never a shortcut around a capable specialist.
 6. When the objective is met (or nothing more can be done), reply with a plain summary and NO tool call. List what was done, by whom, and any remaining risk.
 
 Evidence discipline:
 - When your decision rests on recorded evidence, cite the real event ids from the context in supporting_evidence_ids. Fabricated ids are rejected and your decision loses its citations.
 - The stage tag of a specialist is informational context. You are never required to follow a stage order — call whoever the work needs, whenever the work needs it.
+
+Selecting a specialist (read the roster below — it is data, this prompt hardcodes no roles):
+- The roster is the authoritative, operator-configured list of callable agents; it may list any ids, stages, or counts. Prefer the agent whose declared stage matches the work at hand (design work to a design-stage agent, implementation to an implement-stage agent, review to a review-stage agent, validation to a validate-stage agent). A stage tag is context, not a dispatch rule: never infer a fixed pipeline from it, and treat a stage-less agent as a full participant.
+- Before concluding that work cannot be delegated, scan the roster for ANOTHER agent that can take it: first another agent at the same stage, then any agent whose configured coverage includes the target stage (an agent may declare that it can cover more than its own stage). Prefer re-targeting a specialist over doing the work yourself.
+- Changing WHICH specialist takes the work and re-targeting a chosen specialist to a different model/provider are separate choices; either is preferable to self-execution.
 
 Restructuring an open task (use sparingly, deterministically):
 - When one open task is doing too much, split_task re-cuts it into ordered children that inherit the task's specialist role, evidence, and attempt counter. Splits of pending/running tasks only — completed work is never re-cut.
@@ -14678,9 +14683,11 @@ impl CoordinatorAgent {
                 let remaining = cap - used;
                 prompt.push_str(&format!(
                     "<dispatch_budget>\nRun-wide ceiling: {cap} specialist calls; {used} used, \
-                     {remaining} remaining. Budget them — prefer request_user_input when the \
-                     path ahead is low-confidence rather than spending the remaining calls on \
-                     speculative work.\n</dispatch_budget>\n\n"
+                     {remaining} remaining. Spend them deliberately: a specialist call is the \
+                     default way work advances, so do not hoard the budget by working in-house. \
+                     The ceiling exists to force prioritization, not to price a needed dispatch \
+                     against doing the work yourself. Prefer request_user_input only when the \
+                     path ahead is genuinely low-confidence.\n</dispatch_budget>\n\n"
                 ));
             }
         }
@@ -28804,6 +28811,58 @@ mod tests {
         assert!(
             prompt.contains("status: Verified"),
             "freshness statuses are explicit in the block (issue #56)"
+        );
+    }
+
+    /// Delegation doctrine (owner spec, prompt inversion): the rendered
+    /// dispatch prompt makes delegation the DEFAULT, removes the
+    /// "you are a full agent" self-execution blanket license (permitting
+    /// self-execution only in the enumerated exhaustion cases), and derives
+    /// role selection from the runtime roster rather than hardcoded roles.
+    #[tokio::test]
+    async fn dispatch_prompt_makes_delegation_the_default_and_self_execution_an_exhaustion_case() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+        assert!(
+            prompt.contains("Delegation is the DEFAULT action"),
+            "delegation is the default for implementation/review/validation work"
+        );
+        assert!(
+            prompt.contains("Self-execution is permitted ONLY when you have exhausted the roster"),
+            "self-execution is an enumerated exhaustion case"
+        );
+        assert!(
+            !prompt.contains("you are a full agent"),
+            "the self-execution blanket license is deleted"
+        );
+        assert!(
+            prompt.contains("Selecting a specialist")
+                && prompt.contains("this prompt hardcodes no roles"),
+            "role selection is derived from the runtime roster, not hardcoded"
+        );
+        assert!(
+            prompt.contains("A stage tag is context, not a dispatch rule"),
+            "the stage tag stays advisory context (:266 remains true)"
         );
     }
 
