@@ -25,7 +25,11 @@ use crate::skills_context::SkillsContext;
 /// including the blank-line separator that precedes it. Non-empty working
 /// memory is substituted in place; an empty block removes the separator and
 /// the placeholder together (see [`PromptBuilder::assemble_system`]).
-const WORKING_MEMORY_SEPARATOR_PLACEHOLDER: &str = "\n\n{working_memory}";
+///
+/// Shared with the coordinator dispatch prompt, which appends the same
+/// placeholder so the multi-agent prompt follows the identical
+/// working-memory assembly path as the single-agent loop.
+pub(crate) const WORKING_MEMORY_SEPARATOR_PLACEHOLDER: &str = "\n\n{working_memory}";
 
 /// Builds the full `CompletionRequest` for each agent cycle.
 #[derive(Debug, Clone)]

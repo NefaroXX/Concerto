@@ -1640,9 +1640,22 @@ pub struct CoordinatorAgent {
     skills_section: String,
     /// Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C),
     /// threaded from the runtime's resolved shell settings. Injected into
-    /// every dispatch prompt and into the self-implement persona's prompts.
-    /// Empty when unset (manual/test constructions).
+    /// the self-implement persona's prompts. Empty when unset (manual/test
+    /// constructions). The DISPATCH prompt now receives its card through the
+    /// shared [`crate::prompts::PromptBuilder`] seam, so it is rendered from
+    /// `shell_profile` below rather than from this cached string.
     environment_card: String,
+    /// The session's resolved shell profile (ADR-28), used by the shared
+    /// `PromptBuilder` to append the same OS/shell identity card the
+    /// single-agent loop gets. `None` renders the OS-facts-only card.
+    shell_profile: Option<concerto_config::ShellProfileConfig>,
+    /// ADR-048 prefix discipline for the dispatch prompt: `[context]
+    /// .cache_stable_prefix`, resolved by the runtime via
+    /// [`crate::context_engine::ContextBudgetPolicy::from_config`] so the
+    /// knob's default lives in exactly one place. `false` keeps the default
+    /// (placeholder-substituted) assembly; `true` pins a byte-stable head and
+    /// appends the volatile working memory after it.
+    cache_stable_prefix: bool,
     /// Run-scoped project AGENTS.md context (ADR-70). Constructed once per
     /// run by the runtime (`ProjectContext::refresh` at run start) and
     /// injected into the dispatch system prompt between the skills section
@@ -2728,6 +2741,8 @@ impl CoordinatorAgent {
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
             skills_section: String::new(),
             environment_card: String::new(),
+            shell_profile: None,
+            cache_stable_prefix: false,
             project_context: None,
             project_context_nudge_count: 0,
             max_total_iterations: None,
@@ -4114,6 +4129,27 @@ impl CoordinatorAgent {
     /// (manual/test constructions without resolved shell settings).
     pub fn with_environment_card(mut self, environment_card: String) -> Self {
         self.environment_card = environment_card;
+        self
+    }
+
+    /// Attach the session's resolved shell profile so the dispatch prompt
+    /// receives the SAME OS/shell identity card the single-agent loop gets,
+    /// through the shared `PromptBuilder` seam. Pass `None` for the
+    /// OS-facts-only card.
+    pub fn with_shell_profile(
+        mut self,
+        shell_profile: Option<concerto_config::ShellProfileConfig>,
+    ) -> Self {
+        self.shell_profile = shell_profile;
+        self
+    }
+
+    /// Honor the ADR-048 `[context].cache_stable_prefix` knob for the
+    /// dispatch prompt: the runtime resolves it through
+    /// [`crate::context_engine::ContextBudgetPolicy::from_config`] so the
+    /// default lives in exactly one place.
+    pub fn with_cache_stable_prefix(mut self, enabled: bool) -> Self {
+        self.cache_stable_prefix = enabled;
         self
     }
 
@@ -10654,6 +10690,14 @@ impl CoordinatorAgent {
         self.refresh_world_model(task, &[], Vec::new(), cancel).await;
         let system_prompt =
             self.render_dispatch_system_prompt(task, intro, dispatching, state, ledger);
+        // Thread the dispatch prompt through the shared `PromptBuilder` seam:
+        // the working-memory block (retrieved chunks + active run state) rides
+        // the prompt under the same ADR-048 stable-head/volatile-tail
+        // discipline as the single-agent loop, and the prompt is emitted as
+        // the single `Role::System` message the adapters expect.
+        let working_memory_block = self.dispatch_working_memory_block(base_ctx);
+        let system_message =
+            self.build_dispatch_system_message(system_prompt, &working_memory_block);
         let mut tool_defs: Vec<ToolDefinition> = Vec::new();
         if dispatching {
             tool_defs.push(call_specialist_tool_definition());
@@ -10699,15 +10743,7 @@ impl CoordinatorAgent {
         };
         let model = profile.model_name().to_string();
 
-        let mut messages = vec![Message {
-            role: Role::User,
-            content: system_prompt,
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        }];
+        let mut messages = vec![system_message];
         // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
         // A checkpoint-restored in-flight wait is NEVER re-entered into the
         // park loop; instead it is re-evaluated exactly once against the
@@ -15166,14 +15202,6 @@ impl CoordinatorAgent {
                 prompt.push_str("\n\n");
             }
         }
-        // OS/shell identity card (custom-ai-shell plan, Phase C): the
-        // coordinator dispatches shell-capable specialists, so its decision
-        // prompt names the host OS and the selected agent shell. Only
-        // appended when the runtime supplied a card.
-        if !self.environment_card.is_empty() {
-            prompt.push_str(&self.environment_card);
-            prompt.push_str("\n\n");
-        }
         // ── Dispatch budget advisory (ADR-35 amendment 2026-09-16 §6) ────
         // The run-wide dispatch ceiling (ADR-52 `max_total_iterations`) is
         // the Coordinator's hard budget. Publishing it up front lets the
@@ -15208,7 +15236,59 @@ impl CoordinatorAgent {
             prompt.push_str("\n\n");
             prompt.push_str(&self.supplemental_prompt);
         }
+        // The OS/shell identity card and the working-memory block are added by
+        // the shared `PromptBuilder` seam in `build_dispatch_system_message`
+        // below. The template ends with the same `{working_memory}` separator
+        // the single-agent templates use, so an empty block removes it cleanly
+        // and a non-empty block is substituted in place (default) or appended
+        // as a volatile tail under `cache_stable_prefix`.
+        prompt.push_str(crate::prompts::WORKING_MEMORY_SEPARATOR_PLACEHOLDER);
         prompt
+    }
+
+    /// The working-memory block for the coordinator's dispatch prompt: the
+    /// active orchestration run state (the `WorkingMemorySnapshot` projection)
+    /// followed by the retrieved project-memory chunks, exactly the shape the
+    /// single-agent loop assembles from `format_working_memory` +
+    /// `format_retrieved_memory`.
+    fn dispatch_working_memory_block(&self, base_ctx: &AgentContext) -> String {
+        let active = crate::memory_prompt::format_run_memory(&base_ctx.working_memory);
+        let retrieved = crate::memory_prompt::format_retrieved_memory(&base_ctx.retrieved_chunks);
+        if retrieved.is_empty() {
+            active
+        } else {
+            format!("{active}\n{retrieved}")
+        }
+    }
+
+    /// Assemble the coordinator's dispatch system message through the SAME
+    /// [`crate::prompts::PromptBuilder`] path the single-agent loop uses: the
+    /// rendered dispatch template plus the working-memory block, with the
+    /// ADR-048 stable-head/volatile-tail discipline honoring
+    /// `[context].cache_stable_prefix`. Emitting a single `Role::System`
+    /// message matches the loop (`PromptBuilder::build`) and the
+    /// last-system-wins adapters.
+    fn build_dispatch_system_message(
+        &self,
+        template: String,
+        working_memory_block: &str,
+    ) -> Message {
+        let builder = crate::prompts::PromptBuilder::new(template)
+            .with_shell_profile(self.shell_profile.clone())
+            .with_cache_stable_prefix(self.cache_stable_prefix);
+        let request = builder.build(working_memory_block, &[], None, None);
+        // `PromptBuilder::build` always prepends exactly one system message;
+        // degrade to an empty system message rather than panicking if that
+        // ever changes.
+        request.messages.into_iter().next().unwrap_or_else(|| Message {
+            role: Role::System,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        })
     }
 
     /// The run's evidence/provenance section for the decision prompt: the
@@ -29807,6 +29887,141 @@ mod tests {
             prompt.contains("A stage tag is context, not a dispatch rule"),
             "the stage tag stays advisory context (:266 remains true)"
         );
+    }
+
+    /// The coordinator dispatch prompt runs through the shared `PromptBuilder`
+    /// seam, so the working-memory block (active run state + retrieved chunks)
+    /// reaches the model exactly as it does in the single-agent loop.
+    #[tokio::test]
+    async fn dispatch_prompt_carries_the_working_memory_block() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let mut context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // Active run state: one projected task node.
+        context.working_memory.task_tree.push(concerto_core::memory::TaskNode {
+            id: concerto_core::memory::TaskNodeId(Ulid::new()),
+            session_id: task.session_id,
+            description: "wire the module".into(),
+            status: concerto_core::memory::TaskStatus::Pending,
+            parent_id: None,
+            children: Vec::new(),
+            blocking: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+        // Retrieved project memory: one chunk.
+        let project_id = concerto_core::memory::ProjectId("project-a".into());
+        context.retrieved_chunks.push(concerto_core::memory::MemoryChunk {
+            id: "chunk-1".into(),
+            project_id: project_id.clone(),
+            namespace: concerto_core::memory::MemoryNamespace::Project(project_id),
+            content: "the module graph is documented here".into(),
+            file_path: Some(camino::Utf8PathBuf::from("src/lib.rs")),
+            start_line: Some(1),
+            end_line: Some(3),
+            chunk_type: concerto_core::memory::ChunkType::Function,
+            score: 1.0,
+            model_id: "test".into(),
+            model_version: "1".into(),
+            stale: false,
+        });
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+        assert!(
+            prompt.contains("<orchestration_run_state>") && prompt.contains("wire the module"),
+            "the active run state must reach the coordinator prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("<retrieved_project_memory>")
+                && prompt.contains("the module graph is documented here"),
+            "retrieved chunks must reach the coordinator prompt: {prompt}"
+        );
+    }
+
+    /// An empty working-memory block degrades cleanly: no leaked placeholder
+    /// and no invented working-memory header, in both assembly modes.
+    #[tokio::test]
+    async fn dispatch_prompt_empty_working_memory_degrades_cleanly() {
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let state = DispatchSessionState::default();
+        let ledger = DispatchLedger::default();
+
+        for stable in [false, true] {
+            let bus = EventBus::new(64);
+            let registry =
+                Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                    AgentId::new("coder"),
+                    "implemented",
+                )]));
+            let coordinator =
+                coordinator_with_turns(bus, registry, vec![]).with_cache_stable_prefix(stable);
+            let template =
+                coordinator.render_dispatch_system_prompt(&task, "", true, &state, &ledger);
+            let message = coordinator.build_dispatch_system_message(template, "");
+            assert!(
+                !message.content.contains("{working_memory}"),
+                "the placeholder must never leak (stable={stable}): {}",
+                message.content
+            );
+            assert!(
+                !message.content.contains("<working_memory>")
+                    && !message.content.contains("<orchestration_run_state>"),
+                "no working-memory header may be invented (stable={stable})"
+            );
+        }
+    }
+
+    /// With `cache_stable_prefix` enabled, the system-message head is
+    /// byte-identical across builds whose only difference is the working
+    /// memory; the working memory rides the volatile tail.
+    #[tokio::test]
+    async fn dispatch_prompt_stable_head_is_identical_across_working_memory() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let coordinator =
+            coordinator_with_turns(bus, registry, vec![]).with_cache_stable_prefix(true);
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let state = DispatchSessionState::default();
+        let ledger = DispatchLedger::default();
+        let template = coordinator.render_dispatch_system_prompt(&task, "", true, &state, &ledger);
+        let builder = crate::prompts::PromptBuilder::new(template.clone())
+            .with_shell_profile(coordinator.shell_profile.clone())
+            .with_cache_stable_prefix(true);
+        let head = builder.stable_system_head(None);
+
+        let first = coordinator
+            .build_dispatch_system_message(template.clone(), "<working_memory>A</working_memory>");
+        let second = coordinator
+            .build_dispatch_system_message(template, "<working_memory>B</working_memory>");
+        assert!(
+            first.content.starts_with(&head) && second.content.starts_with(&head),
+            "the stable head must be a byte-identical prefix of both builds"
+        );
+        assert!(
+            !head.contains("<working_memory>A") && !head.contains("<working_memory>B"),
+            "the working memory must not sit inside the stable head: {head}"
+        );
+        assert!(first.content.contains("<working_memory>A"));
+        assert!(second.content.contains("<working_memory>B"));
     }
 
     /// The verified-clean consumption: a decision whose expected artifacts

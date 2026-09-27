@@ -4273,6 +4273,19 @@ async fn run_multi_agent(
     // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
     // above from the resolved shell settings; see the registry wiring.
     .with_environment_card(environment_card)
+    // The DISPATCH prompt receives its OS/shell identity card through the
+    // shared `PromptBuilder` seam, so hand it the same resolved profile the
+    // registry was built with (the self-implement persona keeps the
+    // pre-rendered card above).
+    .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
+    // ADR-048: `[context].cache_stable_prefix` pins a byte-stable dispatch
+    // prompt head and appends the volatile working memory after it, matching
+    // the single-agent loop. Resolved through the engine's budget policy so
+    // the knob's default lives in exactly one place.
+    .with_cache_stable_prefix(
+        crate::context_engine::ContextBudgetPolicy::from_config(services.config.context.as_ref())
+            .cache_stable_prefix,
+    )
     // ADR-58 P2+P3 (Batch 1): the resolved blueprint facade backs the
     // stage-kind resolutions (`role_in_kind_stage`, `execution_stage_tag`,
     // `kind_stage_tag`). ADR-58 amendment (2026-09-05): the facade never
