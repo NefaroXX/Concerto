@@ -58,6 +58,28 @@ a note.
 > bypassing `PromptBuilder`) live in ADR-74 §Known gaps and are deliberately
 > **not** register rows — none of them is a deferral this register ever
 > recorded.
+> **Append 2026-09-27 (shell + plugin-streaming pass):** two rows touched, no
+> status change. Row 24 **rescoped and kept OPEN, size L → M** — the shell
+> runtime is *not* unbuilt: Phases A and B and ADR-28 profile slices 1 **and** 2
+> have all landed, and the row now records that evidence, states the real
+> residual (the C verbs, Phase D, Phase E, Phase F, and two small slice-2
+> requirements), and splits the work — the C verbs as one self-contained
+> piece, D–F as a separate design decision. A **prerequisite** is now the
+> first re-entry item: the repo plan numbers phases A–F and the research plan
+> numbers them 0–5, and `TODO.md:136–137` already says to reconcile them
+> before starting. Row 23 **stays OPEN and deferred**; only its trigger was
+> sharpened, so the precondition is a *named* plugin kind that generates
+> tokens incrementally and the cost is stated plainly (a new ABI export or
+> host-fn chunk sink **plus an ABI version bump** — ADR-53 deliberately did
+> neither). Two of the brief's premises for row 24 did not survive
+> verification and were **not written down as claims**: slice 2 is not a
+> stub (`ManagedBash` is a complete `ShellBackend` impl and
+> `config/src/managed.rs` implements the versioned/offline/integrity-checked
+> install and lifecycle half), and `ManagedEnvConfig` is not unused (it is
+> held in `ShellSettings.managed` and populated from the live runtime).
+> Row 24's stale `TODO.md:114–135` cite was corrected to `:125–146`. No
+> renumbering; gaps left intentionally. Verification notes for today are
+> appended below.
 
 ## Open register
 
@@ -79,8 +101,8 @@ a note.
 | 17 | Eval end-to-end benchmark (live runtime over a real benchmark) **+ multi-agent fault-injection containment coverage (former row 21, merged 2026-09-26 as an included sub-part) — both halves landed 2026-09-26** | ROADMAP:241–245 ("a full live end-to-end eval harness over a real benchmark task remains deferred until multi-agent quality and recovery are reliable"); row 21's former source TODO.md:229–235 (injection tests for rate limits, malformed tool calls, missing executables, cancellation races, provider disconnects — the register's old `TODO.md:218–224` cite had drifted onto the *resolved* eval-`#[ignore]` item and is corrected here); ADR-26 recovery boundaries; scenarios at `crates/orchestrator/src/fault_injection.rs:76–92`; live leg at `crates/eval-runner/src/main.rs:430–490` | **Landed in two commits.** `f4bdc4f` added four **crash-window** fault-injection scenarios to the existing in-process (scripted, deterministic) suite, which had 16 prior scenarios but none expressing the durable/child boundary: **C1** specialist child dies mid-dispatch (issued, never settled) → `specialist_child_dies_mid_dispatch_audits_then_recovers`; **C2** provider disconnect at the settle boundary (after a dispatch settled, before the next decision) → `provider_disconnect_at_the_settle_boundary_preserves_settled_work`; **C3** restart from a durable checkpoint row persisted through a **real** session store, continuing the pending dispatch **exactly once** → `restart_with_preserved_checkpoint_continues_the_pending_dispatch`; **C4** cancellation racing a settle, which **re-pends rather than accepts** → `cancellation_racing_a_settle_re_pends_not_accepts`. `5daf2e7` added the live-runtime benchmark leg, gated **twice** so it never runs in CI (the `#[ignore]` attribute *and* a runtime env check): `CONCERTO_LIVE_PROXY` + `CONCERTO_LIVE_PROXY_KEY` are both required and it skips cleanly when unset; `CONCERTO_LIVE_PROXY_MODEL` is optional (default `gpt-4o-mini`) and `CONCERTO_LIVE_EVAL_SUITE` is an optional suite-dir override; run with `cargo test -p concerto-eval-runner live_runtime_benchmark_leg -- --ignored --nocapture`. **Row STAYS OPEN** — what remains is coverage *breadth*, not the mechanism, and the old ROADMAP trigger is now only half-met: the live leg drives **one** suite against **one** live endpoint, so broad live-provider / multi-model coverage is still unproven, and there is **no quarantine mechanism** for live flakiness (a red live run is indistinguishable from a real regression). **Re-entry: widen the live leg beyond a single suite/model, and land a flake-quarantine story for it.** Size stays **L** — both shipped halves were the cheap, narrow half of the original ask. | L |
 | 18 | Coordinator restart/resume end-to-end (cross-process continue) — **annotated 2026-09-27, still OPEN and unchanged** | TODO.md:18–25 (Partial; e2e remains); ADR-34 D2 | After checkpoint persistence + evidence-spine resume e2e. **Not advanced by ADR-74:** the delegation guard's "has this run delegated?" test reads the *checkpointed* decision journal (`DecisionKind::DispatchSpecialist` entries) and the agent-axis takeover guard is checkpointed too (`GraphCheckpoint.specialist_takeover_attempted`, `#[serde(default)]`), so both guarantees survive a restore — but that is per-run state restoration, not the cross-process continue this row tracks, which still needs the e2e evidence named in its source cell. | L |
 | 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | **GATED DOCTRINE 2026-09-25** — stays OPEN, but gated on ADR-47's own reopen condition (:78–93): reopen **only** when a consumer proposes/needs richer message content the flat shape cannot express (multi-part tool bodies, image/file `File` parts, structured `Thinking`/`RedactedThinking` on Anthropic/Gemini paths, or structured data smuggled into `content: String`). Migration preconditions recorded 2026-09-25 — all three required before any parts work: **(a)** a named consumer need (ADR-47:80–81); **(b)** a parts-joined-text equivalence test — joining `parts` back to flat text must reproduce today's bytes, and Fix 2 strictness must not loosen (proxy-tool-call-fix.md:5,60 — content-embedded strict path buffers content to turn end); **(c)** a checkpoint/`state_json` migration plan for old rows (`orchestration_checkpoints.state_json` is `TEXT NOT NULL`, migration 019:10; `crates/sessions/src/lib.rs:150`), shipped additively with `serde(default)` + legacy-column fallback in one dedicated window, never as a side effect of an unrelated feature (ADR-47:62–65,109–110; ARCHITECTURE-V2.md §10). Verified migration-safe meanwhile: the Mimo/loose-tier tool mods operate on `ToolDefinition`/`ToolCall` **values**, not message shape — `schema_loose.rs:113` `adapt_tool_definitions(&mut [ToolDefinition])`, `:132` `unflatten_tool_arguments(&mut serde_json::Value)`, `google.rs:55` `adapt_tools_for` mutates `request.tools` — so they neither block nor depend on a parts migration. | L |
-| 23 | ADR-53 per-token streaming through WASM (heartbeat landed) | ADR-53:137–139 (streaming through WASM deferred; heartbeat keepalive landed per ADR-53/57) | Verify streaming scope remains deferred | M |
-| 24 | Shell Phases C–F + slices 1–3 (explain/debug/optimize, workflow AST, tool ABI, measured self-improvement) | TODO.md:114–135; ADR-29; ROADMAP | When Phases C–F are scheduled from the roadmap | L |
+| 23 | ADR-53 per-token streaming through WASM (heartbeat landed) — **stays OPEN and deferred; trigger sharpened 2026-09-27 to a named-consumer precondition, with the cost stated** | ADR-53 `docs/adrs/ADR-53-dialect-plugins-and-plugin-heartbeat.md:137–139` ("**No per-token streaming through WASM in this ADR** — streaming is deferred (§Consequences)"), restated as a Consequences deferral at `:171–172`; the deliberate no-ABI-change stance at `:48–50`, `:117–118` and `:170` ("no breaking change, no `abi_version` bump"); the liveness gap it was opened for at `:39–41`; heartbeat landed per ADR-53 §4 (`:128`) | **Precondition: build ONLY when a plugin kind actually generates tokens incrementally.** The ABI is single-shot *by construction*, not by omission: `guest_abi.rs:7` `HOST_ABI_VERSION = 1`; the return value is a `(ptr, len)` pair packed into one `i64` (`:9–16` `RESULT_ERROR`/`pack_ptr_len`/`unpack_ptr_len`); the only three exports are `call_provider`/`call_adapter`/`call_dialect` (`:31–42`, the dialect signature documented as 6 `i32` params → `i64` at `:39`); and the host resolves the export as `get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>` and makes **one** awaited call (`active_plugin.rs:149–166`). **No streaming export exists, and none can be added without a version bump.** Today the host awaits one `call_provider("complete", …)` future and maps the whole JSON result to **ONE** `CompletionChunk` (`provider_host.rs:146–149` awaited call → `:151`; `chunk_from_result` at `:155–163` reads `content`/`finish_reason` and builds a single chunk; the same single call inside the heartbeat task at `:195–199`). **The liveness case that motivated the deferral is already covered** by the landed heartbeat, which is why there is no urgency behind this row: `heartbeat_stream` (`:175–233`) interleaves `CompletionChunk::keepalive()` (`:218`) on a cadence while the call is in flight, wired from the manifest's `heartbeat_interval_secs` (`manager.rs:698–725`, `with_heartbeat`/`with_dialect`), with a no-heartbeat single-chunk fallback (`:344–354`, `futures::stream::once`). **There is NO consumer that would benefit today:** `PluginBackedProvider::stream_completion` (`provider_host.rs:287–288`) does return a real stream, collected by `PluginManager::collect_providers` (`manager.rs:744–746`) and consumed in the runtime wiring (`orchestrator/src/runtime_runner.rs:1688`) — but that stream is *keepalive chunks plus exactly one content chunk*, so a plugin that emits tokens incrementally over minutes would still deliver all of its output in a single terminal chunk. **Cost, stated so this is not scheduled as a generic "streaming" improvement:** it requires a new ABI export (or a host-fn chunk sink the guest calls repeatedly), **plus an ABI version bump** — and ADR-53 deliberately did neither (`:48–50`, `:117–118`, `:170`; §4 is titled "Plugin heartbeat — keepalive, **no streaming ABI**"). It is therefore a breaking guest-ABI change with a plugin-compatibility story, not a provider-host refactor. **Re-entry: a named plugin kind that generates tokens incrementally** (the motivating case being a plugin that wraps a slow local model); until one exists, the keepalive-plus-one-chunk stream is the correct v1. | M |
+| 24 | Shell Phases C–F + ADR-28 profile slices — **rescoped 2026-09-27: Phases A/B and profile slices 1–2 have LANDED; what remains is the C verbs plus D–F, and the row is split in two** (size **L → M**) | ADR-29 (`docs/adrs/ADR-29.md:3`, Accepted) is the runtime/policy execution decision. Repo plan `docs/custom-ai-shell-plan.md:125–228` = **Phase A–F** (A at `:125` already marked "**Implemented**"; B at `:143` "**Implemented at the library boundary**"; C `:184`, D `:199`, E `:209`, F `:219–228`). Research plan `docs/research/ai-native-shell-implementation-plan.md:11–510` = **Phase 0–5** (0 at `:11`, 5 at `:458`) — a *different* numbering for overlapping work. TODO.md:125–146 (both items; **the row's old `TODO.md:114–135` cite had drifted** onto other rows and is corrected here); ROADMAP.md:183–187. Profile slices come from ADR-28, which is **archived and superseded** by ADR-30 (shell selection) + ADR-29 (`docs/adrs/archive/ADR-28.md:3–10`, "not active guidance") — so ADR-28 is historical rationale here, not live authority, and the old row's "superseded in part by ADR-30 for shell selection only" understated it | **PREREQUISITE — reconcile the phase numbering before starting anything, as `TODO.md:136–137` explicitly instructs** ("fresh phase plan starting with the `ToolManifest` schema system (reconcile its phase numbering with `custom-ai-shell-plan.md` before starting)"). Two live plans number the same work incompatibly: the repo plan uses **A–F**, the research plan uses **0–5**. Settle which numbering governs (and whether the research plan supersedes, merges into, or is discarded alongside) before any "Phase C" work is named, or the two get silently merged into a scope neither plan approved. **LANDED — recorded so this row stops implying the shell runtime is unbuilt.** *Phase A (read-only builtins + runtime):* `crates/shell/src/builtins.rs:20–27` (`standard_commands` → `help`/`project-info`/`ls-tree`/`last`), `runtime.rs:43–58` (`ShellRuntime::standard`, every command registered read-only), `parser.rs:33–60` (`parse_command_line` — quoted tokenizing, no shell expansion), `model.rs:24–31` (`CommandStatus::permits_continuation`/`is_success`). *Phase B (policy-gated external exec):* `shell/src/execution.rs:35–80` (`PolicyExecutionAdapter::execute` funnels through `ToolExecutor::execute("shell", …)`, so no command spawns a process itself) and `:73–83` (`external_commands` → `run`/`shell-run`/`shell-profiles`); `profile.rs:13` (`ShellProfileCatalog` — the shell consumes canonical config instead of keeping a second selector, per ADR-30); `config/src/shell.rs:58` `ShellProfileConfig`. *Quoting / argv-direct:* `tools/src/shell.rs:349–441` (`windows_arg_needs_quoting`, `shell_quote_windows`, `shell_quote_posix`, `shell_quote`) with `validate_cmd_args:510` rejecting arguments cmd.exe would `%`-expand, and `:614–640` `legacy_shell_plan` returning `ShellPlan::Direct` argv-direct at `:623–627` (bypass_shell, and Windows where no shell semantics are needed); `tools/src/shell_backend.rs:57–59` `command_args`. *ADR-55 containment:* `tools/src/containment.rs:1–30` (argv/cwd confinement — out-of-root `cd`/`pushd`, path-like args on mutation verbs, `xargs` pipeline laundering of a read-exempt argument, redirect writes). *CPU budget (row 45's portable layer):* `tools/src/shell.rs:65–69` `resolve_cpu_budget` (config wins, including `Some(0)` = off, else `CONCERTO_SHELL_CPU_BUDGET_SECS`), `:875–880`, `:1231–1303` (`plan_takes_cpu_backstop`, the soft-only `cpu_limit_prelude` `ulimit -S -t`, and `spawn_plan` → `ProcessHandle::run_limited`), plus `tools/src/cpu_accounting.rs`. *OS identity card:* `orchestrator/src/prompts.rs:175–180` (always appended, never empty, never errors) and `:375` `environment_card` (profile facts, else OS facts + `detect_os_default_shell`; no process spawned). *Bounded shell repair:* `orchestrator/src/shell_repair.rs` (its own doc calls it a "Phase C subset"); `MAX_SHELL_REPAIR_ATTEMPTS = 5` at `:36`, char caps at `:40–42`, and policy outcomes are **never** repaired (a denial is not coached around) with cancellation spending no turn. *Slice 1 (test profile + availability):* `config/src/shell.rs:235–242` `availability()`, documented "ADR-28 Slice 1"; `tools/src/shell_backend.rs:45–46,69–80,117–124` `check_available`; the desktop Test-profile action is live (`views/settings/shell.rs:164–183` messages, `:403` button; state field labelled "ADR-28 Slice 1" at `state.rs:144–146`). *Slice 2 (Managed Bash PoC) — also landed, and it is **not** a stub:* `config/src/managed.rs` (347 lines) does the versioned, offline, integrity-checked install ADR-28 asked for — versioned dir under `<data>/concerto/managed-bash/<version>/bash` (`:114–119`, `install_from` `:152–194`), blake3 integrity + `verify` (`:205–232`), manifest export/import (`:235–249`), `remove` (`:197–202`), bounded 2 s version probe (`:251–262`); `tools/src/shell_backend.rs:88–125` `ManagedBash` is a **complete** `ShellBackend` impl (not a placeholder) resolving through `ManagedRuntimeManager::auto_detect`; `ManagedEnvConfig` (`config/src/shell.rs:352`) is **not** unused — it is held at `:376` (`ShellSettings.managed`), re-exported at `lib.rs:67`, and populated from the live runtime at `desktop/…/views/settings/state.rs:754–762`; the install/remove/verify/export/import UI is wired (`views/settings/helpers.rs:39,55,95,109`; `settings/shell.rs:187–223` messages, `:509–544` buttons). **REMAINING GAP, stated precisely.** **(a) Phase C's `explain`/`debug`/`optimize` commands are ABSENT** — no such command exists; the intelligence is *prompt content plus repair*, not invocable commands (the plan's own "Shipped subset (2026-09-07)" note, `custom-ai-shell-plan.md:193–197`). A search of `crates/shell/src` for those names returns only `#[derive(Debug)]` attributes and one unrelated doc comment. **(b) Phase D deterministic workflows are ABSENT** — there is no workflow AST: `WorkflowAst` has **zero** matches under `crates/`, and `shell/src/model.rs:100` `Workflow` is a variant of the `CommandSource` enum (`:93–103`), i.e. a provenance tag with no AST behind it. Consequently no cycle/variable/result-type/effect validation, no checkpoints or resumable execution, no bounded retry/fallback/approval/parallel nodes, no execution trace. **(c) Phase E's shell tool/plugin ABI is ABSENT in the shell crate** — `shell/src/registry.rs:38–68` is a static in-process register (`register`/`get`/`specs` over a `RwLock<BTreeMap<..>>`), not an ABI; the real WASM ABI lives in `crates/plugins` (`guest_abi.rs`, `active_plugin.rs::call_json_export`) and **nothing bridges the shell command spec/result envelope to it**, so no shell command can be shipped as a plugin and no custom tool can add shell schemas, renderers, or effect declarations. **(d) Phase F measured self-improvement is ABSENT** — no history mining, no alias/workflow-rewrite suggestion, no validate-before-promotion gate, no provenance/comparison evidence; `shell/src/history.rs` is a bounded in-memory `VecDeque<CommandResult>` that feeds the `last` meta-command and is not a learning loop. *Slice 2 residual (small, specific):* two ADR-28 requirements are unmet — **controlled `PATH`** (`tools/src/shell_backend.rs:109–115` `effective_env` just clones the base env instead of constraining `PATH`) and **PTY-backed terminal** (a `\bpty\b` search under `crates/` returns nothing; there is no PTY dependency anywhere in the workspace). Distribution of a vetted Bash binary is explicitly the later licensing-gated slice (`config/src/managed.rs:10–13`, `views/settings/helpers.rs:36–37`). *Slice 3 (cross-platform packaging):* **not started** — consistent with a deliberately Linux-first PoC, and it is licensing/provenance-gated by ADR-28's own framing. **THE WORK IS SPLIT IN TWO, and the re-entry follows the split.** **(1) The C verbs are one self-contained piece** — prompt/LLM work that reuses the existing `ShellCommand` trait, registry and `CommandResult` envelope, with no new state machine, no persistence, and no new ABI; `explain`/`debug`/`optimize` can and should ship on their own. **(2) D–F are a separate and larger design decision** — a workflow AST is a new persistence + execution model (versioning, validation, checkpoint/resume, node scheduling), and Phase E additionally needs a shell↔WASM ABI decision; neither can ride along on an "add three commands" change. **Re-entry: (0) reconcile the phase numbering, then (1) take the C verbs as its own change, and (2) take D–F only as its own decision** — ADR-first per the repo ADR rule, since a workflow AST is exactly the kind of architectural decision that needs a record before dependent code. | M |
 | 25 | Code editor integration (external editor + open-in-editor + diffs) | TODO.md:157; ROADMAP | Post-1.0 | M |
 | 27 | Pricing/metadata freshness feeds the VISUAL SPEND TRACKER ONLY (rescoped 2026-09-25: display-only, spend tracker) | TODO.md:201; STATUS.md tracked follow-ups | When the display-only pricing/metadata freshness flow lands. Stale prices make usage dollars wrong; routing must never see prices. Non-goal: the coordinator must never know or care about cheap vs expensive models; no cost-based routing, no model switching on price, and no coordinator coupling of any kind. | M |
 | 28 | ADR-58 P5/P6 + TOML diff + canvas DAG editor + partitioning | ADR-58:238–247; STATUS.md ~328–355 (deferred P5 Studio, P6 items, TOML diff, run-one-stage, multi-executor partitioning) | Post-P6 roadmap phase (explicit ADR-58 deferral items) | L |
@@ -465,3 +487,190 @@ runs, no commit**; the tree is left for the orchestrator to commit.
     end-to-end eval harness as fully deferred (`5daf2e7` shipped a first
     env-gated leg). All three were flagged by the 2026-09-26 pass and none is
     a delegation-doctrine item, so none is touched now.
+
+## Verification notes (2026-09-27, shell + plugin-streaming pass)
+
+Docs only — **no source edits, no builds, no test runs, no commit**; the tree is
+left for the orchestrator to commit. Checked against
+`fix/coordinator-error-invariant` at HEAD `1ba7c1d`. Every claim below was read
+in the tree, not taken from a commit message or a plan document's own status
+line. No row is opened, closed, cut, or merged; the Closed appendix is
+untouched.
+
+- **Scope of this pass: rows 23 and 24 only.** Both stay OPEN. Row 24 was
+  rescoped (size **L → M**); row 23's re-entry cell was rewritten and its
+  source cell extended. No renumbering; the existing gaps (10, 12, 14, 19, 21,
+  26, 33, 44, 47, 49) are left intentionally.
+- **Row 24 — the shell runtime is not unbuilt, and the old row said it was.**
+  The register previously carried "Shell Phases C–F + slices 1–3" with the
+  re-entry "When Phases C–F are scheduled from the roadmap", which read as a
+  wholly unstarted runtime. That was stale in the row's favour-of-closing
+  direction and is now corrected with per-phase evidence. Phase A and Phase B
+  are verified landed, and independently so by the plan document's own status
+  lines: `custom-ai-shell-plan.md:125` marks Phase A "**Implemented**" and
+  `:143` marks Phase B "**Implemented at the library boundary**". Code anchors
+  confirmed: `builtins.rs:20–27` (four read-only commands), `runtime.rs:43–58`
+  (`ShellRuntime::standard`, all read-only), `parser.rs:33–60`
+  (`parse_command_line`), `model.rs:24–31` (`CommandStatus` predicates),
+  `execution.rs:35–80` (`PolicyExecutionAdapter::execute` → `ToolExecutor`, plus
+  `external_commands` at `:73–83`), `profile.rs:13` (`ShellProfileCatalog`),
+  `config/src/shell.rs:58` (`ShellProfileConfig`). The safety/identity work
+  around them is also landed and was previously unrecorded on this row: ADR-55
+  containment (`tools/src/containment.rs:1–30`), the row-45 CPU budget
+  (`tools/src/shell.rs:65–69`, `:875–880`, `:1231–1303` + `cpu_accounting.rs`),
+  the OS identity card (`orchestrator/src/prompts.rs:175–180`, `:375`
+  `environment_card`), and bounded shell repair
+  (`orchestrator/src/shell_repair.rs`, `MAX_SHELL_REPAIR_ATTEMPTS = 5` at `:36`).
+- **Row 24 — the four gaps are real, and each was checked for absence rather
+  than assumed.** (a) **Phase C verbs:** a case-insensitive search of
+  `crates/shell/src` for `explain|debug|optimi[sz]e` returns only
+  `#[derive(Debug)]` attributes plus one unrelated doc comment at
+  `model.rs:105`. The intelligence exists as prompt content plus repair — which
+  is exactly what the plan's own "Shipped subset (2026-09-07)" note records at
+  `custom-ai-shell-plan.md:193–197` — but there is no invocable command.
+  (b) **Phase D:** `WorkflowAst` returns **zero** matches repo-wide under
+  `crates/`. `shell/src/model.rs:100` is `Workflow`, one variant of the
+  `CommandSource` enum (`:93–103`), consumed by `CommandProvenance` (`:105–115`)
+  — a provenance tag with no AST behind it, which is the specific confusion
+  worth recording. (c) **Phase E:** `shell/src/registry.rs:38–68` is
+  `register`/`get`/`specs` over a `RwLock<BTreeMap<String, Arc<dyn ShellCommand>>>`
+  — a static in-process register, not an ABI. The real WASM ABI is in
+  `crates/plugins` and nothing bridges the shell command spec to it.
+  (d) **Phase F:** a search for `self-improv|history mining|validate-before-promotion`
+  under `crates/` returns nothing relevant; `shell/src/history.rs` is a bounded
+  in-memory `VecDeque<CommandResult>` feeding the `last` meta-command, not a
+  learning loop.
+- **Row 24 — two premises in the brief did not survive verification, and were
+  deliberately not written into the row.** (i) **Slice 2 is not a stub.**
+  `tools/src/shell_backend.rs:88–125` `ManagedBash` is a *complete*
+  `ShellBackend` implementation (`backend_type`, `resolved_program` via
+  `ManagedRuntimeManager::auto_detect`, `command_args`, `effective_env`,
+  `check_available`), not a placeholder. Behind it, `crates/config/src/managed.rs`
+  (347 lines) implements the ADR-28 Slice 2 PoC's *install/lifecycle* half — not
+  the whole slice, which still has the two residuals below: versioned install
+  under `<data>/concerto/managed-bash/<version>/bash` (`:114–119`,
+  `install_from` `:152–194`), blake3 integrity with `verify` (`:205–232`),
+  manifest export/import (`:235–249`), `remove` (`:197–202`), and a bounded
+  2 s version probe (`:251–262`) — and it is wired to the desktop Settings UI
+  end to end (`views/settings/helpers.rs:39,55,95,109`;
+  `settings/shell.rs:187–223` messages and `:509–544` buttons).
+  (ii) **`ManagedEnvConfig` is not unused.** It is held
+  at `config/src/shell.rs:376` (`ShellSettings.managed`), re-exported at
+  `config/src/lib.rs:67`, and populated from the live runtime at
+  `desktop/…/views/settings/state.rs:754–762`. The row records what *is*
+  genuinely missing from slice 2 instead — **controlled `PATH`**
+  (`shell_backend.rs:109–115` `effective_env` clones the base env rather than
+  constraining `PATH`) and the **PTY-backed terminal** (a `\bpty\b` search under
+  `crates/` returns nothing; no PTY dependency exists in the workspace) — plus
+  the licensing-gated vetted-binary distribution that `managed.rs:10–13` and
+  `helpers.rs:36–37` already call out as a later slice.
+- **Row 24 — slice 1 is also landed, contrary to the old row.** The register
+  listed slice 1 as remaining. It is not: `ShellBackend::check_available` exists
+  on both backends (`shell_backend.rs:45–46`, `:69–80`, `:117–124`),
+  `config/src/shell.rs:235–242` `availability()` is documented "ADR-28 Slice 1",
+  and the desktop Test-profile action is live
+  (`views/settings/shell.rs:164–183` messages, `:403` button) with its state
+  field labelled "ADR-28 Slice 1" at `state.rs:144–146`.
+- **Row 24 — ADR-28's status was understated by the old row.** The old source
+  cell said ADR-28 is "superseded in part by ADR-30 for shell selection only".
+  ADR-28 is **archived and fully superseded** — by ADR-30 (shell selection) *and*
+  ADR-29 (the AI-native runtime) — and its own header says it is "not active
+  guidance" (`docs/adrs/archive/ADR-28.md:3–10`). The row now says so, because
+  citing ADR-28 as live authority for the profile slices is how a reader would
+  re-derive a stale scope.
+- **Row 24 — the phase-numbering conflict is real and pre-existing.**
+  `docs/custom-ai-shell-plan.md:125–228` numbers its phases **A–F**; the research
+  plan `docs/research/ai-native-shell-implementation-plan.md:11–510` numbers
+  overlapping work **0–5** (Phase 0 at `:11` starts from the `ToolManifest`
+  schema system; Phase 5 at `:458`). `docs/TODO.md:136–137` already carries the
+  instruction: "fresh phase plan starting with the `ToolManifest` schema system
+  (reconcile its phase numbering with `custom-ai-shell-plan.md` before
+  starting)". This is why reconciliation is re-entry item (0) rather than a
+  footnote — the two documents currently describe the same roadmap in
+  incompatible vocabularies, and either could be cited as authority for a
+  "Phase 2" that means different things in each.
+- **Row 24 — size change L → M, and why.** The reduction is earned, not
+  optimistic: two of the four phases and two of the three profile slices are
+  landed, so the tracked remainder is the C verbs plus D–F. The row also
+  **splits** the scope, and the split is what makes a single size defensible:
+  the C verbs are one self-contained piece reusing the existing `ShellCommand`
+  trait and result envelope, while D–F is explicitly deferred to its own
+  ADR-backed decision. Recorded plainly: **D–F may itself be L-sized once it is
+  scheduled** — a workflow AST is a new persistence and execution model, and
+  Phase E needs a shell↔WASM ABI decision. The register row now tracks the
+  smaller, split scope; it does not claim D–F is cheap.
+- **Row 24 — citation drift corrected.** The row cited `TODO.md:114–135`, which
+  no longer holds these items; the AI-native-shell entry is at `TODO.md:125–141`
+  and the profile-slices entry at `:142–146`. The row now cites `:125–146`.
+  `ROADMAP.md:183–187` is cited with line numbers for the first time (it repeats
+  the "Phases A and B are implemented as a library foundation" framing).
+- **Row 23 — the single-shot ABI claim is stronger than "no export exists", and
+  the row now says so.** The decisive evidence is not the absence of a
+  streaming export name but the shape of the call itself:
+  `plugins/src/active_plugin.rs:151` resolves the export as
+  `get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>` and `:154–166` makes
+  **one** awaited `call_async`, so the guest can return exactly one
+  `(ptr, len)` result per invocation. Supporting anchors: `guest_abi.rs:7`
+  (`HOST_ABI_VERSION = 1`), `:9–16` (`RESULT_ERROR`, `pack_ptr_len`/
+  `unpack_ptr_len` — the `i64` packing), `:31–42` (the only three exports:
+  `call_provider`, `call_adapter`, `call_dialect`, with the 6-param `i64`
+  signature documented at `:39`), and no streaming export anywhere in the ABI.
+- **Row 23 — the one-chunk mapping and the landed heartbeat were re-verified.**
+  `provider_host.rs:146–149` awaits the single `call_provider("complete", …)`
+  future and `:151` hands the result to `chunk_from_result` (`:155–163`), which
+  reads `content` and `finish_reason` and builds **one** `CompletionChunk`; the
+  same single call is made inside the heartbeat task at `:195–199`. The liveness
+  half is landed: `heartbeat_stream` (`:175–233`) interleaves
+  `CompletionChunk::keepalive()` (`:218`) while the call is in flight, driven by
+  the manifest's `heartbeat_interval_secs` through
+  `PluginBackedProvider::with_heartbeat`/`with_dialect`
+  (`plugins/src/manager.rs:698–725`), with the no-heartbeat single-chunk
+  fallback at `provider_host.rs:344–354` (`futures::stream::once`). So the case
+  that motivated the deferral — the host looking dead during a slow plugin
+  completion — is already handled, which is the reason no urgency sits behind
+  this row.
+- **Row 23 — the "no consumer" claim verified end to end.** A stream *is*
+  produced and consumed: `PluginBackedProvider::stream_completion`
+  (`provider_host.rs:287–288`) returns a real `CompletionStream`, collected by
+  `PluginManager::collect_providers` (`manager.rs:744–746`) and consumed in the
+  runtime wiring (`orchestrator/src/runtime_runner.rs:1688`). What makes the row
+  still correct is the *shape*: that stream is keepalive chunks plus exactly one
+  content chunk, so a plugin emitting tokens incrementally over minutes would
+  still deliver everything in a single terminal chunk. The row says that rather
+  than claiming the stream does not exist.
+- **Row 23 — the cost is now stated, and ADR-53's "§47" cite was corrected.**
+  Building this needs a new ABI export or a host-fn chunk sink the guest calls
+  repeatedly, **plus an ABI version bump**. ADR-53 deliberately did neither, and
+  says so in three places: `docs/adrs/ADR-53-…:48–50` ("the existing
+  `call_tool` / `call_provider` / `call_adapter` ABI v1 exports and the plugin
+  load path — **no breaking change, no `abi_version` bump**"), `:117–118`
+  ("additive-only — **NO breaking change, NO `abi_version` bump**"), and `:170`
+  ("existing manifests, configs, and consumers load unchanged. No
+  `abi_version` bump"), with the deferral itself recorded at `:137–139` and
+  restated under Consequences at `:171–172`. §4 is titled "Plugin heartbeat —
+  keepalive, **no streaming ABI**" (`:128`). The brief's "ADR-53 §47" pointed at
+  the "Explicitly **not changed** by this ADR:" lead-in rather than at the
+  no-bump text, so the row cites the specific lines instead. The point of stating
+  the cost is to stop this being scheduled as a generic "streaming" improvement:
+  it is a breaking guest-ABI change with a plugin-compatibility story.
+- **Follow-ups flagged, not actioned here** (each is outside this pass's scope —
+  they touch documents other than this register, or rows other than 23/24):
+  - `docs/custom-ai-shell-plan.md:195` says the repair budget is "2 per failed
+    tool-call id per run", but the code is `MAX_SHELL_REPAIR_ATTEMPTS = 5`
+    (`orchestrator/src/shell_repair.rs:36`). The plan's Phase C "Shipped
+    subset" note is stale on a number, and the plan also still describes Phase B
+    as needing "live-tested integration" without saying which frontends have it.
+  - `docs/TODO.md:125–141` still reads "AI-native shell Phases C–F. **Not
+    started**" and `:142–146` still lists slices 1–3 as remaining. Both are
+    stale in the same way row 24's citation had drifted, and the AI-native-shell
+    item's own text already flags the phase-numbering reconciliation this row
+    now makes re-entry item (0).
+  - `ROADMAP.md:183–187` repeats the A/B-landed framing but still lists
+    `explain`/`debug`/`optimize`, the workflow AST, the tool/plugin ABI and
+    measured self-improvement as one undifferentiated "Later" bullet; the
+    C-versus-D–F split in row 24 would give it a first sentence.
+  - Still carried forward from the two prior passes and untouched:
+    `docs/security-threat-model.md` §6 gaps #1, #5, #6; `docs/TODO.md:229–235`
+    ("Not started" for work that landed in `f4bdc4f`); `ROADMAP.md:241–245`;
+    and the `— manual` orphan fragment in the 2026-09-24 notes above (line ~170),
+    still unrepaired.
