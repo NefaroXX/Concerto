@@ -154,6 +154,56 @@ a note.
 > `docs/STATUS.md` are **untouched** — they remain the source of truth. No
 > renumbering; the `#32` and `#35` gaps are left intentionally. Verification
 > notes for today are appended below.
+> **Append 2026-09-27 (rows 39 / 40 — release-and-packaging cut, crates.io
+> publish cut):** two rows **cut** and moved to the Closed appendix as #22 and
+> #23, both on the owner decision of 2026-09-27 that each is wanted
+> **eventually** — so both cuts are **RESUMABLE, not cancelled**: the verified
+> state is recorded such that the work can be picked up without repeating any
+> of the investigation done here. They are cut together because they share a
+> single source bullet (`ROADMAP.md:197–198`) and a single unexercised release
+> pipeline, but they rest on **different** findings and are recorded
+> separately. **Row 39** (binary installers deb/rpm/tar) was cut because the row
+> **implied much less built state than actually exists**: a real 4-target
+> tag-triggered release pipeline is already in the repo and publishes a GitHub
+> Release with auto-generated notes — and the genuinely missing part is only
+> everything downstream of a raw binary (no committed installer definitions, no
+> code signing anywhere, no working update channel, no aarch64-linux or
+> arm-windows). The load-bearing fact recorded in the appendix is that the
+> pipeline **has never been run**: the repo has **zero git tags**, so the `v*`
+> trigger has never fired. **Row 40** (crates.io publish) was cut because its
+> re-entry condition named a blocker that does not exist — `publish = false` is
+> one line at `Cargo.toml:37`, licence is already `MIT OR Apache-2.0` and
+> allowed by `deny.toml:101–104`, and there are **no git or out-of-workspace
+> path dependencies**, so nothing outside the workspace needs publishing first.
+> What the appendix records instead is the **decision implicitly made**: the
+> real question is the *subset*, because the graph is coupled (desktop carries
+> 13 internal edges, eval-runner 8, plugins exposes core + api-types), so
+> publishing everything means freezing the whole internal API at `0.1.0`. The
+> realistic option recorded is: publish the `concerto` binary (and possibly
+> `concerto-plugin-sdk`) and keep the rest `publish = false`. **Four premises
+> from the brief did not survive verification and are corrected in the notes
+> below rather than repeated as claims:** the workspace has **25 members, not
+> 26**; **20** crates lack a `description`, not ~21; `repository` **is**
+> defined at `Cargo.toml:36` but **no crate inherits it**, which is a
+> different (and much smaller) piece of work than "no repository link"; and
+> the path-only-without-`version` edges number **8 across 6 crates**, not 4.
+> Two claims were *sharpened* rather than contradicted: desktop's public
+> surface names `core`/`config`/`tools`/`plugins`/`sessions` types, **not**
+> orchestrator or memory (those are private `use`s behind a real dependency
+> coupling); and `crates/cli/src/update.rs` is **not dead code** — it is wired
+> at `crates/cli/src/lib.rs:182–185` — so what is inert is its *target*, plus
+> the newly-found fact that `[updates].update_endpoint`
+> (`config/src/schema.rs:941–942`) is **declared, documented, example'd and read
+> by nobody**. **Both rows' cites had drifted and are corrected in the
+> appendix**: `TODO.md:260–263` and `TODO.md:264–265` are the audit M-05 and
+> M-02 items, not these rows (the real entries are `docs/TODO.md:271–274` and
+> `:275–276`), and `ROADMAP:194` is a line **inside row 32's now-cut
+> certified-evolution bullet** — both release rows were citing another closed
+> row's source (the real cite is `ROADMAP.md:197–198`). `TODO.md`,
+> `ROADMAP.md` and `docs/STATUS.md` are **untouched** and remain the source of
+> truth. No renumbering; the `#39` and `#40` gaps are left intentionally,
+> matching the row 3 / 4 / 10 / 12 / 14 / 19 / 21 / 25 / 26 / 28 / 32 / 33 / 35 /
+> 44 / 47 / 49 precedent. Verification notes for today are appended below.
 
 ## Open register
 
@@ -183,8 +233,6 @@ a note.
 | 36 | Containerized sandbox bundle — `SandboxProfile::Containerized` OS-level isolation — **shipped 2026-09-26 for the container path (row STAYS OPEN: only the Windows path is outstanding)** | TODO.md:103; ROADMAP:235; security-threat-model.md §6 gap #1 (:310–315, "No Containerized Plugin Sandbox"); was a real stub — variant declared but not implemented (architecture.md:250, STATUS.md:272), plugins ran only under the WASM capability sandbox. **Landed 2026-09-26 in three slices:** `d00582b` (ADR-72 + enforceable core half — `core::sandbox` docker/podman runtime detection, `SimplePolicyEngine::check_sandbox` fail-closed admission gate, rules `sandbox_containerized_runtime_unavailable` / `_unenforceable`), `3ae6ea5` (shell invocations actually routed through the container — `tools::container` builds the `docker`/`podman run` argv from a planned `ShellPlan` as `ShellPlan::Direct`, opt-in `ShellTool::with_container`, `command_facts` audits the container argv), `fdf4800` (`CommandRouting` marker — closes the fail-open where `Containerized` was selected without routing) | **Windows path only.** Windows Job Objects need `unsafe` FFI (`windows-sys` `CreateJobObjectW` / `AssignProcessToJobObject`), which the workspace hard-denies (`[workspace.lints] unsafe_code`). ADR-72 §5 records v1 as **unsupported on Windows** (probe returns `Unavailable` → `Containerized` refused, fail-closed and honest), not shipped. Recorded options for a future Windows story: **(a)** a narrow, audited `unsafe` exception; **(b)** the safe high-level `windows` crate — safe Job Object bindings, no `unsafe` in our code, but a new dependency requiring its own ADR; **(c)** accept Linux/macOS-only with loud documentation. **Re-entry: a superseding ADR that chooses among (a)/(b)/(c).** | L |
 | 37 | Hybrid UI full scope (tabbed Settings, Studio split pane, drag-and-drop agent assignment, focus-trap) — **rescoped 2026-09-27 per owner: Minimal + Medium tiers are LANDED, what remains is finish-and-polish with no correctness content. Row STAYS OPEN and deferred post-1.0** (size **L → M**) | **Full scope defined at `docs/hybrid-ui-plan.md:89`** — "All of Medium, plus split Settings into tabbed sub-views, convert Studio to split pane, add drag-and-drop agent assignment, animated panels, focus-trap system." **Citation corrected:** the row's old `TODO.md:145` had drifted onto an unrelated ADR-28 shell-profile note; the full-scope item is at `TODO.md:156–158` and `ROADMAP:147–149`; the landed medium scope is `TODO.md:150–155`. `docs/hybrid-ui-plan.md` is standalone, not part of the world-class plan | **LANDED — recorded so this row stops implying the hybrid UI is unbuilt** (the plan's own status list at `hybrid-ui-plan.md:306–317`; `TODO.md:150–155` for PR #49 Minimal and PR #97 Medium, merged 2026-08-03, commits `1c916b4` memory quick-panel, `4a12839` terminal bottom panel, `ade0c7b` glass modals + overlay/panel animations, `3d691a2` timestamps + transcript format v2, `f8c7b42` blinking cursor). Code anchors verified in the tree: the `SubView` overlay enum at `crates/desktop/src/views/chat.rs:23–25` (`Main`/`Diff`/`AgentGraph`/`ToolLog`/`SpendLog`/`Runtime`) with keyboard routing at `app.rs:1218–1222`; the shared animation layer at `app.rs:498` `ease_out_cubic` and `:4030`; the terminal as a toggleable bottom panel with drag resize (`app.rs:398` `terminal_panel_height`, `:2033–2046`, `:4030`); the memory quick-panel section (`views/quick_panel.rs`, `views/memory.rs`). **REMAINS**, as `crates/desktop/AGENTS.md:65–66` records: "⬜ State lifecycle: lazy init for infrequently used views" and "⬜ Full scope: tabbed Settings, Studio split pane, focus trap" — **plus drag-and-drop agent assignment, which is named in the plan (`:89`), `TODO.md:156–158` and `ROADMAP:147–149` but is *not* on the AGENTS.md ⬜ line** (that line names three items; the plan names four). Precisely, as of 2026-09-27: **(a) tabbed Settings — not done.** Settings is still one scrolling page of **9 collapsible sections** with a jump-sidebar (`views/settings/message.rs:372–382` `SectionId::ALL` = Theme, Providers, Assignments, Policy, Relationships, Retry, Memory, Shell, Extensions; rendered via `collapsible_section` at `views/settings/mod.rs:1049–1054`, sidebar at `:1060–1070`). The *Extensions hub* alone is tabbed, via `ExtensionTab` (`message.rs:342`, wired `mod.rs:1177–1201` — Skills / MCP / Plugins / ProjectContext), so there is no `SectionId::Skills`/`SectionId::Mcp` to tab away from: Skills and MCP are `ExtensionTab` variants inside `SectionId::Extensions`, not top-level sections. **(b) Studio split pane — absent** (Studio renders as a single surface, `views/orchestration_studio.rs`). **(c) drag-and-drop agent assignment — absent.** **(d) focus-trap system — absent.** **(e) lazy-init state lifecycle — absent.** **Size L → M, and why:** the reduction is earned, not optimistic — the two tiers that carried the hours are landed (Minimal ~20–30h and Medium ~60–90h per `hybrid-ui-plan.md:62`/`:75`), and every remaining item is layout/information-architecture polish with **no correctness, policy, or data-integrity content**, so the remainder is a finish pass rather than a design problem. **One caveat stated so "M" is not read as "free":** the plan's Medium item "SubView routing fully replaces `Page` for Chat-adjacent views" (`:83`) and its step 6 "Remove unused `Page` variants" (`:300`) are **not** done — `Page::DiffViewer` and `Page::ToolLog` are still routed and rendered (`app.rs:3973–3974`) and are still reachable from the context bar (`views/context_bar.rs:29–30`) and the quick panel (`views/quick_panel.rs:146`), so collapsing the `Page`/`SubView` dual path is real de-duplication work inside the remaining scope. **LAZY-INIT is the one remaining item with a felt, user-visible payoff** (it is the only one that changes startup cost and responsiveness rather than looks) and **may be pulled forward** ahead of the rest. Re-entry: post-1.0. | M |
 | 38 | Flat/content-embedded tool-call parsing residual (beyond proxy Fixes 1–3) | TODO.md:190–195; ROADMAP:165–168 (residual after Fixes 1–3 landed, see Closed #8); docs/proxy-tool-call-fix.md | When sanitized proxy fixtures + pairwise verification land against real OpenAI-compatible proxies | S |
-| 39 | Binary installers (deb/rpm/tar) | TODO.md:260–263; ROADMAP:194 (Later); STATUS.md:11–14 (no installer packages promised today; only `.tar.gz` via scripts/release.sh) | When a release/distribution decision is made | M |
-| 40 | crates.io publish | TODO.md:264–265; ROADMAP:194 (Later); STATUS.md:12–13 (not published; `publish = false` in workspace Cargo.toml) | Release decision + metadata audit (workspace `publish=false`, licence, repository links) | M |
 | 41 | Memory-grounded resume — Phase 6 M3 (a) run-scoped priming, (b) outcome write-back, (c) plan↔worktree drift gadget | ROADMAP:196–212 (live-test-gated; exit gate = three tests, :208–212; no schema change, no new ADR at this scope) | When live stress/interrupt evidence lands + the three tests pass | M |
 | 42 | Windows shell quoting weakness (threat gap #3) | security-threat-model.md §6 :323–328 (~4 h; cmd.exe quoting weaker than POSIX) | When a security milestone is scheduled (prefer `bypass_shell` on Windows) | S |
 | 43 | API server per-client rate limiting (threat gap #4) | security-threat-model.md §6 :332–337 (~4 h) | When a security milestone is scheduled | S |
@@ -394,6 +442,219 @@ a note.
     release engineer will actually look, and the removal from this register is a
     **reclassification** out of "deferred work with an owner and a size", not a
     cancellation of any item.
+
+22. Binary installers (deb/rpm/tar) — **row #39 cut 2026-09-27 per owner
+    decision, on intent "we will do that eventually" — a CUT, not a
+    cancellation, and resumable without re-investigation.** The row read as a
+    blank ticket; it is not, and the reason for cutting it is that **the
+    release pipeline it was waiting for already exists.** The honest summary is
+    *"a working tag-triggered cross-platform release pipeline is built and has
+    never been run; everything downstream of a raw binary is absent."*
+    **Two of the row's own cites had drifted off the item and are corrected
+    here.** Its `TODO.md:260–263` is the **audit M-05 oversized-module** item
+    (`:257–261`), not installers; the real entry is **`docs/TODO.md:271–274`**
+    ("**Binary installers (deb/rpm/tar).** Not started — `docs/STATUS.md:11-14`
+    … today only a `.tar.gz` release build exists (`scripts/release.sh`)").
+    Its `ROADMAP:194` is a line **inside the certified-evolution item**
+    (`:192–196`, since cut as Closed #20 — so both release rows were citing
+    another closed row's source); the real line is **`ROADMAP.md:197–198`**
+    ("**Binary installers and crates.io publishing:** currently only a `.tar.gz`
+    release build exists"), and note it covers row 40 as a single combined
+    bullet. `STATUS.md:11–14` is correct and untouched.
+    **BUILT (more than the row implied).** A real pipeline exists and was
+    verified end to end by reading it: `.github/workflows/release.yml` triggers
+    on `v*` tag pushes (`:13–16`) with `permissions: contents: write` (`:18–19`);
+    its build job is a **4-target matrix** (`:32–45`) — `x86_64-unknown-linux-gnu`
+    (`:34–36`), `x86_64-pc-windows-msvc` (`:37–39`, `.exe` suffix),
+    `aarch64-apple-darwin` (`:40–42`), `x86_64-apple-darwin` (`:43–45`) — with
+    `fail-fast: false` (`:31`) so one platform's failure still reports the full
+    picture; it installs the iced/wgpu Linux graphics libraries (`:55–62`), builds
+    `cargo build --release --target … -p concerto` (`:70`), stages a per-target
+    artifact (`:72–83`), and a second `release` job (`:85–102`) publishes via
+    **`softprops/action-gh-release@v2`** with **`generate_release_notes: true`**
+    (`:98–102`). The local path is `scripts/release.sh` (54 lines):
+    `cargo build --release --workspace` (`:13`), a tarball named
+    `concerto-${VERSION}-${OS}-${ARCH}.tar.gz` (`:29`, built at `:31–33`) plus a
+    `.sha256` sidecar (`:35–37`), and an **OPTIONAL** `cargo deb` guarded by
+    `command -v cargo-deb` that warns-and-skips rather than failing (`:39–48`).
+    **The pipeline has never been exercised — this is the single most important
+    fact for anyone resuming it.** The repo currently has **zero git tags**, so
+    the `v*` trigger has never fired, the matrix has never been proven on any of
+    the four targets, and the "every target succeeds" precondition on the
+    release job is untested. `docs/TODO.md:271–274` calls the state "only a
+    `.tar.gz` release build exists", which understates `release.yml` — and
+    `release.sh` and `release.yml` are **two independent, unreconciled paths**
+    (workspace-wide vs `-p concerto`; tarball+checksum vs raw per-target binary;
+    optional deb vs nothing) with no single documented release procedure.
+    **GENUINELY MISSING, checked rather than assumed.** (a) **No packaging
+    definitions of any kind are committed.** A repo-wide search for `cargo-deb`,
+    `package.metadata.deb`, `cargo-rpm`, `metadata.rpm`, `NSIS`, `WiX`,
+    `AppImage`, `.desktop`, `winget`, `scoop`, `homebrew`, `flatpak` and
+    `snapcraft` returns hits in exactly **two** places: the four `cargo-deb`
+    lines in `scripts/release.sh` (`:3`, `:39`, `:40`, `:47`), and one **prose**
+    line in a research brief, `docs/research/ai-native-shell-research-brief.md:34`
+    ("Cross-platform distribution: Homebrew, Winget, Cargo, Nix, pre-built
+    binaries"), which is a wishlist sentence, not a definition. So: no
+    installer definition exists, and the `cargo deb` call has **no
+    `[package.metadata.deb]` table behind it** — it would produce nothing as
+    written. (b) **No code signing anywhere.** A search for `codesign`,
+    `notarytool`, `notariz`, `signtool`, `cosign`, `GPG_KEY`, `apple-id` and
+    `import-signing` returns **zero matches repo-wide** — not in `release.yml`,
+    not in `release.sh`. macOS and Windows artifacts are therefore unsigned, and
+    a notarial/gatekeeper story is absent. (c) **No update channel**, and the
+    precise state is better and worse than "none exists": `crates/cli/src/update.rs`
+    is a **notification-only** check whose own module doc says "Never blocks
+    startup, **never auto-downloads**" (`:1–5`); it fires a 2-second-timeout GET
+    (`:17`, `:59–61`) at the hardcoded crates.io API endpoint for a `concerto`
+    crate (`:14`) and only `info!`-logs a newer version (`:23–43`). It is
+    **genuinely wired** — `crates/cli/src/lib.rs:182–185` gates it on
+    `config.updates.check_on_startup` and calls it — and an `[updates]` config
+    section exists (`crates/config/src/schema.rs:932–942`: `check_on_startup`
+    defaulting to **true** at `:945–947`, and `update_endpoint: Option<String>`
+    at `:941–942` documented "`None` = use crates.io API"). **But
+    `update_endpoint` is read by no code at all** — the only reference outside its
+    own definition is the re-export at `config/src/lib.rs:63`, while
+    `update.rs:14` hardcodes the crates.io URL. So the custom-endpoint seam is
+    **declared, documented and example'd (`docs/config.toml.example:237–241`,
+    which ships `check_on_startup = false` and a commented
+    `update_endpoint = "https://example.invalid/concerto/version"`) but
+    unwired** — the same defect shape this register already flags for row 45's
+    `ShellConfig::cpu_budget_secs`. With a default config the check therefore
+    fires against a crate that is not published; `fetch_update` (`:64–90`) never
+    checks `resp.status()`, so the 404's JSON body instead fails at the
+    `newest_version` lookup (`:86–90`) and the error arm logs at **`warn!`**
+    (`:38–40`), not `error!`. (d) **Two build targets are missing**: no
+    `aarch64-unknown-linux-gnu` and no arm/aarch64 Windows — a notable gap given
+    `AGENTS.md` records a Raspberry-Pi ARM host as a dev machine. (e) **The
+    desktop GUI is not separately packaged**, and this is a design fact rather
+    than a gap: `crates/concerto/Cargo.toml:11–14` sets `default = ["desktop"]`
+    with `desktop`/`cli` as optional feature-gated deps (`:13–14`), and
+    `release.yml:70` builds `-p concerto` with **defaults**, so the Iced GUI
+    **rides inside the single `concerto` binary**. There is no second artifact,
+    no `.app` bundle, and no installer for the GUI distinct from the CLI.
+    **How a user obtains a binary today: by building from source, only.**
+    `README.md:150–164` documents `cargo run -p concerto-desktop --release`
+    (`:150`), `cargo run -p concerto-cli --release` (`:156`) and the frontend
+    selector `cargo run -p concerto -- --desktop` / `--features cli -- --cli`
+    (`:162–164`) — `cargo run`, never a download; and `docs/STATUS.md:11–14` is
+    explicit that "Source builds and the automated workspace checks are the
+    supported distribution path" and that the project "does not currently
+    promise binary installer packages" (`:14`). **Recorded so the cut is
+    reversible:** everything the work needs is still written down here and in
+    `docs/TODO.md:271–274` / `ROADMAP.md:197–198`; the packaging decision that
+    remains is *which* installer formats and whether a signing story is funded,
+    and the mechanical baseline is a pipeline that builds and publishes
+    unsigned raw binaries but has never been executed.
+
+23. crates.io publish — **row #40 cut 2026-09-27 per owner decision, on intent
+    "we will do that eventually" — a CUT, not a cancellation, and resumable
+    without re-investigation.** The row's own re-entry condition ("Release
+    decision + metadata audit") named a blocker that **does not exist**; the
+    audit below is the resumption record, and it also records the decision that
+    was implicitly made by writing `publish = false` and never revisiting it.
+    **The same two drifted cites as row 39 apply** and are corrected here: its
+    `TODO.md:264–265` is the **audit M-02 decorative-cancellation** item
+    (`:262–267`), not publishing; the real entry is **`docs/TODO.md:275–276`**
+    ("**crates.io publish.** Not started — `docs/STATUS.md:12-13` (not published;
+    source builds and workspace checks are the supported path)"), and its
+    `ROADMAP:194` is likewise inside the certified-evolution bullet
+    (`:192–196`, Closed #20) — the real cite is the combined
+    **`ROADMAP.md:197–198`**. `STATUS.md:12–13` is correct and untouched.
+    **The flip itself is one line, and this is verified.** `publish = false` is
+    declared exactly once, in `[workspace.package]` at **`Cargo.toml:37`**, and
+    every member inherits it with `publish.workspace = true` in its `[package]`
+    block (`crates/core/Cargo.toml:6`, `crates/concerto/Cargo.toml:6`, and the
+    same line in each of the others). The workspace has **25 members**
+    (`Cargo.toml:4–28`; `AGENTS.md` agrees at "25 crates") — *not* 26, which is
+    worth stating so a resuming agent does not go looking for a 26th.
+    **Two of the row's named blockers are absent, and should not be
+    re-litigated.** (a) **Licence is not a blocker**: `license = "MIT OR
+    Apache-2.0"` (`Cargo.toml:35`) is inherited by every crate, and
+    `deny.toml:101–104` allows both (`"MIT"`, `"Apache-2.0"`, alongside
+    `Apache-2.0 WITH LLVM-exception`, BSD-2/3, Unicode-3.0, ISC). (b) **There is
+    no unpublished-dependency blocker**: a search for `git = ` across
+    `crates/*/Cargo.toml` returns **zero** hits, and every internal `path =`
+    points at `../<crate>`. The only non-`../` `path =` lines in the workspace
+    are four `[[bin]]`/`[[bench]]` *target* paths, not dependencies
+    (`eval-runner:34`, `mcp:29`, `orchestrator:57` and `:61`). So nothing
+    outside the workspace would need publishing first.
+    **The real question is the crate SUBSET, because the graph is coupled —
+    this is the finding that makes the row worth cutting rather than merely
+    deferring.** Publishing "everything" is not one line, it is publishing the
+    whole coupled graph at `0.1.0` with unstable APIs: `crates/desktop/Cargo.toml:12–24`
+    declares **13** internal dependency edges (all correctly carrying
+    `version = "0.1.0"` alongside `path`); `crates/eval-runner/Cargo.toml:12–19`
+    pulls in **8** internal crates; `crates/plugins/Cargo.toml:13–14` exposes
+    `concerto-core` and `concerto-api-types`. **Correction to one framing that
+    is easy to assert and wrong:** desktop's *public* surface does **not**
+    uniformly name orchestrator/memory types. What is public is
+    `pub bus: concerto_core::event::EventBus` (`app.rs:303`, inside
+    `pub struct App` at `:278`), `pub cancel_token: concerto_core::CancellationToken`
+    (`:317`), `pub config`/`pub global_config` as `concerto_config::AppConfig`
+    (`:304`, `:307`), `pub git_summary: Option<concerto_tools::git::RepositorySummary>`
+    (`:426`), `pub plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>`
+    (`views/settings/state.rs:176`), and two `pub fn` signatures
+    (`views/diff.rs:105` takes `&mut VirtualFs` → `concerto_core::ToolError`;
+    `views/tool_log.rs:102` takes `&[concerto_sessions::replay::StoredEvent]`).
+    `concerto-orchestrator` and `concerto-memory` **are** depended on
+    (`:14`, `:13`) and used, but through **private** `use` statements
+    (`app.rs:35–40`, `services/session_handler.rs:16`) — so the coupling is real
+    but it is a *dependency-edge* coupling, and "the public API takes
+    orchestrator/session/memory types" would not survive one grep. **The
+    decision this cut implicitly records: publish the `concerto` binary — and
+    possibly `concerto-plugin-sdk`, which is the one genuinely reusable public
+    surface — and keep the remaining 23–24 crates `publish = false`.** That is
+    the only option that publishes something usable without freezing the entire
+    internal API at `0.1.0`.
+    **Mechanical work, recorded so it is not rediscovered.** (i) **20 of the 25
+    crates have no `description`**, which crates.io hard-requires. Exactly five
+    have one: `concerto-plugin-sdk` (`plugin-sdk/Cargo.toml:3`) and the four
+    `test-*-plugin-wasm` crates (each `:3`). (ii) **`repository` is *defined but
+    never inherited*** — this is the single most misleading item in the row. The
+    workspace sets `repository = "https://github.com/NefaroXX/Concerto"` at
+    **`Cargo.toml:36`**, but **no crate opts in**: every `[package]` block is
+    exactly `name` / `version.workspace` / `edition.workspace` /
+    `license.workspace` / `publish.workspace` (e.g. `core/Cargo.toml:2–6`), with
+    no `repository.workspace = true`. So the value is already written and a
+    resuming agent needs only one added line per crate, not a new URL. No crate
+    has `homepage`, `readme`, `documentation`, `authors`, `keywords` or
+    `categories` at all. (iii) **8 internal dependency edges across 6 crates
+    carry `path` with NO `version`**, which crates.io rejects: the optional
+    `concerto-cli` / `concerto-desktop` deps (`crates/concerto/Cargo.toml:17–18`),
+    `concerto-core` / `concerto-config` (`crates/observability/Cargo.toml:23–24`),
+    and all four `test-*-plugin-wasm → concerto-plugin-sdk` (`:13` in each).
+    (iv) **The remaining 73 internal edges hardcode `version = "0.1.0"` as an
+    inline literal**, and internal crates are **absent from
+    `[workspace.dependencies]` entirely** (no `concerto-*` entry in
+    `Cargo.toml:60–204`; no crate uses `concerto-x.workspace = true`). So
+    bumping the single-sourced `version` at `Cargo.toml:32` does **not**
+    propagate: 73 literals plus 8 path-only edges need lockstep manual editing.
+    (v) **The `test-*-plugin-wasm` crates should be excluded regardless of the
+    subset decision** — they are `crate-type = ["cdylib"]` **test fixtures**
+    (`:10` in all four, alongside `description` at `:3`), built only for the
+    `wasm32-wasip2` integration tests. Publishable in principle, meaningless in
+    practice.
+    **Supporting process state.** Version is single-sourced at `Cargo.toml:32`
+    (`0.1.0`) and inherited everywhere. `CHANGELOG.md` (668 lines) is
+    Keep-a-Changelog + SemVer with the preamble at `:1–6` and a single
+    `## [Unreleased]` section at `:8` — **no released version has ever been
+    cut**, consistent with the zero git tags row 39 records. `CONTRIBUTING.md`
+    has **no release-process section** (its headings are Development setup,
+    Looking for a first contribution?, Before opening an issue, Branches/
+    commits/pull requests, Required checks, Code expectations, Tests, Quality
+    gates, Architecture decisions, Documentation); "release" appears only at
+    `:135` and `:155` as pointers to `TESTING.md`.
+    **One dead-behaviour note, corrected from an easy misreading:**
+    `crates/cli/src/update.rs` is **not unreferenced code** — it is wired at
+    `crates/cli/src/lib.rs:182–185` behind `check_on_startup`. What is inert is
+    its *target*: it queries `https://crates.io/api/v1/crates/concerto`
+    (`:14`) for a crate this workspace does not publish, so the check cannot
+    succeed until a publish actually happens (and `update_endpoint` stays
+    unwired either way, per Closed #22(c)). **Recorded so the cut is
+    reversible:** the flip, the subset decision, and the whole metadata audit
+    are written down above; resuming means choosing the subset, adding
+    `description`/`repository` inheritance, and fixing the 8 versionless edges —
+    not re-investigating why the row existed.
 
 ## Verification notes (2026-09-24)
 
@@ -1512,3 +1773,223 @@ intentionally**, matching the row 3 / 4 / 10 / 12 / 14 / 19 / 21 / 25 / 26 / 28 
     ("Not started" for work that landed in `f4bdc4f`); `ROADMAP.md:241–245`; and
     the `— manual` orphan fragment in the 2026-09-24 notes above, still
     unrepaired.
+
+## Verification notes (2026-09-27, rows 39 / 40 — release-and-packaging cut, crates.io publish cut)
+
+Executed 2026-09-27 on the current checkout. **Docs only — no source edits, no
+builds, no test runs, no commit**; the tree is left for the orchestrator to
+commit alongside the other doc changes already in the working tree. Every claim
+below was re-read in the tree or in the cited document, not carried over from a
+prior note or from the pass brief. **No other row touched; no renumbering; the
+`#39` and `#40` gaps are left intentionally**, matching the row 3 / 4 / 10 / 12 /
+14 / 19 / 21 / 25 / 26 / 28 / 32 / 33 / 35 / 44 / 47 / 49 precedent.
+
+- **Scope of this pass: rows 39 and 40 cut**, landing in the Closed appendix as
+  #22 and #23. **Both cuts are RESUMABLE and neither is a cancellation.** The
+  owner decision recorded on 2026-09-27 for each is that the work is wanted
+  *eventually*, so the purpose of cutting is to get the rows out of the active
+  register while writing down enough verified state that resuming needs **no
+  re-investigation**. The state is recorded in the two appendix lines; this
+  section records the verification behind them, including the claims that were
+  corrected.
+- **The two rows share a source bullet and a pipeline, but not a finding** —
+  hence separate entries. `ROADMAP.md:197–198` is one combined bullet ("Binary
+  installers **and** crates.io publishing"), `docs/TODO.md:271–276` is two
+  adjacent Release-section entries, and both rows depend on the same never-run
+  `release.yml`. But row 39's substance is *a working pipeline plus an absent
+  packaging layer*, while row 40's is *a one-line flip whose real cost is the
+  crate subset*. Merging them would have hidden both.
+- **Row 39 — the "missing" state is real but starts much later than the row
+  implied, and the single most important fact is that nothing has been
+  exercised.** `release.yml` is 102 lines and complete: `v*` tag trigger
+  (`:13–16`), `permissions: contents: write` (`:18–19`), `fail-fast: false`
+  (`:31`), a 4-target matrix (`:32–45` — `x86_64-unknown-linux-gnu`,
+  `x86_64-pc-windows-msvc` with `.exe` suffix, `aarch64-apple-darwin`,
+  `x86_64-apple-darwin`), the iced/wgpu Linux graphics libs (`:55–62`),
+  `cargo build --release --target … -p concerto` (`:70`), artifact staging
+  (`:72–83`), and a `release` job publishing through
+  **`softprops/action-gh-release@v2`** with **`generate_release_notes: true`**
+  (`:98–102`). `scripts/release.sh` is 54 lines: workspace build (`:13`),
+  `concerto-${VERSION}-${OS}-${ARCH}.tar.gz` (`:29`, `:31–33`), `.sha256`
+  (`:35–37`), and an **optional** `cargo deb` behind `command -v cargo-deb` that
+  warns-and-skips (`:39–48`). **`git tag` returns zero tags**, so the `v*`
+  trigger has never fired, the matrix is unproven on all four targets, and the
+  release job's "every target succeeded" precondition is untested. Two
+  independent and **unreconciled** release paths exist (workspace-wide vs
+  `-p concerto`; tarball+checksum vs raw binary; optional deb vs none) with no
+  single documented procedure — recorded because a resuming agent should not
+  assume the two are one system.
+- **Row 39 — every "absent" claim was checked, and two of them turned out to be
+  more nuanced than "absent".** (a) **No packaging definitions are committed:**
+  a repo-wide search for `cargo-deb`, `package.metadata.deb`, `cargo-rpm`,
+  `metadata.rpm`, `NSIS`, `WiX`, `AppImage`, `.desktop`, `winget`, `scoop`,
+  `homebrew`, `flatpak`, `snapcraft` returns hits in exactly **two** files — the
+  four `cargo-deb` lines in `scripts/release.sh` (`:3`, `:39`, `:40`, `:47`) and
+  one **prose** line, `docs/research/ai-native-shell-research-brief.md:34`
+  ("Homebrew, Winget, Cargo, Nix, pre-built binaries"). So the `cargo deb` call
+  has **no `[package.metadata.deb]` table behind it** and would produce nothing
+  as written. The brief's phrasing — "the only hits are in
+  `scripts/release.sh`" — is corrected to name the research-brief line too;
+  it is a wishlist sentence, not a definition. (b) **No code signing: zero
+  matches repo-wide** for `codesign`, `notarytool`, `notariz`, `signtool`,
+  `cosign`, `GPG_KEY`, `apple-id`, `import-signing` — so macOS and Windows
+  artifacts are unsigned and there is no notarial story.
+- **Row 39 — the update story is a half-built seam, and this is the finding that
+  the brief's "no update channel" hid.** `crates/cli/src/update.rs:1–5` is
+  notification-only and says so in its own module doc ("Never blocks startup,
+  **never auto-downloads**"), with a 2s timeout (`:17`, `:59–61`) and a hardcoded
+  crates.io endpoint (`:14`). But an `[updates]` config section **does** exist
+  (`crates/config/src/schema.rs:932–942`): `check_on_startup` defaulting to
+  **true** (`:945–947`) and `update_endpoint: Option<String>` (`:941–942`,
+  documented "`None` = use crates.io API"). The CLI **does** honour the first
+  (`crates/cli/src/lib.rs:182–185`) and the second is **read by nothing** — its
+  only reference outside its own definition is the re-export at
+  `config/src/lib.rs:63`, and `update.rs:14` hardcodes the URL. So
+  `update_endpoint` is declared, documented, and example'd
+  (`docs/config.toml.example:237–241`) but **unwired** — the same defect shape
+  this register already flags for row 45's `ShellConfig::cpu_budget_secs`.
+  Behavioural consequence, stated precisely: with a default config the check
+  fires at a crate that is not published; `fetch_update` (`:64–90`) **never
+  checks `resp.status()`**, so the 404's JSON body fails at the `newest_version`
+  lookup (`:86–90`) and the error arm logs at **`warn!`** (`:38–40`), not
+  `error!`. The example config avoids this by shipping
+  `check_on_startup = false`.
+- **Row 39 — the GUI packaging question has a definite answer, and it is "not
+  separately packaged" by design.** `crates/concerto/Cargo.toml:11–14` sets
+  `default = ["desktop"]` with the frontend deps optional and feature-gated
+  (`:13–14`), and `release.yml:70` builds `-p concerto` **with defaults**, so
+  the Iced GUI rides **inside the single `concerto` binary**. There is no second
+  artifact, no `.app` bundle, and no GUI-distinct installer. A resuming agent
+  should not plan one without first deciding to split the binary. How a user
+  gets a binary today: build from source — `README.md:150–164` documents
+  `cargo run -p concerto-desktop --release` (`:150`),
+  `cargo run -p concerto-cli --release` (`:156`) and the selector forms
+  (`:162–164`), never a download; `docs/STATUS.md:11–14` states source builds
+  are the supported distribution path and that installer packages are "not
+  currently promise[d]" (`:14`).
+- **Row 40 — the row's own re-entry condition named a blocker that does not
+  exist, which is why the row is cut rather than kept pending.** `publish = false`
+  is declared **once**, at `Cargo.toml:37`, and inherited by every member via
+  `publish.workspace = true` (`crates/core/Cargo.toml:6`,
+  `crates/concerto/Cargo.toml:6`, same line in the rest) — so the flip is one
+  line. **Licence is not a blocker**: `MIT OR Apache-2.0` (`Cargo.toml:35`), both
+  allowed by `deny.toml:101–104`. **Nor is any dependency**: `git = ` has **zero**
+  hits across `crates/*/Cargo.toml`, and every internal `path =` points at
+  `../<crate>` — the only non-`../` `path =` lines in the workspace are four
+  `[[bin]]`/`[[bench]]` **target** paths (`eval-runner:34`, `mcp:29`,
+  `orchestrator:57`/`:61`). So nothing outside the workspace would have to be
+  published first, and a resuming agent should not re-audit either of these.
+- **Row 40 — the real question is the SUBSET, and it is the coupling.** Verified
+  edge counts: `crates/desktop/Cargo.toml:12–24` declares **13** internal deps;
+  `crates/eval-runner/Cargo.toml:12–19` pulls **8**; `crates/plugins/Cargo.toml:13–14`
+  exposes core + api-types. So "publish all" means publishing the whole coupled
+  graph at `0.1.0` with unstable APIs. **The decision this cut implicitly
+  records — publish the `concerto` binary (and possibly `concerto-plugin-sdk`,
+  the one genuinely reusable public surface), keep the other 23–24 at
+  `publish = false`** — is the only option that ships something usable without
+  freezing the whole internal API.
+- **Row 40 — FOUR brief counts were wrong and are corrected, because each would
+  have sent a resuming agent looking for something that is not there.**
+  (a) **25 members, not 26** (`Cargo.toml:4–28`; `AGENTS.md` agrees at "25
+  crates"). (b) **20 crates lack a `description`, not ~21** — exactly five have
+  one: `concerto-plugin-sdk` (`plugin-sdk/Cargo.toml:3`) and the four
+  `test-*-plugin-wasm` (each `:3`). (c) **`repository` is *defined but never
+  inherited*** — `Cargo.toml:36` sets
+  `repository = "https://github.com/NefaroXX/Concerto"`, but every `[package]`
+  block is exactly name / version / edition / license / publish (e.g.
+  `core/Cargo.toml:2–6`) with **no `repository.workspace = true`** anywhere.
+  "No repository link" is thus a *one-line-per-crate inheritance add*, not a
+  value to invent. No crate has `homepage`, `readme`, `documentation`, `authors`,
+  `keywords` or `categories` at all. (d) **8 internal edges across 6 crates
+  carry `path` with no `version`**, not 4 — the brief's own enumeration listed
+  2 + 2 + 4: `concerto-cli` / `concerto-desktop` (`crates/concerto/Cargo.toml:17–18`),
+  `concerto-core` / `concerto-config` (`crates/observability/Cargo.toml:23–24`),
+  and all four `test-*-plugin-wasm → concerto-plugin-sdk` (`:13` each).
+- **Row 40 — the lockstep hazard is bigger than the brief stated, and is
+  mechanical.** The other **73** internal edges hardcode `version = "0.1.0"` as
+  an **inline literal**, and internal crates are **absent from
+  `[workspace.dependencies]` entirely** (no `concerto-*` entry in
+  `Cargo.toml:60–204`; no `concerto-x.workspace = true` anywhere). So the
+  single-sourced `version` at `Cargo.toml:32` does **not** propagate: 73 literals
+  plus 8 versionless edges need lockstep manual editing on any bump. Verified by
+  tallying the internal dep lines by form: 16× core, 10× config, 8× api-types,
+  6× sessions, 5× tools, 5× providers, 4× orchestrator, 4× memory, 4× eval,
+  3× skills, 3× plugins, 3× lsp, 2× mcp, 4× plugin-sdk (versionless), 1× each of
+  desktop / core / config / cli (versionless) = 81 internal edges.
+- **Row 40 — the `test-*-plugin-wasm` crates should be excluded regardless of
+  the subset decision.** All four are `crate-type = ["cdylib"]` (`:10` in each —
+  the brief cited `:8`, which is `publish.workspace`) and are test fixtures built
+  only for the `wasm32-wasip2` integration tests. Publishable in principle,
+  meaningless in practice. Separately, the version field is inherited from
+  `Cargo.toml:32` everywhere, `CHANGELOG.md` (668 lines) is Keep-a-Changelog +
+  SemVer with the preamble at `:1–6` and a single `## [Unreleased]` at `:8` —
+  **no released version has ever been cut**, consistent with row 39's zero tags
+  — and `CONTRIBUTING.md` has **no release-process section** (headings: Development
+  setup, Looking for a first contribution?, Before opening an issue, Branches /
+  commits / PRs, Required checks, Code expectations, Tests, Quality gates,
+  Architecture decisions, Documentation; "release" appears only at `:135` and
+  `:155` as pointers to `TESTING.md`).
+- **Row 40 — one claim was sharpened rather than contradicted: the update check
+  is NOT dead code.** The brief called `crates/cli/src/update.rs:1–40` a
+  "dead-code note". It is **wired**: `crates/cli/src/lib.rs:182–185` computes
+  `config.updates.as_ref().is_none_or(|u| u.check_on_startup)` and calls
+  `check_for_updates()`. What is inert is its **target** — the hardcoded
+  `https://crates.io/api/v1/crates/concerto` (`:14`) for a crate this workspace
+  does not publish — so the check cannot succeed until a publish actually
+  happens, and `update_endpoint` stays unwired either way. Writing "dead code"
+  would have been falsified by one grep for the call site; the appendix records
+  the corrected version and cross-references Closed #22(c).
+- **Row 40 — the desktop coupling claim was true in spirit and false in
+  detail, so the precise form is recorded instead.** The brief said
+  "`crates/desktop/Cargo.toml:12-22` public API takes
+  concerto-orchestrator/sessions/memory types". Two corrections: the internal
+  block is **`:12–24`** (13 edges, not 11), and the public surface does **not**
+  name orchestrator or memory types. What is public is
+  `pub bus: concerto_core::event::EventBus` (`app.rs:303`, in `pub struct App`
+  at `:278`), `pub cancel_token: concerto_core::CancellationToken` (`:317`),
+  `pub config`/`pub global_config` as `concerto_config::AppConfig` (`:304`,
+  `:307`), `pub git_summary: Option<concerto_tools::git::RepositorySummary>`
+  (`:426`), `pub plugin_manager: Option<concerto_plugins::manager::SharedPluginManager>`
+  (`views/settings/state.rs:176`), and two `pub fn` signatures
+  (`views/diff.rs:105`, `views/tool_log.rs:102`). `concerto-orchestrator` and
+  `concerto-memory` **are** depended on (`:14`, `:13`) and used, but via
+  **private** `use`s (`app.rs:35–40`, `services/session_handler.rs:16`); a
+  search for `pub use concerto_*` in `crates/desktop/src` returns **no files
+  found**. The coupling is real, but it is a *dependency-edge* coupling — so the
+  register does not claim a public-API coupling it cannot demonstrate.
+- **BOTH rows — their `TODO.md` and `ROADMAP` cites had drifted off the items,
+  and the corrections are recorded in the appendix.** `TODO.md:260–263` is the
+  **audit M-05 oversized-module** entry (`:257–261`); `TODO.md:264–265` is the
+  **audit M-02 decorative-cancellation** entry (`:262–267`). The real entries are
+  **`docs/TODO.md:271–274`** (installers) and **`:275–276`** (publish), under the
+  `## Release` heading at `:269`. `ROADMAP:194` is a line **inside the
+  certified-evolution bullet** (`:192–196` — row 32, already cut as Closed #20),
+  so **both release rows were citing another closed row's source**; the real
+  cite is the combined **`ROADMAP.md:197–198`**. `STATUS.md:11–14` and
+  `:12–13` are correct and untouched. `docs/TODO.md`, `ROADMAP.md` and
+  `docs/STATUS.md` are **not modified by this pass** and remain the source of
+  truth for the release track.
+- **Follow-ups flagged, not actioned here** (outside this pass's scope):
+  - `docs/TODO.md:271–274` still says installers are "Not started" and, via its
+    `CHANGELOG 0.1.0-alpha "Release workflow building .tar.gz for ubuntu +
+    macos"` reference, implies a release workflow that is now known to be
+    unexercised (zero tags). `ROADMAP.md:197–198` still says "currently only a
+    `.tar.gz` release build exists", which understates `release.yml`. Neither
+    source document records the row cut. A future pass should reconcile both
+    against Closed #22.
+  - `crates/config/src/schema.rs:941–942` — `[updates].update_endpoint` is read
+    by no code. Either wire it into `crates/cli/src/update.rs` (replacing the
+    hardcoded `CRATES_IO_API` at `:14`) or drop the field and the
+    `docs/config.toml.example:240` example, so the config surface stops
+    promising a capability that does not exist. **This is a source change and is
+    deliberately not made here.**
+  - `crates/concerto/Cargo.toml:17–18` optional `cli`/`desktop` deps carry no
+    `version`, which will block a publish of the `concerto` crate specifically —
+    i.e. it sits directly on the *recommended* subset from Closed #23, not on a
+    discarded one.
+  - Still carried forward from the prior passes and untouched:
+    `docs/security-threat-model.md` §6 gaps #1, #5, #6; `docs/TODO.md:229–235`;
+    `ROADMAP.md:241–245`; the `docs/STATUS.md:346–349` mirror of cut row 28; the
+    git-ignored `docs/research/certified-universal-evolution.md` cites in
+    `docs/TODO.md:297–304` and `ROADMAP.md:192–196`; and the `— manual` orphan
+    fragment in the 2026-09-24 notes, still unrepaired.
