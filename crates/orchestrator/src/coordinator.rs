@@ -161,23 +161,22 @@ const MAX_DISPATCH_ITERATIONS: usize = 64;
 /// exit with a preserved checkpoint.
 const MAX_PROSE_STOP_REPROMPTS: u32 = 5;
 
-/// ADR-35 same-role dispatch cap: the number of CONSECUTIVE dispatches to one
-/// role on the same objective, with no implement/code artifact produced, at
-/// which the loop guard fires. It is a pure loop invariant — an ADVISORY guard,
-/// never a compiled dispatch policy or state forcing (the guard only records
-/// the loop evidence and nudges toward a different role; it never selects,
-/// auto-dispatches, or escalates the run itself).
+/// Same-role dispatch cap: the number of CONSECUTIVE dispatches to one role on
+/// the same objective before the repeat-dispatch path is bounded and
+/// escalated. At the cap the next dispatch naming that role is NOT re-run as
+/// that role: it escalates through the agent axis (a same-stage peer first,
+/// then any agent whose configured coverage can take the work) and, when no
+/// alternative specialist exists, surfaces the existing user-input decision
+/// point. The escalation never registers a reason for the coordinator to
+/// self-execute (ADR-74): another specialist or an operator decision, never
+/// in-house work while a specialist remains.
 const MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES: u32 = 3;
 
-/// The bounded advisory nudges the same-role guard may emit. Past the ceiling
-/// the guard stays silent on the tool result (the ledger note already carries
-/// the loop evidence); it never escalates on the operator's behalf.
-const MAX_SAME_ROLE_GUARD_NUDGES: u32 = 1;
-
 /// Whether a produced path is an implement/code artifact (as opposed to a
-/// docs-only deliverable). Extension-based, deliberately conservative: the
-/// same-role guard only treats a streak as productive when a code artifact
-/// landed, so a docs-only streak keeps counting toward the cap.
+/// docs-only or rename-style deliverable). Extension-based, deliberately
+/// conservative: the same-role cap only treats a code-edit streak as
+/// productive when a code artifact landed, so a docs-only streak keeps
+/// counting toward the cap.
 fn is_code_artifact_path(path: &camino::Utf8Path) -> bool {
     path.extension().is_some_and(|extension| {
         matches!(
@@ -2363,15 +2362,20 @@ struct DispatchSessionState {
     doc: Option<DesignDoc>,
     doc_verdict: Option<DesignDocVerdict>,
     last_node: Option<TaskId>,
-    /// ADR-35 same-role dispatch cap (in-memory run state, reset per
-    /// objective because a fresh session state is built for each objective):
-    /// the role of the last settled dispatch and how many consecutive
-    /// dispatches to it have settled without an implement/code artifact.
+    /// Same-role dispatch cap (in-memory run state, reset per objective
+    /// because a fresh session state is built for each objective): the role
+    /// of the last settled dispatch and how many consecutive dispatches to it
+    /// have settled without the objective's expected deliverable.
     last_role: Option<AgentId>,
     consecutive_role_count: u32,
-    /// Bounded guidance turns the same-role guard has emitted; at the ceiling
-    /// the guard escalates to `AwaitingUser` instead of nudging again.
-    role_guard_nudges: u32,
+    /// The role whose consecutive-dispatch cap was reached and not yet
+    /// escalated. A later `call_specialist` naming it is redirected to a
+    /// covering specialist (or surfaces a decision point) instead of being
+    /// re-dispatched; cleared as soon as that episode resolves.
+    capped_role: Option<AgentId>,
+    /// Roles already escalated away from on this objective, so a takeover
+    /// never ping-pongs back to a role that itself hit the cap.
+    escalated_roles: HashSet<AgentId>,
 }
 
 /// The binding DesignDoc for expected-artifact derivation: a Verified doc
@@ -4810,6 +4814,25 @@ impl CoordinatorAgent {
     fn takeover_candidate_for_role(&self, original_role: &AgentId) -> Option<AgentId> {
         let stage = self.registry.get(original_role).and_then(|agent| agent.stage())?;
         self.registry.takeover_candidate(&stage, original_role)
+    }
+
+    /// The registered specialist that should take over a role that hit the
+    /// repeat-dispatch cap: the first covering candidate (same-stage peer
+    /// first, then a `can_cover` agent) that has not already been escalated to
+    /// on this objective. `None` when no such candidate exists — the caller
+    /// then surfaces the existing user-input decision point rather than
+    /// looping. Pure and config-driven, exactly like
+    /// [`Self::takeover_candidate_for_role`].
+    fn takeover_candidate_for_capped_role(
+        &self,
+        capped_role: &AgentId,
+        avoid: &HashSet<AgentId>,
+    ) -> Option<AgentId> {
+        let stage = self.registry.get(capped_role).and_then(|agent| agent.stage())?;
+        self.registry
+            .takeover_candidates(&stage, capped_role)
+            .into_iter()
+            .find(|candidate| !avoid.contains(candidate))
     }
 
     async fn attempt_fallback_ladder(
@@ -11273,29 +11296,32 @@ impl CoordinatorAgent {
         Ok((summary, advisory_plan))
     }
 
-    /// ADR-35 same-role dispatch cap — an ADVISORY guard beside the
-    /// vacuous-completion and zero-work guards.
+    /// Same-role dispatch cap — the bound on the repeat-dispatch path beside
+    /// the vacuous-completion and zero-work guards.
     ///
     /// The decision loop tracks, in memory for one objective, how many
-    /// consecutive dispatches have settled against the same role without any
-    /// implement/code artifact landing. At
-    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it fires and pushes a ledger
-    /// note (which downgrades the run exit to `Partial` and keeps the resume
-    /// checkpoint — never a silent `Completed`), plus, while nudge budget
-    /// remains, an advisory nudge in the tool result.
+    /// consecutive dispatches have settled against the same role without the
+    /// objective's expected deliverable. At
+    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it records the loop evidence
+    /// ONCE (a ledger note, which downgrades the run exit to `Partial` and
+    /// keeps the resume checkpoint — never a silent `Completed`) and marks the
+    /// role as capped. The NEXT `call_specialist` naming that role is not
+    /// re-dispatched: `handle_call_specialist` escalates it through the agent
+    /// axis (same-stage peer, then a `can_cover` agent) or, when none exists,
+    /// surfaces the user-input decision point.
     ///
-    /// It NEVER forces a target role and NEVER escalates the run itself: the
-    /// nudge only recommends considering a different role, and re-dispatching
-    /// the same role stays the Coordinator's decision (ADR-35: no compiled
-    /// dispatch policy, no state forcing). A code artifact on the ledger
-    /// resets the streak: a run making real implement progress is never
-    /// flagged by the cap.
+    /// Fit-for-purpose deliverable: a code-edit objective judges a dispatch on
+    /// a code artifact; any other objective judges it on a file change (a
+    /// rename is a file deliverable even though its extension is not code) and
+    /// an inspect/design/research objective that owes no file is judged on
+    /// repetition alone. This is why a rename never trips the code-artifact
+    /// wording, while a real implement circle still does.
     ///
-    /// It also YIELDS to the #53 progress guard: once that guard is engaged
+    /// It YIELDS to the #53 progress guard: once that guard is engaged
     /// (`progress_guard_engaged` — equivalent cycles accumulating or any
     /// reconsideration already emitted), it owns the repetition and the cap
-    /// stays silent. The cap only catches the same-role circles the progress
-    /// guard sees as *progressing*, which is exactly the production failure.
+    /// stays silent.
+    #[allow(clippy::too_many_arguments)]
     fn apply_same_role_dispatch_cap(
         &mut self,
         state: &mut DispatchSessionState,
@@ -11303,13 +11329,22 @@ impl CoordinatorAgent {
         subtask_id: TaskId,
         session_id: Ulid,
         progress_guard_engaged: bool,
+        expects_code_artifact: bool,
         ledger: &mut DispatchLedger,
     ) -> Option<serde_json::Value> {
-        let produced_code = ledger.all_files.iter().any(|path| is_code_artifact_path(path));
-        if produced_code {
-            // Implement progress: the role is not circling. Reset the streak.
+        // A settled dispatch is productive when it produced the deliverable
+        // the objective expected: a code artifact for code-edit work, any
+        // file change otherwise. The expectation is derived from the
+        // objective/subtask, never assumed.
+        let produced_deliverable = if expects_code_artifact {
+            ledger.all_files.iter().any(|path| is_code_artifact_path(path))
+        } else {
+            !ledger.all_files.is_empty()
+        };
+        if produced_deliverable {
             state.last_role = Some(agent_id.clone());
             state.consecutive_role_count = 1;
+            state.capped_role = None;
             return None;
         }
         if state.last_role.as_ref() == Some(agent_id) {
@@ -11317,6 +11352,7 @@ impl CoordinatorAgent {
         } else {
             state.last_role = Some(agent_id.clone());
             state.consecutive_role_count = 1;
+            state.capped_role = None;
             return None;
         }
         if state.consecutive_role_count < MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES {
@@ -11326,22 +11362,22 @@ impl CoordinatorAgent {
             // The #53 progress guard owns repetition stalls; yield to it.
             return None;
         }
+        if state.capped_role.as_ref() == Some(agent_id) {
+            // The episode is already recorded. Never repeat the note.
+            return Some(serde_json::json!({ "same_role_guard": "cap_reached" }));
+        }
 
+        state.capped_role = Some(agent_id.clone());
         let count = state.consecutive_role_count;
-        // A binding DesignDoc is the one cheap signal that implement work is
-        // the legitimate next step, so the guard may nudge toward it.
-        let design_binds =
-            state.doc_verdict.as_ref().is_some_and(|verdict| verdict.state.is_active());
-        let can_nudge = design_binds && state.role_guard_nudges < MAX_SAME_ROLE_GUARD_NUDGES;
         let note = format!(
-            "Same-role dispatch guard (advisory): specialist {agent_id} settled {count} \
-             consecutive dispatches on this objective with no implement/code artifact produced. \
-             {}. The Coordinator decides the next step — re-dispatching {agent_id} is permitted, \
-             but a different implement-stage role (or requesting user input) is recommended.",
-            if design_binds {
-                "A verified DesignDoc binds, so implement work is the recommended next step"
+            "Same-role dispatch cap: specialist {agent_id} settled {count} consecutive \
+             dispatches on this objective without producing {}. The next dispatch naming \
+             {agent_id} is not re-dispatched: it escalates to a different registered \
+             specialist that can cover the work, or pauses for operator input when none exists.",
+            if expects_code_artifact {
+                "the expected code artifact"
             } else {
-                "No binding DesignDoc is attached, so the objective may be design-only"
+                "the expected file change"
             }
         );
         let _ = self.bus.publish_for_session(
@@ -11353,34 +11389,8 @@ impl CoordinatorAgent {
                 kind: ThinkingKind::Detail,
             },
         );
-        ledger.notes.push(note);
-
-        if can_nudge {
-            state.role_guard_nudges += 1;
-            let nudge = format!(
-                "Same-role dispatch guard (advisory): you have dispatched {agent_id} {count} \
-                 times consecutively without any implement/code artifact. Consider dispatching \
-                 a different implement-stage specialist next; re-dispatching {agent_id} remains \
-                 your decision."
-            );
-            let _ = self.bus.publish_for_session(
-                session_id,
-                subtask_id.0,
-                EventKind::AgentThought {
-                    agent_id: "coordinator".into(),
-                    content: nudge.clone(),
-                    kind: ThinkingKind::Detail,
-                },
-            );
-            return Some(serde_json::json!({
-                "same_role_guard": "advisory",
-                "nudge": nudge,
-            }));
-        }
-
-        // Nudge budget exhausted (or no binding design): the ledger note above
-        // already carries the loop evidence; no state is forced.
-        Some(serde_json::json!({ "same_role_guard": "advisory" }))
+        ledger.notes.push(note.clone());
+        Some(serde_json::json!({ "same_role_guard": "cap_reached", "message": note }))
     }
 
     /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
@@ -11412,6 +11422,72 @@ impl CoordinatorAgent {
             });
         };
 
+        // ── Same-role repeat cap: escalate before any further dispatch ──
+        // The requested role already reached the consecutive-dispatch cap on
+        // this objective. Do NOT re-dispatch it: escalate through the agent
+        // axis (a different registered specialist that can cover the work) or,
+        // when none exists, surface the existing user-input decision point.
+        // This is escalation to a specialist or to the operator — never a
+        // reason for the coordinator to self-execute while a specialist
+        // remains (ADR-74).
+        let requested_agent = AgentId::new(&args.agent_id);
+        let effective_agent: AgentId = if state.capped_role.as_ref() == Some(&requested_agent) {
+            match self.takeover_candidate_for_capped_role(&requested_agent, &state.escalated_roles)
+            {
+                Some(candidate) => {
+                    state.escalated_roles.insert(requested_agent.clone());
+                    state.capped_role = None;
+                    state.last_role = Some(candidate.clone());
+                    state.consecutive_role_count = 1;
+                    let note = format!(
+                        "Same-role dispatch cap escalation: {requested_agent} reached the \
+                         consecutive-dispatch cap on this objective; the requested re-dispatch \
+                         was re-targeted to {candidate}, a different registered specialist that \
+                         can cover the same work. No coordinator self-execution is involved."
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: note.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    ledger.notes.push(note);
+                    candidate
+                }
+                None => {
+                    let reason = format!(
+                        "Same-role dispatch cap: {requested_agent} reached the \
+                         consecutive-dispatch cap on this objective and no different registered \
+                         specialist can cover its stage. The run pauses for your decision: add \
+                         or enable a specialist that can take this work, or confirm the \
+                         objective is complete."
+                    );
+                    state.capped_role = None;
+                    self.requested_user_input = Some(reason.clone());
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: reason.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    ledger.notes.push(reason.clone());
+                    return serde_json::json!({
+                        "status": "awaiting_human_input",
+                        "same_role_guard": "cap_reached",
+                        "message": reason,
+                    });
+                }
+            }
+        } else {
+            requested_agent.clone()
+        };
+
         // ── Issue #52: validate the decision BEFORE any mutation ────────
         // The model output is a proposition, not an instruction. Evidence
         // existence is the real whiteboard-row check (dispatch-time, not
@@ -11430,7 +11506,7 @@ impl CoordinatorAgent {
         };
         let decision = match validator.validate(
             crate::decisions::DecisionKind::DispatchSpecialist,
-            Some(&args.agent_id),
+            Some(effective_agent.as_str()),
             &args.task,
             args.notes.as_deref(),
             &cited_ids,
@@ -11440,7 +11516,7 @@ impl CoordinatorAgent {
             Err(rejection) => {
                 warn!(
                     code = %rejection.code,
-                    agent = %args.agent_id,
+                    agent = %effective_agent,
                     "call_specialist rejected an invalid Coordinator decision (structured \
                      error, no state mutation)"
                 );
@@ -11499,7 +11575,7 @@ impl CoordinatorAgent {
             }
         }
 
-        let agent_id = AgentId::new(&args.agent_id);
+        let agent_id = effective_agent;
         let Some(agent) = self.registry.get(&agent_id) else {
             // Structural re-check (the roster can only shrink via
             // configuration): unreachable through the validator — fail
@@ -12113,6 +12189,7 @@ impl CoordinatorAgent {
             subtask_id,
             task.session_id,
             progress_guard_engaged,
+            suitability_class == crate::suitability::TaskClass::CodeEdit,
             ledger,
         );
 
@@ -33353,11 +33430,67 @@ mod tests {
     }
 
     /// Three consecutive `architect` dispatches on one objective with no
-    /// implement/code artifact: the guard fires as ADVICE and the run does NOT
-    /// force `AwaitingUser` — the Coordinator's next turn runs normally, while
-    /// the loop evidence surfaces via the ledger note (a `Partial` exit).
+    /// deliverable, then a FOURTH `architect` dispatch: instead of re-running
+    /// `architect`, the repeat-dispatch path escalates through the agent axis
+    /// to the same-stage peer `architect-alt`, which covers the work. The run
+    /// does not self-execute and does not pause.
     #[tokio::test]
-    async fn same_role_dispatch_cap_is_advisory_and_does_not_escalate() {
+    async fn same_role_cap_escalates_to_a_covering_specialist() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("architect-alt"), "covered the design")
+                .with_stage(Some(AgentStage::new("design"))),
+        ];
+        let registry = AgentRegistry::from_mocks(mocks);
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it again")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it once more",
+                    )]),
+                    // The cap was reached: this fourth architect dispatch is
+                    // re-targeted to the covering peer, not re-run.
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it yet again",
+                    )]),
+                    CoordinatorTurn::Text("escalated and done".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("architect-alt")
+            )),
+            "the covering specialist must be dispatched after the cap: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Same-role dispatch cap escalation"),
+            "the escalation must be recorded: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("coordinator self-execute"),
+            "escalation must not be a self-execution: {}",
+            output.final_message
+        );
+    }
+
+    /// Three consecutive `architect` dispatches and a fourth when NO other
+    /// specialist can cover the stage: the run stops at the user-input
+    /// decision point instead of looping the same role.
+    #[tokio::test]
+    async fn same_role_cap_stops_at_decision_point_without_alternative() {
         let bus = EventBus::new(256);
         let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("architect"), "designed")];
         let registry = AgentRegistry::from_mocks(mocks);
@@ -33372,23 +33505,26 @@ mod tests {
                         "architect",
                         "design it once more",
                     )]),
-                    // The advisory cap never forces a stop, so this turn runs.
-                    CoordinatorTurn::Text("the coordinator decides to stop here".into()),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it yet again",
+                    )]),
+                    CoordinatorTurn::Text("never reached".into()),
                 ],
             ),
             bus.clone(),
         )
         .await;
 
-        assert_ne!(
+        assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::AwaitingUser,
-            "the same-role cap is advisory and must not escalate: {:?}",
+            "with no covering specialist the cap must surface the decision point: {:?}",
             output.completion_status
         );
         assert!(
-            output.final_message.contains("Same-role dispatch guard"),
-            "the guard evidence must surface in the final message: {}",
+            output.final_message.contains("Same-role dispatch cap"),
+            "the cap evidence must surface in the final message: {}",
             output.final_message
         );
         assert!(output.checkpoint_json.is_some(), "the run must keep its checkpoint for resume");
@@ -33535,56 +33671,84 @@ mod tests {
         );
     }
 
-    /// With a BINDING (Verified) DesignDoc the guard returns a bounded
-    /// ADVISORY nudge recommending a different implement-stage role — it never
-    /// forces a role and never escalates; re-dispatching stays the
-    /// Coordinator's decision.
+    /// A rename-style objective delivers a FILE (here a `.txt`), not a code
+    /// artifact. Because the code-artifact expectation is derived from the
+    /// objective/subtask deliverable, the cap must NOT fire on it: the
+    /// presence of the file deliverable resets the streak and no
+    /// "no code artifact" claim is ever recorded.
     #[tokio::test]
-    async fn same_role_dispatch_cap_is_advisory_when_design_doc_binds() {
-        let bus = EventBus::new(256);
-        let mocks =
-            vec![MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON)];
-        let mut registry = AgentRegistry::from_mocks(mocks);
-        registry.attach_configs_for_test(
-            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
-        );
-        let (coordinator, provider) = coordinator_with_turns_captured(
-            bus.clone(),
-            Arc::new(registry),
-            vec![
-                CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
-                CoordinatorTurn::Calls(vec![call_specialist("architect", "refine the design")]),
-                CoordinatorTurn::Calls(vec![call_specialist("architect", "revisit the design")]),
-                CoordinatorTurn::Text("stopping after the guard redirect".into()),
-            ],
-        );
-        let coord = coordinator.with_workspace_snapshot(grounded_snapshot(&["src/a.rs"]));
-        let (output, _events) = run_for_test(coord, bus.clone()).await;
+    async fn rename_objective_does_not_trip_the_code_artifact_cap() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "renamed",
+        )]));
+        let mut coordinator = coordinator_with_turns(bus, registry, vec![]);
+        let coder = AgentId::new("coder");
+        let task_id = TaskId::new();
+        let session = Ulid::new();
+        let mut state = DispatchSessionState::default();
+        // The rename produced its file deliverable (a non-code extension).
+        let mut ledger = DispatchLedger {
+            all_files: vec![camino::Utf8PathBuf::from("test_pass.txt")],
+            ..Default::default()
+        };
 
-        assert_ne!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::AwaitingUser,
-            "the advisory guard never escalates"
-        );
-        let nudge = provider
-            .tool_result_contents()
-            .into_iter()
-            .find_map(|result| {
-                let guard = result.get("guard")?;
-                (guard.get("same_role_guard").and_then(serde_json::Value::as_str)
-                    == Some("advisory"))
-                .then(|| guard.get("nudge").and_then(serde_json::Value::as_str).map(str::to_owned))
-                .flatten()
-            })
-            .expect("the advisory guard nudge must ride the tool result");
+        for _ in 0..3 {
+            let guard = coordinator.apply_same_role_dispatch_cap(
+                &mut state,
+                &coder,
+                task_id,
+                session,
+                false,
+                // Derived from the rename objective: no code artifact expected.
+                false,
+                &mut ledger,
+            );
+            assert!(guard.is_none(), "a produced file deliverable must reset the cap");
+        }
+        assert!(state.capped_role.is_none(), "the rename objective must never be capped");
         assert!(
-            nudge.contains("different implement-stage"),
-            "the nudge must recommend a different role: {nudge}"
+            !ledger.notes.iter().any(|note| note.contains("code artifact")),
+            "a rename must not be judged as a missing code artifact: {:?}",
+            ledger.notes
         );
-        assert!(
-            nudge.contains("remains") && nudge.contains("your decision"),
-            "the nudge must not force a role: {nudge}"
-        );
+    }
+
+    /// The cap records its loop evidence ONCE per episode even when the model
+    /// keeps re-dispatching the same role: the note is not duplicated verbatim
+    /// into the final message.
+    #[tokio::test]
+    async fn same_role_cap_note_is_recorded_once() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let mut coordinator = coordinator_with_turns(bus, registry, vec![]);
+        let coder = AgentId::new("coder");
+        let task_id = TaskId::new();
+        let session = Ulid::new();
+        let mut state = DispatchSessionState::default();
+        let mut ledger = DispatchLedger::default();
+
+        // Three consecutive code-edit dispatches with no code artifact reach
+        // the cap; further settles must not repeat the note.
+        for _ in 0..5 {
+            let _ = coordinator.apply_same_role_dispatch_cap(
+                &mut state,
+                &coder,
+                task_id,
+                session,
+                false,
+                true,
+                &mut ledger,
+            );
+        }
+        let notes =
+            ledger.notes.iter().filter(|note| note.contains("Same-role dispatch cap")).count();
+        assert_eq!(notes, 1, "the cap note must be recorded exactly once: {:?}", ledger.notes);
+        assert!(state.capped_role.as_ref() == Some(&coder));
     }
 
     // ------------------------------------------------------------------

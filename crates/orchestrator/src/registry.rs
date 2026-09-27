@@ -405,6 +405,40 @@ impl AgentRegistry {
         coverage
     }
 
+    /// The registered agents (in stable id order, excluding `exclude`) that
+    /// can take over `target_stage` work: agents staffed AT the same stage
+    /// first, then any agent whose effective coverage includes the stage.
+    /// Coverage is configuration data — never a hardcoded role→stage table.
+    pub(crate) fn takeover_candidates(
+        &self,
+        target_stage: &AgentStage,
+        exclude: &AgentId,
+    ) -> Vec<AgentId> {
+        let mut ids: Vec<AgentId> = self.ids();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut candidates: Vec<AgentId> = Vec::new();
+        // 1. Agents staffed AT the same stage.
+        for id in &ids {
+            if id == exclude {
+                continue;
+            }
+            if self.agents.get(id).and_then(|agent| agent.stage()).as_ref() == Some(target_stage) {
+                candidates.push(id.clone());
+            }
+        }
+        // 2. Any agent whose configured coverage includes the stage (this
+        //    includes a stage-less agent that explicitly lists `can_cover`).
+        for id in &ids {
+            if id == exclude || candidates.contains(id) {
+                continue;
+            }
+            if self.effective_coverage(id).iter().any(|stage| stage == target_stage) {
+                candidates.push(id.clone());
+            }
+        }
+        candidates
+    }
+
     /// The first registered agent (in stable id order, excluding `exclude`)
     /// that can take over `target_stage` work: a second agent staffed AT the
     /// same stage first, then any agent whose effective coverage includes the
@@ -415,28 +449,7 @@ impl AgentRegistry {
         target_stage: &AgentStage,
         exclude: &AgentId,
     ) -> Option<AgentId> {
-        let mut ids: Vec<AgentId> = self.ids();
-        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        // 1. A second agent staffed AT the same stage.
-        for id in &ids {
-            if id == exclude {
-                continue;
-            }
-            if self.agents.get(id).and_then(|agent| agent.stage()).as_ref() == Some(target_stage) {
-                return Some(id.clone());
-            }
-        }
-        // 2. Any agent whose configured coverage includes the stage (this
-        //    includes a stage-less agent that explicitly lists `can_cover`).
-        for id in &ids {
-            if id == exclude {
-                continue;
-            }
-            if self.effective_coverage(id).iter().any(|stage| stage == target_stage) {
-                return Some(id.clone());
-            }
-        }
-        None
+        self.takeover_candidates(target_stage, exclude).into_iter().next()
     }
 
     /// Build the default set of specialist agents (no per-agent config).
