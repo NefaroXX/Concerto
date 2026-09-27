@@ -131,6 +131,29 @@ a note.
 > (`TODO.md:108–110` was the PersonaMem item; `ADR-21.md` is an archived 12-line
 > stub). No renumbering; the `#3` gap is left intentionally. Verification notes
 > for today are appended below.
+> **Append 2026-09-27 (rows 32 / 35 — certified-evolution cut, STATUS-checklist
+> reclassification):** two rows **cut** and moved to the Closed appendix as #20
+> and #21, for different reasons that are recorded separately. **Row 32**
+> (certified evolution / profile-guided CI): its cited
+> `docs/research/certified-universal-evolution.md` does not exist **and is
+> deliberately git-ignored** (`.gitignore:54`, under the `:53` comment "Private
+> research — not for public until ready"), so the register had been citing a
+> document that *cannot* exist in a public clone — and the track is research,
+> not backlog. **Row 35** (STATUS-tracked follow-ups): a **reclassification, not
+> a cancellation** — those items are per-release *human checklists* hanging off
+> `TESTING.md` and `docs/live-test-template.md` (neither has a "done" state,
+> because a fresh sheet is filled in per build/OS/provider), so a DEFERRED row
+> with a re-entry condition and an owner mislabelled them as debt. Two premises
+> in the row-32 brief did not survive verification and are **not** written down
+> as claims: `confidence` is *not* unique in the tree (85 matches — the *name*
+> collides; the *construct* is absent) and `evidence` is *not* absent either
+> (ADR-65's evidence spine is landed; what is missing is a type-level promotion
+> gate). Two cites were corrected: row 35's multiline item lives in
+> `views/orchestration_studio.rs:4114`, not `app.rs:4114`, and row 32's two cites
+> had drifted off the item entirely. `TESTING.md`, the live-test templates and
+> `docs/STATUS.md` are **untouched** — they remain the source of truth. No
+> renumbering; the `#32` and `#35` gaps are left intentionally. Verification
+> notes for today are appended below.
 
 ## Open register
 
@@ -156,9 +179,7 @@ a note.
 | 29 | ADR-43 server mode / SSE / marketplace / persistent desktop state / TOML secrets — **reviewed 2026-09-27 (owner decision): still deferred, no status and no size change. Marketplace sub-item DEEPENED 2026-09-27** (the registry/marketplace clause folded in from row 30, which is rescoped to hot reload + remote loading; **status and size still unchanged**) — **MARKETPLACE/REGISTRY, verified ABSENT: no catalog, no index, no version pinning and no signature verification exist in `crates/plugins`**; `registry` in that crate means only the core `ToolRegistry` tool-registration type (`manager.rs:340,442`, `tool_bridge.rs:207,230`), never a plugin registry. **The load-bearing precondition is the trust model, not a feature: plugins load with NO signature or provenance check** — the repo's own stated position is ADR-37's Alternatives entry, "**Plugin registry signature verification:** most secure, but introduces a dependency on a registry and key infrastructure. **Deferred to post-v1.0**" (`ADR-37.md:104–105`). The only integrity mechanism is ADR-37 grant hash-pinning, and it is worth being exact about what that is and is not: each persisted grant stores `manifest_hash` = **SHA-256 of the loaded WASM binary** (`ADR-37.md:39–40`; computed over the bytes at `manager.rs:193–197` via `capability.rs:9–15` `sha256_hex`), compared against the current binary on every load (`capability.rs:450–454` `load_for_plugin(… wasm_hash …)`, `:364–366` `hash_mismatch`), with prune-on-mismatch forcing a fresh prompt (`manager.rs:205–229`; filter + prune-persist at `capability.rs:465–505`). So it binds an approval to **the exact bytes of a binary** — a **re-approval** mechanism ("the binary changed since you approved it"), **not** an **authenticity** mechanism: nothing anywhere establishes *who published* a file. A registry therefore changes the trust question from "I chose this local file" to "someone published this, and it is executed with no signature check". **Re-entry is a provenance / trust-model decision (ADR-first per the repo ADR rule), not a feature to schedule.** | ADR-43 §3 v1 note (MCP server mode, SSE transport, marketplace/registry, keyring-backed tokens, persistent desktop state deferred); docs/skills.md:202 | When the API surface / web UI materializes | L |
 | 30 | Plugin **hot reload + remote plugin loading** — **rescoped 2026-09-27: the registry/marketplace clause is FOLDED INTO row 29** (which now carries the no-signature-check trust-model precondition), **so this row is only what remains** (size **L → S**) | `docs/TODO.md:119–121` ("**Plugin hot-reload, remote plugins, registry.** Not started — `docs/adrs/ADR-21.md:30-31` deferred list; requires the community/registry story before a distribution path exists") — **the row's old `TODO.md:108–110` cite was wrong and is corrected here: those lines are the PersonaMem long-horizon-memory-eval item**, not plugins. Note the TODO's own `ADR-21.md:30-31` pointer is also stale: `ADR-21.md` is a 12-line **archived stub** superseded by ADR-14 (`ADR-21.md:3–8`), so the deferred list is no longer reachable at that cite. ADR-21 (Archived, superseded by ADR-14); ADR-43 §3 v1 deferral | **HOT RELOAD — verified ABSENT in any form, and the existing discovery path is additive by design rather than half-built.** There is no reload, invalidate, or mtime handling anywhere in `crates/plugins`; `refresh_new_plugins` (`manager.rs:549`) deliberately **skips already-active plugins** (`:583–585`, "plugin refresh: already active — skipping") so a refresh never displaces a plugin a running agent holds. The reload seam is therefore clean and already built: `PluginManager.active` is a `HashMap<String, Arc<Mutex<ActivePlugin>>>` (`manager.rs:64`), unload is `unload_plugin` / `unload_without_registry` (`:439`, `:466`), and re-load is `load_plugin` (`:161`). **The one real obstacle is that `ActivePlugin` owns a `wasmtime::Store` (`active_plugin.rs:10–14`) that cannot be swapped in place**, so a reload must be drop → re-`load_from_bytes` / `initialise` (`loader.rs:60`, `:111`) → re-register tools (`tool_bridge.rs:230`) — never an in-place module swap. There is **no module cache to invalidate**: the `Engine` is reusable and each load builds its own `Arc<Module>` (`loader.rs:68`, `:104`). **The real design question is RE-APPROVAL, and the machinery already exists** — ADR-37 hash-pinning means a changed `.wasm` loses its persisted grants automatically via prune-on-load (row 29's clause for the mechanism), so a reload should wire that existing behaviour rather than invent new grant machinery. **REMOTE LOADING — verified ABSENT, and recorded as a deliberate non-goal so it is not later mistaken for an oversight:** the loader only ever reads a **local file** (`loader.rs:52` `std::fs::read(wasm_path)`, then `:60` `load_from_bytes`), and the only http in the crate is **guest egress** — `host_fns.rs:437` `host_http_get`, gated by `check_url_allowed` against the grant allowlist (`:453`) — an outbound network *capability for plugins*, never a load source. Remote loading stays out of scope until the trust model in row 29 is decided, because a remote source has no local-file provenance story at all. **Re-entry: when plugin iteration during development warrants a watcher** (hot reload); remote loading is gated on row 29's trust-model decision. | S |
 | 31 | L1/STM/PersonaMem memory items (typed extraction, scene memory, persona eval) | TODO.md:58–99 (L1 70–80, STM 65–70, heuristics 89–95, PersonaMem 96–99) | Post-memory relayout (ADR-63/64) | M |
-| 32 | Certified evolution (profile-guided CI, safety gates) | TODO.md:286–293; ROADMAP:189–193 — `[dangling-cite]` the referenced `docs/research/certified-universal-evolution.md` (cited at TODO.md:287, ROADMAP:190) is missing on disk | When certified-evolution research plan lands (restore/rewrite the research doc or re-scope) | L |
 | 34 | C-05/C-06/C-03 + M-08/M-05/M-02 audit cleanups | TODO.md:38–41 (C-05), 237 (C-06), 32–33 (C-03), 241 (M-08), 246 (M-05), 251 (M-02); AUDIT_FINDINGS_CURRENT.md | When module refactors + coverage are scheduled | L |
-| 35 | STATUS-tracked follow-ups (ENV_LOCK, glyphs, multiline, P4/ADR-59 deferrals, release checklist) | STATUS.md "Tracked follow-ups" ~328–355 | Per tracked follow-up row; each release | M |
 | 36 | Containerized sandbox bundle — `SandboxProfile::Containerized` OS-level isolation — **shipped 2026-09-26 for the container path (row STAYS OPEN: only the Windows path is outstanding)** | TODO.md:103; ROADMAP:235; security-threat-model.md §6 gap #1 (:310–315, "No Containerized Plugin Sandbox"); was a real stub — variant declared but not implemented (architecture.md:250, STATUS.md:272), plugins ran only under the WASM capability sandbox. **Landed 2026-09-26 in three slices:** `d00582b` (ADR-72 + enforceable core half — `core::sandbox` docker/podman runtime detection, `SimplePolicyEngine::check_sandbox` fail-closed admission gate, rules `sandbox_containerized_runtime_unavailable` / `_unenforceable`), `3ae6ea5` (shell invocations actually routed through the container — `tools::container` builds the `docker`/`podman run` argv from a planned `ShellPlan` as `ShellPlan::Direct`, opt-in `ShellTool::with_container`, `command_facts` audits the container argv), `fdf4800` (`CommandRouting` marker — closes the fail-open where `Containerized` was selected without routing) | **Windows path only.** Windows Job Objects need `unsafe` FFI (`windows-sys` `CreateJobObjectW` / `AssignProcessToJobObject`), which the workspace hard-denies (`[workspace.lints] unsafe_code`). ADR-72 §5 records v1 as **unsupported on Windows** (probe returns `Unavailable` → `Containerized` refused, fail-closed and honest), not shipped. Recorded options for a future Windows story: **(a)** a narrow, audited `unsafe` exception; **(b)** the safe high-level `windows` crate — safe Job Object bindings, no `unsafe` in our code, but a new dependency requiring its own ADR; **(c)** accept Linux/macOS-only with loud documentation. **Re-entry: a superseding ADR that chooses among (a)/(b)/(c).** | L |
 | 37 | Hybrid UI full scope (tabbed Settings, Studio split pane, drag-and-drop agent assignment, focus-trap) — **rescoped 2026-09-27 per owner: Minimal + Medium tiers are LANDED, what remains is finish-and-polish with no correctness content. Row STAYS OPEN and deferred post-1.0** (size **L → M**) | **Full scope defined at `docs/hybrid-ui-plan.md:89`** — "All of Medium, plus split Settings into tabbed sub-views, convert Studio to split pane, add drag-and-drop agent assignment, animated panels, focus-trap system." **Citation corrected:** the row's old `TODO.md:145` had drifted onto an unrelated ADR-28 shell-profile note; the full-scope item is at `TODO.md:156–158` and `ROADMAP:147–149`; the landed medium scope is `TODO.md:150–155`. `docs/hybrid-ui-plan.md` is standalone, not part of the world-class plan | **LANDED — recorded so this row stops implying the hybrid UI is unbuilt** (the plan's own status list at `hybrid-ui-plan.md:306–317`; `TODO.md:150–155` for PR #49 Minimal and PR #97 Medium, merged 2026-08-03, commits `1c916b4` memory quick-panel, `4a12839` terminal bottom panel, `ade0c7b` glass modals + overlay/panel animations, `3d691a2` timestamps + transcript format v2, `f8c7b42` blinking cursor). Code anchors verified in the tree: the `SubView` overlay enum at `crates/desktop/src/views/chat.rs:23–25` (`Main`/`Diff`/`AgentGraph`/`ToolLog`/`SpendLog`/`Runtime`) with keyboard routing at `app.rs:1218–1222`; the shared animation layer at `app.rs:498` `ease_out_cubic` and `:4030`; the terminal as a toggleable bottom panel with drag resize (`app.rs:398` `terminal_panel_height`, `:2033–2046`, `:4030`); the memory quick-panel section (`views/quick_panel.rs`, `views/memory.rs`). **REMAINS**, as `crates/desktop/AGENTS.md:65–66` records: "⬜ State lifecycle: lazy init for infrequently used views" and "⬜ Full scope: tabbed Settings, Studio split pane, focus trap" — **plus drag-and-drop agent assignment, which is named in the plan (`:89`), `TODO.md:156–158` and `ROADMAP:147–149` but is *not* on the AGENTS.md ⬜ line** (that line names three items; the plan names four). Precisely, as of 2026-09-27: **(a) tabbed Settings — not done.** Settings is still one scrolling page of **9 collapsible sections** with a jump-sidebar (`views/settings/message.rs:372–382` `SectionId::ALL` = Theme, Providers, Assignments, Policy, Relationships, Retry, Memory, Shell, Extensions; rendered via `collapsible_section` at `views/settings/mod.rs:1049–1054`, sidebar at `:1060–1070`). The *Extensions hub* alone is tabbed, via `ExtensionTab` (`message.rs:342`, wired `mod.rs:1177–1201` — Skills / MCP / Plugins / ProjectContext), so there is no `SectionId::Skills`/`SectionId::Mcp` to tab away from: Skills and MCP are `ExtensionTab` variants inside `SectionId::Extensions`, not top-level sections. **(b) Studio split pane — absent** (Studio renders as a single surface, `views/orchestration_studio.rs`). **(c) drag-and-drop agent assignment — absent.** **(d) focus-trap system — absent.** **(e) lazy-init state lifecycle — absent.** **Size L → M, and why:** the reduction is earned, not optimistic — the two tiers that carried the hours are landed (Minimal ~20–30h and Medium ~60–90h per `hybrid-ui-plan.md:62`/`:75`), and every remaining item is layout/information-architecture polish with **no correctness, policy, or data-integrity content**, so the remainder is a finish pass rather than a design problem. **One caveat stated so "M" is not read as "free":** the plan's Medium item "SubView routing fully replaces `Page` for Chat-adjacent views" (`:83`) and its step 6 "Remove unused `Page` variants" (`:300`) are **not** done — `Page::DiffViewer` and `Page::ToolLog` are still routed and rendered (`app.rs:3973–3974`) and are still reachable from the context bar (`views/context_bar.rs:29–30`) and the quick panel (`views/quick_panel.rs:146`), so collapsing the `Page`/`SubView` dual path is real de-duplication work inside the remaining scope. **LAZY-INIT is the one remaining item with a felt, user-visible payoff** (it is the only one that changes startup cost and responsiveness rather than looks) and **may be pulled forward** ahead of the rest. Re-entry: post-1.0. | M |
 | 38 | Flat/content-embedded tool-call parsing residual (beyond proxy Fixes 1–3) | TODO.md:190–195; ROADMAP:165–168 (residual after Fixes 1–3 landed, see Closed #8); docs/proxy-tool-call-fix.md | When sanitized proxy fixtures + pairwise verification land against real OpenAI-compatible proxies | S |
@@ -194,6 +215,185 @@ a note.
 18. ADR-58 P5/P6 + TOML diff + canvas DAG editor + multi-executor partitioning — **row #28 cut 2026-09-27 per owner decision**, on the grounds that the orchestration-studio UI is scheduled for a separate refactor and every item here would have to be re-specified against that new UI. **What the row covered, recorded so the cut is auditable** — ADR-58's own Deferred/Sequencing table (`docs/adrs/ADR-58-configurable-orchestration.md:238–247`): **P5 (pending)** = "Migration runner for legacy `multi_agent` configs; export-merge hardening" (`:243`); **P6 (deferred)** = "Graph/DAG config support; run-one-stage simulation; freeze decisions" (`:244`); **"Explicitly deferred"** = "TOML diff view of include changes; canvas DAG editor; multi-executor artifact partitioning (primary stays a plain flag)" (`:246`). ADR-59 carries the same tail (`docs/adrs/ADR-59-studio-blueprint-editor.md:172–177` — P5 migration runner + export-merge hardening; P6 "freeze/stable-surface decisions"; "Diff view and DAG canvas editor: post-P4 stretch, not planned here"), and `docs/STATUS.md:346–349` mirrors it as tracked follow-up #4. **State of each item, checked rather than assumed** — and it is *not* a uniform blank: **(a) the migration runner is genuinely ABSENT.** No code converts a legacy `multi_agent`-only config into an `[orchestration]` blueprint, and ADR-59:169–170 still states the pre-P5 condition as current ("legacy `multi_agent` remains authoritative only while `[orchestration]` is absent"). `crates/config/src/migration.rs` exists but is *schema_version* step migration (v1→v2 and so on, filling fields with defaults) — a different mechanism, not the P5 runner. **(b) export-merge hardening is substantially LANDED as a side effect, not absent** — `crates/config/src/saving.rs:1–40` documents exactly that: merge-aware `toml_edit` writers (`merge_edit_toml` preserving comments, key order and unedited keys), every writer atomic via temp-file-plus-`rename`, and `seed_orchestration_roster` / `save_agent_roster` writing only the keys they own and preserving the rest of the document byte-for-byte. This is the behaviour P5's "export-merge hardening" asked for; ADR-59:99 lists "post-seed `config.toml` wholesale rewriting" as a **non-goal**, which the merge-aware writers are the reason for. **(c) Graph/DAG *config* support, (d) run-one-stage simulation, (e) the Studio-level freeze / stable-surface decision, (f) the TOML diff view, (g) the canvas DAG editor and (h) multi-executor partitioning are all ABSENT — no implementation and no scaffold.** Searches of `crates/` for `run_one_stage`, `freeze_decision`, `export_merge`, `migration_runner`, `multi_executor`, `executor_partition`, `toml_diff`/`TomlDiff`, `stable_surface`, `SimpleTier`/`simple_tier` return **zero** matches. The `DAG` and `Freeze` symbols that *do* exist are a different, already-landed subsystem and are **not** this row: `orchestrator/src/graph.rs` + `scheduler.rs` + `task_transform.rs` are the runtime `SubTask` task-DAG, including a real `TaskTransformSpec::Freeze` (`task_transform.rs:163–189`, `apply_freeze` at `:542–618`) behind the model-driven "reconsider" decision. None of that is a *config-authorable* graph, a run-one-stage simulation, or a config-surface freeze; the Studio remains a roster/relationships/blueprint CRUD editor (`views/orchestration_studio.rs`). One source inconsistency recorded, not fixed: `docs/STATUS.md:347` labels a "**Studio Simple tier**" as part of P5, but ADR-58's revised decision demoted the tier notion entirely (the blueprint catalog is "advisory data", seeds are materialized into user config) and no "Simple tier" string exists in either the ADR or the code. **This cut is a scoping decision for a UI plan that is being replaced — it is NOT a claim that these capabilities are unwanted.** The P5 migration runner in particular is real standing debt independent of any UI, and after the studio refactor its natural home is whatever that new UI is specced against; if it is wanted before then, it is a config-layer task with no UI dependency at all.
 
 19. Per-session ack queue (bounded depth + ack policy) — **row #4 closed 2026-09-27; landed in `8e3c350`.** ADR-68 §6 (`docs/adrs/ADR-68-h04-session-ack-breaking-param.md:78–86`) recorded only the *policy* — queue a second ack behind the active one, bounded at "1 pending ack beyond the active one", with overflow rejecting via an explicit error — and explicitly deferred the implementation to "the implementation phase". That phase is now the shipped state, and it shipped in the direction §6 chose rather than the opposite one an earlier register note recorded. `SharedPendingAck` is no longer a single `Option` but a depth-bounded FIFO, `Arc<Mutex<VecDeque<PendingAck>>>` (`desktop/src/widgets/capability_dialog.rs:137`), with new `enqueue_ack` (`:151`) and `ack_queue_position` (`:180`), and `ack_view` / `resolve_ack` retargeted to the queue front. **The bound is `MAX_PENDING_ACKS = 2`** (`:98`, rationale on the constant at `:84–97`) — the active dialog plus one queued, which is the bound ADR-68 §6 names, and deliberately tiny because an ack is a *blocking, user-facing* confirmation: one active is what the user can actually read, the single queued slot stops a concurrent prompt from overwriting the first, and a deeper queue would only delay the *second* prompt past the point where its requester is still waiting while letting an ack storm grow UI state without bound. **Overflow is an explicit rejection, never a silent drop.** `AckQueueError` (`:105–114`) has exactly the two fail-closed cases — `QueueFull { capacity }` when the bound is already reached (the new request never displaces an already-pending ack), and `StateUnavailable` when the shared lock is poisoned (the desktop cannot prove the request was recorded, and must not report "no pending acks" for a request that was actually made). The sink maps either to `false` (abort the task) **and** publishes a fresh `DesktopEvent::ErrorOccurred` (`app.rs:4776–4778`), which the app renders as an error toast — so *shown*, *queued* and *refused* are three distinguishable user-visible outcomes instead of one silent no-op. **Session gating is preserved through the queue:** `resolve_ack` pops the front entry and answers it only when its `session_id` matches the caller, restoring a non-matching entry to the front so its owning session still sees its dialog (`capability_dialog.rs:233–246`) — a stale or cross-session entry can never answer another run's prompt, and because resolution drains in order the queued second ack cannot jump the active first. **Dialog indicator:** `ack_queue_position` returns `None` for ≤1 pending, so the single-ack modal layout is byte-for-byte unchanged, and `Some("Acknowledgement 1 of N pending")` for N≥2 (`:180–185`), inserted into the modal only in that case (`:207–213`) so the user can see they have N outstanding acknowledgements rather than believing the displayed one is the only prompt. Supporting call sites: `DesktopApprovalSink::request_ack` enqueues through `enqueue_ack` (`app.rs:4760`) and the status-bar dialog-waiting check moved from `is_some()` to `!is_empty()` (`views/status_bar.rs:58`). **Audit-seam reachability was a finding, not a gap — stated plainly because it is the one part of the row whose work was smaller than the row implied.** The production wiring already existed and predates this commit: `AgentLoop::setup_undo_stash` (`orchestrator/src/agent_loop.rs:1225–1227`) → `ToolExecutionBackend::record_ack_decision` → `InProcessGateBackend` → `ToolExecutor::record_ack_decision`, attributable by `git log` to `26e3fc9` ("ADR-66 phase 1"). The deliverable was therefore a **reachability test** — `in_process_gate::tests::record_ack_decision_writes_request_continue_and_abort_rows` (`orchestrator/src/in_process_gate.rs:554`) — proving the seam writes a `RequestContinue` row for a continuing ack and a `RequestAbort` row for a refused one; alongside it, a now-false doc comment on `ToolExecutor::record_ack_decision` claiming that "nothing calls this in production" was corrected to name the real call chain (`core/src/executor.rs:298–303`). **Residual, recorded rather than dropped: an overflow refusal is audited as `RequestAbort`.** The `ApprovalSink::request_ack` contract returns only `bool`, so the sink cannot hand the audit seam a reason — in the trail an overflow refusal is separable from a user cancel **only by message text, not by a distinct verdict**. Closing that needs a widened `ApprovalSink::request_ack` (a typed decision instead of a bare `bool`), a contract change reaching every sink, and is explicitly out of scope for this commit; it is recorded here so the closure is not read as claiming full audit fidelity for the refusal path. The `#4` numbering gap is left intentionally (no renumbering), matching the row 10 / 12 / 14 / 19 / 21 / 25 / 26 / 28 / 33 / 44 / 47 / 49 precedent.
+
+20. Certified evolution (profile-guided CI, safety gates) — **row #32 cut
+    2026-09-27 per owner decision.** The row's whole subject is a research
+    programme, and the dangling cite that made it a bad register row is
+    **explained, not accidental**. `docs/research/certified-universal-evolution.md`
+    does not exist on this checkout, and it *cannot* be committed: `.gitignore:54`
+    ignores exactly that path, under the comment on `:53` — "**Private research —
+    not for public until ready**". `git check-ignore -v` confirms
+    `.gitignore:54` is the matching rule, and `docs/research/` holds six tracked
+    files, none of them this one. So the register — and `TODO.md:298` and
+    `ROADMAP.md:193` alongside it — has been citing a document that is
+    deliberately withheld from the repository. A reader could not re-derive the
+    scope or ever close the row from what is in the tree. **Two of the row's own
+    cites had also drifted off the item, and are corrected here:** `TODO.md:286–293`
+    is the **prompt-cache-stability** item (row 1's subject), not this one — the
+    certified-evolution item is at `TODO.md:297–304` with its prerequisite list
+    at `:300–303`; and `ROADMAP:189–193` straddles the **code-editor** item
+    (`:188–191`, cut as Closed #17) and only the first two lines of this one —
+    the item is `ROADMAP.md:192–196`.
+    **No scaffold exists, but two of the brief's "absent" premises were false and
+    are recorded corrected rather than repeated.** (a) **`confidence` is not
+    unique in the tree** — a case-insensitive search of `crates/**/*.rs` returns
+    **85 matches**. What is absent is the *construct*, not the *name*: every
+    occurrence is a bare `f32` scalar used for routing, recall ranking, or
+    consultation triggering — the intent-routing `RouterOutput::confidence` and
+    `LOW_CONFIDENCE_THRESHOLD` (`core/src/intent.rs:15,135`; ADR-55 vocabulary
+    whose constant the ADR-56 LLM classifier reuses as its re-route threshold,
+    configured at `config/src/schema.rs:239,269–305`), memory-decision confidence
+    with a `0.0..=1.0` CHECK constraint and supersession tracking
+    (`core/src/memory.rs:303,313`; `memory/src/decision_store.rs`,
+    `memory/src/entities.rs:78,804–805`), and the issue-#59 deterministic
+    low-confidence consultation trigger (`orchestrator/src/consultation.rs:52,292`).
+    None of them is a *type*, and none carries evidence — so "compiler-enforced
+    confidence/evidence types" is genuinely unbuilt, but a claim of "no
+    `confidence` in the tree" would have been falsified by a single grep and is
+    deliberately not made. (b) **`evidence` is not absent either.** ADR-65's
+    evidence spine is a large landed subsystem — `AcceptanceEvidence`
+    (`orchestrator/src/checkpoint.rs:69–103`) plus `design_doc_verifier.rs`,
+    `resume.rs`, `world_model.rs`, `tool_facts.rs`, `read_cache.rs`. What is
+    missing is the certified-evolution *meaning* of it: a **type-level gate on
+    promoting a self-modification**, not a record of what happened during a run.
+    The vocabulary collides; the construct does not exist.
+    **The neighbours are not it — checked rather than assumed.** `crates/eval` is
+    a real, substantial Phase 3 harness (`lib.rs:5–8`, `categories.rs`,
+    `scenarios.rs`, `persona_mem.rs`, ~30 task fixtures across six categories),
+    but what it does is detect the project's own test runner (`cargo`, `npm`,
+    `pytest`, `make`; `lib.rs:7`) and run that suite in a working directory
+    (`run_in_dir`, `:267–274`; fallback path `:291–294`) — no isolation, no
+    immutability, no evaluator-spec validation, no candidate-vs-baseline
+    comparison. It is an agent-task harness, not an evolutionary evaluator. The
+    seven benches are criterion micro-benchmarks (`core/benches/serde.rs`,
+    `core/benches/policy.rs`, `orchestrator/benches/task_graph.rs`,
+    `memory/benches/vector_retrieval.rs`, `memory/benches/fts_search.rs`,
+    `providers/benches/provider_streaming.rs`, `tools/benches/virtual_fs.rs`) —
+    no profile-guided CI gate, and row 48 already carries the Phase 3
+    criterion-benchmark + CI-gate item. `orchestrator/src/fault_injection.rs:76–92`
+    is the G1–G3 issue-gate rows plus the C1–C4 crash-window table — row 17's
+    in-process, deterministic runtime-robustness suite, not an evolution
+    evaluator. A search of `crates/**/*.rs` for `evaluator spec` / `profile.guid`
+    / `evolution` / `self.improv` returns no evaluator-spec type and no promotion
+    gate; the `promote`/`mutation` hits are all file-write policy. **`STOKE`
+    occurs in exactly two places repo-wide**, both prose in the two cited lines
+    (`ROADMAP.md:196`, `TODO.md:303`), and zero times in code — so no
+    STOKE-comparable evidence exists.
+    **What it would have required**, verbatim from `TODO.md:300–303` and
+    `ROADMAP.md:192–196`: compiler-enforced confidence/evidence types; evaluator
+    specification validation; deterministic isolated **immutable** evaluation
+    infrastructure; explicit resource budgets with stop/resume semantics;
+    small-domain evidence comparable to STOKE. Of those five, the tree has at
+    most one *adjacent* item — resource budgets, via rows 36/45's CPU budget and
+    the existing wall-clock timeout — and that budget bounds a shell command, not
+    an evolution run. **Why it is cut:** `TODO.md:303–304` says the track's own
+    status outright — "STATUS.md does not cover this track; it is roadmap-scoped
+    research, not a promised feature." It is a research programme, not a backlog
+    item, and a row whose re-entry condition names a withheld document is
+    unresolvable by construction: leaving it open with an unresolvable cite is
+    worse than removing it. **The cut is reversible and nothing is lost:** the
+    track's prerequisites remain written down in `TODO.md` and `ROADMAP.md` in
+    the repository, and if the research lands it returns as a **new row with a
+    real in-repo source**. No other register row duplicates this track.
+
+21. STATUS-tracked follow-ups (ENV_LOCK, glyphs, multiline, ADR-59/P4
+    deferrals, orchestration-editor checklist, release-priority matrix) — **row
+    #35 cut 2026-09-27 per owner decision; a RECLASSIFICATION, not a
+    cancellation.** These are **not deferred engineering work**. They are
+    per-release *human checklists* that hang off two living forms, because no
+    automated check can verify rendering or layout: **`TESTING.md`** (290 lines)
+    opens "Use one copy of this sheet per build, operating system, and
+    provider/model combination. Mark each result **Pass**, **Fail**, **Blocked**,
+    or **Not tested**" (`:1–6`) and carries a 14-field environment table
+    (`:12–29`), the automated-checks result table (`:53–60`), the acceptance-bar
+    section mapping the audit's 12 end-to-end scenarios to named automated tests
+    (`:62–92`), and the area sheets — default desktop, multi-agent, cancellation,
+    memory restart/projects, spend chip and Spend Log, shell and policy, skills
+    and MCP (`:113–257`); and **`docs/live-test-template.md`** (76 lines), the
+    same per-build/OS/provider form with the same four verdicts (`:1–7`), the
+    environment table, nine generic key-test rows plus the six Studio rows
+    (`:42–47`), the automated-checks block and table (`:49–66`), and the
+    outcome/funding-notes form. Because a **fresh sheet is filled in per
+    build/OS/provider combination**, these have no terminal state: they will
+    never reach zero, and "reach zero" is not a concept that applies to them.
+    Carrying them in a register of *deferred work* — with a re-entry condition,
+    a size, and an implied owner — mislabelled living checklists as debt.
+    **Current state of each, checked in the tree today so nothing is lost — all
+    six are OPEN.**
+    1. **`CONFIG_ENV_LOCK` env-restore race hardening — OPEN.** `STATUS.md:328–333`
+       asks for restore-before-assertion or an RAII guard. The lock exists
+       (`crates/desktop/src/app.rs:4943`, `CONFIG_ENV_LOCK`, documented as
+       mirroring `PROJECT_ROOTS_ENV_LOCK` in concerto-config and `ENV_LOCK` in
+       concerto-cli), and the panic-safe pattern is real and written down at
+       `app.rs:8028–8033` ("restore the env BEFORE any assertion so a panic
+       cannot leak the redirect"). Most guarded tests do follow it —
+       `first_studio_open_auto_seeds_the_orchestration_roster` (guard `:5223`,
+       restore `:5245–5249`), the `:5308` test (`:5330–5334`),
+       `startup_config_load_failure_marks_config_broken` (`:5365`, restore
+       `:5377–5380`), `navigate_to_studio_changes_page` (`:6839`, restore
+       `:6845–6848`), and the global-key import-refusal test (`:8632`, restore
+       `:8654–8657`). **It is not applied universally, which is exactly the
+       finding:** `save_materializes_a_name_selection_inline_into_the_global_config`
+       asserts at `:5565` while its restore sits at `:5598–5599`, and the test
+       guarded at `:5705` asserts at `:5733–5736` before restoring at
+       `:5742–5745`. An assertion panic in either unwinds past the restore and
+       leaks the `XDG_CONFIG_HOME` redirect into parallel tests. No RAII guard
+       type exists in the module.
+    2. **Glyph-font coverage — OPEN, cosmetic and text-paired.** `STATUS.md:334–340`.
+       The glyphs `🛡 ➜ ⛓` are `semantics_glyph`
+       (`views/orchestration_studio.rs:909–915`), paired with `semantics_label`
+       text (`:917–926`) in both the kind-picker options and the row's semantics
+       tag, under a doc comment at `:907` that the affordance is "never color
+       alone". Still no bundled icon font and no explicit iced fallback; the
+       worst case is cosmetic tofu, which is why `STATUS.md` ranks the options
+       (swap orphan glyphs for text **S** / symbol fallback font **M** / bundle
+       an icon set **L**).
+    3. **Multiline system-instructions — OPEN.** `STATUS.md:341–345`. The
+       fallback-persona input is still a single-line
+       `text_input("System Instructions", …)` at
+       **`views/orchestration_studio.rs:4114–4116`**, not upgraded to the iced
+       `text_editor`, with no edit plumbing and no tests. **Citation correction:**
+       the framing pointed at `app.rs:4114–4122`, which is the SubView overlay
+       title bar — close button at `:4113–4115`, the
+       `Main`/`Diff`/`AgentGraph`/`ToolLog`/`SpendLog`/`Runtime` title match at
+       `:4117–4124` — and has nothing to do with the input. The real site is in
+       the Studio view.
+    4. **ADR-59 / P4 deferrals — OPEN, and two of the five are already tracked
+       elsewhere.** `STATUS.md:346–349` (tracked follow-up #4) mirrors
+       `ADR-59:172–177`: P5 migration runner + export-merge hardening, P6
+       freeze/stable-surface decisions, and "Diff view and DAG canvas editor:
+       post-P4 stretch, not planned here". The **TOML diff view and canvas DAG
+       editor (P6)** are already recorded in the now-cut row 28's Closed #18
+       entry — cross-referenced here rather than duplicated. Of the rest,
+       **export-merge hardening substantially LANDED** as a side effect of the
+       single-arm Save work: `crates/config/src/saving.rs:1–40` documents
+       merge-aware `toml_edit` writers that preserve comments, key order and
+       unedited keys, all atomic via temp-file-plus-`rename`, with
+       `seed_orchestration_roster` / `save_agent_roster` writing only the keys
+       they own. The **migration runner is genuinely absent** — no code converts
+       a legacy `multi_agent`-only config into `[orchestration]`, ADR-59:169–170
+       still states the pre-P5 condition as current, and
+       `config/src/migration.rs` is *schema_version* step migration, a different
+       mechanism. Run-one-stage simulation and the freeze/stable-surface decision
+       are likewise absent with no scaffold. `STATUS.md:347`'s "Studio Simple
+       tier" label still has no counterpart in ADR-58 or in the code.
+    5. **Orchestration-editor manual checklist — OPEN.** `STATUS.md:350–355`
+       names six rows added to `docs/live-test-template.md`; they are present at
+       `:42–47` with their Result cells blank. "Run before the next release;
+       automated tests cannot see rendering/layout issues" is the entire reason
+       this is a form rather than a task.
+    6. **Release-priority matrix — OPEN.** `STATUS.md:357–365`, "Immediate
+       release priorities", items 1–5. **Note the boundary:** this section sits
+       *outside* the "Tracked follow-ups" block (`STATUS.md:323–355`), so the
+       row's own `~328–355` cite never actually covered it. Recorded here
+       explicitly so it is not lost along with the row.
+    **The living checklists REMAIN the source of truth after this cut.** Nothing
+    was deleted from `TESTING.md`, `docs/live-test-template.md`,
+    `docs/live-test-*.md`, or `docs/STATUS.md` — this pass edited only
+    `docs/DEFERRED.md`. Every item above is still written down, in the place a
+    release engineer will actually look, and the removal from this register is a
+    **reclassification** out of "deferred work with an owner and a size", not a
+    cancellation of any item.
 
 ## Verification notes (2026-09-24)
 
@@ -1121,3 +1321,194 @@ not carried over from a prior note. **No other row touched; no renumbering; the
   active guidance"), so that cite cannot be resolved; the live plugin design is
   ADR-14. Row 30 now records both corrections instead of inheriting a cite that
   points at the wrong subject.
+
+## Verification notes (2026-09-27, rows 32 / 35 — certified-evolution cut, STATUS-checklist reclassification)
+
+Executed 2026-09-27 on the current checkout. **Docs only — no source edits, no
+builds, no test runs, no commit**; the tree is left for the orchestrator to commit
+alongside the other doc changes already in the working tree. Every claim below was
+re-read in the tree or in the cited document, not carried over from a prior note.
+**No other row touched; no renumbering; the `#32` and `#35` gaps are left
+intentionally**, matching the row 3 / 4 / 10 / 12 / 14 / 19 / 21 / 25 / 26 / 28 /
+33 / 44 / 47 / 49 precedent.
+
+- **Scope of this pass: rows 32 and 35 cut**, landing in the Closed appendix as
+  #20 and #21. The two cuts rest on different grounds and are recorded separately
+  on purpose: row 32 is a **research programme with an unresolvable cite**, row
+  35 is a **reclassification of living checklists**. The table keeps its 5
+  columns; both rows were deleted whole rather than left as stubs.
+- **Row 32 — the dangling cite is deliberate, and that is the finding, not an
+  excuse.** `docs/research/certified-universal-evolution.md` is absent from disk
+  *and* ignored by `.gitignore:54`, whose path is that file exactly; the comment
+  on `.gitignore:53` reads "**Private research — not for public until ready**".
+  `git check-ignore -v docs/research/certified-universal-evolution.md` reports the
+  matching rule as `.gitignore:54`, and `docs/research/` contains six tracked
+  files, none of them this one. So the register has been citing, as the source of
+  a deferral, a document that **cannot exist in this repository** — which is why
+  a `[dangling-cite]` flag was the right annotation and why the row could never be
+  closed from what is in the tree. Recorded as **explained, not accidental**.
+- **Row 32 — two of the row's own cites had drifted off the item, and both are
+  corrected in the appendix.** The old `TODO.md:286–293` is the
+  **prompt-cache-stability** entry (which is row 1's subject, not this row's); the
+  certified-evolution item is `TODO.md:297–304`, with the prerequisite list at
+  `:300–303`. The old `ROADMAP:189–193` straddles the **code-editor** entry
+  (`:188–191`, since cut as Closed #17) and only the first two lines of this one;
+  the item is `ROADMAP.md:192–196`. The row was therefore citing two documents at
+  the wrong offsets *and* a third document that is git-ignored — the cut removes a
+  row that was already unciteable, which is the honest way to describe it.
+- **Row 32 — TWO premises in the brief FAILED verification and are deliberately
+  not written into the row as claims. This is the substantive part of the note.**
+  (a) **"The only `confidence` in the tree is an intent-routing threshold" is
+  FALSE.** A case-insensitive search of `crates/**/*.rs` returns **85 matches**,
+  across three unrelated subsystems: intent routing (`core/src/intent.rs:15,135`
+  — `LOW_CONFIDENCE_THRESHOLD` + `RouterOutput::confidence`, ADR-55 vocabulary
+  whose constant the ADR-56 LLM classifier reuses as its re-route threshold, with
+  the operator knob at `config/src/schema.rs:239,269–305`); memory-decision
+  confidence (`core/src/memory.rs:303,313`, plus
+  `memory/src/decision_store.rs:94–108,158–168`,
+  `memory/src/entities.rs:78,804–805` — a `0.0..=1.0` SQLite CHECK constraint
+  with supersession tracking); and the issue-#59 low-confidence consultation
+  trigger (`orchestrator/src/consultation.rs:52,71,292`;
+  `coordinator.rs:16930,16938`). **The conclusion survives anyway, on a better
+  basis:** every one of those is a bare `f32` scalar for routing, recall ranking
+  or consultation triggering — none is a *type*, and none carries evidence. So
+  "compiler-enforced confidence/evidence types" is genuinely unbuilt, but the
+  register must not carry a "no confidence in the tree" claim, because one grep
+  falsifies it. (b) **"No evidence types" is also FALSE, and by a wide margin.**
+  ADR-65's evidence spine is a large, landed subsystem: `AcceptanceEvidence`
+  (`orchestrator/src/checkpoint.rs:69–103`), `design_doc_verifier.rs`
+  (`:75–88` reason taxonomy, `:112–127` gathered-evidence struct, `:204–216`
+  claim resolution), `resume.rs` (`:16`, `:192` `RefreshEvidence`),
+  `world_model.rs` (`:141–182` resolved-question evidence ids), plus
+  `tool_facts.rs` and `read_cache.rs`. What is missing is the
+  certified-evolution *sense* of the word: a **type-level gate on promoting a
+  self-modification**, not a record of what happened in a run. The name collides;
+  the construct does not exist. Writing the brief's version would have put two
+  false claims into a permanent record.
+- **Row 32 — the neighbours are not it, and each was checked for what it actually
+  does rather than waved off by name.** `crates/eval` is real and substantial
+  (six modules; `lib.rs:5–8` "Phase 3 evaluation harness"; `categories.rs`,
+  `scenarios.rs`, `persona_mem.rs`; ~30 fixtures under `benchmark_tasks/`) — but
+  its contract is to *detect the project's own test runner* (`cargo`, `npm`,
+  `pytest`, `make`; `lib.rs:7`) and run that suite in a working directory
+  (`run_in_dir` `:267–274`; the honest-`Fallback` cargo path `:291–294`; the
+  evidence-resolved root logic `:91–112`). No isolation, no immutability, no
+  evaluator-spec validation, no candidate-vs-baseline comparison. It answers
+  "can the agent finish this task?", not "does this candidate modification
+  improve a metric?". The **seven benches are criterion micro-benchmarks**
+  (`core/benches/serde.rs`, `core/benches/policy.rs`,
+  `orchestrator/benches/task_graph.rs`, `memory/benches/vector_retrieval.rs`,
+  `memory/benches/fts_search.rs`, `providers/benches/provider_streaming.rs`,
+  `tools/benches/virtual_fs.rs`) — no profile-guided CI gate, and the Phase 3
+  criterion-benchmark + CI-gate work is already carried by **row 48**, so nothing
+  is being dropped by this cut. `orchestrator/src/fault_injection.rs:76–92` is
+  the G1–G3 issue-gate rows plus the C1–C4 crash-window table — **row 17's**
+  in-process, deterministic runtime-robustness suite, and its own module doc
+  (`:78–85`) says so. A search of `crates/**/*.rs` for `evaluator spec` /
+  `profile.guid` / `evolution` / `self.improv` returns no evaluator-spec type and
+  no promotion gate; the `promote`/`mutation` hits are all file-write policy
+  (`core/src/authorization.rs`, `core/src/policy.rs`,
+  `config/src/saving.rs:181–191`). **`STOKE` occurs in exactly two places
+  repo-wide** — `ROADMAP.md:196` and `TODO.md:303`, both prose in the two cited
+  lines — and zero times in any `.rs` file (the `crates/providers/src/google.rs`
+  hits are `candidatesTokenCount`, a false positive). So there is no
+  STOKE-comparable evidence and never has been.
+- **Row 32 — the required scope is recorded verbatim so the cut is reversible.**
+  From `TODO.md:300–303` and `ROADMAP.md:192–196`: compiler-enforced
+  confidence/evidence types, evaluator specification validation, deterministic
+  isolated **immutable** evaluation infrastructure, explicit resource budgets
+  with stop/resume semantics, and small-domain evidence comparable to STOKE. Of
+  those five, the tree has at most one *adjacent* item — resource budgets, via
+  rows 36/45's CPU budget and the existing wall-clock timeout — and that budget
+  bounds a **shell command**, not an evolution run. `TODO.md:303–304` supplies
+  the cut's own authority: "STATUS.md does not cover this track; it is
+  roadmap-scoped research, not a promised feature."
+- **Row 35 — the mislabelling, established from the forms themselves rather than
+  asserted.** `TESTING.md:1–6` and `docs/live-test-template.md:1–7` both open by
+  requiring one sheet per build / OS / provider-model combination, and both
+  prescribe the same four verdicts — **Pass / Fail / Blocked / Not tested**.
+  `TESTING.md` is 290 lines: environment table `:12–29`, automated-checks results
+  `:53–60`, the acceptance-bar section that maps the audit's 12 end-to-end
+  scenarios onto named automated tests `:62–92`, and the area sheets `:113–257`
+  (default desktop `:113`, … cancellation `:196–203`, memory restart `:205–214`,
+  spend `:216–226`, shell and policy `:228–241`, skills and MCP `:243–257`).
+  `docs/live-test-template.md` is 76 lines: environment table `:11–25`, nine
+  generic key-test rows plus the six Studio rows `:42–47`, automated checks
+  `:49–66`, outcome and funding notes `:68–76`. Every result cell is meant to be
+  filled in, per build, every release. **These have no terminal state**, so
+  "promote to Closed when the re-entry condition is met" is a category error for
+  them, and an entry with a size and an implied owner reads as debt.
+- **Row 35 — all six items are OPEN, and the state of each was re-verified today
+  so the removal loses nothing.** (i) **ENV_LOCK race hardening: OPEN.** The lock
+  is real (`app.rs:4943`), and so is the panic-safe pattern, documented at
+  `app.rs:8028–8033`. Most guarded tests follow it (guard/restore pairs
+  `:5223`/`:5245–5249`, `:5308`/`:5330–5334`, `:5365`/`:5377–5380`,
+  `:6839`/`:6845–6848`, `:8632`/`:8654–8657`) — **but not universally**, which is
+  the substance: `save_materializes_a_name_selection_inline_into_the_global_config`
+  asserts at `app.rs:5565` while restoring at `:5598–5599`, and the test guarded
+  at `:5705` asserts at `:5733–5736` before restoring at `:5742–5745`. A panic in
+  either unwinds past the restore and leaks the redirect into parallel tests, and
+  no RAII guard type exists in the module. (ii) **Glyph-font coverage: OPEN**,
+  and still cosmetic/text-paired as `STATUS.md` claims — `semantics_glyph`
+  (`views/orchestration_studio.rs:909–915`, the `🛡 ➜ ⛓` set) is paired with
+  `semantics_label` (`:917–926`) in both the kind picker and the row's semantics
+  tag, under the `:907` comment that the affordance is "never color alone"; no
+  bundled icon font, no explicit iced fallback. (iii) **Multiline
+  system-instructions: OPEN** — see the citation correction below. (iv)
+  **ADR-59/P4 deferrals: OPEN**, and the two ADR-59 items that overlap the
+  now-cut **row 28** (the TOML diff view and the canvas DAG editor, P6) are
+  **already recorded there** in Closed #18, so they are cross-referenced here
+  rather than duplicated; **export-merge hardening actually LANDED as a side
+  effect** — `crates/config/src/saving.rs:1–40` documents merge-aware `toml_edit`
+  writers preserving comments, key order and unedited keys, all atomic via
+  temp-file-plus-`rename`, with `seed_orchestration_roster` / `save_agent_roster`
+  writing only the keys they own — **while the migration runner did not** (no
+  code converts a legacy `multi_agent`-only config into `[orchestration]`;
+  ADR-59:169–170 still states the pre-P5 condition as current; and
+  `config/src/migration.rs` is *schema_version* step migration, a different
+  mechanism). (v) **Orchestration-editor checklist: OPEN** — the six rows are
+  present at `docs/live-test-template.md:42–47` with blank Result cells, matching
+  `STATUS.md:350–355`. (vi) **Release-priority matrix: OPEN** —
+  `STATUS.md:357–365`, "Immediate release priorities" items 1–5. Note the
+  boundary: that section sits **outside** the "Tracked follow-ups" block
+  (`STATUS.md:323–355`), so the row's own `~328–355` cite never covered it;
+  recorded here so it is not lost with the row.
+- **Row 35 — ONE citation in the brief was wrong and is corrected, because the
+  wrong file would have sent a reader to the SubView title bar.** The brief cited
+  `crates/desktop/src/app.rs:4114–4122` for the multiline system-instructions
+  input. `app.rs:4113–4115` is the SubView overlay **close button** and
+  `:4117–4124` is the `Main`/`Diff`/`AgentGraph`/`ToolLog`/`SpendLog`/`Runtime`
+  **title match** — unrelated to any input. The real site is
+  **`crates/desktop/src/views/orchestration_studio.rs:4114–4116`**,
+  `text_input("System Instructions", &p.system_instructions)`, still a
+  single-line `text_input` and not upgraded to `text_editor`, confirmed OPEN. The
+  same view also carries the sibling long-text inputs at `:4117–4122`
+  ("Constraints & Safety", "Output Format"), so the repo's long-text pattern is
+  uniform here and the upgrade is a real slice, not a one-line widget swap.
+- **Row 35 — the reclassification is explicit, and nothing was deleted.** This
+  pass edited **only** `docs/DEFERRED.md`. `TESTING.md` (290 lines),
+  `docs/live-test-template.md` (76 lines), the ready-made `docs/live-test-*.md`
+  copies, and `docs/STATUS.md` (376 lines, `Tracked follow-ups` at `:323–355`,
+  `Immediate release priorities` at `:357–365`) are all untouched and **remain
+  the source of truth** for every one of the six items. Anyone looking for the
+  ENV_LOCK fix, the glyph work, the multiline upgrade, the ADR-59 tail, the
+  Studio checklist or the release matrix will find them exactly where a release
+  engineer looks today. This is a **reclassification** out of "deferred work
+  with a re-entry condition, a size and an owner" — not a cancellation, and not a
+  judgement that the items are unimportant.
+- **Follow-ups flagged, not actioned here** (outside this pass's scope):
+  - `docs/STATUS.md:346–349` is the mirror of the now-cut **row 28** and still
+    lists the deferred P5/P6 items as tracked follow-up #4 without recording
+    that the register row was cut. Still unreconciled — previously flagged by the
+    2026-09-27 owner-decisions pass, and deliberately left alone here too.
+  - `docs/TODO.md:297–304` and `ROADMAP.md:192–196` still cite the git-ignored
+    `docs/research/certified-universal-evolution.md`. The dangling cites are now
+    *explained* (and the register no longer carries them), but the two source
+    documents still point at a file that cannot exist in a public clone. A future
+    pass should either un-ignore the file or reword those two lines to say the
+    design is private.
+  - Still carried forward from the three prior passes and untouched:
+    `docs/security-threat-model.md` §6 gaps #1, #5, #6; `docs/TODO.md:229–235`
+    ("Not started" for work that landed in `f4bdc4f`); `ROADMAP.md:241–245`; and
+    the `— manual` orphan fragment in the 2026-09-24 notes above, still
+    unrepaired.
