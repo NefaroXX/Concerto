@@ -654,6 +654,23 @@ fn is_cancellation_error(error: &OrchestratorError) -> bool {
 /// still counts toward the ADR-52 run-wide dispatch cap.
 const MAX_FALLBACK_ATTEMPTS: usize = 3;
 
+/// Ladder hold (owner doctrine, option b): the maximum number of
+/// coordinator-owned planning-recovery ROUNDS per run. Replaces the historical
+/// once-per-run `planning_recovery_attempted` latch so recovery is no longer
+/// one-shot, while staying bounded.
+const MAX_PLANNING_RECOVERY_ROUNDS: u32 = 3;
+
+/// Ladder hold (owner doctrine, option b): the maximum number of times one run
+/// may HOLD a throttled planning rung (wait out its `Retry-After`, then retry
+/// the SAME provider) before falling back to the provider bridge.
+const MAX_PLANNING_HOLDS: u32 = 2;
+
+/// Ladder hold (owner doctrine, option b): the documented ceiling on a single
+/// hold wait, regardless of how long a provider's `Retry-After` asks for. The
+/// provider's own hint is respected up to this bound so a rogue hint can never
+/// park a run indefinitely.
+const MAX_PLANNING_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `(provider_config_id, model)` — the identity of a fallback pipe, used to
 /// record which pipes a guarded scope has already tried so the bounded
 /// iteration never repeats one.
@@ -1559,12 +1576,19 @@ pub struct CoordinatorAgent {
     fallback_pipes: Vec<(Arc<dyn concerto_core::traits::provider::LlmProvider>, ModelProfile)>,
     /// Coordinator-owned planning-provider recovery (ADR-42/45 ladder
     /// semantics, owned by the Coordinator since the compiled scheduler was
-    /// removed): whether this run may still attempt the one-shot fallback
-    /// retry of the planning dispatch session. `false` until a provider-class
-    /// planning failure either retried on the default-model provider or was
-    /// skipped (degenerate/unavailable/disabled); at most one recovery per
-    /// run. Run-scoped: reset at the start of every `run` invocation.
-    planning_recovery_attempted: bool,
+    /// removed): the number of recovery ROUNDS this run has entered, bounded
+    /// by [`MAX_PLANNING_RECOVERY_ROUNDS`]. Replaces the historical
+    /// once-per-run `planning_recovery_attempted` latch so recovery is not
+    /// one-shot. Run-scoped: reset at the start of every `run` invocation.
+    planning_recovery_rounds: u32,
+    /// Re-entrancy guard for the planning recovery: `true` while a recovery
+    /// (hold retry or fallback swap) is in flight, so the nested
+    /// `decompose_task` failure cannot start a SECOND, concurrent recovery.
+    planning_recovery_in_progress: bool,
+    /// Ladder hold: the number of throttled rungs this run has held (waited
+    /// out `Retry-After` then retried the SAME provider), bounded by
+    /// [`MAX_PLANNING_HOLDS`]. Run-scoped: reset at the start of every `run`.
+    planning_hold_rounds: u32,
     /// Set when the coordinator-owned planning recovery was attempted or
     /// skipped, so `run()`'s decompose error arm renders a ladder-exhausted
     /// note instead of a silent "Automation paused". Consumed (`take()`n) by
@@ -2685,7 +2709,9 @@ impl CoordinatorAgent {
             default_model_profile: None,
             default_model_fallback: true,
             fallback_pipes: Vec::new(),
-            planning_recovery_attempted: false,
+            planning_recovery_rounds: 0,
+            planning_recovery_in_progress: false,
+            planning_hold_rounds: 0,
             planning_recovery_note: None,
             planning_produced_files: Vec::new(),
             planning_profile: None,
@@ -9220,10 +9246,12 @@ impl CoordinatorAgent {
         // loop counts toward it too, so loop + graph dispatches share one
         // ceiling.
         self.model_dispatch_count = 0;
-        // The coordinator-owned planning recovery is once per `run`: the
-        // attempt guard and its ladder-exhausted note do not carry across
-        // runs.
-        self.planning_recovery_attempted = false;
+        // The coordinator-owned planning recovery budget is per `run`: the
+        // bounded rounds/holds and the ladder-exhausted note do not carry
+        // across runs (recovery is no longer one-shot, but still bounded).
+        self.planning_recovery_rounds = 0;
+        self.planning_recovery_in_progress = false;
+        self.planning_hold_rounds = 0;
         self.planning_recovery_note = None;
         self.planning_produced_files.clear();
         // Advisor-mode intent routing: finalize the run shape from the router's
@@ -9673,9 +9701,9 @@ impl CoordinatorAgent {
         // The retried session may finally dispatch (the run proceeds); if it too
         // ends empty, the retried result flows into `execute_graph`, whose
         // vacuous-completion guard reports Partial and KEEPS the checkpoint for
-        // resume. The recovery is once-per-run: the nested retry's own
-        // prose-only stop is skipped via `planning_recovery_attempted`, so this
-        // never recurses deeper than one level.
+        // resume. The nested retry's own prose-only stop is suppressed by
+        // `planning_recovery_in_progress`, so this never recurses deeper than
+        // one level (the run budget is bounded by MAX_PLANNING_RECOVERY_ROUNDS).
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
             && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
             && graph.is_empty();
@@ -9707,7 +9735,9 @@ impl CoordinatorAgent {
     /// compiled scheduler is gone: when the planning dispatch session's
     /// provider fails with a provider-class error (HTTP status, auth,
     /// capability refusal, or a throttle/transient-5xx-caused retry exhaustion
-    /// — never cancellation or a structural error), the Coordinator retries
+    /// — never cancellation or a structural error), the Coordinator HOLDs the
+    /// rung on a throttled exhaustion that preserved a `Retry-After` (retry
+    /// the SAME provider after its cooldown, no demotion), otherwise retries
     /// `decompose_task` on the run's fallback pipes (ADR-45 tier-1b pipe; then
     /// the next capable alternate on a 404 model-not-found fallback failure,
     /// up to [`MAX_FALLBACK_ATTEMPTS`] total) and records each attempt as an
@@ -9716,13 +9746,13 @@ impl CoordinatorAgent {
     /// because the retried `run_dispatch_session` increments it per turn.
     ///
     /// The retry is skipped — straight to a graceful `Partial` — when
-    /// cancellation/structural errors surface, the run already consumed its
-    /// one recovery, the tier-1b gate is disabled, no fallback provider is
-    /// configured, or the fallback resolves to the same (provider, model) as
-    /// the failed planning provider (a permanent 400 would just repeat). The
-    /// ORIGINAL error always drives the caller's Partial exit; failure of the
-    /// fallback retry is surfaced through `planning_recovery_note`, never as
-    /// a hard crash.
+    /// cancellation/structural errors surface, the run spent its bounded
+    /// recovery budget ([`MAX_PLANNING_RECOVERY_ROUNDS`]), the tier-1b gate is
+    /// disabled, no fallback provider is configured, or the fallback resolves
+    /// to the same (provider, model) as the failed planning provider (a
+    /// permanent 400 would just repeat). The ORIGINAL error always drives the
+    /// caller's Partial exit; failure of the fallback retry is surfaced
+    /// through `planning_recovery_note`, never as a hard crash.
     async fn attempt_planning_provider_recovery(
         &mut self,
         task: &AgentTask,
@@ -9734,6 +9764,13 @@ impl CoordinatorAgent {
         // misrouted cancellation/structural failure must not be swallowed
         // into a retry (immediate-exit semantics, ADR-42 NonRecoverable).
         if is_cancellation_error(original_error) {
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        // Nested re-entry: the retried `decompose_task` failed and called back
+        // in. The outer recovery round owns the decision — never start a
+        // second, concurrent recovery (the re-entrancy guard that replaces the
+        // historical once-per-run latch's recursion-stopping duty).
+        if self.planning_recovery_in_progress {
             return PlanningRecoveryOutcome::Exhausted;
         }
         // Recoverable provider failures: any surfaced HTTP status (permanent
@@ -9758,13 +9795,63 @@ impl CoordinatorAgent {
         if !recoverable {
             return PlanningRecoveryOutcome::Exhausted;
         }
-        // The Decision reason must distinguish the throttle-exhausted cause
-        // from the ordinary provider-failure path (an operator reading the
-        // whiteboard can tell *why* recovery fired).
+        if self.planning_recovery_rounds >= MAX_PLANNING_RECOVERY_ROUNDS {
+            self.planning_recovery_note = Some(format!(
+                "planning recovery budget spent ({MAX_PLANNING_RECOVERY_ROUNDS} rounds this run)"
+            ));
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        self.planning_recovery_rounds += 1;
+        self.planning_recovery_in_progress = true;
+        let outcome = self.recover_planning_rung(task, context, cancel, original_error).await;
+        self.planning_recovery_in_progress = false;
+        outcome
+    }
+
+    /// The bounded body of ONE planning-recovery round.
+    ///
+    /// Owner doctrine, option (b): when the planning provider exhausted its
+    /// retries on THROTTLING and preserved a known `Retry-After`, HOLD the rung
+    /// — wait out the cooldown (cancellably, capped at [`MAX_PLANNING_HOLD`])
+    /// and retry the SAME provider. A held rung that recovers stays the primary
+    /// pipe (no swap, no demotion). Only terminal classes (auth, 404/model-not-
+    /// found, malformed request, capability refusal) and a rung without a
+    /// cooldown hint go straight to the existing fallback behaviour. A hold that
+    /// fails afterwards bridges to a fallback provider as a BRIDGE (not a
+    /// demotion), with the trail naming the bridge.
+    async fn recover_planning_rung(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        original_error: &OrchestratorError,
+    ) -> PlanningRecoveryOutcome {
+        // Field names stay in sync: `recoverable` was checked by the caller.
+        // Extraction stays on the error, never a global.
         let throttle_exhausted = matches!(
             original_error,
             OrchestratorError::Provider(error) if error.is_throttle_exhaustion()
         );
+        let mut bridged = false;
+        if throttle_exhausted {
+            let retry_after = match original_error {
+                OrchestratorError::Provider(error) => error.retry_after_hint(),
+                _ => None,
+            };
+            if let Some(retry_after) = retry_after {
+                // A hold is attempted: any fallback that follows is a BRIDGE,
+                // not an abandonment of the rung.
+                bridged = true;
+                if let Some(recovered) =
+                    self.hold_rung_and_retry(task, context, cancel, retry_after).await
+                {
+                    return PlanningRecoveryOutcome::Recovered(recovered);
+                }
+            }
+        }
+        // The Decision reason must distinguish the throttle-exhausted cause
+        // from the ordinary provider-failure path (an operator reading the
+        // whiteboard can tell *why* recovery fired).
         let (tag_prefix, decision_output) = if throttle_exhausted {
             (
                 "planning-provider-recovery-throttle-exhausted",
@@ -9779,8 +9866,113 @@ impl CoordinatorAgent {
                  (ADR-45 tier-1b fallback) after the planning provider failed",
             )
         };
-        self.retry_planning_on_default_model(task, context, cancel, tag_prefix, decision_output)
-            .await
+        self.retry_planning_on_default_model_inner(
+            task,
+            context,
+            cancel,
+            tag_prefix,
+            decision_output,
+            bridged,
+        )
+        .await
+    }
+
+    /// HOLD a throttled planning rung: wait out the provider's own
+    /// `Retry-After` (capped at [`MAX_PLANNING_HOLD`]) with cancellation, then
+    /// retry the SAME planning provider. `Some(recovered)` when the rung
+    /// recovers — it stays the primary pipe, nothing was demoted; `None` when
+    /// the wait was cancelled or the rung still failed, so the caller bridges.
+    async fn hold_rung_and_retry(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        first_retry_after: std::time::Duration,
+    ) -> Option<Box<(TaskGraph, Option<PlanArtifact>, DispatchLedger, String)>> {
+        let mut retry_after = first_retry_after;
+        loop {
+            if self.planning_hold_rounds >= MAX_PLANNING_HOLDS {
+                self.planning_recovery_note = Some(format!(
+                    "planning hold budget spent ({MAX_PLANNING_HOLDS} holds this run); \
+                     bridging to a fallback pipe instead of waiting again"
+                ));
+                return None;
+            }
+            self.planning_hold_rounds += 1;
+            let hold = retry_after.min(MAX_PLANNING_HOLD);
+            self.append_planning_recovery_decision(
+                task,
+                "planning-provider-hold",
+                &format!(
+                    "Hold the planning rung: the provider exhausted its retries on throttling and \
+                     asked to wait {retry_after:?}. Waiting {hold:?} (cap {MAX_PLANNING_HOLD:?}), \
+                     then retrying the SAME provider — not abandoning it — before any bridge or \
+                     fallback"
+                ),
+            )
+            .await;
+            tokio::select! {
+                _ = tokio::time::sleep(hold) => {}
+                _ = cancel.cancelled() => {
+                    self.planning_recovery_note =
+                        Some("planning rung hold cancelled".to_owned());
+                    return None;
+                }
+            }
+            if cancel.is_cancelled() {
+                self.planning_recovery_note = Some("planning rung hold cancelled".to_owned());
+                return None;
+            }
+            // The hold retry is a real model dispatch (ADR-52): count it.
+            self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+            // Retry the SAME provider/profile: no swap, no demotion. Nested
+            // failures observe `planning_recovery_in_progress` and return
+            // Exhausted instead of recursing.
+            let this = &mut *self;
+            let retried =
+                Box::pin(async move { this.decompose_task(task, context, cancel).await }).await;
+            match retried {
+                Ok((graph, advisory_plan, ledger, summary)) => {
+                    self.append_planning_recovery_decision(
+                        task,
+                        "planning-provider-hold-recovered",
+                        "The held planning rung recovered on the SAME provider after its \
+                         cooldown; it remains the primary pipe (no bridge, no demotion)",
+                    )
+                    .await;
+                    return Some(Box::new((graph, advisory_plan, ledger, summary)));
+                }
+                Err(error) => {
+                    // Still throttled AND still within the hold budget: wait
+                    // out this cooldown too before ever bridging.
+                    let next_hint = match &error {
+                        OrchestratorError::Provider(provider_error)
+                            if provider_error.is_throttle_exhaustion() =>
+                        {
+                            provider_error.retry_after_hint()
+                        }
+                        _ => None,
+                    };
+                    if let Some(next_hint) = next_hint {
+                        retry_after = next_hint;
+                        continue;
+                    }
+                    self.planning_recovery_note = Some(format!(
+                        "the held planning rung still failed after its cooldown: {error}"
+                    ));
+                    self.append_planning_recovery_decision(
+                        task,
+                        "planning-provider-hold-failed-bridging",
+                        &format!(
+                            "The held planning rung still failed after its cooldown ({error}); \
+                             bridging to a fallback provider as a BRIDGE, not abandoning the run"
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+            }
+        }
     }
 
     /// Coordinator-owned recovery for a prose-only, zero-dispatch planning
@@ -9813,31 +10005,12 @@ impl CoordinatorAgent {
         .await
     }
 
-    /// Shared tail of the coordinator-owned planning recovery (ADR-45
-    /// tier-1b): resolve the fallback pipe, record the attempt (or skip) as an
-    /// ADR-65 `Decision` event, retry `decompose_task` on the fallback, and
-    /// restore the original planning pipe/profile regardless of the outcome.
-    ///
-    /// `tag_prefix` seeds every `Decision` reason tag (`{tag}-attempted`,
-    /// `{tag}-failed`, `{tag}-exhausted`, `{tag}-skipped-disabled`,
-    /// `{tag}-skipped-unavailable`, `{tag}-skipped-degenerate`);
-    /// `decision_output` is the `required_output` the Decision event records
-    /// for the retry. Shared by the provider-failure recovery
-    /// ([`Self::attempt_planning_provider_recovery`]) and the prose-only
-    /// zero-dispatch recovery ([`Self::attempt_prose_only_planning_recovery`]).
-    ///
-    /// The first retry enters as ONE recovery per run (the run-scoped
-    /// `planning_recovery_attempted` latch also stops the nested retry from
-    /// re-entering). From there, a fallback failure that is a model-not-found
-    /// (HTTP 404) advances to the NEXT capable alternate pipe, bounded to
-    /// [`MAX_FALLBACK_ATTEMPTS`] total attempts and never repeating a pipe.
-    /// Other failure classes keep the historical single-attempt semantics.
-    /// The retry is skipped — the caller's graceful `Partial` stands — when
-    /// the run already consumed its recovery, the tier-1b gate is disabled, no
-    /// fallback provider is configured, or the fallback resolves to the same
-    /// (provider, model) as the current planning provider (the failure would
-    /// just repeat). Failure of the fallback retry is surfaced through
-    /// `planning_recovery_note`, never as a hard crash.
+    /// Enter a fallback bridge as ONE bounded recovery round: guard against
+    /// re-entry, spend a round from the run budget, and run the shared bridge
+    /// tail. Used by the prose-only zero-dispatch recovery
+    /// ([`Self::attempt_prose_only_planning_recovery`]); the provider-failure
+    /// path enters the bridge tail directly from
+    /// [`Self::recover_planning_rung`] (which already owns the round).
     async fn retry_planning_on_default_model(
         &mut self,
         task: &AgentTask,
@@ -9846,15 +10019,63 @@ impl CoordinatorAgent {
         tag_prefix: &str,
         decision_output: &str,
     ) -> PlanningRecoveryOutcome {
-        if self.planning_recovery_attempted {
-            self.planning_recovery_note =
-                Some("planning recovery was already attempted or skipped this run".to_owned());
+        if self.planning_recovery_in_progress {
+            self.planning_recovery_note = Some("planning recovery re-entry suppressed".to_owned());
             return PlanningRecoveryOutcome::Exhausted;
         }
-        // Once this run's recovery slot is decided (attempted or skipped) it
-        // is spent — a replan follow-up cannot re-enter recovery.
-        self.planning_recovery_attempted = true;
+        if self.planning_recovery_rounds >= MAX_PLANNING_RECOVERY_ROUNDS {
+            self.planning_recovery_note = Some(format!(
+                "planning recovery budget spent ({MAX_PLANNING_RECOVERY_ROUNDS} rounds this run)"
+            ));
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        self.planning_recovery_rounds += 1;
+        self.planning_recovery_in_progress = true;
+        let outcome = self
+            .retry_planning_on_default_model_inner(
+                task,
+                context,
+                cancel,
+                tag_prefix,
+                decision_output,
+                false,
+            )
+            .await;
+        self.planning_recovery_in_progress = false;
+        outcome
+    }
 
+    /// Shared tail of the coordinator-owned planning recovery (ADR-45
+    /// tier-1b): resolve the fallback pipe, record the attempt (or skip) as an
+    /// ADR-65 `Decision` event, retry `decompose_task` on the fallback, and
+    /// restore the original planning pipe/profile regardless of the outcome.
+    ///
+    /// `tag_prefix` seeds every `Decision` reason tag (`{tag}-attempted`,
+    /// `{tag}-failed`, `{tag}-exhausted`, `{tag}-skipped-disabled`,
+    /// `{tag}-skipped-unavailable`, `{tag}-skipped-degenerate`, plus
+    /// `{tag}-bridged-recovered`/`{tag}-abandoned` when `bridged`); the run's
+    /// bounded recovery round is already spent by the caller. `bridged` is
+    /// `true` when this bridge follows a FAILED hold of the throttled rung —
+    /// it distinguishes "bridged and recovered" from "abandoned" in the trail.
+    ///
+    /// A fallback failure that is a model-not-found (HTTP 404) advances to the
+    /// NEXT capable alternate pipe, bounded to [`MAX_FALLBACK_ATTEMPTS`] total
+    /// attempts and never repeating a pipe. Other failure classes keep the
+    /// historical single-attempt semantics. The retry is skipped — the
+    /// caller's graceful `Partial` stands — when the tier-1b gate is disabled,
+    /// no fallback provider is configured, or the fallback resolves to the same
+    /// (provider, model) as the current planning provider (the failure would
+    /// just repeat). Failure of the fallback retry is surfaced through
+    /// `planning_recovery_note`, never as a hard crash.
+    async fn retry_planning_on_default_model_inner(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        tag_prefix: &str,
+        decision_output: &str,
+        bridged: bool,
+    ) -> PlanningRecoveryOutcome {
         // ADR-45 §4 user gate: tier-1b default-model re-dispatch disabled.
         if !self.default_model_fallback {
             self.planning_recovery_note =
@@ -9932,9 +10153,9 @@ impl CoordinatorAgent {
             // exit below restores before returning. The swap re-enters
             // `decompose_task` through this shared helper (self-recursion), so
             // the inner call is boxed to keep the future sized (E0733); the
-            // cycle terminates because the prose-only guard inside the retried
-            // `decompose_task` observes `planning_recovery_attempted` and
-            // returns Exhausted instead of re-entering recovery.
+            // cycle terminates because the nested call observes
+            // `planning_recovery_in_progress` and returns Exhausted instead of
+            // re-entering recovery.
             let original_provider =
                 std::mem::replace(&mut self.planning_provider, fallback_provider);
             let original_profile = self.planning_profile.replace(fallback_profile.clone());
@@ -9952,6 +10173,15 @@ impl CoordinatorAgent {
                         task_id = %task.id,
                         "coordinator planning recovery succeeded on the default-model provider"
                     );
+                    if bridged {
+                        self.append_planning_recovery_decision(
+                            task,
+                            &format!("{tag_prefix}-bridged-recovered"),
+                            "The fallback provider carried the planning session as a BRIDGE \
+                             after the held rung failed; the run recovered on the bridge",
+                        )
+                        .await;
+                    }
                     return PlanningRecoveryOutcome::Recovered(Box::new((
                         graph,
                         advisory_plan,
@@ -9984,6 +10214,15 @@ impl CoordinatorAgent {
                     self.planning_recovery_note = Some(format!(
                         "fallback planning-provider retry also failed: {second_error}"
                     ));
+                    self.append_planning_recovery_decision(
+                        task,
+                        &format!("{tag_prefix}-abandoned"),
+                        &format!(
+                            "The fallback provider also failed; the rung is abandoned and the \
+                             run pauses with a Partial outcome ({second_error})"
+                        ),
+                    )
+                    .await;
                     tracing::warn!(
                         error = %second_error,
                         "coordinator planning recovery exhausted: the fallback provider also failed"
@@ -10210,9 +10449,9 @@ impl CoordinatorAgent {
         // recovery slot already spent. The SAME ADR-45 tier-1b ladder
         // applies: retry the planning session ONCE on the run's
         // default-model provider, recording the attempt as an ADR-65
-        // `Decision` event. The recovery is once-per-run, so the nested
-        // retry's own prose-only stop is skipped via
-        // `planning_recovery_attempted` — never deeper than one level.
+        // `Decision` event. The recovery is re-entrancy guarded and bounded, so
+        // the nested retry's own prose-only stop is suppressed via
+        // `planning_recovery_in_progress` — never deeper than one level.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
             && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
             && graph.is_empty();
@@ -15240,6 +15479,7 @@ mod tests {
                     elapsed: std::time::Duration::from_secs(30),
                     last_error: "all retries failed".into(),
                     throttled: false,
+                    retry_after: None,
                 }
             )),
             SubtaskFailureClass::LimitReached
@@ -18534,6 +18774,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs(120),
             last_error: "transient HTTP status 429; maximum attempt count (8) reached".into(),
             throttled: true,
+            retry_after: None,
         }
     }
 
@@ -18545,6 +18786,20 @@ mod tests {
             elapsed: std::time::Duration::from_secs(30),
             last_error: last_error.to_owned(),
             throttled: false,
+            retry_after: None,
+        }
+    }
+
+    /// A throttled exhaustion that PRESERVED the provider's `Retry-After`
+    /// hint — the signal the ladder hold waits out before retrying the SAME
+    /// provider (owner doctrine, option b).
+    fn throttle_exhausted_with_retry_after(retry_after: std::time::Duration) -> ProviderError {
+        ProviderError::RetryExhausted {
+            attempts: 8,
+            elapsed: std::time::Duration::from_secs(120),
+            last_error: "transient HTTP status 429; maximum attempt count (8) reached".into(),
+            throttled: true,
+            retry_after: Some(retry_after),
         }
     }
 
@@ -18768,6 +19023,60 @@ mod tests {
 
         fn provider_name(&self) -> &'static str {
             "planning-failure"
+        }
+    }
+
+    /// A provider that fails the first `fail_first` requests with `error`,
+    /// then serves one plan text on every later request. Models a throttled
+    /// rung that recovers once its cooldown elapses — the ladder-hold subject.
+    struct FlakyThenPlanProvider {
+        error: ProviderError,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        fail_first: usize,
+        plan: String,
+    }
+
+    impl FlakyThenPlanProvider {
+        fn new(
+            error: ProviderError,
+            requests: Arc<std::sync::atomic::AtomicUsize>,
+            fail_first: usize,
+            plan: &str,
+        ) -> Self {
+            Self { error, requests, fail_first, plan: plan.to_owned() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for FlakyThenPlanProvider {
+        async fn stream_completion(
+            &self,
+            _request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            let seen = self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if seen <= self.fail_first {
+                return Err(self.error.clone());
+            }
+            Ok(Box::pin(futures::stream::iter(vec![Ok(concerto_core::types::CompletionChunk {
+                reasoning: None,
+                delta: self.plan.clone(),
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            })])))
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "flaky-then-plan"
         }
     }
 
@@ -19301,6 +19610,250 @@ mod tests {
             decisions[0].payload["reason"],
             "planning-provider-recovery-throttle-exhausted-attempted",
             "the throttle cause is distinguishable in the Decision reason"
+        );
+    }
+
+    /// Ladder hold (owner doctrine, option b): a throttled exhaustion that
+    /// preserved a known `Retry-After` HOLDS the rung — waits out the cooldown
+    /// and retries the SAME provider. When it recovers there is no bridge and
+    /// the rung is never abandoned.
+    #[tokio::test]
+    async fn planning_hold_recovers_on_same_provider_without_bridging() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(FlakyThenPlanProvider::new(
+                throttle_exhausted_with_retry_after(std::time::Duration::from_millis(1)),
+                requests.clone(),
+                1,
+                "# Held plan\nrecovered on the same provider",
+            ));
+        let fallback = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Must not be used".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("nim", "default-nim"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the held rung must recover the run: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("recovered on the same provider"),
+            "the SAME provider's plan is the run's final message: {}",
+            output.final_message,
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the held rung is retried exactly once on the same provider"
+        );
+        assert_eq!(fallback.turn_count(), 0, "a recovered rung never bridges");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<String> = operational_decisions(&logged)
+            .iter()
+            .filter_map(|decision| decision.payload["reason"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            reasons.iter().any(|reason| reason == "planning-provider-hold"),
+            "the hold is recorded: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "planning-provider-hold-recovered"),
+            "the same-provider recovery is recorded: {reasons:?}"
+        );
+        assert!(
+            !reasons.iter().any(|reason| reason.ends_with("-bridged-recovered")),
+            "no bridge is recorded when the held rung recovers: {reasons:?}"
+        );
+    }
+
+    /// Ladder hold is NOT one-shot: a rung that is still throttled after its
+    /// first cooldown is held again (bounded by [`MAX_PLANNING_HOLDS`]) before
+    /// any bridge is considered.
+    #[tokio::test]
+    async fn planning_hold_is_not_one_shot_and_can_hold_twice() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(FlakyThenPlanProvider::new(
+                throttle_exhausted_with_retry_after(std::time::Duration::from_millis(1)),
+                requests.clone(),
+                2,
+                "# Twice-held plan\nrecovered on the third request",
+            ));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the twice-held rung must recover the run: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two held retries then a recovery on the SAME provider"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let holds = operational_decisions(&logged)
+            .iter()
+            .filter(|decision| decision.payload["reason"] == "planning-provider-hold")
+            .count();
+        assert_eq!(holds, 2, "the rung is held twice, proving recovery is not one-shot");
+    }
+
+    /// The hold observes cancellation: a cancelled run never completes the
+    /// wait and never dispatches the hold retry.
+    #[tokio::test]
+    async fn planning_hold_observes_cancellation() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                throttle_exhausted_with_retry_after(std::time::Duration::from_secs(3600)),
+                requests.clone(),
+            ));
+        let mut coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            canceller.cancel();
+        });
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            coordinator.hold_rung_and_retry(
+                &task,
+                &context,
+                &cancel,
+                std::time::Duration::from_secs(3600),
+            ),
+        )
+        .await
+        .expect("the hold must not outlive the cancellation");
+
+        assert!(recovered.is_none(), "a cancelled hold recovers nothing");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the hold retry never dispatches after cancellation"
+        );
+        assert!(
+            coordinator.planning_recovery_note.as_deref().unwrap_or_default().contains("cancelled"),
+            "the cancellation is recorded: {:?}",
+            coordinator.planning_recovery_note
+        );
+    }
+
+    /// A non-throttle exhaustion that happens to carry a `Retry-After` hint is
+    /// NOT held: terminal classes keep the historical behaviour (no wait), and
+    /// the run pauses.
+    #[tokio::test]
+    async fn planning_hold_ignores_non_throttle_class_with_hint() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::RetryExhausted {
+                    attempts: 4,
+                    elapsed: std::time::Duration::from_secs(30),
+                    last_error: "provider authentication failed".into(),
+                    throttled: false,
+                    retry_after: Some(std::time::Duration::from_millis(1)),
+                },
+                requests.clone(),
+            ));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a non-throttle exhaustion pauses without a hold",
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-throttle class is never retried on the same provider"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            !operational_decisions(&logged)
+                .iter()
+                .any(|decision| decision.payload["reason"] == "planning-provider-hold"),
+            "no hold is recorded for a terminal class"
         );
     }
 

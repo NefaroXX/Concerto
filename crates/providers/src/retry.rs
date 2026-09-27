@@ -516,6 +516,11 @@ where
                             elapsed,
                             last_error: reason,
                             throttled: is_throttle_class(decision.class),
+                            // Preserve the final attempt's raw provider wait
+                            // hint so a caller can HOLD the rung and retry the
+                            // SAME provider after the cooldown instead of
+                            // abandoning it (owner doctrine, ladder hold).
+                            retry_after: decision.provider_delay,
                         });
                     }
                 }

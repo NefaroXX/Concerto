@@ -259,6 +259,12 @@ pub enum ProviderError {
         /// preserves the prior "skip" behaviour for auth, permanent 400,
         /// capability, and network-unknown causes.
         throttled: bool,
+        /// The final attempt's raw provider wait hint (`Retry-After`), when it
+        /// carried one. Preserved past the retry budget so a caller can HOLD a
+        /// throttled rung and retry the SAME provider after the cooldown
+        /// instead of abandoning it. `None` when the provider gave no hint;
+        /// construction sites that cannot attest to one leave it `None`.
+        retry_after: Option<Duration>,
     },
 
     /// A tool-requiring task was resolved onto a provider/model that cannot
@@ -333,6 +339,19 @@ impl ProviderError {
     /// provider would succeed.
     pub fn is_throttle_exhaustion(&self) -> bool {
         matches!(self, ProviderError::RetryExhausted { throttled: true, .. })
+    }
+
+    /// The provider's own wait hint (`Retry-After`), when the error carries
+    /// one: a live [`Self::RateLimit`]/[`Self::HttpStatus`] or a
+    /// [`Self::RetryExhausted`] whose final attempt preserved it. `None` when
+    /// the provider gave no hint.
+    pub fn retry_after_hint(&self) -> Option<Duration> {
+        match self {
+            ProviderError::RateLimit { retry_after } => Some(*retry_after),
+            ProviderError::HttpStatus { retry_after, .. } => *retry_after,
+            ProviderError::RetryExhausted { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 }
 
@@ -1239,6 +1258,7 @@ mod unit_tests {
             elapsed: std::time::Duration::from_secs(30),
             last_error: "timeout".into(),
             throttled: false,
+            retry_after: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("5"), "should include attempt count");
