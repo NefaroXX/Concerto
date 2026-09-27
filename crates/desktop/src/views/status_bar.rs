@@ -55,7 +55,7 @@ fn run_stage_label(stage: RunStage) -> String {
 /// checks the App performs when rendering the overlays.
 fn dialog_waiting(app: &App) -> bool {
     !app.cap_pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-        || app.pending_ack.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        || !app.pending_ack.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
         || !app.pending_intent.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
         || !app.pending_plan.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }

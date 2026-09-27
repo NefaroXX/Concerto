@@ -65,6 +65,11 @@ pub enum DesktopEvent {
         tool_name: String,
         error: String,
     },
+    /// A backend error surfaced to the user (e.g. an explicit acknowledgement
+    /// refusal when the bounded ack queue is full). Rendered as an error toast.
+    ErrorOccurred {
+        message: String,
+    },
     /// Policy requires user approval.
     ApprovalRequested {
         tool_name: String,
@@ -484,6 +489,9 @@ fn translate_misc_event(event: &BackendEvent) -> Option<DesktopEvent> {
             kind: *kind,
         }),
         EventKind::SessionSaved => Some(DesktopEvent::SessionSaved),
+        EventKind::ErrorOccurred { message } => {
+            Some(DesktopEvent::ErrorOccurred { message: message.clone() })
+        }
         EventKind::AssistantMessage { content, .. } => {
             Some(DesktopEvent::AssistantMessage { content: content.clone() })
         }
@@ -688,6 +696,9 @@ pub fn route_event(
         }
         DesktopEvent::ApprovalRequested { .. } => {
             // Handled by the capability dialog overlay
+        }
+        DesktopEvent::ErrorOccurred { .. } => {
+            // Rendered as an App-level error toast.
         }
         DesktopEvent::AssistantMessage { content } => {
             chat_state.update_last_assistant(content.clone());
@@ -932,5 +943,27 @@ mod tests {
         // Some events may or may not be translated — the key is no panic.
         // SessionSaved is typically handled, so this should return Some.
         assert!(result.is_some() || result.is_none());
+    }
+
+    /// A backend error (e.g. an ack-queue refusal) reaches the desktop as an
+    /// `ErrorOccurred` event carrying its message, so the App can surface the
+    /// named refusal to the user rather than dropping it (§ fail-closed).
+    #[test]
+    fn error_occurred_translates_with_its_message() {
+        let event = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::ErrorOccurred {
+                message: "Acknowledgement refused: acknowledgement queue is full (2 pending); \
+                          refusing the new ack"
+                    .into(),
+            },
+        );
+
+        assert!(matches!(
+            translate_event(&event),
+            Some(DesktopEvent::ErrorOccurred { message })
+                if message.contains("acknowledgement queue is full")
+        ));
     }
 }

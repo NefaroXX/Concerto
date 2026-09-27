@@ -287,18 +287,20 @@ impl ToolExecutor {
     /// [`Self::record_approval_decision`].
     ///
     /// `ApprovalSink::request_ack` returns a bare `bool` (acknowledged →
-    /// continue, or abort) and today leaves no audit trace (audit H-04). This
-    /// is the backend-agnostic record seam for that path: the verdict
-    /// vocabulary is extended with `RequestContinue` / `RequestAbort`, the
-    /// warning text is preserved as `user_response`, and `rule_matched` is
-    /// `"user_ack"`. Because an ack is not tied to any tool call, `tool_name`
-    /// is the synthetic `"request_ack"`, `input_hash` is the empty string (no
-    /// input exists), and the ADR-28 §6 execution fields stay `None`.
+    /// continue, or abort); this is the backend-agnostic record seam for that
+    /// path. The verdict vocabulary is extended with `RequestContinue` /
+    /// `RequestAbort`, the warning text is preserved as `user_response`, and
+    /// `rule_matched` is `"user_ack"`. Because an ack is not tied to any tool
+    /// call, `tool_name` is the synthetic `"request_ack"`, `input_hash` is the
+    /// empty string (no input exists), and the ADR-28 §6 execution fields stay
+    /// `None`.
     ///
-    /// Phase 0 ships the channel only: the live `request_ack` call site lives
-    /// in the orchestrator (`setup_undo_stash`), and wiring it here is a later,
-    /// explicitly additive phase. Until then nothing calls this method in
-    /// production, so this is zero-behavioral.
+    /// Wired in production through the single-agent loop
+    /// (`AgentLoop::setup_undo_stash` → `ToolExecutionBackend::record_ack_decision`),
+    /// so every ack decision point — a continuing ack, an aborted ack, and a
+    /// queue-full refusal (which surfaces to the sink as `false`) — records a
+    /// row. The in-process backend delegates here; the supervised agent-process
+    /// backend leaves the audit supervisor-side (ADR-60 D4/D5).
     pub async fn record_ack_decision(
         &self,
         session_id: crate::ids::Ulid,
