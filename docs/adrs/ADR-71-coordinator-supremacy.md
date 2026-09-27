@@ -29,6 +29,24 @@ effect. Supersedes: none in full.
 > consult), and the "remove them as follow-up" tax no longer exists. The core
 > ADR-71 decision (no intent topology branching; Coordinator owns run shape)
 > is unaffected and remains in force.
+>
+> **Refinement note (2026-09-27, commits `5a22405`/`269c344`/`eefd45e`/`115f85c`):**
+> [ADR-74](./ADR-74-delegation-doctrine-and-ladder-hold.md) **refines this ADR;
+> it does not contradict it, and nothing in §1–§6 is revoked.** Supremacy
+> settled *who* decides a run (the Coordinator, alone). ADR-74 settles *what the
+> Coordinator is permitted to decide with*: delegation is the default action,
+> self-execution is an enumerated roster-exhaustion case, and the agent axis is
+> consulted before provider escalation. Every mechanism it adds is still a
+> Coordinator decision — a prompt doctrine the Coordinator follows, a policy
+> refusal the Coordinator can only resolve by dispatching, and Coordinator-owned
+> recovery that holds or bridges. It adds **no compiled authority** that selects
+> an agent, orders work, or ends a run, which is the exact thing §3 revoked.
+> Two consequences are worth reading together: §5's "registry / roster —
+> advisory" is now load-bearing for *mutation* (a mutating self-execution is
+> refused while a roster exists and no delegation is recorded) while remaining
+> advisory for *which* agent to call; and the §3 conflict table's "no routing
+> branch" holds, because ADR-74's takeover ordering is a Coordinator decision
+> over registry data, not a branch on an intent classification.
 
 ## Context
 

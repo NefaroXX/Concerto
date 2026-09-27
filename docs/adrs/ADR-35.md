@@ -162,6 +162,26 @@ implement, **sequential** for review and validate, encoded as
 
 ### 8. Coordinator self-execution (Revision 2026-08-13)
 
+> **Amendment (2026-09-27) — trigger 1 replaced by [ADR-74](./ADR-74-delegation-doctrine-and-ladder-hold.md).**
+> Read §8 below together with ADR-74; ADR-74 amends this section and supersedes
+> nothing else in it. **What changed:** trigger 1's *stage absence* condition is
+> replaced by **roster exhaustion** — the lawful cases are now an empty roster,
+> a roster that is disabled/unavailable, or a delegation that was attempted and
+> failed. A non-empty roster that is not staffed for the stage at hand is **not**
+> an exhaustion case: the Coordinator must delegate to whoever is registered.
+> Gating on *which* stages are staffed would have constrained operator-chosen
+> rosters, which this document explicitly does not require. Delegation is now the
+> default action rather than one option among several, and the blanket
+> self-execution license previously granted by the dispatch prompt is deleted.
+> **What did not change:** everything else in §8 — the shared
+> `ToolExecutor`/policy/`VirtualFs` path, the guardrails, the
+> `provider: "coordinator-self-execute"` sentinel, `self_execute_attempted`,
+> and the reserved `coordinator` id (which is never registered from config, so it
+> never appears in the roster the guard inspects). ADR-74 also **reverses** the
+> ADR-45-era rule that a hard-failed subtask is never reassigned to a same-stage
+> peer: that peer is now the preferred takeover target on the agent axis
+> (ADR-74 §4).
+
 The Coordinator can perform every lifecycle stage itself. Registration of a
 stage agent is an optimization/delegation choice, never a requirement.
 

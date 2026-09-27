@@ -42,7 +42,22 @@ a note.
 > cap — agents are additive with no hard cap; the re-entry is now the three real
 > sub-items, cited to ADR-60 Revision v1.2 item 4 rather than the `ADR-60:112`
 > IPC-overhead cost note). Verification notes for today are appended below. No
-> renumbering; gaps left intentional.
+> renumbering; gaps left intentionally.
+> **Append 2026-09-27 (delegation doctrine, ADR-74 Accepted):** the doctrine
+> landed in four commits (`5a22405` prompt inversion, `269c344` delegation
+> guard, `eefd45e` ladder hold, `115f85c` agent-axis takeover). **No row is
+> opened, closed, cut, or merged** — nothing this pass implemented was a
+> registered deferral. Two existing lines are annotated **minimally**: Closed #5
+> (route() deletion / routing-carcass removal) to record that ADR-74 is its
+> *prompt-level* counterpart, and open row 18 (coordinator restart/resume) so
+> "the delegation guard is journal-checkpointed" is not mistaken for
+> "cross-process continue is done". Both are one-clause additions; the table is
+> not restructured and nothing is renumbered. Verification notes for today are
+> appended below. ADR-74's own open items (no `can_cover` UI, no example config,
+> the hold being planning-rung-only, and the coordinator dispatch prompt
+> bypassing `PromptBuilder`) live in ADR-74 §Known gaps and are deliberately
+> **not** register rows — none of them is a deferral this register ever
+> recorded.
 
 ## Open register
 
@@ -62,7 +77,7 @@ a note.
 | 15 | ADR-60 Deferred item 4 — multi-level disclosure + real-embedder swap proof + scheduler/subscription generalization at high agent counts — **rescoped 2026-09-26 per owner clarification: "beyond 6 agents" is NOT a 6-agent cap** | ADR-60 Revision **v1.2 item 4** (`:150–151`: "Deferred item 4 (scheduler/subscription generalization beyond 6 agents, real-embedder swap, multi-level disclosure) remains deferred per ADR") — **not** `ADR-60:112`, which is only an IPC-overhead cost note ("acceptable at 3–6 agents; revisited only if profiling demands") and was the wrong cite for this row; ADR-60 `:31`/`:98` (v1 *scale* is 3–6 agents, but the scheduler/subscription model is "expressed with N not hardcoded anywhere"); ADR-58:247 (the same three items deferred) | **Doctrine: agents are ADDITIVE with no hard cap.** No `MAX_AGENTS` — or any total-agent limit — constant exists anywhere in `crates/`; the only agent-count-shaped cap in the gate is the **per-agent** `Semaphore` `WriteGate::max_in_flight_per_agent` (`crates/orchestrator/src/gate.rs:501,678,1084`), so nothing rejects an Nth agent and agents compose without a ceiling. The old "when profiling shows need beyond 6 agents" trigger is therefore **not** a re-entry gate: profiling pressure cannot unblock a cap that does not exist. What is genuinely open is the three sub-items themselves: **(a) multi-level disclosure** — today a *single* level, the `retrieve-memory` shortlist clamped to `DISCLOSURE_MAX_CHUNKS = 10` (`consolidation.rs:80`; `supervisor.rs:2118,2129`, `ADR-60:360`), with topic hierarchy, filter-by-relevance/recency, cross-subscriber backpressure signalling and schedule-driven pushes all behind item 4 (`ADR-60:326–329`); **(b) the real-embedder swap proof** — the swap is *real, not pending*, so this is a smaller residual than the old row implied: `ProviderEmbedder` runs `fastembed` (BAAI/bge-small-en-v1.5) on-device and is the production wiring (`memory/src/embedder.rs:42–110`; `orchestrator/src/runtime_runner.rs:1317`), so the consolidation projection no longer depends on the deterministic `feature-hash` placeholder — only the **fallback dependency** remains (retiring the `fastembed` fallback in favour of a provider-hosted embedding API, and the `EmbedderState::Unavailable` degradation path); **(c) scheduler/subscription generalization at high agent counts** — bounded slices, per-agent cursors and disclosure, characterized at 3–6 agents, not at swarm scale. | L |
 | 16 | Single-project limit (one active project per process) | ROADMAP:216 (explicitly deferred/incomplete); STATUS.md | Multi-project support requires per-project scoping of process-global services | L |
 | 17 | Eval end-to-end benchmark (live runtime over a real benchmark) **+ multi-agent fault-injection containment coverage (former row 21, merged 2026-09-26 as an included sub-part) — both halves landed 2026-09-26** | ROADMAP:241–245 ("a full live end-to-end eval harness over a real benchmark task remains deferred until multi-agent quality and recovery are reliable"); row 21's former source TODO.md:229–235 (injection tests for rate limits, malformed tool calls, missing executables, cancellation races, provider disconnects — the register's old `TODO.md:218–224` cite had drifted onto the *resolved* eval-`#[ignore]` item and is corrected here); ADR-26 recovery boundaries; scenarios at `crates/orchestrator/src/fault_injection.rs:76–92`; live leg at `crates/eval-runner/src/main.rs:430–490` | **Landed in two commits.** `f4bdc4f` added four **crash-window** fault-injection scenarios to the existing in-process (scripted, deterministic) suite, which had 16 prior scenarios but none expressing the durable/child boundary: **C1** specialist child dies mid-dispatch (issued, never settled) → `specialist_child_dies_mid_dispatch_audits_then_recovers`; **C2** provider disconnect at the settle boundary (after a dispatch settled, before the next decision) → `provider_disconnect_at_the_settle_boundary_preserves_settled_work`; **C3** restart from a durable checkpoint row persisted through a **real** session store, continuing the pending dispatch **exactly once** → `restart_with_preserved_checkpoint_continues_the_pending_dispatch`; **C4** cancellation racing a settle, which **re-pends rather than accepts** → `cancellation_racing_a_settle_re_pends_not_accepts`. `5daf2e7` added the live-runtime benchmark leg, gated **twice** so it never runs in CI (the `#[ignore]` attribute *and* a runtime env check): `CONCERTO_LIVE_PROXY` + `CONCERTO_LIVE_PROXY_KEY` are both required and it skips cleanly when unset; `CONCERTO_LIVE_PROXY_MODEL` is optional (default `gpt-4o-mini`) and `CONCERTO_LIVE_EVAL_SUITE` is an optional suite-dir override; run with `cargo test -p concerto-eval-runner live_runtime_benchmark_leg -- --ignored --nocapture`. **Row STAYS OPEN** — what remains is coverage *breadth*, not the mechanism, and the old ROADMAP trigger is now only half-met: the live leg drives **one** suite against **one** live endpoint, so broad live-provider / multi-model coverage is still unproven, and there is **no quarantine mechanism** for live flakiness (a red live run is indistinguishable from a real regression). **Re-entry: widen the live leg beyond a single suite/model, and land a flake-quarantine story for it.** Size stays **L** — both shipped halves were the cheap, narrow half of the original ask. | L |
-| 18 | Coordinator restart/resume end-to-end (cross-process continue) | TODO.md:18–25 (Partial; e2e remains); ADR-34 D2 | After checkpoint persistence + evidence-spine resume e2e | L |
+| 18 | Coordinator restart/resume end-to-end (cross-process continue) — **annotated 2026-09-27, still OPEN and unchanged** | TODO.md:18–25 (Partial; e2e remains); ADR-34 D2 | After checkpoint persistence + evidence-spine resume e2e. **Not advanced by ADR-74:** the delegation guard's "has this run delegated?" test reads the *checkpointed* decision journal (`DecisionKind::DispatchSpecialist` entries) and the agent-axis takeover guard is checkpointed too (`GraphCheckpoint.specialist_takeover_attempted`, `#[serde(default)]`), so both guarantees survive a restore — but that is per-run state restoration, not the cross-process continue this row tracks, which still needs the e2e evidence named in its source cell. | L |
 | 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | **GATED DOCTRINE 2026-09-25** — stays OPEN, but gated on ADR-47's own reopen condition (:78–93): reopen **only** when a consumer proposes/needs richer message content the flat shape cannot express (multi-part tool bodies, image/file `File` parts, structured `Thinking`/`RedactedThinking` on Anthropic/Gemini paths, or structured data smuggled into `content: String`). Migration preconditions recorded 2026-09-25 — all three required before any parts work: **(a)** a named consumer need (ADR-47:80–81); **(b)** a parts-joined-text equivalence test — joining `parts` back to flat text must reproduce today's bytes, and Fix 2 strictness must not loosen (proxy-tool-call-fix.md:5,60 — content-embedded strict path buffers content to turn end); **(c)** a checkpoint/`state_json` migration plan for old rows (`orchestration_checkpoints.state_json` is `TEXT NOT NULL`, migration 019:10; `crates/sessions/src/lib.rs:150`), shipped additively with `serde(default)` + legacy-column fallback in one dedicated window, never as a side effect of an unrelated feature (ADR-47:62–65,109–110; ARCHITECTURE-V2.md §10). Verified migration-safe meanwhile: the Mimo/loose-tier tool mods operate on `ToolDefinition`/`ToolCall` **values**, not message shape — `schema_loose.rs:113` `adapt_tool_definitions(&mut [ToolDefinition])`, `:132` `unflatten_tool_arguments(&mut serde_json::Value)`, `google.rs:55` `adapt_tools_for` mutates `request.tools` — so they neither block nor depend on a parts migration. | L |
 | 23 | ADR-53 per-token streaming through WASM (heartbeat landed) | ADR-53:137–139 (streaming through WASM deferred; heartbeat keepalive landed per ADR-53/57) | Verify streaming scope remains deferred | M |
 | 24 | Shell Phases C–F + slices 1–3 (explain/debug/optimize, workflow AST, tool ABI, measured self-improvement) | TODO.md:114–135; ADR-29; ROADMAP | When Phases C–F are scheduled from the roadmap | L |
@@ -93,7 +108,7 @@ a note.
 2. Weighted-sum hybrid ranking — superseded by RRF (ADR-22; ADR-63:7–10).
 3. WRR (weighted round-robin) fairness — superseded by structural per-agent in-flight isolation (ADR-60 §D1/D2 note).
 4. Shell argv/cwd containment (ADR-55) — landed (`crates/tools/src/containment.rs`; `shell.rs:4,668`; STATUS.md:72 asserts 21d4d3e landing).
-5. route() deletion / routing carcass — landed (commit `cbb09b0`; ADR-71:19–22; TODO.md:163–166).
+5. route() deletion / routing carcass — landed (commit `cbb09b0`; ADR-71:19–22; TODO.md:163–166). **Annotated 2026-09-27, unchanged and still closed:** ADR-74 (`5a22405`/`269c344`) is the *prompt-level* counterpart of this line, not a reversal of it — that commit deleted the deterministic keyword router in code, this one deleted the hardcoded role→capability reasoning and the "you are a full agent" self-execution license from the coordinator's dispatch prompt, leaving the runtime roster as the only source of who can be called. Nothing in ADR-74 consults `route()` or reintroduces routing as control flow, and `crates/core/src/intent.rs` is untouched by all four delegation-doctrine commits.
 6. ReviewResume module removal — landed (CHANGELOG:33–34; commit `cbb09b0`).
 7. Threat sanitizer + hash pinning (threat gaps #2, #8) — closed (security-threat-model.md, 2026-09-19 / 2026-09-24).
 8. Proxy tool-call parsing Fixes 1–3 — landed (ROADMAP:168; missing-providers.md:51; flat/content-embedded legacy residual tracked in TODO.md:190–195).
@@ -355,3 +370,98 @@ ADR, not against a commit message alone. No builds were run for this pass.
     had drifted. The four scenarios landed in `f4bdc4f`.
   - `ROADMAP.md:241–245` still describes the live end-to-end eval harness as
     fully deferred; `5daf2e7` shipped a first env-gated leg.
+
+## Verification notes (2026-09-27, delegation-doctrine pass)
+
+The delegation doctrine, executed 2026-09-27 against HEAD `115f85c` on
+`fix/coordinator-error-invariant`. All four commits are reachable from this
+checkout; every claim below was checked in the tree, not read off a commit
+message. Recorded in full in
+`docs/adrs/ADR-74-delegation-doctrine-and-ladder-hold.md` (Status: Accepted —
+implemented). **Docs only in this pass — no source edits, no builds, no test
+runs, no commit**; the tree is left for the orchestrator to commit.
+
+- **Scope of this pass: zero row-status changes.** Four implementation commits
+  landed, and **not one of them implemented a registered deferral** — the
+  register has no delegation, coordinator-supremacy, roster-customization, or
+  provider-ladder-hold row to close. So nothing is opened, closed, cut, or
+  merged here, the Closed appendix is unchanged, and no row is renumbered. The
+  two annotations below are deliberately one-clause each, added so the register
+  cannot be misread against ADR-74.
+- **Closed #5 annotated, still closed.** `route()` deletion / routing-carcass
+  removal is the *code-level* half of what ADR-74 does at the *prompt level*.
+  Verified in the tree: no `fn route(` definition exists anywhere under
+  `crates/` — the remaining `route(` hits are axum `Router::route` HTTP route
+  registrations in `api-server`/`observability` plus benchmark fixtures, and the
+  sole reference to the deleted function is one historical mention in the
+  `crates/core/src/intent.rs:6` module doc (a source comment, out of scope for a
+  docs-only pass). `crates/core/src/intent.rs` keeps only the vocabulary types
+  per ADR-71's reconciliation note, and all four delegation-doctrine commits
+  leave it untouched — `git show --stat` for `5a22405`/`269c344` lists only
+  `crates/orchestrator/src/coordinator.rs` and `crates/core/src/event.rs`. The
+  prompt-side change is the deletion of the "you are a full agent" license and
+  the addition of the "Selecting a specialist" section, whose own text says the
+  roster "is data, this prompt hardcodes no roles". Recorded so a future reader
+  does not mistake ADR-74 for routing logic returning by another name.
+- **Row 18 annotated, still OPEN at L.** The delegation guard derives
+  "has this run delegated?" from the decision journal rather than a live counter
+  (`has_recorded_delegation_attempt` scans `self.decision_journal.entries()` for
+  `DecisionKind::DispatchSpecialist`, `coordinator.rs:2871`), and the agent-axis
+  takeover guard rides in the checkpoint (`GraphCheckpoint.specialist_takeover_attempted`,
+  `#[serde(default)]` so an old checkpoint restores empty rather than failing to
+  load). Both therefore survive a resume — but that is per-run state
+  restoration, **not** the cross-process continue this row tracks, whose
+  re-entry condition (checkpoint persistence + evidence-spine resume e2e) is
+  untouched by any of the four commits. Annotated so the two are not conflated.
+- **The doctrine itself, as recorded.** (a) Delegation is the coordinator
+  default and the blanket self-execution license is deleted; self-execution is
+  permitted only on roster exhaustion (empty / disabled-or-unavailable /
+  delegation-attempted-and-failed), and the exhaustion condition replaces ADR-35
+  §8's *stage-absence* trigger — the guard asks only whether the roster is empty
+  and never inspects which stage is staffed, so operator-chosen rosters stay
+  fully customizable. (b) The guard refuses a coordinator mutating tool call
+  (`write`/`shell`/`git`, and `filesystem` `write`/`delete`/`move`/`copy`; read-
+  only calls untouched) with the named, policy-visible verdict
+  `"Denied: delegation-required"` and a structured `delegation_required` result
+  back to the model; lawful self-execution records
+  `EventKind::CoordinatorSelfImplementing { .. reason }` with
+  `roster-empty-or-disabled` or `delegation-attempted`, and a *refused* attempt
+  records no such event. (c) The agent axis runs **before** the
+  provider-escalation tiers, and coverage is configuration data —
+  `CustomAgentConfig.can_cover: Vec<AgentStage>`, `#[serde(default)]`, effective
+  coverage = own stage ∪ `can_cover`, a same-stage peer preferred, non-covering
+  agents never selected. It **reverses** ADR-45's "never reassign a same-stage
+  peer" invariant: `ladder_hard_failure_takes_over_to_same_stage_peer` replaced
+  `ladder_hard_failure_never_reassigns_stages`, so the reversal is visible in
+  the diff rather than smuggled. (d) A throttled planning rung with a known
+  `Retry-After` is **held** and retried on the same provider — `MAX_PLANNING_HOLD`
+  30 s, `MAX_PLANNING_HOLDS` 2, `MAX_PLANNING_RECOVERY_ROUNDS` 3 replacing the
+  once-per-run latch, plus a re-entrancy guard — and the fallback, when it runs,
+  is a **bridge**, not a demotion; auth / 404 / malformed-request /
+  capability-refusal classes are not held. `can_cover` is additive:
+  `SCHEMA_VERSION` stays `8`, and the desktop Studio round-trips it so a save
+  cannot drop it (no UI editor yet).
+- **Follow-ups flagged, not actioned here** (each is ADR-74 §Known gaps or
+  belongs to a row outside this pass's scope; none is a register row today):
+  - **The coordinator's dispatch prompt is not on the `PromptBuilder` path.**
+    Verified: `render_dispatch_system_prompt` builds a plain `String` that is
+    sent as a single `Message { role: Role::User, content: system_prompt }`
+    (`coordinator.rs:10680`), so it uses none of
+    `SYSTEM_PROMPT_BUILD`/`_CHAT`/`_PLAN`, has no `{working_memory}`
+    placeholder, and gets no stable-head treatment —
+    `with_cache_stable_prefix` is consumed only in `runtime_runner.rs` for the
+    single-agent loop. **The working-memory delivery in `251d457` and the
+    stable-head prefix discipline in `32d6809` therefore do not reach the
+    coordinator.** Recorded as a known gap in ADR-74 and deliberately *not*
+    fixed here: routing that prompt through `PromptBuilder` is a behavioural
+    change to the hot dispatch path and deserves its own decision.
+  - **This register's own pass note (2026-09-24) has a formatting defect at the
+    `— manual` orphan fragment** (flagged by the 2026-09-26 group-F pass as worth
+    a one-line repair). Still unrepaired; left alone to keep this diff scoped.
+  - **Carried forward, still unreconciled:** `docs/security-threat-model.md` §6
+    gaps #1, #5 and #6 are still worded as fully open (rows 36, 44, 45);
+    `docs/TODO.md:229–235` still says the fault-injection item is "Not started"
+    (landed in `f4bdc4f`); `ROADMAP.md:241–245` still describes the live
+    end-to-end eval harness as fully deferred (`5daf2e7` shipped a first
+    env-gated leg). All three were flagged by the 2026-09-26 pass and none is
+    a delegation-doctrine item, so none is touched now.

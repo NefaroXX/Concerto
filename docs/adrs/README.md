@@ -63,7 +63,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [32](./ADR-32.md) | Explicit provider failures and safe interactive policy defaults | 2026-07-20 | Accepted | Visible, typed provider errors; conservative default approval prompts. |
 | [33](./ADR-33.md) | Shared frontend project and runtime context | 2026-07-23 | Accepted | Common project/session context across desktop and CLI frontends. |
 | [34](./ADR-34.md) | Durable orchestration runtime | 2026-07-27 | Accepted | Persisted runs and checkpoints for multi-agent orchestration. |
-| [35](./ADR-35.md) | Tag-driven agent orchestration with Coordinator-first architecture | 2026-08-01 (rev. 2026-08-13) | Accepted (revised in place) | `AgentStage` tags drive coordinator algorithms; open-vocabulary custom agents. |
+| [35](./ADR-35.md) | Tag-driven agent orchestration with Coordinator-first architecture | 2026-08-01 (rev. 2026-08-13) | Accepted (revised in place) — §8 self-execution exhaustion condition amended by [ADR-74](./ADR-74-delegation-doctrine-and-ladder-hold.md) | `AgentStage` tags drive coordinator algorithms; open-vocabulary custom agents. |
 | [36](./ADR-36.md) | Durable typed session transcript | 2026-08-01 | Accepted — complete | Typed, replayable transcript entries persisted in SQLite. |
 | [37](./ADR-37.md) | Plugin Capability Grant Lifecycle — TTL, Hash Pinning, Revocation | 2026-07-26 | Accepted (renumbered 2026-08-02) | Time-bounded, pinned, revocable capability grants instead of indefinite approvals. |
 | [38](./ADR-38.md) | Async WASM Host Functions | 2026-08-02 | Accepted — implemented | wasmtime `async_support` for plugin host calls. |
@@ -100,6 +100,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [70](./ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | 2026-09-20 | Accepted | Global + per-project AGENTS.md injected into every prompt path (skills → AGENTS → environment card); project-over-global, bounded/truncated, fail-soft, opt-in, coordinator maintenance nudge (text only). |
 | [71](./ADR-71-coordinator-supremacy.md) | Coordinator Supremacy — the coordinator is the sole master of a run | 2026-09-24 | Accepted | Coordinator sole master: instructions run until done / intervention / coordinator error; all agent errors to coordinator; four-class terminal taxonomy (Coordinator decision / intervention / Coordinator error / immutable safety terminals); hardcoded cycle terminals → coordinator-owned guards; planner + registry advisory-only; no intent topology branching; compiled schedulers revoked except the resolver-as-reuse-oracle; scoped partial supersession of ADR-19/55/58/64/65. |
 | [73](./ADR-73-audit-encryption-and-retention.md) | Audit-Log Encryption at Rest and Bounded Retention | 2026-09-26 | Accepted — implemented (`7351128`) | `sessions.db` (including the append-only `audit_log`) encrypted with SQLCipher, opted in and fail-closed; aged rows archived into a keyed archive and then deleted, verified before delete, configured via `[audit]`; answers ADR-40 §Decision item 3. |
+| [74](./ADR-74-delegation-doctrine-and-ladder-hold.md) | Delegation Doctrine — delegate by default, hold a rung before demoting it | 2026-09-27 | Accepted — implemented (`5a22405`/`269c344`/`eefd45e`/`115f85c`) | Delegation is the coordinator default; self-execution only on roster exhaustion, enforced by a named `delegation-required` policy refusal with a `CoordinatorSelfImplementing` record; `can_cover` makes agent coverage config data and puts the agent axis before provider escalation; a throttled planning rung is **held** (30 s × 2, 3 recovery rounds) and retried, with the fallback as a **bridge**, not a demotion. Refines ADR-71, ADR-42/45, ADR-58; amends ADR-35 §8's exhaustion condition. |
 
 > **Partial supersession note (2026-09-24):**
 > [ADR-71](./ADR-71-coordinator-supremacy.md) makes **scoped partial
@@ -116,6 +117,27 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 > clauses — append-only, detach-don't-delete, migration rebuild — remain in
 > force and ADR-40 is **not** archived. The distinction item 3 drew is kept:
 > retention is a time-based policy, not a session-lifecycle one.
+
+> **Refinement note (2026-09-27):**
+> [ADR-74](./ADR-74-delegation-doctrine-and-ladder-hold.md) **refines
+> [ADR-71](./ADR-71-coordinator-supremacy.md) and does not contradict it.**
+> Supremacy settled *who* decides a run (the Coordinator, alone); ADR-74
+> settles *what the Coordinator may decide with* — delegation is the default,
+> self-execution is an enumerated roster-exhaustion case, and the agent axis is
+> consulted before provider escalation. Every mechanism it adds is still a
+> Coordinator decision: a prompt doctrine the Coordinator follows, a
+> policy refusal the Coordinator can only resolve by dispatching, and
+> Coordinator-owned recovery that holds or bridges. It adds no compiled
+> authority that selects an agent, orders work, or ends a run — the exact thing
+> ADR-71 §3 revoked. It also **amends ADR-35 §8** on one point only: the
+> self-execution trigger is now roster exhaustion (empty / disabled-unavailable /
+> delegation-attempted-and-failed) rather than *stage absence*, because gating on
+> which stage is staffed would constrain operator-chosen rosters. ADR-35 §8's
+> shared-executor guardrails, the `coordinator-self-execute` sentinel, and the
+> reserved `coordinator` id are unchanged. ADR-42/ADR-45 are refined, not
+> superseded — and one ADR-45-era invariant is deliberately **reversed**: the
+> ladder no longer refuses to reassign a hard-failed subtask to a same-stage
+> peer; that peer is now the preferred takeover target.
 
 ## Archived ADRs ([`archive/`](./archive/))
 
