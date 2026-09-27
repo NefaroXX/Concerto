@@ -1191,6 +1191,169 @@ mod tests {
         assert_eq!(copy.data["content"], "copy me");
     }
 
+    // -----------------------------------------------------------------------
+    // Reproduction — an existing in-root file that was never staged in the
+    // overlay must still move/copy (ADR-62 §4: reads resolve through the
+    // overlay onto disk). Observed on Windows: a file created on disk before
+    // the session made `move` return "file not found" in 0-1 ms — an early
+    // bail from the overlay-only source lookup, not a filesystem check.
+    // -----------------------------------------------------------------------
+
+    /// The reproducer: the file exists on disk but was never read or written
+    /// through the tool's `VirtualFs`, so it has no overlay entry. Before the
+    /// fix the move failed with "file not found"; after it must succeed and
+    /// rename on disk.
+    #[tokio::test]
+    async fn move_finds_existing_disk_file_absent_from_overlay() {
+        let (tool, dir) = tool_and_dir();
+        // Created on disk directly — exactly the "created on disk in the
+        // project dir" precondition (the overlay never saw it).
+        std::fs::write(dir.path().join("file_test.txt"), "").unwrap();
+        assert!(dir.path().join("file_test.txt").exists());
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "move",
+                    "path": "file_test.txt",
+                    "destination": "file_test_pass.txt"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an existing in-root file must be movable even when absent from the overlay");
+        assert!(output.summary.contains("Moved"), "unexpected summary: {}", output.summary);
+        assert!(!dir.path().join("file_test.txt").exists(), "source must be gone after move");
+        assert!(dir.path().join("file_test_pass.txt").exists(), "destination must exist");
+    }
+
+    /// The `list` and `exists` operations already fall through to disk; prove
+    /// the directory is enumerable while the file is present, matching the
+    /// Windows evidence (`list .` succeeded seconds before `move` failed).
+    #[tokio::test]
+    async fn disk_file_is_listable_and_existing_before_move() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("file_test.txt"), "").unwrap();
+        let session = session_for(dir.path());
+
+        let listed = tool
+            .execute(
+                serde_json::json!({"operation": "list", "path": "."}),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("listing the workspace root must succeed");
+        assert!(
+            listed.data["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|e| e["name"] == "file_test.txt")),
+            "the on-disk file must be listed: {}",
+            listed.data
+        );
+
+        let exists = tool
+            .execute(
+                serde_json::json!({"operation": "exists", "path": "file_test.txt"}),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exists must succeed");
+        assert!(exists.data["exists"].as_bool().unwrap(), "the on-disk file must exist");
+    }
+
+    /// Fail-closed: when the source is genuinely absent (overlay and disk),
+    /// the move still reports "file not found".
+    #[tokio::test]
+    async fn move_missing_source_still_reports_not_found() {
+        let (tool, dir) = tool_and_dir();
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "move",
+                    "path": "ghost.txt",
+                    "destination": "ghost_pass.txt"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a missing source must not move");
+        assert!(
+            error.to_string().contains("file not found"),
+            "expected a not-found error, got: {error}"
+        );
+        assert!(!dir.path().join("ghost_pass.txt").exists(), "no destination may be created");
+    }
+
+    /// A staged deletion must not be resurrected from disk by the move fix.
+    #[tokio::test]
+    async fn move_does_not_resurrect_staged_deletion() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("doomed.txt"), "bye").unwrap();
+        let session = session_for(dir.path());
+
+        // Stage a delete (this loads the disk file as Original then marks it
+        // Deleted in the overlay).
+        tool.execute(
+            serde_json::json!({"operation": "delete", "path": "doomed.txt"}),
+            &test_policy(),
+            &session,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("delete of an on-disk file must succeed");
+
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "move",
+                    "path": "doomed.txt",
+                    "destination": "survivor.txt"
+                }),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a staged deletion must not be moved");
+        assert!(
+            error.to_string().contains("deleted"),
+            "expected a deleted-source error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_finds_existing_disk_file_absent_from_overlay() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("file_test.txt"), "contents").unwrap();
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "copy",
+                    "path": "file_test.txt",
+                    "destination": "file_test_copy.txt"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an existing in-root file must be copyable even when absent from the overlay");
+        assert!(output.summary.contains("Copied"), "unexpected summary: {}", output.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file_test_copy.txt")).unwrap(),
+            "contents"
+        );
+    }
+
     #[tokio::test]
     async fn write_rejects_empty_content() {
         let (tool, dir) = tool_and_dir();

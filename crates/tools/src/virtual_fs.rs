@@ -988,6 +988,51 @@ mod tests {
         assert_eq!(fs.read(Utf8Path::new("b.txt")).unwrap(), "hello");
     }
 
+    // -----------------------------------------------------------------------
+    // Repro — move/copy of an on-disk source that was never staged in the
+    // overlay. Reproduces the Windows "file not found" bail: `read` consults
+    // only the overlay, so it never touches the filesystem.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn move_file_loads_unstaged_disk_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("a.txt"), "from disk").unwrap();
+
+        let mut fs = VirtualFs::new();
+        fs.move_file(&root.join("a.txt"), &root.join("b.txt"))
+            .expect("an on-disk source absent from the overlay must move");
+
+        assert_eq!(fs.read(&root.join("b.txt")).unwrap(), "from disk");
+        assert!(matches!(fs.get(&root.join("a.txt")), Some(VirtualFsEntry::Deleted { .. })));
+    }
+
+    #[test]
+    fn copy_file_loads_unstaged_disk_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("a.txt"), "from disk").unwrap();
+
+        let mut fs = VirtualFs::new();
+        fs.copy_file(&root.join("a.txt"), &root.join("b.txt"))
+            .expect("an on-disk source absent from the overlay must copy");
+
+        assert_eq!(fs.read(&root.join("b.txt")).unwrap(), "from disk");
+        assert_eq!(fs.read(&root.join("a.txt")).unwrap(), "from disk");
+    }
+
+    #[test]
+    fn move_file_missing_source_reports_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut fs = VirtualFs::new();
+        let error = fs
+            .move_file(&root.join("ghost.txt"), &root.join("ghost2.txt"))
+            .expect_err("a missing source must not move");
+        assert!(error.to_string().contains("file not found"), "got: {error}");
+    }
+
     #[test]
     fn virtual_fs_snapshot_restore() {
         let mut fs = VirtualFs::new();
