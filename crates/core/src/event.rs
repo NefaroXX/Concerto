@@ -695,6 +695,23 @@ pub enum EventKind {
         /// Human-readable reason; `None` when the outcome needs none.
         reason: Option<String>,
     },
+    /// The Coordinator executed a MUTATING tool of its own instead of
+    /// delegating.
+    ///
+    /// Recorded only when self-execution is lawful: the roster is empty (or
+    /// disabled), or a delegation attempt was already recorded. The `reason`
+    /// names which exhaustion case permitted it, so coordinator self-work is
+    /// no longer indistinguishable from a delegated dispatch. Read-only
+    /// coordinator actions publish nothing here.
+    CoordinatorSelfImplementing {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The coordinator's own tool that ran (e.g. `write`, `shell`, `git`).
+        tool_name: String,
+        /// Why self-execution was permitted: `roster-empty-or-disabled` or
+        /// `delegation-attempted`.
+        reason: String,
+    },
 }
 
 /// The intent-routing payload of an intent [`EventKind::RoutingDecided`]

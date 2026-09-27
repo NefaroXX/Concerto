@@ -2595,6 +2595,23 @@ fn tool_executor_offers(executor: Option<&ToolExecutor>, tool_name: &str) -> boo
         executor.tool_definitions().iter().any(|definition| definition.name == tool_name)
     })
 }
+
+/// The precise set of the Coordinator's own tool calls that MUTATE the
+/// workspace, derived from the executor's registered tool names: the `write`
+/// alias, `shell`, and `git`, plus the `filesystem` tool's destructive
+/// operations (`write`/`delete`/`move`/`copy`). Read-only calls (`filesystem`
+/// `read`/`list`/`exists`, LSP, consult, etc.) are never classified here, so
+/// they stay unrestricted.
+fn is_mutating_self_execution_tool(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    match tool_name {
+        "write" | "shell" | "git" => true,
+        "filesystem" => matches!(
+            arguments.get("operation").and_then(serde_json::Value::as_str),
+            Some("write" | "delete" | "move" | "copy")
+        ),
+        _ => false,
+    }
+}
 /// Resolve each registered agent to the stage kind it staffs, for building the
 /// engine-default collaboration topology (ADR-58 D2/ADR-35).
 ///
@@ -2814,6 +2831,80 @@ impl CoordinatorAgent {
     /// evidence, and `project_root` bounds artifact canonicalization.
     fn decision_roster(&self) -> HashSet<String> {
         self.registry.ids().into_iter().map(|id| id.as_str().to_owned()).collect()
+    }
+
+    /// Whether this run has RECORDED at least one validated `call_specialist`
+    /// dispatch decision. Read from the checkpointed decision journal, so the
+    /// answer survives a resume. A malformed or validator-rejected call is
+    /// never recorded as a dispatch decision, so it does not count.
+    fn has_recorded_delegation_attempt(&self) -> bool {
+        self.decision_journal
+            .entries()
+            .iter()
+            .any(|entry| entry.kind == crate::decisions::DecisionKind::DispatchSpecialist)
+    }
+
+    /// Delegation-doctrine guard (owner spec): refuse the Coordinator's own
+    /// MUTATING tool call with a named, policy-visible verdict when the run
+    /// has recorded no delegation attempt while the roster is non-empty. A
+    /// roster that is empty (or disabled — disabled agents never register)
+    /// permits self-execution and records `CoordinatorSelfImplementing` with
+    /// the reason, so self-work is never again indistinguishable from
+    /// delegation. The roster's SHAPE is never inspected: staffing a
+    /// particular stage is the user's business, never a gate here.
+    ///
+    /// Returns `Some(refusal_json)` when the call must be refused, `None`
+    /// when it may proceed.
+    fn guard_self_execution(
+        &self,
+        session_id: Ulid,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        if !is_mutating_self_execution_tool(tool_name, arguments) {
+            return None;
+        }
+        let roster_empty = self.registry.ids().is_empty();
+        if roster_empty {
+            self.publish_self_implementing(session_id, tool_name, "roster-empty-or-disabled");
+            return None;
+        }
+        if self.has_recorded_delegation_attempt() {
+            self.publish_self_implementing(session_id, tool_name, "delegation-attempted");
+            return None;
+        }
+        // Roster is non-empty and no delegation was recorded: refuse, so the
+        // Coordinator must dispatch instead of quietly doing the work itself.
+        let verdict = "Denied: delegation-required".to_owned();
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::PolicyVerdict { tool_name: tool_name.to_owned(), verdict: verdict.clone() },
+        );
+        Some(serde_json::json!({
+            "error": "delegation_required",
+            "verdict": verdict,
+            "message": format!(
+                "the Coordinator may not run its own mutating tool '{tool_name}' while a \
+                 non-empty specialist roster is registered and no delegation has been \
+                 attempted; dispatch work with call_specialist first, or delegate to \
+                 another registered specialist that can cover the work"
+            ),
+        }))
+    }
+
+    /// Publish the self-execution record (never fails the run).
+    fn publish_self_implementing(&self, session_id: Ulid, tool_name: &str, reason: &str) {
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::CoordinatorSelfImplementing {
+                run_id: self.run_id.clone(),
+                session_id,
+                tool_name: tool_name.to_owned(),
+                reason: reason.to_owned(),
+            },
+        );
     }
 
     /// The decision time's advisory the coordinator's decision machinery
@@ -14257,6 +14348,14 @@ impl CoordinatorAgent {
         arguments: &serde_json::Value,
         tool_name: &str,
     ) -> serde_json::Value {
+        // Delegation-doctrine guard: the Coordinator's own MUTATING tools are
+        // refused while a non-empty roster has seen no delegation attempt.
+        // Read-only calls pass straight through.
+        if let Some(refusal) =
+            self.guard_self_execution(base_ctx.session.session_id, tool_name, arguments)
+        {
+            return refusal;
+        }
         let Some(executor) = self.tool_executor.clone() else {
             return serde_json::json!({
                 "error": "no_executor",
@@ -15933,7 +16032,7 @@ mod tests {
     #[async_trait::async_trait]
     impl concerto_core::traits::tool::Tool for TestWriteTool {
         fn name(&self) -> &str {
-            "test_write_file"
+            "write"
         }
         fn description(&self) -> &str {
             "writes a file into the project"
@@ -15982,11 +16081,12 @@ mod tests {
         Arc::new(ToolExecutor::new(Arc::new(registry), policy))
     }
 
-    /// A `test_write_file` tool call for the coordinator's own toolset.
+    /// A mutating `write` tool call for the coordinator's own toolset (the
+    /// real tool name, so the delegation guard recognizes it).
     fn test_write_tool_call(path: &str) -> ToolCall {
         ToolCall {
             id: format!("write-{path}"),
-            name: "test_write_file".to_string(),
+            name: "write".to_string(),
             arguments: serde_json::json!({ "path": path, "content": "// generated" }),
 
             ..Default::default()
@@ -17831,24 +17931,20 @@ mod tests {
         );
     }
 
-    /// ADR-35 §8 (stage absence) under the amended contract: with NO
-    /// implement-stage agent registered and the shared executor attached,
-    /// the Coordinator does the work itself — the decision loop offers the
-    /// executor's tools and the coordinator's own tool call performs the
-    /// write through the SAME policy engine, VirtualFs, and gates the
-    /// specialists use.
+    /// Delegation doctrine (COMMIT 2, allow branch): with an EMPTY roster
+    /// (none registered, or all disabled — disabled agents never register)
+    /// and the shared executor attached, the Coordinator does the work itself
+    /// — the decision loop offers the executor's tools and the coordinator's
+    /// own tool call performs the write through the SAME policy engine,
+    /// VirtualFs, and gates the specialists use. The lawful self-execution is
+    /// recorded via `CoordinatorSelfImplementing` with the reason.
     #[tokio::test]
-    async fn coordinator_self_executes_when_no_implement_agent_is_registered() {
+    async fn coordinator_self_executes_when_roster_is_empty() {
         let bus = EventBus::new(256);
-        // Deliberately NO implement-stage agent: the coordinator carries the
-        // work itself through its own executor tool.
-        let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
-        ];
+        // Deliberately EMPTY roster: self-execution is the exhaustion case.
         let mut coordinator = coordinator_with_turns(
             bus.clone(),
-            Arc::new(AgentRegistry::from_mocks(mocks)),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
             vec![
                 CoordinatorTurn::Calls(vec![test_write_tool_call("src/hand.rs")]),
                 CoordinatorTurn::Text("implemented by the coordinator self".into()),
@@ -17856,7 +17952,7 @@ mod tests {
         );
         coordinator = coordinator.with_executor(self_execute_executor());
         let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
-        let (output, _events) =
+        let (output, events) =
             run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
 
         assert_eq!(
@@ -17872,6 +17968,141 @@ mod tests {
             output.files_modified.iter().any(|path| path.as_str().ends_with("src/hand.rs")),
             "expected the coordinator's own tool write in files_modified: {:?}",
             output.files_modified
+        );
+        // Self-execution is no longer indistinguishable from delegation.
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::CoordinatorSelfImplementing { reason, .. }
+                    if reason == "roster-empty-or-disabled"
+            )),
+            "lawful self-execution records the exhaustion reason"
+        );
+    }
+
+    /// Delegation doctrine (COMMIT 2, refuse branch): while a non-empty
+    /// roster is registered and no delegation has been attempted, the
+    /// Coordinator's own MUTATING tool call is refused with a NAMED,
+    /// policy-visible verdict, the model reads back a `delegation_required`
+    /// error, and nothing is written.
+    #[tokio::test]
+    async fn coordinator_mutating_self_execution_is_refused_before_any_delegation() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![test_write_tool_call("src/nope.rs")]),
+                CoordinatorTurn::Text("finished".into()),
+            ],
+        );
+        let coordinator = coordinator.with_executor(self_execute_executor());
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
+
+        assert!(
+            !output.files_modified.iter().any(|path| path.as_str().ends_with("src/nope.rs")),
+            "the refused write must not land: {:?}",
+            output.files_modified
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the refusal is a named, policy-visible verdict: {events:?}"
+        );
+        let tool_results = provider.tool_result_contents();
+        assert!(
+            tool_results.iter().any(|result| {
+                result.get("error").and_then(serde_json::Value::as_str)
+                    == Some("delegation_required")
+            }),
+            "the model reads back a named delegation_required refusal: {tool_results:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|kind| matches!(kind, EventKind::CoordinatorSelfImplementing { .. })),
+            "a refused self-execution is not recorded as self-implementing"
+        );
+    }
+
+    /// The mutating classification is precise: read-only calls stay
+    /// unrestricted under the guard.
+    #[test]
+    fn mutating_self_execution_classification_is_precise() {
+        for name in ["write", "shell", "git"] {
+            assert!(
+                is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} mutates"
+            );
+        }
+        for operation in ["write", "delete", "move", "copy"] {
+            assert!(
+                is_mutating_self_execution_tool(
+                    "filesystem",
+                    &serde_json::json!({ "operation": operation })
+                ),
+                "filesystem {operation} mutates"
+            );
+        }
+        for operation in ["read", "list", "exists"] {
+            assert!(
+                !is_mutating_self_execution_tool(
+                    "filesystem",
+                    &serde_json::json!({ "operation": operation })
+                ),
+                "filesystem {operation} is read-only"
+            );
+        }
+        assert!(!is_mutating_self_execution_tool("consult_specialist", &serde_json::json!({})));
+        assert!(!is_mutating_self_execution_tool("call_specialist", &serde_json::json!({})));
+    }
+
+    /// Delegation is NEVER gated on which stage is staffed: a roster with a
+    /// single STAGE-LESS custom agent still accepts a `call_specialist`
+    /// dispatch to it (no implement-stage agent exists anywhere).
+    #[tokio::test]
+    async fn delegation_is_never_gated_on_stage_staffing() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("misc"),
+            "did the work",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("misc", "do the work")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (_output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "delegation to a stage-less agent is never refused"
+        );
+        let tool_results = provider.tool_result_contents();
+        assert!(
+            tool_results
+                .iter()
+                .any(|result| result.get("outcome").and_then(serde_json::Value::as_str)
+                    == Some("success")),
+            "the stage-less agent actually ran the dispatch: {tool_results:?}"
         );
     }
 
@@ -24854,7 +25085,7 @@ mod tests {
                 &CancellationToken::new(),
                 &mut ledger,
                 &arguments,
-                "test_write_file",
+                "write",
             )
             .await;
 
@@ -24871,7 +25102,7 @@ mod tests {
         // denied (the specialist path is unchanged).
         let denied = executor
             .execute(
-                "test_write_file",
+                "write",
                 serde_json::json!({ "path": "denied.rs", "content": "// nope" }),
                 &concerto_core::types::SessionContext::new(
                     session_id,
@@ -28881,6 +29112,9 @@ mod tests {
             bus.clone(),
             Arc::clone(&registry),
             vec![
+                // Delegation doctrine: a mutating self-write is lawful only
+                // after a delegation attempt, so dispatch first.
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "first pass")]),
                 CoordinatorTurn::Calls(vec![test_write_tool_call("src/main.rs")]),
                 CoordinatorTurn::Calls(vec![call_specialist_with_artifacts(
                     "coder",
@@ -28906,8 +29140,8 @@ mod tests {
 
         let prompts = provider.prompts();
         assert!(
-            prompts.len() >= 3,
-            "two scripted tool turns plus the final text, got {}",
+            prompts.len() >= 4,
+            "three scripted tool turns plus the final text, got {}",
             prompts.len()
         );
         // The advisory rides the call_specialist TOOL RESULT the model reads
