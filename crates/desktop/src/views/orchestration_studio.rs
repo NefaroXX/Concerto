@@ -206,6 +206,10 @@ pub struct AgentConfig {
     pub name: String,
     pub role: String,
     pub stage: Option<AgentStage>,
+    /// Additional stage tags this agent can cover beyond its own `stage`
+    /// (owner doctrine: agent-axis takeover before provider escalation).
+    /// Round-tripped verbatim; edited via config, not this first-pass UI.
+    pub can_cover: Vec<AgentStage>,
     /// Structured submission contract (Freeform = plain text output; the others
     /// tie the agent into the typed `submit_design_doc` / `submit_research_report`
     /// / `submit_review_report` contracts). Preserved across saves.
@@ -652,6 +656,7 @@ fn agent_to_custom(a: &AgentConfig) -> CustomAgentConfig {
         name: a.name.clone(),
         role: a.role.clone(),
         stage: a.stage.clone(),
+        can_cover: a.can_cover.clone(),
         output_mode: a.output_mode,
         prompt_sections: a.prompt_sections.clone(),
         model_override: a.model_override.clone(),
@@ -668,6 +673,7 @@ fn custom_to_agent(c: &CustomAgentConfig) -> AgentConfig {
         name: c.name.clone(),
         role: c.role.clone(),
         stage: c.stage.clone(),
+        can_cover: c.can_cover.clone(),
         output_mode: c.output_mode,
         prompt_sections: c.prompt_sections.clone(),
         model_override: c.model_override.clone(),
@@ -965,6 +971,7 @@ fn default_coordinator_agent() -> AgentConfig {
         name: "Coordinator".into(),
         role: "coordinator".into(),
         stage: None,
+        can_cover: Vec::new(),
         output_mode: OutputMode::Freeform,
         prompt_sections: PromptSections {
             system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
@@ -1000,6 +1007,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Architect".into(),
             role: "architect".into(),
             stage: Some(AgentStage::new(AgentStage::DESIGN)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::DesignDoc,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Software Architect. Produce a high-level design: goals, constraints, proposed files, interface sketch, risks.".into(),
@@ -1018,6 +1026,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Researcher".into(),
             role: "researcher".into(),
             stage: Some(AgentStage::new(AgentStage::RESEARCH)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::ResearchReport,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Researcher. Investigate the codebase and produce factual findings with citations.".into(),
@@ -1036,6 +1045,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Coder".into(),
             role: "coder".into(),
             stage: Some(AgentStage::new(AgentStage::IMPLEMENT)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::Freeform,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Coder. Implement the Architect's changes precisely and safely.".into(),
@@ -1061,6 +1071,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Reviewer".into(),
             role: "reviewer".into(),
             stage: Some(AgentStage::new(AgentStage::REVIEW)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::ReviewReport,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Reviewer. Check the Coder's output against the Architect's requirements and the Researcher's findings.".into(),
@@ -1079,6 +1090,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Validator".into(),
             role: "validator".into(),
             stage: Some(AgentStage::new(AgentStage::VALIDATE)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::Freeform,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Validator. Run the eval engine (build/tests/lint) and report whether acceptance criteria are met — you don't reason about correctness yourself, you report what actually ran.".into(),
@@ -1990,6 +2002,7 @@ impl State {
                             self.new_agent_role.trim().to_string()
                         },
                         stage: None,
+                        can_cover: Vec::new(),
                         output_mode: OutputMode::default(),
                         prompt_sections: PromptSections::default(),
                         model_override: None,

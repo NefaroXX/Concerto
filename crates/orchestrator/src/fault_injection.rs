@@ -1561,6 +1561,7 @@ fn design_doc_config(id: &str) -> concerto_config::CustomAgentConfig {
         name: "Architect".to_owned(),
         role: "architect".to_owned(),
         stage: Some(concerto_core::types::AgentStage::new("design")),
+        can_cover: Vec::new(),
         prompt_sections: concerto_config::PromptSections::default(),
         model_override: None,
         provider_id: None,

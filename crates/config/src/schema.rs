@@ -2175,6 +2175,17 @@ pub struct CustomAgentConfig {
     /// the DAG with full context and no lifecycle behavior.
     #[serde(default)]
     pub stage: Option<AgentStage>,
+    /// Optional ADDITIONAL stage tags this agent can cover beyond its own
+    /// `stage` (e.g. an architect with `can_cover = ["implement"]`).
+    ///
+    /// Empty (the default) means the agent covers ONLY its own `stage`; a
+    /// stage-less agent therefore covers nothing unless it lists tags here.
+    /// Read by the coordinator's agent-axis takeover BEFORE it escalates a
+    /// failed subtask across providers, so an operator can make any agent able
+    /// to cover any stage without touching code (owner doctrine: the roster
+    /// stays completely customizable). Never a hardcoded role→stage table.
+    #[serde(default)]
+    pub can_cover: Vec<AgentStage>,
     #[serde(default)]
     pub prompt_sections: PromptSections,
     #[serde(default)]

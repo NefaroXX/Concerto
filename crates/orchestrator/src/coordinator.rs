@@ -1548,6 +1548,10 @@ pub struct CoordinatorAgent {
     /// ADR-42 §4 tier 2 guard: whether coordinator self-execution has already
     /// been attempted for a task this run (at most once per task).
     self_execute_attempted: HashSet<TaskId>,
+    /// Agent-axis takeover guard (owner doctrine): whether a DIFFERENT
+    /// registered specialist has already been tried for a task this run
+    /// (at most once per task). Runs BEFORE the provider-axis tiers.
+    specialist_takeover_attempted: HashSet<TaskId>,
     /// ADR-45 tier 1b guard: whether a default-model-on-default-provider
     /// re-dispatch has already been attempted for a task this run (at most
     /// once per task).
@@ -2704,6 +2708,7 @@ impl CoordinatorAgent {
             identical_failures: crate::failure_diagnosis::IdenticalFailureTracker::default(),
             default_model_attempted: HashSet::new(),
             self_execute_attempted: HashSet::new(),
+            specialist_takeover_attempted: HashSet::new(),
             default_model_provider_attempted: HashSet::new(),
             default_model_provider: None,
             default_model_profile: None,
@@ -4422,6 +4427,7 @@ impl CoordinatorAgent {
             default_model_attempted: self.default_model_attempted.clone(),
             default_model_provider_attempted: self.default_model_provider_attempted.clone(),
             self_execute_attempted: self.self_execute_attempted.clone(),
+            specialist_takeover_attempted: self.specialist_takeover_attempted.clone(),
             escalation_attempted: self.escalation_attempted.clone(),
             doc_resolution: self.last_doc_resolution.clone(),
             snapshot_generation: self.snapshot_generation(),
@@ -4796,6 +4802,16 @@ impl CoordinatorAgent {
     /// `FallbackOutcome::Exhausted` when every tier was skipped or failed.
     /// Cancellation observed inside a tier short-circuits with
     /// `FallbackOutcome::Cancelled`.
+    /// The registered specialist that should take over a failed subtask on
+    /// the AGENT axis before any provider escalation: another agent at the
+    /// original role's stage, else any agent whose configured coverage
+    /// includes that stage. `None` when the role has no stage or no OTHER
+    /// agent can cover it. Pure and config-driven — no role names appear here.
+    fn takeover_candidate_for_role(&self, original_role: &AgentId) -> Option<AgentId> {
+        let stage = self.registry.get(original_role).and_then(|agent| agent.stage())?;
+        self.registry.takeover_candidate(&stage, original_role)
+    }
+
     async fn attempt_fallback_ladder(
         &mut self,
         task: &SubTask,
@@ -4967,6 +4983,78 @@ impl CoordinatorAgent {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // ── Agent axis: a DIFFERENT registered specialist takes the work ───
+        // Owner doctrine: before escalating across PROVIDERS, check the AGENT
+        // axis — another agent at the same stage, then any agent whose
+        // configured coverage includes the target stage. Choosing a DIFFERENT
+        // agent and re-targeting a chosen agent to a different provider are
+        // SEPARATE axes; re-targeting a specialist is preferred over a
+        // provider swap or self-execution. Coverage is configuration data
+        // (`can_cover`), never a hardcoded role→stage table.
+        if !self.specialist_takeover_attempted.contains(&task.id) {
+            self.specialist_takeover_attempted.insert(task.id);
+            if let Some(candidate) = self.takeover_candidate_for_role(original_role) {
+                match self.model_selector.fallback_to_default(&candidate) {
+                    Ok(profile) => {
+                        // ADR-52: a takeover dispatch is a real model dispatch
+                        // and counts toward the run-wide cap.
+                        self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+                        match self
+                            .runner
+                            .run(candidate.clone(), task, context.clone(), &profile, cancel.clone())
+                            .await
+                        {
+                            Ok(result) if matches!(result.outcome, AgentOutcome::Success) => {
+                                self.publish_ladder_note(
+                                    task,
+                                    format!(
+                                        "Agent-axis takeover: {candidate} covered {original_role} \
+                                         subtask {} before any provider escalation",
+                                        task.id
+                                    ),
+                                );
+                                return FallbackOutcome::Success(Box::new(result));
+                            }
+                            Ok(_) => {
+                                self.publish_ladder_note(
+                                    task,
+                                    format!(
+                                        "Agent-axis takeover by {candidate} for {original_role} \
+                                         subtask {} did not succeed; the provider ladder continues",
+                                        task.id
+                                    ),
+                                );
+                            }
+                            Err(tier_err) => {
+                                if is_cancellation_error(&tier_err) {
+                                    return FallbackOutcome::Cancelled;
+                                }
+                                self.publish_ladder_note(
+                                    task,
+                                    format!(
+                                        "Agent-axis takeover by {candidate} for {original_role} \
+                                         subtask {} failed: {tier_err}; the provider ladder \
+                                         continues",
+                                        task.id
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(tier_err) => {
+                        self.publish_ladder_note(
+                            task,
+                            format!(
+                                "Agent-axis takeover for {original_role} subtask {} skipped: no \
+                                 serving profile resolved for {candidate}: {tier_err}",
+                                task.id
+                            ),
+                        );
                     }
                 }
             }
@@ -6009,6 +6097,7 @@ impl CoordinatorAgent {
         self.default_model_attempted = cp.default_model_attempted.clone();
         self.default_model_provider_attempted = cp.default_model_provider_attempted.clone();
         self.self_execute_attempted = cp.self_execute_attempted.clone();
+        self.specialist_takeover_attempted = cp.specialist_takeover_attempted.clone();
         self.escalation_attempted = cp.escalation_attempted.clone();
         // ADR-65 §7: keep the doc resolution and pending decision
         // round-tripping — the resumed run's checkpoints carry them forward
@@ -16254,6 +16343,7 @@ mod tests {
             name: "Architect".to_string(),
             role: "architect".to_string(),
             stage: Some(concerto_core::AgentStage::new("design")),
+            can_cover: Vec::new(),
             prompt_sections: concerto_config::PromptSections::default(),
             model_override: None,
             provider_id: None,
@@ -21287,35 +21377,28 @@ mod tests {
         drop(coordinator);
     }
 
-    /// ADR-42 (two-tier): the ladder NEVER reassigns a subtask to another
-    /// agent with the same declared stage. With multiple design-stage agents
-    /// registered, a hard `LimitReached` failure dispatches ONLY the original
-    /// role — tier 1 re-uses the same agent on the default model, and when
-    /// tier 2 (coordinator self-execution) also fails the run exits Partial
-    /// without the same-stage peer ever being dispatched. (The old three-tier
-    /// ladder reassigned to the lexicographically-first untried same-stage
-    /// agent; the peer's silence proves that tier is gone.)
+    /// Agent-axis takeover (owner doctrine): before escalating across
+    /// PROVIDERS, the coordinator takes over a hard-failed subtask with
+    /// ANOTHER registered specialist — here a same-stage peer — which rescues
+    /// the work. Choosing a different agent is a distinct axis from
+    /// re-targeting a provider, and is preferred over the provider ladder.
     #[tokio::test]
-    async fn ladder_hard_failure_never_reassigns_stages() {
+    async fn ladder_hard_failure_takes_over_to_same_stage_peer() {
         let bus = EventBus::new(256);
-        // The original design-stage role fails hard on the first dispatch, the
-        // tier-1 default-model re-dispatch, AND the tier-2 takeover dispatch
-        // (three auth errors) so the ladder exhausts to Partial. `architect-alt`
-        // shares the "design" stage and would succeed if dispatched — under the
-        // old three-tier ladder it was the tier-2 reassignment target, so its
-        // silence is the proof that no reassignment happens.
+        // The original design-stage role fails hard on the first dispatch and
+        // the tier-1 default-model re-dispatch. `architect-alt` shares the
+        // "design" stage and succeeds, so the agent-axis takeover rescues the
+        // subtask before any provider escalation.
         let architect = MockExpertAgent::sequence(
             AgentId::new("architect"),
             vec![err_auth(), err_auth(), err_auth()],
         );
         let alt = MockExpertAgent::sequence(
             AgentId::new("architect-alt"),
-            vec![ok_result("architect-alt", "peer must never run")],
+            vec![ok_result("architect-alt", "covered the design work")],
         )
         .with_stage(Some(AgentStage::new("design")));
         let session_id = Ulid::new();
-        // Tier 2 (takeover dispatch) also fails with the third auth error, so
-        // the ladder exhausts to Partial rather than rescuing the subtask.
         let planning: Arc<dyn concerto_core::traits::provider::LlmProvider> =
             Arc::new(MockProvider::default());
         let mut coordinator = coordinator_for_ladder(
@@ -21335,21 +21418,17 @@ mod tests {
 
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "a hard failure with both ladder tiers exhausted must surface Partial, got: {:?}",
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the same-stage takeover must rescue the subtask, got: {:?}",
             output.completion_status,
         );
-        // Only the original role is ever dispatched (the runner dispatches it
-        // three times — first dispatch + tier-1 re-dispatch + tier-2 takeover —
-        // and every dispatch reuses the original role). No same-stage peer
-        // appears in any SubTaskStarted event.
         let alt_dispatched = events.iter().any(|kind| {
             matches!(
                 kind,
                 EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("architect-alt")
             )
         });
-        assert!(!alt_dispatched, "the ladder must never dispatch a same-stage peer");
+        assert!(alt_dispatched, "the same-stage peer takes over before provider escalation");
         let started_roles: std::collections::HashSet<AgentId> = events
             .iter()
             .filter_map(|kind| match kind {
@@ -21359,11 +21438,14 @@ mod tests {
             .collect();
         assert_eq!(
             started_roles,
-            std::collections::HashSet::from([AgentId::new("architect")]),
-            "expected only the original role to be dispatched, got: {started_roles:?}",
+            std::collections::HashSet::from([
+                AgentId::new("architect"),
+                AgentId::new("architect-alt"),
+            ]),
+            "the original role plus its takeover peer were dispatched: {started_roles:?}",
         );
-        // The ladder really walked tier 1 (same agent, default model) then
-        // tier 2 (self-execution) before exhausting to Partial.
+        // The ladder really walked tier 1 (same agent, default model) before
+        // the agent-axis takeover.
         let tier1_failed = events.iter().any(|kind| {
             matches!(
                 kind,
@@ -21372,14 +21454,14 @@ mod tests {
             )
         });
         assert!(tier1_failed, "expected the tier-1 re-dispatch failure to be reported");
-        let exhausted_note = events.iter().any(|kind| {
+        let takeover_note = events.iter().any(|kind| {
             matches!(
                 kind,
                 EventKind::AgentThought { content, .. }
-                    if content.contains("Fallback ladder exhausted")
+                    if content.contains("Agent-axis takeover")
             )
         });
-        assert!(exhausted_note, "expected the ladder-exhaustion note to be published");
+        assert!(takeover_note, "expected the agent-axis takeover to be reported");
     }
 
     /// ADR-42 §4: a ladder tier may return an `Ok` result whose `outcome` is

@@ -179,6 +179,10 @@ pub struct CheckpointContext {
     /// already attempted for the task this run.
     pub default_model_provider_attempted: HashSet<TaskId>,
     pub self_execute_attempted: HashSet<TaskId>,
+    /// Agent-axis takeover guard (owner doctrine, before provider
+    /// escalation): the subtasks whose work was already re-targeted to a
+    /// DIFFERENT registered specialist, so a resume does not re-takeover.
+    pub specialist_takeover_attempted: HashSet<TaskId>,
     pub escalation_attempted: HashSet<TaskId>,
     /// ADR-65 §7: where the DesignDoc claim stood at save time (verdict +
     /// real event ids). `None` when never resolved.
@@ -339,6 +343,10 @@ pub struct GraphCheckpoint {
     pub default_model_provider_attempted: HashSet<TaskId>,
     #[serde(default)]
     pub self_execute_attempted: HashSet<TaskId>,
+    /// Agent-axis takeover guard (additive; owner doctrine). Old checkpoints
+    /// default it empty and simply allow one takeover attempt.
+    #[serde(default)]
+    pub specialist_takeover_attempted: HashSet<TaskId>,
     #[serde(default)]
     pub escalation_attempted: HashSet<TaskId>,
     /// ADR-65 §7: the whiteboard cursor — the `gate_seq` of the last log
@@ -647,6 +655,7 @@ pub fn build_checkpoint(
         default_model_attempted: context.default_model_attempted.clone(),
         default_model_provider_attempted: context.default_model_provider_attempted.clone(),
         self_execute_attempted: context.self_execute_attempted.clone(),
+        specialist_takeover_attempted: context.specialist_takeover_attempted.clone(),
         escalation_attempted: context.escalation_attempted.clone(),
         // ADR-65 §7 fields. The cursor is stamped at PERSIST time (the log
         // head then), so the builder leaves it `None` for
@@ -1499,6 +1508,7 @@ mod tests {
                 default_model_provider_attempted: HashSet::new(),
                 default_model_attempted: HashSet::from([task_id]),
                 self_execute_attempted: HashSet::new(),
+                specialist_takeover_attempted: HashSet::new(),
                 escalation_attempted: HashSet::new(),
                 doc_resolution: None,
                 snapshot_generation: None,
@@ -1792,6 +1802,7 @@ mod tests {
                 default_model_provider_attempted: HashSet::new(),
                 default_model_attempted: HashSet::new(),
                 self_execute_attempted: HashSet::new(),
+                specialist_takeover_attempted: HashSet::new(),
                 escalation_attempted: HashSet::new(),
                 doc_resolution: None,
                 snapshot_generation: None,

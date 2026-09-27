@@ -1738,6 +1738,7 @@ enabled = true
             name: format!("Agent {id}"),
             role: id.to_string(),
             stage: Some(concerto_core::AgentStage::new("run_once")),
+            can_cover: Vec::new(),
             prompt_sections: PromptSections {
                 system_instructions: format!("You are {id}."),
                 constraints: "Never touch secrets.".into(),
