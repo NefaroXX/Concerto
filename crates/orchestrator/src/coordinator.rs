@@ -144,6 +144,21 @@ pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 /// is the human-in-the-loop consent path itself, not a workspace mutation.
 pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
 
+/// C-06 evidence kind (3): the Coordinator's explicit, recorded declaration
+/// that no separate verification pass is required for this objective, with a
+/// reason. The declaration is auditable — the handler records a
+/// `coordinator_decision` audit row and a whiteboard `Decision` event (code
+/// `verification-exempt`) — which is what the completion-time C-06 acceptance
+/// gate reads as evidence. It dispatches no agents and touches no tools; like
+/// `request_user_input` it applies no policy gate (it mutates no workspace
+/// state), and a declaration that cannot be durably recorded is refused.
+pub(crate) const DECLARE_VERIFICATION_EXEMPT_TOOL: &str = "declare_no_verification_required";
+
+/// The whiteboard `Decision`/audit code stamped by
+/// [`DECLARE_VERIFICATION_EXEMPT_TOOL`]; the C-06 gate recognises exactly this
+/// code when reading a run's recorded declarations.
+const VERIFICATION_EXEMPT_DECISION_CODE: &str = "verification-exempt";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -572,6 +587,39 @@ fn request_user_input_tool_definition() -> ToolDefinition {
     }
 }
 
+/// Argument schema for the Coordinator's
+/// [`DECLARE_VERIFICATION_EXEMPT_TOOL`] declaration (C-06 evidence kind 3):
+/// the explicit, auditable statement that no separate verification pass is
+/// required for this objective, carrying the reason. It records a
+/// `verification-exempt` decision (audit + whiteboard) that the completion-time
+/// acceptance gate consumes as evidence. A reason is mandatory so "no
+/// verification needed" is never silent.
+fn declare_verification_exempt_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DECLARE_VERIFICATION_EXEMPT_TOOL.to_string(),
+        description: "Declare that no separate verification pass is required for this \
+                      objective, and state why. Use this ONLY when the work is directly \
+                      self-evidencing (for example a rename or a mechanical edit whose \
+                      success is visible in the executed tool result). The declaration and \
+                      its reason are recorded in the run's audit trail and are consumed by \
+                      the completion-time acceptance gate as verification evidence. It does \
+                      NOT waive the declared-deliverable artifact checks: those still run."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why no separate verification pass is required for this \
+                                    objective. Mandatory and non-empty; it is recorded as the \
+                                    auditable justification."
+                }
+            },
+            "required": ["reason"]
+        }),
+    }
+}
+
 /// Three-way failure classification for subtask dispatches (ADR-42 §1).
 enum SubtaskFailureClass {
     /// Transient; retry the same agent/model (today's recoverable path).
@@ -853,6 +901,180 @@ fn expected_artifact_list(
 ) -> Vec<camino::Utf8PathBuf> {
     let mut seen = HashSet::new();
     snapshot.values().flatten().filter(|path| seen.insert((*path).clone())).cloned().collect()
+}
+
+/// Cap on the per-kind whiteboard window the C-06 evidence reader scans. A
+/// generous bound: a real run's `ToolExecuted`/`Decision` rows are far below
+/// it, and a truncated read only degrades to "no evidence" (fail-closed),
+/// never to a false accept.
+const VERIFICATION_EVIDENCE_SCAN_LIMIT: usize = 4096;
+
+/// Which kind of verification evidence satisfied the C-06 acceptance gate.
+/// Recorded for the audit trail and the completion decision; never a routing
+/// signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationEvidenceKind {
+    /// (1) An Acceptance-kind subtask settled `completed` in the ledger.
+    DeclaredValidator,
+    /// (2a) A successful mutating tool touched a declared deliverable.
+    MutatingToolOnDeliverable,
+    /// (2b) A successful build/test/lint/format command ran.
+    BuildOrTestCommand,
+    /// (3) A recorded coordinator declaration that verification is unnecessary.
+    CoordinatorDeclaration,
+}
+
+/// One piece of evidence that satisfies the C-06 acceptance gate, with a
+/// short human-readable detail for the decision record.
+#[derive(Debug, Clone)]
+struct VerificationEvidence {
+    kind: VerificationEvidenceKind,
+    detail: String,
+}
+
+/// Normalise a project-relative path for identity comparison: strip any
+/// leading `./` segments. Both the declared artifacts and the recorded tool
+/// facts are project-relative, so this is sufficient (no root resolution).
+fn normalize_evidence_path(raw: &str) -> String {
+    let mut value = raw.trim();
+    while let Some(stripped) = value.strip_prefix("./") {
+        value = stripped;
+    }
+    value.to_owned()
+}
+
+/// Whether a recorded tool fact names a mutating file operation (write /
+/// delete / move / copy / edit). Reuses the evidence-spine grammar
+/// ([`crate::tool_facts::is_file_affecting_tool`]) plus the `write` alias.
+fn is_mutating_tool_fact(tool: &str, args: &serde_json::Value) -> bool {
+    tool == "write" || crate::tool_facts::is_file_affecting_tool(tool, args)
+}
+
+/// Whether a recorded `shell` tool command is a build/test/lint/format
+/// invocation. Bounded, documented classifier over the first one or two
+/// whitespace-separated tokens of `command` + `args` (joined). Pure so it is
+/// unit-testable. Unknown runners return `false` (fail-closed).
+fn is_build_or_test_command(args: &serde_json::Value) -> bool {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+        parts.push(command.to_owned());
+    }
+    if let Some(list) = args.get("args").and_then(serde_json::Value::as_array) {
+        for item in list {
+            if let Some(value) = item.as_str() {
+                parts.push(value.to_owned());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    let normalized = parts.join(" ").to_lowercase();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let tokens: Vec<&str> = normalized.split(' ').collect();
+    let first = tokens.first().copied().unwrap_or("");
+    let second = tokens.get(1).copied().unwrap_or("");
+    match first {
+        "cargo" => {
+            matches!(
+                second,
+                "build" | "check" | "test" | "clippy" | "fmt" | "nextest" | "deny" | "audit"
+            )
+        }
+        "make" => true,
+        "npm" | "yarn" | "pnpm" => matches!(second, "test" | "run"),
+        "pytest" => true,
+        "python" => second == "-m" && tokens.get(2).copied() == Some("pytest"),
+        "go" => matches!(second, "build" | "test" | "vet"),
+        "dotnet" => matches!(second, "build" | "test"),
+        "mvn" => matches!(second, "test" | "verify" | "package"),
+        "gradle" | "./gradlew" => matches!(second, "test" | "build"),
+        "tsc" | "eslint" | "rustfmt" => true,
+        _ => false,
+    }
+}
+
+/// Every path a recorded tool fact touches: the observed `paths` plus the
+/// raw arguments' `path` / `destination` / `target`. The destination is read
+/// explicitly because move/copy record it in the arguments and in the tool's
+/// output data, neither of which the fact's observed `paths` include.
+fn tool_fact_touched_paths(
+    args: &serde_json::Value,
+    paths: &[concerto_sessions::ObservedPath],
+) -> Vec<String> {
+    let mut candidates: Vec<String> =
+        paths.iter().map(|observed| normalize_evidence_path(&observed.path)).collect();
+    for key in ["path", "destination", "target"] {
+        if let Some(value) = args.get(key).and_then(serde_json::Value::as_str) {
+            candidates.push(normalize_evidence_path(value));
+        }
+    }
+    candidates
+}
+
+/// (2a): whether a successful recorded mutation touched one of the run's
+/// declared expected artifacts (the objective's declared deliverable). An
+/// empty declared set is never satisfied — there is no deliverable to
+/// evidence.
+fn fact_touches_declared_deliverable(
+    args: &serde_json::Value,
+    paths: &[concerto_sessions::ObservedPath],
+    declared: &[camino::Utf8PathBuf],
+) -> bool {
+    if declared.is_empty() {
+        return false;
+    }
+    let touched = tool_fact_touched_paths(args, paths);
+    declared.iter().any(|artifact| {
+        let artifact = normalize_evidence_path(artifact.as_str());
+        touched.iter().any(|candidate| candidate == &artifact)
+    })
+}
+
+/// Evaluate a run's recorded `ToolExecuted` facts for C-06 evidence (2).
+/// FAIL-CLOSED: only `success == true` facts qualify, so a failed or
+/// policy-refused call never counts; a fact whose payload cannot be decoded
+/// contributes nothing. Facts are attributed to the run when they carry no
+/// `run_id` (legacy/test producers) or when their `run_id` matches the
+/// current run — a fact from a different run is ignored.
+fn tool_fact_verification_evidence(
+    events: &[WhiteboardEvent],
+    run_id: Option<&str>,
+    declared: &[camino::Utf8PathBuf],
+) -> Option<VerificationEvidence> {
+    for event in events {
+        let Ok(fact) =
+            serde_json::from_value::<concerto_sessions::ToolExecutedPayload>(event.payload.clone())
+        else {
+            continue;
+        };
+        if !fact.success {
+            continue;
+        }
+        if let (Some(fact_run), Some(current_run)) = (fact.run_id.as_deref(), run_id) {
+            if fact_run != current_run {
+                continue;
+            }
+        }
+        if fact.tool == "shell" && is_build_or_test_command(&fact.args) {
+            return Some(VerificationEvidence {
+                kind: VerificationEvidenceKind::BuildOrTestCommand,
+                detail: format!("successful build/test/lint command via `{}`", fact.tool),
+            });
+        }
+        if is_mutating_tool_fact(&fact.tool, &fact.args)
+            && fact_touches_declared_deliverable(&fact.args, &fact.paths, declared)
+        {
+            return Some(VerificationEvidence {
+                kind: VerificationEvidenceKind::MutatingToolOnDeliverable,
+                detail: format!(
+                    "successful mutating tool `{}` touched a declared deliverable",
+                    fact.tool
+                ),
+            });
+        }
+    }
+    None
 }
 
 /// Whether any declared expected artifact is unproduced on disk (missing,
@@ -9125,15 +9347,19 @@ impl CoordinatorAgent {
         };
         // ── C-06 completion-time acceptance gate ─────────────────────────
         // ADR-35 amendment (2026-09-16 §4): a build task may only be
-        // reported Completed when the Coordinator actually invoked
-        // verification and the artifacts passed acceptance. The gate
-        // detects "declared verification evidence" — a successful
-        // acceptance-stage dispatch in the ledger (subtask settled with
-        // kind "completed" whose role resolves to StageKind::Acceptance) —
-        // and invokes `acceptance_rejection` to enforce artifact checks
-        // and record the accepted/rejected decision. Without declared
-        // verification evidence the completion claim is downgraded to
-        // Partial with a recoverable note.
+        // reported Completed when the run's promised work is evidenced and
+        // the artifacts passed acceptance. Evidence may be (1) an accepted
+        // validation-stage dispatch (the original declared-verification
+        // path), (2) direct executed-tool evidence recorded on the run's
+        // evidence spine (a successful mutating tool against a declared
+        // deliverable, or a successful build/test/lint command), or (3) a
+        // recorded coordinator declaration that no separate verification is
+        // required. When evidence exists `acceptance_rejection` enforces the
+        // artifact checks and records the accepted/rejected decision;
+        // without any evidence the completion claim is downgraded to Partial
+        // with a note naming the missing evidence. FAIL-CLOSED: absence of
+        // evidence is never Complete; failed or refused tool calls are never
+        // evidence.
         let build_task = graph.all_tasks().iter().any(|subtask| {
             self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
         });
@@ -9145,42 +9371,65 @@ impl CoordinatorAgent {
         });
         if build_task && completion_status == concerto_core::types::AgentCompletionStatus::Completed
         {
-            if has_declared_verification {
-                // ADR-35 §4: the Coordinator dispatched a validator that
-                // succeeded. Invoke acceptance_rejection to enforce artifact
-                // checks and record the accepted/rejected decision in the
-                // action ledger.
-                if let Some(rejected) =
-                    self.acceptance_rejection(&task, build_task, &project_root, &mut action_ledger)
-                {
-                    recoverable_notes.push(rejected.summary.clone());
-                    completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+            let declared_artifacts = expected_artifact_list(&self.expected_artifacts_snapshot());
+            let run_id = checkpoint_scope.run_id.to_string();
+            let evidence = self
+                .run_verification_evidence(
+                    task.session_id,
+                    Some(run_id.as_str()),
+                    &declared_artifacts,
+                    has_declared_verification,
+                )
+                .await;
+            match evidence {
+                Some(evidence) => {
+                    // The run's promised work is evidenced. Enforce the
+                    // artifact checks and record the accepted/rejected
+                    // decision in the action ledger.
+                    tracing::debug!(
+                        kind = ?evidence.kind,
+                        detail = %evidence.detail,
+                        "C-06 acceptance gate: verification evidence present"
+                    );
+                    if let Some(rejected) = self.acceptance_rejection(
+                        &task,
+                        build_task,
+                        &project_root,
+                        &mut action_ledger,
+                    ) {
+                        recoverable_notes.push(rejected.summary.clone());
+                        completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    }
                 }
-            } else {
-                // No verification evidence was declared for this run. Name
-                // any declared-but-unproduced deliverables (a quarantined
-                // DesignDoc's carried contract paths included) so the
-                // omission is concrete, not generic.
-                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
-                let unproduced = unproduced_expected_artifacts(
-                    &project_root,
-                    &self.expected_artifacts_snapshot(),
-                );
-                let detail = if unproduced.is_empty() {
-                    String::new()
-                } else {
-                    let list = unproduced
-                        .iter()
-                        .map(|(path, reason)| format!("{path} ({reason})"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(" Unproduced declared deliverable(s): {list}.")
-                };
-                recoverable_notes.push(format!(
-                    "Acceptance gate C-06: the run contained implement-stage work but no \
-                     verification evidence was declared for this run; the completion claim \
-                     is reported Partial.{detail}"
-                ));
+                None => {
+                    // No evidence of any kind. Name the blocker concretely
+                    // (including any declared-but-unproduced deliverables, a
+                    // quarantined DesignDoc's carried contract paths
+                    // included) so the omission is actionable, not generic.
+                    completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    let unproduced = unproduced_expected_artifacts(
+                        &project_root,
+                        &self.expected_artifacts_snapshot(),
+                    );
+                    let detail = if unproduced.is_empty() {
+                        String::new()
+                    } else {
+                        let list = unproduced
+                            .iter()
+                            .map(|(path, reason)| format!("{path} ({reason})"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(" Unproduced declared deliverable(s): {list}.")
+                    };
+                    recoverable_notes.push(format!(
+                        "Acceptance gate C-06: the run contained implement-stage work and \
+                         reported completion, but no verification evidence exists for this run \
+                         — no accepted validator pass, no successful mutating tool against a \
+                         declared deliverable, no successful build/test/lint command, and no \
+                         recorded declaration that separate verification is unnecessary; the \
+                         completion claim is reported Partial.{detail}"
+                    ));
+                }
             }
         }
         // ── Completion-time unfinished-work guards ───────────────────────
@@ -9670,6 +9919,91 @@ impl CoordinatorAgent {
                 verification_passed,
             }),
         });
+    }
+
+    /// C-06 evidence evaluation at completion: whether the run's promised
+    /// work is evidenced, and by what. Evidence kinds, checked in order:
+    ///
+    /// 1. declared verification (an accepted validator dispatch) — the
+    ///    existing path, trusted unchanged;
+    /// 2. direct executed-tool evidence read from the run's recorded
+    ///    `ToolExecuted` whiteboard facts — a successful mutating tool that
+    ///    touched a declared deliverable, or a successful build/test/lint
+    ///    command;
+    /// 3. a recorded coordinator declaration (`verification-exempt`) that no
+    ///    separate verification is required, with a reason.
+    ///
+    /// FAIL-CLOSED: `None` means there is no evidence and the gate must
+    /// downgrade to `Partial`. A missing pool or a read error yields `None`
+    /// (logged, never a panic); failed/refused tool calls are never
+    /// evidence.
+    async fn run_verification_evidence(
+        &self,
+        session_id: Ulid,
+        run_id: Option<&str>,
+        declared: &[camino::Utf8PathBuf],
+        has_declared_verification: bool,
+    ) -> Option<VerificationEvidence> {
+        if has_declared_verification {
+            return Some(VerificationEvidence {
+                kind: VerificationEvidenceKind::DeclaredValidator,
+                detail: "declared validation-stage subtask settled completed".to_owned(),
+            });
+        }
+        let pool = self.review_store.as_ref()?;
+        let session = session_id.to_string();
+
+        match concerto_sessions::whiteboard::load_session_events_of_kind(
+            pool,
+            &session,
+            WhiteboardKind::ToolExecuted,
+            VERIFICATION_EVIDENCE_SCAN_LIMIT,
+        )
+        .await
+        {
+            Ok(events) => {
+                if let Some(evidence) = tool_fact_verification_evidence(&events, run_id, declared) {
+                    return Some(evidence);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "C-06 evidence: tool-fact read failed (fail-closed)");
+            }
+        }
+
+        match concerto_sessions::whiteboard::load_session_events_of_kind(
+            pool,
+            &session,
+            WhiteboardKind::Decision,
+            VERIFICATION_EVIDENCE_SCAN_LIMIT,
+        )
+        .await
+        {
+            Ok(events) => {
+                for event in events {
+                    let code =
+                        event.payload.get("required_output").and_then(serde_json::Value::as_str);
+                    let reason = event
+                        .payload
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if code == Some(VERIFICATION_EXEMPT_DECISION_CODE) && !reason.trim().is_empty()
+                    {
+                        return Some(VerificationEvidence {
+                            kind: VerificationEvidenceKind::CoordinatorDeclaration,
+                            detail: format!(
+                                "coordinator declared no verification required: {reason}"
+                            ),
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "C-06 evidence: declaration read failed (fail-closed)");
+            }
+        }
+        None
     }
 
     /// C-06: coordinator-owned acceptance for build tasks.
@@ -10719,6 +11053,9 @@ impl CoordinatorAgent {
             // ADR-35 amendment (2026-09-16 §2): the human-input request
             // surface — stops the run AwaitingUser for the operator's answer.
             tool_defs.push(request_user_input_tool_definition());
+            // C-06 evidence kind (3): the explicit, recorded declaration that
+            // no separate verification is required for this objective.
+            tool_defs.push(declare_verification_exempt_tool_definition());
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
@@ -11092,6 +11429,16 @@ impl CoordinatorAgent {
                     // operator-consent path itself applies no policy gate.
                     REQUEST_USER_INPUT_TOOL if dispatching => {
                         self.handle_request_user_input(&tool_call.arguments).await
+                    }
+                    // C-06 evidence kind (3): the explicit, recorded
+                    // declaration that no separate verification pass is
+                    // required for this objective. Dispatches nothing and
+                    // touches no tools; the reason is recorded durably (audit
+                    // + whiteboard) so the completion gate can consume it as
+                    // evidence and the decision is visible after the fact.
+                    DECLARE_VERIFICATION_EXEMPT_TOOL if dispatching => {
+                        self.handle_declare_no_verification(task.session_id, &tool_call.arguments)
+                            .await
                     }
                     // Issue #64: the explicit reconsideration surface — the
                     // model supersedes a decision and freezes ONLY its
@@ -14401,6 +14748,58 @@ impl CoordinatorAgent {
         serde_json::json!({
             "status": "awaiting_human_input",
             "message": "The run is paused awaiting your input.",
+        })
+    }
+
+    /// C-06 evidence kind (3): handle ONE
+    /// [`DECLARE_VERIFICATION_EXEMPT_TOOL`] call — an explicit declaration
+    /// that no separate verification pass is required for this objective,
+    /// carrying the reason. The declaration must be DURABLY recorded (audit
+    /// row + whiteboard `Decision`) or it is refused: an unrecordable
+    /// declaration is not evidence. No policy gate applies (no workspace
+    /// mutation).
+    async fn handle_declare_no_verification(
+        &self,
+        session_id: Ulid,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial declaration) ────────────────────────────
+        let Some(reason) = arguments
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "declare_no_verification_required requires a non-empty reasoning string",
+            });
+        };
+        // ── 2. Durability gate: an unrecordable declaration is not
+        //      evidence, so refuse rather than let the model believe it
+        //      counted.
+        if self.review_store.is_none() && self.tool_executor.is_none() {
+            return serde_json::json!({
+                "error": "declaration_unrecordable",
+                "message": "no audit or whiteboard sink is attached; the declaration \
+                            cannot be recorded and is not valid verification evidence",
+            });
+        }
+        // ── 3. Record (fail-soft at the seam, but the call succeeded only
+        //      when a sink existed).
+        crate::bypass_decision::record_decision_row(
+            self.tool_executor.as_deref(),
+            self.review_store.as_ref(),
+            session_id,
+            VERIFICATION_EXEMPT_DECISION_CODE,
+            reason,
+        )
+        .await;
+        serde_json::json!({
+            "outcome": "declared",
+            "reason": reason,
+            "message": "Declared that no separate verification is required; the reason was \
+                        recorded and will satisfy the completion-time acceptance gate.",
         })
     }
 
@@ -18640,6 +19039,381 @@ mod tests {
         assert!(
             !events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
             "no validation-stage agent should mean no validation cycle runs"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C-06 evidence gate: direct executed-tool evidence and declarations
+    // ------------------------------------------------------------------
+
+    /// A coder mock that reports one successful tool call and one produced
+    /// file — the shape of a real specialist that actually did work (so the
+    /// zero-work/vacuous guards stay out of the way of the C-06 assertions).
+    fn coder_with_tool_work() -> MockExpertAgent {
+        MockExpertAgent::sequence(
+            AgentId::new("coder"),
+            vec![Ok(AgentRunResult {
+                task_id: TaskId::new(),
+                role: AgentId::new("coder"),
+                outcome: AgentOutcome::Success,
+                summary: "implemented".to_owned(),
+                files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
+                tool_call_count: 1,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                tokens_in: 0,
+                tokens_out: 0,
+            })],
+        )
+    }
+
+    /// Append one `ToolExecuted` fact attributed to `session_id` (no
+    /// `run_id`, so the gate's run filter accepts it), mirroring what a real
+    /// specialist's evidence writer records.
+    async fn append_evidence_tool_fact(
+        pool: &sqlx::SqlitePool,
+        session_id: Ulid,
+        tool: &str,
+        args: serde_json::Value,
+        success: bool,
+        paths: &[&str],
+    ) {
+        let payload = serde_json::json!({
+            "agent_id": "coder",
+            "tool": tool,
+            "args": args,
+            "success": success,
+            "paths": paths
+                .iter()
+                .map(|path| serde_json::json!({ "path": path }))
+                .collect::<Vec<_>>(),
+        });
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coder".to_owned(),
+            kind: WhiteboardKind::ToolExecuted,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload,
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        append_whiteboard_event(pool, &event).await.expect("tool fact appended");
+    }
+
+    /// Build a declared-deliverable build run: architect (grounded DesignDoc
+    /// for `src/a.rs`) + coder that produced the file, over a real temp
+    /// workspace with a non-placeholder `src/a.rs` on disk. The caller
+    /// supplies the tool fact or declaration before invoking it.
+    fn c06_build_registry() -> AgentRegistry {
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            coder_with_tool_work(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry
+    }
+
+    fn c06_build_turns() -> Vec<CoordinatorTurn> {
+        vec![
+            CoordinatorTurn::Calls(vec![
+                call_specialist("architect", "design it"),
+                call_specialist("coder", "implement"),
+            ]),
+            CoordinatorTurn::Text("done".into()),
+        ]
+    }
+
+    fn c06_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir for C-06 workspace");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        std::fs::write(dir.path().join("src/a.rs"), "// real implementation\npub fn main() {}\n")
+            .expect("write deliverable");
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    /// (a) A build run whose declared deliverable was produced by a
+    /// successful mutating tool completes — no validator is dispatched and
+    /// the run is not downgraded by C-06. A fact attributed to another
+    /// session is ignored (sanity for the run/session filter).
+    #[tokio::test]
+    async fn c06_mutating_tool_evidence_completes_without_validator() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        // A foreign-session fact must NOT satisfy the gate.
+        append_evidence_tool_fact(
+            &pool,
+            Ulid::new(),
+            "filesystem",
+            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            true,
+            &["src/a.rs"],
+        )
+        .await;
+        // The real fact, attributed to this run's session.
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "filesystem",
+            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            true,
+            &["src/a.rs"],
+        )
+        .await;
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a successful mutating tool against the declared deliverable must complete: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Acceptance gate C-06"),
+            "unexpected C-06 downgrade: {}",
+            output.final_message
+        );
+    }
+
+    /// (c) A run whose only tool attempt FAILED does not complete: a failed
+    /// tool fact is never evidence.
+    #[tokio::test]
+    async fn c06_failed_tool_attempt_is_not_evidence() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "filesystem",
+            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            false,
+            &["src/a.rs"],
+        )
+        .await;
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a failed tool attempt must not satisfy the gate: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Acceptance gate C-06"),
+            "the no-evidence note must name the blocker: {}",
+            output.final_message
+        );
+    }
+
+    /// (2b) A successful build/test/lint command is verification evidence.
+    #[tokio::test]
+    async fn c06_successful_build_command_is_evidence() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "shell",
+            serde_json::json!({ "command": "cargo", "args": ["test"] }),
+            true,
+            &[],
+        )
+        .await;
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a successful build/test command must satisfy the gate: {}",
+            output.final_message
+        );
+    }
+
+    /// (d) A recorded coordinator declaration completes the run and the
+    /// recorded reason is visible after the fact.
+    #[tokio::test]
+    async fn c06_coordinator_declaration_completes_and_records_reason() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let reason =
+            "the declared deliverable is a mechanical rename; no separate verification applies";
+        let turns = vec![
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "declare-verification".to_owned(),
+                name: DECLARE_VERIFICATION_EXEMPT_TOOL.to_owned(),
+                arguments: serde_json::json!({ "reason": reason }),
+                ..Default::default()
+            }]),
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+            CoordinatorTurn::Text("done".into()),
+        ];
+        // No architect/DesignDoc: the declaration must stand on its own
+        // (artifact checks are vacuous with no declared deliverable).
+        let mut registry = AgentRegistry::from_mocks(vec![coder_with_tool_work()]);
+        registry.attach_configs_for_test(std::collections::HashMap::new());
+
+        let mut coordinator = coordinator_with_turns(bus.clone(), Arc::new(registry), turns)
+            .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "declare it done");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a recorded declaration must satisfy the gate: {}",
+            output.final_message
+        );
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let declaration = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["required_output"] == serde_json::json!("verification-exempt")
+            })
+            .expect("the declaration decision was recorded");
+        assert_eq!(
+            declaration.payload["reason"],
+            serde_json::json!(reason),
+            "the recorded reason is the one the coordinator declared"
+        );
+    }
+
+    #[test]
+    fn c06_build_or_test_command_classifier() {
+        assert!(is_build_or_test_command(
+            &serde_json::json!({ "command": "cargo", "args": ["test"] })
+        ));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "cargo test" })));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "make" })));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "pytest" })));
+        assert!(is_build_or_test_command(
+            &serde_json::json!({ "command": "npm", "args": ["test"] })
+        ));
+        assert!(is_build_or_test_command(
+            &serde_json::json!({ "command": "./gradlew", "args": ["test"] })
+        ));
+        assert!(!is_build_or_test_command(
+            &serde_json::json!({ "command": "echo", "args": ["cargo test"] })
+        ));
+        assert!(!is_build_or_test_command(&serde_json::json!({ "command": "ls" })));
+        assert!(!is_build_or_test_command(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn c06_mutating_fact_and_deliverable_matching() {
+        assert!(is_mutating_tool_fact("filesystem", &serde_json::json!({ "operation": "move" })));
+        assert!(is_mutating_tool_fact("write", &serde_json::json!({ "path": "x" })));
+        assert!(!is_mutating_tool_fact("filesystem", &serde_json::json!({ "operation": "read" })));
+        let paths = vec![];
+        // The move destination lives in the arguments, not the observed paths.
+        assert!(fact_touches_declared_deliverable(
+            &serde_json::json!({ "operation": "move", "path": "src/a.rs", "destination": "src/b.rs" }),
+            &paths,
+            &[camino::Utf8PathBuf::from("src/b.rs")],
+        ));
+        assert!(!fact_touches_declared_deliverable(
+            &serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            &paths,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn c06_failed_fact_yields_no_evidence() {
+        let event = WhiteboardEvent {
+            event_id: "fact-1".to_owned(),
+            gate_seq: 1,
+            agent_id: "coder".to_owned(),
+            agent_seq: 1,
+            kind: WhiteboardKind::ToolExecuted,
+            scope: String::new(),
+            session_id: Some("s".to_owned()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "tool": "filesystem",
+                "args": { "operation": "move", "path": "src/a.rs" },
+                "success": false,
+                "paths": [{ "path": "src/a.rs" }],
+            }),
+            content_hash: String::new(),
+            pre_image_hash: None,
+            created_at: 0,
+        };
+        assert!(
+            tool_fact_verification_evidence(
+                std::slice::from_ref(&event),
+                None,
+                &[camino::Utf8PathBuf::from("src/a.rs")]
+            )
+            .is_none(),
+            "a failed fact is never evidence"
         );
     }
 

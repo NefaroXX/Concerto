@@ -409,6 +409,36 @@ pub async fn load_whiteboard_events(
     rows.into_iter().map(WhiteboardEvent::try_from).collect()
 }
 
+/// Load every event of ONE `kind` for ONE session, ordered by `gate_seq`
+/// ascending, up to `limit` rows.
+///
+/// A targeted, bounded read for consumers that need a single topic of the
+/// evidence spine (e.g. the C-06 acceptance gate reading a run's
+/// `ToolExecuted` facts and `Decision` records) without paging the whole
+/// session log. `limit` is caller-supplied so the window can be sized to the
+/// consumer's evidence budget (the acceptance gate uses a generous bound and
+/// treats a read failure as no evidence — fail-closed).
+pub async fn load_session_events_of_kind(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    kind: WhiteboardKind,
+    limit: usize,
+) -> Result<Vec<WhiteboardEvent>, SessionError> {
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM whiteboard_events \
+         WHERE session_id = ? AND kind = ? ORDER BY gate_seq ASC LIMIT ?"
+    );
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let rows = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql))
+        .bind(session_id)
+        .bind(kind.as_str())
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(WhiteboardEvent::try_from).collect()
+}
+
 /// Load every event keyed to a plan, ordered by `gate_seq` ascending.
 ///
 /// Future #152 structured-state reads (ADR-60 D7): the DesignDoc, task graph,
@@ -1151,6 +1181,41 @@ mod tests {
         assert_eq!(decoded.payload["files"][0]["path"], json!("a.md"));
         assert_eq!(decoded.payload["files"][0]["size_bytes"], json!(42));
         assert_eq!(decoded.payload["generation"], json!("gen-3"));
+    }
+
+    /// The targeted per-session/per-kind read returns only matching rows, in
+    /// `gate_seq` order, and respects `limit`.
+    #[tokio::test]
+    async fn load_session_events_of_kind_filters_kind_and_session() {
+        let (_dir, pool) = test_pool(1).await;
+
+        let mut facts_session_a = new_event("f-1", "coder", WhiteboardKind::ToolExecuted);
+        facts_session_a.session_id = Some("sess-a".into());
+        let mut facts_session_a_2 = new_event("f-2", "coder", WhiteboardKind::ToolExecuted);
+        facts_session_a_2.session_id = Some("sess-a".into());
+        let mut decision_session_a = new_event("d-1", "coordinator", WhiteboardKind::Decision);
+        decision_session_a.session_id = Some("sess-a".into());
+        let mut facts_session_b = new_event("f-3", "coder", WhiteboardKind::ToolExecuted);
+        facts_session_b.session_id = Some("sess-b".into());
+
+        for event in [&facts_session_a, &decision_session_a, &facts_session_b, &facts_session_a_2] {
+            append_whiteboard_event(&pool, event).await.expect("append");
+        }
+
+        let loaded = load_session_events_of_kind(&pool, "sess-a", WhiteboardKind::ToolExecuted, 50)
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(),
+            vec!["f-1", "f-2"],
+            "only sess-a tool-executed rows, in gate_seq order"
+        );
+
+        let bounded = load_session_events_of_kind(&pool, "sess-a", WhiteboardKind::ToolExecuted, 1)
+            .await
+            .expect("load");
+        assert_eq!(bounded.len(), 1, "limit bounds the window");
+        assert_eq!(bounded[0].event_id, "f-1", "the earliest row is returned first");
     }
 
     /// ADR-65 §1 acceptance 8: a Decision event citing REAL evidence ids
