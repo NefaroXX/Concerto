@@ -80,6 +80,40 @@ a note.
 > Row 24's stale `TODO.md:114–135` cite was corrected to `:125–146`. No
 > renumbering; gaps left intentionally. Verification notes for today are
 > appended below.
+> **Append 2026-09-27 (owner decisions 2026-09-27, rows 4/25/28/37/9/29):**
+> two rows **cut** and moved to the Closed appendix with their scope recorded so
+> the cuts stay reversible — row 25 (external-editor integration; the in-app
+> editor and diff viewer are landed and were *not* cut) and row 28 (ADR-58 P5/P6
+> + TOML diff + canvas DAG editor + multi-executor partitioning, cut because the
+> orchestration-studio UI is scheduled for a separate refactor). One row
+> **rescoped and kept OPEN**: row 37 (hybrid UI full scope), size **L → M**,
+> because the Minimal and Medium tiers are landed and what remains is
+> finish-and-polish with no correctness content. One row **corrected**: row 9's
+> `[verify]` flag and "unverified" framing are removed — the setup wizard has a
+> real source and real substance; the row stays OPEN and deferred. One row
+> **reviewed and left exactly as it was**: row 29 (ADR-43 server mode / SSE /
+> marketplace / persistent state / TOML secrets) — still deferred, no status or
+> size change, with the factual state recorded in the notes below. Row 4 was
+> read and left untouched. No renumbering; numbering gaps left intentional.
+> Verification notes for today are appended below.
+> **Append 2026-09-27 (row 4 closed — desktop ack queue shipped in `8e3c350`):**
+> row 4 **closed**. ADR-68 §6's deferred "implementation phase" is now the
+> shipped state, and it shipped in the direction §6 chose rather than in the
+> opposite one an earlier note recorded: the desktop ack cell is a depth-bounded
+> `VecDeque<PendingAck>` FIFO under `MAX_PENDING_ACKS = 2` — the active dialog
+> plus one queued, the exact bound §6 names — with explicit fail-closed overflow
+> rejection (`AckQueueError::QueueFull` / `StateUnavailable`) surfaced to the UI
+> as an `ErrorOccurred` toast rather than a silent drop, session-gated
+> resolution preserved through the queue, and an "Acknowledgement 1 of N
+> pending" indicator that leaves the single-ack modal layout byte-for-byte
+> unchanged. The row's stale pre-queue note ("single slot", "reject-busy went
+> the other way on purpose") is **deleted as superseded** — it described the
+> pre-queue tree. One residual is recorded rather than dropped: an overflow
+> refusal audits as `RequestAbort`, because `ApprovalSink::request_ack` returns
+> only `bool`, so an overflow is distinguishable from a user cancel by message
+> text but not by a distinct verdict; closing that needs a widened sink
+> contract, out of scope. No renumbering; the `#4` gap is left intentionally.
+> Verification notes for today are appended below.
 
 ## Open register
 
@@ -88,12 +122,11 @@ a note.
 | 1 | `cache_stable_prefix` wired into engine/request assembly (stable-head prefix discipline) | ADR-48 D1; knob exists at `crates/config/src/schema.rs:649,683` ("the ADR-048 gap knob") but is not wired into any engine/request path | When prompt-cache prefix stability is exercised (TODO.md "prompt-cache stability" ~271–282) | S |
 | 2 | Responses `tokens_out` / `tokens_in` written per message from provider-reported usage | ADR-48:27–29,111 — columns exist but are always `0` (inert); per-iteration totals surface resolved provider only | When real provider-reported usage accounting lands (ADR-48 §4/§5; nothing wired today) | S |
 | 3 | `.wasm` plugin-file watcher (hot reload on file change) | `[verify]` no in-repo source found for a `.wasm` watcher; nearest is the memory re-index watcher (ROADMAP, ADR-57) | Verify scope first: if "plugin hot-reload" was meant, row 30 applies | S |
-| 4 | Per-session ack queue (bounded depth + ack policy) | ADR-68 §6 (queue decision pooled at approval, ~78–97; prefer in-flight budget instead per note) | Implementation phase of ADR-68 desktop ack queue; revisit at desktop persistence work (ADR-43) | S |
 | 5 | Recall budget caps + recall timeout (char caps, 5000 ms timeout race, skip-with-warning, capability-envelope payload; includes the ChunkSelector char-budget allocator across the selected chunks — TODO.md:88 "no char budget across the selected chunks"; naming trap: the `chunk_selector.rs` constants are compaction selection, not recall) | TODO.md memory section (caps/timeout ~81–88) | When a char-budget allocator + timeout guard land in `chunk_selector.rs`/`rag.rs` | M |
 | 6 | Tier-3 SDKs — Copilot / Bedrock / Azure / Vertex / watsonx | docs/missing-providers.md Tier 3 (open) | Per-provider wrapper + pairwise parity test; Tier 1/2 already done | L |
 | 7 | Doubao / StepFun / Replicate providers | `[unplanned]` — no repo register (zero matches for these names) | Add explicit provider rows if planning changes | L |
 | 8 | Vercel Gateway decision | `[verify]` researched in docs/research/multi-provider-resilience.md (Vercel AI SDK among gateways); no in-repo decision record | Confirm whether a dedicated gateway row is wanted | S |
-| 9 | Setup wizard per-variant auth flows | `[verify]` wizard exists (`crates/config/src/setup.rs`); per-variant auth steps unverified | Verify scope; no dedicated row in repo docs | M |
+| 9 | Setup wizard per-variant auth flows — **re-verified 2026-09-27: NOT unverified. The `[verify]` flag and the "per-variant auth steps unverified" framing are removed; the row stays OPEN and deferred per owner decision 2026-09-27** | **The wizard exists and is wired.** `SetupWizard::run` (`crates/config/src/setup.rs:236–264`) runs provider → key → model → working dir → policy and returns a `PendingConfig`; `PendingConfig::save` / `save_overwrite` (`:109–119`) write the TOML and push the key to the OS keychain via `CredentialStore` (ADR-04 — the key is never written to TOML). Hooked into the CLI at **first-run and `--reconfigure`** (`crates/cli/src/lib.rs:106–170`), which deliberately does *not* call `run()`: it re-drives the same prompts individually (`:126–152`) so a **live model probe** can be slotted between the key and the model steps — `list_models_for_provider_blocking(provider_name, &api_key, None)` at `:141–146` feeding `set_available_models` (`:146`) for a numbered picker. **There is ZERO desktop onboarding wiring:** a search of `crates/desktop` for `SetupWizard` / `setup::` / `needs_setup` / `run_wizard` returns no hits, so the wizard is reachable only from a terminal. **The per-variant auth gap, precisely:** one generic `prompt_api_key` (`setup.rs:314–317` — `"API key (leave blank for local models): "`, taking no provider argument) serves **all seven `ProviderKind`s** (`:40–48` — OpenAI, Anthropic, Ollama, NvidiaNim, OpenRouter, OpenCodeZen, Other), and the **only per-kind delta anywhere in the wizard is `default_model`** (`:51–61`). There is no OAuth / device-code / token-exchange variant for any kind, and `Other` is a bare custom provider id with no base-URL or credential-shape step | **Two separable pieces, deliberately not merged here.** (a) Per-kind auth flows — an auth step that varies by provider kind, not a second generic key prompt. (b) A desktop onboarding surface, so the first-run experience does not require a terminal. Either can be taken alone; (a) is a `setup.rs` change, (b) is new UI. Re-entry is whichever the owner schedules first | M |
 | 11 | M-01: Estimator deduplication + `rag_pct` configurability | ADR-67 follow-ups (~92–98) | When Estimator/rag_pct consolidation is taken up | S |
 | 13 | Codebase cascade S1/S2/S3 (link store, scoring, slicing) | ADR-69 slices; IMPLEMENTED on fix/coordinator-error-invariant 2026-09-24 (S1 link store + write path, S1 activation, S2 scoring/decay/caps, purge fix, S3 observability — commits 60841dd/af98afe/224f0f9/7713b8d/7584d2d; tests green incl multi-hop guard) | CLOSED on merge of that branch + production proof (link verdicts firing, cascade reorder observed in a live run) | L |
 | 15 | ADR-60 Deferred item 4 — multi-level disclosure + real-embedder swap proof + scheduler/subscription generalization at high agent counts — **rescoped 2026-09-26 per owner clarification: "beyond 6 agents" is NOT a 6-agent cap** | ADR-60 Revision **v1.2 item 4** (`:150–151`: "Deferred item 4 (scheduler/subscription generalization beyond 6 agents, real-embedder swap, multi-level disclosure) remains deferred per ADR") — **not** `ADR-60:112`, which is only an IPC-overhead cost note ("acceptable at 3–6 agents; revisited only if profiling demands") and was the wrong cite for this row; ADR-60 `:31`/`:98` (v1 *scale* is 3–6 agents, but the scheduler/subscription model is "expressed with N not hardcoded anywhere"); ADR-58:247 (the same three items deferred) | **Doctrine: agents are ADDITIVE with no hard cap.** No `MAX_AGENTS` — or any total-agent limit — constant exists anywhere in `crates/`; the only agent-count-shaped cap in the gate is the **per-agent** `Semaphore` `WriteGate::max_in_flight_per_agent` (`crates/orchestrator/src/gate.rs:501,678,1084`), so nothing rejects an Nth agent and agents compose without a ceiling. The old "when profiling shows need beyond 6 agents" trigger is therefore **not** a re-entry gate: profiling pressure cannot unblock a cap that does not exist. What is genuinely open is the three sub-items themselves: **(a) multi-level disclosure** — today a *single* level, the `retrieve-memory` shortlist clamped to `DISCLOSURE_MAX_CHUNKS = 10` (`consolidation.rs:80`; `supervisor.rs:2118,2129`, `ADR-60:360`), with topic hierarchy, filter-by-relevance/recency, cross-subscriber backpressure signalling and schedule-driven pushes all behind item 4 (`ADR-60:326–329`); **(b) the real-embedder swap proof** — the swap is *real, not pending*, so this is a smaller residual than the old row implied: `ProviderEmbedder` runs `fastembed` (BAAI/bge-small-en-v1.5) on-device and is the production wiring (`memory/src/embedder.rs:42–110`; `orchestrator/src/runtime_runner.rs:1317`), so the consolidation projection no longer depends on the deterministic `feature-hash` placeholder — only the **fallback dependency** remains (retiring the `fastembed` fallback in favour of a provider-hosted embedding API, and the `EmbedderState::Unavailable` degradation path); **(c) scheduler/subscription generalization at high agent counts** — bounded slices, per-agent cursors and disclosure, characterized at 3–6 agents, not at swarm scale. | L |
@@ -103,17 +136,15 @@ a note.
 | 22 | ADR-47 message `parts` (canonical parts replace flat string content) | ADR-47:85–98 (deferred; flat model retained); ARCHITECTURE-V2.md:323 | **GATED DOCTRINE 2026-09-25** — stays OPEN, but gated on ADR-47's own reopen condition (:78–93): reopen **only** when a consumer proposes/needs richer message content the flat shape cannot express (multi-part tool bodies, image/file `File` parts, structured `Thinking`/`RedactedThinking` on Anthropic/Gemini paths, or structured data smuggled into `content: String`). Migration preconditions recorded 2026-09-25 — all three required before any parts work: **(a)** a named consumer need (ADR-47:80–81); **(b)** a parts-joined-text equivalence test — joining `parts` back to flat text must reproduce today's bytes, and Fix 2 strictness must not loosen (proxy-tool-call-fix.md:5,60 — content-embedded strict path buffers content to turn end); **(c)** a checkpoint/`state_json` migration plan for old rows (`orchestration_checkpoints.state_json` is `TEXT NOT NULL`, migration 019:10; `crates/sessions/src/lib.rs:150`), shipped additively with `serde(default)` + legacy-column fallback in one dedicated window, never as a side effect of an unrelated feature (ADR-47:62–65,109–110; ARCHITECTURE-V2.md §10). Verified migration-safe meanwhile: the Mimo/loose-tier tool mods operate on `ToolDefinition`/`ToolCall` **values**, not message shape — `schema_loose.rs:113` `adapt_tool_definitions(&mut [ToolDefinition])`, `:132` `unflatten_tool_arguments(&mut serde_json::Value)`, `google.rs:55` `adapt_tools_for` mutates `request.tools` — so they neither block nor depend on a parts migration. | L |
 | 23 | ADR-53 per-token streaming through WASM (heartbeat landed) — **stays OPEN and deferred; trigger sharpened 2026-09-27 to a named-consumer precondition, with the cost stated** | ADR-53 `docs/adrs/ADR-53-dialect-plugins-and-plugin-heartbeat.md:137–139` ("**No per-token streaming through WASM in this ADR** — streaming is deferred (§Consequences)"), restated as a Consequences deferral at `:171–172`; the deliberate no-ABI-change stance at `:48–50`, `:117–118` and `:170` ("no breaking change, no `abi_version` bump"); the liveness gap it was opened for at `:39–41`; heartbeat landed per ADR-53 §4 (`:128`) | **Precondition: build ONLY when a plugin kind actually generates tokens incrementally.** The ABI is single-shot *by construction*, not by omission: `guest_abi.rs:7` `HOST_ABI_VERSION = 1`; the return value is a `(ptr, len)` pair packed into one `i64` (`:9–16` `RESULT_ERROR`/`pack_ptr_len`/`unpack_ptr_len`); the only three exports are `call_provider`/`call_adapter`/`call_dialect` (`:31–42`, the dialect signature documented as 6 `i32` params → `i64` at `:39`); and the host resolves the export as `get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>` and makes **one** awaited call (`active_plugin.rs:149–166`). **No streaming export exists, and none can be added without a version bump.** Today the host awaits one `call_provider("complete", …)` future and maps the whole JSON result to **ONE** `CompletionChunk` (`provider_host.rs:146–149` awaited call → `:151`; `chunk_from_result` at `:155–163` reads `content`/`finish_reason` and builds a single chunk; the same single call inside the heartbeat task at `:195–199`). **The liveness case that motivated the deferral is already covered** by the landed heartbeat, which is why there is no urgency behind this row: `heartbeat_stream` (`:175–233`) interleaves `CompletionChunk::keepalive()` (`:218`) on a cadence while the call is in flight, wired from the manifest's `heartbeat_interval_secs` (`manager.rs:698–725`, `with_heartbeat`/`with_dialect`), with a no-heartbeat single-chunk fallback (`:344–354`, `futures::stream::once`). **There is NO consumer that would benefit today:** `PluginBackedProvider::stream_completion` (`provider_host.rs:287–288`) does return a real stream, collected by `PluginManager::collect_providers` (`manager.rs:744–746`) and consumed in the runtime wiring (`orchestrator/src/runtime_runner.rs:1688`) — but that stream is *keepalive chunks plus exactly one content chunk*, so a plugin that emits tokens incrementally over minutes would still deliver all of its output in a single terminal chunk. **Cost, stated so this is not scheduled as a generic "streaming" improvement:** it requires a new ABI export (or a host-fn chunk sink the guest calls repeatedly), **plus an ABI version bump** — and ADR-53 deliberately did neither (`:48–50`, `:117–118`, `:170`; §4 is titled "Plugin heartbeat — keepalive, **no streaming ABI**"). It is therefore a breaking guest-ABI change with a plugin-compatibility story, not a provider-host refactor. **Re-entry: a named plugin kind that generates tokens incrementally** (the motivating case being a plugin that wraps a slow local model); until one exists, the keepalive-plus-one-chunk stream is the correct v1. | M |
 | 24 | Shell Phases C–F + ADR-28 profile slices — **rescoped 2026-09-27: Phases A/B and profile slices 1–2 have LANDED; what remains is the C verbs plus D–F, and the row is split in two** (size **L → M**) | ADR-29 (`docs/adrs/ADR-29.md:3`, Accepted) is the runtime/policy execution decision. Repo plan `docs/custom-ai-shell-plan.md:125–228` = **Phase A–F** (A at `:125` already marked "**Implemented**"; B at `:143` "**Implemented at the library boundary**"; C `:184`, D `:199`, E `:209`, F `:219–228`). Research plan `docs/research/ai-native-shell-implementation-plan.md:11–510` = **Phase 0–5** (0 at `:11`, 5 at `:458`) — a *different* numbering for overlapping work. TODO.md:125–146 (both items; **the row's old `TODO.md:114–135` cite had drifted** onto other rows and is corrected here); ROADMAP.md:183–187. Profile slices come from ADR-28, which is **archived and superseded** by ADR-30 (shell selection) + ADR-29 (`docs/adrs/archive/ADR-28.md:3–10`, "not active guidance") — so ADR-28 is historical rationale here, not live authority, and the old row's "superseded in part by ADR-30 for shell selection only" understated it | **PREREQUISITE — reconcile the phase numbering before starting anything, as `TODO.md:136–137` explicitly instructs** ("fresh phase plan starting with the `ToolManifest` schema system (reconcile its phase numbering with `custom-ai-shell-plan.md` before starting)"). Two live plans number the same work incompatibly: the repo plan uses **A–F**, the research plan uses **0–5**. Settle which numbering governs (and whether the research plan supersedes, merges into, or is discarded alongside) before any "Phase C" work is named, or the two get silently merged into a scope neither plan approved. **LANDED — recorded so this row stops implying the shell runtime is unbuilt.** *Phase A (read-only builtins + runtime):* `crates/shell/src/builtins.rs:20–27` (`standard_commands` → `help`/`project-info`/`ls-tree`/`last`), `runtime.rs:43–58` (`ShellRuntime::standard`, every command registered read-only), `parser.rs:33–60` (`parse_command_line` — quoted tokenizing, no shell expansion), `model.rs:24–31` (`CommandStatus::permits_continuation`/`is_success`). *Phase B (policy-gated external exec):* `shell/src/execution.rs:35–80` (`PolicyExecutionAdapter::execute` funnels through `ToolExecutor::execute("shell", …)`, so no command spawns a process itself) and `:73–83` (`external_commands` → `run`/`shell-run`/`shell-profiles`); `profile.rs:13` (`ShellProfileCatalog` — the shell consumes canonical config instead of keeping a second selector, per ADR-30); `config/src/shell.rs:58` `ShellProfileConfig`. *Quoting / argv-direct:* `tools/src/shell.rs:349–441` (`windows_arg_needs_quoting`, `shell_quote_windows`, `shell_quote_posix`, `shell_quote`) with `validate_cmd_args:510` rejecting arguments cmd.exe would `%`-expand, and `:614–640` `legacy_shell_plan` returning `ShellPlan::Direct` argv-direct at `:623–627` (bypass_shell, and Windows where no shell semantics are needed); `tools/src/shell_backend.rs:57–59` `command_args`. *ADR-55 containment:* `tools/src/containment.rs:1–30` (argv/cwd confinement — out-of-root `cd`/`pushd`, path-like args on mutation verbs, `xargs` pipeline laundering of a read-exempt argument, redirect writes). *CPU budget (row 45's portable layer):* `tools/src/shell.rs:65–69` `resolve_cpu_budget` (config wins, including `Some(0)` = off, else `CONCERTO_SHELL_CPU_BUDGET_SECS`), `:875–880`, `:1231–1303` (`plan_takes_cpu_backstop`, the soft-only `cpu_limit_prelude` `ulimit -S -t`, and `spawn_plan` → `ProcessHandle::run_limited`), plus `tools/src/cpu_accounting.rs`. *OS identity card:* `orchestrator/src/prompts.rs:175–180` (always appended, never empty, never errors) and `:375` `environment_card` (profile facts, else OS facts + `detect_os_default_shell`; no process spawned). *Bounded shell repair:* `orchestrator/src/shell_repair.rs` (its own doc calls it a "Phase C subset"); `MAX_SHELL_REPAIR_ATTEMPTS = 5` at `:36`, char caps at `:40–42`, and policy outcomes are **never** repaired (a denial is not coached around) with cancellation spending no turn. *Slice 1 (test profile + availability):* `config/src/shell.rs:235–242` `availability()`, documented "ADR-28 Slice 1"; `tools/src/shell_backend.rs:45–46,69–80,117–124` `check_available`; the desktop Test-profile action is live (`views/settings/shell.rs:164–183` messages, `:403` button; state field labelled "ADR-28 Slice 1" at `state.rs:144–146`). *Slice 2 (Managed Bash PoC) — also landed, and it is **not** a stub:* `config/src/managed.rs` (347 lines) does the versioned, offline, integrity-checked install ADR-28 asked for — versioned dir under `<data>/concerto/managed-bash/<version>/bash` (`:114–119`, `install_from` `:152–194`), blake3 integrity + `verify` (`:205–232`), manifest export/import (`:235–249`), `remove` (`:197–202`), bounded 2 s version probe (`:251–262`); `tools/src/shell_backend.rs:88–125` `ManagedBash` is a **complete** `ShellBackend` impl (not a placeholder) resolving through `ManagedRuntimeManager::auto_detect`; `ManagedEnvConfig` (`config/src/shell.rs:352`) is **not** unused — it is held at `:376` (`ShellSettings.managed`), re-exported at `lib.rs:67`, and populated from the live runtime at `desktop/…/views/settings/state.rs:754–762`; the install/remove/verify/export/import UI is wired (`views/settings/helpers.rs:39,55,95,109`; `settings/shell.rs:187–223` messages, `:509–544` buttons). **REMAINING GAP, stated precisely.** **(a) Phase C's `explain`/`debug`/`optimize` commands are ABSENT** — no such command exists; the intelligence is *prompt content plus repair*, not invocable commands (the plan's own "Shipped subset (2026-09-07)" note, `custom-ai-shell-plan.md:193–197`). A search of `crates/shell/src` for those names returns only `#[derive(Debug)]` attributes and one unrelated doc comment. **(b) Phase D deterministic workflows are ABSENT** — there is no workflow AST: `WorkflowAst` has **zero** matches under `crates/`, and `shell/src/model.rs:100` `Workflow` is a variant of the `CommandSource` enum (`:93–103`), i.e. a provenance tag with no AST behind it. Consequently no cycle/variable/result-type/effect validation, no checkpoints or resumable execution, no bounded retry/fallback/approval/parallel nodes, no execution trace. **(c) Phase E's shell tool/plugin ABI is ABSENT in the shell crate** — `shell/src/registry.rs:38–68` is a static in-process register (`register`/`get`/`specs` over a `RwLock<BTreeMap<..>>`), not an ABI; the real WASM ABI lives in `crates/plugins` (`guest_abi.rs`, `active_plugin.rs::call_json_export`) and **nothing bridges the shell command spec/result envelope to it**, so no shell command can be shipped as a plugin and no custom tool can add shell schemas, renderers, or effect declarations. **(d) Phase F measured self-improvement is ABSENT** — no history mining, no alias/workflow-rewrite suggestion, no validate-before-promotion gate, no provenance/comparison evidence; `shell/src/history.rs` is a bounded in-memory `VecDeque<CommandResult>` that feeds the `last` meta-command and is not a learning loop. *Slice 2 residual (small, specific):* two ADR-28 requirements are unmet — **controlled `PATH`** (`tools/src/shell_backend.rs:109–115` `effective_env` just clones the base env instead of constraining `PATH`) and **PTY-backed terminal** (a `\bpty\b` search under `crates/` returns nothing; there is no PTY dependency anywhere in the workspace). Distribution of a vetted Bash binary is explicitly the later licensing-gated slice (`config/src/managed.rs:10–13`, `views/settings/helpers.rs:36–37`). *Slice 3 (cross-platform packaging):* **not started** — consistent with a deliberately Linux-first PoC, and it is licensing/provenance-gated by ADR-28's own framing. **THE WORK IS SPLIT IN TWO, and the re-entry follows the split.** **(1) The C verbs are one self-contained piece** — prompt/LLM work that reuses the existing `ShellCommand` trait, registry and `CommandResult` envelope, with no new state machine, no persistence, and no new ABI; `explain`/`debug`/`optimize` can and should ship on their own. **(2) D–F are a separate and larger design decision** — a workflow AST is a new persistence + execution model (versioning, validation, checkpoint/resume, node scheduling), and Phase E additionally needs a shell↔WASM ABI decision; neither can ride along on an "add three commands" change. **Re-entry: (0) reconcile the phase numbering, then (1) take the C verbs as its own change, and (2) take D–F only as its own decision** — ADR-first per the repo ADR rule, since a workflow AST is exactly the kind of architectural decision that needs a record before dependent code. | M |
-| 25 | Code editor integration (external editor + open-in-editor + diffs) | TODO.md:157; ROADMAP | Post-1.0 | M |
 | 27 | Pricing/metadata freshness feeds the VISUAL SPEND TRACKER ONLY (rescoped 2026-09-25: display-only, spend tracker) | TODO.md:201; STATUS.md tracked follow-ups | When the display-only pricing/metadata freshness flow lands. Stale prices make usage dollars wrong; routing must never see prices. Non-goal: the coordinator must never know or care about cheap vs expensive models; no cost-based routing, no model switching on price, and no coordinator coupling of any kind. | M |
-| 28 | ADR-58 P5/P6 + TOML diff + canvas DAG editor + partitioning | ADR-58:238–247; STATUS.md ~328–355 (deferred P5 Studio, P6 items, TOML diff, run-one-stage, multi-executor partitioning) | Post-P6 roadmap phase (explicit ADR-58 deferral items) | L |
-| 29 | ADR-43 server mode / SSE / marketplace / persistent desktop state / TOML secrets | ADR-43 §3 v1 note (MCP server mode, SSE transport, marketplace/registry, keyring-backed tokens, persistent desktop state deferred); docs/skills.md:202 | When the API surface / web UI materializes | L |
+| 29 | ADR-43 server mode / SSE / marketplace / persistent desktop state / TOML secrets — **reviewed 2026-09-27 (owner decision): still deferred, no status and no size change** | ADR-43 §3 v1 note (MCP server mode, SSE transport, marketplace/registry, keyring-backed tokens, persistent desktop state deferred); docs/skills.md:202 | When the API surface / web UI materializes | L |
 | 30 | Plugin hot-reload / remote / registry / marketplace | TODO.md:108–110 | Requires community/registry story (ADR-21, ADR-43 deferred) | L |
 | 31 | L1/STM/PersonaMem memory items (typed extraction, scene memory, persona eval) | TODO.md:58–99 (L1 70–80, STM 65–70, heuristics 89–95, PersonaMem 96–99) | Post-memory relayout (ADR-63/64) | M |
 | 32 | Certified evolution (profile-guided CI, safety gates) | TODO.md:286–293; ROADMAP:189–193 — `[dangling-cite]` the referenced `docs/research/certified-universal-evolution.md` (cited at TODO.md:287, ROADMAP:190) is missing on disk | When certified-evolution research plan lands (restore/rewrite the research doc or re-scope) | L |
 | 34 | C-05/C-06/C-03 + M-08/M-05/M-02 audit cleanups | TODO.md:38–41 (C-05), 237 (C-06), 32–33 (C-03), 241 (M-08), 246 (M-05), 251 (M-02); AUDIT_FINDINGS_CURRENT.md | When module refactors + coverage are scheduled | L |
 | 35 | STATUS-tracked follow-ups (ENV_LOCK, glyphs, multiline, P4/ADR-59 deferrals, release checklist) | STATUS.md "Tracked follow-ups" ~328–355 | Per tracked follow-up row; each release | M |
 | 36 | Containerized sandbox bundle — `SandboxProfile::Containerized` OS-level isolation — **shipped 2026-09-26 for the container path (row STAYS OPEN: only the Windows path is outstanding)** | TODO.md:103; ROADMAP:235; security-threat-model.md §6 gap #1 (:310–315, "No Containerized Plugin Sandbox"); was a real stub — variant declared but not implemented (architecture.md:250, STATUS.md:272), plugins ran only under the WASM capability sandbox. **Landed 2026-09-26 in three slices:** `d00582b` (ADR-72 + enforceable core half — `core::sandbox` docker/podman runtime detection, `SimplePolicyEngine::check_sandbox` fail-closed admission gate, rules `sandbox_containerized_runtime_unavailable` / `_unenforceable`), `3ae6ea5` (shell invocations actually routed through the container — `tools::container` builds the `docker`/`podman run` argv from a planned `ShellPlan` as `ShellPlan::Direct`, opt-in `ShellTool::with_container`, `command_facts` audits the container argv), `fdf4800` (`CommandRouting` marker — closes the fail-open where `Containerized` was selected without routing) | **Windows path only.** Windows Job Objects need `unsafe` FFI (`windows-sys` `CreateJobObjectW` / `AssignProcessToJobObject`), which the workspace hard-denies (`[workspace.lints] unsafe_code`). ADR-72 §5 records v1 as **unsupported on Windows** (probe returns `Unavailable` → `Containerized` refused, fail-closed and honest), not shipped. Recorded options for a future Windows story: **(a)** a narrow, audited `unsafe` exception; **(b)** the safe high-level `windows` crate — safe Job Object bindings, no `unsafe` in our code, but a new dependency requiring its own ADR; **(c)** accept Linux/macOS-only with loud documentation. **Re-entry: a superseding ADR that chooses among (a)/(b)/(c).** | L |
-| 37 | Hybrid UI full scope (tabbed Settings, Studio split pane, drag-and-drop agent assignment, focus-trap) | TODO.md:145; ROADMAP:147 (post-1.0); docs/hybrid-ui-plan.md — standalone, not part of the world-class plan | Post-1.0 | L |
+| 37 | Hybrid UI full scope (tabbed Settings, Studio split pane, drag-and-drop agent assignment, focus-trap) — **rescoped 2026-09-27 per owner: Minimal + Medium tiers are LANDED, what remains is finish-and-polish with no correctness content. Row STAYS OPEN and deferred post-1.0** (size **L → M**) | **Full scope defined at `docs/hybrid-ui-plan.md:89`** — "All of Medium, plus split Settings into tabbed sub-views, convert Studio to split pane, add drag-and-drop agent assignment, animated panels, focus-trap system." **Citation corrected:** the row's old `TODO.md:145` had drifted onto an unrelated ADR-28 shell-profile note; the full-scope item is at `TODO.md:156–158` and `ROADMAP:147–149`; the landed medium scope is `TODO.md:150–155`. `docs/hybrid-ui-plan.md` is standalone, not part of the world-class plan | **LANDED — recorded so this row stops implying the hybrid UI is unbuilt** (the plan's own status list at `hybrid-ui-plan.md:306–317`; `TODO.md:150–155` for PR #49 Minimal and PR #97 Medium, merged 2026-08-03, commits `1c916b4` memory quick-panel, `4a12839` terminal bottom panel, `ade0c7b` glass modals + overlay/panel animations, `3d691a2` timestamps + transcript format v2, `f8c7b42` blinking cursor). Code anchors verified in the tree: the `SubView` overlay enum at `crates/desktop/src/views/chat.rs:23–25` (`Main`/`Diff`/`AgentGraph`/`ToolLog`/`SpendLog`/`Runtime`) with keyboard routing at `app.rs:1218–1222`; the shared animation layer at `app.rs:498` `ease_out_cubic` and `:4030`; the terminal as a toggleable bottom panel with drag resize (`app.rs:398` `terminal_panel_height`, `:2033–2046`, `:4030`); the memory quick-panel section (`views/quick_panel.rs`, `views/memory.rs`). **REMAINS**, as `crates/desktop/AGENTS.md:65–66` records: "⬜ State lifecycle: lazy init for infrequently used views" and "⬜ Full scope: tabbed Settings, Studio split pane, focus trap" — **plus drag-and-drop agent assignment, which is named in the plan (`:89`), `TODO.md:156–158` and `ROADMAP:147–149` but is *not* on the AGENTS.md ⬜ line** (that line names three items; the plan names four). Precisely, as of 2026-09-27: **(a) tabbed Settings — not done.** Settings is still one scrolling page of **9 collapsible sections** with a jump-sidebar (`views/settings/message.rs:372–382` `SectionId::ALL` = Theme, Providers, Assignments, Policy, Relationships, Retry, Memory, Shell, Extensions; rendered via `collapsible_section` at `views/settings/mod.rs:1049–1054`, sidebar at `:1060–1070`). The *Extensions hub* alone is tabbed, via `ExtensionTab` (`message.rs:342`, wired `mod.rs:1177–1201` — Skills / MCP / Plugins / ProjectContext), so there is no `SectionId::Skills`/`SectionId::Mcp` to tab away from: Skills and MCP are `ExtensionTab` variants inside `SectionId::Extensions`, not top-level sections. **(b) Studio split pane — absent** (Studio renders as a single surface, `views/orchestration_studio.rs`). **(c) drag-and-drop agent assignment — absent.** **(d) focus-trap system — absent.** **(e) lazy-init state lifecycle — absent.** **Size L → M, and why:** the reduction is earned, not optimistic — the two tiers that carried the hours are landed (Minimal ~20–30h and Medium ~60–90h per `hybrid-ui-plan.md:62`/`:75`), and every remaining item is layout/information-architecture polish with **no correctness, policy, or data-integrity content**, so the remainder is a finish pass rather than a design problem. **One caveat stated so "M" is not read as "free":** the plan's Medium item "SubView routing fully replaces `Page` for Chat-adjacent views" (`:83`) and its step 6 "Remove unused `Page` variants" (`:300`) are **not** done — `Page::DiffViewer` and `Page::ToolLog` are still routed and rendered (`app.rs:3973–3974`) and are still reachable from the context bar (`views/context_bar.rs:29–30`) and the quick panel (`views/quick_panel.rs:146`), so collapsing the `Page`/`SubView` dual path is real de-duplication work inside the remaining scope. **LAZY-INIT is the one remaining item with a felt, user-visible payoff** (it is the only one that changes startup cost and responsiveness rather than looks) and **may be pulled forward** ahead of the rest. | Post-1.0 | M |
 | 38 | Flat/content-embedded tool-call parsing residual (beyond proxy Fixes 1–3) | TODO.md:190–195; ROADMAP:165–168 (residual after Fixes 1–3 landed, see Closed #8); docs/proxy-tool-call-fix.md | When sanitized proxy fixtures + pairwise verification land against real OpenAI-compatible proxies | S |
 | 39 | Binary installers (deb/rpm/tar) | TODO.md:260–263; ROADMAP:194 (Later); STATUS.md:11–14 (no installer packages promised today; only `.tar.gz` via scripts/release.sh) | When a release/distribution decision is made | M |
 | 40 | crates.io publish | TODO.md:264–265; ROADMAP:194 (Later); STATUS.md:12–13 (not published; `publish = false` in workspace Cargo.toml) | Release decision + metadata audit (workspace `publish=false`, licence, repository links) | M |
@@ -142,6 +173,11 @@ a note.
 14. Review/validation escalation events (threat: informational evidence; no terminal conversion) — **row #33 cut 2026-09-26 per owner decision; closed 2026-09-26 in `9385ecf`.** The row tracked two `EventKind` variants, `ReviewCycleEscalated` and `ValidationEscalated`, cited at `core/src/event.rs:386,394` as "event-bearing only". Both were **dead weight**: neither had a publish site, and the live escalation path is verdict-driven and event-free — `progress::CycleVerdict::Escalate` stops the coordinator's decision loop (`coordinator.rs:10817`) and surfaces an informational `AgentThought`. The commit removed the variants plus every now-dead reference in the same sweep (transcript rendering arms, desktop activity-translation arms, fault-injection test-observer arms/fields — `crates/core/src/event.rs`, `crates/core/src/transcript.rs`, `crates/desktop/src/runtime.rs`, `crates/orchestrator/src/fault_injection.rs`), and left an in-place comment at `event.rs:394–397` recording *why* no escalation event kind is part of the live contract, so the vocabulary does not drift back. **Not a miscitation and not a cancellation:** the deferral was real once, the implementation it named was simply never written because the design moved to a verdict, and the honest resolution is to delete the placeholder rather than to keep a task that no longer has a consumer. `EventKind` is `#[non_exhaustive]`, so external exhaustive matches already carried a wildcard and the live `Escalate` path is untouched. The `#33` numbering gap is left intentionally (no renumbering), matching the row 10 / 12 / 14 / 19 / 21 / 26 precedent.
 15. Audit-log at-rest encryption + retention (threat gap #5; former row 19, merged 2026-09-25) — **row #44 closed 2026-09-26; shipped in `7351128` with ADR-73 (Accepted).** Both halves the row was merged around landed together, which is what the 2026-09-25 merge rationale predicted: `crates/sessions/src/at_rest.rs` (SQLCipher via `bundled-sqlcipher` feature unification on `libsqlite3-sys`, so the persistence layer stays plain sqlx and the key travels as `PRAGMA key`; 32-byte hex key resolved `CONCERTO_AUDIT_DB_ENCRYPTION_KEY` → OS keychain account `audit/db_encryption_key` → generate-once-and-store, failing closed with **no plaintext fallback**; a `<db>.sqlcipher` marker so the ADR-54 plaintext-header quarantine heuristic never misclassifies a healthy encrypted store, and a **two-phase** `<db>.migrating` marker so a crash mid-swap can never leave the final marker beside a plaintext database; `sqlcipher_export` into `<db>.enc-tmp`, key-verified, then two renames with `<db>.old` swept after the first successful keyed open; statement logging disabled on keyed connections so the key pragma never reaches a log sink) and `crates/sessions/src/audit_retention.rs` (archive-then-prune into an encrypted `audit-archive.db`; a failed archive write **aborts** the prune, so rows are never deleted un-archived), with `crates/sessions/migrations/033_audit_created_at_index.sql` and the `[audit]` config section (`crates/config/src/schema.rs:840–881`). ADR-73 (`docs/adrs/ADR-73-audit-encryption-and-retention.md`) answers the question ADR-40:47 deliberately left open, amending ADR-40 §Decision item 3 only and affirming items 1, 2 and 4. **Recorded honestly, the *posture* is opt-in and the *capability* is complete:** `encrypt_at_rest` defaults to `false` and `retention_days` to `None`, so a default install is still plaintext and still grow-only — a deliberate, ADR-73-documented choice (`:151–153`, `:238`; "nothing is ever deleted or encrypted behind the user's back"), not a gap in the delivered work. `docs/security-threat-model.md` §6 gap #5 is still worded as open and is **not** reconciled by that commit; tracked as a docs follow-up, not as a new register row.
 16. ADR-60 S5 agent-process slice — mock-only provider + `DenyAllApprovalSink` — **row #49 closed 2026-09-26; landed in two commits.** The row tracked the two stubs the child carried: `CONCERTO_PROVIDER` accepted only `"mock"` (`agent_process.rs:137–152`) and interactive approvals were dropped as a `DenyAllApprovalSink` (`:155`, `:292–336`), so a supervised run could never talk to a real model and could never prompt for approval. `d62ebac` (real provider injection) replaced the stub with a new `crates/orchestrator/src/agent_process_config.rs`: the child rebuilds its provider through `ProviderFactory::config_for_model` + `ProviderFactory::build` against a `CredentialStore`, i.e. the same keyring path the parent uses, and **never silently substitutes a mock** — no configured provider is the named error `NoProviderConfigured` ("refusing to fall back to mock"), an unreadable credential fails closed the same way, and the scripted mock is now an **explicit opt-in** (`MOCK_PROVIDER = "mock"`, `selects_mock()`; unset, empty or any other value does *not* select it). `7859a0a` (approval IPC) added the bridge over the existing newline-delimited stdio transport — new `IpcMethod::ApprovalRequest` / `ApprovalResolved` and an `ApprovalActionWire` projection (`ipc.rs:69–90`, `:374–390`), a child-side `ApprovalProxySink` that forwards each request to the supervisor (`bin/agent_process.rs:163–168`), and supervisor-side handlers that route to the **same `Arc<dyn ApprovalSink>` the in-process coordinator/single-agent paths use** (`SupervisorServices::approval_sink`, `supervisor.rs:764`), so supervised approvals light up the existing UI rather than a parallel system; the returned decision is applied child-side and the authoritative `ApprovalRequested`/`ApprovalResolved` audit events are published under the request's real session + correlation identity. **Fail-closed is preserved end to end**, and that was the point of routing through the same sink: no sink configured, a cancelled run (teardown), a malformed/unattributable session identity, an unknown wire decision label, a transport error, or a closed channel **all answer `deny`** (`supervisor.rs:1933–2010`; `ipc.rs:415–417` — an unrecognized `#[non_exhaustive]` label is "a protocol violation the caller answers with a deny"; the child's own default is unchanged). **Residual, recorded rather than dropped: the approval wire carries `session_id` + `correlation_id` but no embedded `run_id`.** The envelope therefore cannot attribute an approval to a specific run, because `SupervisorServices` holds no run-scope field either; closing it needs either a `core` event-contract change (widening the `ApprovalRequested`/`ApprovalResolved` shape) or run-scope plumbing through `SupervisorServices`. Neither rides along with a docs change. The two items the row's re-entry condition named — real provider injection, and approvals surfaced through the supervisor rather than always denied — are both delivered; the row is closed, not merged into another, and the `#49` numbering gap is left intentionally (no renumbering).
+
+17. Code editor integration (external editor / open-in-editor) — **row #25 cut 2026-09-27 per owner decision.** The row covered the **external** editor track only: configurable external editors with file/line/column launch templates, plus an "Open in editor" handoff from diffs, tool logs, chat references and memory (`ROADMAP.md:188–191`; `docs/TODO.md:168–173`, which already read "**Not started** — no code exists". The register's own `TODO.md:157` cite had drifted onto the hybrid-UI item and is corrected here). **Verified absent, not assumed:** a search of `crates/` for `open_in_editor` returns **zero** hits, and there is no `$EDITOR`/`$VISUAL` wiring anywhere — the only `EDITOR` occurrences in the whole tree are an unrelated shell-env fixture in `crates/config/src/shell.rs:958–963` (test setup, not an editor launch). **Recorded honestly so the cut is reversible: nothing neighbouring the row went with it.** An in-app editor with syntax highlighting and LSP integration is landed — `crates/desktop/src/views/code_editor/mod.rs:1–7` (hierarchical file tree, multi-line editor with `iced_highlighter` highlighting, open/save/new/delete, and hover / diagnostics / go-to-definition via `concerto-lsp`), routed as `Page::Editor` (`app.rs:81`) and rendered at `app.rs:3999` — and a diff viewer is landed (`Page::DiffViewer` at `app.rs:79`, rendered `app.rs:3974`, widget in `widgets/diff_viewer.rs`). `TODO.md:172–173` already distinguishes the two features ("the studio `Editor` … is a different feature (in-app code editor)"). **If the external-editor handoff is ever wanted again it composes with the in-app editor; it does not replace it.** The in-app editor is what a file/line handoff would target, and an external protocol would be an additional launch path layered on top of it, never a substitute for it. This is a **scope** cut, not a claim that external editing is unwanted. Two stale lines left for a later docs pass, flagged not fixed: `ROADMAP.md:190–191` still frames the embedded editor as "only considered later if it clearly beats a reliable external-editor protocol" (the embedded editor has since landed, so the comparison it sets up no longer holds), and `TODO.md:172–173` cites `docs/desktop-cli-parity.md:103-104` for the `Editor` row, which is actually at `:96–97`.
+18. ADR-58 P5/P6 + TOML diff + canvas DAG editor + multi-executor partitioning — **row #28 cut 2026-09-27 per owner decision**, on the grounds that the orchestration-studio UI is scheduled for a separate refactor and every item here would have to be re-specified against that new UI. **What the row covered, recorded so the cut is auditable** — ADR-58's own Deferred/Sequencing table (`docs/adrs/ADR-58-configurable-orchestration.md:238–247`): **P5 (pending)** = "Migration runner for legacy `multi_agent` configs; export-merge hardening" (`:243`); **P6 (deferred)** = "Graph/DAG config support; run-one-stage simulation; freeze decisions" (`:244`); **"Explicitly deferred"** = "TOML diff view of include changes; canvas DAG editor; multi-executor artifact partitioning (primary stays a plain flag)" (`:246`). ADR-59 carries the same tail (`docs/adrs/ADR-59-studio-blueprint-editor.md:172–177` — P5 migration runner + export-merge hardening; P6 "freeze/stable-surface decisions"; "Diff view and DAG canvas editor: post-P4 stretch, not planned here"), and `docs/STATUS.md:346–349` mirrors it as tracked follow-up #4. **State of each item, checked rather than assumed** — and it is *not* a uniform blank: **(a) the migration runner is genuinely ABSENT.** No code converts a legacy `multi_agent`-only config into an `[orchestration]` blueprint, and ADR-59:169–170 still states the pre-P5 condition as current ("legacy `multi_agent` remains authoritative only while `[orchestration]` is absent"). `crates/config/src/migration.rs` exists but is *schema_version* step migration (v1→v2 and so on, filling fields with defaults) — a different mechanism, not the P5 runner. **(b) export-merge hardening is substantially LANDED as a side effect, not absent** — `crates/config/src/saving.rs:1–40` documents exactly that: merge-aware `toml_edit` writers (`merge_edit_toml` preserving comments, key order and unedited keys), every writer atomic via temp-file-plus-`rename`, and `seed_orchestration_roster` / `save_agent_roster` writing only the keys they own and preserving the rest of the document byte-for-byte. This is the behaviour P5's "export-merge hardening" asked for; ADR-59:99 lists "post-seed `config.toml` wholesale rewriting" as a **non-goal**, which the merge-aware writers are the reason for. **(c) Graph/DAG *config* support, (d) run-one-stage simulation, (e) the Studio-level freeze / stable-surface decision, (f) the TOML diff view, (g) the canvas DAG editor and (h) multi-executor partitioning are all ABSENT — no implementation and no scaffold.** Searches of `crates/` for `run_one_stage`, `freeze_decision`, `export_merge`, `migration_runner`, `multi_executor`, `executor_partition`, `toml_diff`/`TomlDiff`, `stable_surface`, `SimpleTier`/`simple_tier` return **zero** matches. The `DAG` and `Freeze` symbols that *do* exist are a different, already-landed subsystem and are **not** this row: `orchestrator/src/graph.rs` + `scheduler.rs` + `task_transform.rs` are the runtime `SubTask` task-DAG, including a real `TaskTransformSpec::Freeze` (`task_transform.rs:163–189`, `apply_freeze` at `:542–618`) behind the model-driven "reconsider" decision. None of that is a *config-authorable* graph, a run-one-stage simulation, or a config-surface freeze; the Studio remains a roster/relationships/blueprint CRUD editor (`views/orchestration_studio.rs`). One source inconsistency recorded, not fixed: `docs/STATUS.md:347` labels a "**Studio Simple tier**" as part of P5, but ADR-58's revised decision demoted the tier notion entirely (the blueprint catalog is "advisory data", seeds are materialized into user config) and no "Simple tier" string exists in either the ADR or the code. **This cut is a scoping decision for a UI plan that is being replaced — it is NOT a claim that these capabilities are unwanted.** The P5 migration runner in particular is real standing debt independent of any UI, and after the studio refactor its natural home is whatever that new UI is specced against; if it is wanted before then, it is a config-layer task with no UI dependency at all.
+
+19. Per-session ack queue (bounded depth + ack policy) — **row #4 closed 2026-09-27; landed in `8e3c350`.** ADR-68 §6 (`docs/adrs/ADR-68-h04-session-ack-breaking-param.md:78–86`) recorded only the *policy* — queue a second ack behind the active one, bounded at "1 pending ack beyond the active one", with overflow rejecting via an explicit error — and explicitly deferred the implementation to "the implementation phase". That phase is now the shipped state, and it shipped in the direction §6 chose rather than the opposite one an earlier register note recorded. `SharedPendingAck` is no longer a single `Option` but a depth-bounded FIFO, `Arc<Mutex<VecDeque<PendingAck>>>` (`desktop/src/widgets/capability_dialog.rs:137`), with new `enqueue_ack` (`:151`) and `ack_queue_position` (`:180`), and `ack_view` / `resolve_ack` retargeted to the queue front. **The bound is `MAX_PENDING_ACKS = 2`** (`:98`, rationale on the constant at `:84–97`) — the active dialog plus one queued, which is the bound ADR-68 §6 names, and deliberately tiny because an ack is a *blocking, user-facing* confirmation: one active is what the user can actually read, the single queued slot stops a concurrent prompt from overwriting the first, and a deeper queue would only delay the *second* prompt past the point where its requester is still waiting while letting an ack storm grow UI state without bound. **Overflow is an explicit rejection, never a silent drop.** `AckQueueError` (`:105–114`) has exactly the two fail-closed cases — `QueueFull { capacity }` when the bound is already reached (the new request never displaces an already-pending ack), and `StateUnavailable` when the shared lock is poisoned (the desktop cannot prove the request was recorded, and must not report "no pending acks" for a request that was actually made). The sink maps either to `false` (abort the task) **and** publishes a fresh `DesktopEvent::ErrorOccurred` (`app.rs:4776–4778`), which the app renders as an error toast — so *shown*, *queued* and *refused* are three distinguishable user-visible outcomes instead of one silent no-op. **Session gating is preserved through the queue:** `resolve_ack` pops the front entry and answers it only when its `session_id` matches the caller, restoring a non-matching entry to the front so its owning session still sees its dialog (`capability_dialog.rs:233–246`) — a stale or cross-session entry can never answer another run's prompt, and because resolution drains in order the queued second ack cannot jump the active first. **Dialog indicator:** `ack_queue_position` returns `None` for ≤1 pending, so the single-ack modal layout is byte-for-byte unchanged, and `Some("Acknowledgement 1 of N pending")` for N≥2 (`:180–185`), inserted into the modal only in that case (`:207–213`) so the user can see they have N outstanding acknowledgements rather than believing the displayed one is the only prompt. Supporting call sites: `DesktopApprovalSink::request_ack` enqueues through `enqueue_ack` (`app.rs:4760`) and the status-bar dialog-waiting check moved from `is_some()` to `!is_empty()` (`views/status_bar.rs:58`). **Audit-seam reachability was a finding, not a gap — stated plainly because it is the one part of the row whose work was smaller than the row implied.** The production wiring already existed and predates this commit: `AgentLoop::setup_undo_stash` (`orchestrator/src/agent_loop.rs:1225–1227`) → `ToolExecutionBackend::record_ack_decision` → `InProcessGateBackend` → `ToolExecutor::record_ack_decision`, attributable by `git log` to `26e3fc9` ("ADR-66 phase 1"). The deliverable was therefore a **reachability test** — `in_process_gate::tests::record_ack_decision_writes_request_continue_and_abort_rows` (`orchestrator/src/in_process_gate.rs:554`) — proving the seam writes a `RequestContinue` row for a continuing ack and a `RequestAbort` row for a refused one; alongside it, a now-false doc comment on `ToolExecutor::record_ack_decision` claiming that "nothing calls this in production" was corrected to name the real call chain (`core/src/executor.rs:298–303`). **Residual, recorded rather than dropped: an overflow refusal is audited as `RequestAbort`.** The `ApprovalSink::request_ack` contract returns only `bool`, so the sink cannot hand the audit seam a reason — in the trail an overflow refusal is separable from a user cancel **only by message text, not by a distinct verdict**. Closing that needs a widened `ApprovalSink::request_ack` (a typed decision instead of a bare `bool`), a contract change reaching every sink, and is explicitly out of scope for this commit; it is recorded here so the closure is not read as claiming full audit fidelity for the refusal path. The `#4` numbering gap is left intentionally (no renumbering), matching the row 10 / 12 / 14 / 19 / 21 / 25 / 26 / 28 / 33 / 44 / 47 / 49 precedent.
 
 ## Verification notes (2026-09-24)
 
@@ -674,3 +710,289 @@ untouched.
     ("Not started" for work that landed in `f4bdc4f`); `ROADMAP.md:241–245`;
     and the `— manual` orphan fragment in the 2026-09-24 notes above (line ~170),
     still unrepaired.
+
+## Verification notes (2026-09-27, owner decisions pass)
+
+Owner decisions of 2026-09-27 covering rows 4, 25, 28, 37, 9 and 29, executed
+2026-09-27 against `fix/coordinator-error-invariant` at HEAD `2cada54`. Every
+claim below was read in the tree or in the cited source document, not taken from
+a commit message. **Docs only — no source edits, no builds, no test runs, no
+commit**; the tree is left for the orchestrator to commit.
+
+- **Scope of this pass: rows 25 and 28 cut, row 37 rescoped, row 9 corrected,
+  row 29 annotated-only, row 4 read-only.** Two rows leave the open table and
+  land in the Closed appendix as #17 and #18. No renumbering: the open-table
+  gaps are now 10, 12, 14, 19, 21, **25**, 26, **28**, 33, 44, 47, 49, all left
+  intentionally, matching the row 10 / 12 / 14 / 19 / 26 precedent.
+- **Row 25 cut** (see Closed #17). The external-editor integration is verifiably
+  unbuilt — zero `open_in_editor` hits under `crates/`, no `$EDITOR`/`$VISUAL`
+  wiring (the only `EDITOR` strings in the tree are a shell-env test fixture at
+  `config/src/shell.rs:958–963`). What the cut explicitly does **not** touch is
+  recorded in the appendix so the decision is reversible: the in-app editor is
+  landed (`views/code_editor/mod.rs:1–7` — file tree, `iced_highlighter`
+  highlighting, file ops, and LSP hover/diagnostics/go-to-definition through
+  `concerto-lsp`; `Page::Editor` at `app.rs:81`, rendered `app.rs:3999`) and the
+  diff viewer is landed (`Page::DiffViewer` at `app.rs:79`, rendered `app.rs:3974`).
+  Two citation problems surfaced and are fixed in the appendix: the row's
+  `TODO.md:157` had drifted onto the hybrid-UI item (the editor entry is
+  `TODO.md:168–173`), and `TODO.md:172–173` in turn cites
+  `docs/desktop-cli-parity.md:103-104` for the `Editor` row, which is actually at
+  `:96–97`. Also flagged, not fixed (outside this pass): `ROADMAP.md:190–191`
+  still frames the embedded editor as a maybe-later alternative to an external
+  protocol, which no longer holds now that the embedded editor has shipped.
+- **Row 28 cut** (see Closed #18). The cut is justified by the owner's reason —
+  the orchestration-studio UI is scheduled for a separate refactor and every
+  item would be re-specified against it — and the appendix records ADR-58's own
+  P5/P6 wording (`:240–247`) plus the ADR-59 and `STATUS.md` mirrors so the cut
+  is auditable. **One correction to the brief, because the evidence disagrees with
+  a uniform "all absent" reading:** P5 has two halves and only one is absent. The
+  **migration runner is genuinely absent** — no code converts a legacy
+  `multi_agent`-only config into `[orchestration]`, and ADR-59:169–170 still
+  states that pre-P5 condition as current. But **export-merge hardening is
+  substantially landed** as a side effect of the single-arm Save work:
+  `config/src/saving.rs:1–40` documents merge-aware `toml_edit` writers that
+  preserve comments, key order and unedited keys, all atomic via
+  temp-file-plus-`rename`, with `seed_orchestration_roster` / `save_agent_roster`
+  writing only the keys they own. `config/src/migration.rs` is *schema_version*
+  step migration, which is a different mechanism and does not satisfy P5.
+  Everything else — config-authorable Graph/DAG, run-one-stage simulation, the
+  Studio-level freeze / stable-surface decision, the TOML diff view, the canvas
+  DAG editor, multi-executor partitioning — is absent with no scaffold
+  (`run_one_stage`, `freeze_decision`, `migration_runner`, `multi_executor`,
+  `executor_partition`, `toml_diff`, `stable_surface`, `simple_tier` all return
+  zero hits). The `DAG`/`Freeze` code that does exist
+  (`graph.rs`, `scheduler.rs`, `task_transform.rs:163–189`, `apply_freeze`
+  `:542–618`) is the landed runtime task-DAG and the model-driven "reconsider"
+  freeze — **not** a config-surface graph or freeze — and the appendix says so, so
+  a later reader does not mistake one for the other. `STATUS.md:347`'s "Studio
+  Simple tier" label has no counterpart in ADR-58 (which demoted the tier
+  notion) or in the code; recorded as a source inconsistency, not fixed. The cut
+  is recorded as a scoping decision about a superseded UI plan, explicitly **not**
+  as a claim that the capabilities are unwanted, and the migration runner is
+  called out as standing debt that has no UI dependency at all.
+- **Row 37 rescoped L → M, kept OPEN and deferred post-1.0.** The reduction is
+  earned: the plan's Minimal (~20–30h) and Medium (~60–90h) tiers are landed, per
+  the plan's own status list (`hybrid-ui-plan.md:306–317`) and `TODO.md:150–155`
+  (PR #49 Minimal, PR #97 Medium, merged 2026-08-03), and the code confirms it —
+  the `SubView` overlay enum (`views/chat.rs:23–25`, with `SpendLog` and
+  `Runtime` added since the plan was written) routed by keyboard at
+  `app.rs:1218–1222`, the shared animation layer (`app.rs:498` `ease_out_cubic`,
+  `:4030`), the terminal bottom panel with drag resize (`app.rs:398`, `:2033–2046`),
+  and the memory quick-panel. What remains has **no correctness, policy or
+  data-integrity content** — it is layout and information-architecture polish —
+  which is what makes a single M defensible. **Two corrections to the brief,
+  recorded because the accurate version changes what the row should say.**
+  (i) **There is no `SectionId::Skills` or `SectionId::Mcp`.** Settings is one
+  scrolling page of **9 collapsible sections** — `SectionId::ALL` at
+  `views/settings/message.rs:372–382` (Theme, Providers, Assignments, Policy,
+  Relationships, Retry, Memory, Shell, Extensions), rendered through
+  `collapsible_section` at `mod.rs:1049–1054` with a jump-sidebar at `:1060–1070`.
+  Skills and MCP are `ExtensionTab` variants (`message.rs:342`, wired
+  `mod.rs:1177–1201` — Skills / MCP / Plugins / ProjectContext) *inside* the one
+  `SectionId::Extensions` hub. So "tabbed Settings" is unbuilt at the top level
+  and a *hub* of four sub-tabs already exists; the row now describes it that way
+  rather than naming sections that do not exist. (ii) **Drag-and-drop agent
+  assignment is not on the `crates/desktop/AGENTS.md` ⬜ line.** That line
+  (`:65–66`) names two items — lazy-init, and "Full scope: tabbed Settings,
+  Studio split pane, focus trap" — while the plan (`:89`), `TODO.md:156–158` and
+  `ROADMAP:147–149` name four. The row cites both sources so the residual is not
+  read as smaller than it is. **Also flagged as real work inside the remaining
+  scope:** the plan's Medium item "SubView routing fully replaces `Page` for
+  Chat-adjacent views" (`:83`) and its step 6 "Remove unused `Page` variants"
+  (`:300`) are **not** done — `Page::DiffViewer` and `Page::ToolLog` are still
+  routed and rendered (`app.rs:3973–3974`) and remain reachable from the context
+  bar (`views/context_bar.rs:29–30`) and the quick panel
+  (`views/quick_panel.rs:146`), so the `Page`/`SubView` dual path is live
+  duplication, not a cosmetic leftover. Per the brief, **LAZY-INIT is called out
+  as the one remaining item with a felt payoff** (it is the only one that changes
+  startup cost and responsiveness rather than looks) and may be pulled forward.
+  Citation correction applied: the row's `TODO.md:145` had drifted onto an
+  unrelated ADR-28 shell-profile note; the item is at `TODO.md:156–158`.
+- **Row 9 corrected — it was never "unverified".** The `[verify]` flag and the
+  "per-variant auth steps unverified" framing are removed, and the row now states
+  what is actually true: the wizard exists and is wired, and the auth gap is
+  real, specific and named. **Wiring:** `SetupWizard::run`
+  (`config/src/setup.rs:236–264`) = provider → key → model → working dir →
+  policy, returning a `PendingConfig` whose `save`/`save_overwrite` (`:109–119`)
+  write TOML and push the key to the OS keychain (ADR-04; the key is never in
+  TOML). The CLI hooks it at first-run **and** `--reconfigure`
+  (`cli/src/lib.rs:106–170`) and deliberately does *not* call `run()` — it
+  re-drives the same prompts individually (`:126–152`) so a **live model probe**
+  can be slotted in between: `list_models_for_provider_blocking` at `:141–146`
+  feeding `set_available_models` at `:146` for a numbered picker. **Desktop
+  onboarding: zero wiring**, confirmed by search — `SetupWizard`, `setup::`,
+  `needs_setup` and `run_wizard` return no hits anywhere under `crates/desktop`,
+  so the wizard is reachable only from a terminal. **The per-variant gap,
+  precisely:** one generic `prompt_api_key` (`:314–317`, no provider argument)
+  serves all **seven** `ProviderKind`s (`:40–48`), and the only per-kind delta
+  anywhere in the wizard is `default_model` (`:51–61`); there is no OAuth,
+  device-code, or token-exchange variant for any kind. The row stays OPEN and
+  deferred per owner decision, and its re-entry cell now splits the two
+  separable pieces (per-kind auth is a `setup.rs` change; desktop onboarding is
+  new UI) so neither implies the other.
+- **Row 29 reviewed, confirmed still deferred, left otherwise untouched.** No
+  status change and no size change — only a dated marker in the Item cell. The
+  factual state, checked in the tree: **SSE is LANDED** — `SseAdapter::from_bus`
+  (`api-server/src/sse.rs:17–20`) bridging the `EventBus` to an axum SSE stream
+  filtered by `TaskId`, served as `GET /v1/sessions/{id}/tasks/{tid}/stream`
+  (`api-server/src/routes.rs:345–366`). **Server mode is LANDED as a binary** —
+  `api-server/src/main.rs:101–107` binds a `TcpListener` and serves the router
+  (with the non-loopback bind warning at `:93–99` and connect-info for the
+  per-client rate-limit key at `:105–107`). **Marketplace is ABSENT:** a
+  repo-wide search for `marketplace` / `registry_url` / `plugin_registry`
+  returns **zero code hits** — the only four matches are doc statements of the
+  deferral itself (this register rows 29 and 30, `skills-mcp-extensions-plan.md:21`,
+  `ADR-43:162`). **Persistent desktop state is ABSENT:** the desktop extension
+  surface is config-driven with next-run semantics (`docs/skills.md:201–202`,
+  "live toggles via a held runtime handle are deferred (ADR-43 §3 v1 note)"), and
+  the desktop settings state is explicitly transient — `settings/state.rs:25–27`,
+  "Transient view state: never persisted and never arms the dirty flag". **TOML
+  secrets are absent BY DESIGN, not by omission:** credentials are keyring-only
+  (`config/src/credentials.rs:6–12`, ADR-04, with `from_env()` as the test-mode
+  env-var path), and the MCP server schema states it outright
+  (`config/src/schema.rs:1156–1157`, "Secrets are never stored in TOML (keyring
+  integration is deferred)"); ADR-43:163 lists keyring-backed MCP tokens as
+  deferred. So three of the row's five sub-items are either landed or
+  permanently out of scope, and the two that remain real (marketplace, persistent
+  live state) are exactly the ones a later web/API UI would need. Noted for a
+  future pass, not actioned: this row's compound framing now understates the
+  landed half, so when it is next promoted or re-scoped it should be split
+  rather than closed as a unit.
+- **Row 4 — this pass's read-only finding is SUPERSEDED and was corrected, not
+  left to rot.** As recorded below earlier today, the row was read and left
+  untouched, on the basis that the tree showed a *single-slot* ack cell where
+  "reject-busy went the other way on purpose" — the opposite of ADR-68 §6's
+  queue decision. That description applied to the pre-queue tree and no longer
+  describes the code: `8e3c350` ("feat(desktop): bounded per-session
+  acknowledgement queue (DEFERRED row 4)") landed the queue, so the row is now
+  **closed** and removed from the open table, with the shipped state recorded in
+  Closed #19 and a full verification entry appended below. The stale pre-queue
+  sentences are **deleted**, not annotated. Two facts from the original read do
+  survive the change and are carried forward here so nothing real is lost: (i)
+  the **session-scoping half of ADR-68 is landed** — `PendingAck.session_id`,
+  now carried per queue entry rather than on a lone cell, satisfying A3 and the
+  executor-boundary validation of A1; (ii) the row's source cell carried a
+  **dangling clause**, "prefer in-flight budget instead per note", citing a note
+  that exists nowhere — a repo-wide search for "in-flight budget" /
+  "inflight_budget" returns exactly one hit, this register's own row 4. That
+  clause disappears with the row; noted here so a future reader does not go
+  hunting for a recommendation that was never written down.
+- **Follow-ups flagged, not actioned here** (all outside this pass's scope —
+  they touch other documents or other rows):
+  - `docs/TODO.md:42–45` still reads "`request_ack` unscoped approval event (audit
+    H-04 follow-up). **Not started** — `ApprovalSink::request_ack` passes no
+    session id" and cites `AUDIT_FINDINGS_CURRENT.md` H-04 "Remains". That is
+    stale in the same way row 21's citation had drifted: the signature is
+    `request_ack(session_id, message, cancel)` and `PendingAck` carries
+    `session_id` (ADR-68 landed). The *unscoped approval **event*** half may
+    still be open, but the item as written describes a defect that is fixed.
+  - `ROADMAP.md:188–191` (code editor integration) still treats the embedded
+    editor as a maybe-later alternative, which the landed `views/code_editor`
+    contradicts; and `docs/desktop-cli-parity.md:96–97` remains the correct cite
+    for the GUI-only `Editor` that `TODO.md:172–173` mispoints at `:103–104`.
+  - `crates/desktop/AGENTS.md:50` still says the hybrid Minimal + Medium scope is
+    "pending review/merge" on `feat/ui-depth-improvements`, while
+    `TODO.md:150–155` and `hybrid-ui-plan.md:306–317` record it merged into `dev`
+    via PR #97 on 2026-08-03. Row 37's own citations are corrected; that AGENTS.md
+    line is not.
+  - `docs/STATUS.md:346–349` is the mirror of the now-cut row 28 and still lists
+    the deferred P5/P6 items as tracked follow-up #4 without saying the register
+    row was cut. Left alone here (a STATUS reconciliation touches row 35's
+    source); worth one pass.
+  - Still carried forward from the three prior passes and untouched:
+    `docs/security-threat-model.md` §6 gaps #1, #5, #6; `docs/TODO.md:229–235`
+    ("Not started" for work that landed in `f4bdc4f`); `ROADMAP.md:241–245`;
+    and the `— manual` orphan fragment in the 2026-09-24 notes above (line ~170),
+    still unrepaired.
+
+## Verification notes (2026-09-27, row 4 closure)
+
+Follow-up pass closing register **row 4** (per-session ack queue), executed
+2026-09-27 on `fix/coordinator-error-invariant` at HEAD `8e3c350`. **Docs only —
+no source edits, no builds, no test runs, no commit**; the tree is left for the
+orchestrator to commit alongside the other staged row changes. Every claim below
+was re-read in the tree at HEAD, not taken from the commit message.
+
+- **Row 4 closed — see Closed #19.** Its re-entry condition ("Implementation
+  phase of ADR-68 desktop ack queue") has been reached and answered *in the
+  direction ADR-68 §6 chose*. The desktop ack cell is now a depth-bounded FIFO,
+  not a single slot: `SharedPendingAck = Arc<Mutex<VecDeque<PendingAck>>>`
+  (`desktop/src/widgets/capability_dialog.rs:137`), bounded by
+  `MAX_PENDING_ACKS = 2` (`:98`) — the "at most one pending ack beyond the active
+  one" of ADR-68 §6, expressed as the active dialog plus one queued. The row is
+  removed from the open table and its `#4` gap left intentionally, matching the
+  row 10 / 12 / 14 / 19 / 21 / 25 / 26 / 28 / 33 / 44 / 47 / 49 precedent. No
+  other row touched; no renumbering.
+- **The bound's rationale is documented in code, and recorded here because it is
+  the non-obvious design choice in this commit** (`capability_dialog.rs:84–97`):
+  an ack is a *blocking, user-facing* confirmation, not a background job. One
+  active is what the user can actually read; the one queued slot exists so a
+  concurrent prompt (another run/session) cannot overwrite the first; a deeper
+  queue would only delay the *second* prompt past the point where its requester
+  is still waiting, and would let an ack storm grow UI state without bound. Two
+  is the smallest depth that covers the real concurrent case without becoming an
+  ack buffer.
+- **Overflow is an explicit refusal, never a silent drop — verified, both
+  variants.** `AckQueueError` (`:105–114`) carries exactly two fail-closed
+  cases: `QueueFull { capacity }` (the new request is refused outright and never
+  displaces an already-pending ack) and `StateUnavailable` (the shared lock is
+  poisoned, so the desktop cannot prove the request was recorded and must not
+  report "no pending acks" for a request that was actually made). The sink maps
+  either to `false` — abort the task — **and** publishes a new
+  `DesktopEvent::ErrorOccurred` (`app.rs:4776–4778`) that the app renders as an
+  error toast. That toast is what makes *shown*, *queued* and *refused* three
+  distinguishable user-visible outcomes rather than one silent no-op; the
+  `Display` impl (`:116–128`) is what carries the difference to the user.
+- **Session gating is preserved through the queue, and FIFO order cannot be
+  jumped.** `resolve_ack` (`:233–246`) pops the front entry and answers it only
+  when its `session_id` matches the caller; a non-matching entry is pushed back
+  to the front so its owning session still sees its dialog. This is the
+  pre-existing session check retargeted to the queue front, not a new check —
+  worth stating because queueing is exactly the change that could have weakened
+  it. Resolution drains in order, so the queued second ack cannot overtake the
+  active first.
+- **Dialog indicator keeps the common case byte-for-byte unchanged.**
+  `ack_queue_position` (`:180–185`) returns `None` for ≤1 pending and
+  `Some("Acknowledgement 1 of N pending")` for N≥2; the count line is pushed into
+  the modal's children only in the `Some` case (`:207–213`). A single-pending ack
+  therefore renders exactly as it did pre-queue. Note for accuracy: this helper
+  is private (`fn`, not `pub`) — an internal render concern, not new API.
+- **Supporting call sites confirmed:** `DesktopApprovalSink::request_ack`
+  enqueues through `enqueue_ack` (`app.rs:4760`) and the status-bar
+  dialog-waiting check moved from `is_some()` to `!is_empty()`
+  (`views/status_bar.rs:58`). Both are the minimum to keep the new queue
+  coherent — the `is_some()` check would have gone stale silently otherwise.
+- **The audit-seam half was a reachability *finding*, not missing wiring — and
+  this corrects the brief's framing, so it is recorded explicitly.** The
+  production chain `AgentLoop::setup_undo_stash` (`agent_loop.rs:1225–1227`) →
+  `ToolExecutionBackend::record_ack_decision` → `InProcessGateBackend` →
+  `ToolExecutor::record_ack_decision` already existed, and `git log` attributes
+  it to `26e3fc9` ("ADR-66 phase 1 — per-model tool capability, fail-loud
+  seams, Gemini loose schemas"), i.e. it predates `8e3c350`. What actually landed
+  in this commit is the **test that proves reachability** —
+  `in_process_gate::tests::record_ack_decision_writes_request_continue_and_abort_rows`
+  (`orchestrator/src/in_process_gate.rs:554`), covering a `RequestContinue` row
+  for a continuing ack and a `RequestAbort` row for a refused one — plus the
+  correction of a doc comment on `ToolExecutor::record_ack_decision` that falsely
+  claimed "nothing calls this in production", now naming the real chain
+  (`core/src/executor.rs:298–303`). Practical consequence: the row's audit half
+  was smaller than the row implied, and a future reader should not expect a
+  second wiring change here.
+- **Residual recorded, not fixed — the one honest gap in this closure.** An
+  overflow refusal audits as `RequestAbort`, because `ApprovalSink::request_ack`
+  returns only `bool`: the sink cannot hand the audit seam a reason, so in the
+  trail an overflow is distinguishable from a user cancel **only by message
+  text, not by a distinct verdict**. Fixing it requires widening
+  `ApprovalSink::request_ack` to a typed decision — a contract change reaching
+  every sink — which is out of scope for this commit and stated in Closed #19 so
+  the closure is not read as claiming full audit fidelity on the refusal path.
+- **The row's stale pre-queue note was deleted, not annotated.** It survived in
+  the 2026-09-27 owner-decisions notes above as "single slot" / "reject-busy went
+  the other way on purpose"; both described the pre-`8e3c350` tree. That whole
+  bullet is replaced by a short superseded-pointer, with the two facts from it
+  that still hold (the landed session-scoping half of ADR-68; the dangling
+  "prefer in-flight budget instead per note" clause, which cites a note that
+  exists nowhere) carried forward so nothing real is lost. The historical header
+  append for the owner-decisions pass still says "Row 4 was read and left
+  untouched" — that is left as-written, because it accurately describes *that*
+  pass, and this section plus the new header append supersede it.
