@@ -1,6 +1,6 @@
 use crate::error::PolicyError;
 use crate::ids::Ulid;
-use crate::types::{PolicyAction, PolicyVerdict};
+use crate::types::{PathPolicyFacts, PolicyAction, PolicyVerdict};
 use crate::CancellationToken;
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -228,4 +228,10 @@ pub struct AuditEntry {
     pub plan_id: Option<String>,
     /// Source revision the plan was approved at, if known.
     pub source_revision: Option<String>,
+    // ---- Path-shaped structured facts (additive) ----------------------------
+    /// Structured facts about a path-shaped tool operation (filesystem, git,
+    /// LSP): operation + attempted/resolved target path. `None` for tools that
+    /// do not operate on a path. Recorded alongside — not instead of — the
+    /// ADR-28 §6 command facts.
+    pub path_facts: Option<PathPolicyFacts>,
 }

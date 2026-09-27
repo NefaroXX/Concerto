@@ -5,8 +5,8 @@ use crate::traits::policy::{AuditEntry, PolicyEngine};
 use crate::traits::tool::Tool;
 use crate::traits::ApprovalSink;
 use crate::types::{
-    CapabilitySet, CommandPolicyFacts, PolicyAction, PolicyVerdict, SessionContext, ToolDefinition,
-    ToolOutput, ToolRegistry,
+    CapabilitySet, CommandPolicyFacts, PathPolicyFacts, PolicyAction, PolicyVerdict,
+    SessionContext, ToolDefinition, ToolOutput, ToolRegistry,
 };
 use crate::CancellationToken;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ struct ExecutionAuditContext {
     correlation_id: crate::ids::Ulid,
     input_hash: String,
     facts: Option<CommandPolicyFacts>,
+    path_facts: Option<PathPolicyFacts>,
 }
 
 /// Construct the policy action for a tool call, shared by the executing path
@@ -59,6 +60,10 @@ fn build_action<'a>(
         // shell tool resolves executable/argv/cwd), so the policy engine
         // and audit log reason about what actually runs, not just a string.
         command_facts: tool.command_facts(input, session),
+        // Path-shaped counterpart: filesystem/git/LSP tools resolve the
+        // operation and target path (attempted + confined) so the audit trail
+        // can attribute the action to a concrete target.
+        path_facts: tool.path_facts(input, session),
         // Orchestrator-authority marker: only the authority execute path sets
         // this; every ordinary (specialist / gate / bridge) path passes false.
         orchestrator_authority,
@@ -133,7 +138,7 @@ impl ToolExecutor {
         // its exit code, and its duration. The ADR-28 §6 shell fields are derived
         // from `command_facts` when present and stay `None` otherwise, so
         // non-shell tools get a minimal, truthful completion row.
-        let ExecutionAuditContext { correlation_id, input_hash, facts } = audit;
+        let ExecutionAuditContext { correlation_id, input_hash, facts, path_facts } = audit;
         let exit_code = result
             .as_ref()
             .ok()
@@ -175,6 +180,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel.clone()).await {
             tracing::error!(%error, "post-execution audit write failed");
@@ -269,6 +275,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: action.path_facts.clone(),
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "approval-decision audit write failed");
@@ -321,6 +328,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "ack-decision audit write failed");
@@ -377,6 +385,7 @@ impl ToolExecutor {
             // A shape decision binds no plan and names no source revision.
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "coordinator-shape audit write failed");
@@ -432,6 +441,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::warn!(%error, decision, "coordinator-decision audit write failed (fail-soft)");
@@ -492,6 +502,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: Some(plan_id.to_owned()),
             source_revision: source_revision.map(str::to_owned),
+            path_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "plan-decision audit write failed");
@@ -557,6 +568,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "capability-refusal audit write failed");
@@ -618,6 +630,7 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "tool-driver audit write failed");
@@ -679,6 +692,7 @@ impl ToolExecutor {
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
+        let path_facts = action.path_facts.clone();
 
         match self.policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {
@@ -688,7 +702,12 @@ impl ToolExecutor {
                     input,
                     session,
                     cancel,
-                    ExecutionAuditContext { correlation_id, input_hash, facts: command_facts },
+                    ExecutionAuditContext {
+                        correlation_id,
+                        input_hash,
+                        facts: command_facts,
+                        path_facts,
+                    },
                 )
                 .await
             }
@@ -724,6 +743,7 @@ impl ToolExecutor {
                                             correlation_id,
                                             input_hash,
                                             facts: command_facts,
+                                            path_facts,
                                         },
                                     )
                                     .await
@@ -788,6 +808,7 @@ impl ToolExecutor {
             correlation_id: action.correlation_id,
             input_hash: crate::policy::compute_input_hash(&input),
             facts: action.command_facts.clone(),
+            path_facts: action.path_facts.clone(),
         };
         self.execute_allowed(tool, tool_name, input, session, cancel, audit).await
     }
@@ -824,8 +845,9 @@ impl ToolExecutor {
     /// Called only when the serve gate served a cached read *without* executing
     /// the tool, so no policy decision row precedes this entry: it gets a
     /// fresh `correlation_id` and leaves the ADR-28 §6 execution fields `None`.
-    /// The served path is recorded in `argv` — the [`AuditEntry`] schema has no
-    /// dedicated path column — and `rule_matched` is `"served_from_cache"`.
+    /// The served path is recorded in a dedicated path-facts carrier (and, for
+    /// backward compatibility with existing consumers, still in `argv`), and
+    /// `rule_matched` is `"served_from_cache"`.
     ///
     /// `ServedFromCache` rows count toward read-count grounding metrics exactly
     /// like a real `ExecutionSucceeded` read row (ADR-65 §3.2). Fail-soft: a
@@ -860,6 +882,11 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: Some(PathPolicyFacts {
+                operation: "read".to_owned(),
+                attempted_path: Some(path.to_owned()),
+                ..PathPolicyFacts::default()
+            }),
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "served-read audit write failed");
@@ -1086,6 +1113,54 @@ mod tests {
                 summary: "completed".to_owned(),
                 data: serde_json::json!({ "exit_code": 7 }),
             })
+        }
+    }
+
+    /// Path-shaped tool (filesystem-like) that produces structured path facts,
+    /// used to prove the carrier reaches both the policy and completion rows.
+    struct PathTool;
+
+    #[async_trait]
+    impl Tool for PathTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+        fn description(&self) -> &str {
+            "path-shaped test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn path_facts(
+            &self,
+            input: &serde_json::Value,
+            _session: &SessionContext,
+        ) -> Option<PathPolicyFacts> {
+            Some(PathPolicyFacts {
+                operation: input
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("read")
+                    .to_owned(),
+                attempted_path: input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                resolved_path: Some("/proj/notes.txt".to_owned()),
+                ..PathPolicyFacts::default()
+            })
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput { summary: "ok".to_owned(), data: serde_json::json!({}) })
         }
     }
 
@@ -1467,9 +1542,48 @@ mod tests {
         assert_eq!(entries[1].argv, None);
         assert_eq!(entries[1].network_requested, None);
         assert_eq!(entries[1].resolved_executable, None);
+        // A non-path tool records no path facts either.
+        assert_eq!(entries[0].path_facts, None);
+        assert_eq!(entries[1].path_facts, None);
         // Both rows share correlation_id and input_hash.
         assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
         assert_eq!(entries[0].input_hash, entries[1].input_hash);
+    }
+
+    /// A path-shaped tool's structured facts reach both the policy decision row
+    /// and the post-execution completion row.
+    #[tokio::test]
+    async fn path_tool_records_path_facts_on_policy_and_completion_rows() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            audit.clone(),
+        ));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(PathTool));
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+
+        executor
+            .execute(
+                "filesystem",
+                serde_json::json!({"operation": "write", "path": "notes.txt"}),
+                &test_session(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("path tool executes");
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 2, "policy row + completion row");
+        let decision_facts = entries[0].path_facts.as_ref().expect("policy row carries path facts");
+        assert_eq!(decision_facts.operation, "write");
+        assert_eq!(decision_facts.attempted_path.as_deref(), Some("notes.txt"));
+        assert_eq!(decision_facts.resolved_path.as_deref(), Some("/proj/notes.txt"));
+        assert_eq!(
+            entries[1].path_facts.as_ref(),
+            Some(decision_facts),
+            "the completion row carries the same path facts"
+        );
     }
 
     /// A tool whose execution returns an error must produce an
@@ -1820,6 +1934,7 @@ mod tests {
                 toolchain_version: None,
                 plan_id: None,
                 source_revision: None,
+                path_facts: None,
             };
             self.audit.entries.lock().unwrap().push(entry);
             Ok(PolicyVerdict::RequireApproval { timeout: Duration::from_secs(30) })

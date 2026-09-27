@@ -339,6 +339,17 @@ pub struct PolicyAction<'a> {
     /// the producing tool has not populated them. Kept optional so existing
     /// call sites and non-shell tools are unaffected.
     pub command_facts: Option<CommandPolicyFacts>,
+    /// Structured, pre-resolved facts about a path-shaped tool operation
+    /// (filesystem, git, LSP, …). `None` for tools that do not operate on a
+    /// path (e.g. shell, provider) or when the producing tool has not populated
+    /// them. Kept optional so existing call sites and non-path tools are
+    /// unaffected.
+    ///
+    /// This is the path-shaped counterpart to [`CommandPolicyFacts`]: it records
+    /// the *operation* and the *target path* (attempted as supplied and resolved
+    /// after workspace containment) so the audit trail can attribute a
+    /// filesystem/git operation to a concrete target instead of a hash only.
+    pub path_facts: Option<PathPolicyFacts>,
     /// Orchestrator-authority marker (additive; default `false`).
     ///
     /// Set `true` ONLY at the orchestrator's own top-level call sites — the
@@ -495,6 +506,93 @@ pub struct CommandPolicyFacts {
     /// genuinely wrapped in a container runtime. See [`CommandRouting`] for the
     /// full producer contract the policy engine enforces.
     pub container_routing: CommandRouting,
+}
+
+/// Structured facts about a path-shaped tool operation (filesystem, git, LSP,
+/// …): the operation name and the target path as supplied by the caller and as
+/// resolved after workspace containment.
+///
+/// This is the path-shaped sibling of [`CommandPolicyFacts`]. It exists so a
+/// filesystem/git operation can be attributed in the audit log to a concrete
+/// target and operation instead of a hash only — the defect this carrier
+/// closes. Until it was added, `fs` operations recorded `command_facts: None`,
+/// leaving `argv`, `working_directory`, `filesystem_scope` and the target path
+/// empty and unrecoverable.
+///
+/// # Secret safety (documented rule)
+///
+/// Only paths and operation names are recorded here — never raw tool input,
+/// HTTP headers, or request bodies. A path may itself embed a secret (e.g. a
+/// URL query string), so URL-shaped actions MUST be built through
+/// [`PathPolicyFacts::for_url`], which strips userinfo, query, and fragment via
+/// [`strip_url_secrets`]. The filesystem producer records the attempted and
+/// resolved path, which are already confined to the workspace.
+///
+/// `attempted_*` and `resolved_*` are recorded separately on purpose: a
+/// difference between them is exactly what reveals a containment rewrite (a
+/// caller path re-anchored under the workspace root), which forensics needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathPolicyFacts {
+    /// The operation the tool attempted: `read`/`write`/`move`/`copy`/`delete`/
+    /// `exists`/`list` for the filesystem tool, the git subcommand for the git
+    /// tool, or the LSP method for an LSP tool.
+    pub operation: String,
+    /// The path/URL exactly as supplied by the caller (URL-shaped targets are
+    /// stripped of secrets before reaching this field).
+    pub attempted_path: Option<String>,
+    /// The resolved absolute path after workspace containment. `None` when
+    /// resolution failed (e.g. a traversal rejection); the attempted path is
+    /// still recorded so the rejection is attributable.
+    pub resolved_path: Option<String>,
+    /// Destination path as supplied by the caller (move/copy only).
+    pub attempted_destination: Option<String>,
+    /// Resolved absolute destination after containment (move/copy only).
+    pub resolved_destination: Option<String>,
+}
+
+impl PathPolicyFacts {
+    /// Build facts for a URL-shaped action, stripping secret-bearing URL
+    /// components (userinfo, query, fragment) so no secret can reach the audit
+    /// row. `resolved_path` is left empty: a URL is not resolved against the
+    /// workspace.
+    pub fn for_url(operation: impl Into<String>, url: &str) -> Self {
+        Self {
+            operation: operation.into(),
+            attempted_path: Some(strip_url_secrets(url)),
+            ..Self::default()
+        }
+    }
+
+    /// Whether any target path was recorded. Used to avoid writing an empty
+    /// carrier for an action that named no path.
+    pub fn has_target(&self) -> bool {
+        self.attempted_path.is_some()
+            || self.resolved_path.is_some()
+            || self.attempted_destination.is_some()
+            || self.resolved_destination.is_some()
+    }
+}
+
+/// Strip secret-bearing components from a URL-shaped target, keeping only
+/// `scheme://host/path`.
+///
+/// Removes userinfo (`user:pass@`), the query string, and the fragment. A
+/// string with no `://` is treated as a plain filesystem path and returned
+/// unchanged, so a legitimate path is never mangled.
+pub fn strip_url_secrets(target: &str) -> String {
+    let Some(scheme_end) = target.find("://") else {
+        return target.to_string();
+    };
+    let scheme = &target[..scheme_end];
+    let rest = &target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let remainder = &rest[authority_end..];
+    let path_end = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let path = &remainder[..path_end];
+    // `rsplit('@').next()` drops any userinfo while keeping the host.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}{path}")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -656,6 +754,13 @@ pub enum Condition {
     ArgvPattern(String),
     /// ADR-28 §6: match the working directory against a glob.
     WorkingDir(String),
+    /// Match, against a glob, the path a path-shaped tool action targets after
+    /// workspace containment (falling back to the attempted path when the
+    /// target did not resolve, e.g. a rejected traversal). Reads the resolved
+    /// path from [`PathPolicyFacts`] rather than the raw tool input, so a rule
+    /// can gate the path Concerto would actually touch — including a
+    /// containment rewrite — instead of the caller's spelling.
+    ResolvedPathGlob(String),
     /// ADR-55 §2: the intent gate. As the **top-level condition of an
     /// approval-producing rule** (`RequireApproval`,
     /// `RequireApprovalWithTimeout`, `RequireManagedToolApproval`,
@@ -2519,5 +2624,33 @@ mod tests {
         .unwrap();
         assert_eq!(partial.prompt_tokens, Some(7));
         assert_eq!(partial.completion_tokens, None);
+    }
+
+    // ---- Path-shaped structured facts -------------------------------------
+
+    #[test]
+    fn strip_url_secrets_removes_userinfo_query_and_fragment() {
+        let url = "https://user:sup3rsecret@example.com/a/b?token=abcdef#frag";
+        let stripped = strip_url_secrets(url);
+        assert_eq!(stripped, "https://example.com/a/b");
+        assert!(!stripped.contains("sup3rsecret"), "userinfo must be stripped");
+        assert!(!stripped.contains("abcdef"), "query must be stripped");
+        assert!(!stripped.contains("frag"), "fragment must be stripped");
+    }
+
+    #[test]
+    fn strip_url_secrets_leaves_a_plain_path_unchanged() {
+        // A filesystem path with no scheme must never be mangled.
+        assert_eq!(strip_url_secrets("/proj/src/main.rs"), "/proj/src/main.rs");
+        assert_eq!(strip_url_secrets("src/../lib.rs"), "src/../lib.rs");
+    }
+
+    #[test]
+    fn for_url_records_only_scheme_host_path() {
+        let facts = PathPolicyFacts::for_url("request", "https://h/a?secret=xyz#tok");
+        assert_eq!(facts.operation, "request");
+        assert_eq!(facts.attempted_path.as_deref(), Some("https://h/a"));
+        assert!(facts.has_target(), "the URL is the target");
+        assert!(facts.resolved_path.is_none(), "a URL is not workspace-resolved");
     }
 }

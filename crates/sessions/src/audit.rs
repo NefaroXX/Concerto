@@ -29,6 +29,24 @@ impl AuditLog for SqliteAuditLog {
             .argv
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()));
+        // Path-shaped structured facts are persisted into dedicated nullable
+        // TEXT columns. All five are `None` when the tool named no path.
+        let (
+            path_operation,
+            attempted_path,
+            resolved_path,
+            attempted_destination,
+            resolved_destination,
+        ) = match entry.path_facts {
+            Some(facts) => (
+                Some(facts.operation),
+                facts.attempted_path,
+                facts.resolved_path,
+                facts.attempted_destination,
+                facts.resolved_destination,
+            ),
+            None => (None, None, None, None, None),
+        };
 
         sqlx::query(
             "INSERT INTO audit_log (\
@@ -36,8 +54,10 @@ impl AuditLog for SqliteAuditLog {
                 rule_matched, user_response, created_at, \
                 profile_id, resolved_executable, argv, working_directory, \
                 network_requested, filesystem_scope, destructive_classification, \
-                exit_code, duration_ms, toolchain_version, plan_id, source_revision) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                exit_code, duration_ms, toolchain_version, plan_id, source_revision, \
+                path_operation, attempted_path, resolved_path, \
+                attempted_destination, resolved_destination) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Ulid::new().to_string())
         .bind(entry.session_id.to_string())
@@ -60,6 +80,11 @@ impl AuditLog for SqliteAuditLog {
         .bind(entry.toolchain_version)
         .bind(entry.plan_id)
         .bind(entry.source_revision)
+        .bind(path_operation)
+        .bind(attempted_path)
+        .bind(resolved_path)
+        .bind(attempted_destination)
+        .bind(resolved_destination)
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -116,7 +141,9 @@ mod tests {
     use super::*;
     use concerto_core::policy::SimplePolicyEngine;
     use concerto_core::traits::policy::PolicyEngine;
-    use concerto_core::types::{CapabilitySet, Condition, PolicyAction, PolicyRule, PolicyVerdict};
+    use concerto_core::types::{
+        CapabilitySet, Condition, PathPolicyFacts, PolicyAction, PolicyRule, PolicyVerdict,
+    };
     use concerto_core::CancellationToken;
     use std::sync::Arc;
 
@@ -133,6 +160,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/024_audit_intent_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/034_audit_path_facts.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -169,6 +200,7 @@ mod tests {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         let result = audit.record(entry, CancellationToken::new()).await;
         assert!(result.is_ok(), "record should succeed: {:?}", result.err());
@@ -192,6 +224,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/024_audit_intent_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/034_audit_path_facts.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -221,6 +257,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         let result = engine.evaluate(&action, CancellationToken::new()).await;
@@ -250,6 +287,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/024_audit_intent_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/034_audit_path_facts.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -294,6 +335,7 @@ mod tests {
             toolchain_version: Some("1.0.0".into()),
             plan_id: Some("01J4V6Q8X000000000000000099".into()),
             source_revision: Some("abc1234".into()),
+            path_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         let count: (i64,) =
@@ -327,6 +369,7 @@ mod tests {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         let count: (i64,) =
@@ -365,6 +408,7 @@ mod tests {
                     toolchain_version: None,
                     plan_id: None,
                     source_revision: None,
+                    path_facts: None,
                 };
                 a.record(entry, CancellationToken::new()).await
             }));
@@ -404,6 +448,7 @@ mod tests {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         // Read back the raw argv column and verify it is valid JSON.
@@ -449,6 +494,7 @@ mod tests {
             toolchain_version: None,
             plan_id: Some(plan_id.into()),
             source_revision: Some(source_revision.into()),
+            path_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
 
@@ -495,6 +541,7 @@ mod tests {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         };
         let e2 = AuditEntry { tool_name: "second".into(), ..e1.clone() };
         log.record(e1.clone(), CancellationToken::new()).await.unwrap();
@@ -533,6 +580,7 @@ mod tests {
                 toolchain_version: None,
                 plan_id: None,
                 source_revision: None,
+                path_facts: None,
             };
             log.record(entry, CancellationToken::new()).await.unwrap();
         }
@@ -569,6 +617,7 @@ mod tests {
                     toolchain_version: None,
                     plan_id: None,
                     source_revision: None,
+                    path_facts: None,
                 };
                 l.record(entry, CancellationToken::new()).await.unwrap();
             }));
@@ -604,6 +653,7 @@ mod tests {
             toolchain_version: Some("1.2.3".into()),
             plan_id: Some("plan_1".into()),
             source_revision: Some("deadbeef".into()),
+            path_facts: None,
         };
         let clone = entry.clone();
         // Field-by-field comparison.
@@ -770,5 +820,248 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(joined.0, 1, "audit infra row must correlate with its session event");
+    }
+
+    /// Helper: a minimal `AuditEntry` with all legacy fields `None` and the
+    /// given path facts.
+    fn entry_with_path_facts(
+        session_id: Ulid,
+        tool_name: &str,
+        verdict: &str,
+        path_facts: Option<PathPolicyFacts>,
+    ) -> AuditEntry {
+        AuditEntry {
+            tool_name: tool_name.into(),
+            verdict: verdict.into(),
+            input_hash: "hash".into(),
+            session_id,
+            correlation_id: Ulid::new(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            user_response: None,
+            rule_matched: Some("auto_approve".into()),
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+            path_facts,
+        }
+    }
+
+    /// The five nullable path-facts columns, fetched as one row.
+    type PathFactsRow =
+        (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+
+    /// Every path-facts column round-trips through SQLite unchanged.
+    #[tokio::test]
+    async fn sqlite_audit_log_round_trips_path_facts() {
+        let (pool, session_id) = setup_audit_pool().await;
+        let audit = SqliteAuditLog::new(pool.clone());
+        let facts = PathPolicyFacts {
+            operation: "move".into(),
+            attempted_path: Some("a.txt".into()),
+            resolved_path: Some("/proj/a.txt".into()),
+            attempted_destination: Some("b.txt".into()),
+            resolved_destination: Some("/proj/b.txt".into()),
+        };
+        audit
+            .record(
+                entry_with_path_facts(session_id, "filesystem", "Allow", Some(facts.clone())),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let row: PathFactsRow = sqlx::query_as(
+            "SELECT path_operation, attempted_path, resolved_path, \
+                 attempted_destination, resolved_destination FROM audit_log",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("move"));
+        assert_eq!(row.1.as_deref(), Some("a.txt"));
+        assert_eq!(row.2.as_deref(), Some("/proj/a.txt"));
+        assert_eq!(row.3.as_deref(), Some("b.txt"));
+        assert_eq!(row.4.as_deref(), Some("/proj/b.txt"));
+    }
+
+    /// The forensic regression: a sequence of filesystem operations is fully
+    /// reconstructable from the audit rows alone — which file, which operation,
+    /// which verdict, in what order.
+    #[tokio::test]
+    async fn audit_rows_alone_reconstruct_a_filesystem_operation_sequence() {
+        let (pool, session_id) = setup_audit_pool().await;
+        // Same rule shape as the live default: reads auto-approve, writes deny.
+        let rules = vec![
+            PolicyRule::AutoApprove(Condition::All(vec![
+                Condition::ToolName("filesystem".into()),
+                Condition::Operation("read".into()),
+            ])),
+            PolicyRule::AutoDeny(Condition::All(vec![
+                Condition::ToolName("filesystem".into()),
+                Condition::Operation("write".into()),
+            ])),
+        ];
+        let audit = Arc::new(SqliteAuditLog::new(pool.clone()));
+        let engine = SimplePolicyEngine::new(rules, audit);
+
+        let operations = [("read", "src/main.rs"), ("write", "src/lib.rs"), ("read", "README.md")];
+        for (operation, path) in operations {
+            let input = serde_json::json!({"operation": operation, "path": path});
+            let facts = PathPolicyFacts {
+                operation: operation.into(),
+                attempted_path: Some(path.into()),
+                resolved_path: Some(format!("/proj/{path}")),
+                ..PathPolicyFacts::default()
+            };
+            let action = PolicyAction {
+                tool_name: "filesystem",
+                input: &input,
+                session_id,
+                correlation_id: Ulid::new(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                path_facts: Some(facts),
+                orchestrator_authority: false,
+            };
+            // The verdict is not asserted here; the audit rows below are.
+            let _ = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        }
+
+        // Reconstruct from the rows alone, in write order.
+        let rows: Vec<(Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT path_operation, attempted_path, verdict FROM audit_log ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let reconstructed: Vec<(Option<String>, Option<String>)> =
+            rows.iter().map(|(op, path, _)| (op.clone(), path.clone())).collect();
+        assert_eq!(
+            reconstructed,
+            vec![
+                (Some("read".into()), Some("src/main.rs".into())),
+                (Some("write".into()), Some("src/lib.rs".into())),
+                (Some("read".into()), Some("README.md".into())),
+            ],
+            "the audit rows must name each operation and file, in order"
+        );
+        assert_eq!(rows[0].2, "Allow", "read auto-approved");
+        assert_eq!(rows[1].2, "Deny", "write denied");
+        assert_eq!(rows[2].2, "Allow", "read auto-approved");
+    }
+
+    /// A secret embedded in a URL query/fragment/userinfo must never reach an
+    /// audit row: only scheme+host+path are recorded.
+    #[tokio::test]
+    async fn audit_row_never_contains_url_secrets() {
+        let (pool, session_id) = setup_audit_pool().await;
+        let audit = SqliteAuditLog::new(pool.clone());
+        let facts = PathPolicyFacts::for_url(
+            "request",
+            "https://user:pass@api.example.com/v1/completions?api_key=SUPERSECRET#access_token",
+        );
+        audit
+            .record(
+                entry_with_path_facts(session_id, "http", "Allow", Some(facts)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let (path_operation, attempted_path): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT path_operation, attempted_path FROM audit_log")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(path_operation.as_deref(), Some("request"));
+        assert_eq!(attempted_path.as_deref(), Some("https://api.example.com/v1/completions"));
+        let recorded = attempted_path.unwrap_or_default();
+        assert!(!recorded.contains("SUPERSECRET"), "query secret must not be recorded");
+        assert!(!recorded.contains("access_token"), "fragment must not be recorded");
+        assert!(!recorded.contains("pass"), "userinfo must not be recorded");
+    }
+
+    /// Migration 034 applies over a database that already holds pre-034 rows;
+    /// legacy rows keep their values with the new columns NULL, and new writes
+    /// still succeed.
+    #[tokio::test]
+    async fn migration_034_preserves_legacy_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for migration in [
+            include_str!("../migrations/001_initial_schema.sql"),
+            include_str!("../migrations/002_audit_log.sql"),
+            include_str!("../migrations/016_audit_command_facts.sql"),
+            include_str!("../migrations/024_audit_intent_columns.sql"),
+            include_str!("../migrations/032_audit_infra_columns.sql"),
+        ] {
+            sqlx::query(migration).execute(&pool).await.unwrap();
+        }
+        let session_id = Ulid::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, project_dir, provider, model) \
+             VALUES (?, 0, '/tmp', 'test', 'test')",
+        )
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A legacy row written by the pre-034 schema.
+        sqlx::query(
+            "INSERT INTO audit_log (id, session_id, correlation_id, tool_name, verdict, \
+             input_hash, created_at) VALUES (?, ?, ?, 'filesystem', 'Allow', 'legacyhash', 0)",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(session_id.to_string())
+        .bind(Ulid::new().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Applying 034 must not disturb the legacy row.
+        sqlx::query(include_str!("../migrations/034_audit_path_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT input_hash, path_operation, attempted_path FROM audit_log")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy.0, "legacyhash", "the legacy input_hash is retained");
+        assert_eq!(legacy.1, None);
+        assert_eq!(legacy.2, None);
+
+        // And a post-034 write still lands.
+        let audit = SqliteAuditLog::new(pool.clone());
+        audit
+            .record(
+                entry_with_path_facts(
+                    session_id,
+                    "filesystem",
+                    "Allow",
+                    Some(PathPolicyFacts {
+                        operation: "read".into(),
+                        attempted_path: Some("x.txt".into()),
+                        ..PathPolicyFacts::default()
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM audit_log").fetch_one(&pool).await.unwrap();
+        assert_eq!(count.0, 2);
     }
 }

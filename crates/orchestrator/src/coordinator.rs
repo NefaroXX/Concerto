@@ -11642,6 +11642,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: true,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -12403,6 +12404,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -12624,6 +12626,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: true,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -13085,6 +13088,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -13808,6 +13812,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -25810,6 +25815,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = policy.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(
@@ -34267,6 +34273,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: true,
+            path_facts: None,
         };
         let plain_action =
             PolicyAction { orchestrator_authority: false, ..authority_action.clone() };

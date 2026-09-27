@@ -2001,6 +2001,7 @@ async fn handle_approval_request(
                 command_facts: None,
                 // The child is untrusted by design; never an authority action.
                 orchestrator_authority: false,
+                path_facts: None,
             };
             sink.request_approval(&policy_action, cancel.clone()).await
         }

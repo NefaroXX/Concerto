@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use camino::Utf8Path;
 use concerto_core::text::normalize_typographic;
 use concerto_core::traits::PolicyEngine;
-use concerto_core::types::{CapabilitySet, SessionContext, ToolOutput};
+use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -245,6 +245,50 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), ToolError> {
     }
 }
 
+/// The root path used for containment, mirroring [`FilesystemTool::execute`]:
+/// the session's project dir when set, otherwise the tool's construction root.
+fn effective_root<'a>(tool_root: &'a Utf8Path, session: &'a SessionContext) -> &'a Utf8Path {
+    if !session.project_dir.as_os_str().is_empty() {
+        session.project_dir.to_str().map(Utf8Path::new).unwrap_or(tool_root)
+    } else {
+        tool_root
+    }
+}
+
+/// Build structured path facts for a filesystem action from its raw input.
+///
+/// Records the operation, the attempted path exactly as the caller supplied it,
+/// and the confined absolute path after workspace containment (recorded
+/// separately so a containment rewrite is visible). Move/copy also record the
+/// attempted and confined destination. Never records file content — only the
+/// operation and paths.
+///
+/// Returns `None` only when the input cannot be parsed as a filesystem action;
+/// a path that fails containment still yields facts with `resolved_path: None`
+/// so a rejected traversal remains attributable.
+fn filesystem_path_facts(root: &Utf8Path, input: &serde_json::Value) -> Option<PathPolicyFacts> {
+    let parsed = coerce_filesystem_input(input).ok()?;
+    let resolved_path = crate::common::resolve_path(root, Utf8Path::new(&parsed.path))
+        .ok()
+        .map(|path| path.to_string());
+    let (attempted_destination, resolved_destination) = match parsed.destination.as_deref() {
+        Some(destination) if !destination.is_empty() => (
+            Some(destination.to_string()),
+            crate::common::resolve_path(root, Utf8Path::new(destination))
+                .ok()
+                .map(|path| path.to_string()),
+        ),
+        _ => (None, None),
+    };
+    Some(PathPolicyFacts {
+        operation: parsed.operation,
+        attempted_path: Some(parsed.path),
+        resolved_path,
+        attempted_destination,
+        resolved_destination,
+    })
+}
+
 #[async_trait]
 impl concerto_core::traits::tool::Tool for FilesystemTool {
     fn name(&self) -> &str {
@@ -280,6 +324,15 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
         // enforcement is policy's job (default rules auto-approve reads and
         // require approval for writes), not the capability filter's.
         CapabilitySet::default().with_requirement("filesystem")
+    }
+
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
+        let root = effective_root(&self.root, session);
+        filesystem_path_facts(root, input)
     }
 
     async fn execute(
@@ -661,6 +714,17 @@ impl concerto_core::traits::tool::Tool for WriteTool {
         // Canonical identity + operation-bearing input: full parity with a
         // direct filesystem write under every rule shape.
         ("filesystem".to_string(), Self::canonical_input(input))
+    }
+
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
+        // The executor passes the canonical policy view (operation forced to
+        // `write`), so the shared filesystem fact builder sees the operation.
+        let root = effective_root(&self.inner.root, session);
+        filesystem_path_facts(root, input)
     }
 
     async fn execute(
@@ -1417,6 +1481,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1593,5 +1658,82 @@ mod tests {
             error.to_string().contains("missing 'content' field for write operation"),
             "unexpected error: {error}"
         );
+    }
+
+    // ---- Path-shaped structured facts (audit observability) ----------------
+
+    /// Every read/write/delete/exists/list operation records its operation name
+    /// and the attempted plus confined path.
+    #[test]
+    fn path_facts_records_operation_and_confined_path_for_each_operation() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        for operation in ["read", "write", "delete", "exists", "list"] {
+            let input = serde_json::json!({"operation": operation, "path": "sub/file.txt"});
+            let facts = tool.path_facts(&input, &session).expect("facts are produced");
+            assert_eq!(facts.operation, operation);
+            assert_eq!(facts.attempted_path.as_deref(), Some("sub/file.txt"));
+            let resolved = facts.resolved_path.expect("the path resolves inside the workspace");
+            assert!(
+                resolved.ends_with("sub/file.txt"),
+                "resolved path {resolved} must be the confined target"
+            );
+        }
+    }
+
+    /// Move and copy also record the attempted and confined destination.
+    #[test]
+    fn path_facts_records_destination_for_move_and_copy() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        for operation in ["move", "copy"] {
+            let input = serde_json::json!({"operation": operation, "path": "a.txt", "destination": "b.txt"});
+            let facts = tool.path_facts(&input, &session).expect("facts are produced");
+            assert_eq!(facts.operation, operation);
+            assert_eq!(facts.attempted_destination.as_deref(), Some("b.txt"));
+            let resolved =
+                facts.resolved_destination.expect("the destination resolves in the workspace");
+            assert!(resolved.ends_with("b.txt"), "resolved destination: {resolved}");
+        }
+    }
+
+    /// A containment rewrite is visible as attempted != resolved.
+    #[test]
+    fn path_facts_show_containment_rewrite() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        let input = serde_json::json!({"operation": "read", "path": "nested/../target.txt"});
+        let facts = tool.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.attempted_path.as_deref(), Some("nested/../target.txt"));
+        let resolved = facts.resolved_path.expect("resolved");
+        assert_ne!(resolved, "nested/../target.txt", "the resolved path is re-anchored");
+        assert!(resolved.ends_with("target.txt"), "resolved path: {resolved}");
+    }
+
+    /// A traversal rejection still records the attempted path, with no resolved
+    /// path, so the rejected target stays attributable.
+    #[test]
+    fn path_facts_record_rejected_traversal_without_resolved_path() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        let input = serde_json::json!({"operation": "read", "path": "../../etc/passwd"});
+        let facts = tool.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.attempted_path.as_deref(), Some("../../etc/passwd"));
+        assert!(facts.resolved_path.is_none(), "an escaping path must not resolve");
+    }
+
+    /// The `write` alias records the canonical filesystem write operation.
+    #[test]
+    fn write_alias_path_facts_report_canonical_write() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write_tool = WriteTool::new(root);
+        let session = session_for(dir.path());
+        let raw = serde_json::json!({"path": "alias.txt", "content": "hi"});
+        let (_, canonical) = write_tool.policy_view(&raw);
+        let facts = write_tool.path_facts(&canonical, &session).expect("facts are produced");
+        assert_eq!(facts.operation, "write");
+        assert_eq!(facts.attempted_path.as_deref(), Some("alias.txt"));
+        assert!(facts.resolved_path.is_some());
     }
 }

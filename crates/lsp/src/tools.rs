@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use concerto_core::error::ToolError;
 use concerto_core::traits::tool::Tool;
 use concerto_core::traits::PolicyEngine;
-use concerto_core::types::{CapabilitySet, SessionContext, ToolOutput};
+use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::CancellationToken;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -168,6 +168,22 @@ fn file_uri(file_path: &str) -> String {
     format!("file://{file_path}")
 }
 
+/// Structured path facts for an LSP tool call: the tool name as the operation
+/// and the absolute `file_path` as the attempted target.
+///
+/// LSP operates on caller-supplied absolute paths rather than
+/// workspace-confined ones, so `resolved_path` stays `None`; the attempted path
+/// is still attributable and gate-able. Tools whose input carries no
+/// `file_path` (e.g. `ExecuteCodeAction`) record no facts.
+fn lsp_path_facts(operation: &str, input: &serde_json::Value) -> Option<PathPolicyFacts> {
+    let file_path = input.get("file_path").and_then(serde_json::Value::as_str)?;
+    Some(PathPolicyFacts {
+        operation: operation.to_owned(),
+        attempted_path: Some(file_path.to_owned()),
+        ..PathPolicyFacts::default()
+    })
+}
+
 macro_rules! lsp_tool {
     ($name:ident, $method:expr, $desc:expr, $input_type:ty, $build_params:expr) => {
         pub struct $name;
@@ -184,6 +200,13 @@ macro_rules! lsp_tool {
             }
             fn capability_requirements(&self) -> CapabilitySet {
                 CapabilitySet::default()
+            }
+            fn path_facts(
+                &self,
+                input: &serde_json::Value,
+                _session: &SessionContext,
+            ) -> Option<PathPolicyFacts> {
+                lsp_path_facts(stringify!($name), input)
             }
             async fn execute(
                 &self,
@@ -220,6 +243,13 @@ macro_rules! lsp_tool {
             }
             fn capability_requirements(&self) -> CapabilitySet {
                 CapabilitySet::default()
+            }
+            fn path_facts(
+                &self,
+                input: &serde_json::Value,
+                _session: &SessionContext,
+            ) -> Option<PathPolicyFacts> {
+                lsp_path_facts(stringify!($name), input)
             }
             async fn execute(
                 &self,
@@ -331,6 +361,13 @@ impl Tool for GetDiagnostics {
     fn capability_requirements(&self) -> CapabilitySet {
         CapabilitySet::default()
     }
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        _session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
+        lsp_path_facts(self.name(), input)
+    }
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -430,6 +467,35 @@ mod tests {
         let input = json!({});
         let err = text_doc_id(&input).unwrap_err();
         assert_missing_field(&err, "file_path");
+    }
+
+    // ------------------------------------------------------------------
+    // Path-shaped structured facts
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lsp_path_facts_record_operation_and_file_path() {
+        let input = json!({"file_path": "/home/user/main.rs", "line": 1});
+        let facts = lsp_path_facts("GetHover", &input).expect("facts are produced");
+        assert_eq!(facts.operation, "GetHover");
+        assert_eq!(facts.attempted_path.as_deref(), Some("/home/user/main.rs"));
+        assert!(facts.resolved_path.is_none(), "LSP paths are absolute, not workspace-resolved");
+    }
+
+    #[test]
+    fn lsp_path_facts_absent_without_file_path() {
+        let input = json!({"command": "rust-analyzer.something", "arguments": []});
+        assert!(lsp_path_facts("ExecuteCodeAction", &input).is_none());
+    }
+
+    #[test]
+    fn lsp_tool_trait_reports_path_facts() {
+        let session =
+            SessionContext::new(concerto_core::ids::Ulid::new(), std::path::PathBuf::from("/tmp"));
+        let input = json!({"file_path": "/home/user/main.rs"});
+        let facts = GetDiagnostics.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.operation, "GetDiagnostics");
+        assert_eq!(facts.attempted_path.as_deref(), Some("/home/user/main.rs"));
     }
 
     #[test]

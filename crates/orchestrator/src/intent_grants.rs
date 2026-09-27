@@ -322,6 +322,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -487,6 +488,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: Some(facts),
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 

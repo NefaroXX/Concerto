@@ -2313,6 +2313,7 @@ impl AgentLoop {
                 estimated_cost_usd: None,
                 command_facts: None,
                 orchestrator_authority: false,
+                path_facts: None,
             };
 
             match self.approval.request_approval(&action, cancel.clone()).await {

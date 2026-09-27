@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS archive.audit_log_archive (
     error_kind              TEXT,
     server_id               TEXT,
     plugin_id               TEXT,
+    path_operation          TEXT,
+    attempted_path          TEXT,
+    resolved_path           TEXT,
+    attempted_destination   TEXT,
+    resolved_destination    TEXT,
     archived_at             INTEGER NOT NULL
 )";
 
@@ -76,7 +81,9 @@ INSERT OR IGNORE INTO archive.audit_log_archive (
     rule_matched, user_response, created_at, profile_id, resolved_executable,
     argv, working_directory, network_requested, filesystem_scope,
     destructive_classification, exit_code, duration_ms, toolchain_version,
-    plan_id, source_revision, error_kind, server_id, plugin_id, archived_at
+    plan_id, source_revision, error_kind, server_id, plugin_id,
+    path_operation, attempted_path, resolved_path, attempted_destination,
+    resolved_destination, archived_at
 )
 SELECT *, ? FROM audit_log WHERE created_at < ?";
 

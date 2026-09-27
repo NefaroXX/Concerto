@@ -3136,6 +3136,7 @@ mod tests {
                     toolchain_version: None,
                     plan_id: None,
                     source_revision: None,
+                    path_facts: None,
                 },
                 cancel.clone(),
             )
@@ -3453,6 +3454,7 @@ mod tests {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
         }
     }
 

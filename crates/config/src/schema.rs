@@ -1339,12 +1339,15 @@ pub struct PolicyRuleDef {
 #[non_exhaustive]
 /// Policy condition definitions (ADR-43 §6): `ToolNamePrefix` matches any tool
 /// whose name starts with the prefix (e.g. `mcp:github:`), enabling
-/// server-level MCP policy rules.
+/// server-level MCP policy rules. `ResolvedPathGlob` matches a path-shaped
+/// action's resolved target path (after workspace containment) against a glob,
+/// unlike `PathGlob`, which matches the caller-supplied input path.
 pub enum ConditionDef {
     ToolOperation { tool_name: String, operation: String },
     ToolName { tool_name: String },
     ToolNamePrefix { tool_name_prefix: String },
     PathGlob { path_glob: String },
+    ResolvedPathGlob { resolved_path_glob: String },
     CommandPattern { command_pattern: String },
     GitOperation { git_operation: String },
     Always { always: bool },
@@ -1398,6 +1401,9 @@ impl ConditionDef {
                 Condition::Operation(operation.clone()),
             ]),
             ConditionDef::PathGlob { path_glob } => Condition::PathGlob(path_glob.clone()),
+            ConditionDef::ResolvedPathGlob { resolved_path_glob } => {
+                Condition::ResolvedPathGlob(resolved_path_glob.clone())
+            }
             ConditionDef::CommandPattern { command_pattern } => {
                 Condition::CommandPattern(command_pattern.clone())
             }

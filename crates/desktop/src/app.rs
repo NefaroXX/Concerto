@@ -7206,6 +7206,7 @@ custom_agents = []
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 

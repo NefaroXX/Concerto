@@ -1177,6 +1177,7 @@ impl WriteGate {
                 // truthful about the caller's authority so its audit row
                 // reflects who issued it.
                 orchestrator_authority: req.orchestrator_authority,
+                path_facts: None,
             };
             match self.policy.evaluate_advisory(&action, cancel.clone()).await {
                 Ok(verdict) => tracing::debug!(
@@ -1233,6 +1234,7 @@ impl WriteGate {
             // `true`, and the supervisor boundary always forces it `false` for
             // child-supplied requests (see `GateRequest::orchestrator_authority`).
             orchestrator_authority: req.orchestrator_authority,
+            path_facts: None,
         };
 
         // Only `Allow` executes. Every other verdict is a durable

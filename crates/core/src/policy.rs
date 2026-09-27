@@ -382,6 +382,17 @@ impl SimplePolicyEngine {
                 .and_then(|p| p.to_str())
                 .map(|p| self.compiled.get(&format!("wd:{glob}")).is_some_and(|re| re.is_match(p)))
                 .unwrap_or(false),
+            Condition::ResolvedPathGlob(glob) => {
+                let facts = action.path_facts.as_ref();
+                // Prefer the confined resolved path; fall back to the attempted
+                // path so a rejected traversal is still gate-able.
+                facts
+                    .and_then(|f| f.resolved_path.as_deref().or(f.attempted_path.as_deref()))
+                    .map(|p| {
+                        self.compiled.get(&format!("rpath:{glob}")).is_some_and(|re| re.is_match(p))
+                    })
+                    .unwrap_or(false)
+            }
             // ADR-55 §2: as a plain boolean predicate the intent condition
             // matches only when an attached authorization allows the action.
             // Approval-producing rules handle the bare condition through
@@ -515,6 +526,7 @@ impl SimplePolicyEngine {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: action.path_facts.clone(),
         };
         self.record_audit(entry, cancel).await;
     }
@@ -689,6 +701,22 @@ fn collect_from_cond(cond: &Condition, map: &mut HashMap<String, regex::Regex>) 
                 }
             }
         }
+        Condition::ResolvedPathGlob(glob) => {
+            // Namespace like PathGlob/WorkingDir so the three glob namespaces
+            // can never collide on identical source text.
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(format!("rpath:{glob}"))
+            {
+                let re_str = glob_to_regex(glob);
+                match regex::Regex::new(&re_str) {
+                    Ok(re) => {
+                        e.insert(re);
+                    }
+                    Err(err) => {
+                        error!(?glob, error = %err, "invalid glob in policy pattern");
+                    }
+                }
+            }
+        }
         Condition::Not(inner) => collect_from_cond(inner, map),
         Condition::All(conds) | Condition::Any(conds) => {
             for c in conds {
@@ -720,6 +748,11 @@ fn collect_invalid(cond: &Condition, problems: &mut Vec<String>) {
             }
         }
         Condition::WorkingDir(glob) => {
+            if regex::Regex::new(&glob_to_regex(glob)).is_err() {
+                problems.push(format!("invalid glob pattern: {glob}"));
+            }
+        }
+        Condition::ResolvedPathGlob(glob) => {
             if regex::Regex::new(&glob_to_regex(glob)).is_err() {
                 problems.push(format!("invalid glob pattern: {glob}"));
             }
@@ -1305,7 +1338,7 @@ mod tests {
     use crate::sandbox::{ContainerRuntime, ContainerRuntimeProbe, RuntimeAvailability};
     use crate::types::{
         CapabilitySet, CommandPolicyFacts, CommandRouting, DestructiveClass, FilesystemScope,
-        SandboxProfile,
+        PathPolicyFacts, SandboxProfile,
     };
     use std::path::PathBuf;
 
@@ -1340,6 +1373,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1688,6 +1722,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let cond = Condition::Capability(rule_caps);
         let engine = SimplePolicyEngine::new(
@@ -1715,6 +1750,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let cond = Condition::Capability(rule_caps);
         let engine = SimplePolicyEngine::new(
@@ -1857,6 +1893,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: Some(facts),
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1957,6 +1994,77 @@ mod tests {
         assert!(!engine.eval_cond(&Condition::ShellProfile("managed-bash".into()), &action));
         assert!(!engine.eval_cond(&Condition::ArgvPattern(".*".into()), &action));
         assert!(!engine.eval_cond(&Condition::WorkingDir("**".into()), &action));
+        assert!(!engine.eval_cond(&Condition::ResolvedPathGlob("**".into()), &action));
+    }
+
+    // ---- Path-shaped structured facts (filesystem observability) ------------
+
+    /// Build a `filesystem` action carrying the given path facts.
+    fn path_facts_action<'a>(
+        input: &'a serde_json::Value,
+        path_facts: PathPolicyFacts,
+    ) -> PolicyAction<'a> {
+        PolicyAction { path_facts: Some(path_facts), ..make_action("filesystem", input) }
+    }
+
+    #[test]
+    fn resolved_path_glob_matches_the_confined_path() {
+        let input = serde_json::json!({"operation": "write", "path": "src/../lib.rs"});
+        let facts = PathPolicyFacts {
+            operation: "write".into(),
+            attempted_path: Some("src/../lib.rs".into()),
+            resolved_path: Some("/proj/lib.rs".into()),
+            ..PathPolicyFacts::default()
+        };
+        let action = path_facts_action(&input, facts);
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoDeny(Condition::ResolvedPathGlob("/proj/**".into()))],
+            Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) }),
+        );
+
+        // The resolved path is matched, not the caller's spelling.
+        assert!(engine.eval_cond(&Condition::ResolvedPathGlob("/proj/**".into()), &action));
+        assert!(!engine.eval_cond(&Condition::ResolvedPathGlob("/proj/src/**".into()), &action));
+    }
+
+    #[test]
+    fn resolved_path_glob_falls_back_to_attempted_path() {
+        // A rejected traversal never resolves, yet must stay gate-able.
+        let input = serde_json::json!({"operation": "read", "path": "../outside.txt"});
+        let facts = PathPolicyFacts {
+            operation: "read".into(),
+            attempted_path: Some("../outside.txt".into()),
+            resolved_path: None,
+            ..PathPolicyFacts::default()
+        };
+        let action = path_facts_action(&input, facts);
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoDeny(Condition::ResolvedPathGlob("../**".into()))],
+            Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) }),
+        );
+
+        assert!(engine.eval_cond(&Condition::ResolvedPathGlob("../**".into()), &action));
+        assert!(!engine.eval_cond(&Condition::ResolvedPathGlob("/proj/**".into()), &action));
+    }
+
+    #[tokio::test]
+    async fn record_decision_carries_path_facts() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit.clone());
+        let input = serde_json::json!({"operation": "write", "path": "notes.txt"});
+        let facts = PathPolicyFacts {
+            operation: "write".into(),
+            attempted_path: Some("notes.txt".into()),
+            resolved_path: Some("/proj/notes.txt".into()),
+            ..PathPolicyFacts::default()
+        };
+        let action = path_facts_action(&input, facts.clone());
+
+        engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path_facts.as_ref(), Some(&facts));
     }
 
     // ---- Sandbox profiles (stub — all non-None profiles deny) ----------------
@@ -1977,6 +2085,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Allow);
@@ -1998,6 +2107,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -2019,6 +2129,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -2069,6 +2180,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -2119,6 +2231,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Allow);
@@ -2211,6 +2324,7 @@ mod tests {
                 container_routing,
             }),
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -2400,6 +2514,7 @@ mod tests {
             estimated_cost_usd: Some(0.6),
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         // Preflight succeeds without charging the estimate.
@@ -2431,6 +2546,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         // First 3 calls should succeed.
@@ -2461,6 +2577,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
@@ -3117,6 +3234,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -3151,6 +3269,7 @@ mod tests {
             estimated_cost_usd: Some(0.6),
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         tracker.record(0.6);
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
