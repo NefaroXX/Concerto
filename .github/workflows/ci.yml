@@ -130,6 +130,56 @@ jobs:
       - name: Build entire workspace
         run: cargo build --workspace
 
+  # -------------------------------------------------------------- benchmarks
+  bench:
+    name: Benchmarks (compile + smoke run)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-wasip2
+
+      - name: Install system dependencies (dbus, ssl, sqlite, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libssl-dev libsqlite3-dev
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # Tier 1 of the benchmark gate. Every PR compiles and smoke-runs every
+      # criterion benchmark; this catches rot, dead targets, and API breakage.
+      #
+      # `--test` runs each benchmark once without measuring, so this gate is
+      # deterministic and makes no timing assertion — wall-clock timing on
+      # shared runners is too noisy to gate on. Timing regressions are handled
+      # off the PR path by bench-baseline.yml (scheduled + manual), which
+      # compares against a stored baseline with an explicit tolerance.
+      #
+      # Bench targets are discovered from the workspace manifests rather than
+      # listed by hand, so a newly added [[bench]] is covered automatically.
+      # They are selected individually because a bare `cargo bench --workspace`
+      # also builds each crate's lib bench harness, which runs that crate's unit
+      # tests in bench mode — duplicating the `test` job and adding failures
+      # unrelated to the benchmarks.
+      - name: Compile and smoke-run benchmark targets
+        run: |
+          set -euo pipefail
+          mapfile -t bench_names < <(
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json, sys; d = json.load(sys.stdin); print("\n".join(sorted({t["name"] for p in d["packages"] for t in p["targets"] if "bench" in t["kind"]})))'
+          )
+          bench_args=()
+          for name in "${bench_names[@]}"; do
+            bench_args+=(--bench "${name}")
+          done
+          echo "Smoke-running benchmark targets: ${bench_names[*]}"
+          cargo bench --workspace "${bench_args[@]}" -- --test
+
   # ------------------------------------------------------------ wasm plugins
   wasm-plugins:
     name: WASM plugins (wasm32-wasip2)

@@ -1,5 +1,10 @@
 /target
 /crates/*/target
+# Criterion benchmark baselines and reports are regenerated locally and in CI
+# (see .github/workflows/bench-baseline.yml); timing data is not source.
+# Redundant with /target above, kept explicit so the CI cache path is obviously
+# never committed.
+/target/criterion/
 **/*.rs.bk
 .DS_Store
 
