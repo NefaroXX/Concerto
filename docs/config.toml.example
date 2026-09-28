@@ -114,7 +114,7 @@ max_concurrent_per_provider = 2
 # default-model fallback tier of the ladder; disable it to skip that tier.
 default_model_fallback = true
 # ADR-45: dispatch-attempt ceiling per subtask before the fallback ladder
-# walks in. Defaults to 3 when omitted. Raise it for flaky providers.
+# walks in. Defaults to 6 when omitted (DEFAULT_MAX_SUBTASK_ATTEMPTS).
 # max_subtask_attempts = 5
 
 # NOTE: relationship endpoints are STAGE TAGS, not agent ids. Cycle budgets
@@ -160,12 +160,12 @@ relationship = "provides_context_to"
 # role = "coder"
 # stage = "implement"
 # can_cover = ["review"]          # ADR-74: also eligible to cover review
-# system_instructions = "..."     # via [multi_agent.custom_agents.prompt_sections]
 # model_override = "another-tool-capable-model"
 # provider_id = "local-provider"
 # disabled = false                # true = not registered at runtime
 #
-# [[multi_agent.custom_agents.prompt_sections]]
+# prompt_sections is a table (PromptSections), not a list of tables:
+# [multi_agent.custom_agents.prompt_sections]
 # system_instructions = "You are the Coder agent."
 # constraints = "Never touch generated files."
 # output_format = "A unified diff."
@@ -174,14 +174,18 @@ relationship = "provides_context_to"
 # `stage` is one tag from an OPEN vocabulary, not a fixed pipeline position. A
 # stage-less agent is a full participant in the delegation path.
 
-# Blueprint / pipeline selection (ADR-58). Omit the section entirely to keep the
-# embedded five-stage `standard` pipeline. `blueprint` takes exactly one of
-# `name` (a shipped blueprint), `include` (a path), or `inline`.
-# [orchestration]
-# schema_version = 1
-#
-# [orchestration.blueprint]
-# name = "standard"                # standard | tdd | docs-only | research-only
+# Blueprint / pipeline selection (ADR-58). Without this section the engine uses
+# the embedded five-stage `standard` pipeline; `blueprint` takes exactly one of
+# `name` (a shipped blueprint), `include` (a path), or `inline`. NOTE: an
+# active [orchestration] section also makes THIS config own the agent roster —
+# with no [multi_agent.custom_agents] entries declared the roster is empty and
+# the coordinator self-implements (ADR-35 §8) instead of dispatching to the
+# built-in specialists.
+[orchestration]
+schema_version = 1
+
+[orchestration.blueprint]
+name = "standard"                # standard | tdd | docs-only | research-only
 #
 # For a full inline definition (stages, kinds, flags, per-stage max_cycles,
 # fallback personas) see crates/config/src/blueprint.rs and the Orchestration
@@ -230,17 +234,17 @@ always = true
 # auto_approve_below_usd = 0.10
 
 # Audit log at-rest protection and retention (ADR-73). Every knob is explicit
-# opt-in: without this section the database is plaintext and the audit log is
+# opt-in: the shipped defaults keep the database plaintext and the audit log
 # grow-only, exactly as before.
-# [audit]
-# encrypt_at_rest = false
+[audit]
+encrypt_at_rest = false
 #   # When true, `sessions.db` (including `audit_log`) is encrypted with
 #   # SQLCipher. The key is generated on first use and stored in the OS keychain
 #   # under `audit/db_encryption_key`; CONCERTO_AUDIT_DB_ENCRYPTION_KEY
 #   # overrides it and is the supported way to provision a key on a headless
 #   # host. The store REFUSES to start if SQLCipher or the key is unavailable —
 #   # encryption is never silently downgraded to plaintext.
-# retention_days = 0              # 0 or omitted = keep every row forever
+retention_days = 0              # 0 or omitted = keep every row forever
 #   # Days before an `audit_log` row is archived out and deleted. Older rows move
 #   # to the archive FIRST; a failed archive write aborts the prune, so a row is
 #   # never deleted un-archived. Retention is time-based, not
@@ -252,43 +256,46 @@ always = true
 # carrying a `[tools]` table is silently ignored (AppConfig has no
 # deny_unknown_fields), which is why several source comments that say "[tools]"
 # are wrong.
-# [tool_settings]
-# git_auto_init = true            # run a bare `git init` when not already in a repo
+[tool_settings]
+git_auto_init = true            # run a bare `git init` when not already in a repo
 
 # Project memory: retrieval, indexing, and persistence. Shared by CLI and
-# desktop.
-# [memory]
-# enabled = true
-# ttl_days = 30                   # retention window for indexed chunks
-# exclude_patterns = ["target/**"]
-# ignore_file = ".concertoignore" # loaded after .gitignore
-# summary_keep_per_session = 20   # ADR-65 §8 count cap on derived summaries; 0 = keep all
-# summary_retention_days = 365    # 0 disables the age-based prune
-# dedup_judge = true              # ADR-46 L1; advisory and fail-open
-# max_out_degree = 32             # ADR-69 out-degree cap; 0 is rejected
+# desktop. Uncommented keys carry their shipped defaults.
+[memory]
+enabled = true
+ttl_days = 30                   # retention window for indexed chunks
+# exclude_patterns = ["target/**"]  # default: none (extra project-relative excludes)
+# ignore_file = ".concertoignore" # default: none; loaded after .gitignore
+summary_keep_per_session = 20   # ADR-65 §8 count cap on derived summaries; 0 = keep all
+summary_retention_days = 365    # 0 disables the age-based prune
+dedup_judge = true              # ADR-46 L1; advisory and fail-open
+# max_out_degree = 32             # ADR-69 out-degree cap; 0 is rejected; default 32
 # cascade_decay_days = 90         # ADR-69 decay window; 0 disables decay; >365 rejected
 
 # Frontend motion/accessibility controls shared by desktop and CLI. The default
 # is full motion (both cues off-disabled).
-# [display]
-# reduced_motion = false
-# scanline_overlay_enabled = false
-# animated_terminal_title = true
-# theme = "dark"                  # or "light"; --theme / CONCERTO_THEME override
-# muted_agents = []               # roster ids to grey out in the agent view
+[display]
+reduced_motion = false
+scanline_overlay_enabled = false
+animated_terminal_title = true
+# theme = "Midnight"             # unset = Midnight; also Slate | Chalk | Nebula;
+#                               # --theme / CONCERTO_THEME override
+muted_agents = []               # roster ids to grey out in the agent view
 
-# Deterministic context budget for the single-agent loop (ADR-048). Omitted
-# keys fall back to the engine's embedded defaults.
-# [context]
-# trigger_tokens = 16000
-# retain_user_turns = 4
-# minimum_user_turns = 6
-# cache_stable_prefix = false     # true pins a byte-stable cached prompt head
+# Deterministic context budget for the single-agent loop (ADR-048). The four
+# keys below are the engine's embedded defaults; omit any of them to inherit
+# the same values from context_compaction.rs.
+[context]
+trigger_tokens = 16000
+retain_user_turns = 4
+minimum_user_turns = 6
+cache_stable_prefix = false     # true pins a byte-stable cached prompt head
 
 # Shell profiles are normally detected and saved by Settings. The single
 # selected profile is used by agents, validation, and the integrated terminal.
-# A custom profile example:
-# [shell_settings]
+# An empty table is the shipped shape: Settings writes the host-detected
+# profiles and the selected id into it. A custom profile example:
+[shell_settings]
 # selected_profile = "my-bash"
 #
 # [[shell_settings.profiles]]
@@ -302,41 +309,42 @@ always = true
 # encoding = "utf-8"
 # default_working_dir = "project_root"
 
-# Exporters are disabled by omitting fields/the entire section.
-# [observability]
-# prometheus_port = 9091
-# service_name = "concerto"
-# otlp_endpoint = "http://localhost:4318"
+# Exporters are disabled by omitting fields/the entire section. Uncommented
+# keys carry their shipped defaults.
+[observability]
+service_name = "concerto"
+# prometheus_port = 9091         # omitted = Prometheus export disabled
+# otlp_endpoint = "http://localhost:4318"   # omitted = OTLP disabled
 # langfuse_host = "https://cloud.langfuse.com"
 # langfuse_public_key = "keyring:langfuse/public_key"
 # langfuse_secret_key = "keyring:langfuse/secret_key"
 
 # WASM plugins. Tool, provider, and memory-adapter kinds all execute; a
 # memory-adapter plugin supplies an alternative vector store.
-# [plugins]
-# enabled = false
-# search_paths = ["~/.local/share/concerto/plugins"]  # when empty: <data-dir>/plugins
-# bundled_plugins_enabled = true
-# auto_load = true
+[plugins]
+enabled = false
+# search_paths = ["~/.local/share/concerto/plugins"]  # default: empty = <data-dir>/plugins
+# bundled_plugins_enabled = true  # default false
+# auto_load = true                # default false; nothing loads while enabled = false
 
 # Skills are local instruction packs injected into prompts (ADR-43). They
-# never execute code. Defaults shown here apply when the section is omitted.
-# NOTE: enabled defaults to false (ADR-43 decision 5 — explicit opt-in).
-# The default search paths are <data-dir>/concerto/skills (Linux
-# ~/.local/share, Windows %APPDATA%), then ./.concerto/skills; the legacy
-# literal ~/.local/share/concerto/skills is kept only when it differs from the
+# never execute code. `enabled` defaults to false (ADR-43 decision 5 — explicit
+# opt-in); set it to true to discover and inject packs. The default search
+# paths are <data-dir>/concerto/skills (Linux ~/.local/share, Windows
+# %APPDATA%), then ./.concerto/skills; the legacy literal
+# ~/.local/share/concerto/skills is kept only when it differs from the
 # platform root. `~` and %VAR% references are expanded at discovery time.
-# [skills]
-# enabled = true
+[skills]
+enabled = false
+auto_load = true
 # search_paths = ["%APPDATA%\\concerto\\skills", "./.concerto/skills"]  # Windows example
-# auto_load = true
-# enabled_ids = ["rust-testing", "commit-style"]  # empty/unset = all discovered
-# max_chars = 4000  # cap on the injected skills section
+# enabled_ids = ["rust-testing", "commit-style"]  # unset = all discovered when auto_load
+# max_chars = 4000  # unset = 4000-char cap on the injected skills section
 
 # MCP client (ADR-43). Default off until you opt in. Servers run as child
 # processes; every mcp:* tool is policy-gated (RequireApproval by default).
-# [mcp]
-# enabled = false
+[mcp]
+enabled = false
 #
 # [[mcp.servers]]
 # id = "filesystem"
@@ -349,15 +357,16 @@ always = true
 # Project AGENTS.md injection (ADR-70). Reads the global AGENTS.md at
 # <config_dir>/concerto/AGENTS.md plus the project's <root>/AGENTS.md and
 # appends both to the system prompt, truncated independently to max_bytes.
-# Default off until you opt in (injected into every prompt). Conflicts are
-# resolved project-over-global, with both sources named in the prompt.
-# <config_dir> is ~/.config on Linux and %APPDATA% on Windows.
-# [project_context]
-# enabled = true
+# Default off until you opt in (injected into every prompt) — set
+# `enabled = true`. Conflicts are resolved project-over-global, with both
+# sources named in the prompt. <config_dir> is ~/.config on Linux and
+# %APPDATA% on Windows.
+[project_context]
+enabled = false
 # global_path = "~/.config/concerto/AGENTS.md"  # default when unset (per-platform)
 # max_bytes = 32768  # 32 KiB per file; per-file truncation with a marker
-# auto_update_agents_md = false  # coordinator nudge only; never edits files
-# update_frequency = 1  # nudge every N dispatches when auto_update is on
+auto_update_agents_md = false  # coordinator nudge only; never edits files
+update_frequency = 1  # nudge every N dispatches when auto_update is on
 
 # The default crates.io update endpoint is not useful for an unpublished
 # source build. Disable it unless you provide an endpoint for your deployment.
