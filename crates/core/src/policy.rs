@@ -535,6 +535,7 @@ impl SimplePolicyEngine {
             plan_id: None,
             source_revision: None,
             path_facts: action.path_facts.clone(),
+            result_facts: None,
         };
         self.record_audit(entry, cancel).await;
     }

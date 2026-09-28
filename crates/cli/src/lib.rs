@@ -1383,6 +1383,11 @@ fn format_audit_entry(number: usize, row: &AuditLogRow) -> String {
     if let Some(destination) = &row.resolved_destination {
         detail.push(format!("destination {destination}"));
     }
+    // Migration 035: what a read-only operation RETURNED (boolean / count /
+    // size) — the "what the agent learned" half of the trail. Never content.
+    if let Some(result_facts) = &row.result_facts {
+        detail.push(format!("result {result_facts}"));
+    }
     if let Some(rule) = &row.rule_matched {
         detail.push(format!("rule {rule}"));
     }
@@ -2552,6 +2557,7 @@ api_key = "sk-test-key-for-provider-list-1234567890"
             resolved_path: None,
             attempted_destination: None,
             resolved_destination: None,
+            result_facts: None,
         }
     }
 
@@ -2719,5 +2725,46 @@ api_key = "sk-test-key-for-provider-list-1234567890"
     #[test]
     fn format_audit_timestamp_renders_rfc3339_utc() {
         assert_eq!(format_audit_timestamp(0), "1970-01-01T00:00:00Z");
+    }
+
+    /// A read-only row carries its result summary on the detail line, and a
+    /// row without one (mutating op / pre-035) renders no result clause.
+    #[test]
+    fn format_audit_entry_shows_read_result_facts() {
+        let row = AuditLogRow {
+            path_operation: Some("list".to_string()),
+            attempted_path: Some(".".to_string()),
+            resolved_path: Some("/proj".to_string()),
+            result_facts: Some("entries=1".to_string()),
+            ..audit_row()
+        };
+        let rendered = format_audit_entry(2, &row);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        assert!(lines[1].contains("resolved /proj"), "{}", lines[1]);
+        assert!(lines[1].contains("result entries=1"), "{}", lines[1]);
+
+        let plain = format_audit_entry(3, &audit_row());
+        assert!(!plain.contains("result "), "no recorded result, no clause: {plain}");
+    }
+
+    /// The `--json` envelope carries `result_facts` and deserialises back
+    /// into the same row (read side of the audit trail).
+    #[test]
+    fn audit_json_output_round_trips_result_facts() {
+        let row = AuditLogRow { result_facts: Some("exists=false".to_string()), ..audit_row() };
+        let envelope =
+            serde_json::json!({ "session_id": AUDIT_TEST_SESSION_ID, "entries": vec![row] });
+        let encoded = serde_json::to_string(&envelope).expect("envelope serialises");
+        assert!(
+            encoded.contains("\"result_facts\":\"exists=false\""),
+            "the new field must appear in --json: {encoded}"
+        );
+
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
+        let entries: Vec<AuditLogRow> =
+            serde_json::from_value(decoded["entries"].clone()).expect("rows decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result_facts.as_deref(), Some("exists=false"));
     }
 }

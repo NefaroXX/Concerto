@@ -1,6 +1,6 @@
 use crate::error::PolicyError;
 use crate::ids::Ulid;
-use crate::types::{PathPolicyFacts, PolicyAction, PolicyVerdict};
+use crate::types::{PathPolicyFacts, PolicyAction, PolicyVerdict, ReadResultFacts};
 use crate::CancellationToken;
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -234,4 +234,15 @@ pub struct AuditEntry {
     /// do not operate on a path. Recorded alongside — not instead of — the
     /// ADR-28 §6 command facts.
     pub path_facts: Option<PathPolicyFacts>,
+    // ---- Read-only operation results (additive, migration 035) -------------
+    /// What a **successful read-only** operation returned: `exists` → boolean,
+    /// `list` → entry count, `read` → byte size. Set only on the
+    /// post-execution completion row, derived from the result the executor
+    /// already holds (no second read, no extra syscall). `None` for mutating
+    /// operations, failed executions, and every decision-time row.
+    ///
+    /// SAFETY: never file content, entry names, secrets, or any other
+    /// unbounded value — only a boolean / count / size, per the rule on
+    /// [`ReadResultFacts`].
+    pub result_facts: Option<ReadResultFacts>,
 }

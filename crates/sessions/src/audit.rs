@@ -50,6 +50,11 @@ impl AuditLog for SqliteAuditLog {
             ),
             None => (None, None, None, None, None),
         };
+        // Read-only result summary (migration 035): a bounded, content-free
+        // canonical string (`exists=true`, `entries=3`, `bytes=42`) rendered
+        // from the typed carrier, or NULL when the operation was mutating,
+        // failed, or names no read-only result. Never file content.
+        let result_facts = entry.result_facts.map(|facts| facts.to_string());
 
         sqlx::query(
             "INSERT INTO audit_log (\
@@ -59,8 +64,8 @@ impl AuditLog for SqliteAuditLog {
                 network_requested, filesystem_scope, destructive_classification, \
                 exit_code, duration_ms, toolchain_version, plan_id, source_revision, \
                 path_operation, attempted_path, resolved_path, \
-                attempted_destination, resolved_destination) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                attempted_destination, resolved_destination, result_facts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Ulid::new().to_string())
         .bind(entry.session_id.to_string())
@@ -88,6 +93,7 @@ impl AuditLog for SqliteAuditLog {
         .bind(resolved_path)
         .bind(attempted_destination)
         .bind(resolved_destination)
+        .bind(result_facts)
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -142,8 +148,9 @@ impl AuditLog for SqliteAuditLog {
 // ---------------------------------------------------------------------------
 // Read path — the audit trail as a sequence
 //
-// The writer above records the path/operation facts added by migration 034;
-// this is the matching read so those columns are usable without raw sqlite3.
+// The writer above records the path/operation facts added by migration 034
+// and the read-only result facts added by migration 035; this is the
+// matching read so those columns are usable without raw sqlite3.
 // ---------------------------------------------------------------------------
 
 /// One `audit_log` row, projected for reading back (forensics / display).
@@ -151,7 +158,8 @@ impl AuditLog for SqliteAuditLog {
 /// Rows written before migration 034 carry `NULL` in all five path columns
 /// and arrive here as `None`; tools that name no path look the same. Both
 /// must be rendered honestly — use [`AuditLogRow::has_path_facts`] to mark
-/// them instead of silently blanking them.
+/// them instead of silently blanking them. Migration 035's `result_facts`
+/// behaves the same way for rows written before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AuditLogRow {
     /// Audit row id (ULID).
@@ -185,6 +193,14 @@ pub struct AuditLogRow {
     pub attempted_destination: Option<String>,
     /// Confined absolute destination (move/copy only).
     pub resolved_destination: Option<String>,
+    /// What a successful **read-only** operation returned (migration 035):
+    /// `exists=<bool>` / `entries=<count>` / `bytes=<size>`, as stored.
+    ///
+    /// `NULL` for mutating operations, failed executions, decision-time rows,
+    /// and rows written before migration 035. SAFETY: the column holds only a
+    /// boolean, a count, or a byte size — never file content, entry names, or
+    /// secrets (see `concerto_core::types::ReadResultFacts`).
+    pub result_facts: Option<String>,
 }
 
 impl AuditLogRow {
@@ -239,7 +255,7 @@ impl SqliteSessionStore {
         let mut sql = String::from(
             "SELECT id, session_id, created_at, tool_name, verdict, rule_matched, \
              error_kind, duration_ms, path_operation, attempted_path, resolved_path, \
-             attempted_destination, resolved_destination \
+             attempted_destination, resolved_destination, result_facts \
              FROM audit_log WHERE session_id = ?",
         );
         if filter.tool.is_some() {
@@ -280,6 +296,7 @@ mod tests {
     use concerto_core::traits::policy::PolicyEngine;
     use concerto_core::types::{
         CapabilitySet, Condition, PathPolicyFacts, PolicyAction, PolicyRule, PolicyVerdict,
+        ReadResultFacts,
     };
     use concerto_core::CancellationToken;
     use std::sync::Arc;
@@ -301,6 +318,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/034_audit_path_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -338,6 +359,7 @@ mod tests {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         let result = audit.record(entry, CancellationToken::new()).await;
         assert!(result.is_ok(), "record should succeed: {:?}", result.err());
@@ -365,6 +387,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/034_audit_path_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -435,6 +461,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
         let sid = Ulid::new();
         sqlx::query(
             "INSERT INTO sessions (id, created_at, project_dir, provider, model) VALUES (?, 0, '/tmp', 'test', 'test')",
@@ -473,6 +503,7 @@ mod tests {
             plan_id: Some("01J4V6Q8X000000000000000099".into()),
             source_revision: Some("abc1234".into()),
             path_facts: None,
+            result_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         let count: (i64,) =
@@ -507,6 +538,7 @@ mod tests {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         let count: (i64,) =
@@ -546,6 +578,7 @@ mod tests {
                     plan_id: None,
                     source_revision: None,
                     path_facts: None,
+                    result_facts: None,
                 };
                 a.record(entry, CancellationToken::new()).await
             }));
@@ -586,6 +619,7 @@ mod tests {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         // Read back the raw argv column and verify it is valid JSON.
@@ -632,6 +666,7 @@ mod tests {
             plan_id: Some(plan_id.into()),
             source_revision: Some(source_revision.into()),
             path_facts: None,
+            result_facts: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
 
@@ -679,6 +714,7 @@ mod tests {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         let e2 = AuditEntry { tool_name: "second".into(), ..e1.clone() };
         log.record(e1.clone(), CancellationToken::new()).await.unwrap();
@@ -718,6 +754,7 @@ mod tests {
                 plan_id: None,
                 source_revision: None,
                 path_facts: None,
+                result_facts: None,
             };
             log.record(entry, CancellationToken::new()).await.unwrap();
         }
@@ -755,6 +792,7 @@ mod tests {
                     plan_id: None,
                     source_revision: None,
                     path_facts: None,
+                    result_facts: None,
                 };
                 l.record(entry, CancellationToken::new()).await.unwrap();
             }));
@@ -791,6 +829,7 @@ mod tests {
             plan_id: Some("plan_1".into()),
             source_revision: Some("deadbeef".into()),
             path_facts: None,
+            result_facts: None,
         };
         let clone = entry.clone();
         // Field-by-field comparison.
@@ -989,6 +1028,7 @@ mod tests {
             plan_id: None,
             source_revision: None,
             path_facts,
+            result_facts: None,
         }
     }
 
@@ -1028,6 +1068,86 @@ mod tests {
         assert_eq!(row.2.as_deref(), Some("/proj/a.txt"));
         assert_eq!(row.3.as_deref(), Some("b.txt"));
         assert_eq!(row.4.as_deref(), Some("/proj/b.txt"));
+    }
+
+    /// Migration 035 end to end: each read-only result kind stores its
+    /// canonical bounded string, a mutating operation stores NULL, and the
+    /// `read` case proves content never reaches the row (only `bytes=…`).
+    #[tokio::test]
+    async fn sqlite_audit_log_records_read_result_facts() {
+        let (pool, session_id) = setup_audit_pool().await;
+        let audit = SqliteAuditLog::new(pool.clone());
+
+        let cases: [(PathPolicyFacts, Option<ReadResultFacts>, Option<&str>); 6] = [
+            (
+                PathPolicyFacts { operation: "exists".into(), ..PathPolicyFacts::default() },
+                Some(ReadResultFacts::Exists(true)),
+                Some("exists=true"),
+            ),
+            (
+                PathPolicyFacts { operation: "exists".into(), ..PathPolicyFacts::default() },
+                Some(ReadResultFacts::Exists(false)),
+                Some("exists=false"),
+            ),
+            (
+                PathPolicyFacts { operation: "list".into(), ..PathPolicyFacts::default() },
+                Some(ReadResultFacts::Entries(0)),
+                Some("entries=0"),
+            ),
+            (
+                PathPolicyFacts { operation: "list".into(), ..PathPolicyFacts::default() },
+                Some(ReadResultFacts::Entries(3)),
+                Some("entries=3"),
+            ),
+            (
+                PathPolicyFacts { operation: "read".into(), ..PathPolicyFacts::default() },
+                Some(ReadResultFacts::Bytes(13)),
+                Some("bytes=13"),
+            ),
+            // Mutating operation: no result is ever recorded.
+            (
+                PathPolicyFacts { operation: "write".into(), ..PathPolicyFacts::default() },
+                None,
+                None,
+            ),
+        ];
+
+        // The canonical rendering expected per row, captured before `cases`
+        // is consumed by the loop.
+        let expected_values: Vec<Option<String>> =
+            cases.iter().map(|(_, _, expected)| expected.map(str::to_owned)).collect();
+
+        for (path_facts, result_facts, expected) in cases {
+            assert_eq!(
+                result_facts.map(|facts| facts.to_string()).as_deref(),
+                expected,
+                "canonical rendering"
+            );
+            let entry = AuditEntry {
+                result_facts,
+                ..entry_with_path_facts(session_id, "filesystem", "Allow", Some(path_facts))
+            };
+            audit.record(entry, CancellationToken::new()).await.expect("record");
+        }
+
+        let stored: Vec<Option<String>> = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT result_facts FROM audit_log ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("result_facts column")
+        .into_iter()
+        .map(|(value,)| value)
+        .collect();
+        assert_eq!(
+            stored, expected_values,
+            "every recorded value is a canonical, content-free scalar"
+        );
+        // Explicit safety net: no free-form content can be in the column.
+        for value in stored.iter().flatten() {
+            assert!(value.len() <= 24, "bounded rendering: {value}");
+            assert!(value.split('=').count() == 2, "canonical shape: {value}");
+        }
     }
 
     /// The forensic regression: a sequence of filesystem operations is fully
@@ -1179,6 +1299,13 @@ mod tests {
         assert_eq!(legacy.1, None);
         assert_eq!(legacy.2, None);
 
+        // Migration 035 completes the writer's column set; it too must apply
+        // cleanly over those rows before a post-034 write can land.
+        sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
         // And a post-034 write still lands.
         let audit = SqliteAuditLog::new(pool.clone());
         audit
@@ -1200,6 +1327,86 @@ mod tests {
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM audit_log").fetch_one(&pool).await.unwrap();
         assert_eq!(count.0, 2);
+    }
+
+    /// Migration 035 applies over a database that already holds pre-035 rows:
+    /// legacy rows keep their values with `result_facts` NULL, and post-035
+    /// writes land the canonical result string.
+    #[tokio::test]
+    async fn migration_035_preserves_legacy_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for migration in [
+            include_str!("../migrations/001_initial_schema.sql"),
+            include_str!("../migrations/002_audit_log.sql"),
+            include_str!("../migrations/016_audit_command_facts.sql"),
+            include_str!("../migrations/024_audit_intent_columns.sql"),
+            include_str!("../migrations/032_audit_infra_columns.sql"),
+            include_str!("../migrations/034_audit_path_facts.sql"),
+        ] {
+            sqlx::query(migration).execute(&pool).await.unwrap();
+        }
+        let session_id = Ulid::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, project_dir, provider, model) \
+             VALUES (?, 0, '/tmp', 'test', 'test')",
+        )
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A legacy row written by the pre-035 schema.
+        sqlx::query(
+            "INSERT INTO audit_log (id, session_id, correlation_id, tool_name, verdict, \
+             input_hash, created_at, path_operation, attempted_path) \
+             VALUES (?, ?, ?, 'filesystem', 'Allow', 'legacyhash', 0, 'read', 'x.txt')",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(session_id.to_string())
+        .bind(Ulid::new().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Applying 035 must not disturb the legacy row.
+        sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT input_hash, path_operation, result_facts FROM audit_log")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy.0, "legacyhash", "the legacy input_hash is retained");
+        assert_eq!(legacy.1.as_deref(), Some("read"), "pre-035 path facts stay");
+        assert_eq!(legacy.2, None, "pre-035 rows simply have no result facts");
+
+        // And a post-035 write lands.
+        let audit = SqliteAuditLog::new(pool.clone());
+        let entry = AuditEntry {
+            result_facts: Some(ReadResultFacts::Entries(0)),
+            ..entry_with_path_facts(
+                session_id,
+                "filesystem",
+                "Allow",
+                Some(PathPolicyFacts {
+                    operation: "list".into(),
+                    attempted_path: Some(".".into()),
+                    ..PathPolicyFacts::default()
+                }),
+            )
+        };
+        audit.record(entry, CancellationToken::new()).await.unwrap();
+        let stored: Vec<Option<String>> = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT result_facts FROM audit_log ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(value,)| value)
+        .collect();
+        assert_eq!(stored, vec![None, Some("entries=0".to_owned())]);
     }
 
     // -----------------------------------------------------------------------
@@ -1412,6 +1619,66 @@ mod tests {
         assert!(fresh.has_path_facts());
         assert_eq!(fresh.path_operation.as_deref(), Some("write"));
         assert_eq!(fresh.attempted_path.as_deref(), Some("x.txt"));
+    }
+
+    /// The read path carries `result_facts` back out: a read-only row returns
+    /// its canonical string, a mutating row and a pre-035 row both read `None`
+    /// (indistinguishable at this seam, which is honest — neither learned a
+    /// result).
+    #[tokio::test]
+    async fn load_audit_log_returns_result_facts() {
+        let (pool, session_id) = setup_audit_read_pool().await;
+
+        // Pre-035 legacy row: written without the column at all.
+        sqlx::query(
+            "INSERT INTO audit_log (id, session_id, correlation_id, tool_name, verdict, \
+             input_hash, rule_matched, created_at, path_operation) \
+             VALUES (?, ?, ?, 'filesystem', 'Allow', 'legacyhash', 'auto_approve', 44, 'read')",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(session_id.to_string())
+        .bind(Ulid::new().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let audit = SqliteAuditLog::new(pool.clone());
+        // A read-only row with a recorded result.
+        let read_row = AuditEntry {
+            result_facts: Some(ReadResultFacts::Bytes(13)),
+            ..entry_at(
+                session_id,
+                "filesystem",
+                "Allow",
+                45,
+                Some(PathPolicyFacts {
+                    operation: "read".into(),
+                    attempted_path: Some("a.txt".into()),
+                    ..PathPolicyFacts::default()
+                }),
+            )
+        };
+        audit.record(read_row, CancellationToken::new()).await.unwrap();
+        // A mutating row: no result is recorded.
+        let write_row = entry_at(
+            session_id,
+            "filesystem",
+            "Allow",
+            46,
+            Some(PathPolicyFacts {
+                operation: "write".into(),
+                attempted_path: Some("b.txt".into()),
+                ..PathPolicyFacts::default()
+            }),
+        );
+        audit.record(write_row, CancellationToken::new()).await.unwrap();
+
+        let rows = load_trail(&pool, session_id, AuditLogFilter::default()).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].result_facts, None, "pre-035 row");
+        assert_eq!(rows[1].result_facts.as_deref(), Some("bytes=13"), "read-only row");
+        assert_eq!(rows[2].result_facts, None, "mutating row");
+        assert_eq!(rows[1].path_operation.as_deref(), Some("read"));
     }
 
     /// `--tool`, `--operation`, `--failed` and `--limit` each narrow the

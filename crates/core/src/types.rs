@@ -573,6 +573,46 @@ impl PathPolicyFacts {
     }
 }
 
+/// Compact, content-free summary of what a **successful read-only** tool
+/// operation returned — persisted in `audit_log.result_facts` (migration 035)
+/// next to the migration-034 path facts.
+///
+/// Recorded so a post-hoc audit can tell what the agent *learned*, not only
+/// what it attempted: a `list` row reporting `entries=0` proves the agent
+/// knew the directory was empty before it acted on that knowledge.
+///
+/// # Safety rule (non-negotiable)
+///
+/// Only a boolean, a count, or a byte length is ever recorded. File content,
+/// directory entry names, and any other unbounded or secret-bearing value
+/// **never** reach this type — every variant renders to a fixed-shape,
+/// O(1)-sized string (`exists=true`, `entries=3`, `bytes=42`), so the column
+/// can never carry a payload. Producers must take these numbers from the
+/// result they already hold: deriving one must never re-read a file or add a
+/// second syscall on the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadResultFacts {
+    /// `exists`: whether the target path was present.
+    Exists(bool),
+    /// `list`: how many entries the listing returned — what the agent saw,
+    /// so a tool-capped listing is recorded at its cap. `0` means empty.
+    Entries(i64),
+    /// `read`: byte length of the returned content — never the content.
+    Bytes(i64),
+}
+
+impl std::fmt::Display for ReadResultFacts {
+    /// The canonical rendering stored in `audit_log.result_facts` and shown
+    /// by `concerto audit`: fixed shape, bounded length, never content.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Exists(exists) => write!(f, "exists={exists}"),
+            Self::Entries(count) => write!(f, "entries={count}"),
+            Self::Bytes(bytes) => write!(f, "bytes={bytes}"),
+        }
+    }
+}
+
 /// Strip secret-bearing components from a URL-shaped target, keeping only
 /// `scheme://host/path`.
 ///

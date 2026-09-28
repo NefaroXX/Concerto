@@ -1,0 +1,31 @@
+-- Read-only operation results: what the tool RETURNED, not just what it
+-- attempted (extends the migration-034 path facts).
+--
+-- Motivation (real incident): migration 034 recorded the operation and the
+-- attempted/resolved paths, so a read-only call (`exists`, `list`, `read`)
+-- was auditable as an *attempt* — but never as a *result*. The audit trail
+-- could not show what the agent had learned. In the incident, a `list .`
+-- returned a directory containing only `file_test_pass.txt`; the coordinator
+-- then instructed a specialist to "create test.md first, then rename it to
+-- test_pass.md", fabricating a file. AgentThought events showed the
+-- reasoning, but the trail alone could not answer: did the agent know the
+-- file was absent before it acted?
+--
+--   * result_facts — compact, content-free summary of a successful read-only
+--     result:
+--       `exists=<bool>`    — whether the target was present,
+--       `entries=<count>`  — how many entries the listing returned (0 means
+--                            empty; the count is what the agent saw, so a
+--                            tool-capped listing is recorded at its cap),
+--       `bytes=<size>`     — byte length of the content that was read.
+--
+-- SAFETY RULE (enforced by `concerto_core::types::ReadResultFacts`): only a
+-- boolean, a count, or a byte length is ever recorded — never file content,
+-- never directory entry names, never secrets, never any other unbounded
+-- string. The column renders to a fixed-shape, bounded string.
+--
+-- NULL means "no read-only result to report": mutating operations, failed
+-- executions, decision-time rows, and rows written before this migration.
+-- Nullable, so every existing row defaults to NULL and the change is
+-- backward compatible.
+ALTER TABLE audit_log ADD COLUMN result_facts TEXT;

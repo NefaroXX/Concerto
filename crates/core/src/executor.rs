@@ -6,7 +6,7 @@ use crate::traits::tool::Tool;
 use crate::traits::ApprovalSink;
 use crate::types::{
     CapabilitySet, CommandPolicyFacts, PathPolicyFacts, PolicyAction, PolicyVerdict,
-    SessionContext, ToolDefinition, ToolOutput, ToolRegistry,
+    ReadResultFacts, SessionContext, ToolDefinition, ToolOutput, ToolRegistry,
 };
 use crate::CancellationToken;
 use std::sync::Arc;
@@ -67,6 +67,39 @@ fn build_action<'a>(
         // Orchestrator-authority marker: only the authority execute path sets
         // this; every ordinary (specialist / gate / bridge) path passes false.
         orchestrator_authority,
+    }
+}
+
+/// Derive the audit-safe result summary of a read-only tool call from the
+/// result the executor already holds.
+///
+/// `operation` is the path-facts operation recorded alongside the attempt:
+/// `exists` / `list` / `read` are the filesystem read-only vocabulary, and no
+/// other producer emits them (git records subcommands, LSP records method
+/// names). Every value comes from `output.data`, produced by the execution
+/// that just finished — the boolean is already computed, the entry count is
+/// an array length, the size is a string length — so this derivation is
+/// O(1) and performs **no** additional I/O: it never re-reads the file and
+/// never adds a syscall to the hot path.
+///
+/// Returns `None` when the operation is not read-only, or when the expected
+/// field is absent or of the wrong type (e.g. a future tool reusing one of
+/// these operation names with a different result shape): an unknown result
+/// is recorded as "nothing learned", never guessed.
+fn read_result_facts(operation: &str, output: &ToolOutput) -> Option<ReadResultFacts> {
+    match operation {
+        "exists" => output
+            .data
+            .get("exists")
+            .and_then(serde_json::Value::as_bool)
+            .map(ReadResultFacts::Exists),
+        "list" => output.data.get("entries").and_then(serde_json::Value::as_array).map(|entries| {
+            ReadResultFacts::Entries(i64::try_from(entries.len()).unwrap_or(i64::MAX))
+        }),
+        "read" => output.data.get("content").and_then(serde_json::Value::as_str).map(|content| {
+            ReadResultFacts::Bytes(i64::try_from(content.len()).unwrap_or(i64::MAX))
+        }),
+        _ => None,
     }
 }
 
@@ -152,6 +185,15 @@ impl ToolExecutor {
             (Err(error), _) => format!("ExecutionError({error})"),
         };
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        // Read-only result facts: record what the operation RETURNED (the
+        // `exists` boolean, the `list` entry count, the `read` byte size)
+        // straight from the result already in hand — never the content, and
+        // never a second read. Mutating operations, failed executions and
+        // tools that name no operation stay `None`.
+        let result_facts = match (&result, &path_facts) {
+            (Ok(output), Some(facts)) => read_result_facts(&facts.operation, output),
+            _ => None,
+        };
         let entry = AuditEntry {
             tool_name: tool_name.to_owned(),
             verdict,
@@ -182,6 +224,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts,
+            result_facts,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel.clone()).await {
             tracing::error!(%error, "post-execution audit write failed");
@@ -265,6 +308,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts: action.path_facts.clone(),
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "approval-decision audit write failed");
@@ -320,6 +364,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "ack-decision audit write failed");
@@ -377,6 +422,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "coordinator-shape audit write failed");
@@ -433,6 +479,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::warn!(%error, decision, "coordinator-decision audit write failed (fail-soft)");
@@ -494,6 +541,7 @@ impl ToolExecutor {
             plan_id: Some(plan_id.to_owned()),
             source_revision: source_revision.map(str::to_owned),
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "plan-decision audit write failed");
@@ -560,6 +608,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "capability-refusal audit write failed");
@@ -622,6 +671,7 @@ impl ToolExecutor {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "tool-driver audit write failed");
@@ -882,6 +932,10 @@ impl ToolExecutor {
                 attempted_path: Some(path.to_owned()),
                 ..PathPolicyFacts::default()
             }),
+            // No tool output at this seam: the serve path hands the caller the
+            // cached payload directly, so there is no result to summarise
+            // here without threading the payload through the API.
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "served-read audit write failed");
@@ -1591,6 +1645,189 @@ mod tests {
         );
     }
 
+    /// Read-only-shaped tool: reports the input operation in its path facts
+    /// and returns the matching filesystem result shape, so the completion
+    /// row's *result* facts can be observed end to end.
+    struct ReadOnlyShapeTool;
+
+    #[async_trait]
+    impl Tool for ReadOnlyShapeTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+        fn description(&self) -> &str {
+            "read-only shaped test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn path_facts(
+            &self,
+            input: &serde_json::Value,
+            _session: &SessionContext,
+        ) -> Option<PathPolicyFacts> {
+            Some(PathPolicyFacts {
+                operation: input
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("read")
+                    .to_owned(),
+                attempted_path: input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                ..PathPolicyFacts::default()
+            })
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            let operation =
+                input.get("operation").and_then(serde_json::Value::as_str).unwrap_or("read");
+            let data = match operation {
+                "exists" => serde_json::json!({
+                    "path": "a.txt",
+                    "exists": input.get("exists").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                }),
+                "list" => serde_json::json!({
+                    "path": ".",
+                    "entries": input.get("entries").cloned().unwrap_or_else(|| serde_json::json!([])),
+                }),
+                "read" => serde_json::json!({
+                    "path": "a.txt",
+                    "content": input.get("content").and_then(serde_json::Value::as_str).unwrap_or(""),
+                }),
+                _ => serde_json::json!({ "path": "a.txt", "size": 12 }),
+            };
+            Ok(ToolOutput { summary: "ok".to_owned(), data })
+        }
+    }
+
+    /// The incident regression: a read-only operation's completion row
+    /// records what it RETURNED — the `exists` boolean, the `list` entry
+    /// count (so `entries=0` proves emptiness was learned), the `read` byte
+    /// size — while a mutating operation records nothing, and no content
+    /// ever reaches the row.
+    #[tokio::test]
+    async fn read_only_operations_record_result_facts_on_the_completion_row() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            audit.clone(),
+        ));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(ReadOnlyShapeTool));
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+
+        let content = "Hello, World!";
+        let cases: [(&str, serde_json::Value, Option<ReadResultFacts>); 6] = [
+            (
+                "exists present",
+                serde_json::json!({"operation": "exists", "path": "a.txt", "exists": true}),
+                Some(ReadResultFacts::Exists(true)),
+            ),
+            (
+                "exists absent",
+                serde_json::json!({"operation": "exists", "path": "b.txt", "exists": false}),
+                Some(ReadResultFacts::Exists(false)),
+            ),
+            (
+                "list one entry",
+                serde_json::json!({
+                    "operation": "list",
+                    "path": ".",
+                    "entries": [{"name": "file_test_pass.txt", "kind": "file"}],
+                }),
+                Some(ReadResultFacts::Entries(1)),
+            ),
+            (
+                "list empty",
+                serde_json::json!({"operation": "list", "path": ".", "entries": []}),
+                Some(ReadResultFacts::Entries(0)),
+            ),
+            (
+                "read size",
+                serde_json::json!({"operation": "read", "path": "a.txt", "content": content}),
+                Some(ReadResultFacts::Bytes(13)),
+            ),
+            (
+                "mutating write",
+                serde_json::json!({"operation": "write", "path": "a.txt", "content": content}),
+                None,
+            ),
+        ];
+
+        for (label, input, expected) in cases {
+            audit.entries.lock().expect("audit lock").clear();
+            executor
+                .execute("filesystem", input, &test_session(), CancellationToken::new())
+                .await
+                .expect("tool executes");
+
+            let entries = audit.entries.lock().expect("audit lock");
+            assert_eq!(entries.len(), 2, "{label}: policy row + completion row");
+            assert_eq!(
+                entries[0].result_facts, None,
+                "{label}: decision-time rows never record a result"
+            );
+            assert_eq!(entries[1].result_facts, expected, "{label}");
+
+            let rendered = entries[1].result_facts.map(|facts| facts.to_string());
+            assert!(!rendered.as_deref().unwrap_or_default().contains(content), "{label}");
+            assert!(
+                rendered.as_deref().unwrap_or_default().len() <= 24,
+                "{label}: bounded rendering, got {rendered:?}"
+            );
+            if let Some(ReadResultFacts::Entries(count)) = entries[1].result_facts {
+                assert_eq!(count == 0, label == "list empty", "{label}: emptiness");
+            }
+        }
+    }
+
+    /// `read_result_facts` records only safe scalars: unknown operations and
+    /// missing/mistyped fields yield nothing, and neither content nor entry
+    /// names nor paths can appear in the rendering.
+    #[test]
+    fn read_result_facts_never_carries_content_or_unknown_shapes() {
+        let content = "SUPER-SECRET-FILE-CONTENT";
+        let read = ToolOutput {
+            summary: "read".to_owned(),
+            data: serde_json::json!({ "path": "secrets.env", "content": content }),
+        };
+        let facts = read_result_facts("read", &read).expect("a read result is recorded");
+        assert_eq!(facts, ReadResultFacts::Bytes(i64::try_from(content.len()).unwrap_or(i64::MAX)));
+        let rendered = facts.to_string();
+        assert!(!rendered.contains("SUPER-SECRET"), "{rendered}");
+        assert!(!rendered.contains("secrets.env"), "{rendered}");
+        assert_eq!(rendered, "bytes=25");
+
+        let list = ToolOutput {
+            summary: "list".to_owned(),
+            data: serde_json::json!({ "path": ".", "entries": [{"name": "id_rsa"}] }),
+        };
+        assert_eq!(read_result_facts("list", &list), Some(ReadResultFacts::Entries(1)));
+
+        // Mutating operation, missing field, wrong type: record nothing.
+        let write = ToolOutput {
+            summary: "wrote".to_owned(),
+            data: serde_json::json!({ "path": "a.txt", "size": 12 }),
+        };
+        assert_eq!(read_result_facts("write", &write), None);
+        let no_bool =
+            ToolOutput { summary: "odd".to_owned(), data: serde_json::json!({ "exists": "yes" }) };
+        assert_eq!(read_result_facts("exists", &no_bool), None);
+        let no_entries =
+            ToolOutput { summary: "odd".to_owned(), data: serde_json::json!({ "path": "." }) };
+        assert_eq!(read_result_facts("list", &no_entries), None);
+    }
+
     /// A tool whose execution returns an error must produce an
     /// `ExecutionError` completion row (duration populated, no exit code).
     #[tokio::test]
@@ -2041,6 +2278,7 @@ mod tests {
                 plan_id: None,
                 source_revision: None,
                 path_facts: None,
+                result_facts: None,
             };
             self.audit.entries.lock().unwrap().push(entry);
             Ok(PolicyVerdict::RequireApproval { timeout: Duration::from_secs(30) })

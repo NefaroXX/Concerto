@@ -3138,6 +3138,7 @@ mod tests {
                     plan_id: None,
                     source_revision: None,
                     path_facts: None,
+                    result_facts: None,
                 },
                 cancel.clone(),
             )
@@ -3456,6 +3457,7 @@ mod tests {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         }
     }
 
@@ -3651,6 +3653,47 @@ mod tests {
             .await
             .expect("archive tool_name");
         assert_eq!(tool, "test_tool");
+        conn.close().await.expect("close archive");
+    }
+
+    #[tokio::test]
+    /// `ARCHIVE_DDL` and `ARCHIVE_INSERT` stay in lockstep with the hot
+    /// schema: migration 035's `result_facts` must survive the `SELECT *`
+    /// copy into the archive. A missed or reordered column fails the copy
+    /// loudly, before anything is deleted from the live table.
+    async fn prune_audit_preserves_result_facts_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+
+        let project = camino::Utf8PathBuf::from("/tmp/prune-result-facts");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        let audit = crate::audit::SqliteAuditLog::new(store.pool.clone());
+        let mut entry = aged_audit_entry(session.id, 100 * 86_400);
+        entry.result_facts = Some(concerto_core::types::ReadResultFacts::Exists(false));
+        audit.record(entry, CancellationToken::new()).await.expect("aged audit row");
+        assert_eq!(audit_row_count(&store).await, 1);
+
+        let archive_dir = dir.path().join("archive");
+        let report =
+            store.prune_audit(30, &archive_dir, &CancellationToken::new()).await.expect("prune");
+        assert_eq!(report.archived, 1);
+        assert_eq!(audit_row_count(&store).await, 0, "the aged row left the live table");
+
+        let archive_path = archive_dir.join("audit-archive.db");
+        let options = SqliteConnectOptions::new().filename(&archive_path);
+        let mut conn = SqliteConnection::connect_with(&options).await.expect("open archive");
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT result_facts FROM audit_log_archive")
+                .fetch_one(&mut conn)
+                .await
+                .expect("archive result_facts");
+        assert_eq!(
+            stored.as_deref(),
+            Some("exists=false"),
+            "the column must reach the archive intact"
+        );
         conn.close().await.expect("close archive");
     }
 

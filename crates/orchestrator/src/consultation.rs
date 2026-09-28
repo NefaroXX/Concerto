@@ -222,6 +222,7 @@ impl ConsultReadOnlyPolicy {
             plan_id: None,
             source_revision: None,
             path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.inner.audit_log().record(entry, cancel).await {
             tracing::warn!(
