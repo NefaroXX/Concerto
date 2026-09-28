@@ -2843,6 +2843,160 @@ fn duplicate_dispatch_reason(
     None
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Source-existence preflight (coordinator error invariant)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Operation verbs whose OBJECT is the SOURCE of a transform: the concrete
+/// path named right after one of them must ALREADY EXIST for the operation
+/// to mean anything. Inflected forms are listed because subtask text is
+/// free prose, not a command grammar.
+const SOURCE_TRANSFORM_VERBS: &[&str] =
+    &["rename", "renamed", "renaming", "move", "moved", "moving"];
+
+/// The in-place-edit counterpart: the file being edited is the source, and
+/// editing a file that is not there invites the same synthesis a missing
+/// rename source does.
+const SOURCE_EDIT_VERBS: &[&str] = &[
+    "edit",
+    "edited",
+    "editing",
+    "modify",
+    "modified",
+    "modifying",
+    "update",
+    "updated",
+    "updating",
+    "append",
+    "appended",
+];
+
+/// The words that end a source span by naming the DESTINATION instead.
+/// Everything after them is excluded from the preflight: a move's
+/// destination normally must NOT exist yet, so it is never preflighted.
+const SOURCE_SPAN_SEPARATORS: &[&str] = &["to", "into"];
+
+/// How far past a source verb the scan looks for the named source. A source
+/// named further away than this belongs to a different sentence — treat the
+/// parse as inconclusive and fail open rather than guess.
+const SOURCE_SCAN_TOKEN_LIMIT: usize = 16;
+
+/// The objective text split into candidate tokens: path characters stay
+/// inside a token, surrounding punctuation drops away, and case is
+/// PRESERVED (the existence lookup needs the path's real spelling on a
+/// case-sensitive filesystem).
+fn source_scan_tokens(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | '\\')))
+        .map(|token| token.trim_end_matches(['.', '-']))
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Whether a token is a CONCRETE workspace path rather than a bare
+/// identifier: the existing path-like shape, further required to carry a
+/// directory separator or a dotted file-name extension whose final segment
+/// holds a letter. Bare snake_case identifiers (`handle_call`) and version
+/// numbers (`1.2.3`) are not workspace paths — a miss there is
+/// inconclusive and must fail OPEN.
+fn is_concrete_source_path(token: &str) -> bool {
+    if !is_path_like_token(token) {
+        return false;
+    }
+    if token.contains(['/', '\\']) {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => !stem.is_empty() && ext.chars().any(|c| c.is_ascii_alphabetic()),
+        None => false,
+    }
+}
+
+/// The distinct concrete paths the objective names as the SOURCE of a
+/// transform/edit operation, in first-appearance order.
+///
+/// A path counts only when it sits between a source verb and the
+/// destination separator (`to` / `into`), so a rename/move DESTINATION —
+/// which legitimately may not exist yet — is never a candidate. A verb span
+/// holding no concrete path (nothing named) or several (two operations in
+/// one sentence) contributes nothing, and [`missing_source_preflight_reason`]
+/// fails open unless exactly ONE source resolves overall.
+fn named_source_paths(task_text: &str) -> Vec<String> {
+    let tokens = source_scan_tokens(task_text);
+    let mut found: Vec<String> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let word = token.to_ascii_lowercase();
+        if !SOURCE_TRANSFORM_VERBS.contains(&word.as_str())
+            && !SOURCE_EDIT_VERBS.contains(&word.as_str())
+        {
+            continue;
+        }
+        let mut span: Vec<&str> = Vec::new();
+        for next in tokens.iter().skip(index + 1).take(SOURCE_SCAN_TOKEN_LIMIT) {
+            let following = next.to_ascii_lowercase();
+            if SOURCE_SPAN_SEPARATORS.contains(&following.as_str()) {
+                break;
+            }
+            if is_concrete_source_path(next) {
+                span.push(next);
+            }
+        }
+        let [source] = span.as_slice() else {
+            continue; // none named, or ambiguous within this span: skip it
+        };
+        if !found.iter().any(|existing| existing.as_str() == *source) {
+            found.push((*source).to_owned());
+        }
+    }
+    found
+}
+
+/// The dispatch-time source-existence preflight: the reason this subtask
+/// must NOT be dispatched, or `None` when dispatching is allowed.
+///
+/// NARROW by construction — it fires only when the objective names EXACTLY
+/// ONE concrete path as the source of a transform/edit operation and that
+/// path is provably absent from the workspace. Everything else fails OPEN:
+/// no source verb (a creation objective names none), no concrete path, more
+/// than one candidate (ambiguous parsing), a path outside the workspace or
+/// otherwise unresolvable, or an I/O error other than `NotFound`.
+/// Destinations are never preflighted.
+///
+/// Path identity goes through [`crate::tool_facts::canonical_project_path`],
+/// the same normalizer the decision validator uses for artifact paths, so
+/// the preflight and the validator can never disagree about which file the
+/// objective named. It is a lexical join plus one `stat` — cheap enough to
+/// run on every dispatch.
+fn missing_source_preflight_reason(
+    task_text: &str,
+    project_root: &camino::Utf8Path,
+) -> Option<String> {
+    let sources = named_source_paths(task_text);
+    if sources.len() != 1 {
+        return None;
+    }
+    let named = sources[0].clone();
+    let canonical = crate::tool_facts::canonical_project_path(project_root.as_std_path(), &named)?;
+    match std::fs::metadata(project_root.join(&canonical).as_std_path()) {
+        // The named source exists: the operation is meaningful, dispatch.
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let named_as = if canonical == named {
+                canonical.clone()
+            } else {
+                format!("{named} ({canonical})")
+            };
+            Some(format!(
+                "missing source: the objective transforms the EXISTING path {named_as}, but it \
+                 does not exist in the workspace. Dispatch refused — creating it would fabricate \
+                 the source instead of transforming it. The run pauses for your decision: confirm \
+                 the correct path, or state explicitly that {canonical} should be created."
+            ))
+        }
+        // Any other I/O problem is inconclusive: fail OPEN.
+        Err(_) => None,
+    }
+}
+
 /// Issue #60: the observed dispatch spend in thousandths of a dollar —
 /// recorded for ledger-interpretation parity ONLY. This value is stored
 /// on the suitability observation and NEVER reaches the score (pinned by
@@ -12092,6 +12246,45 @@ impl CoordinatorAgent {
             ledger.notes.push(reason.clone());
             return serde_json::json!({
                 "error": "duplicate_dispatch",
+                "message": reason,
+            });
+        }
+
+        // ── Source-existence preflight (coordinator error invariant) ─────
+        // An objective that TRANSFORMS a named existing artifact (rename /
+        // move / edit) is only meaningful when that artifact exists. When it
+        // does not, dispatching invites the specialist to fabricate the
+        // source to satisfy the operation — the run reports the discrepancy
+        // instead, through the existing user-input path, naming the exact
+        // path it looked for. Pre-validator: nothing is journaled, gated or
+        // materialized, and any parse the preflight cannot pin down as ONE
+        // concrete source path fails OPEN, so a legitimate dispatch is never
+        // blocked by ambiguous wording.
+        let project_root =
+            camino::Utf8PathBuf::from_path_buf(base_ctx.session.project_dir.clone()).ok();
+        if let Some(reason) = project_root
+            .as_deref()
+            .and_then(|root| missing_source_preflight_reason(&args.task, root))
+        {
+            warn!(
+                agent = %effective_agent,
+                "call_specialist refused: the objective's named source path does not exist \
+                 (no dispatch; surfaced to user input)"
+            );
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::AgentThought {
+                    agent_id: "coordinator".into(),
+                    content: reason.clone(),
+                    kind: ThinkingKind::Detail,
+                },
+            );
+            ledger.notes.push(reason.clone());
+            self.requested_user_input = Some(reason.clone());
+            return serde_json::json!({
+                "error": "missing_source",
+                "status": "awaiting_human_input",
                 "message": reason,
             });
         }
@@ -21570,6 +21763,11 @@ mod tests {
         let mut rx = bus.subscribe();
         let task = AgentTask::new(Ulid::new(), "test task");
         let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        // The rename SOURCE exists here: this test exercises the duplicate
+        // dispatch guard, so the source-existence preflight must let the
+        // first dispatch through (absence is covered by its own test).
+        std::fs::write(project_dir.path().join("test_file.txt"), b"seeded rename source\n")
+            .expect("seed the rename source");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
             project_dir.path().to_path_buf(),
@@ -21650,6 +21848,11 @@ mod tests {
         let mut rx = bus.subscribe();
         let task = AgentTask::new(Ulid::new(), "test task");
         let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        // The rename SOURCE exists here too: this test exercises the notes
+        // escape hatch of the duplicate-dispatch guard, so the
+        // source-existence preflight must stay out of its way.
+        std::fs::write(project_dir.path().join("test_file.txt"), b"seeded rename source\n")
+            .expect("seed the rename source");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
             project_dir.path().to_path_buf(),
@@ -21680,6 +21883,308 @@ mod tests {
             )),
             "the corrected dispatch settled: {events:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Source-existence preflight (coordinator error invariant) — an
+    // objective that transforms a NAMED EXISTING artifact must never be
+    // satisfied by synthesizing that artifact when it is absent.
+    // ------------------------------------------------------------------
+
+    /// Pure parse coverage: only a concrete path between a source verb and
+    /// the destination separator is a candidate, and everything
+    /// inconclusive yields nothing to look up (the caller then fails open).
+    #[test]
+    fn source_preflight_names_only_transform_sources() {
+        assert_eq!(
+            named_source_paths("rename test.md to test_pass.md"),
+            vec!["test.md".to_owned()],
+            "the source is named; the destination never is"
+        );
+        assert_eq!(
+            named_source_paths("move notes.md to archive/notes.md"),
+            vec!["notes.md".to_owned()],
+            "a destination that does not exist yet is never a candidate"
+        );
+        assert_eq!(
+            named_source_paths("edit src/main.rs to add a guard"),
+            vec!["src/main.rs".to_owned()],
+            "an in-place edit names its source as well"
+        );
+        assert!(
+            named_source_paths("create notes.md with a short summary of the run").is_empty(),
+            "a creation objective names no source at all"
+        );
+        assert!(
+            named_source_paths("rename handle_call to handle_dispatch").is_empty(),
+            "a bare identifier is not a concrete workspace path"
+        );
+        assert!(
+            named_source_paths("implement the feature in the repository").is_empty(),
+            "no source verb, no candidate"
+        );
+        assert_eq!(
+            named_source_paths("rename alpha.txt to beta.txt and move gamma.txt to delta.txt")
+                .len(),
+            2,
+            "two sources in one objective are ambiguous — the caller fails open"
+        );
+    }
+
+    /// The preflight's contract end to end on a real directory: it reports
+    /// ONLY a single concrete source that is provably absent, and stays
+    /// silent for every fail-open case (creation, ambiguity, non-paths,
+    /// paths outside the workspace).
+    #[test]
+    fn missing_source_preflight_fires_only_for_one_absent_concrete_path() {
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let root =
+            camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf()).expect("utf-8 dir");
+        std::fs::write(root.join("test.md"), b"present\n").expect("seed the source");
+
+        assert!(
+            missing_source_preflight_reason("rename test.md to test_pass.md", &root).is_none(),
+            "an existing source dispatches normally"
+        );
+        let reason = missing_source_preflight_reason("rename gone.md to here.md", &root)
+            .expect("one absent concrete source is reported");
+        assert!(reason.contains("gone.md"), "the reason names the path: {reason}");
+
+        // Fail-open conditions: none of these may block a dispatch.
+        assert!(
+            missing_source_preflight_reason("create gone.md with content", &root).is_none(),
+            "a creation objective is not a missing source"
+        );
+        assert!(
+            missing_source_preflight_reason(
+                "rename gone.md to other.md and move more.md to next.md",
+                &root
+            )
+            .is_none(),
+            "an ambiguous objective fails open"
+        );
+        assert!(
+            missing_source_preflight_reason("rename handle_call to handle_dispatch", &root)
+                .is_none(),
+            "a non-path token fails open"
+        );
+        assert!(
+            missing_source_preflight_reason("rename /etc/passwd to backup.txt", &root).is_none(),
+            "a path outside the workspace fails open"
+        );
+        assert!(
+            missing_source_preflight_reason("edit test.md to add a section", &root).is_none(),
+            "editing an existing source dispatches normally"
+        );
+    }
+
+    /// The defect's regression: a rename whose SOURCE does not exist is NOT
+    /// dispatched. The run pauses at the existing user-input path naming the
+    /// exact path it looked for, the refusal reaches the model as a
+    /// structured tool result, and the lookup is an event on the trail.
+    #[tokio::test]
+    async fn rename_of_a_missing_source_is_surfaced_instead_of_dispatched() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "renamed",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test.md to test_pass.md",
+                )]),
+                CoordinatorTurn::Text("never reached".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        // `test.md` is deliberately ABSENT: the workspace starts empty.
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a missing source pauses for the operator: {:?}",
+            output.completion_status
+        );
+        assert!(
+            output.final_message.contains("test.md"),
+            "the pause names the exact path looked for: {}",
+            output.final_message
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert!(created.is_empty(), "no dispatch may materialize: {events:?}");
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("missing_source")
+            )),
+            "the structured refusal is published with the tool result: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("test.md")
+            )),
+            "the path lookup is observable in the trail, never silent: {events:?}"
+        );
+    }
+
+    /// The fail-open half: when the source EXISTS, the same rename
+    /// dispatches normally and settles.
+    #[tokio::test]
+    async fn rename_of_an_existing_source_dispatches_normally() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "renamed",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test.md to test_pass.md",
+                )]),
+                CoordinatorTurn::Text("renamed and done".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        std::fs::write(workspace.path().join("test.md"), b"present\n")
+            .expect("seed the rename source");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an existing source must dispatch, not pause: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the rename dispatches: {events:?}");
+        assert!(
+            !provider.tool_result_contents().iter().any(|result| {
+                result.get("error").and_then(serde_json::Value::as_str) == Some("missing_source")
+            }),
+            "no missing-source refusal for an existing source"
+        );
+    }
+
+    /// An objective that CREATES a file is not a missing-source case: it
+    /// names no transform source, so it dispatches normally.
+    #[tokio::test]
+    async fn create_the_file_objective_dispatches_normally() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "created",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "create notes.md with a short summary of the run",
+                )]),
+                CoordinatorTurn::Text("created and done".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a creation objective must not pause: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the creation dispatches: {events:?}");
+    }
+
+    /// A move's DESTINATION normally must not exist yet — it is never
+    /// preflighted, so the dispatch goes through.
+    #[tokio::test]
+    async fn move_to_a_nonexistent_destination_dispatches_normally() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "moved",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "move notes.md to archive/notes.md",
+                )]),
+                CoordinatorTurn::Text("moved and done".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        std::fs::write(workspace.path().join("notes.md"), b"seeded move source\n")
+            .expect("seed the move source");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a missing destination must never pause: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the move dispatches: {events:?}");
+    }
+
+    /// Fail-open on ambiguity: an objective naming more than one candidate
+    /// source is inconclusive, and an inconclusive preflight never blocks a
+    /// legitimate dispatch.
+    #[tokio::test]
+    async fn ambiguous_source_objective_fails_open_and_dispatches() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "worked",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename alpha.txt to beta.txt and move gamma.txt to delta.txt",
+                )]),
+                CoordinatorTurn::Text("ambiguous but dispatched".into()),
+            ],
+        );
+        // Neither candidate exists — ambiguity, not proof, decides here.
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an ambiguous objective fails OPEN: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the ambiguous dispatch still runs: {events:?}");
     }
 
     /// In the Coordinator's decision loop, a failed specialist dispatch
