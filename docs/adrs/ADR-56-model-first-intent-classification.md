@@ -1,19 +1,63 @@
 # ADR-56: Model-first intent classification — the LLM decides intent; deterministic rules become fallbacks
 
-**Status:** Accepted (2026-08-11) — supersedes two ADR-55 Phase 2c pins, in part:
-    Phase 2c §2 (`classifier_enabled` default **false** → **true**) and Phase 2c
-    §3 (AskUser-only classifier placement → model-first with two deterministic
-    fast paths). Nothing else in ADR-55 is contradicted: the deterministic
-    router's rule set and evaluation order, the policy gates, grants,
-    confirmation dialogs, plan bindings, audit §5 correlation-id chain, and
-    Phase 1e gate-always-on all remain in force.
+**Status:** Accepted (2026-08-11) — supersedes two ADR-55 Phase 2c pins, in
+    part: Phase 2c §2 (`classifier_enabled` default **false** → **true**) and
+    Phase 2c §3 (AskUser-only classifier placement → model-first with two
+    deterministic fast paths), both as recorded in ADR-55 §10. **Operating
+    status:** the model-first classifier is **retired from run dispatch** by
+    the unified-loop decision (ADR-55 §1/§10, 2026-09-09/09-24; ADR-71);
+    the surviving intent-classification role is evaluation / authorization-
+    input, never dispatch. Read "Current state" before the recorded design.
 **Date:** 2026-08-11
 **Deciders:** Concerto architecture
-**Supersedes:** ADR-55 Phase 2c §2 (default pin) and Phase 2c §3 (placement pin), in part.
-**Composes with:** ADR-55 (deterministic router, policy gates, grants,
-    confirmation dialogs, plan bindings, audit chain), ADR-26 (audit /
-    correlation-id chain), ADR-52 (plan artifacts), ADR-44 (session-scoped
-    `VirtualFs`), ADR-37 (capability lifecycle)
+**Supersedes:** ADR-55 Phase 2c §2 (default pin) and Phase 2c §3 (placement pin), in part — as recorded.
+**Composes with:** ADR-55 (deterministic tier classifier, policy gates, plan
+    bindings, audit chain), ADR-26 (audit / correlation-id chain), ADR-52
+    (plan artifacts), ADR-44 (session-scoped `VirtualFs`), ADR-37 (capability
+    lifecycle), ADR-71 (coordinator supremacy — run shape).
+
+## Current state (read this first)
+
+The LLM intent classifier does **not** run on any dispatch path today. In
+citable terms:
+
+- **No invocation:** nothing in the tree calls an LLM intent classifier —
+  `intent_classifier` appears only in config-migration history (schema v6→v7
+  added its keys, v7→v8 dropped them). The module was deleted in the
+  routing-carcass cleanup of 2026-09-24 (the same cleanup that deleted
+  `route()` and `cycle_manager`; ADR-55 §1/§10).
+- **No config surface:** the `[intent]` classifier keys
+  (`classifier_enabled`, `classifier_model`, `classifier_confidence_threshold`)
+  were removed at schema **v8** (2026-09-11); loading is unknown-key tolerant
+  so old files keep loading. **No threshold invariant survives** — the
+  `>= LOW_CONFIDENCE_THRESHOLD` (0.7) validation that bound the re-route band
+  is gone with the keys.
+- **No auto-grant on the hot path.** The 2026-09-06 amendment that let the
+  classifier auto-grant at high confidence is **moot and removed** (its text
+  is preserved verbatim in
+  [`archive/ADR-55-phase-history.md`](archive/ADR-55-phase-history.md)). Grants
+  come only from confirmed user decisions: an Apply/Replan plan decision or a
+  user-picked Execute, both through `grant_execute` — or from the
+  **exact-objective auto-Apply** of a user-approved, artifact-hash-verified
+  plan binding (ADR-55 §4), which is keyed to the binding, never to model or
+  classifier output.
+- **What survives as intent classification:** the deterministic, pure
+  `classify_tier` action classifier in `crates/core/src/authorization.rs`
+  (Observe / MutateLocal / Consequential), feeding `IntentVerdict` into the
+  policy gate as an **authorization-input and audit-label mechanism** — it
+  classifies *actions*, never routes runs, and never grants.
+  `LOW_CONFIDENCE_THRESHOLD` (0.7) remains the gate's shared constant.
+- **Why it stopped gating dispatch (the reasoning, stated natively):** the
+  tool-level path is authoritative. Every non-empty run enters one unified
+  agent loop in which the model selects tools and containment is enforced at
+  the policy engine — deny-class rules first, the approval sink, and loop
+  guards (ADR-55 §1). A model-first *request* classifier interposed between
+  the user and that loop could at best save a model call and at worst
+  re-introduced exactly what the unified loop removed: a pre-loop decision
+  point whose mistakes became dispatch decisions. With the loop in place the
+  classifier's remaining honest jobs — evaluating intent offline and feeding
+  authorization context — are served by the deterministic tier classifier;
+  the added LLM call had no reader.
 
 ## Context
 
@@ -38,24 +82,28 @@ adding rules:
    literally anything; no finite corpus can distinguish "talk about building a
    house" from "build a house".
 
-The structural point that settles the direction: **the LLM reads the
+The structural point that settled the direction: **the LLM reads the
 conversation; the keyword corpus cannot.** Market LLM coding tools (opencode,
 Claude Code, and peers) do not use keyword intent classification at all — the
 model reads the conversation and tool use is gated at the tool/permission
 level, not by pre-classifying the message into a fixed outcome set. ADR-55
 Phase 2c deliberately shipped the classifier as an off-by-default wrapper at
-the AskUser sink only. This ADR supersedes exactly those two pins: the
-classifier becomes the primary decider, and the deterministic rules become
+the AskUser sink only. This ADR superseded exactly those two pins: the
+classifier became the primary decider, and the deterministic rules became
 fallbacks and safety nets.
 
-## Decision
+## Decision (as recorded) — and how it operates today
 
-Model-first intent classification: when `[intent] classifier_enabled` is true,
-the LLM classifier is the intent authority for every user message except two
-deterministic fast paths. Deterministic routing remains the read-only safety
-net and the offline fallback. Nine decisions:
+Sections 1–3, 5–7 record the model-first design as accepted (2026-08-11).
+Sections 4 and 8 state the decision as it **operates today**; read them with
+the "Current state" block above. The model-first design is superseded in
+force by the unified-loop decision (ADR-55 §1) — the classifier no longer
+runs on dispatch — but the supersession's lesson survives: request
+classification is an evaluation/authorization-input concern, and the safety
+invariant that no model output can authorize a mutation is **stronger** now
+than when this ADR was written.
 
-### 1. Primary decider — the LLM classifies every message except two fast paths
+### 1. Primary decider — the LLM classifies every message except two fast paths (recorded)
 
 When `[intent] classifier_enabled` is true, the LLM classifier becomes the
 intent authority for **every** user message except two deterministic fast
@@ -63,225 +111,170 @@ paths, which run **before** the classifier:
 
 - **(a) Negation-override** (read-only safety invariant): a user saying
   "don't touch", "do not …", "never …", "without changing …" must never be
-  overridden by a model — even a mistaken one. The `NEGATION_PHRASES` corpus
-  keeps its first-match-wins priority (`crates/core/src/intent.rs`), exactly as
-  today.
+  overridden by a model — even a mistaken one.
 - **(b) Smalltalk route** (zero-cost chat): pure greetings/pleasantries of at
   most `SMALLTALK_MAX_INPUT_LEN` (48) characters route to a read-only `Answer`
-  so "hi" never costs an LLM call. Smalltalk continues to be length-bounded so
-  a long message that merely opens with a greeting is not swallowed.
+  so "hi" never costs an LLM call.
 
-Every other message — including explicit keyword hits ("build", "plan",
-"execute", …), question-detection results, and AskUser-remaining ambiguity —
-is classified by the model when the classifier is enabled. The deterministic
-rules no longer short-circuit the LLM; their internal evaluation order in
-`route()` is otherwise unchanged.
+Every other message — including explicit keyword hits, question-detection
+results, and AskUser-remaining ambiguity — was classified by the model when
+the classifier was enabled; the deterministic rules no longer
+short-circuited the LLM. This reversed the 2c wrapper semantics: the
+classifier mounted **after the two fast paths and before** any rule hit,
+question detection, or the AskUser sink. As accepted, this section was the
+operating decision; see "Current state" for the superseding one.
 
-This reverses the ADR-55 Phase 2c §1/§3 wrapper semantics: the classifier is no
-longer mounted **only** at the AskUser sink; it is mounted **after the two fast
-paths and before** any rule hit, question detection, or the AskUser sink.
-`route()` itself stays pure and unchanged — the classifier remains a wrapper
-around it (as in 2c §1/§4). The change is where the wrapper mounts, not the
-router's internals.
+### 2. Default — `classifier_enabled` flips to true (recorded)
 
-### 2. Default — `classifier_enabled` flips to true
+`classifier_enabled` defaults flipped **false → true**; `classifier_model`
+stayed `None`-default (fallback to the run's chat model, 2c §2/§9). Spend
+cap / reservation semantics were unchanged: reserve-before-call gates the
+call and fail-soft on cap-exceeded (2c §6 unchanged). The default flip is
+moot in force — schema v8 removed the keys (Current state).
 
-`classifier_enabled` defaults flip **false → true**. The 2c §2 "conservative;
-an added model call" framing is superseded: the added call is now the intended
-primary path, not an opt-in extra. `classifier_model` stays `None`-default —
-it falls back to the run's chat model (2c §2, §9 unchanged). Spend cap /
-reservation semantics are unchanged: reserve-before-call gates the call and
-fail-soft on cap-exceeded (2c §6 unchanged).
+### 3. Demoted fallbacks — the deterministic chain stood as today (recorded)
 
-### 3. Demoted fallbacks — the deterministic chain stands exactly as today
+When the classifier was disabled, unavailable, cancelled, malformed, or
+fail-soft, the full deterministic chain — **negation → question → explicit
+keywords → smalltalk → AskUser** — stood exactly as today. Offline behavior
+was the fallback, never the primary. This chain itself was later removed with
+`route()` (ADR-55 §1): the unified loop replaced the chain's dispatch role,
+and containment became mechanical (deny-class rules + approval sink + loop
+guards) rather than corpus-derived.
 
-When the classifier is disabled, unavailable (no provider / no config),
-cancelled, produces malformed output, or fails soft, the full deterministic
-chain — **negation → question → explicit keywords → smalltalk → AskUser** — in
-`route()`'s documented order stands exactly as today. Offline behavior is the
-fallback, never the primary: with the classifier off, a run behaves
-byte-for-byte like an ADR-55 deterministic-router-only run (an ambiguous
-request lands on the AskUser sink unchanged). There is no behavioral regression
-when the classifier is off or unreachable.
+### 4. The classifier is not a dispatch-routing gate; no auto-grant on the hot path
 
-### 4. Confidence semantics — reroute at threshold, never grant
+The classifier's role is **evaluation / observability and authorization-input**,
+not dispatch. Concretely, today:
 
-- A classifier suggestion at or above `classifier_confidence_threshold`
-  re-routes the outcome to the suggested route: `RouterOutput.route =
-  LlmClassifier`, confidence replaced — path selection only, as 2c §3.
-- Below-threshold → the deterministic routing result stands (which may be
-  Execute → the confirmation dialog, or AskUser → the modal).
-- **The classifier never grants:** a re-routed Execute still passes through
-  the confirmation dialog and grants machinery (arm-1 gate; the 2c §4
-  never-grant invariant is unchanged).
-- `classifier_confidence_threshold` stays validated
-  `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (0.7) at config load — no
-  configured threshold can create a `[threshold, LOW_CONFIDENCE_THRESHOLD)`
-  band (2c §2 invariant retained).
+- **Routing happens in the loop, not before it.** Every non-empty run enters
+  the unified agent loop; the coordinator owns run shape; intent signals are
+  advisory flavor (ADR-55 §1/§8, ADR-71). There is no pre-loop classification
+  step whose output selects a code path — so there is nothing for a
+  classifier confidence threshold to re-route, and the recorded
+  above-threshold re-route / below-threshold-stands semantics of this ADR
+  (and of 2c §3) no longer have an operating site.
+- **Authorization input is deterministic.** The only classifier consulted by
+  the policy engine is `classify_tier` (`crates/core/src/authorization.rs`),
+  which classifies each *policy action* into Observe / MutateLocal /
+  Consequential and feeds `IntentVerdict`. That verdict can only upgrade
+  `RequireApproval` → `Allow` under a standing user-confirmed grant; it never
+  overrides `Deny`, and Consequential actions always prompt (ADR-55 §3).
+- **No auto-grant exists from any model output.** The 2026-09-06 auto-grant
+  amendment is moot and removed (Current state). The only click-free grant is
+  the exact-objective auto-Apply of a user-approved, hash-verified plan
+  binding (ADR-55 §4) — the authorization is the binding, never a
+  classification.
+- **Threshold semantics, recorded for the record.** As accepted, a classifier
+  suggestion at or above `classifier_confidence_threshold` re-routed the
+  outcome (`RouterOutput.route = LlmClassifier`, confidence replaced — path
+  selection only), below-threshold left the deterministic result standing,
+  and `classifier_confidence_threshold` was validated
+  `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (0.7) at config load so no
+  `[threshold, 0.7)` band could exist. The 2026-09-11 clarification retired
+  the surface: no threshold invariant survives. What survives from this
+  section's spine is the invariant behind it — classification never grants —
+  which §8 states in its current, stronger form.
 
-### 5. Audit chain unchanged
+### 5. Audit chain (recorded; the routed rows are gone)
 
-- The pre-replacement router row name is captured **before** the classifier
-  call (already implemented), so the trail always records the deterministic
-  outcome the classifier was asked about.
-- Classifier rows keep `rule_matched = "llm_classifier"`,
-  `verdict = "n/a"`, the JSON envelope `{route, confidence, threshold,
-  rationale}`, and share the router-decision row's correlation id (2c §5
-  unchanged).
-- Fail-soft rows (malformed, provider-error, cancelled, cap-exceeded)
-  carry zero confidence and the literal envelope route `"ask_user"` as a
-  schema-stable "no classification to report" marker; the actual
-  pre-replacement route name is recorded on the caller's router-decision
-  row, never fabricated here. Below-threshold is **not** fail-soft: it is a
-  real classification (envelope carries the classified route + confidence)
-  that the caller declines to re-route.
+The pre-replacement router row name was captured **before** the classifier
+call, classifier rows kept `rule_matched = "llm_classifier"`,
+`verdict = "n/a"`, the JSON envelope `{route, confidence, threshold,
+rationale}`, and the shared correlation id (2c §5). Fail-soft rows carried
+zero confidence and the literal envelope route `"ask_user"`. Operating state:
+the routed `intent_router` grant rows are no longer written and the
+`intent_classifier` rows cannot occur — the classifier does not run
+(ADR-55 §6). The audit chain that remains is the action rows,
+plan-decision rows (`record_plan_decision`, `intent:plan`), and coordinator
+decision rows on one `correlation_id` lineage.
 
-### 6. Prompt — utterance-only one-shot JSON classification
+### 6. Prompt — utterance-only one-shot JSON classification (recorded)
 
-The classifier prompt stays an **utterance-only one-shot** classification:
-one system instruction + the raw utterance, demanding a single JSON object
-`{route, confidence, rationale}` with `route` ∈ the six-outcome set
-(Answer / Diagnose / Review / Plan / Execute / Verify), `confidence` 0..1, and
-`rationale` ≤ 512 characters. Temperature 0, bounded output tokens, one
-bounded non-streaming call (2c §3 unchanged). Conservative-outcome guidance
-("answer/review over execute when uncertain") is retained. **Future option,
-noted not decided:** adding conversation context for relative-utterance
-resolution ("apply that") stays in the known-v2 list (1d §6, 2c §8).
+The classifier prompt was an **utterance-only one-shot** classification: one
+system instruction + the raw utterance, demanding a single JSON object
+`{route, confidence, rationale}` with `route` ∈ the six-outcome set,
+`confidence` 0..1, `rationale` ≤ 512 characters; temperature 0, bounded
+output tokens, one bounded non-streaming call. Conservative-outcome guidance
+("answer/review over execute when uncertain") was retained. Conversation
+context for relative utterances ("apply that") stayed in the known-v2 list.
+Recorded only — no operating prompt exists.
 
-### 7. Cost — one bounded LLM call per non-fast-path message
+### 7. Cost — one bounded LLM call per non-fast-path message (recorded)
 
-With the classifier enabled there is one bounded LLM call per non-fast-path
-message. It is spend-tracked on the same channel as any model call, counted
-against the session spend cap, and gated by **reserve-before-call** — a
-cap-exceeded reservation means the call never happens, fail-soft (2c §6
-unchanged). Missing provider/config → classifier disabled with a debug log.
+With the classifier enabled there was one bounded LLM call per non-fast-path
+message, spend-tracked, counted against the session spend cap, gated by
+reserve-before-call, fail-soft on cap-exceeded. Operating state: there are
+**zero** classifier calls per run — this section's entire cost envelope
+retired with the module.
 
 ### 8. Security posture — the model classifies, never authorizes
 
-Authorization is unchanged and remains exclusively user-event-driven:
-confirmation dialog for Execute + `IntentGrantStore` grants + `SessionIntentAuth`
-read-only + `SimplePolicyEngine` / `VirtualFs` tool gates. **The model
-classifies, never authorizes.** A model misclassification can at worst produce
-an unwanted confirmation dialog or a conservative outcome — it can never
-produce an unconfirmed mutation. The negation fast path (§1a) guarantees
-read-only stays read-only even against a permissive model, so the read-only
-invariant rests on the `NEGATION_PHRASES` corpus, not on model behavior.
-`AutoDeny` danger patterns, `Deny`-is-final, and the first-match-wins engine
-order are untouched (ADR-55 §Decision 2).
+Authorization is exclusively **user-event-driven**; nothing that classifies —
+the deterministic tier classifier or any model output — can ever produce a
+grant:
+
+- **The model classifies, never authorizes.** A misclassification can at
+  worst shape a flavor hint or an offline evaluation; it can never produce an
+  unconfirmed mutation, because no model output is on the grant path. This
+  invariant is structural, not behavioral: grants enter only through
+  user-confirmed decisions (`grant_execute` on Apply / picked Execute) or the
+  user-approved, hash-verified plan binding (ADR-55 §4/§5).
+- **The tool-level path is authoritative.** Deny-class `AutoDeny` danger
+  patterns and `Deny`-is-final run first in the first-match-wins policy
+  engine; `Condition::IntentAuthorized` only upgrades `RequireApproval`, never
+  overrides `Deny`; Consequential actions always prompt; shell is
+  project-bounded (`intent_authorized_shell`) or approval-gated —
+  `shell_requires_approval` — and never grantable (ADR-55 §3).
+- **No auto-grant derives from classification.** The 2026-09-06 auto-grant is
+  removed; the exact-objective auto-Apply is bound to the artifact hash of a
+  plan the user approved, consumed on execution, and loud-fails on drift —
+  its authority is the user's approval, not a route or a confidence score
+  (ADR-55 §4).
+- **Read-only is mechanical.** Where a run is declared read-only (Replan,
+  dismissal, a denial), `intent_readonly_deny` is a hard, pre-sink denial —
+  not a prompt, not a re-route, not an upgrade (ADR-55 §2/§3).
 
 ### 9. Supersession scope — exactly two pins, nothing more
 
-This ADR supersedes exactly two ADR-55 Phase 2c pins:
-
-- **Phase 2c §2:** `classifier_enabled` default **false → true**.
-- **Phase 2c §3:** AskUser-only placement → **model-first with two
-  deterministic fast paths**.
-
-Nothing else in ADR-55 is contradicted: the deterministic router's corpora and
-evaluation order, the policy gates (`Condition::IntentAuthorized`), grants
-(§Decision 4), confirmation dialogs (§Decision 3 / 1d), plan bindings
-(1d / 2b), audit §5 correlation-id chain, and Phase 1e gate-always-on all
-remain in force. Where this ADR is silent, ADR-55 governs.
+This ADR superseded exactly two ADR-55 Phase 2c pins, as recorded in ADR-55
+§10: **Phase 2c §2** (`classifier_enabled` default false → true) and
+**Phase 2c §3** (AskUser-only placement → model-first with two deterministic
+fast paths). Nothing else in ADR-55 was contradicted, and the later unified-
+loop decision (ADR-55 §1/§10; ADR-71) superseded this ADR's operating role,
+not its pins or its never-grant invariant. Where this ADR is silent, ADR-55
+governs.
 
 ## Consequences
 
-- **Positive.** Chat works like market tools: plain utterances ("hi, lets work
-  on something", "i was planning my vacation", "we should fix the website")
-  route sensibly instead of falling into the AskUser modal or being hijacked
-  by keyword corpora. No corpus treadmill for the infinite ambiguity of chat —
-  the model reads the conversation. Deterministic behavior is preserved
-  offline: with the classifier off or fail-soft, today's chain stands
-  unchanged. Gate and security are unaffected: the classifier never grants,
-  and the negation fast path keeps read-only a hard invariant.
-- **Costs / trade-offs.** One bounded LLM call per non-fast-path message when
-  the feature is enabled (spend-tracked, reserve-before-call, against the
-  session cap). Smalltalk and negation exceptions exist so zero-cost chat and
-  read-only safety never depend on a model call. Classifier quality depends on
-  the configured model; a wrong read misroutes — bounded to an unwanted
-  confirmation dialog or a conservative outcome. Keyword corpora retain only
-  fallback / deny-rule value when the classifier is enabled; their role becomes
-  the read-only safety net and the offline fallback.
-- **Risks.** The model-first path adds model spend surface to the default
-  configuration; the spend cap and reserve-before-call semantics bound it. The
-  two fast paths are load-bearing (read-only invariant and zero-cost chat) and
-  must run before the classifier; reordering them would regress either.
+- **Positive (as accepted).** The model-first experiment proved the market
+  direction — the model reads the conversation — and its two lessons carried
+  into the unified loop: request classification is not a trustworthy dispatch
+  authority, and safety must live at the tool/permission level. The
+  never-grant invariant (§8) is now *stronger* than the design that shipped
+  it: no classifier path exists at all.
+- **Costs / trade-offs.** The classifier's per-message LLM call is gone (no
+  cost, but also no offline classifier-supported routing — the unified loop
+  replaced both). The recorded design's validation machinery
+  (threshold ≥ 0.7, reserve-before-call, envelope audit) is recorded history;
+  re-introducing any classifier later must re-justify every one of those
+  pieces against the loop, not just the dispatch hookup.
+- **Risks.** The surviving risk is the same one this ADR always guarded: a
+  future change that lets *any* classification output upgrade authorization.
+  ADR-55 §3's injection-point rule and §8's structural invariant are the
+  standing defenses; ADR-74's delegation doctrine must not be read as
+  authorization-by-classification.
 
-## Verification notes
+## Verification notes (current state)
 
-- Fast paths beat the classifier: a negation-override input and a
-  ≤48-char smalltalk input never reach the provider even with the classifier
-  enabled.
-- Every other message with the classifier enabled reaches the classifier —
-  keyword hits, questions, and AskUser alike.
-- Default flip: a config without `[intent]` now yields `classifier_enabled =
-  true`; `classifier_model` still defaults to the run's model.
-- Fail-soft chain: disabled / malformed / provider-error / cancelled /
-  cap-exceeded all leave the deterministic result standing, byte-identical to
-  today's behavior.
-- Never-grant: a re-routed Execute still hits the arm-1 confirmation dialog;
-  `AutoDeny`/`Deny`-is-final untouched.
-- Audit: two rows per classifier-eligible event — the router row keeps the
-  pre-replacement route name, the classifier row keeps
-  `rule_matched = "llm_classifier"` with the shared correlation id.
-
-## Amendment (2026-09-06) — the classifier may auto-grant at high confidence (issue #27, superseded in part)
-
-ADR-55 Addendum (Phase 2d) lands automatic intent gating: `route()` +
-classifier result is the decision, and high-confidence outcomes auto-grant.
-This amendment supersedes, **in part**, two §4/§8 invariants as finalized by
-2d:
-
-- **§4 "The classifier never grants"** — "a re-routed Execute still passes
-  through the confirmation dialog and grants machinery (arm-1 gate; the 2c §4
-  never-grant invariant is unchanged)": replaced by 2d §1 — a re-routed
-  `Execute` (or `Plan`/`Verify`/`Review`/`Diagnose`) at
-  `confidence >= classifier_confidence_threshold` **auto-grants** with the
-  standard `filesystem`/`git` scopes; no confirmation dialog.
-- **§8 "The model classifies, never authorizes"** — "it can never produce an
-  unconfirmed mutation": a high-confidence misclassification (>= 0.7) can now
-  produce an unconfirmed mutation. This is the deliberate, accepted trade of
-  issue #27 (the click added no information above the threshold) and is
-  bounded — never silent — by:
-
-  1. the negation fast path (§1a) runs before any model and is an absolute
-     read-only veto; `NEGATION_PHRASES` remains load-bearing;
-  2. `AskUser` (confidence `0.0`) never auto-grants — hard read-only (2d §2);
-  3. `AutoDeny` danger patterns and `Deny`-is-final run first in the policy
-     engine; `IntentAuthorized` only upgrades `RequireApproval`, never
-     overrides `Deny` (ADR-55 §Decision 2);
-  4. `Consequential` tier and unscoped actions are outside any blanket grant
-     (ADR-55 §Decision 2) — the auto-grant carries exactly the
-     `filesystem`/`git` scopes a confirmed `Apply` holds today;
-  5. spend cap + reserve-before-call (§7) gate the classifier call itself;
-  6. every auto decision is audited (`intent_router: auto_granted` +
-     `RoutingDecided`, 2d §5) — observable, not blocking.
-
-**Unchanged:** §1a/§1b fast paths and their precedence; §3 offline fallback
-chain (classifier off/unreachable → byte-identical deterministic chain with
-the AskUser modal standing — the modal survives only where no confidence
-exists, not as a click tax on confident routes); §4 threshold validation
-(`classifier_confidence_threshold >= LOW_CONFIDENCE_THRESHOLD` at config
-load; no `[threshold, 0.7)` band); §5 audit chain; §6 utterance-only prompt;
-§7 cost semantics.
-
-## Amendment (2026-09-09) — classifier retired from run dispatch (unification, ADR-55 Phase 2e)
-
-The classifier leaves the run hot path: §1 "primary decider" and §4
-"reroute at threshold" no longer operate on run dispatch (saves one bounded
-LLM call + latency per run). What remains: deterministic safety rules +
-flavor scan in `route()`; the `intent_classifier` module itself, retained
-for future eval/classification UX and marked off-hot-path (no dispatch
-hookups). §8 (classifies, never authorizes) holds wherever the module is
-used. The 2026-09-06 auto-grant amendment is moot on the hot path — grants
-derive from the deterministic envelope (ADR-55 Phase 2e §§2–3), not from
-classifier output.
-
-## Clarification (2026-09-11) — classifier config surface removed
-
-With the classifier off the hot path, its dedicated config surface
-(`[intent].classifier_enabled`, `[intent].classifier_model`,
-`[intent].classifier_confidence_threshold`, ADR-55 Phase 2c §2 as adopted
-by §2 here) serves no reader and is removed from the schema (unknown-key
-tolerant: old files keep loading). The `intent_classifier` module itself
-stays for eval/future UX per the 2026-09-09 amendment. ADR-55 Phase 2c §2's
-schema-6→7 history stands as record; no threshold invariant survives it.
+- **No dispatch hookups:** `rg "intent_classifier|IntentClassifier"` over
+  `crates/` matches only config-migration tests (v7→v8 drop) and a
+  legacy-config load test; no module, no call site.
+- **Config:** a schema-7 config with classifier keys loads at v8 unchanged
+  (unknown-key tolerant) and the keys are ignored.
+- **Never-grant:** `grant_execute` is reachable only from an Apply decision
+  or a user-picked Execute; the exact-objective auto-Apply consumes a
+  hash-verified binding; `Deny` and `intent_readonly_deny` stay final.
+- **Consistency:** ADR-55 §10 records the classifier arc (proposal-only →
+  2c → model-first → auto-grant experiment → unified-loop retirement →
+  deletion) in one place; this ADR records the pins and the invariant.

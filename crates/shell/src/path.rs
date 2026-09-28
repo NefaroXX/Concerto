@@ -1,4 +1,4 @@
-//! Root-confined path resolution for shell builtins (ADR-55 §2, Phase 2).
+//! Root-confined path resolution for shell builtins (ADR-55 §3, Phase 2).
 //!
 //! The filesystem tool confines its paths via
 //! `concerto-tools::common::resolve_path`; the shell crate cannot depend on

@@ -223,7 +223,7 @@ pub struct AuditEntry {
     pub duration_ms: Option<i64>,
     /// Toolchain/runtime version that ran the command, if known.
     pub toolchain_version: Option<String>,
-    // ---- ADR-55 Phase 1d §4: schema-derived intent-decision columns ----
+    // ---- ADR-55 §6: schema-derived intent-decision columns ----
     /// Bound plan id of a plan-approval decision (`intent:plan`), if any.
     pub plan_id: Option<String>,
     /// Source revision the plan was approved at, if known.

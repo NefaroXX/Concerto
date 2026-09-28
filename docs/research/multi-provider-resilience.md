@@ -2,7 +2,7 @@
 
 > **Compiled:** August 2026
 > **Scope:** Provider abstraction patterns, error handling taxonomies, retry strategies, circuit breakers, fallback chains, and production resilience patterns across major LLM platforms and gateways.
-> **Origin:** Independent research thread by sol (augments `docs/ARCHITECTURE-V2.md`).
+> **Origin:** Independent research thread by sol (augments `docs/research/ARCHITECTURE-V2.md`).
 
 ---
 

@@ -31,7 +31,7 @@ struct PendingApproval {
 
 /// The intent confirmation question plus its selectable outcomes, exposed to
 /// the TUI so it can render the modal and translate keypresses back into a
-/// decision (ADR-55 §1).
+/// decision (ADR-55 §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentPrompt {
     pub question: String,
@@ -49,7 +49,7 @@ struct PendingIntent {
 
 /// The plan-approval question plus its identity, exposed to the TUI so it can
 /// render the modal and translate keypresses back into a decision (ADR-55
-/// Phase 1d). `session_id` + `plan_id` gate resolution so a stale or
+/// §4). `session_id` + `plan_id` gate resolution so a stale or
 /// cross-session request can never be answered by the wrong run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanPrompt {
@@ -343,7 +343,7 @@ impl ApprovalSink for CliApprovalSink {
         // Mirror the interactive approval prompt: queue the question and await
         // the TUI's keypress decision. `None` covers both a deliberate reject
         // (Esc/q) and a dropped/never-answered prompt, which the run loop
-        // treats as read-only (ADR-55 §1).
+        // treats as read-only (ADR-55 §2).
         match self.state.request_intent(question, options) {
             Some(receiver) => receiver.await.unwrap_or(None),
             None => None,
@@ -362,7 +362,7 @@ impl ApprovalSink for CliApprovalSink {
         // Mirror the intent confirmation: queue the prompt and await the TUI's
         // keypress decision. `None` covers a drop (no receiver — the occupied
         // slot / conservative reading) and a dismissed prompt, both of which
-        // the run loop treats as read-only (ADR-55 Phase 1d).
+        // the run loop treats as read-only (ADR-55 §4).
         match self.state.request_plan(session_id, plan_id, question, plan_text.to_string()) {
             Some(receiver) => receiver.await.unwrap_or(None),
             None => None,
@@ -844,7 +844,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // request_intent_confirmation (ADR-55 §1)
+    // request_intent_confirmation (ADR-55 §2)
     // ------------------------------------------------------------------
 
     /// Wait until the spawned sink future has installed the pending intent so
@@ -938,7 +938,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // request_plan_approval (ADR-55 Phase 1d)
+    // request_plan_approval (ADR-55 §4)
     // ------------------------------------------------------------------
 
     /// Wait until the spawned sink future has installed the pending plan so

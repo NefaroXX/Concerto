@@ -1,7 +1,8 @@
 # ADR-40: Audit Log is Append-Only and Outlives Session Pruning
 
 **Status:** Accepted (2026-08-02) — §Decision item 3 superseded by
-[ADR-73](./ADR-73-audit-encryption-and-retention.md) (2026-09-26); items 1, 2
+[ADR-73](./ADR-73-audit-encryption-and-retention.md) (2026-09-26) and restated
+below in its settled form, so item 3 is read here, not skipped; items 1, 2
 and 4 remain in force unchanged. Not archived: the amendment is scoped to one
 clause.
 **Date:** 2026-08-02
@@ -47,15 +48,26 @@ correct one.
    pointer is nulled. Because the audit log is write-only today, no reader
    needs to handle both shapes; any future reader must treat `session_id` as
    nullable.
-3. **Audit retention remains a future policy question, not a session one.**
-   No age- or size-based *audit-only* truncation is introduced; if one is ever
-   wanted it belongs in its own ADR, separate from session pruning.
-   **[Superseded by ADR-73 (2026-09-26)]** — that ADR now exists: the audit
-   database is encrypted at rest (SQLCipher) and aged rows are archived into a
-   keyed archive and then deleted, configured via `[audit]` in the global
-   config, defaulting to off. The distinction this clause drew is preserved —
-   retention is a time-based policy, **not** a session-lifecycle one, and
-   session pruning still never deletes audit rows.
+3. **Audit retention is a time-based policy, never a session-lifecycle one.**
+   Session pruning does not reach the log (item 1), and a bound on the log is
+   an *age-based, operator-configured* decision that must not be folded into
+   session deletion: the two act on different axes, so neither may be a
+   consequence of the other. As settled by
+   [ADR-73](./ADR-73-audit-encryption-and-retention.md) (2026-09-26, Accepted,
+   implemented in `7351128`), that bound is **archive, then delete, verified**:
+   rows strictly older than `retention_days` are copied into a keyed
+   `audit-archive.db` and only then removed from the hot `audit_log`, in one
+   transaction, and the archive write is **verified before** any delete, so a
+   row is never removed without a copy. It is configured through the global
+   config `[audit]` section (`retention_days`, `archive_dir`) and **defaults to
+   off**, so a default install keeps item 1's exact grow-only behavior; `0` is
+   folded away at the config seam and rejected by the prune path rather than
+   meaning "delete everything". The archive carries the same at-rest key, and
+   the enclosing `sessions.db` — the log included — is encrypted at rest under
+   `[audit] encrypt_at_rest` (also default off). There is no size-based bound:
+   retention is age-based only, as this item framed the question. The
+   distinction is load-bearing and unchanged — aging a row out never deletes a
+   session, and pruning a session never ages a row out.
 4. The table rebuild copies all current columns (002 + 016 additions) and
    recreates `idx_audit_session`; this is executed in the standard sqlx
    migration transaction.
@@ -71,7 +83,9 @@ correct one.
   `PRAGMA foreign_keys = ON`).
 - Space: sessions keep their audit rows after pruning; this is deliberate and
   costs only the tiny audit-row footprint. Correctness/record-keeping beats
-  a marginal space win for a log that is supposed to be durable.
+  a marginal space win for a log that is supposed to be durable. The hot log
+  is bounded separately and by age only (item 3), and only when an operator
+  opts in.
 - Compatibility: existing databases migrate in place; existing rows keep their
   `session_id`; only future deletes null it.
 - Supersedes nothing; amends the H-6 PRD's draft behavior (which was

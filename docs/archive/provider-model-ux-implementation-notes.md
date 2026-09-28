@@ -1,7 +1,7 @@
 # Provider / Model-UX Rework — Implementation Notes (Phase 0)
 
 > **Status:** Historical implementation record. For current user behavior and
-> configuration, see [`models.md`](models.md). Facts below describe the rework
+> configuration, see [`models.md`](../models.md). Facts below describe the rework
 > checkpoints and should not be treated as the current public contract.
 
 Companion to a historical provider/model rework plan that is not retained in

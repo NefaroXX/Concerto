@@ -1,6 +1,12 @@
 # Skills + MCP + Extension Manager — Integration Plan
 
-**Status:** Accepted — executable plan (amended 2026-08-04)
+> **Moved to `docs/research/` 2026-09-28.** This is the executable plan that
+> ADR-43 accepted. It shipped: the live behaviour is documented in
+> [`docs/skills.md`](../skills.md) and [`docs/mcp.md`](../mcp.md). Keep this
+> file as the design record (including the CORR/AMEND review notes), not as
+> current state.
+
+**Status:** Accepted — executable plan (amended 2026-08-04) · **Shipped**
 **Repo:** `NefaroXX/Concerto` (GitHub) · **Branch:** `feat/skills-mcp-extensions` → PR into `dev`
 **Architecture record:** `docs/adrs/ADR-43-skills-mcp-and-extension-manager.md`
 **Validation:** Repo fact-check + architecture review completed 2026-08-04; this document
@@ -225,8 +231,8 @@ crates/
   cli/             # extensions subcommand
 docs/
   adrs/ADR-43-skills-mcp-and-extension-manager.md
-  skills-mcp-extensions-plan.md   # this file
-  skills.md, mcp.md               # Phase E
+  skills-mcp-extensions-plan.md   # this file (now in docs/research/)
+  skills.md, mcp.md               # Phase E (shipped)
 ```
 
 Wire new crates into workspace `Cargo.toml` (`publish = false` inherited).
@@ -238,7 +244,7 @@ Wire new crates into workspace `Cargo.toml` (`publish = false` inherited).
 ```text
 TASK 1 — ADR + plan        ✔ committed on feat/skills-mcp-extensions
   - docs/adrs/ADR-43-….md (Accepted), ROADMAP index rows 41/42/43
-  - docs/skills-mcp-extensions-plan.md (this file)
+  - docs/research/skills-mcp-extensions-plan.md (this file)
   - Commit: docs(adr): skills, MCP client, extension manager
 
 TASK 2 — Config + types

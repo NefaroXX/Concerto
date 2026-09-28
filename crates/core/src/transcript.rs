@@ -241,7 +241,7 @@ pub fn transcript_entry_from_event_with_labels(
         }
         EventKind::RoutingDecided { task_id, role, provider, model, reason, intent } => {
             match intent {
-                // ADR-55 Phase 2d §5: an intent-routing record tells the
+                // ADR-55 §6: an intent-routing record tells the
                 // routing decision story ({rule, confidence, route, outcome},
                 // auto-granted or not) instead of a model assignment.
                 Some(decision) => Some(TranscriptEntry::Activity {
@@ -753,7 +753,7 @@ mod tests {
             provider: "openrouter".into(),
             model: "example/model".into(),
             reason: "configured".into(),
-            // Model-routing row: no intent payload (ADR-55 2d §5).
+            // Model-routing row: no intent payload (ADR-55 §8).
             intent: None,
         });
         assert_eq!(
@@ -883,7 +883,7 @@ mod tests {
                 provider: "openrouter".into(),
                 model: "example/model".into(),
                 reason: "configured".into(),
-                // Model-routing row: no intent payload (ADR-55 2d §5).
+                // Model-routing row: no intent payload (ADR-55 §8).
                 intent: None,
             },
             &labels,

@@ -4,7 +4,7 @@
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
 **Supersedes:** Phase 6 of the provider-first redesign plan
-    (`docs/ARCHITECTURE-V2.md`, §7 "Phase 6 (later) — plugins for novel
+    (`docs/research/ARCHITECTURE-V2.md`, §7 "Phase 6 (later) — plugins for novel
     dialects, heartbeats, merge leftovers").
 **Composes with:** ADR-14 (WASM plugin architecture), ADR-37 (plugin
     capability lifecycle), ADR-46/ADR-48 (reasoning-as-data, ContextEngine —

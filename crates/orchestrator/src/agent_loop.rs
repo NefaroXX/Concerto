@@ -560,7 +560,7 @@ impl AgentLoop {
                         merge_run_progress(accumulated, &output);
                         output = accumulated.clone();
                     }
-                    // Truthful completion (ADR-55 Phase 2e, completion fix):
+                    // Truthful completion (ADR-55 §1, completion fix):
                     // `AgentOutput.completion_status` is the single source
                     // of truth. `finalize_completion` set it from the agent's
                     // own landing state (an eval failure stays `Partial`);
@@ -1234,7 +1234,7 @@ impl AgentLoop {
                     }
                     ack
                 };
-            // Audit seam (ADR-55 §5 / audit H-04): persist the ack outcome
+            // Audit seam (ADR-55 §6 / audit H-04): persist the ack outcome
             // through the same channel as approval decisions, sharing the run's
             // correlation_id chain. Pure observability — the ack bool still
             // drives the same abort branch below. A remembered (skipped) prompt

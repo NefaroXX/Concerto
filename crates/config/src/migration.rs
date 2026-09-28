@@ -12,9 +12,9 @@
 //! | 2    | 3  | Add `model_settings: None`, add `id`/`name` fields to `ProviderConfig` |
 //! | 3    | 4  | Add `shell_settings: None` (ADR-28 shell profiles) |
 //! | 4    | 5  | Add `[skills]`/`[mcp]` sections, serde-defaulted to `None` (ADR-43) |
-//! | 5    | 6  | Drop `mode`/`[intent]` — intent gate is the only routing path (ADR-55 Phase 1e) |
-//! | 6    | 7  | Add `[intent]` classifier keys (ADR-55 Phase 2c; ADR-56) — retired at v8 |
-//! | 7    | 8  | Drop the `[intent]` classifier keys — classifier is off the run hot path, no reader (ADR-56 2026-09-11 clarification) |
+//! | 5    | 6  | Drop `mode`/`[intent]` — intent gate is the only routing path (ADR-55 §7) |
+//! | 6    | 7  | Add `[intent]` classifier keys (ADR-55 §10; ADR-56) — retired at v8 |
+//! | 7    | 8  | Drop the `[intent]` classifier keys — classifier is off the run hot path, no reader (ADR-56) |
 //!
 //! # Policy
 //!
@@ -181,7 +181,7 @@ fn migrate_v4_to_v5(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
-/// v5 → v6: Drop `mode` and `[intent]` (ADR-55 Phase 1e).
+/// v5 → v6: Drop `mode` and `[intent]` (ADR-55 §7).
 ///
 /// The intent gate is now the ONLY routing path and the Build/Chat/Plan mode
 /// picker is removed, so `AppConfig` no longer carries either key. The fields
@@ -193,7 +193,7 @@ fn migrate_v5_to_v6(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
-/// v6 → v7: Add `[intent]` classifier keys (ADR-55 Phase 2c; ADR-56).
+/// v6 → v7: Add `[intent]` classifier keys (ADR-55 §10; ADR-56).
 ///
 /// Historical step. The surface it inserted was retired at v7 → v8, so with
 /// the struct no longer carrying the section this step is now a version bump
@@ -204,8 +204,7 @@ fn migrate_v6_to_v7(mut config: AppConfig) -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
-/// v7 → v8: Drop the retired `[intent]` classifier keys (ADR-56, the
-/// 2026-09-11 clarification).
+/// v7 → v8: Drop the retired `[intent]` classifier keys (ADR-56).
 ///
 /// With the classifier off the run hot path the three classifier keys serve
 /// no reader and `AppConfig` no longer carries the section. The fields cease
@@ -409,10 +408,10 @@ mod tests {
         assert_eq!(v7.session_spend_cap_usd, Some(5.0));
     }
 
-    /// v7 → v8: the `[intent]` classifier surface retires (ADR-56, the
-    /// 2026-09-11 clarification). Version bump only — the fields cease to
-    /// exist in the struct; stale TOML keys are ignored at load because
-    /// AppConfig has no deny_unknown_fields, and no user field is modified.
+    /// v7 → v8: the `[intent]` classifier surface retires (ADR-56). Version
+    /// bump only — the fields cease to exist in the struct; stale TOML keys
+    /// are ignored at load because AppConfig has no deny_unknown_fields, and
+    /// no user field is modified.
     #[test]
     fn v7_to_v8_drops_intent_classifier_keys() {
         let v7 = AppConfig { schema_version: 7, ..v1_fixture() };

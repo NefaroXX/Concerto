@@ -1,4 +1,4 @@
-//! Shell argv/cwd containment (ADR-55 §2, Phase 1b).
+//! Shell argv/cwd containment (ADR-55 §3, Phase 1b).
 //!
 //! [`common::resolve_path`] confines only the `filesystem` tool's paths; the
 //! shell tool historically executed commands with no path confinement, so an
@@ -1060,7 +1060,7 @@ fn scan_path_arguments(
 }
 
 /// Validate that a shell command's working-directory changes, redirect writes,
-/// and path-like arguments stay within the session project root (ADR-55 §2,
+/// and path-like arguments stay within the session project root (ADR-55 §3,
 /// Phase 1b).
 ///
 /// `root` is the containment trust anchor (the session project directory);

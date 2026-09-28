@@ -93,7 +93,7 @@ impl PolicyPresets {
                 Condition::CommandPattern(r"mkfs".into()),
                 Condition::CommandPattern(r":\(\)\{\s*:\|:&\s*\};:".into()),
             ])),
-            // ADR-55 §2: the intent gate. A run-scoped authorization provider
+            // ADR-55 §3: the intent gate. A run-scoped authorization provider
             // (when attached) decides the action on this bare condition:
             // Allow upgrades `RequireApproval` → `Allow`, RequireApproval keeps
             // the action under approval, and Deny is final. With no provider

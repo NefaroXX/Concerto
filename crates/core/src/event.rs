@@ -423,7 +423,7 @@ pub enum EventKind {
         provider: String,
         model: String,
         reason: String,
-        /// ADR-55 Phase 2d §5: the intent-routing decision payload, present
+        /// ADR-55 §6: the intent-routing decision payload, present
         /// only on the run loop's intent-routing emissions. The multi-agent
         /// model-routing rows (`crates/providers/src/routing.rs`) carry
         /// `None`. `#[serde(default)]` keeps pre-2d payloads deserializable.
@@ -621,10 +621,10 @@ pub enum EventKind {
         retry_after_ms: Option<u64>,
     },
 
-    // --- intent routing (ADR-55 Phase 0) ---
+    // --- intent routing (ADR-55 §9) ---
     /// A run advanced to a new [`crate::intent::RunStage`].
     ///
-    /// ADR-55 Phase 0 ships the type and the event kind only —
+    /// ADR-55 §9 ships the type and the event kind only —
     /// `RunStageChanged` is NEVER emitted in Phase 0; it is pure additive
     /// plumbing. Emission lands with the intent-router wiring in a later
     /// phase. Additive variant: consumers must tolerate its absence.
@@ -720,7 +720,7 @@ pub enum EventKind {
 }
 
 /// The intent-routing payload of an intent [`EventKind::RoutingDecided`]
-/// record (ADR-55 Phase 2d §5).
+/// record (ADR-55 §6).
 ///
 /// Mirrors the `{rule, confidence, route}` envelope of the matching
 /// `intent_router: auto_granted` audit row so the `session_events` record and
@@ -1796,7 +1796,7 @@ mod tests {
     }
 
     /// The run-stage transition event must survive serde round-trip with its
-    /// payload intact (ADR-55 Phase 2a: emitted from the run wrapper, consumed
+    /// payload intact (ADR-55 §9: emitted from the run wrapper, consumed
     /// by the desktop/cli bus adapters).
     #[test]
     fn run_stage_changed_serialization_roundtrip() {

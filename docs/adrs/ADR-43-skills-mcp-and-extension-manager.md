@@ -4,7 +4,7 @@
 **Date:** 2026-08-04
 **Deciders:** Concerto architecture
 **Extends:** ADR-14 (plugin architecture — WASM), ADR-37 (plugin capability grant lifecycle), ADR-26 (fault containment and recovery)
-**Plan:** `docs/skills-mcp-extensions-plan.md`
+**Plan:** `docs/research/skills-mcp-extensions-plan.md` (plan; shipped reality is `docs/skills.md` + `docs/mcp.md`)
 
 ## Context
 

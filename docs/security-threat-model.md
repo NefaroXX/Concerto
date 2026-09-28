@@ -287,7 +287,8 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 **Limitations**:
 - Does not prove absence of uninstrumented actions
 - May contain sensitive metadata (paths, tool names)
-- Not encrypted at rest
+- Not encrypted at rest by default — SQLCipher + bounded retention are opt-in
+  (gap #5, ADR-73); an unconfigured deployment is plaintext on disk
 
 ### API Server Authentication
 
@@ -297,35 +298,46 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 - `/v1/health` public, other routes authenticated
 - Request body size limit (1 MiB)
 - OpenAPI docs disabled by default
+- Opt-in per-client rate limiting (gap #4)
 
 **Limitations**:
 - API key stored in environment variable
-- No rate limiting per client
+- Rate limiting is opt-in (`CONCERTO_API_RATE_LIMIT`); unset means unthrottled
 - No IP allowlisting
 
 ## Security Gaps
 
 ### Critical Gaps
 
-1. **No Containerized Plugin Sandbox**
-   - **Risk**: WASM plugins can access host resources through granted capabilities
-   - **Impact**: Data exfiltration, system compromise
-   - **Mitigation**: Implement `SandboxProfile::Containerized` with namespace isolation
-   - **Priority**: High
-   - **Effort**: 16 hours
-
+1. **No Containerized Plugin Sandbox** — ✅ CLOSED WITH RESIDUAL (2026-09-26)
+   - ADR-72 Accepted: `SandboxProfile::Containerized` is in force on
+     Linux/macOS. Admission fails closed unless the runtime is detected
+     (`d00582b`), shell invocations are routed through `docker`/`podman run`
+     (`3ae6ea5`), and routing must be asserted with an explicit
+     `CommandRouting::Containerized` marker (`fdf4800`). A tool the container
+     path cannot enforce is refused rather than run unconfined.
+   - **Residual (open):** Windows. Windows Job Objects need `unsafe` FFI, which
+     `[workspace.lints]` hard-denies, so v1 is unsupported on Windows and fails
+     closed. Re-entry is a superseding ADR (DEFERRED row 36). `ReadOnlyFs` and
+     `NetworkIsolated` remain explicit unimplemented stubs (ADR-72 §1).
 2. **No Secret Sanitization in Events** — ✅ DONE (2026-09-19)
    - `SecretSanitizer` implemented at `core/sanitizer.rs:250`
    - Wired into `EventBus` at `event.rs:583` (sanitize method), `:767`
      (sanitizer field), `:930` (`with_sanitizer` constructor)
    - Priority: ~~High~~ Resolved
-
-3. **Windows Shell Quoting Weakness**
-   - **Risk**: cmd.exe quoting rules weaker than POSIX
-   - **Impact**: Command injection on Windows
-   - **Mitigation**: Prefer `bypass_shell: true` on Windows, document limitations
-   - **Priority**: Medium
-   - **Effort**: 4 hours
+3. **Windows Shell Quoting Weakness** — ✅ DONE (2026-09-26)
+   - `cmd_verbatim_launch` (`tools/src/shell.rs:339`) launches argv-direct with
+     cmd/CRT quoting instead of building a `cmd /c` string; a hard
+     `bypass_shell` preference plus the independent shell denylist remains
+     (`da611e4`, DEFERRED closed row 22).
+   - **Residual (open):** cmd.exe quoting is inherently weaker than POSIX;
+     documented as a limitation, not a defect.
+4. **No Rate Limiting for API Server** — ✅ DONE (2026-09-26, opt-in)
+   - Fixed-window per-client limiter as axum middleware, IPv6 /64 bucketing
+     (`api-server/src/rate_limit.rs:119`, `61f34b7` + `d8e7bb0`).
+   - **Residual (open, by design):** disabled unless
+     `CONCERTO_API_RATE_LIMIT` is set, so an unconfigured server is
+     unthrottled; there is still no IP allowlisting.
 
 ### High-Priority Gaps
 
@@ -336,29 +348,31 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
    - **Priority**: Medium
    - **Effort**: 4 hours
 
-5. **No Encryption for Audit Logs**
-   - **Risk**: Sensitive metadata exposed if database file accessed
-   - **Impact**: Privacy violation, reconnaissance
-   - **Mitigation**: Encrypt SQLite database at rest (SQLCipher)
-   - **Priority**: Medium
-   - **Effort**: 8 hours
-
-6. **No CPU Rate Limiting for Shell Commands**
-   - **Risk**: Resource exhaustion
-   - **Impact**: System slowdown, denial of service
-   - **Mitigation**: Add cgroup/ulimit integration for shell processes
-   - **Priority**: Low
-   - **Effort**: 12 hours
+5. **No Encryption for Audit Logs** — ✅ DONE (2026-09-26, opt-in)
+   - SQLCipher at-rest encryption for the sessions/audit database plus
+     age-based, operator-configured archive-then-delete retention
+     (`sessions/src/at_rest.rs`, `7351128`, ADR-73 Accepted). Key resolution is
+     env var → OS keychain → generated once; an unreadable *or* unstoreable key
+     fails closed, with no plaintext fallback. A sidecar marker keeps the
+     ADR-54 quarantine heuristic from mistaking an encrypted file for a
+     corrupt one.
+   - **Residual (open, by design):** the posture is opt-in, so an unconfigured
+     deployment is still plaintext at rest (DEFERRED closed row 15).
+6. **No CPU Rate Limiting for Shell Commands** — ✅ CLOSED WITH RESIDUAL
+     (portable layer 2026-09-26)
+   - `tools/src/cpu_accounting.rs`: Linux process-group CPU-time watchdog
+     sampling `/proc/<pid>/stat`, plus a POSIX `ulimit -S -t` soft backstop
+     (`13cba1c`). Budgets are off by default; the env var is the only operator
+     knob.
+   - **Residual (open):** no Windows enforcement (governed by the gap-#1
+     ADR decision), cgroup v2 unimplemented, and `cpu_budget_secs` is `None` in
+     every production constructor with no TOML key (DEFERRED row 45).
 
 ### Medium-Priority Gaps
 
-7. **No Network Egress Filtering for Plugins**
-   - **Risk**: Plugins can make arbitrary HTTP requests
-   - **Impact**: Data exfiltration, C2 communication
-   - **Mitigation**: Add network capability with allowlist
-   - **Priority**: Low
-   - **Effort**: 8 hours
-
+7. **No Network Egress Filtering for Plugins** — ✅ DONE (2026-09-26)
+   - Domain allowlist on the `NetworkOutbound` capability
+     (`plugins/src/capability.rs`, `450cb58`, DEFERRED closed row 24).
 8. **No Integrity Verification for Plugin Binaries** — ✅ DONE (2026-09-24)
    - ADR-37 SHA-256 hash pinning: the WASM binary hash is recorded with each
      persisted capability grant (`CapabilityManager`, `capability.rs:299`), and a
@@ -370,12 +384,13 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
      matching grant edit (a local adversary can still replace a plugin with one
      that is not covered by pinned grants).
 
-9. **No Memory Encryption for Sensitive Data**
-   - **Risk**: Memory dumps contain secrets
-   - **Impact**: Credential theft
-   - **Mitigation**: Use secure memory allocation (mlock, madvise)
-   - **Priority**: Low
-   - **Effort**: 8 hours
+9. **No Memory Encryption for Sensitive Data** — ✅ CLOSED WITH RESIDUAL
+   - Safe-reachable scope landed `1c38c9f` (2026-09-26): provider keys and
+     credentials live in zero-on-drop, non-rendering holders
+     (`core/src/secret.rs`).
+   - **Residual (accepted limitation):** `mlock`/`madvise` RAM pinning is
+     unimplementable here — no safe abstraction exists and `unsafe_code` is
+     denied — so secrets can still be paged to swap (DEFERRED closed row 13).
 
 ## Secure Development Guidelines
 

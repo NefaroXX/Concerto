@@ -354,7 +354,7 @@ pub fn resolve(state: &SharedPending, decision: &Message) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Intent confirmation dialog (ADR-55 §1)
+// Intent confirmation dialog (ADR-55 §2)
 // ---------------------------------------------------------------------------
 //
 // The run loop asks the user to confirm a change of run intent before letting
@@ -475,7 +475,7 @@ pub fn resolve_intent(state: &SharedPendingIntent, message: IntentDialogMessage)
 }
 
 // ---------------------------------------------------------------------------
-// Plan approval dialog (ADR-55 Phase 1d)
+// Plan approval dialog (ADR-55 §4)
 // ---------------------------------------------------------------------------
 //
 // Mirrors the intent dialog: the sink queues a [`PendingPlan`] and awaits its

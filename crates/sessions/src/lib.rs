@@ -387,7 +387,7 @@ pub trait SessionStore: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<Vec<TranscriptEntry>, SessionError>;
 
-    // ---- Durable plan bindings (ADR-55 Phase 2b live-fix) ----
+    // ---- Durable plan bindings (ADR-55 §4, live-fix) ----
     //
     // Mirrors the process-scoped `PlanApprovalRegistry` on disk so a
     // natural-language approval ("i approve the plan") offered after an app

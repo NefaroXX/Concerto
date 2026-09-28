@@ -136,23 +136,25 @@ lifecycle decisions. What is true on `dev` today:
   streaming cursor. Tracked by `docs/hybrid-ui-plan.md`; full scope is still
   pending (see Next).
 - `feat/codebase-world-class` was merged into `dev` (PR #63); Phase 0 is
-  complete there and Phases 1–5 are unstarted (see Next).
+  complete there, and Phase 3 has since shipped (see Next). The remaining
+  phases are registered per-item in `docs/DEFERRED.md`, not per-phase.
 
 ## Next
 
-Feature-sized items planned next. The fine-grained, verified task list with
-file/line references is `docs/TODO.md`; this section keeps only the items that
-shape the roadmap.
+Feature-sized items planned next. The verified outstanding register, with
+file/line references and re-entry conditions, is `docs/DEFERRED.md`; this
+section keeps only the items that shape the roadmap.
 
 - **Hybrid UI full scope** (post-1.0): split Settings into tabbed sub-views,
   Studio split pane, drag-and-drop agent assignment, focus-trap system —
   `docs/hybrid-ui-plan.md`.
-- **Codebase-world-class Phases 1–5** (~300 h, from
-  `docs/codebase-world-class-plan.md`): hotspot refactoring (desktop markdown
-  renderer, largest modules), test-coverage targets, criterion benchmarks,
-  architecture consistency (builder pattern, duplicate error types,
-  cancellation audit), security/polish (threat model, secret sanitizer,
-  hardened WASM sandbox).
+- **Codebase-world-class Phases 1–5** (from
+  `docs/research/codebase-world-class-plan.md`, an aspirational estimate rather
+  than a schedule): Phase 3 shipped (`10357cd` — two-tier criterion gate in CI).
+  The rest of the real work is registered per-item, not per-phase: hotspot and
+  module decomposition, duplicate error types, and the cancellation audit are
+  `docs/DEFERRED.md` row 34; coverage breadth and the eval live leg are row 17;
+  the security/polish theme is `docs/security-threat-model.md` §6.
 - **Coordinator restart/resume:** checkpoint persistence to the session
   database exists (`coordinator.rs::persist_checkpoint`); ADR-65 Phase 7
   (evidence-driven resume at the whiteboard cursor, checkpoint schema v4) is
@@ -164,16 +166,20 @@ shape the roadmap.
   rank-ordered (`crates/memory/src/fts.rs:148,160-163`;
   `crates/memory/src/rag.rs:412-459`); the stored `score: 1.0` is inert by
   construction (`crates/memory/src/sync.rs:61,130`), proven by
-  `crates/memory/src/fts.rs:404-450,458-498`. (STUB-FINDINGS #6, DEFERRED #20.)
+  `crates/memory/src/fts.rs:404-450,458-498`. (archive/STUB-FINDINGS.md #6,
+  DEFERRED closed row 12.)
 - **Provider reach follow-ups:** the named OpenAI-compatible wrappers are
   implemented (22 provider ids); remaining work is the *flat*/content-embedded
   tool-call parsing for proxies documented in `docs/proxy-tool-call-fix.md`
-  (Fixes 1–3 landed; any residual gaps live in `docs/TODO.md`).
+  (Fixes 1–3 landed; any residual gaps live in `docs/DEFERRED.md`).
 - **Fault-injection tests** for the multi-agent containment boundaries in
   ADR-26 (rate limits, malformed tool calls, missing executables, cancellation
   races, provider disconnects).
-- **Audit-log retention policy:** define retention/archival for `audit_log`
-  rows; ADR-40 explicitly leaves this to a future policy.
+- **Audit-log retention policy — landed 2026-09-26.** ADR-73 (Accepted) and
+  `7351128` give the audit database SQLCipher at-rest encryption plus
+  age-based, operator-configured archive-then-delete retention. Posture is
+  opt-in by design; there is no outstanding retention work
+  (`docs/DEFERRED.md` closed row 15).
 
 ## Later
 
@@ -189,13 +195,16 @@ these are promised near-term features.
   file/line/column launch templates, and an "Open in editor" handoff from
   diffs, tool logs, chat references, and memory. An embedded editor is only
   considered later if it clearly beats a reliable external-editor protocol.
-- **Certified evolutionary optimization:** the exploratory design in
-  `docs/research/certified-universal-evolution.md` stays research until
-  compiler-enforced confidence/evidence types, evaluator specification
-  validation, deterministic isolated evaluation infrastructure, explicit
-  resource budgets, and small-domain evidence comparable to STOKE exist.
+- **Certified evolutionary optimization:** this is research, not backlog, and
+  it is recorded as cut rather than deferred (`docs/DEFERRED.md` closed row 28).
+  Its source document is deliberately git-ignored, so there is no in-repo path
+  to cite; the prerequisites it listed are compiler-enforced confidence/evidence
+  types, evaluator specification validation, deterministic isolated evaluation
+  infrastructure, explicit resource budgets, and small-domain evidence
+  comparable to STOKE.
 - **Binary installers and crates.io publishing:** currently only a `.tar.gz`
-  release build exists; see the Release section of `docs/TODO.md`.
+  release build exists; see the "cut, not deferred" list in
+  `docs/DEFERRED.md`.
 - **Memory-grounded resume (Phase 6 M3, live-test-gated):** make resume
   *informed* rather than purely mechanical. Three increments, all on existing
   stores (no schema change, no new ADR at this scope): (a) **run-scoped
@@ -236,17 +245,28 @@ these are promised near-term features.
   (`.concerto.toml`) reloads on switch, and tool filesystem access is rooted at
   the project dir (`resolve_path`, `crates/tools/src/common.rs`).
 - **Sandbox / execution isolation.** `SandboxProfile::Containerized` is
-  declared but not implemented; plugins run under the WASM capability sandbox,
-  which is not complete OS-level isolation (ADR-21, `docs/STATUS.md`).
-- **Evaluator end-to-end runner depth.** The former `#[ignore]`d eval
-  end-to-end test was removed in favor of fast runner unit tests
-  (`crates/eval/src/runner.rs`); a full live end-to-end eval harness over a
-  real benchmark task remains deferred until multi-agent quality and recovery
-  are reliable.
+  implemented and enforced on Linux/macOS (ADR-72 Accepted: `d00582b` runtime
+  detection + fail-closed admission, `3ae6ea5` shell routing through
+  `docker`/`podman run`, `fdf4800` the required routing marker). Windows is
+  unsupported and fails closed — Job Objects need `unsafe` FFI, which
+  `[workspace.lints]` denies — so re-entry needs a superseding ADR choosing
+  (a) a narrow audited `unsafe` exception, (b) the `windows` crate, or (c)
+  Linux/macOS-only with loud docs (`docs/DEFERRED.md` row 36). WASM capability
+  enforcement is an additional layer, not OS-level isolation on its own.
+- **Evaluator live-run breadth.** The former `#[ignore]`d eval end-to-end test
+  was removed in favor of fast runner unit tests
+  (`crates/eval/src/runner.rs`), and a live-runtime eval leg has since landed:
+  four crash-window fault-injection scenarios
+  (`crates/orchestrator/src/fault_injection.rs:76-92`, `f4bdc4f`) plus an
+  env-gated live leg that never runs in CI
+  (`crates/eval-runner/src/main.rs:430-490`, `5daf2e7`). What remains is
+  coverage breadth beyond one suite/model and a flake-quarantine policy
+  (`docs/DEFERRED.md` row 17).
 - **Replacing SQLite memory storage** without a measured need.
 - **Claiming global optimality** for an unbounded real-world software problem.
-- Audit-log retention, provider reach, and the AI-shell phases are parked in
-  Next/Later above rather than silently dropped.
+- Provider reach and the AI-shell phases are parked in Next/Later above rather
+  than silently dropped; audit-log retention is no longer pending — it landed
+  2026-09-26 (ADR-73, `7351128`).
 
 ## Architecture decision index
 
@@ -292,7 +312,7 @@ historical numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [40](docs/adrs/ADR-40.md) | Audit log append-only / session pruning | Accepted |
 | [41](docs/adrs/ADR-41.md) | Spend surfaces in status bar; no Dashboard page | Accepted |
 | [42](docs/adrs/ADR-42.md) | Coordinator resilience: failure-class fallback ladder | Accepted |
-| [43](docs/adrs/ADR-43.md) | Skills, MCP client, and extension manager | Accepted |
+| [43](docs/adrs/ADR-43-skills-mcp-and-extension-manager.md) | Skills, MCP client, and extension manager | Accepted |
 | [44](docs/adrs/ADR-44.md) | Project-root confinement and consent gating | Accepted |
 | [45](docs/adrs/ADR-45.md) | Ladder provider switch, retry configurability, coordinator takeover | Accepted — amends ADR-42 |
 | [46](docs/adrs/ADR-46-reasoning-as-data.md) | Reasoning content as first-class data | Accepted |

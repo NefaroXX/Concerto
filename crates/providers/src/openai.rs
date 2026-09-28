@@ -859,7 +859,7 @@ impl LlmProvider for OpenAiProvider {
                         }
                         items
                     }
-                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // Stream-retry: a transport fault
                     // mid-stream is retriable (tools execute only
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures

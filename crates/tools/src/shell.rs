@@ -1171,7 +1171,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
                     None => cwd.clone(),
                 }
             };
-            // Containment (ADR-55 §2, Phase 1b): the profile backend spawns the
+            // Containment (ADR-55 §3, Phase 1b): the profile backend spawns the
             // process in `effective_cwd`; keep the command's directory changes,
             // redirects, and path arguments inside the project root.
             contain_shell_command(
@@ -1188,7 +1188,7 @@ impl concerto_core::traits::tool::Tool for ShellTool {
             return into_tool_output(result, &shell_input.command, timeout_secs);
         }
 
-        // Containment (ADR-55 §2, Phase 1b): the command's directory changes,
+        // Containment (ADR-55 §3, Phase 1b): the command's directory changes,
         // redirect writes, and path-like arguments must stay within the
         // project root. `cwd` is the sandboxed working directory from which
         // the process will be spawned.

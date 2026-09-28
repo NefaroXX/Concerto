@@ -24,7 +24,7 @@ pub struct SimplePolicyEngine {
     compiled: HashMap<String, regex::Regex>,
     spend_tracker: Option<Arc<SpendTracker>>,
     rate_limiter: Option<Arc<RpmLimiter>>,
-    /// ADR-55 §2: optional, session-scoped, non-durable source of
+    /// ADR-55 §3: optional, session-scoped, non-durable source of
     /// authorization state consulted by `Condition::IntentAuthorized`.
     /// `None` (the default) preserves exact pre-ADR-55 behavior.
     intent_auth: Option<Arc<dyn IntentAuthorization>>,
@@ -93,7 +93,7 @@ impl SimplePolicyEngine {
         self
     }
 
-    /// Attach an intent-authorization state source (ADR-55 §2).
+    /// Attach an intent-authorization state source (ADR-55 §3).
     ///
     /// The provider returns the *full* policy outcome for each action:
     /// [`IntentVerdict::Allow`] upgrades `RequireApproval` → `Allow`,
@@ -256,7 +256,7 @@ impl SimplePolicyEngine {
         }
     }
 
-    /// ADR-55 §2 intent gate: apply the attached authorization's verdict
+    /// ADR-55 §3 intent gate: apply the attached authorization's verdict
     /// mechanically to the rule's normal outcome. `Allow` upgrades
     /// `RequireApproval` → `Allow` (audit `rule_matched` = the verdict's rule);
     /// `RequireApproval` keeps the action under the rule's approval path;
@@ -401,7 +401,7 @@ impl SimplePolicyEngine {
                     })
                     .unwrap_or(false)
             }
-            // ADR-55 §2: as a plain boolean predicate the intent condition
+            // ADR-55 §3: as a plain boolean predicate the intent condition
             // matches only when an attached authorization allows the action.
             // Approval-producing rules handle the bare condition through
             // `eval_intent_gate` instead, so a compound condition can never
@@ -3028,7 +3028,7 @@ mod tests {
         assert_eq!(denied, PolicyVerdict::Deny);
     }
 
-    // ---- ADR-55 1c: intent-gate (`Condition::IntentAuthorized`) ------------
+    // ---- ADR-55 §3: intent-gate (`Condition::IntentAuthorized`) ------------
 
     /// Stub authorization provider returning a fixed verdict for every action.
     #[derive(Clone, Copy)]
@@ -3055,7 +3055,7 @@ mod tests {
         // The gate maps each authorization verdict to the rule's normal policy
         // outcome and records the verdict's rule name as the audit
         // `rule_matched`. Every 1c verdict is pinned as a regression row
-        // (ADR-55 §2).
+        // (ADR-55 §3).
         let cases: &[(IntentVerdict, PolicyVerdict, &str)] = &[
             (IntentVerdict::Allow { rule: RULE_OBSERVE }, PolicyVerdict::Allow, RULE_OBSERVE),
             (
@@ -3120,7 +3120,7 @@ mod tests {
 
     #[tokio::test]
     async fn consequential_requires_approval_even_when_authorized() {
-        // Consequential-tier actions are never covered by a grant (ADR-55 §2):
+        // Consequential-tier actions are never covered by a grant (ADR-55 §3):
         // the gate keeps them under RequireApproval and labels the audit row
         // "consequential".
         let (engine, audit) = engine_with_auth(

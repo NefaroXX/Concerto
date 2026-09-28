@@ -199,8 +199,8 @@ pub enum ProviderError {
     /// The HTTP request succeeded and the response stream had opened, then
     /// the connection broke mid-stream (reset, dropped socket, body read
     /// error). Kept distinct from a pre-request [`ProviderError::Network`]
-    /// failure so the retry layer can retry it deliberately (ADR-55 Phase
-    /// 2e stream-retry): tools execute only after a stream is fully
+    /// failure so the retry layer can retry it deliberately (the
+    /// stream-retry rule): tools execute only after a stream is fully
     /// assembled, so re-issuing the request is side-effect-free within the
     /// bounded attempt budget. Framing and parse failures inside a healthy
     /// stream stay fatal (`Serialization`/`InvalidResponse`) — retrying
@@ -302,8 +302,7 @@ impl ProviderError {
             ProviderError::HttpStatus { status, .. } => *status >= 500 || *status == 429,
             ProviderError::Network(_) => true,
             // A mid-stream transport fault is as transient as a
-            // pre-request one — see the variant's docs (ADR-55 Phase 2e
-            // stream-retry).
+            // pre-request one — see the variant's docs (stream-retry).
             ProviderError::StreamTransport(_) => true,
             ProviderError::Timeout { .. } => true,
             ProviderError::InvalidResponse(_) => true,

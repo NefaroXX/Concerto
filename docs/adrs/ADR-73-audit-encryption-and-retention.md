@@ -3,7 +3,9 @@
 **Status:** Accepted
 
 Answers the question [ADR-40](./ADR-40.md) §Decision item 3 deliberately left
-open ("Audit retention remains a future policy question, not a session one").
+open — that clause read, before this amendment, "Audit retention remains a
+future policy question, not a session one". It now states the settled decision
+in place.
 Composes with ADR-40 (append-only audit log, detach-don't-delete), ADR-03
 (layered config) and ADR-04 (keyring credential storage), and ADR-11 (the
 data-dir lock that makes the startup prune single-writer). **Amends** ADR-40
@@ -26,14 +28,15 @@ ADR-40 made `audit_log` append-only: `delete_session` stops deleting audit
 rows, the session pointer is nulled instead (`ON DELETE SET NULL`), and the
 decision record outlives the working data. That is the right call for
 forensics and it has a direct cost — the log is grow-only by design, and
-ADR-40 item 3 explicitly declined to bound it:
+ADR-40 item 3 explicitly declined to bound it. The clause as it stood before
+this amendment:
 
 > **3. Audit retention remains a future policy question, not a session one.**
 > No age- or size-based *audit-only* truncation is introduced; if one is ever
 > wanted it belongs in its own ADR, separate from session pruning.
 
-That is this ADR. It was also an open TODO (`docs/TODO.md:14–17`: "Define
-retention/archival for `audit_log` rows").
+That is this ADR. It was also an open TODO (`docs/TODO.md` "Resolved" table,
+audit-log retention: "Define retention/archival for `audit_log` rows").
 
 Two gaps converge on the same store:
 
@@ -161,7 +164,7 @@ existing config changes meaning.
 |---|---|
 | Item 1 — `audit_log` is append-only, never trimmed by session lifecycle | **Unchanged.** Session pruning still never deletes audit rows. |
 | Item 2 — detach, don't delete (`ON DELETE SET NULL`) | **Unchanged.** |
-| Item 3 — "audit retention remains a future policy question" | **Superseded by this ADR.** The question is now answered: age-based, archive-then-delete, operator-configured, and — as ADR-40 required — still *not* a session concern. |
+| Item 3 — retention as a time-based policy (pre-amendment wording: "audit retention remains a future policy question") | **Superseded by this ADR.** The question is now answered: age-based, archive-then-delete, operator-configured, and — as ADR-40 required — still *not* a session concern. |
 | Item 4 — migration `021` table rebuild mechanics | **Unchanged.** |
 
 The distinction ADR-40 insisted on is preserved: retention is a **time-based

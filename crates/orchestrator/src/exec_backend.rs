@@ -62,7 +62,7 @@ pub trait ToolExecutionBackend: Send + Sync {
     }
 
     /// Persist an acknowledgment decision through the audit channel (ADR-55
-    /// §5 / audit H-04). The supervised path logs a warning instead: in the
+    /// §6 / audit H-04). The supervised path logs a warning instead: in the
     /// ADR-60 model the audit trail is written supervisor-side (D4/D5).
     async fn record_ack_decision(
         &self,

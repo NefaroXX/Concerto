@@ -98,7 +98,7 @@ fn function_call_args(fc: &serde_json::Value) -> serde_json::Value {
 ///
 /// The wire spelling has varied: the API's own error text and early field
 /// dumps use snake_case `thought_signature`, while the canonical IR names the
-/// same field `thoughtSignature` (ARCHITECTURE-V2 §2.1). Both spellings are
+/// same field `thoughtSignature` (docs/research/ARCHITECTURE-V2.md §2.1). Both spellings are
 /// accepted so a capture never silently drops a signature.
 fn part_thought_signature(part: &serde_json::Value) -> Option<String> {
     ["thought_signature", "thoughtSignature"]
@@ -592,7 +592,7 @@ impl LlmProvider for GoogleProvider {
                         }
                         items
                     }
-                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // Stream-retry: a transport fault
                     // mid-stream is retriable (tools execute only
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures

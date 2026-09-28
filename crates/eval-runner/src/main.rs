@@ -184,7 +184,7 @@ async fn run_agent(
     let eval_engine = EvalEngine::new(&project_dir);
 
     // Create prompt builder with the canonical build system prompt (ADR-55
-    // Phase 1e: the Build prompt constant in concerto-core is the single
+    // §8: the Build prompt constant in concerto-core is the single
     // source of truth).
     let prompt_builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD);
 

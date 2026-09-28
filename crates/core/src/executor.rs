@@ -488,7 +488,7 @@ impl ToolExecutor {
         }
     }
 
-    /// Persist a plan-approval decision (ADR-55 Phase 1d) as a distinct audit
+    /// Persist a plan-approval decision (ADR-55 §4) as a distinct audit
     /// entry.
     ///
     /// A plan decision is not tied to any tool call, so `tool_name` is the
@@ -498,7 +498,7 @@ impl ToolExecutor {
     /// back to the router's classification), and `user_response` is a compact
     /// JSON envelope with the bound `plan_id` and the source revision the plan
     /// was approved at. The same values are mirrored into the schema-derived
-    /// `plan_id` / `source_revision` columns (ADR-55 Phase 1d §4) so the log is
+    /// `plan_id` / `source_revision` columns (ADR-55 §6) so the log is
     /// queryable without JSON parsing; the envelope is retained for
     /// replay/backward compatibility. The ADR-28 §6 execution fields stay
     /// `None`: there is no command behind a plan decision.
@@ -2422,7 +2422,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Audit-log completeness: request_ack outcomes are recorded through the
-    // same channel as approval decisions (audit H-04; ADR-55 Phase 0).
+    // same channel as approval decisions (audit H-04; ADR-55 §6).
     // ------------------------------------------------------------------
 
     /// `request_ack` returning `true` (the user acknowledged and wants to
@@ -2574,7 +2574,7 @@ mod tests {
             "user_response envelope carries the bound plan id"
         );
         assert_eq!(response["source_revision"], "f00dcafe");
-        // ADR-55 Phase 1d §4: the values are mirrored into schema-derived
+        // ADR-55 §6: the values are mirrored into schema-derived
         // columns so the log is queryable without JSON parsing.
         assert_eq!(entries[0].plan_id.as_deref(), Some("01J4V6Q8X000000000000000001"));
         assert_eq!(entries[0].source_revision.as_deref(), Some("f00dcafe"));

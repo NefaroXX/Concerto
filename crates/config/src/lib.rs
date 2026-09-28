@@ -836,7 +836,7 @@ mod tests {
 
     /// A retired v6 config file still loads — the migration chain bumps it
     /// through v7 into v8 without resurrecting the `[intent]` surface
-    /// (removed at v8; ADR-56 2026-09-11 clarification).
+    /// (removed at v8; ADR-56).
     #[test]
     fn v6_config_file_migrates_to_latest_schema() {
         let dir = tempfile::tempdir().unwrap();

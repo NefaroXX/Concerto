@@ -252,9 +252,9 @@ pub enum Message {
     ToastExpiryTick,
     /// User decision on the acknowledgement (no-undo) dialog.
     AckDialog(capability_dialog::AckDialogMessage),
-    /// User decision on the intent confirmation dialog (ADR-55 §1).
+    /// User decision on the intent confirmation dialog (ADR-55 §2).
     IntentDialog(capability_dialog::IntentDialogMessage),
-    /// User decision on the plan approval dialog (ADR-55 Phase 1d).
+    /// User decision on the plan approval dialog (ADR-55 §4).
     PlanDialog(capability_dialog::PlanDialogMessage),
 }
 
@@ -295,9 +295,9 @@ pub struct App {
     // Capability approval dialog state
     pub cap_pending: capability_dialog::SharedPending,
     pub pending_ack: capability_dialog::SharedPendingAck,
-    /// Pending intent confirmations (ADR-55 §1), FIFO queue.
+    /// Pending intent confirmations (ADR-55 §2), FIFO queue.
     pub pending_intent: capability_dialog::SharedPendingIntent,
-    /// Pending plan approvals (ADR-55 Phase 1d), FIFO queue.
+    /// Pending plan approvals (ADR-55 §4), FIFO queue.
     pub pending_plan: capability_dialog::SharedPendingPlan,
 
     pub bus: concerto_core::event::EventBus,
@@ -316,7 +316,7 @@ pub struct App {
     pub plugin_manager: SharedPluginManager,
     pub cancel_token: concerto_core::CancellationToken,
     pub run_status: RunStatus,
-    /// Current intent-router stage of the active run (ADR-55 Phase 2a),
+    /// Current intent-router stage of the active run (ADR-55 §9),
     /// rendered as the status-bar run-stage chip. `Some` only while
     /// `run_status == RunStatus::Running`; it is set by
     /// `DesktopEvent::RunStageChanged` (guarded by the run status) and cleared
@@ -2315,7 +2315,7 @@ impl App {
             return Some("no providers are configured".to_string());
         }
         let creds = CredentialStore::new();
-        // The intent gate is always on (ADR-55 Phase 1e): there is no mode
+        // The intent gate is always on (ADR-55 §7): there is no mode
         // picker, so every run is a potential Execute regardless of the chat
         // outcome the router eventually classifies. Validate the active
         // (composer) provider unconditionally and check every agent
@@ -4274,7 +4274,7 @@ impl App {
                 });
             stack![after_subview, backdrop].into()
         } else if let Some(intent_dlg) = capability_dialog::intent_view(&self.pending_intent) {
-            // Intent confirmation modal (ADR-55 §1), mirroring the capability
+            // Intent confirmation modal (ADR-55 §2), mirroring the capability
             // and ack dialogs: a centered card over a dimmed palette backdrop.
             let backdrop = container(intent_dlg.map(Message::IntentDialog))
                 .width(Length::Fill)
@@ -4292,7 +4292,7 @@ impl App {
         } else if let Some(plan_dlg) =
             capability_dialog::plan_view(&self.pending_plan, &self.current_theme)
         {
-            // Plan approval modal (ADR-55 Phase 1d), mirroring the intent
+            // Plan approval modal (ADR-55 §4), mirroring the intent
             // dialog: a centered card over a dimmed palette backdrop.
             let backdrop = container(plan_dlg.map(Message::PlanDialog))
                 .width(Length::Fill)
@@ -6115,7 +6115,7 @@ custom_agents = []
     }
 
     // -----------------------------------------------------------------------
-    // AgentMode tests (ADR-55 Phase 1e: the mode picker is gone; the intent
+    // AgentMode tests (ADR-55 §7: the mode picker is gone; the intent
     // gate derives the effective outcome instead of a persisted mode).
     // -----------------------------------------------------------------------
 
@@ -6293,7 +6293,7 @@ custom_agents = []
         assert_eq!(super::format_run_summary(&plain), "All done");
     }
 
-    // ── Run-stage chip (ADR-55 Phase 2a) ───────────────────────────────────
+    // ── Run-stage chip (ADR-55 §9) ───────────────────────────────────
 
     /// A `RunStageChanged` event while a run is in flight arms the chip.
     #[test]
@@ -6462,7 +6462,7 @@ custom_agents = []
             },
         ];
 
-        // The intent gate is always on (ADR-55 Phase 1e): every run is a
+        // The intent gate is always on (ADR-55 §7): every run is a
         // potential Execute, so an incomplete specialist assignment blocks
         // dispatch — there is no mode picker to narrow the check.
         assert!(
@@ -7613,7 +7613,7 @@ custom_agents = []
     }
 
     // -----------------------------------------------------------------------
-    // request_intent_confirmation (ADR-55 §1)
+    // request_intent_confirmation (ADR-55 §2)
     // -----------------------------------------------------------------------
 
     /// Wait until the sink's request future has queued a dialog on
@@ -7767,7 +7767,7 @@ custom_agents = []
     }
 
     // -----------------------------------------------------------------------
-    // request_plan_approval (ADR-55 Phase 1d)
+    // request_plan_approval (ADR-55 §4)
     // -----------------------------------------------------------------------
 
     /// Wait until the sink's request future has queued a dialog on

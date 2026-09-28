@@ -56,14 +56,14 @@ pub use types::{
 // `AuditLog::record_infra`.
 pub use traits::policy::{InfraAuditEntry, InfraVerdict, RULE_INFRA_FAILURE};
 
-// Phase 0 intent-routing vocabulary (ADR-55): types plus the confidence
+// Intent-routing vocabulary (ADR-55 §1): types plus the confidence
 // threshold the router uses for path selection.
 pub use intent::{
     PlanDecision, RequestedOutcome, RouterOutput, RouterRoute, RunStage, TaskScope,
     LOW_CONFIDENCE_THRESHOLD,
 };
 
-// ADR-55 batch 1c: intent tiers, the pure classifier, the verdict-source
+// ADR-55 §3: intent tiers, the pure classifier, the verdict-source
 // authorization seam the policy engine consults under
 // `Condition::IntentAuthorized`, and the audit rule-name vocabulary.
 pub use authorization::{

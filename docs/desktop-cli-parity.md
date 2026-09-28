@@ -3,8 +3,8 @@
 **Status: complete as of 2026-08-03.** Every item in this plan (R2–R4 and
 P1–P7) is implemented in source; R1 is tracked on a separate branch and is not
 duplicated here. This document is retained as the historical record and the
-regression checklist. The fine-grained pending-work list lives in
-[TODO.md](TODO.md).
+regression checklist. Anything still pending is registered in
+[`DEFERRED.md`](DEFERRED.md).
 
 ## Objective
 

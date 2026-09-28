@@ -1,5 +1,5 @@
 //! Dialect adapters — the provider-family seam of the provider-first design
-//! (Phase 2, `docs/ARCHITECTURE-V2.md`).
+//! (Phase 2, `docs/research/ARCHITECTURE-V2.md`).
 //!
 //! Providers are dialects of one canonical protocol: a [`Dialect`] lowers a
 //! canonical [`CompletionRequest`] onto the exact wire request body that a

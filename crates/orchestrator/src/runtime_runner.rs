@@ -507,7 +507,7 @@ use concerto_memory::{
     vector_store::VectorStore,
 };
 
-/// Transition-only run-stage publisher (ADR-55 Phase 2a).
+/// Transition-only run-stage publisher (ADR-55 §9).
 ///
 /// Tracks the current [`RunStage`] of the active run and publishes
 /// [`EventKind::RunStageChanged`] to the bus *only when the stage actually
@@ -1921,7 +1921,7 @@ async fn setup_policy_and_audit(
     if mcp_has_enabled_server {
         policy_rules.push(PolicyRule::RequireApproval(Condition::ToolNamePrefix("mcp:".into())));
     }
-    // ADR-55 §2 (B-3): custom user policy rules replace default_rules()
+    // ADR-55 §3 (B-3): custom user policy rules replace default_rules()
     // wholesale and may drop the bare `IntentAuthorized` gate rule, which
     // would leave the gate inert — still prompting and auditing but never
     // deciding. Whenever the gate's authorization provider is attached,
@@ -2086,7 +2086,7 @@ async fn execute_agent_loop(
     task: AgentTask,
     event_recorder: EventRecorderGuard,
     transcript_recorder: TranscriptRecorderGuard,
-    // ADR-55 Phase 2e §2: the run's permission envelope. Under full local
+    // ADR-55 §2: the run's permission envelope. Under full local
     // agency this is always `Acting`; the parameter is retained so the loop's
     // prompt selection stays explicit rather than implicit.
     envelope: RunEnvelope,
@@ -2183,7 +2183,7 @@ async fn execute_agent_loop(
     // `task` is moved into the loop below; Ulid is Copy so the task id is
     // captured up front for spend attribution (Phase 3, issue #93).
     let task_id = task.id.0;
-    // Run-stage signals (ADR-55 Phase 2a): the loop is about to start, so the
+    // Run-stage signals (ADR-55 §9): the loop is about to start, so the
     // run is Inspecting the workspace; a mutation-capable run then moves to
     // Execute. Complete is reported only after `run` returns Ok below — an Err
     // or cancellation never advances the stage. Under full local agency the
@@ -2410,7 +2410,7 @@ async fn select_or_init_memory_services(
     Ok(Some(mem.store))
 }
 
-/// ADR-55 Phase 2d §3: resolve the plan binding a confident Execute
+/// ADR-55 §4: resolve the plan binding a confident Execute
 /// auto-Applies — the coordinator decides, no clicks.
 ///
 /// Two sources, in order:
@@ -2446,14 +2446,14 @@ async fn resolve_auto_apply_binding(
         if raw.artifact_verifies() {
             return Ok(Some(raw));
         }
-        // ADR-55 Phase 2d §3: the approved plan for THIS objective drifted
+        // ADR-55 §4: the approved plan for THIS objective drifted
         // from its artifact hash. Executing anything else would be a silent
         // re-decompose — fail the run loudly instead.
         return Err(OrchestratorError::Unrecoverable {
             message: format!(
                 "approved plan binding for objective {objective_hash} drifted from its artifact \
                  hash (plan {}); refusing to silently re-decompose — re-plan explicitly to \
-                 replace it (ADR-55 Phase 2d §3)",
+                 replace it (ADR-55 §4)",
                 raw.plan_id(),
             ),
         });
@@ -2490,7 +2490,7 @@ pub fn dispatches_to_coordinator(force_single_agent: bool) -> bool {
     !force_single_agent
 }
 
-/// ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
+/// ADR-55 §4 (M3, live-fix): an Apply run executes the APPROVED plan,
 /// not the approval phrase ("i approve"). The stored, capped plan text is
 /// what the user approved; the original ask rides in the transcript.
 fn approved_plan_task_description(binding: &PlanBinding) -> String {
@@ -2881,8 +2881,8 @@ async fn seed_run_continuity(
     }
 }
 
-/// Build the run's task from the gate and plan-binding state (ADR-55 Phase
-/// 2b, M3 live-fix).
+/// Build the run's task from the gate and plan-binding state (ADR-55 §4,
+/// M3 live-fix).
 ///
 /// An Apply run must describe the APPROVED plan rather than the approval
 /// phrase that armed the dialog ("i approve"); without this the coordinator's
@@ -3058,7 +3058,7 @@ pub async fn run_shared_agent(
     //
     // Full local agency: the run-scoped grant store is created fresh per call
     // and never derived from routing. Grants are per-run and non-durable
-    // (ADR-55 §4): a fresh store per call means they can never cross sessions.
+    // (ADR-55 §5): a fresh store per call means they can never cross sessions.
     // Deny-class rules and the approval sink remain the boundaries.
     let store = Arc::new(IntentGrantStore::new());
     let auth = Arc::new(SessionIntentAuth::new(store.clone()));
@@ -3110,7 +3110,7 @@ pub async fn run_shared_agent(
     // control flow: every message enters ONE unified loop that may act, with
     // the orchestrator authority (landed) bypassing intent restrictions while
     // deny-class rules still run first and Consequential actions still reach
-    // the approval sink. Grants remain per-run and non-durable (ADR-55 §4).
+    // the approval sink. Grants remain per-run and non-durable (ADR-55 §5).
     let plan_objective_hash = blake3::hash(req.input.as_bytes()).to_hex().to_string();
 
     // Carry forward previous session spend so the cap looks at cumulative
@@ -3124,7 +3124,7 @@ pub async fn run_shared_agent(
         }
     }
 
-    // ADR-55 Phase 2d §3 (plan→Execute auto-Apply): a stored plan binding for
+    // ADR-55 §4 (plan→Execute auto-Apply): a stored plan binding for
     // THIS exact objective executes the persisted plan outright — hash-verified,
     // loud-fail on drift, no `approve the plan` click and no keyword gate. A
     // binding for a different objective never intercepts. See
@@ -3143,9 +3143,9 @@ pub async fn run_shared_agent(
     // grant and no read-only-from-routing. The orchestrator authority (landed)
     // bypasses intent restrictions while deny-class rules run first and
     // Consequential actions still reach the approval sink. The auto-Apply
-    // additionally feeds the ADR-55 Phase 2b (M2) checkpoint suppression below.
+    // additionally feeds the ADR-55 §4 (M2) checkpoint suppression below.
     let mut plan_decision: Option<PlanDecision> = None;
-    // ADR-55 Phase 2b (M3, live-fix): the auto-Apply consumes the stored
+    // ADR-55 §4 (M3, live-fix): the auto-Apply consumes the stored
     // binding below, so capture it BEFORE that consumption — the Execute run's
     // task must be built from the approved plan text, which is only available
     // while the binding still exists.
@@ -3156,7 +3156,7 @@ pub async fn run_shared_agent(
     // divergence, never something a user saw.
     let mut approval_time_revision: Option<String> = None;
     if let Some(binding) = bound {
-        // ADR-55 Phase 2d §3: auto-Apply — no dialog. The binding was
+        // ADR-55 §4: auto-Apply — no dialog. The binding was
         // hash-verified at interception ([`resolve_auto_apply_binding`]);
         // consume it in both stores so a later run cannot re-apply an
         // already-executed plan.
@@ -3166,7 +3166,7 @@ pub async fn run_shared_agent(
         let binding_revision = binding.source_revision().unwrap_or("unknown");
         // The auto decision is audited under the synthetic `intent:plan`
         // identity with plan_id + source revision in the user response
-        // (`auto_apply`, ADR-55 Phase 2d §5).
+        // (`auto_apply`, ADR-55 §6).
         executor
             .record_plan_decision(
                 session_id,
@@ -3174,7 +3174,7 @@ pub async fn run_shared_agent(
                 binding.plan_id(),
                 objective_hash,
                 current_revision.as_deref(),
-                // ADR-55 Phase 2d §5: the plan-decision seam gains the
+                // ADR-55 §6: the plan-decision seam gains the
                 // `auto_apply` variant.
                 "auto_apply",
                 req.cancel_token.clone(),
@@ -3185,16 +3185,16 @@ pub async fn run_shared_agent(
             plan_id = %binding.plan_id(),
             plan_revision = %binding_revision,
             current_revision = %current_revision.as_deref().unwrap_or("unknown"),
-            "auto-Applying the hash-verified stored plan (ADR-55 Phase 2d §3, no dialog)"
+            "auto-Applying the hash-verified stored plan (ADR-55 §4, no dialog)"
         );
-        // The decision rides along for ADR-55 Phase 2b (M2) checkpoint
+        // The decision rides along for ADR-55 §4 (M2) checkpoint
         // suppression below.
         plan_decision = Some(PlanDecision::Apply);
         // The auto-Apply CONSUMES the stored plan: drop the session's
         // binding in the in-memory registry and in durable storage so a
         // later run cannot re-apply an already-executed plan. A missing
         // durable row is a no-op (fail-soft).
-        // ADR-55 Phase 2b (M3, live-fix): capture the binding BEFORE
+        // ADR-55 §4 (M3, live-fix): capture the binding BEFORE
         // consuming it so the Execute run below can describe the
         // approved plan.
         applied_plan = Some(binding.clone());
@@ -3210,7 +3210,7 @@ pub async fn run_shared_agent(
         let _ = apply_auto_plan_decision(&store);
     }
 
-    // ADR-55 Phase 2b (M2): an Apply decision authorizes the STORED plan for
+    // ADR-55 §4 (M2): an Apply decision authorizes the STORED plan for
     // this objective — the run must execute that plan, never silently resume
     // a stale partial-graph checkpoint from an earlier Execute of the same
     // objective (its input hash would otherwise match the implicit-resume
@@ -3334,7 +3334,7 @@ pub async fn run_shared_agent(
         if !req.force_single_agent {
             let resume_requested = is_resume_request(&req.input);
 
-            // ADR-55 Phase 2b (M2): an Apply executes the APPROVED plan for
+            // ADR-55 §4 (M2): an Apply executes the APPROVED plan for
             // this objective. A checkpoint left over from a previous partial
             // Execute of the same objective would match the input hash and
             // silently resume the old partial graph below — the approved
@@ -3553,7 +3553,7 @@ pub async fn run_shared_agent(
             return Err(OrchestratorError::Provider(refusal));
         }
     }
-    // ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
+    // ADR-55 §4 (M3, live-fix): an Apply run executes the APPROVED plan,
     // not the approval phrase. `req.input` is still recorded in the transcript
     // and audit; only the task the agents execute is replaced. ADR-60 D7: a
     // whiteboard-verified approved plan swaps in the structured artifact +
@@ -3614,7 +3614,7 @@ pub async fn run_shared_agent(
         }
     }
 
-    // Run-stage tracking (ADR-55 Phase 2a). Created here, after routing, so
+    // Run-stage tracking (ADR-55 §9). Created here, after routing, so
     // the stage chip always starts from Understand; threaded down into the
     // single- and multi-agent paths below, which report the later stages.
     let stage_tracker =
@@ -3728,7 +3728,7 @@ pub async fn run_shared_agent(
 /// Run the multi-agent (coordinator) path: resolve role-specific providers,
 /// or launch a full multi-agent `CoordinatorAgent` with collaboration rules.
 ///
-/// ADR-55 Phase 2e §1: this path receives every non-forced run. Under full
+/// ADR-55 §1: this path receives every non-forced run. Under full
 /// local agency the coordinator's decision loop engages specialists on need,
 /// never by pre-scanning the user's words; `action_required` is always true.
 ///
@@ -3901,7 +3901,7 @@ async fn run_multi_agent(
     // ADR-35 phase 4: the roles needing provider/model resolution mirror the
     // runtime topology (coordinator + built-ins not disabled + enabled custom
     // agents) instead of a hardcoded role list. The shape follows the intent
-    // gate's effective outcome (ADR-55 Phase 1e): Execute runs use the full
+    // gate's effective outcome (ADR-55 §7): Execute runs use the full
     // topology, everything else resolves only the coordinator.
     let roles_to_resolve: Vec<AgentId> = if action_required {
         topology_roles(&services.config.multi_agent)
@@ -4099,7 +4099,7 @@ async fn run_multi_agent(
     // the process supervisor (real `orchestrator-agent-process` children under
     // one write gate) instead of the in-process coordinator waves. Only
     // Execute-classified runs take this path — the text-only fork above was
-    // deleted with the unified agent loop (ADR-55 Phase 2e §1) and Plan still
+    // deleted with the unified agent loop (ADR-55 §1) and Plan still
     // runs on the coordinator at planning-only depth. Any preparation gap
     // (no session-DB pool, missing child binary, empty roster) degrades loudly
     // to the coordinator below rather than failing the run.
@@ -4462,7 +4462,7 @@ async fn run_multi_agent(
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
-    // Run-stage tracking (ADR-55 Phase 2a): the coordinator publishes
+    // Run-stage tracking (ADR-55 §9): the coordinator publishes
     // `SubTaskCreated` and gate-cycle (`ReviewCycleStarted` /
     // `ValidationCycleStarted`) events on the bus as the graph progresses, so
     // the stage chip can follow the actual lifecycle instead of the wrapper's
@@ -4612,7 +4612,7 @@ async fn run_multi_agent(
     };
     stage_feed.abort();
     stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
-    // ADR-55 Phase 2b (M3): on a completed planning-only run, bind the
+    // ADR-55 §4 (M3): on a completed planning-only run, bind the
     // rendered plan (the coordinator's final message) to this objective,
     // keyed by the same plan_id the coordinator persisted as the durable
     // PlanArtifact (ADR-52), newest-wins.
@@ -5369,7 +5369,7 @@ fn resume_scope_project_id(project_dir: &Path) -> String {
     ProjectId::resolve(project_dir).0
 }
 
-/// ADR-55 Phase 2b (M2): discard the session's orchestration checkpoint
+/// ADR-55 §4 (M2): discard the session's orchestration checkpoint
 /// before a plan-driven (Apply) Execute so the run re-plans from the
 /// approved plan instead of silently resuming an old partial graph — the
 /// same objective hash would otherwise trip the implicit-resume check.
@@ -5426,7 +5426,7 @@ mod runtime_runner_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ===========================================================================
-    // ADR-55 Phase 2e: envelope + acceptance tests (A6-revised / A8 / A10).
+    // ADR-55 §2: envelope + acceptance tests (archived acceptance ids).
     // ===========================================================================
 
     // ===========================================================================
@@ -7261,7 +7261,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2b (M3, live-fix): an Apply run's task describes the
+    // ADR-55 §4 (M3, live-fix): an Apply run's task describes the
     // approved plan, never the approval phrase that armed the dialog.
     // ------------------------------------------------------------------
 
@@ -8030,7 +8030,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // Run-stage tracking (ADR-55 Phase 2a): StageTracker transition-only
+    // Run-stage tracking (ADR-55 §9): StageTracker transition-only
     // emission and the single-agent wiring through execute_agent_loop.
     // ------------------------------------------------------------------
 
@@ -8280,7 +8280,7 @@ mod runtime_runner_tests {
     /// Live-fix (restart-safe auto-Apply): a durable binding in the session
     /// DB rehydrates into the once-empty in-process registry so a confident
     /// Execute after an app restart still auto-Applies the real persisted
-    /// plan (ADR-55 Phase 2d §3), with its original age preserved.
+    /// plan (ADR-55 §4), with its original age preserved.
     #[tokio::test]
     async fn durable_binding_rehydrates_for_auto_apply() {
         use concerto_sessions::{PlanBindingRecord, SqliteSessionStore};
@@ -8326,7 +8326,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2d §3 / A5: plan→Execute auto-Apply — a confident
+    // ADR-55 §4: plan→Execute auto-Apply — a confident
     // Execute over a stored binding executes the persisted plan outright,
     // hash-verified; drift on the exact-objective leg is a LOUD failure,
     // never a silent re-decompose.
@@ -8366,7 +8366,7 @@ mod runtime_runner_tests {
     /// A5 (loud-fail on drift): a stored binding whose plan text no longer
     /// matches its creation-time artifact hash must fail the run LOUDLY —
     /// never silently fall through to a fresh re-decompose of the same
-    /// objective (ADR-55 Phase 2d §3).
+    /// objective (ADR-55 §4).
     #[tokio::test]
     async fn a5_drifted_exact_objective_binding_loud_fails_never_redecomposes() {
         let session = Ulid::new();
@@ -8742,7 +8742,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2b (M2): plan-driven Execute must not silently resume a
+    // ADR-55 §4 (M2): plan-driven Execute must not silently resume a
     // stale partial-graph checkpoint
     // ------------------------------------------------------------------
 

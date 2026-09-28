@@ -22,22 +22,22 @@ use crate::ConfigError;
 /// configs keep working via serde defaults (skills enabled with standard
 /// search paths, MCP disabled) and an insert-only migration step.
 ///
-/// v5 -> v6: drop `mode` and `[intent]` (ADR-55 Phase 1e) — the intent gate is
+/// v5 -> v6: drop `mode` and `[intent]` (ADR-55 §7) — the intent gate is
 /// now the only routing path and there is no user-selectable Build/Chat/Plan
 /// mode. The keys simply cease to exist; stale TOML keys are ignored at load
 /// because `AppConfig` has no `deny_unknown_fields`.
 ///
-/// v6 -> v7: re-add `[intent]` (ADR-55 Phase 2c) with the three classifier
+/// v6 -> v7: re-add `[intent]` (ADR-55 §10) with the three classifier
 /// keys only. This does NOT resurrect the `mode`/`enabled` keys dropped at v6 —
 /// the gate stays always-on; v7 adds only `classifier_enabled`,
 /// `classifier_model`, and `classifier_confidence_threshold`. Additive;
 /// `migrate_v6_to_v7` inserts the section with defaults when absent.
 ///
-/// v7 -> v8: drop the retired `[intent]` classifier surface (ADR-56, the
-/// 2026-09-11 clarification). With the classifier off the run hot path the
-/// three keys serve no reader; the section ceases to exist in the struct and
-/// stale TOML keys are ignored at load because `AppConfig` has no
-/// `deny_unknown_fields` (v5 -> v6 precedent).
+/// v7 -> v8: drop the retired `[intent]` classifier surface (ADR-56). With
+/// the classifier off the run hot path the three keys serve no reader; the
+/// section ceases to exist in the struct and stale TOML keys are ignored at
+/// load because `AppConfig` has no `deny_unknown_fields` (v5 -> v6
+/// precedent).
 ///
 /// ADR-56 supersedes the Phase 2c `classifier_enabled` default pin (off → on):
 /// the LLM classifier is the primary intent decider, so the omitted-key
@@ -240,11 +240,11 @@ fn default_classifier_confidence_threshold() -> f32 {
     // Bound to the gate's constant (not a literal) so no configured threshold
     // can create a [threshold, LOW_CONFIDENCE_THRESHOLD) band where a
     // classifier Execute re-route would miss the gate's arm-1 dialog
-    // (ADR-55 Phase 2c §2).
+    // (ADR-55 §10).
     concerto_core::LOW_CONFIDENCE_THRESHOLD
 }
 
-/// LLM intent classifier configuration (ADR-55 Phase 2c §2; ADR-56).
+/// LLM intent classifier configuration (ADR-55 §10; ADR-56).
 ///
 /// `[intent]` is additive and default-on. When the classifier is enabled it is
 /// the primary intent decider for every non-fast-path request (ADR-56 §1); a
@@ -262,7 +262,7 @@ pub struct IntentConfig {
     pub classifier_enabled: bool,
 
     /// Model used for the classifier call. `None` = the run's effective chat
-    /// model (ADR-55 Phase 2c §2, per §9 "same chat model").
+    /// model (ADR-55 §10 "same chat model").
     #[serde(default)]
     pub classifier_model: Option<String>,
 
@@ -270,7 +270,7 @@ pub struct IntentConfig {
     /// routing result to the suggested outcome. Default: 0.7 — validated at
     /// config load to be `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (the
     /// gate's constant), so a classifier Execute re-route always clears the
-    /// intent gate's arm-1 confirmation dialog (ADR-55 Phase 2c §2; ADR-56 §4
+    /// intent gate's arm-1 confirmation dialog (ADR-55 §10; ADR-56 §4
     /// keeps the invariant).
     #[serde(default = "default_classifier_confidence_threshold")]
     pub classifier_confidence_threshold: f32,
@@ -291,11 +291,11 @@ impl IntentConfig {
     /// [`RetryConfig::validate`].
     ///
     /// The threshold is bound to `concerto_core::LOW_CONFIDENCE_THRESHOLD`
-    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 Phase
-    /// 2d §1) uses that constant, so a configured threshold below it could
+    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 §1)
+    /// uses that constant, so a configured threshold below it could
     /// re-route a classifier Execute at a confidence the gate treats as
     /// ambiguous — landing it in the read-only wildcard instead of the
-    /// auto-grant (ADR-55 Phase 2c §2 invariant retained by the ADR-56
+    /// auto-grant (ADR-55 §10 invariant retained by the ADR-56
     /// amendment).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.classifier_confidence_threshold.is_finite()

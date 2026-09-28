@@ -183,7 +183,7 @@ pub enum DesktopEvent {
         cap_usd: f64,
     },
 
-    // --- Run-stage chip (ADR-55 Phase 2a) ---
+    // --- Run-stage chip (ADR-55 §9) ---
     /// The active run advanced to a new intent-router stage. `task_id` is
     /// deliberately dropped: the desktop tracks one active run and the chip is
     /// guarded by `run_status == Running` at the App level.
@@ -353,7 +353,7 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
         }
         EventKind::RoutingDecided { task_id, role, provider, model, reason, intent } => {
             match intent {
-                // ADR-55 Phase 2d §5: an intent-routing record tells the routing
+                // ADR-55 §6: an intent-routing record tells the routing
                 // decision story instead of a model assignment.
                 Some(decision) => activity(
                     "Coordinator",
@@ -523,7 +523,7 @@ fn translate_misc_event(event: &BackendEvent) -> Option<DesktopEvent> {
     }
 }
 
-/// Translate intent-router run-stage transitions (ADR-55 Phase 2a).
+/// Translate intent-router run-stage transitions (ADR-55 §9).
 ///
 /// The backend event carries the correlation `task_id`; the desktop tracks one
 /// active run per window, so the task id is dropped here — the App chip is
@@ -786,7 +786,7 @@ mod tests {
                 provider: "openrouter".into(),
                 model: "example/model".into(),
                 reason: "configured assignment".into(),
-                // Model-routing row: no intent payload (ADR-55 2d §5).
+                // Model-routing row: no intent payload (ADR-55 §8).
                 intent: None,
             },
         );
@@ -799,7 +799,7 @@ mod tests {
         ));
     }
 
-    /// ADR-55 Phase 2d §5: an intent-routing `RoutingDecided` record renders
+    /// ADR-55 §6: an intent-routing `RoutingDecided` record renders
     /// the routing decision story ({rule, route, confidence, outcome}) rather
     /// than a model assignment.
     #[test]

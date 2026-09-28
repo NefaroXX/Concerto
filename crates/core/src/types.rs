@@ -815,7 +815,7 @@ pub enum Condition {
     /// can gate the path Concerto would actually touch — including a
     /// containment rewrite — instead of the caller's spelling.
     ResolvedPathGlob(String),
-    /// ADR-55 §2: the intent gate. As the **top-level condition of an
+    /// ADR-55 §3: the intent gate. As the **top-level condition of an
     /// approval-producing rule** (`RequireApproval`,
     /// `RequireApprovalWithTimeout`, `RequireManagedToolApproval`,
     /// `RequireToolchainApproval`) it applies the attached
@@ -926,13 +926,13 @@ pub enum TaskExecutionMode {
     },
 }
 
-// ---- System prompts (ADR-55 Phase 1e) --------------------------------------
+// ---- System prompts (ADR-55 §8) --------------------------------------
 
 /// Build-mode system prompt: write code/files to disk via tools. Used for
 /// [`RequestedOutcome::Execute`] runs.
 ///
 /// Formerly the `AgentMode::Build` prompt text; preserved verbatim when the
-/// mode picker was removed (ADR-55 Phase 1e) so intent-gated Execute runs keep
+/// mode picker was removed (ADR-55 §7) so intent-gated Execute runs keep
 /// the same behavior.
 ///
 /// Carries the trailing `{working_memory}` placeholder
@@ -994,7 +994,7 @@ pub const SYSTEM_PROMPT_PLAN: &str =
     {working_memory}";
 
 /// Select the run's system prompt from the intent-gate outcome (ADR-55
-/// Phase 1e): the intent gate is now the ONLY routing path, so the prompt is
+/// §8): the intent gate is now the ONLY routing path, so the prompt is
 /// derived from the classified [`RequestedOutcome`] instead of a
 /// user-selectable mode picker.
 ///

@@ -1321,7 +1321,7 @@ struct ReadyTask {
     previous_results: Vec<AgentRunResult>,
 }
 
-/// ADR-55 Phase 2b: how far a multi-agent run may take the orchestrated
+/// ADR-55 archived Phase 2b §1: how far a multi-agent run may take the
 /// graph. `Full` runs the historical lifecycle (plan, execute, review,
 /// validate); `PlanningOnly` stops after the plan is produced, rendered and
 /// persisted — no subtask dispatch, review, or validation.
@@ -1331,7 +1331,7 @@ pub enum OrchestrationDepth {
     #[default]
     Full,
     /// Plan only: memory + design + TaskPlanner + graph validation, then
-    /// return the rendered plan (ADR-55 Phase 2b).
+    /// return the rendered plan (ADR-55 §4).
     PlanningOnly,
 }
 
@@ -1892,7 +1892,8 @@ pub struct CoordinatorAgent {
     /// pace the project-context maintenance nudge. Reset at construction; the
     /// cadence is [`crate::project_context::ProjectContext::nudge_frequency`].
     project_context_nudge_count: u64,
-    /// ADR-55 Phase 2b: how far this run may go — full lifecycle (default)
+    /// ADR-55 archived Phase 2b §1: how far this run may go — full
+    /// lifecycle (default)
     /// or planning-only (produce + render + persist the plan, nothing else).
     ///
     /// Advisor-mode intent routing: this is the DECIDED depth. When a
@@ -1914,7 +1915,7 @@ pub struct CoordinatorAgent {
     /// [`Self::decided_run_shape`], mirrored into the audit row and whiteboard
     /// payload (`None` when the run was not hint-driven).
     run_shape_decision_label: Option<String>,
-    /// ADR-55 Phase 2b: plan id of the most recently persisted PlanArtifact
+    /// ADR-55 §4: plan id of the most recently persisted PlanArtifact
     /// (ADR-52), surfaced so the runtime runner can bind a planning-only
     /// run's rendered plan to its durable artifact.
     last_plan_id: Option<String>,
@@ -4181,7 +4182,8 @@ impl CoordinatorAgent {
         self
     }
 
-    /// ADR-55 Phase 2b: cap the run at planning. The coordinator produces
+    /// ADR-55 archived Phase 2b §1: cap the run at planning. The
+    /// coordinator produces
     /// and renders the plan (persisted as a PlanArtifact when `with_plans`
     /// is attached) but never dispatches subtask execution, review, or
     /// validation.
@@ -4224,7 +4226,7 @@ impl CoordinatorAgent {
         self.run_shape_decision_label.as_deref()
     }
 
-    /// ADR-55 Phase 2b: the plan id of the most recently persisted plan
+    /// ADR-55 §4: the plan id of the most recently persisted plan
     /// artifact (`None` when plan persistence is disabled or failed). The
     /// runtime runner reads this after a planning-only run to bind the
     /// rendered plan to its durable artifact.
@@ -4914,7 +4916,7 @@ impl CoordinatorAgent {
         self.design_doc.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
-    /// ADR-55 Phase 2b: render the produced plan as the run's final message —
+    /// ADR-55 §4: render the produced plan as the run's final message —
     /// the design-doc summary plus one line per planned subtask (role,
     /// description, dependencies). Rendered from the GRAPH so both the
     /// TaskPlanner success path and the heuristic fallback pipeline produce
@@ -6511,7 +6513,7 @@ impl CoordinatorAgent {
     /// [`DecomposeResult`] whose objective/hash fields describe WHAT this run
     /// is executing (the fresh task description, or the evidence seed's
     /// original plan text + objective hash). Event ordering is load-bearing:
-    /// `MultiAgentModeStarted` must fire before the ADR-55 Phase 2b
+    /// `MultiAgentModeStarted` must fire before the ADR-55 §4
     /// planning-only early return.
     ///
     /// Terminal classes do not surface here: this tail runs only after a
@@ -6549,7 +6551,7 @@ impl CoordinatorAgent {
                 self.persist_plan_artifact(&fallback_plan)
             }
         };
-        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // ADR-55 §4: retain the id so a planning-only run can bind
         // its rendered plan to the durable artifact.
         self.last_plan_id = plan_id.clone();
         let _ = self.bus.publish_for_session(
@@ -6561,7 +6563,7 @@ impl CoordinatorAgent {
                 plan_id,
             },
         );
-        // ADR-55 Phase 2b: the planning-only run's plan IS the Coordinator's
+        // ADR-55 §4: the planning-only run's plan IS the Coordinator's
         // decision-loop summary (advisory prose; nothing was dispatched).
         if self.orchestration_depth == OrchestrationDepth::PlanningOnly && summary.is_empty() {
             return Ok(DecomposeResult {
@@ -6932,7 +6934,7 @@ impl CoordinatorAgent {
         let plan =
             PlanArtifact::from_graph(cp.run_id.to_string(), task, &graph, &cp.expected_artifacts);
         let plan_id = self.persist_plan_artifact(&plan);
-        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // ADR-55 §4: retain the id so a planning-only run can bind
         // its rendered plan to the durable artifact.
         self.last_plan_id = plan_id.clone();
         // ── Phase 6 M3c step 4: publish the investigation ─────────────────
@@ -10154,7 +10156,8 @@ impl CoordinatorAgent {
             }
         };
 
-        // ADR-55 Phase 2b: planning-only orchestration. The plan was just
+        // ADR-55 archived Phase 2b §1: planning-only orchestration. The plan
+        // was just
         // produced (resume is always `None` on this path, so nothing was
         // restored); the Coordinator's decision-loop summary IS the plan.
         // Render it as the run's final message and return without dispatching
@@ -11336,7 +11339,8 @@ impl CoordinatorAgent {
     /// structural iteration bound. Every iteration is a model dispatch and
     /// counts toward the ADR-52 run-wide doom guard.
     ///
-    /// `PlanningOnly` depth (ADR-55 Phase 2b) offers NO tools: the single
+    /// `PlanningOnly` depth (ADR-55 archived Phase 2b §1) offers NO tools:
+    /// the single
     /// planning response IS the plan — advisory prose, nothing is
     /// dispatched, no tools are touched (M1).
     ///
@@ -24922,10 +24926,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2b: planning-only orchestration depth
+    // ADR-55 archived Phase 2b §1 (phase history: docs/adrs/archive/
+    // ADR-55-phase-history.md): planning-only orchestration depth
     // ------------------------------------------------------------------
 
-    /// ADR-55 Phase 2b + ADR-35 amendment (2026-09-05): a planning-only run
+    /// ADR-55 archived Phase 2b §1 + ADR-35 amendment (2026-09-05): a
+    /// planning-only run
     /// is the Coordinator's OWN plan (advisory prose — the plan is context,
     /// never a workload). It completes, surfaces the plan as the final
     /// message, and NEVER dispatches a subtask — zero tool calls, no

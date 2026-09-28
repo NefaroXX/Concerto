@@ -1,4 +1,4 @@
-//! Durable plan bindings (ADR-55 Phase 2b live-fix).
+//! Durable plan bindings (ADR-55 §4; phase history: docs/adrs/archive/ADR-55-phase-history.md).
 //!
 //! The in-run `/Apply|Replan` dialog is armed by the process-scoped
 //! [`concerto_orchestrator::plan_approval::PlanApprovalRegistry`], which is
@@ -28,8 +28,8 @@ pub struct PlanBindingRecord {
     pub plan_id: String,
     /// The rendered plan text shown in the Apply/Replan dialog.
     pub plan_text: String,
-    /// blake3 fingerprint of `plan_text` captured at creation (ADR-55 §1
-    /// pending: diff-vs-artifact). `None` for rows written before migration
+    /// blake3 fingerprint of `plan_text` captured at creation (ADR-55 §4,
+    /// diff-vs-artifact). `None` for rows written before migration
     /// 025 — those are unverifiable at dialog arming.
     pub artifact_hash: Option<String>,
     /// The git revision the plan was created at, when known.

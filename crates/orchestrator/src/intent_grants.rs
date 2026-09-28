@@ -1,4 +1,4 @@
-//! Session-scoped, non-durable intent grants (ADR-55 §4).
+//! Session-scoped, non-durable intent grants (ADR-55 §5).
 //!
 //! # Deprecated as control flow
 //!
@@ -28,7 +28,7 @@ pub struct GrantEntry {
     /// The confirmed requested outcome that produced this grant.
     pub intent: RequestedOutcome,
     /// The tool class covered (`"filesystem"` | `"git"`). Shell is never
-    /// grantable (ADR-55 §2 shell scope hole), and Consequential actions are
+    /// grantable (ADR-55 §3 shell scope hole), and Consequential actions are
     /// decided before the grant is ever consulted.
     pub scope: &'static str,
 }
@@ -36,7 +36,7 @@ pub struct GrantEntry {
 /// Run-scoped grant store.
 ///
 /// Created fresh per run: grants are per-plan, session-scoped, non-durable,
-/// and revoked by `Stop` / a changed objective (ADR-55 §4) — all of which is
+/// and revoked by `Stop` / a changed objective (ADR-55 §5) — all of which is
 /// achieved structurally here because the store is dropped when the run ends
 /// and never persisted.
 #[derive(Debug, Default)]
@@ -53,7 +53,7 @@ impl IntentGrantStore {
     /// Record a grant covering `scope` for the confirmed `intent`.
     ///
     /// Callers are the run loop, after either a high-confidence route
-    /// (auto-grant, ADR-55 Phase 2d §1) or an explicit user decision in the
+    /// (auto-grant, ADR-55 §1) or an explicit user decision in the
     /// AskUser modal (the classifier-off chain, ADR-56 §3) — never from
     /// routing or classification alone below the threshold.
     pub fn grant(&self, intent: RequestedOutcome, scope: &'static str) {
@@ -81,10 +81,10 @@ impl IntentGrantStore {
     }
 }
 
-/// Authorization state source for one run (ADR-55 §2/§4).
+/// Authorization state source for one run (ADR-55 §3/§5).
 ///
 /// `is_read_only_intent` starts `true`: a run stays read-only until routing
-/// auto-grants (ADR-55 Phase 2d §1) or the user confirms a mutating intent
+/// auto-grants (ADR-55 §1) or the user confirms a mutating intent
 /// through the AskUser modal (the classifier-off chain). Only the run loop
 /// changes it.
 pub struct SessionIntentAuth {
@@ -124,7 +124,7 @@ impl IntentAuthorization for SessionIntentAuth {
         self.store.covers(action.tool_name)
     }
 
-    /// ADR-55 shell scope amendment (2026-09-09, Fix 2): layer the scoped
+    /// ADR-55 §3 (2026-09-09, Fix 2): layer the scoped
     /// shell project-bounded auto-approval on top of the default gate arms.
     ///
     /// Under an **Acting** grant (the same auto-grant a filesystem write is
@@ -140,7 +140,7 @@ impl IntentAuthorization for SessionIntentAuth {
     /// (`shell_requires_approval`) approval path, the hard read-only `Deny`,
     /// and every Consequential/denylist classification are untouched.
     ///
-    /// ADR-55 delegation scope amendment (2026-09-10): under the same Acting
+    /// ADR-55 §3 (2026-09-10): under the same Acting
     /// grant, the Coordinator's `call_specialist` dispatch is likewise
     /// upgraded to [`IntentVerdict::Allow`] (`rule =
     /// "intent_authorized_delegation"` — its own DISTINCT audited row,
@@ -172,7 +172,7 @@ impl IntentAuthorization for SessionIntentAuth {
 }
 
 /// True when `tool_name` is one of the Coordinator's policy-evaluated
-/// orchestration/delegation tools (ADR-55 delegation scope amendment, 2026-09-10).
+/// orchestration/delegation tools (ADR-55 §3, 2026-09-10).
 ///
 /// Audit (2026-09-10, branch `fix/coordinator-delegation-grant`): the
 /// Coordinator's decision loop offers exactly three tool families —
@@ -188,7 +188,7 @@ fn is_orchestration_tool(tool_name: &str) -> bool {
     tool_name == crate::coordinator::CALL_SPECIALIST_TOOL
 }
 
-/// The audit `rule_matched` value for a routing path (ADR-55 §5.2).
+/// The audit `rule_matched` value for a routing path (ADR-55 §6).
 ///
 /// `RuleHit` carries the deterministic corpus name (`execute_keyword`, ...);
 /// the classifier and the ask path use stable synthetic names.
@@ -201,7 +201,7 @@ pub fn router_route_name(route: &RouterRoute) -> &'static str {
     }
 }
 
-/// The routing **path kind** for audit envelopes (ADR-55 Phase 2d §5/A2):
+/// The routing **path kind** for audit envelopes (ADR-55 §6):
 /// the [`RouterRoute`] variant name, distinguishing a deterministic corpus
 /// hit from the LLM classifier path (`RuleHit` | `LlmClassifier`).
 pub fn router_path_name(route: &RouterRoute) -> &'static str {
@@ -213,7 +213,7 @@ pub fn router_path_name(route: &RouterRoute) -> &'static str {
     }
 }
 
-/// The audit `user_response` value for a requested outcome (ADR-55 §5.2).
+/// The audit `user_response` value for a requested outcome (ADR-55 §6).
 pub fn outcome_name(outcome: RequestedOutcome) -> &'static str {
     match outcome {
         RequestedOutcome::Answer => "Answer",
@@ -227,7 +227,7 @@ pub fn outcome_name(outcome: RequestedOutcome) -> &'static str {
 }
 
 /// Grant the two in-scope, mutate-local tool classes for a **confirmed**
-/// Execute: filesystem local mutations and git local mutations (ADR-55 §2).
+/// Execute: filesystem local mutations and git local mutations (ADR-55 §3).
 ///
 /// Shared by the paths that carry a confirmed Execute decision: an `Apply`
 /// decision on a stored plan binding (see
@@ -241,18 +241,18 @@ pub fn grant_execute(store: &IntentGrantStore) {
 }
 
 /// Grant the two in-scope, mutate-local tool classes for `intent`
-/// (ADR-55 Phase 2d §1): the same `filesystem`/`git` scopes a confirmed
+/// (ADR-55 §5): the same `filesystem`/`git` scopes a confirmed
 /// `Apply` holds, bound to the routed outcome instead of `Execute`.
 ///
 /// Shell stays never-grantable and Consequential actions are decided before
-/// the grant is ever consulted (ADR-55 §Decision 2 capability tiers — a grant
+/// the grant is ever consulted (ADR-55 §3 capability tiers — a grant
 /// only upgrades `RequireApproval`, never overrides `Deny`).
 pub fn grant_outcome(store: &IntentGrantStore, intent: RequestedOutcome) {
     store.grant(intent, "filesystem");
     store.grant(intent, "git");
 }
 
-/// ADR-55 Phase 2e §2: the permission envelope a routed run executes under.
+/// ADR-55 §2: the permission envelope a routed run executes under.
 ///
 /// The router keeps only the safety job: it decides whether the run may act,
 /// never which code path runs. Every non-empty run enters the unified agent
@@ -454,7 +454,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 shell scope amendment: scoped project-bounded shell upgrade
+    // ADR-55 §3: scoped project-bounded shell upgrade
     // ------------------------------------------------------------------
 
     use concerto_core::types::{CommandPolicyFacts, DestructiveClass, FilesystemScope};
@@ -747,7 +747,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 delegation scope amendment (2026-09-10): call_specialist
+    // ADR-55 §3 (2026-09-10): call_specialist
     // under Acting grants
     // ------------------------------------------------------------------
 

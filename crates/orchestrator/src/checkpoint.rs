@@ -1642,7 +1642,7 @@ mod tests {
         // artifact requirements, timestamps, assignments, and completed
         // results.
         //
-        // Known divergence (documented in docs/audits/AUDIT_FINDINGS_CURRENT.md,
+        // Known divergence (documented in docs/TODO.md: Audit cleanups, DEFERRED.md row 34,
         // C-05): `model_assignments` are stamped at PERSIST time from the
         // authoritative run ledger in `CoordinatorAgent::persist_checkpoint`,
         // so a persisted checkpoint cannot lag the ledger by a batch. A

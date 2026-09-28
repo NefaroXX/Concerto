@@ -30,7 +30,7 @@ fn shortcut_hints(page: Page) -> &'static str {
     }
 }
 
-/// Chip label for an intent-router [`RunStage`] (ADR-55 Phase 2a).
+/// Chip label for an intent-router [`RunStage`] (ADR-55 §9).
 ///
 /// The labels describe what the agent is doing in user terms rather than the
 /// router's internal stage names.
@@ -153,7 +153,7 @@ pub fn status_bar_view(app: &App) -> Element<'_, Message> {
             None => text("No provider selected").size(ts.caption).color(palette.warning).into(),
         };
 
-    // Intent-router run-stage chip (ADR-55 Phase 2a), between the run
+    // Intent-router run-stage chip (ADR-55 §9), between the run
     // indicator and the transient feedback. Shows the current stage in
     // user-facing terms, or "Waiting" while a dialog blocks the run. Hidden
     // when idle / no stage yet. Rendered as a non-actionable button so it

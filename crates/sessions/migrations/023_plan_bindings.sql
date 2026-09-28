@@ -1,4 +1,4 @@
--- Durable plan bindings (ADR-55 Phase 2b live-fix, restart-safe Apply dialog).
+-- Durable plan bindings (ADR-55 §4, restart-safe Apply dialog).
 --
 -- Mirrors the process-scoped in-memory `PlanApprovalRegistry` on disk so a
 -- natural-language approval ("i approve the plan") offered after an app

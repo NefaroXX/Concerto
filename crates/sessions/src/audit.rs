@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    /// Schema-derived intent columns (ADR-55 Phase 1d §4) must round-trip:
+    /// Schema-derived intent columns (ADR-55 §6) must round-trip:
     /// `plan_id` / `source_revision` land in dedicated columns while the
     /// `user_response` JSON envelope is preserved for replay.
     async fn sqlite_audit_log_intent_columns_round_trip() {

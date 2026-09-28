@@ -1,10 +1,16 @@
 # Concerto Live Test Form — Template
 
-**Purpose**: Live verification of a specific change under real conditions.
-Use one copy per feature/change, build type, OS, and provider/model
-combination. Mark each result **Pass**, **Fail**, **Blocked**, or
-**Not tested**. Attach sanitized logs and screenshots for failures. Never
-include credentials or private source content.
+**This is the one form to copy.** Use one copy per feature/change, build type,
+OS, and provider/model combination. Mark each result **Pass**, **Fail**,
+**Blocked**, or **Not tested**. Attach sanitized logs and screenshots for
+failures. Never include credentials or private source content.
+
+The full acceptance bar — the standard desktop, multi-agent, retry,
+cancellation, memory, spend, shell/policy, and skills/MCP regression rows, plus
+the automated-check commands and what is already automated — is
+[`TESTING.md`](../TESTING.md). Copy the rows you need from it into "Key Tests"
+below. Worked examples with recorded results: `live-test-skills-mcp.md`,
+`live-test-multi-agent-eval.md`.
 
 ## Test Environment
 
@@ -26,8 +32,9 @@ include credentials or private source content.
 
 ## Key Tests
 
-Fill in the feature-specific checks below (see the ready-made copies in
-`docs/live-test-*.md` for worked examples).
+Fill in the feature-specific checks below. For the standard regression rows,
+copy them from [`TESTING.md`](../TESTING.md); for worked examples, see
+`docs/live-test-*.md`.
 
 | Check | Expected Result | Result/Notes |
 |---|---|---|
@@ -47,6 +54,10 @@ Fill in the feature-specific checks below (see the ready-made copies in
 | Studio — validation surfacing | Break a rule (e.g. empty stage tag) → Save disabled + toolbar badge shows the issue | |
 
 ## Automated Checks
+
+The commands and their CI pins (Rust 1.96.0, `wasm32-wasip2` target,
+`CONCERTO_TEST_MODE=1`, `CARGO_BUILD_JOBS=2`) are maintained in
+[`../TESTING.md`](../TESTING.md#automated-workspace-checks). The short form:
 
 ```bash
 cargo fmt --all -- --check

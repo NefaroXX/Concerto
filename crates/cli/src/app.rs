@@ -274,7 +274,7 @@ pub struct App {
     pub input: String,
     pub scroll: u16,
     /// Vertical scroll offset of the plan-approval modal's plan body (ADR-55
-    /// Phase 1d). The stored plan can be up to 16 KiB, far larger than the
+    /// §4). The stored plan can be up to 16 KiB, far larger than the
     /// modal, so j/k / arrow keys page through it.
     pub plan_scroll: u16,
     pub input_mode: bool,
@@ -298,7 +298,7 @@ pub struct App {
     pub agent_assignments: Vec<AgentModelAssignment>,
     pub agent_assignment_index: usize,
     pub running: bool,
-    /// Intent-router stage of the active run (ADR-55 Phase 2a), rendered in
+    /// Intent-router stage of the active run (ADR-55 §9), rendered in
     /// the status bar. `Some` only while a run is in flight; cleared at every
     /// run boundary: dispatch start, completion, and cancel.
     pub run_stage: Option<RunStage>,
@@ -873,7 +873,7 @@ impl App {
                 }
             }
 
-            // Run-stage transitions from the backend (ADR-55 Phase 2a); the
+            // Run-stage transitions from the backend (ADR-55 §9); the
             // status bar shows only the latest stage. The terminal title
             // follows the same transition (once per change, never per-frame).
             let mut stage_changed = false;
@@ -3332,7 +3332,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Intent confirmation key handling (ADR-55 §1)
+    // Intent confirmation key handling (ADR-55 §2)
     // ------------------------------------------------------------------
 
     /// Wait until the spawned sink call has installed the pending intent so the
@@ -3426,7 +3426,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Plan approval key handling (ADR-55 Phase 1d)
+    // Plan approval key handling (ADR-55 §4)
     // ------------------------------------------------------------------
 
     /// Wait until the spawned sink call has installed the pending plan so the

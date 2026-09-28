@@ -1,5 +1,16 @@
 # Codebase Improvement Plan: World-Class Engineering
 
+> **Moved to `docs/research/` 2026-09-28.** An aspirational estimate
+> (2026-08-06), not a schedule. Since then: Phase 0 merged (PR #63); Phase 3
+> criterion benchmarks + a two-tier CI gate landed (`10357cd`,
+> `.github/workflows/bench-baseline.yml`); the secret sanitizer, hardened WASM
+> capability sandbox, and threat-model work in Phases 4–5 landed (threat
+> gaps #1–#9 are tracked in
+> [`docs/security-threat-model.md`](../security-threat-model.md) §6). The
+> outstanding real items are in
+> [`docs/DEFERRED.md`](../DEFERRED.md) (module decomposition, duplicate error
+> names, cancellation audit).
+
 **Verdict on Feasibility: Highly Feasible — 8–12 weeks of disciplined work**
 
 The codebase is already above average for a Rust project of this size (25 crates, 78k lines). Several pieces — SimplePolicyEngine, EventBus, Plugin SDK, VirtualFs, Error Taxonomy — are already world-class. The gap is concentrated in specific areas: cognitive complexity hotspots, test coverage in peripheral crates, and the desktop/CLI UI layers.

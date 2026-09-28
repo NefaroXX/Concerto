@@ -1,6 +1,6 @@
-//! ADR-55 Phase 1d: process-scoped plan binding registry and decision helper.
+//! ADR-55 §4: process-scoped plan binding registry and decision helper.
 //!
-//! §2 defines a registry keyed strictly by `(session_id, objective_hash)`
+//! §4 defines a registry keyed strictly by `(session_id, objective_hash)`
 //! (newest-wins per key) that holds the most recent approved plan for an
 //! objective as free text. The single-agent run consults it when an
 //! action-required Execute request matches a stored plan: instead of the
@@ -10,12 +10,12 @@
 //! uses (a confirmed Execute grants filesystem + git; anything else keeps the
 //! run read-only).
 //!
-//! The registry is process-scoped (ADR-55 §2): it is populated after every
+//! The registry is process-scoped (ADR-55 §4): it is populated after every
 //! gate-enabled, *successful* Plan run and consulted before a later Execute
 //! run of the same objective within the process. Plan text is capped at
 //! [`MAX_PLAN_TEXT_BYTES`] and stored on a char boundary.
 //!
-//! ADR-55 §1 (pending): every binding carries an artifact hash — the blake3
+//! ADR-55 §4: every binding carries an artifact hash — the blake3
 //! fingerprint of its plan text captured at creation ([`PlanBinding::new`]).
 //! Before a binding arms the Apply/Replan dialog it is re-verified
 //! ([`verified_binding`]): a text that no longer matches its hash, or a
@@ -61,15 +61,15 @@ use concerto_sessions::whiteboard::{
 /// Upper bound for stored plan text (16 KiB), enforced by [`plan_text_cap`].
 pub const MAX_PLAN_TEXT_BYTES: usize = 16 * 1024;
 
-/// One stored plan, bound to the exact objective it implements (ADR-55 §2).
+/// One stored plan, bound to the exact objective it implements (ADR-55 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanBinding {
     plan_id: String,
     objective_hash: String,
     source_revision: Option<String>,
     plan_text: String,
-    /// blake3 fingerprint of `plan_text` captured at creation (ADR-55 §1
-    /// pending: diff-vs-artifact). `None` only on bindings rehydrated from
+    /// blake3 fingerprint of `plan_text` captured at creation (ADR-55 §4,
+    /// diff-vs-artifact). `None` only on bindings rehydrated from
     /// durable rows written before migration 025 — those are unverifiable.
     artifact_hash: Option<String>,
     created_at: OffsetDateTime,
@@ -151,7 +151,7 @@ impl PlanBinding {
     }
 
     /// Does the stored plan text still match the artifact hash it was bound
-    /// under at creation (ADR-55 §1 pending)? Re-hashes the current text and
+    /// under at creation (ADR-55 §4)? Re-hashes the current text and
     /// compares. A missing hash (legacy durable row) never verifies.
     pub fn artifact_verifies(&self) -> bool {
         match self.artifact_hash() {
@@ -168,12 +168,12 @@ impl PlanBinding {
 
 /// blake3 fingerprint of a plan's text — the `artifact_hash` captured on every
 /// binding so the Apply/Replan dialog can verify the plan text it shows
-/// against the creation-time artifact before arming (ADR-55 §1 pending).
+/// against the creation-time artifact before arming (ADR-55 §4).
 pub fn plan_artifact_hash(plan_text: &str) -> String {
     blake3::hash(plan_text.as_bytes()).to_hex().to_string()
 }
 
-/// Process-scoped plan binding registry (ADR-55 §2).
+/// Process-scoped plan binding registry (ADR-55 §4).
 ///
 /// Keyed by `(session_id, objective_hash)`; inserting a new plan for the same
 /// key replaces the previous one (newest-wins). All operations are
@@ -214,7 +214,7 @@ impl PlanApprovalRegistry {
 
     /// Newest binding stored for `session_id` across every objective.
     ///
-    /// ADR-55 Phase 2b: a planning-only run binds the rendered plan under the
+    /// ADR-55 §4: a planning-only run binds the rendered plan under the
     /// *current* input's hash, so a later natural-language approval ("i approve
     /// the plan") — which hashes differently — surfaces the just-rendered plan
     /// through this lookup rather than a strict-hash miss.
@@ -249,7 +249,7 @@ impl PlanApprovalRegistry {
 }
 
 /// Does the stored plan text still match the artifact hash it was bound under
-/// at creation (ADR-55 §1 pending: diff-vs-artifact)?
+/// at creation (ADR-55 §4: diff-vs-artifact)?
 ///
 /// Re-hashes the current text and compares against the stored hash. `None`
 /// (a legacy durable row without a hash) never verifies — per ADR-55 the
@@ -268,7 +268,7 @@ pub fn verified_binding(binding: PlanBinding) -> Option<PlanBinding> {
     None
 }
 
-/// Process-scoped singleton registry (ADR-55 §2: "in-memory, held in the
+/// Process-scoped singleton registry (ADR-55 §4: "in-memory, held in the
 /// process"). Frontends and the run loop share one registry so a plan created
 /// by one run can be applied by a later run of the same objective.
 static REGISTRY: OnceLock<Arc<PlanApprovalRegistry>> = OnceLock::new();
@@ -290,7 +290,7 @@ pub fn plan_registry() -> &'static Arc<PlanApprovalRegistry> {
 /// `None` when no durable row exists. Fail-soft: a storage error logs and
 /// returns `None`, leaving the run to fall through to the unchanged generic
 /// intent gate. The rehydrated binding is also verified against its artifact
-/// hash (ADR-55 §1 pending): a tampered or legacy unverifiable row logs and
+/// hash (ADR-55 §4): a tampered or legacy unverifiable row logs and
 /// returns `None` and is never re-seeded into the registry.
 pub async fn rehydrate_durable_binding(
     store: &dyn concerto_sessions::SessionStore,
@@ -307,7 +307,7 @@ pub async fn rehydrate_durable_binding(
                 record.artifact_hash,
                 record.created_at,
             );
-            // ADR-55 §1 (pending): only a binding whose plan text still
+            // ADR-55 §4: only a binding whose plan text still
             // matches its creation-time artifact hash may arm the dialog. A
             // tampered or legacy (unverifiable) row falls through to the
             // generic intent gate and is never re-seeded into the registry.
@@ -624,7 +624,7 @@ fn string_field(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
 }
 
 /// Translate the user's plan-binding decision into the run's effective outcome
-/// and audit confirmation (ADR-55 Phase 1d).
+/// and audit confirmation (ADR-55 §4).
 ///
 /// - `Some(Apply)` → the stored plan is authorized; effective `Execute`
 ///   carries the same in-scope filesystem + git grants as a confirmed Execute
@@ -657,7 +657,7 @@ pub fn apply_plan_decision(
     }
 }
 
-/// ADR-55 Phase 2d §3: the run's auto-Apply of a hash-verified plan binding.
+/// ADR-55 §4: the run's auto-Apply of a hash-verified plan binding.
 ///
 /// The coordinator decides — no click: a confident Execute over a stored
 /// binding executes the persisted plan outright, carrying the SAME in-scope
@@ -808,7 +808,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 §1 (pending): the dialog's plan text is verified against the
+    // ADR-55 §4: the dialog's plan text is verified against the
     // creation-time artifact hash before arming.
     // ------------------------------------------------------------------
 
