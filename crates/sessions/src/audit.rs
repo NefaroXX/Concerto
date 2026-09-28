@@ -2,7 +2,10 @@ use concerto_core::error::PolicyError;
 use concerto_core::ids::Ulid;
 use concerto_core::traits::policy::{AuditEntry, AuditLog, InfraAuditEntry, RULE_INFRA_FAILURE};
 use concerto_core::CancellationToken;
-use sqlx::SqlitePool;
+use serde::{Deserialize, Serialize};
+use sqlx::{AssertSqlSafe, SqlitePool};
+
+use crate::{check_cancel, SessionError, SqliteSessionStore};
 
 /// SQLite-backed append-only audit log.
 pub struct SqliteAuditLog {
@@ -133,6 +136,140 @@ impl AuditLog for SqliteAuditLog {
         })?;
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read path — the audit trail as a sequence
+//
+// The writer above records the path/operation facts added by migration 034;
+// this is the matching read so those columns are usable without raw sqlite3.
+// ---------------------------------------------------------------------------
+
+/// One `audit_log` row, projected for reading back (forensics / display).
+///
+/// Rows written before migration 034 carry `NULL` in all five path columns
+/// and arrive here as `None`; tools that name no path look the same. Both
+/// must be rendered honestly — use [`AuditLogRow::has_path_facts`] to mark
+/// them instead of silently blanking them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AuditLogRow {
+    /// Audit row id (ULID).
+    pub id: String,
+    /// Session the decision belongs to (infra rows are `NULL` and are never
+    /// returned by [`SqliteSessionStore::load_audit_log`]).
+    pub session_id: Option<String>,
+    /// Unix seconds. Rows come back ordered by `(created_at, rowid)`.
+    pub created_at: i64,
+    /// Tool that was evaluated (e.g. `filesystem`, `shell`, `mcp:<id>`).
+    pub tool_name: String,
+    /// Recorded verdict: `Allow` / `Deny` / `RequireApproval …` for policy
+    /// decisions, the [`InfraVerdict`] labels for infrastructure failures.
+    ///
+    /// [`InfraVerdict`]: concerto_core::traits::policy::InfraVerdict
+    pub verdict: String,
+    /// Policy rule that produced the verdict (`infra_failure` for infra rows).
+    pub rule_matched: Option<String>,
+    /// Failure category for infrastructure rows (migration 032).
+    pub error_kind: Option<String>,
+    /// Tool execution duration in milliseconds, when recorded.
+    pub duration_ms: Option<i64>,
+    /// Path-shaped operation attempted (`read`, `write`, `move`, …).
+    pub path_operation: Option<String>,
+    /// Path/URL exactly as supplied by the caller (secrets already stripped).
+    pub attempted_path: Option<String>,
+    /// Confined absolute path after workspace containment (`NULL` when the
+    /// resolution was rejected).
+    pub resolved_path: Option<String>,
+    /// Destination as supplied (move/copy only).
+    pub attempted_destination: Option<String>,
+    /// Confined absolute destination (move/copy only).
+    pub resolved_destination: Option<String>,
+}
+
+impl AuditLogRow {
+    /// Whether any migration-034 path fact is present on this row.
+    ///
+    /// `false` for rows written before migration 034 *and* for post-034 rows
+    /// whose tool named no path — the two are indistinguishable in the data,
+    /// so display both as "no path facts recorded".
+    pub fn has_path_facts(&self) -> bool {
+        self.path_operation.is_some()
+            || self.attempted_path.is_some()
+            || self.resolved_path.is_some()
+            || self.attempted_destination.is_some()
+            || self.resolved_destination.is_some()
+    }
+}
+
+/// Filters for [`SqliteSessionStore::load_audit_log`]. All fields are
+/// optional; [`Default`] (nothing filtered) returns the whole trail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditLogFilter {
+    /// Exact `tool_name` match (e.g. `filesystem`).
+    pub tool: Option<String>,
+    /// Exact `path_operation` match (e.g. `read`, `write`, `move`).
+    pub operation: Option<String>,
+    /// Only entries whose verdict is not `Allow` — `Deny`,
+    /// `RequireApproval …`, infrastructure failures.
+    pub failed: bool,
+    /// Maximum number of rows *after* ordering; `None` returns everything.
+    pub limit: Option<u64>,
+}
+
+impl SqliteSessionStore {
+    /// Read one session's audit trail in deterministic write order.
+    ///
+    /// Ordered by `(created_at, rowid)`: `rowid` breaks ties inside the same
+    /// second, so the result reads as the true sequence of decisions. Only
+    /// session-scoped rows match — infrastructure rows carry a `NULL`
+    /// `session_id` and are never returned.
+    ///
+    /// Errors: [`SessionError`] from the query itself, or
+    /// `SessionError::Database("operation cancelled")` when `cancel` fires
+    /// before the statement runs.
+    pub async fn load_audit_log(
+        &self,
+        session_id: Ulid,
+        filter: &AuditLogFilter,
+        cancel: CancellationToken,
+    ) -> Result<Vec<AuditLogRow>, SessionError> {
+        check_cancel(&cancel)?;
+
+        let mut sql = String::from(
+            "SELECT id, session_id, created_at, tool_name, verdict, rule_matched, \
+             error_kind, duration_ms, path_operation, attempted_path, resolved_path, \
+             attempted_destination, resolved_destination \
+             FROM audit_log WHERE session_id = ?",
+        );
+        if filter.tool.is_some() {
+            sql.push_str(" AND tool_name = ?");
+        }
+        if filter.operation.is_some() {
+            sql.push_str(" AND path_operation = ?");
+        }
+        if filter.failed {
+            sql.push_str(" AND verdict <> 'Allow'");
+        }
+        sql.push_str(" ORDER BY created_at, rowid");
+        if filter.limit.is_some() {
+            sql.push_str(" LIMIT ?");
+        }
+
+        // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from
+        // static fragments; every filter value is bound via `?`.
+        let mut query =
+            sqlx::query_as::<_, AuditLogRow>(AssertSqlSafe(sql)).bind(session_id.to_string());
+        if let Some(tool) = &filter.tool {
+            query = query.bind(tool);
+        }
+        if let Some(operation) = &filter.operation {
+            query = query.bind(operation);
+        }
+        if let Some(limit) = filter.limit {
+            query = query.bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 }
 
@@ -1063,5 +1200,348 @@ mod tests {
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM audit_log").fetch_one(&pool).await.unwrap();
         assert_eq!(count.0, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Read path (SqliteSessionStore::load_audit_log)
+    // -----------------------------------------------------------------------
+
+    /// In-memory pool with the *full* migration set plus one session row, so
+    /// the read path is exercised against the real schema (columns 002/016/
+    /// 024/032/034 included).
+    async fn setup_audit_read_pool() -> (sqlx::SqlitePool, Ulid) {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let sid = Ulid::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, project_dir, provider, model) \
+             VALUES (?, 0, '/tmp', 'test', 'test')",
+        )
+        .bind(sid.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, sid)
+    }
+
+    /// A store over `pool` for the read path (test-only construction: the
+    /// fields are crate-private and this module is inside the crate).
+    fn read_store(pool: &sqlx::SqlitePool) -> SqliteSessionStore {
+        SqliteSessionStore { pool: pool.clone(), _data_dir_lock: None, at_rest_key: None }
+    }
+
+    /// Run `load_audit_log` once against `pool` and unwrap the rows.
+    async fn load_trail(
+        pool: &sqlx::SqlitePool,
+        session_id: Ulid,
+        filter: AuditLogFilter,
+    ) -> Vec<AuditLogRow> {
+        read_store(pool)
+            .load_audit_log(session_id, &filter, CancellationToken::new())
+            .await
+            .unwrap()
+    }
+
+    /// `AuditEntry` stamped with a fixed unix timestamp for ordering tests.
+    fn entry_at(
+        session_id: Ulid,
+        tool_name: &str,
+        verdict: &str,
+        timestamp: i64,
+        path_facts: Option<PathPolicyFacts>,
+    ) -> AuditEntry {
+        AuditEntry {
+            timestamp: time::OffsetDateTime::from_unix_timestamp(timestamp)
+                .expect("test timestamp within range"),
+            ..entry_with_path_facts(session_id, tool_name, verdict, path_facts)
+        }
+    }
+
+    /// The read path returns every path column, ordered by
+    /// `(created_at, rowid)` — the oldest decision first, ties broken by
+    /// insertion order, so the result reads as the true sequence.
+    #[tokio::test]
+    async fn load_audit_log_returns_path_columns_in_write_order() {
+        let (pool, session_id) = setup_audit_read_pool().await;
+        let audit = SqliteAuditLog::new(pool.clone());
+
+        // Two rows share `created_at` (rowid decides); one is older.
+        let entries = [
+            (
+                1_000i64,
+                PathPolicyFacts {
+                    operation: "read".into(),
+                    attempted_path: Some("a.txt".into()),
+                    resolved_path: Some("/proj/a.txt".into()),
+                    ..PathPolicyFacts::default()
+                },
+            ),
+            (
+                1_000,
+                PathPolicyFacts {
+                    operation: "write".into(),
+                    attempted_path: Some("b.txt".into()),
+                    resolved_path: Some("/proj/b.txt".into()),
+                    ..PathPolicyFacts::default()
+                },
+            ),
+            (
+                500,
+                PathPolicyFacts {
+                    operation: "move".into(),
+                    attempted_path: Some("c.txt".into()),
+                    resolved_path: Some("/proj/c.txt".into()),
+                    attempted_destination: Some("d.txt".into()),
+                    resolved_destination: Some("/proj/d.txt".into()),
+                },
+            ),
+        ];
+        for (timestamp, facts) in entries {
+            audit
+                .record(
+                    entry_at(session_id, "filesystem", "Allow", timestamp, Some(facts)),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let store = read_store(&pool);
+        let rows = store
+            .load_audit_log(session_id, &AuditLogFilter::default(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "all three entries are returned");
+        // Oldest first; the two same-second rows keep insertion order.
+        assert_eq!(rows[0].created_at, 500);
+        assert_eq!(rows[1].created_at, 1_000);
+        assert_eq!(rows[2].created_at, 1_000);
+
+        let sequence: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.path_operation.as_deref().unwrap_or_default(),
+                    row.attempted_path.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![("move", "c.txt"), ("read", "a.txt"), ("write", "b.txt")],
+            "the trail must read as the true sequence of operations"
+        );
+
+        // Every requested column arrives.
+        let last = &rows[0];
+        assert_eq!(last.tool_name, "filesystem");
+        assert_eq!(last.verdict, "Allow");
+        assert_eq!(last.rule_matched.as_deref(), Some("auto_approve"));
+        assert_eq!(last.attempted_destination.as_deref(), Some("d.txt"));
+        assert_eq!(last.resolved_destination.as_deref(), Some("/proj/d.txt"));
+        assert_eq!(last.resolved_path.as_deref(), Some("/proj/c.txt"));
+        assert!(last.has_path_facts());
+        let expected_session = session_id.to_string();
+        assert!(rows
+            .iter()
+            .all(|row| row.session_id.as_deref() == Some(expected_session.as_str())));
+    }
+
+    /// A row written with the pre-034 shape (NULL path columns) reads back
+    /// as `None` in every path field and is flagged by `has_path_facts()`
+    /// so callers can mark it instead of blanking it; a post-034 row with
+    /// facts is not flagged.
+    #[tokio::test]
+    async fn load_audit_log_marks_rows_without_path_facts() {
+        let (pool, session_id) = setup_audit_read_pool().await;
+
+        // Legacy row: the exact column set a pre-034 writer left behind.
+        sqlx::query(
+            "INSERT INTO audit_log (id, session_id, correlation_id, tool_name, verdict, \
+             input_hash, rule_matched, created_at, duration_ms) \
+             VALUES (?, ?, ?, 'filesystem', 'Allow', 'legacyhash', 'auto_approve', 42, 7)",
+        )
+        .bind(Ulid::new().to_string())
+        .bind(session_id.to_string())
+        .bind(Ulid::new().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Post-034 row that carries path facts.
+        let audit = SqliteAuditLog::new(pool.clone());
+        audit
+            .record(
+                entry_at(
+                    session_id,
+                    "filesystem",
+                    "Deny",
+                    43,
+                    Some(PathPolicyFacts {
+                        operation: "write".into(),
+                        attempted_path: Some("x.txt".into()),
+                        ..PathPolicyFacts::default()
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let store = read_store(&pool);
+        let rows = store
+            .load_audit_log(session_id, &AuditLogFilter::default(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let legacy = &rows[0];
+        assert_eq!(legacy.created_at, 42);
+        assert!(!legacy.has_path_facts(), "legacy rows must be flagged");
+        assert_eq!(legacy.path_operation, None);
+        assert_eq!(legacy.attempted_path, None);
+        assert_eq!(legacy.resolved_path, None);
+        assert_eq!(legacy.attempted_destination, None);
+        assert_eq!(legacy.resolved_destination, None);
+        // The non-path columns of the legacy row survive intact.
+        assert_eq!(legacy.verdict, "Allow");
+        assert_eq!(legacy.rule_matched.as_deref(), Some("auto_approve"));
+        assert_eq!(legacy.duration_ms, Some(7));
+
+        let fresh = &rows[1];
+        assert!(fresh.has_path_facts());
+        assert_eq!(fresh.path_operation.as_deref(), Some("write"));
+        assert_eq!(fresh.attempted_path.as_deref(), Some("x.txt"));
+    }
+
+    /// `--tool`, `--operation`, `--failed` and `--limit` each narrow the
+    /// trail, and the query never leaks another session's rows.
+    #[tokio::test]
+    async fn load_audit_log_filters_by_tool_operation_verdict_and_limit() {
+        let (pool, session_id) = setup_audit_read_pool().await;
+        let audit = SqliteAuditLog::new(pool.clone());
+
+        let cases = [
+            ("filesystem", "Allow", 100i64, "read"),
+            ("filesystem", "Deny", 101, "write"),
+            ("http", "Deny", 102, "request"),
+        ];
+        for (tool, verdict, timestamp, operation) in cases {
+            audit
+                .record(
+                    entry_at(
+                        session_id,
+                        tool,
+                        verdict,
+                        timestamp,
+                        Some(PathPolicyFacts {
+                            operation: operation.into(),
+                            attempted_path: Some(format!("{operation}.txt")),
+                            ..PathPolicyFacts::default()
+                        }),
+                    ),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // A fourth row in a *different* session must never leak into this
+        // session's trail.
+        let other_session = Ulid::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, project_dir, provider, model) \
+             VALUES (?, 0, '/tmp', 'test', 'test')",
+        )
+        .bind(other_session.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        audit
+            .record(
+                entry_at(
+                    other_session,
+                    "filesystem",
+                    "Allow",
+                    99,
+                    Some(PathPolicyFacts {
+                        operation: "read".into(),
+                        attempted_path: Some("other.txt".into()),
+                        ..PathPolicyFacts::default()
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // Unfiltered: this session only, oldest first.
+        let all = load_trail(&pool, session_id, AuditLogFilter::default()).await;
+        assert_eq!(all.len(), 3, "other sessions must not leak in");
+        assert_eq!(all.iter().map(|r| r.created_at).collect::<Vec<_>>(), vec![100, 101, 102]);
+
+        // --tool
+        let by_tool = load_trail(
+            &pool,
+            session_id,
+            AuditLogFilter { tool: Some("filesystem".into()), ..AuditLogFilter::default() },
+        )
+        .await;
+        assert_eq!(by_tool.len(), 2);
+        assert!(by_tool.iter().all(|row| row.tool_name == "filesystem"));
+
+        // --operation
+        let by_operation = load_trail(
+            &pool,
+            session_id,
+            AuditLogFilter { operation: Some("write".into()), ..AuditLogFilter::default() },
+        )
+        .await;
+        assert_eq!(by_operation.len(), 1);
+        assert_eq!(by_operation[0].attempted_path.as_deref(), Some("write.txt"));
+
+        // --failed: everything that did not receive an Allow verdict.
+        let failed = load_trail(
+            &pool,
+            session_id,
+            AuditLogFilter { failed: true, ..AuditLogFilter::default() },
+        )
+        .await;
+        assert_eq!(failed.len(), 2);
+        assert!(failed.iter().all(|row| row.verdict == "Deny"));
+        assert_eq!(failed[0].created_at, 101);
+
+        // --limit
+        let limited = load_trail(
+            &pool,
+            session_id,
+            AuditLogFilter { limit: Some(1), ..AuditLogFilter::default() },
+        )
+        .await;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].created_at, 100, "limit keeps the oldest rows");
+
+        // Filters compose.
+        let combined = load_trail(
+            &pool,
+            session_id,
+            AuditLogFilter {
+                tool: Some("filesystem".into()),
+                failed: true,
+                ..AuditLogFilter::default()
+            },
+        )
+        .await;
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].path_operation.as_deref(), Some("write"));
+
+        // A filter that matches nothing returns an empty trail, not an error.
+        let nothing = load_trail(
+            &pool,
+            session_id,
+            AuditLogFilter { tool: Some("no-such-tool".into()), ..AuditLogFilter::default() },
+        )
+        .await;
+        assert!(nothing.is_empty());
     }
 }

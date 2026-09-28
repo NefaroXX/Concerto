@@ -16,6 +16,7 @@ pub mod spend;
 pub mod whiteboard;
 
 pub use at_rest::{is_at_rest_encrypted, marker_path, AtRestKey};
+pub use audit::{AuditLogFilter, AuditLogRow};
 pub use audit_retention::AuditRetentionReport;
 pub use plan_bindings::PlanBindingRecord;
 pub use resource_facts::{
