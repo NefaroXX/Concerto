@@ -275,6 +275,11 @@ How to work:
 5. Self-execution is permitted ONLY when you have exhausted the roster: (a) no agents are registered (an empty roster), (b) the roster is disabled or unavailable, or (c) you attempted delegation and it genuinely failed. While ANY specialist remains that could do the work, you must delegate. Doing the work yourself is never a shortcut around a capable specialist.
 6. When the objective is met (or nothing more can be done), reply with a plain summary and NO tool call. List what was done, by whom, and any remaining risk.
 
+Transforming an EXISTING artifact (no synthesis):
+- When an objective requires transforming, renaming, moving, editing, or otherwise operating on a NAMED EXISTING artifact, and that artifact is absent, you must NOT create, stub, placeholder, or synthesize it. Surface the discrepancy to the user through the request_user_input path, naming the exact path you looked for.
+- Creating a file to satisfy a rename is not a rename. Never offer to synthesize the missing source as a fallback, and never write a subtask that instructs a specialist to fabricate one.
+- Absent an explicit user instruction to create something, absence is information to report, not an obstacle to route around.
+
 Evidence discipline:
 - When your decision rests on recorded evidence, cite the real event ids from the context in supporting_evidence_ids. Fabricated ids are rejected and your decision loses its citations.
 - The stage tag of a specialist is informational context. You are never required to follow a stage order — call whoever the work needs, whenever the work needs it.
@@ -31086,6 +31091,68 @@ mod tests {
         assert!(
             prompt.contains("A stage tag is context, not a dispatch rule"),
             "the stage tag stays advisory context (:266 remains true)"
+        );
+    }
+
+    /// Coordinator error invariant (prompt half): the dispatch prompt carries
+    /// the no-synthesis doctrine for a MISSING transform source, and never
+    /// carries the blanket "create it first" fallback license that let a
+    /// fabricated source satisfy a rename objective.
+    #[tokio::test]
+    async fn dispatch_prompt_forbids_synthesizing_a_missing_source() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+        assert!(
+            prompt.contains("Transforming an EXISTING artifact (no synthesis)"),
+            "the doctrine block is present"
+        );
+        assert!(
+            prompt.contains(
+                "you must NOT create, stub, placeholder, or synthesize it. Surface the \
+                 discrepancy to the user through the request_user_input path, naming the exact \
+                 path you looked for"
+            ),
+            "absence is surfaced through the user-input path, naming the path"
+        );
+        assert!(
+            prompt.contains("Creating a file to satisfy a rename is not a rename"),
+            "creation is never offered as a substitute for the transformation"
+        );
+        assert!(
+            prompt.contains("absence is information to report, not an obstacle to route around"),
+            "absence is reported, not routed around"
+        );
+        assert!(
+            !prompt.contains("create it first"),
+            "the blanket create-the-missing-source fallback license is gone"
+        );
+        // The pre-existing doctrines must survive the addition intact.
+        assert!(
+            prompt.contains("Delegation is the DEFAULT action")
+                && prompt.contains(
+                    "Self-execution is permitted ONLY when you have exhausted the roster"
+                ),
+            "ADR-74 delegation doctrine is untouched"
         );
     }
 
