@@ -8,11 +8,11 @@
 > superseded (2026-09-24) by [ADR-71](ADR-71-coordinator-supremacy.md):**
 > outcome→topology branching (what was Phase 1e §2 here) and the Phase 2b §1
 > planner-roster contract — the coordinator owns run shape; intent signals are
-> advisory. Every other decision in this ADR remains in force. The full
+> advisory. Every other decision in this ADR remains in force. The
 > phase-by-phase record of how this decision landed (addenda 1d–2e, live-fix
-> rounds, acceptance lists) is preserved verbatim in
-> [`archive/ADR-55-phase-history.md`](archive/ADR-55-phase-history.md) and is
-> not quoted here.
+> rounds, acceptance lists) was removed on 2026-09-28 with the rest of the
+> research/archive tiers; the load-bearing outcome of each phase is stated in
+> this ADR's decision sections and in [ADR-56](./ADR-56-model-first-intent-classification.md).
 
 **Status:** Accepted
 **Date:** 2026-08-09

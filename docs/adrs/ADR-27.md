@@ -1,7 +1,8 @@
-# ADR-27: Markdown-Centric Workspace — superseded
+# ADR-27: Integrated Desktop Terminal Lifecycle — superseded
 
 > **Superseded.** The decision this number carried is no longer in force; it is
-> consolidated in [ADR-30](./ADR-30-*.md). This entry exists only so
-> historical references to ADR-27 resolve, and records no current design.
+> consolidated in [ADR-30](./ADR-30.md). This entry exists only so
+> historical references to ADR-27 resolve, and records no current design. No
+> full text of the superseded decision is retained.
 >
 > See [docs/adrs/README.md](./README.md) for the current index.

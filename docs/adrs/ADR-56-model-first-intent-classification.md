@@ -34,13 +34,12 @@ citable terms:
   is gone with the keys.
 - **No auto-grant on the hot path.** The 2026-09-06 amendment that let the
   classifier auto-grant at high confidence is **moot and removed** (its text
-  is preserved verbatim in
-  [`archive/ADR-55-phase-history.md`](archive/ADR-55-phase-history.md)). Grants
-  come only from confirmed user decisions: an Apply/Replan plan decision or a
-  user-picked Execute, both through `grant_execute` — or from the
-  **exact-objective auto-Apply** of a user-approved, artifact-hash-verified
-  plan binding (ADR-55 §4), which is keyed to the binding, never to model or
-  classifier output.
+  was removed on 2026-09-28 with the archive tier; the rule it touched is
+  restated in this bullet). Grants come only from confirmed user decisions: an
+  Apply/Replan plan decision or a user-picked Execute, both through
+  `grant_execute` — or from the **exact-objective auto-Apply** of a
+  user-approved, artifact-hash-verified plan binding (ADR-55 §4), which is keyed
+  to the binding, never to model or classifier output.
 - **What survives as intent classification:** the deterministic, pure
   `classify_tier` action classifier in `crates/core/src/authorization.rs`
   (Observe / MutateLocal / Consequential), feeding `IntentVerdict` into the

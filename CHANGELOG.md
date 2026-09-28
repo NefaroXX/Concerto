@@ -52,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Auditable tool trail.** File operations record operation, attempted path,
   resolved path and destinations (migration 034) and read-only operations record
   what they returned — `exists=<bool>`, `entries=<count>`, `bytes=<size>`, never
-  content (migration 035). Read it with `concerto audit <session-id>`, with
-  `--tool`/`--operation`/`--failed`/`--limit`/`--json` filters.
+   content (migration 035). Read it with `concerto --cli audit <session-id>`, with
+   `--tool`/`--operation`/`--failed`/`--limit`/`--json` filters.
 - **Bounded per-session acknowledgement queue** with explicit overflow refusal
   and a wired audit seam (`8e3c350`).
 - **Verification evidence at the C-06 acceptance gate.** A run completes on a
@@ -98,8 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DEFERRED.md` row 46 (provider circuit breaker + in-flight dedup) and row 47
   (catalog flattening + per-role/per-tier fallback controls). `DEFERRED.md` rows 8
   and 24 were rewritten to quote their substance instead of citing a deleted file.
-  Superseded ADRs in `docs/adrs/archive/` are untouched: their full text is a
-  decision record, so rule 3 keeps that one archive.
+  Superseded ADRs in `docs/adrs/` keep a short pointer stub in place naming their
+  successor; no full text is retained, so ADR-55's phase history was consolidated
+  into the live ADR-55 file and `docs/README.md` rule 3 was updated to match.
 - **Unified agent loop (ADR-55):** every non-empty run enters the
   loop and the model shapes it; outcomes are non-binding flavor hints; the
   text-only branch is deleted; the classifier left the hot path. Under full

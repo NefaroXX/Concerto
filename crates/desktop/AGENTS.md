@@ -51,7 +51,9 @@ desktop/
 - These three commands run in sequence before any push or PR creation. The repo-root AGENTS.md documents the full-workspace CI workflow for reference.
 
 ## UI REWORK STATUS (hybrid chat-centric layout)
-Tracked in `docs/hybrid-ui-plan.md`. Minimal + Medium scope from the plan is feature-complete on `feat/ui-depth-improvements`, pending review/merge:
+Tracked in `docs/hybrid-ui-plan.md`. Minimal scope merged on `dev` (PR #49,
+2026-07-24) and Medium scope merged on `dev` (PR #97, 2026-08-03). Full scope
+is still outstanding and is tracked as `docs/DEFERRED.md` row 37:
 
 | Status | Item |
 |--------|------|
@@ -67,7 +69,7 @@ Tracked in `docs/hybrid-ui-plan.md`. Minimal + Medium scope from the plan is fea
 | ✅ | Chat entries timestamped (created_at/finished_at), thinking duration labels (⏱ Ns) |
 | ✅ | Blinking streaming cursor (▌, 500ms while assistant is streaming) |
 | ⬜ | State lifecycle: lazy init for infrequently used views |
-| ⬜ | Full scope: tabbed Settings, Studio split pane, focus trap |
+| ⬜ | Full scope: tabbed Settings, Studio split pane, focus trap (DEFERRED row 37) |
 
 ## ANTI-PATTERNS
 - Do not use `iced::window::Settings` directly in views; configure in `app.rs`

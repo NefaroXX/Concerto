@@ -27,7 +27,7 @@ All members live under `crates/` and depend upward on `concerto-core`.
 - `api-types` / `api-server` — shared types + Axum API
 - `eval` / `eval-runner` — benchmark harness + runner binary
 - `lsp`, `observability`, `concerto` (entry binary)
-- `test-plugin-wasm`, `test-provider-plugin-wasm`, `test-adapter-plugin-wasm` — WASM plugin examples/end-to-end tests
+- `test-plugin-wasm`, `test-provider-plugin-wasm`, `test-adapter-plugin-wasm`, `test-dialect-plugin-wasm` — WASM plugin examples/end-to-end tests
 
 Deeper maps: `docs/architecture.md`, `docs/crate-graph.md`, `ROADMAP.md`.
 

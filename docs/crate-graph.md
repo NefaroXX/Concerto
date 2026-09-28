@@ -162,8 +162,10 @@ Each entry lists only internal workspace dependencies (external crates omitted f
 - **concerto** (entry binary) → `desktop` (primary); `cli` (optional feature gate)
 
 ### Examples
-- **test-plugin-wasm** → `plugin-sdk`
-- **test-dialect-plugin-wasm** → `plugin-sdk`
+- **test-plugin-wasm** → `plugin-sdk` (tool plugin)
+- **test-provider-plugin-wasm** → `plugin-sdk` (provider plugin)
+- **test-adapter-plugin-wasm** → `plugin-sdk` (memory-adapter plugin)
+- **test-dialect-plugin-wasm** → `plugin-sdk` (provider dialect plugin, ADR-53)
 
 ## Notes
 
@@ -184,7 +186,8 @@ Each entry lists only internal workspace dependencies (external crates omitted f
   `api-types` for the shared manifest types (no `config` dependency), and `mcp`
   depends on `api-types`, `config`, and `core`; both stay below the
   orchestrator, which consumes them at runtime.
-- `test-plugin-wasm`, `test-adapter-plugin-wasm`, and
-  `test-provider-plugin-wasm` require the `wasm32-wasip2` Rust target to build.
+- The four `test-*-plugin-wasm` crates — `test-plugin-wasm`,
+  `test-provider-plugin-wasm`, `test-adapter-plugin-wasm`, and
+  `test-dialect-plugin-wasm` — require the `wasm32-wasip2` Rust target to build.
 - `lsp` tools are registered unconditionally in the agent tool registry
   (`runtime_runner.rs:1715-1722`); the LSP server starts lazily on first use.

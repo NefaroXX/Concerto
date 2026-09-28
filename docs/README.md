@@ -9,7 +9,7 @@ Start here. This file is the map; nothing below is a substitute for it.
 | What exists right now, and what is still unverified in real use | [STATUS.md](STATUS.md) |
 | What is outstanding, and what condition would reopen it | [DEFERRED.md](DEFERRED.md) — the single outstanding-work register |
 | How the system fits together | [architecture.md](architecture.md), [crate-graph.md](crate-graph.md) |
-| Why a decision was made | [adrs/README.md](adrs/README.md) — index; superseded ADRs live in [adrs/archive/](adrs/archive/) |
+| Why a decision was made | [adrs/README.md](adrs/README.md) — index; a superseded ADR keeps its number as a pointer to its successor |
 | How a provider/model is configured | [models.md](models.md), [missing-providers.md](missing-providers.md) |
 | How tools are allowed or denied | [policy-rules.md](policy-rules.md), [security-threat-model.md](security-threat-model.md) §6 |
 | How multi-agent roles and relationships work | [agent-collaboration.md](agent-collaboration.md) |
@@ -68,10 +68,11 @@ These are **not** registers — for what is outstanding, use `DEFERRED.md`.
    `TODO.md`. A row must be readable on its own: quote the substance of any
    source it cites rather than making the reader chase a file to learn what was
    actually asked for.
-3. Do not delete a decision or a recorded result. Supersede, archive, or point
-   at the replacement — and keep the old path resolving if anything links it.
-   `adrs/archive/` is the one permitted exception to "no archive": superseded
-   ADRs keep their full text there, and the stub in place carries the pointer.
+3. Do not delete a decision or a recorded result. Supersede it or point at the
+   replacement — and keep the old number resolving if anything cites it. A
+   superseded ADR keeps a short stub in place that names its successor; **no
+   full text is retained** and there is no archive tier, so move any rationale a
+   live doc still needs into that live doc (see rule 1).
 4. Never leave a dangling path. When a file moves or is removed, update its
    references, including doc comments in source.
 5. Every claim carries a checkable reference: a file, a line, a test name, or a

@@ -17,7 +17,8 @@ to this file — those belong in the commit that made the change, and a claim th
 cannot be traced to a file, line, or commit is not written down at all.
 
 **Last reconciled:** 2026-09-28, against checkout `fix/coordinator-error-invariant`
-(HEAD `caadb2d`), cross-checked against `dev` (`edba420`).
+(HEAD `7563818`, the commit that removed `docs/research/`, `docs/archive/`,
+`docs/design/`, and `docs/adrs/archive/`).
 
 ## Outstanding
 

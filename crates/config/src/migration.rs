@@ -102,7 +102,7 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         project_roots: config.project_roots,
         // v5 adds [context] (ADR-48); additive Option defaults to None.
         context: None,
-        // [tools] is additive and default-on; old configs keep it None.
+        // [tool_settings] is additive and default-on; old configs keep it None.
         tool_settings: None,
         // [audit] is additive; old configs keep it None (plaintext, no retention).
         audit: None,
@@ -149,7 +149,7 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         project_roots: config.project_roots,
         // v5 adds [context] (ADR-48); preserve any deserialized value.
         context: config.context,
-        // [tools] is additive and default-on; old configs keep it None.
+        // [tool_settings] is additive and default-on; old configs keep it None.
         tool_settings: None,
         // [audit] is additive; old configs keep it None (plaintext, no retention).
         audit: None,

@@ -5,11 +5,12 @@
 **Deciders:** Concerto architecture
 
 > **Current implementation:** Persistent session/memory state and active vector
-> retrieval are SQLite-backed (FTS5 + vector hybrid). LanceDB is an optional,
-> feature-gated alternative (`lancedb` feature, default off) — see ADR-10 — so
-> the concurrent-LanceDB-writer concerns below apply only when that feature is
-> enabled. The `fd-lock`/multi-instance decision remains relevant to local
-> persistent files.
+> retrieval are SQLite-backed (FTS5 + vector hybrid). LanceDB was **removed**
+> in pre-release cleanup — there is no `lancedb` feature or dependency in the
+> workspace, and `SqliteVectorStore` is the only vector store — so the
+> concurrent-LanceDB-writer concerns below are historical and do not apply to
+> any current configuration. The `fd-lock`/multi-instance decision remains
+> relevant to local persistent files.
 
 ## Context
 
