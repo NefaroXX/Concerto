@@ -8,26 +8,42 @@ updates:
   #
   # Workspace crates (24 members, single root manifest). Weekly cadence keeps
   # dependency drift small; the 5-PR cap prevents a flood after quiet periods.
+  #
+  # Semver-major updates are ignored on purpose. A 1,056-package lock file with
+  # `cargo deny` as the gate is worth keeping patched, but majors are planned
+  # work (utoipa 5->6, opentelemetry 0.31->0.32 both touch the api-server), not
+  # a weekly surprise. A major is taken deliberately, as part of the change that
+  # needs it; ignoring it does not lose it, it just means Dependabot will not
+  # re-propose that target version on its own.
   - package-ecosystem: "cargo"
     directory: "/"
     target-branch: "dev"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      - update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "deps"
       include: "scope"
     labels:
       - "dependencies"
 
-  # CI/release actions (checkout, rust-toolchain, rust-cache, ...). Grouped
-  # so minor/patch bumps arrive as one reviewable PR.
+  # CI/release actions (checkout, cargo-deny, rust-cache, ...). Grouped so
+  # minor/patch bumps arrive as one reviewable PR.
+  #
+  # `dtolnay/rust-toolchain` is excluded deliberately. It drives the
+  # `channel = "1.96.0"` pin in rust-toolchain.toml, and CI formats and lints
+  # against that pin -- so an automated bump silently redefines what "green"
+  # means. Moving the toolchain is an engineering decision, not a weekly chore.
   - package-ecosystem: "github-actions"
     directory: "/"
     target-branch: "dev"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    exclude:
+      - dependency-name: "dtolnay/rust-toolchain"
     commit-message:
       prefix: "deps"
       include: "scope"
