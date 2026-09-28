@@ -1482,7 +1482,10 @@ fn invocation_args(args: &[String]) -> anyhow::Result<(Vec<String>, Option<PathB
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--cli" | "-c" | "--multi-agent" | "-m" | "--fast" | "-f" | "--reconfigure" | "-r" => {}
+            // Startup flags the caller already parsed (see `parse_cli_args`)
+            // are stripped here so they never reach subcommand dispatch.
+            "--cli" | "-c" | "--multi-agent" | "-m" | "--fast" | "-f" | "--reconfigure" | "-r"
+            | "--reduced-motion" => {}
             "--project" | "-p" => {
                 index += 1;
                 let value = args
@@ -1705,6 +1708,16 @@ mod tests {
         let args = ["--reconfigure".to_string(), "sessions".to_string(), "list".to_string()];
         let (remaining, _project) = invocation_args(&args).unwrap();
         assert_eq!(remaining, vec!["sessions", "list"]);
+    }
+
+    #[test]
+    fn invocation_args_reduced_motion_flag_is_stripped() {
+        // Regression: `--reduced-motion` was parsed by `parse_cli_args` but
+        // never stripped here, so it reached subcommand dispatch and failed
+        // as an unknown subcommand.
+        let args = ["--reduced-motion".to_string(), "providers".to_string(), "list".to_string()];
+        let (remaining, _project) = invocation_args(&args).unwrap();
+        assert_eq!(remaining, vec!["providers", "list"]);
     }
 
     #[test]

@@ -45,7 +45,13 @@ fn main() {
             let multi_agent = args.iter().any(|a| a == "--multi-agent" || a == "-m");
             let fast = args.iter().any(|a| a == "--fast" || a == "-f");
             let reconfigure = args.iter().any(|a| a == "--reconfigure" || a == "-r");
-            if let Err(e) = concerto_cli::run_cli(multi_agent, fast, reconfigure) {
+            // `--reduced-motion` is parsed here exactly like the flags above:
+            // `Some(true)` only when the flag is passed (there is no
+            // `--no-reduced-motion`), `None` defers to CONCERTO_REDUCED_MOTION
+            // env → `[display] reduced_motion` config → default (false) — the
+            // same contract as `concerto_cli::parse_cli_args`.
+            let reduced_motion = args.iter().any(|a| a == "--reduced-motion").then_some(true);
+            if let Err(e) = concerto_cli::run_cli(multi_agent, fast, reconfigure, reduced_motion) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }

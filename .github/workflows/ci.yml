@@ -130,6 +130,29 @@ jobs:
       - name: Build entire workspace
         run: cargo build --workspace
 
+      # The `cli` runtime is opt-in (`default = ["desktop"]`), so the workspace
+      # build above never compiles the `#[cfg(feature = "cli")]` path in
+      # crates/concerto/src/main.rs — a `concerto_cli::run_cli` signature change
+      # broke exactly that build while every CI job stayed green. Build the two
+      # distinct feature combinations CI otherwise misses: `cli` alongside the
+      # default `desktop`, and `cli` alone (which also exercises the
+      # `cfg(not(feature = "desktop"))` branch). Both reuse the artifacts the
+      # workspace build just produced.
+      - name: Build cli runtime feature combinations
+        run: |
+          cargo build -p concerto --features cli
+          cargo build -p concerto --no-default-features --features cli
+
+      # Compile success alone does not prove the CLI starts: the flag scan in
+      # main.rs and the subcommand dispatch in concerto-cli are runtime paths no
+      # build exercises. Run the just-built (cli-only) binary twice: `--help`
+      # must print and exit 0, and a real subcommand behind a startup flag must
+      # dispatch instead of failing as an unknown subcommand.
+      - name: Smoke-run the cli runtime binary
+        run: |
+          ./target/debug/concerto --help
+          ./target/debug/concerto --cli --reduced-motion projects list
+
   # -------------------------------------------------------------- benchmarks
   bench:
     name: Benchmarks (compile + smoke run)
