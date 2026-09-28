@@ -96,6 +96,13 @@ cargo audit
   (`theme.palette.*`), never `Color::from_rgb`/`from_rgba`,
   `Color::{BLACK,WHITE,TRANSPARENT}`, or hex literals. Enforced by
   `scripts/check-hardcoded-colors.sh` in CI; `widgets/` and `theme/` are exempt.
+  Iced 0.14's `from_rgb` family has no alpha channel — build translucent colors
+  from a palette token (`iced::Color { a: 0.12, ..palette.accent }`).
+- **Frontend animation state**: ratatui is immediate-mode — every frame is a full
+  redraw, so animation state lives in an external timer or frame counter, never
+  in widget state. Desktop and CLI share the same pacing constants (8 characters
+  per 16 ms tick); diverging them needs an ADR. Restored transcripts are never
+  animated.
 
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are

@@ -5,8 +5,8 @@
     provider-first redesign plan (tool resilience, fix classes 2&3).
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
-**Supersedes:** Phase 1 of the provider-first redesign plan
-    (`docs/research/ARCHITECTURE-V2.md`) — the tool-resilience items (failure classes
+**Supersedes:** Phase 1 of the provider-first redesign plan (removed 2026-09-28
+    with the rest of `docs/research/`) — the tool-resilience items (failure classes
     2 and 3) this ADR finalizes.
 **Composes with:** ADR-42/45 and ADR-52 (fallback ladder / orchestration
     safety gates) — tool failures stay *recoverable* context for the ladder to

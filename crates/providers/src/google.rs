@@ -98,7 +98,7 @@ fn function_call_args(fc: &serde_json::Value) -> serde_json::Value {
 ///
 /// The wire spelling has varied: the API's own error text and early field
 /// dumps use snake_case `thought_signature`, while the canonical IR names the
-/// same field `thoughtSignature` (docs/research/ARCHITECTURE-V2.md §2.1). Both spellings are
+/// same field `thoughtSignature`. Both spellings are
 /// accepted so a capture never silently drops a signature.
 fn part_thought_signature(part: &serde_json::Value) -> Option<String> {
     ["thought_signature", "thoughtSignature"]

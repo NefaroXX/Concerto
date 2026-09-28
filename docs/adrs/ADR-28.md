@@ -1,13 +1,7 @@
-# ADR-28: Shell Profiles and Integrated Toolchain
+# ADR-28: Shell & Process Toolchain — superseded
 
-> **Archived — superseded by ADR-30 (unified shell selection, expanded to
-> carry the surviving profile/config/policy-facts decisions) and ADR-29
-> (AI-native shell runtime); consolidated 2026-08-22.** See
-> [docs/adrs/README.md](./README.md) for the current index.
+> **Superseded.** The decision this number carried is no longer in force; it is
+> consolidated in [ADR-30](./ADR-30-*.md). This entry exists only so
+> historical references to ADR-28 resolve, and records no current design.
 >
-> The full historical text lives at [archive/ADR-28.md](./archive/ADR-28.md).
-> This stub is not active guidance.
-
----
-
-*Last updated: 2026-08-22 (retrospective consolidation — see [README](./README.md)).*
+> See [docs/adrs/README.md](./README.md) for the current index.

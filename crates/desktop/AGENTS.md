@@ -32,6 +32,10 @@ desktop/
 
 ## CONVENTIONS
 - **Iced version** - 0.14 via `iced::application(App::new, App::update, App::view)`
+- **Color alpha** - Iced 0.14's `Color::from_rgb` family carries no alpha
+  channel; build translucent colors from a palette token
+  (`iced::Color { a: 0.12, ..palette.accent }`) or a transparent palette
+  variant. Never smuggle alpha in through a hex literal or a `from_rgb` call.
 - **Theme** - defined in `theme.rs` using `Palette` and `ExtendedPalette`; avoid hard-coded colors
 - **Views** - keep rendering pure where possible; state/update pairs are routed
   by `App`
