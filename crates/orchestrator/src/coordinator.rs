@@ -2650,6 +2650,194 @@ fn specialist_task_description(task: &str, notes: Option<&str>) -> String {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Duplicate-dispatch guard (near-identical re-dispatch after a provable
+// failure) — pure text comparison, no state, no I/O.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Cosine-similarity threshold above which two task descriptions count as the
+/// SAME dispatch request. Calibrated on the pathology this guard exists for:
+/// two paraphrases of one intent differing only in filler and terminal
+/// phrasing score ≈0.89, while genuinely different actions on different
+/// target paths score ≈0.14. One auditable number beats a pile of special
+/// cases.
+const DUPLICATE_DISPATCH_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Multiplier applied to each occurrence of a path-shaped token (a path, a
+/// dotted file name, a snake_case identifier) so target paths dominate the
+/// similarity score — two descriptions naming the same files are the same
+/// work regardless of how the surrounding sentence is phrased.
+const DESCRIPTION_PATH_TOKEN_WEIGHT: f64 = 3.0;
+
+/// Function words with no intent signal when comparing dispatch text.
+/// Negation (`not`, `never`, `without`) is deliberately NOT listed: dropping
+/// it would make "rename X" and "do not rename X" compare identical.
+const DESCRIPTION_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "in", "on", "at", "to", "of", "for", "and", "or", "with", "by", "from",
+    "into", "is", "are", "be", "as", "that", "this", "it", "its", "using", "use", "then", "than",
+    "please", "will", "would", "should", "can", "could", "you", "your", "we", "our", "they",
+    "their", "if", "when", "while", "so", "but", "also", "any", "all", "some", "more", "most",
+    "other", "which", "what", "who", "how", "here", "there", "these", "those", "up", "out", "over",
+    "under", "again", "new", "across", "against", "about", "per", "via",
+];
+
+/// Whether a token names a FILE or a PATH (dotted file name, path segment,
+/// snake_case identifier). These carry the intent of a dispatch description
+/// and are weighted accordingly.
+fn is_path_like_token(token: &str) -> bool {
+    if token.contains(['/', '\\', '_']) {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Lowercase, split on punctuation, drop stopwords — the token view two task
+/// descriptions are compared in. Bounded by the input text itself (task text
+/// is already bounded by the decision validator).
+fn description_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | '\\')))
+        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/' | '\\')))
+        .filter(|token| !token.is_empty() && !DESCRIPTION_STOPWORDS.contains(token))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The distinct path-shaped tokens of a description (sorted, so the sets of
+/// two descriptions compare equal).
+fn path_token_set(tokens: &[String]) -> Vec<&str> {
+    let mut paths: Vec<&str> =
+        tokens.iter().filter(|token| is_path_like_token(token)).map(String::as_str).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+/// The weighted token vector of a description: token → accumulated weight
+/// (path tokens weigh [`DESCRIPTION_PATH_TOKEN_WEIGHT`]).
+fn weighted_token_vector(tokens: &[String]) -> HashMap<&str, f64> {
+    let mut counts: HashMap<&str, f64> = HashMap::new();
+    for token in tokens {
+        let weight = if is_path_like_token(token) { DESCRIPTION_PATH_TOKEN_WEIGHT } else { 1.0 };
+        *counts.entry(token).or_default() += weight;
+    }
+    counts
+}
+
+/// Cosine similarity of two token views, with path tokens weighted by
+/// [`DESCRIPTION_PATH_TOKEN_WEIGHT`]. `0.0` when either side is empty (an
+/// empty description never duplicates anything).
+fn description_similarity(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let (va, vb) = (weighted_token_vector(a), weighted_token_vector(b));
+    let norm = |v: &HashMap<&str, f64>| v.values().map(|value| value * value).sum::<f64>().sqrt();
+    let (norm_a, norm_b) = (norm(&va), norm(&vb));
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    let dot: f64 = va.iter().filter_map(|(token, x)| vb.get(token).map(|y| x * y)).sum();
+    dot / (norm_a * norm_b)
+}
+
+/// Whether two task descriptions request the SAME dispatch: with identical
+/// non-empty target paths, the leading action verb must also match ("rename"
+/// vs "copy" of the same file are different work); with no shared target
+/// paths, the path-weighted cosine similarity must reach
+/// [`DUPLICATE_DISPATCH_SIMILARITY_THRESHOLD`].
+fn is_near_duplicate_description(a: &str, b: &str) -> bool {
+    let (tokens_a, tokens_b) = (description_tokens(a), description_tokens(b));
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return false;
+    }
+    let (paths_a, paths_b) = (path_token_set(&tokens_a), path_token_set(&tokens_b));
+    if !paths_a.is_empty() && paths_a == paths_b {
+        return tokens_a.first() == tokens_b.first();
+    }
+    description_similarity(&tokens_a, &tokens_b) >= DUPLICATE_DISPATCH_SIMILARITY_THRESHOLD
+}
+
+/// Bound an excerpt of prior task text for the refusal message (model-facing,
+/// so it stays short no matter how long the original description was).
+fn bounded_description_excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let first_line = text.split('\n').next().unwrap_or(text).trim();
+    if first_line.chars().count() <= MAX_CHARS {
+        return first_line.to_owned();
+    }
+    let mut out: String = first_line.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// The duplicate-dispatch guard: the reason this `call_specialist` must NOT
+/// run, or `None` when dispatching is allowed.
+///
+/// The guard is ARMED only once the run has recorded a TOOL-level diagnosis
+/// that is not retryable — a provably impossible action (missing path, denied
+/// permission, containment rejection, policy denial) — and it only fires for
+/// a near-duplicate of an earlier dispatch by the SAME specialist that itself
+/// settled failed or blocked, when the new call carries no corrective delta.
+/// Provider, agent and contract diagnoses never arm it: a context-overflow or
+/// auth failure is recovered by re-dispatching the SAME task to another model,
+/// which must stay allowed. The delta valves (non-empty coordinator notes, a
+/// different target specialist) are the model's escape hatch, and the text
+/// comparison refuses only near-identical wording, so an agent that genuinely
+/// changes the work still dispatches.
+fn duplicate_dispatch_reason(
+    graph: &TaskGraph,
+    diagnoses: &[crate::failure_diagnosis::FailureDiagnosis],
+    agent: &AgentId,
+    args: &CallSpecialistArgs,
+) -> Option<String> {
+    let armed = diagnoses.iter().any(|diagnosis| {
+        !diagnosis.retryable && diagnosis.kind == crate::failure_diagnosis::FailureKind::Tool
+    });
+    if !armed {
+        // No provably impossible action has been diagnosed yet: no arm, no
+        // gate. Transient failures stay retryable and never arm it either.
+        return None;
+    }
+    if args.notes.as_deref().is_some_and(|notes| !notes.trim().is_empty()) {
+        // Coordinator notes on the dispatch are an explicit corrective
+        // delta — a re-dispatch that changes the instruction is the point.
+        return None;
+    }
+    for prior in graph.all_tasks() {
+        if &prior.role != agent {
+            continue; // a different specialist's task: not this dispatch
+        }
+        if !matches!(prior.status, SubTaskStatus::Blocked | SubTaskStatus::Failed) {
+            continue; // only a dispatch that did NOT deliver is a repeat
+        }
+        // The stored description carries the notes suffix of ITS dispatch;
+        // strip it so the comparison is the task text both times.
+        let prior_task =
+            prior.description.split("\n\nCoordinator notes: ").next().unwrap_or(&prior.description);
+        if prior_task != args.task && !is_near_duplicate_description(prior_task, &args.task) {
+            continue;
+        }
+        return Some(format!(
+            "duplicate dispatch refused: specialist {agent} already ran the near-identical \
+             task {} ({}) — \"{}\". Re-issuing it cannot succeed; add corrective notes or \
+             change the action and its target before dispatching again.",
+            prior.id,
+            prior.status.as_str(),
+            bounded_description_excerpt(prior_task),
+        ));
+    }
+    None
+}
+
 /// Issue #60: the observed dispatch spend in thousandths of a dollar —
 /// recorded for ledger-interpretation parity ONLY. This value is stored
 /// on the suitability observation and NEVER reaches the score (pinned by
@@ -11870,6 +12058,38 @@ impl CoordinatorAgent {
         } else {
             requested_agent.clone()
         };
+
+        // ── Duplicate-dispatch guard (pre-validator: no state mutation) ──
+        // After a provably impossible ACTION (a non-retryable tool-level
+        // diagnosis), re-dispatching a near copy of the failed work with no
+        // corrective delta is the model re-issuing that impossible action one
+        // level up. Refuse it HERE — before the decision journal, the policy
+        // gate and the graph materialization — as a structured tool error the
+        // model can act on: add corrective notes, target a different
+        // specialist, or change the action.
+        if let Some(reason) =
+            duplicate_dispatch_reason(graph, &self.failure_diagnoses, &effective_agent, &args)
+        {
+            warn!(
+                agent = %effective_agent,
+                "call_specialist refused as a duplicate dispatch (structured error, no \
+                 state mutation)"
+            );
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::AgentThought {
+                    agent_id: "coordinator".into(),
+                    content: reason.clone(),
+                    kind: ThinkingKind::Detail,
+                },
+            );
+            ledger.notes.push(reason.clone());
+            return serde_json::json!({
+                "error": "duplicate_dispatch",
+                "message": reason,
+            });
+        }
 
         // ── Issue #52: validate the decision BEFORE any mutation ────────
         // The model output is a proposition, not an instruction. Evidence
@@ -21254,6 +21474,206 @@ mod tests {
             coordinator.failure_diagnoses.iter().all(|diagnosis| diagnosis.code == "provider-auth"),
             "each escalation re-diagnosed the same permanent failure: {:?}",
             coordinator.failure_diagnoses
+        );
+    }
+
+    /// The near-duplicate comparison: rephrased wording over the SAME target
+    /// paths and the SAME action is one dispatch request; a different target
+    /// or a different action verb is genuinely new work.
+    #[test]
+    fn near_duplicate_description_detects_a_rephrased_repeat() {
+        let first = "rename test_file.txt to file_test_pass.txt in the workspace root";
+        let rephrased = "rename test_file.txt to file_test_pass.txt using filesystem move \
+                         operation";
+        assert!(is_near_duplicate_description(first, first), "identical text duplicates itself");
+        assert!(is_near_duplicate_description(first, rephrased), "pathology pair: {rephrased}");
+
+        // Different target paths: not the same dispatch, no matter the prose.
+        assert!(
+            !is_near_duplicate_description(
+                first,
+                "rename other_file.txt to alt_test.txt in the workspace root",
+            ),
+            "different paths must stay dispatchable"
+        );
+        // Same paths, different verb: rename and copy are different work.
+        assert!(
+            !is_near_duplicate_description(
+                first,
+                "copy test_file.txt to file_test_pass.txt in the workspace root",
+            ),
+            "the verb is part of the intent"
+        );
+        // Empty text never duplicates anything (fail-open).
+        assert!(!is_near_duplicate_description("", first));
+        assert!(!is_near_duplicate_description(first, "   "));
+    }
+
+    /// A deterministic (non-retryable) TOOL diagnosis keeps the ADR-42
+    /// `Recoverable` class: the recovery machinery must not treat a provably
+    /// impossible action as a ladder/exit event — only the retryable flags the
+    /// model reads change.
+    #[test]
+    fn deterministic_diagnosis_keeps_the_recoverable_class() {
+        let diagnosis = crate::failure_diagnosis::diagnose(&OrchestratorError::Tool(
+            concerto_core::ToolError::ExecutionFailed {
+                message: "file not found: test_file.txt".into(),
+            },
+        ));
+        assert_eq!(diagnosis.code, "tool-precondition");
+        assert!(
+            matches!(SubtaskFailureClass::from(&diagnosis), SubtaskFailureClass::Recoverable),
+            "the deterministic diagnosis must not leave the Recoverable class: {diagnosis:?}"
+        );
+    }
+
+    /// Acceptance for the duplicate-dispatch guard: after a dispatch failed
+    /// PROVABLY (a deterministic tool precondition), a rephrased re-dispatch
+    /// of the same work with no corrective delta is refused as a structured
+    /// tool error — no second graph node, no second specialist run — while the
+    /// diagnosis stays on the audit trail.
+    #[tokio::test]
+    async fn near_duplicate_dispatch_after_a_deterministic_failure_is_refused() {
+        let bus = EventBus::new(256);
+        let coder = MockExpertAgent::sequence(
+            AgentId::new("coder"),
+            vec![
+                Err(OrchestratorError::Tool(concerto_core::ToolError::ExecutionFailed {
+                    message: "file not found: test_file.txt".into(),
+                })),
+                ok_result("coder", "would have run again without the guard"),
+            ],
+        );
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt in the workspace root",
+                )]),
+                // Rephrased rationale, same target paths, same verb, no notes
+                // — the pathological re-dispatch.
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt using filesystem move operation",
+                )]),
+                CoordinatorTurn::Text("stopped after the duplicate".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("a refused duplicate must not crash the run");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert_eq!(provider.turn_count(), 3, "the loop served all three scripted turns");
+        let refusal = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| {
+                result.get("error").and_then(serde_json::Value::as_str)
+                    == Some("duplicate_dispatch")
+            })
+            .expect("the duplicate dispatch returns a structured tool error");
+        assert!(
+            refusal["message"].as_str().is_some_and(|message| message.contains("test_file.txt")),
+            "the refusal cites the prior dispatch: {refusal:?}"
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "only the first dispatch materialized a node: {events:?}");
+        assert!(
+            coordinator.failure_diagnoses.iter().any(|diagnosis| {
+                diagnosis.kind == crate::failure_diagnosis::FailureKind::Tool
+                    && diagnosis.code == "tool-precondition"
+            }),
+            "the provable failure is on the audit trail: {:?}",
+            coordinator.failure_diagnoses
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the run ends with the unresolved dispatch visible"
+        );
+    }
+
+    /// The guard's escape hatch: the SAME task with corrective coordinator
+    /// notes is a genuine delta and must still dispatch (the specialist is
+    /// not starved of the correction it needs).
+    #[tokio::test]
+    async fn corrective_delta_dispatch_is_allowed_after_a_deterministic_failure() {
+        let bus = EventBus::new(256);
+        let coder = MockExpertAgent::sequence(
+            AgentId::new("coder"),
+            vec![
+                Err(OrchestratorError::Tool(concerto_core::ToolError::ExecutionFailed {
+                    message: "file not found: test_file.txt".into(),
+                })),
+                ok_result("coder", "created the missing file first, then renamed it"),
+            ],
+        );
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt in the workspace root",
+                )]),
+                CoordinatorTurn::Calls(vec![call_specialist_with(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt in the workspace root",
+                    Some("create test_file.txt first, then perform the rename"),
+                    &[],
+                )]),
+                CoordinatorTurn::Text("corrected work finished".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the corrected dispatch runs");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            provider.tool_result_contents().iter().all(|result| {
+                result.get("error").and_then(serde_json::Value::as_str)
+                    != Some("duplicate_dispatch")
+            }),
+            "notes are a corrective delta: the dispatch must be allowed"
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 2, "both dispatches materialize a node: {events:?}");
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskCompleted { role, .. } if role == &AgentId::new("coder")
+            )),
+            "the corrected dispatch settled: {events:?}"
         );
     }
 

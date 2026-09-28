@@ -562,6 +562,33 @@ pub fn diagnose_tool(error: &concerto_core::ToolError) -> FailureDiagnosis {
             true,
             &error.to_string(),
         ),
+        // Deterministic failure: the action's precondition is provably absent
+        // (missing path, denied permission, containment rejection,
+        // unsatisfiable input — see `ToolError::is_deterministic_failure`).
+        // Re-dispatching the SAME action cannot succeed, so the diagnosis
+        // stops calling it retryable and the model is told the action itself
+        // must change. Same-agent viability stays true: a CORRECTED action
+        // from the same agent is still the cheapest recovery, which keeps the
+        // ADR-42 `Recoverable` classification (and its bounded attempt
+        // ladder) intact — only the retryable/transient flags change.
+        ToolError::ExecutionFailed { .. }
+        | ToolError::Timeout { .. }
+        | ToolError::VirtualFsConflict { .. }
+        | ToolError::LspError { .. }
+        | ToolError::Io(_)
+            if error.is_deterministic_failure() =>
+        {
+            FailureDiagnosis::new(
+                FailureKind::Tool,
+                "tool-precondition",
+                false,
+                false,
+                true,
+                false,
+                true,
+                &error.to_string(),
+            )
+        }
         // Execution faults, timeouts, vfs conflicts, LSP and I/O errors may
         // resolve on a re-run of the same agent.
         ToolError::ExecutionFailed { .. }
@@ -626,6 +653,25 @@ pub fn diagnose_outcome_failure(error: &str) -> FailureDiagnosis {
             true,
             true,
             true,
+            true,
+            error,
+        );
+    }
+    // A reported error that states a precondition failure (missing path,
+    // denied permission, containment rejection — the SAME grammar the loop
+    // classifies `ToolError`s with) is DETERMINISTIC: re-running the
+    // identical work with unchanged input and unchanged workspace cannot
+    // succeed. Checked after the artifact-contract markers, which describe a
+    // contract miss a corrected dispatch can still satisfy, and before the
+    // malformed-output branch, whose text can overlap ("failed to parse").
+    if concerto_core::error::is_deterministic_failure_message(error) {
+        return FailureDiagnosis::new(
+            FailureKind::Tool,
+            "tool-precondition",
+            false,
+            false,
+            true,
+            false,
             true,
             error,
         );
@@ -885,6 +931,68 @@ mod tests {
         let timeout = diagnose(&OrchestratorError::Tool(ToolError::Timeout { timeout_secs: 30 }));
         assert_eq!(timeout.code, "tool-failed");
         assert!(timeout.retryable);
+    }
+
+    #[test]
+    fn deterministic_tool_failure_diagnoses_a_non_retryable_precondition() {
+        let diagnosis = diagnose(&OrchestratorError::Tool(ToolError::ExecutionFailed {
+            message: "file not found: src/main.rs".into(),
+        }));
+        assert_eq!(diagnosis.kind, FailureKind::Tool);
+        assert_eq!(diagnosis.code, "tool-precondition");
+        assert!(!diagnosis.transient && !diagnosis.retryable, "{diagnosis:?}");
+        // Same-agent viability is RETAINED: a corrected action from the same
+        // agent is still the cheapest recovery, so the ADR-42 `Recoverable`
+        // classification (and its bounded attempt ladder) is unchanged —
+        // only the retryable/transient flags the model reads move.
+        assert!(diagnosis.same_agent_viable, "{diagnosis:?}");
+        assert!(!diagnosis.alternate_agent_viable, "{diagnosis:?}");
+        assert!(diagnosis.replan_required, "{diagnosis:?}");
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Reconsider);
+    }
+
+    #[test]
+    fn deterministic_guard_keeps_the_specific_preexisting_codes() {
+        // The precondition arm must not swallow the codes the recovery
+        // machinery already keys on.
+        let policy = diagnose(&OrchestratorError::Tool(ToolError::PolicyDenied {
+            rule: "deny_shell".into(),
+        }));
+        assert_eq!(policy.code, "policy-denied");
+        assert!(!policy.retryable);
+
+        let repo = diagnose(&OrchestratorError::Tool(ToolError::NotARepository {
+            message: "no .git".into(),
+        }));
+        assert_eq!(repo.code, "environment-not-a-repo");
+        assert!(!repo.retryable);
+    }
+
+    #[test]
+    fn outcome_reported_as_a_precondition_failure_is_not_retryable() {
+        let diagnosis =
+            diagnose_outcome_failure("dispatch failed: file not found: crates/core/src/lib.rs");
+        assert_eq!(diagnosis.kind, FailureKind::Tool);
+        assert_eq!(diagnosis.code, "tool-precondition");
+        assert!(!diagnosis.transient && !diagnosis.retryable, "{diagnosis:?}");
+        assert!(diagnosis.same_agent_viable, "{diagnosis:?}");
+    }
+
+    #[test]
+    fn artifact_contract_marker_wins_over_precondition_text() {
+        // Ordering matters: a contract miss is satisfiable by a corrected
+        // dispatch and must stay retryable even if the text overlaps.
+        let diagnosis =
+            diagnose_outcome_failure("expected artifacts not produced (file not found)");
+        assert_eq!(diagnosis.code, "artifact-contract-missed");
+        assert!(diagnosis.retryable, "{diagnosis:?}");
+    }
+
+    #[test]
+    fn transient_outcome_text_stays_retryable() {
+        let diagnosis = diagnose_outcome_failure("specialist failed: connection reset by peer");
+        assert_eq!(diagnosis.code, "agent-failed");
+        assert!(diagnosis.retryable && diagnosis.same_agent_viable);
     }
 
     #[test]

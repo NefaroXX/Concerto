@@ -470,6 +470,119 @@ pub enum ToolError {
     Io(#[from] std::io::Error),
 }
 
+/// Message markers of a DETERMINISTIC tool failure — a precondition failure
+/// (missing path, wrong path shape, unsatisfiable input, denied permission)
+/// rather than a fault. Compared against the lowercased message.
+///
+/// One grammar, one place: [`ToolError::is_deterministic_failure`] and
+/// `concerto-orchestrator`'s `failure_diagnosis::diagnose_outcome_failure`
+/// both key on these markers, so an error classified as provably impossible
+/// in the loop and in the Coordinator's diagnosis can never disagree.
+///
+/// Deliberately conservative: transport-shaped faults (connection reset,
+/// timeout, 429/5xx) and anything unrecognized return `false`, because a
+/// false "impossible" blocks a retry that could have succeeded, while a
+/// false "transient" merely costs one extra attempt.
+const DETERMINISTIC_FAILURE_MARKERS: &[&str] = &[
+    // Missing source/target — the action's precondition is absent.
+    "file not found",
+    "no such file",
+    "file already deleted",
+    "file has been deleted",
+    "does not exist",
+    "shell executable not found on PATH",
+    // Permissions — the same identity re-running hits the same wall.
+    "permission denied",
+    "read-only file system",
+    // Wrong path shape (file vs directory, existing destination).
+    "not a directory",
+    "is a directory",
+    "destination already exists",
+    // Path/target resolution: the workspace boundary cannot be satisfied.
+    "is outside the project root",
+    "no existing ancestor",
+    "containment: cannot",
+    "cannot access workspace root",
+    // Schema-valid but unsatisfiable input: the action cannot even be formed.
+    "invalid argument",
+    "invalid filesystem input",
+    "invalid git input",
+    "invalid shell input",
+    "invalid branch name",
+    "must not start with '-'",
+    "missing 'destination' field",
+    "missing 'content' field",
+    "unknown filesystem operation",
+    "'branch' is required for this operation",
+    "'message' is required for this operation",
+    "'paths' must be a non-empty array",
+    "looks like a flag, not a valid file path",
+    "exceeds maximum length",
+    "too many arguments",
+    "non-utf-8",
+];
+
+/// Markers of a containment/traversal rejection in a
+/// [`ToolError::VirtualFsConflict`] reason — the boundary check is part of
+/// the workspace configuration, so the identical command is rejected again
+/// without executing. A genuine overlay conflict (a concurrent edit) matches
+/// none of these and stays retryable. Compared lowercased.
+const DETERMINISTIC_CONTAINMENT_MARKERS: &[&str] =
+    &["escapes workspace root", "outside the project root", "path traversal"];
+
+/// Whether an error message states a DETERMINISTIC failure: re-issuing the
+/// exact same action, with unchanged input and unchanged workspace state,
+/// cannot succeed.
+///
+/// Public so the Coordinator's outcome-failure diagnosis can classify an
+/// agent's reported error text with exactly the same grammar the loop uses
+/// for the [`ToolError`] it actually saw.
+pub fn is_deterministic_failure_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    DETERMINISTIC_FAILURE_MARKERS.iter().any(|marker| lowered.contains(marker))
+}
+
+impl ToolError {
+    /// Whether this failure is DETERMINISTIC — the "provably impossible"
+    /// signal, mirroring [`ProviderError::is_transient`].
+    ///
+    /// `true` means the same action with the same input cannot succeed, so
+    /// re-issuing it is wasted work: the single-agent loop refuses the
+    /// identical re-issue with a terminal corrective tool result (instead of
+    /// burning an approval prompt or a retry), and the failure diagnosis stops
+    /// calling the failure retryable.
+    ///
+    /// Policy denials, approvals, cancellations, timeouts, LSP faults and
+    /// ordinary execution faults return `false`: they are either not failures
+    /// at all or may resolve on a re-run.
+    pub fn is_deterministic_failure(&self) -> bool {
+        match self {
+            // Structural facts of the environment or of the request: the
+            // identical call is denied/refused again, unchanged.
+            ToolError::PolicyDenied { .. }
+            | ToolError::NotARepository { .. }
+            | ToolError::RollbackNotSupported => true,
+            ToolError::ExecutionFailed { message } => is_deterministic_failure_message(message),
+            ToolError::VirtualFsConflict { reason, .. } => {
+                let lowered = reason.to_ascii_lowercase();
+                DETERMINISTIC_CONTAINMENT_MARKERS.iter().any(|marker| lowered.contains(marker))
+            }
+            ToolError::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::IsADirectory
+            ),
+            // A pause is not a failure; a timeout, a cancellation, and an
+            // overlay conflict may all resolve on a later attempt.
+            _ => false,
+        }
+    }
+}
+
 /// Policy evaluation and enforcement errors.
 ///
 /// These errors occur during policy rule evaluation, approval workflows, and
@@ -1127,6 +1240,102 @@ mod unit_tests {
     fn tool_error_display_timeout() {
         let err = ToolError::Timeout { timeout_secs: 30 };
         assert!(err.to_string().contains("30"));
+    }
+
+    // ── Deterministic-failure classification (the "provably impossible" seam) ──
+
+    #[test]
+    fn tool_error_deterministic_failure_classifies_preconditions() {
+        // Structural facts of the environment or of the request: the
+        // identical call is refused again, unchanged.
+        assert!(ToolError::PolicyDenied { rule: "deny_all".into() }.is_deterministic_failure());
+        assert!(ToolError::NotARepository { message: "not a git repository".into() }
+            .is_deterministic_failure());
+        assert!(ToolError::RollbackNotSupported.is_deterministic_failure());
+
+        // Precondition markers: the action's input cannot be satisfied.
+        for message in [
+            "file not found: src/main.rs",
+            "permission denied: /srv/config",
+            "destination already exists: out.rs",
+            "missing 'destination' field in input",
+            "read-only file system",
+            // The real filesystem tool's missing-path message (crates/tools):
+            // a read of a path that was never created.
+            "'missing.txt' does not exist in workspace '/work'. Check the path, or use the \
+             filesystem write operation to create it",
+        ] {
+            assert!(
+                ToolError::ExecutionFailed { message: message.into() }.is_deterministic_failure(),
+                "expected deterministic: {message}"
+            );
+        }
+
+        // A containment/traversal rejection is a boundary fact of the
+        // workspace configuration, so the identical command is rejected again.
+        assert!(ToolError::VirtualFsConflict {
+            path: "../etc/passwd".into(),
+            reason: "path traversal detected — resolved path escapes workspace root".into(),
+        }
+        .is_deterministic_failure());
+
+        // I/O kinds that cannot heal on a re-run of the same path.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let error = ToolError::Io(std::io::Error::new(kind, "detail"));
+            assert!(error.is_deterministic_failure(), "expected deterministic: {kind:?}");
+        }
+    }
+
+    #[test]
+    fn tool_error_deterministic_failure_leaves_transient_faults_retryable() {
+        // Not failures at all — they must never be refused as "impossible".
+        assert!(!ToolError::Timeout { timeout_secs: 30 }.is_deterministic_failure());
+        assert!(!ToolError::Cancelled.is_deterministic_failure());
+        assert!(!ToolError::PausedAwaitingApproval {
+            tool_name: "shell".into(),
+            detail: "command".into(),
+            input_hash: "hash".into(),
+            correlation_id: crate::ids::Ulid::new(),
+            timeout_secs: 30,
+        }
+        .is_deterministic_failure());
+
+        // Faults that may resolve on a re-run.
+        assert!(
+            !ToolError::LspError { message: "server crashed".into() }.is_deterministic_failure()
+        );
+        assert!(!ToolError::ExecutionFailed { message: "connection reset by peer".into() }
+            .is_deterministic_failure());
+        assert!(!ToolError::ExecutionFailed {
+            message: "the request failed with status 503".into()
+        }
+        .is_deterministic_failure());
+        // A genuine concurrent overlay conflict is not a precondition failure.
+        assert!(!ToolError::VirtualFsConflict {
+            path: "a.txt".into(),
+            reason: "the file changed since it was read".into(),
+        }
+        .is_deterministic_failure());
+        // Transient I/O kinds stay retryable.
+        assert!(!ToolError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+            .is_deterministic_failure());
+    }
+
+    #[test]
+    fn deterministic_message_grammar_stays_conservative() {
+        assert!(is_deterministic_failure_message("No such file or directory (os error 2)"));
+        assert!(is_deterministic_failure_message("file not found: crates/core"));
+        // Unrecognized messages default to retryable — a false "impossible"
+        // would block a retry that could have succeeded.
+        assert!(!is_deterministic_failure_message("the request failed"));
+        // No bare "not found" / "timeout" over-trigger.
+        assert!(!is_deterministic_failure_message("not found"));
+        assert!(!is_deterministic_failure_message("timed out waiting for the server"));
+        assert!(!is_deterministic_failure_message("the model produced malformed JSON"));
     }
 
     #[test]
